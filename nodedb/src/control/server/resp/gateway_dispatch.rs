@@ -162,7 +162,12 @@ fn meter_resp_dispatch(
     let Some(identity) = session.identity.as_ref() else {
         return;
     };
-    let scope = resp_auth_scope(identity, state.auth_stores(), database_id);
+    let scope = resp_auth_scope(
+        identity,
+        state.auth_stores(),
+        database_id,
+        &session.peer_addr,
+    );
     meter_dispatch(state, &scope, info, Some(1));
 }
 
@@ -182,7 +187,12 @@ fn authorize_resp_task(
             resource: "RESP AUTH required before data access".into(),
         })?;
 
-    let scope = resp_auth_scope(identity, state.auth_stores(), database_id);
+    let scope = resp_auth_scope(
+        identity,
+        state.auth_stores(),
+        database_id,
+        &session.peer_addr,
+    );
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
@@ -257,13 +267,20 @@ fn authorize_resp_task(
 /// `scope.database_id()` (used for `PhysicalTask::database_id`) and
 /// `scope.auth().database_id` (used for RLS substitution) cannot disagree —
 /// split out from `authorize_resp_task` so that guarantee is directly
-/// unit-testable. Thin wrapper over [`RequestAuthScope::for_database`].
+/// unit-testable.
+///
+/// `peer_addr` is the connection's accept-time remote address; it reaches
+/// the risk scorer so `$auth.risk_score` is stamped for RESP commands too.
 fn resp_auth_scope<'a>(
     identity: &'a AuthenticatedIdentity,
     stores: crate::control::security::request_scope::AuthStores<'a>,
     database_id: DatabaseId,
+    peer_addr: &str,
 ) -> RequestAuthScope<'a> {
-    RequestAuthScope::for_database(identity, stores, database_id)
+    RequestAuthScope::builder(identity, stores)
+        .with_session_database(Some(database_id))
+        .with_peer_addr(peer_addr)
+        .build()
 }
 
 /// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
@@ -344,10 +361,12 @@ mod tests {
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
 
+        let scorer = crate::control::security::risk::RiskScorer::default();
         let scope = resp_auth_scope(
             &identity,
-            AuthStores::new(&grants, &quotas),
+            AuthStores::new(&grants, &quotas, &scorer),
             DatabaseId::DEFAULT,
+            "127.0.0.1:6379",
         );
 
         assert_eq!(scope.database_id(), DatabaseId::DEFAULT);

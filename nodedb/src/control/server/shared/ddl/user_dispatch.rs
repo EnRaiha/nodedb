@@ -123,7 +123,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         // unit for `None`, which is correct for the lookup/mutation that
         // just happened.
         if let Some(info) = &plan_metering_info {
-            let metering_scope = resolve_dispatch_scope(state, identity, database_id);
+            let metering_scope = resolve_dispatch_scope(state, identity, database_id, peer_addr);
             meter_dispatch(state, &metering_scope, info, None);
         }
     }
@@ -154,7 +154,7 @@ fn authorize_for_identity(
     peer_addr: &str,
 ) -> crate::Result<AuthorizedTask> {
     let mut plan = plan;
-    let scope = resolve_dispatch_scope(state, identity, database_id);
+    let scope = resolve_dispatch_scope(state, identity, database_id, peer_addr);
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
@@ -217,14 +217,22 @@ fn authorize_for_identity(
 /// [`RequestAuthScope::database_id`]) and `$auth.database_id` (via
 /// [`RequestAuthScope::auth`]) are read from — split out from
 /// [`authorize_for_identity`] so that guarantee is directly unit-testable.
-/// Thin wrapper over [`RequestAuthScope::for_database`] that reads the
-/// auth stores off `state`.
+/// Reads the auth stores off `state`.
+///
+/// `peer_addr` is the caller-supplied real remote address; it reaches the
+/// risk scorer so `$auth.risk_score` is stamped on this path too. Callers
+/// that already ran the admission gate for the request pass an empty
+/// string, which is not an address and is therefore never scored.
 fn resolve_dispatch_scope<'a>(
     state: &'a SharedState,
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
+    peer_addr: &str,
 ) -> RequestAuthScope<'a> {
-    RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
+    RequestAuthScope::builder(identity, state.auth_stores())
+        .with_session_database(Some(database_id))
+        .with_peer_addr(peer_addr)
+        .build()
 }
 
 #[cfg(test)]
@@ -288,7 +296,7 @@ mod tests {
         );
         identity.default_database = Some(identity_default);
 
-        let scope = resolve_dispatch_scope(&state, &identity, dispatch_target);
+        let scope = resolve_dispatch_scope(&state, &identity, dispatch_target, "127.0.0.1:5432");
 
         assert_eq!(scope.database_id(), dispatch_target);
         assert_eq!(scope.auth().database_id, Some(dispatch_target));

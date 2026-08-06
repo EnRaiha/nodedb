@@ -43,6 +43,7 @@ pub async fn execute_sql(
     // `database_id` rather than falling back through `identity`'s default.
     let scope = RequestAuthScope::builder(identity, shared.auth_stores())
         .with_session_database(Some(database_id))
+        .with_peer_addr(peer_addr)
         .build();
 
     // Request-admission gate: internal-service exemption, blacklist, account

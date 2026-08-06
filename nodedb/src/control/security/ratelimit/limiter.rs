@@ -33,6 +33,7 @@ use super::bucket::TokenBucket;
 use super::config::RateLimitConfig;
 
 /// Rate limit check result.
+#[derive(Debug)]
 pub struct RateLimitResult {
     /// Whether the request is allowed.
     pub allowed: bool,

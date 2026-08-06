@@ -9,6 +9,7 @@ use crate::control::security::auth_context::{AuthContext, generate_session_id};
 use crate::control::security::deny::DenyMode;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::jwks::registry::VerifiedJwtClaims;
+use crate::control::security::risk::client_ip_from_peer;
 use crate::control::security::scope::enrichment::enrich_auth_context_with_scopes;
 
 use super::resolved::RequestAuthScope;
@@ -33,6 +34,7 @@ pub struct RequestAuthScopeBuilder<'a> {
     verified_jwt: Option<&'a VerifiedJwtClaims>,
     session_id: Option<String>,
     adopted_auth_context: Option<AuthContext>,
+    client_ip: Option<String>,
 }
 
 impl<'a> RequestAuthScopeBuilder<'a> {
@@ -48,7 +50,24 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             verified_jwt: None,
             session_id: None,
             adopted_auth_context: None,
+            client_ip: None,
         }
+    }
+
+    /// The transport's real peer address for this request, in whatever shape
+    /// its socket layer produced (`10.1.2.3:5432`, `[::1]:5432`, or a bare
+    /// address). Used to stamp `$auth.risk_score`.
+    ///
+    /// Pass the genuine remote address or nothing at all — never a
+    /// placeholder. Anything that does not parse as an address is discarded
+    /// by [`client_ip_from_peer`], and a scope with no client address leaves
+    /// `risk_score` unset, which the request-admission gate treats as
+    /// "unassessed" and refuses whenever risk scoring is enabled. A fake
+    /// address would instead be scored as if it were real, mis-scoring every
+    /// request behind that transport.
+    pub fn with_peer_addr(mut self, peer_addr: &str) -> Self {
+        self.client_ip = client_ip_from_peer(peer_addr);
+        self
     }
 
     /// The session's currently active database (from `USE DATABASE` or a
@@ -139,6 +158,10 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     ///    a required argument. This step runs even for an adopted context,
     ///    since a pooled `AuthContext` was enriched only once, at
     ///    handle-creation time, and may be stale.
+    /// 6. Stamp `auth.risk_score` when risk scoring is enabled, the identity
+    ///    is not an internal service, and [`Self::with_peer_addr`] supplied a
+    ///    usable client address. Enforcement of the resulting decision lives
+    ///    at the request-admission gate, not here — `build` stays infallible.
     pub fn build(self) -> RequestAuthScope<'a> {
         let resolved_db = self
             .session_database
@@ -176,6 +199,21 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             crate::control::security::time::now_secs(),
         );
 
+        // Risk scoring. Internal-service identities (triggers, Raft apply,
+        // CRDT sync, scheduler, replay) are exempt here for the same reason
+        // the request-admission gate exempts them from the blacklist and
+        // rate-limit guards: server-owned work must never be scored or
+        // refused, and scoring it would also pollute the known-IP cache with
+        // loopback traffic.
+        if self.stores.risk_scorer.is_enabled()
+            && !self.identity.is_internal_service()
+            && let Some(client_ip) = self.client_ip.as_deref()
+        {
+            let (score, _decision, _signals) =
+                self.stores.risk_scorer.score(&auth.id, client_ip, &auth);
+            auth.risk_score = Some(score);
+        }
+
         RequestAuthScope::new(self.identity, auth, resolved_db)
     }
 }
@@ -185,6 +223,7 @@ mod tests {
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
     use crate::control::security::jwt::JwtClaims;
     use crate::control::security::metering::quota::QuotaManager;
+    use crate::control::security::risk::{RiskConfig, RiskScorer};
     use crate::control::security::scope::grant::{ScopeGrantParams, ScopeGrantStore};
     use crate::types::TenantId;
     use std::collections::HashMap;
@@ -225,7 +264,8 @@ mod tests {
         identity.default_database = Some(DatabaseId::new(7));
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .with_session_database(Some(DatabaseId::new(99)))
@@ -240,7 +280,8 @@ mod tests {
         identity.default_database = Some(DatabaseId::new(7));
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores).build();
 
@@ -252,7 +293,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores).build();
 
@@ -265,7 +307,8 @@ mod tests {
         identity.default_database = Some(DatabaseId::new(3));
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores).build();
 
@@ -277,7 +320,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build()
@@ -292,7 +336,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
         grants
             .grant(ScopeGrantParams {
                 scope_name: "pro:all",
@@ -320,6 +365,7 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
+        let scorer = RiskScorer::default();
         grants
             .grant(ScopeGrantParams {
                 scope_name: "pro:all",
@@ -347,7 +393,7 @@ mod tests {
             10,
             crate::control::security::time::now_secs(),
         );
-        let stores = AuthStores::new(&grants, &quotas);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores).build();
 
@@ -366,7 +412,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
         let claims = test_claims(true);
         let verified = VerifiedJwtClaims::new_for_test(claims);
 
@@ -383,7 +430,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
         // Simulate a pooled session's cached `AuthContext`, resolved for a
         // different database than the one this request is scoped to.
         let mut pooled = AuthContext::from_identity(&identity, "s_pooled".into());
@@ -409,7 +457,8 @@ mod tests {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
-        let stores = AuthStores::new(&grants, &quotas);
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
         grants
             .grant(ScopeGrantParams {
                 scope_name: "pro:all",
@@ -431,5 +480,120 @@ mod tests {
             scope.auth().metadata.get("scope_status.pro:all"),
             Some(&"active".to_string())
         );
+    }
+
+    // ── Risk scoring ────────────────────────────────────────────────────
+
+    fn enabled_scorer(allow: f64, deny: f64) -> RiskScorer {
+        RiskScorer::new(RiskConfig {
+            enabled: true,
+            allow_threshold: allow,
+            deny_threshold: deny,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn risk_score_is_not_stamped_when_scoring_is_disabled() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = RiskScorer::default();
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("10.0.0.1:5432")
+            .build();
+
+        assert_eq!(scope.auth().risk_score, None);
+    }
+
+    #[test]
+    fn risk_score_is_stamped_when_enabled_with_a_real_peer_address() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = enabled_scorer(0.3, 0.7);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("10.0.0.1:5432")
+            .build();
+
+        let score = scope
+            .auth()
+            .risk_score
+            .expect("an enabled scorer with a real peer address must stamp a score");
+        assert!(score >= 0.0);
+        assert_eq!(
+            scope.auth().resolve_variable("risk_score"),
+            Some(serde_json::json!(score)),
+            "$auth.risk_score must resolve to the stamped score for RLS substitution"
+        );
+    }
+
+    /// The configured thresholds must reach the scorer — a `RiskConfig`
+    /// that is constructed but never read would leave every score in the
+    /// allow band no matter what the operator set.
+    #[test]
+    fn configured_thresholds_reach_the_scorer() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        // Everything is denied: an allow band that ends below zero and a
+        // deny band that starts at zero.
+        let scorer = enabled_scorer(-1.0, 0.0);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("10.0.0.1:5432")
+            .build();
+
+        let refusal = scorer
+            .refusal_for(scope.auth())
+            .expect("configured deny threshold must refuse");
+        assert_eq!(refusal.resource, "denied by risk policy");
+    }
+
+    /// A peer address that is not an address at all (the literal `"http"`
+    /// the HTTP query routes pass today) must not be scored as if it were
+    /// one — the scope stays unassessed and the gate fails closed.
+    #[test]
+    fn placeholder_peer_address_leaves_the_scope_unassessed() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = enabled_scorer(0.3, 0.7);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("http")
+            .build();
+
+        assert_eq!(scope.auth().risk_score, None);
+        assert!(scorer.refusal_for(scope.auth()).is_some());
+    }
+
+    #[test]
+    fn internal_service_identity_is_never_scored() {
+        let identity = AuthenticatedIdentity::new_internal_service(
+            7,
+            "internal-service",
+            TenantId::new(1),
+            vec![],
+            false,
+            None,
+            DatabaseSet::All,
+        );
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = enabled_scorer(-1.0, 0.0);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("10.0.0.1:5432")
+            .build();
+
+        assert_eq!(scope.auth().risk_score, None);
     }
 }

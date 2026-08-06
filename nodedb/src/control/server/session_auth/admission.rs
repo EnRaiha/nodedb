@@ -13,7 +13,7 @@ use crate::control::security::ratelimit::limiter::RateLimitResult;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::state::SharedState;
 
-use super::guards::{check_blacklist, check_rate_limit};
+use super::guards::{check_blacklist, check_rate_limit, check_risk};
 
 /// Run the full request-admission gate: internal-service exemption,
 /// blacklist, account status, then rate limit.
@@ -36,7 +36,12 @@ use super::guards::{check_blacklist, check_rate_limit};
 ///    persistent `state.auth_users` store, whereas `AuthContext.status` is
 ///    built `Active` and is only mutated in-session by the escalation engine
 ///    onto a possibly-pooled context. Both must be checked.
-/// 4. [`check_rate_limit`] — runs last, and before any planning/catalog work,
+/// 4. [`check_risk`] — the adaptive-auth risk decision for the score the
+///    scope was built with. Off unless the operator enabled `[auth.risk]`.
+///    It runs after the cheap identity-shaped rejections and before the rate
+///    limiter, because a request that is about to be refused on risk should
+///    not consume the caller's rate-limit budget.
+/// 5. [`check_rate_limit`] — runs last, and before any planning/catalog work,
 ///    so load is shed before it is spent.
 pub fn check_request_admission(
     state: &SharedState,
@@ -50,6 +55,7 @@ pub fn check_request_admission(
 
     check_blacklist(state, scope.identity(), peer_addr)?;
     scope.auth().check_status()?;
+    check_risk(state, scope.identity(), scope.auth(), peer_addr)?;
 
     let database_id: DatabaseId = scope.database_id();
     let result = check_rate_limit(
@@ -69,11 +75,14 @@ pub fn check_request_admission(
 /// rate-limiter's cost table models — ILP/OTLP ingest, CRDT delta sync,
 /// shape subscription/resync, and admin-scoped COPY backup/restore — but
 /// which must still refuse a blacklisted or suspended/banned account.
-/// Composes the same internal-service exemption, [`check_blacklist`], and
-/// [`AuthContext::check_status`](crate::control::security::auth_context::AuthContext::check_status)
-/// steps [`check_request_admission`] runs, minus [`check_rate_limit`] —
-/// see that function's doc for why the order (exemption, then blacklist,
-/// then status) matters.
+/// Composes the same internal-service exemption, [`check_blacklist`],
+/// [`AuthContext::check_status`](crate::control::security::auth_context::AuthContext::check_status),
+/// and [`check_risk`] steps [`check_request_admission`] runs, minus
+/// [`check_rate_limit`] — see that function's doc for why the order
+/// (exemption, then blacklist, then status, then risk) matters. The risk
+/// gate is not part of the rate-limiter's cost model, so it belongs on this
+/// door too: a request refused by risk policy must be refused on every door,
+/// not only the ones that also meter QPS.
 pub fn check_blacklist_and_status(
     state: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -84,7 +93,8 @@ pub fn check_blacklist_and_status(
     }
 
     check_blacklist(state, scope.identity(), peer_addr)?;
-    scope.auth().check_status()
+    scope.auth().check_status()?;
+    check_risk(state, scope.identity(), scope.auth(), peer_addr)
 }
 
 #[cfg(test)]
@@ -111,6 +121,21 @@ mod tests {
         );
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
         let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        (state, dir)
+    }
+
+    /// Same as [`test_state`] but with risk scoring built from `risk_config`
+    /// instead of the disabled default.
+    async fn test_state_with_risk(
+        risk_config: crate::control::security::risk::RiskConfig,
+    ) -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new_with_risk_config(dispatcher, wal, risk_config)
+            .expect("construct shared state");
         (state, dir)
     }
 
@@ -244,6 +269,160 @@ mod tests {
             result.is_some(),
             "checked path must report Some(rate limit result)"
         );
+    }
+
+    // ── Risk gate. Scoring is stamped by the scope builder from the real
+    //    peer address; admission turns the decision into a refusal. ───────
+
+    use crate::control::security::risk::RiskConfig;
+
+    fn risk_config(enabled: bool, allow: f64, deny: f64) -> RiskConfig {
+        RiskConfig {
+            enabled,
+            allow_threshold: allow,
+            deny_threshold: deny,
+            ..Default::default()
+        }
+    }
+
+    fn scoped<'a>(
+        state: &'a SharedState,
+        identity: &'a AuthenticatedIdentity,
+        peer_addr: &str,
+    ) -> RequestAuthScope<'a> {
+        RequestAuthScope::builder(identity, state.auth_stores())
+            .with_session_database(Some(DatabaseId::DEFAULT))
+            .with_peer_addr(peer_addr)
+            .build()
+    }
+
+    fn rejection_reason(error: &crate::Error) -> String {
+        match error {
+            crate::Error::RejectedAuthz { resource, .. } => resource.clone(),
+            other => panic!("expected an authz rejection, got {other:?}"),
+        }
+    }
+
+    /// A scored, in-band request is admitted and its score is visible to RLS
+    /// through `$auth.risk_score`.
+    #[tokio::test]
+    async fn scored_request_in_allow_band_is_admitted_and_exposes_its_score() {
+        // Everything is allowed: the allow band covers the whole range.
+        let (state, _dir) = test_state_with_risk(risk_config(true, 1.0, 2.0)).await;
+        let identity = regular_identity(9201, AuthMethod::ScramSha256);
+        let scope = scoped(&state, &identity, "10.0.0.1:5432");
+
+        let result = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+            .expect("an in-band score must be admitted");
+        assert!(result.is_some());
+
+        let score = scope
+            .auth()
+            .risk_score
+            .expect("an enabled scorer must stamp a score");
+        let resolved =
+            crate::control::security::predicate::PredicateValue::AuthRef("risk_score".to_string())
+                .resolve(scope.auth());
+        assert_eq!(
+            resolved,
+            Some(serde_json::json!(score)),
+            "$auth.risk_score must substitute into RLS predicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_band_refuses_the_request() {
+        // Deny band starts at zero, so every score lands in it.
+        let (state, _dir) = test_state_with_risk(risk_config(true, -1.0, 0.0)).await;
+        let identity = regular_identity(9202, AuthMethod::ScramSha256);
+        let scope = scoped(&state, &identity, "10.0.0.1:5432");
+
+        let error = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+            .expect_err("a deny-band score must be refused");
+        assert_eq!(rejection_reason(&error), "denied by risk policy");
+    }
+
+    /// The step-up band has no protocol behind it yet, so it fails closed —
+    /// with its own reason, distinct from a plain deny.
+    #[tokio::test]
+    async fn step_up_band_refuses_with_a_distinct_reason() {
+        // First request scores new_ip (0.15) + device_not_trusted (0.20) =
+        // 0.35, which sits between these thresholds.
+        let (state, _dir) = test_state_with_risk(risk_config(true, 0.3, 0.7)).await;
+        let identity = regular_identity(9203, AuthMethod::ScramSha256);
+        let scope = scoped(&state, &identity, "10.0.0.1:5432");
+
+        let error = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+            .expect_err("the step-up band must not be admitted");
+        assert_eq!(rejection_reason(&error), "step-up authentication required");
+    }
+
+    /// Server-owned work is exempt from the risk gate exactly as it is from
+    /// the blacklist and rate-limit guards.
+    #[tokio::test]
+    async fn internal_service_identity_is_never_risk_refused() {
+        let (state, _dir) = test_state_with_risk(risk_config(true, -1.0, 0.0)).await;
+        let identity = internal_service_identity(9204);
+        let scope = scoped(&state, &identity, "10.0.0.1:5432");
+
+        assert_eq!(
+            scope.auth().risk_score,
+            None,
+            "exempt identities are unscored"
+        );
+        let result = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+            .expect("internal-service identities must never be risk-refused");
+        assert!(result.is_none());
+    }
+
+    /// A scope built without a usable client address cannot be assessed, so
+    /// the gate refuses rather than admitting an unscored request.
+    #[tokio::test]
+    async fn unassessed_request_fails_closed_when_scoring_is_enabled() {
+        let (state, _dir) = test_state_with_risk(risk_config(true, 1.0, 2.0)).await;
+        let identity = regular_identity(9205, AuthMethod::ScramSha256);
+        // `"http"` is not an address — the HTTP query routes pass exactly
+        // this literal today.
+        let scope = scoped(&state, &identity, "http");
+
+        let error = check_request_admission(&state, &scope, "http", "point_get")
+            .expect_err("an unassessed request must not be admitted");
+        assert_eq!(
+            rejection_reason(&error),
+            "risk assessment unavailable for this request"
+        );
+    }
+
+    /// The knob is not inert: the very same request that a deny-everything
+    /// threshold refuses is admitted once the configuration says so, and
+    /// nothing is scored at all while `enabled` is false.
+    #[tokio::test]
+    async fn configured_thresholds_change_the_outcome() {
+        let identity = regular_identity(9206, AuthMethod::ScramSha256);
+
+        let (denying, _dir_a) = test_state_with_risk(risk_config(true, -1.0, 0.0)).await;
+        let scope = scoped(&denying, &identity, "10.0.0.1:5432");
+        assert!(check_request_admission(&denying, &scope, "10.0.0.1:5432", "point_get").is_err());
+
+        let (permitting, _dir_b) = test_state_with_risk(risk_config(true, 1.0, 2.0)).await;
+        let scope = scoped(&permitting, &identity, "10.0.0.1:5432");
+        assert!(check_request_admission(&permitting, &scope, "10.0.0.1:5432", "point_get").is_ok());
+
+        let (disabled, _dir_c) = test_state_with_risk(risk_config(false, -1.0, 0.0)).await;
+        let scope = scoped(&disabled, &identity, "10.0.0.1:5432");
+        assert_eq!(scope.auth().risk_score, None);
+        assert!(check_request_admission(&disabled, &scope, "10.0.0.1:5432", "point_get").is_ok());
+    }
+
+    #[tokio::test]
+    async fn blacklist_and_status_door_also_enforces_the_risk_gate() {
+        let (state, _dir) = test_state_with_risk(risk_config(true, -1.0, 0.0)).await;
+        let identity = regular_identity(9207, AuthMethod::ApiKey);
+        let scope = scoped(&state, &identity, "10.0.0.1:5432");
+
+        let error = check_blacklist_and_status(&state, &scope, "10.0.0.1:5432")
+            .expect_err("the non-rate-limited door must refuse a deny-band request too");
+        assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
 
     // ── `check_blacklist_and_status` — the blacklist-only-plus-status door

@@ -18,7 +18,7 @@ impl SharedState {
     /// that build a scope from `&SharedState` directly rather than pulling
     /// the two fields separately.
     pub fn auth_stores(&self) -> AuthStores<'_> {
-        AuthStores::new(&self.scope_grants, &self.quota_manager)
+        AuthStores::new(&self.scope_grants, &self.quota_manager, &self.risk_scorer)
     }
 
     /// Sequenced Raft proposer for ordinary writes; absent outside cluster mode.

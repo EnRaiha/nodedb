@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Post-identity authorization guards: blacklist and rate-limit checks.
+//! Post-identity authorization guards: blacklist, risk, and rate-limit checks.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::auth_context::AuthContext;
@@ -93,6 +93,52 @@ pub fn check_blacklist(
     }
 
     Ok(())
+}
+
+/// Enforce the adaptive-auth risk decision for a request.
+///
+/// The score itself was computed once, in
+/// [`RequestAuthScopeBuilder::build`](crate::control::security::request_scope::RequestAuthScopeBuilder::build),
+/// where the transport's real client address was in hand; this guard only
+/// turns the stamped `$auth.risk_score` into a refusal. Returns `Ok(())`
+/// when scoring is disabled or the score is in the allow band.
+///
+/// Refusals use [`crate::Error::RejectedAuthz`] — the same authorization
+/// rejection the blacklist and account-status guards raise on this path, so
+/// clients see one consistent, non-retryable code for "this request is not
+/// allowed" rather than a risk-specific status they would have to learn.
+/// The reason string distinguishes the three cases (deny, step-up required,
+/// unassessed).
+pub fn check_risk(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    auth_ctx: &AuthContext,
+    peer_addr: &str,
+) -> crate::Result<()> {
+    let Some(refusal) = state.risk_scorer.refusal_for(auth_ctx) else {
+        return Ok(());
+    };
+
+    state.audit_record(
+        AuditEvent::AuthFailure,
+        Some(identity.tenant_id),
+        peer_addr,
+        &format!(
+            "risk gate refused user '{}': {}",
+            identity.username, refusal.audit_detail
+        ),
+    );
+
+    // Escalation seam: a refusal here is exactly the repeated-violation
+    // signal `EscalationEngine` consumes, and wiring it is one line —
+    // `state.escalation.record_violation(&auth_ctx.id);` — placed right
+    // here, before the error is returned, so a user who keeps tripping the
+    // risk gate escalates to Suspended/Banned like any other violator.
+
+    Err(crate::Error::RejectedAuthz {
+        tenant_id: identity.tenant_id,
+        resource: refusal.resource,
+    })
 }
 
 /// Check rate limit for a request.

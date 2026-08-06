@@ -430,6 +430,13 @@ pub struct AuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub siem: Option<crate::control::security::siem::SiemConfig>,
 
+    /// Adaptive-auth risk scoring configuration (signal weights, allow/deny
+    /// thresholds, known-IP cache bound). Absent — and, when present, absent
+    /// `enabled = true` — leaves scoring off: no request is scored,
+    /// `$auth.risk_score` stays unresolvable, and no request is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<crate::control::security::risk::RiskConfig>,
+
     /// Opaque session handle configuration: fingerprint binding, resolve
     /// rate-limit, miss-spike detection.
     #[serde(default)]
@@ -457,6 +464,7 @@ impl Default for AuthConfig {
             rate_limit: None,
             metering: None,
             siem: None,
+            risk: None,
             session: SessionHandleConfig::default(),
         }
     }

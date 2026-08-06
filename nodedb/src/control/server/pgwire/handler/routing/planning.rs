@@ -48,6 +48,7 @@ impl NodeDbPgHandler {
         };
         let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
+            .with_peer_addr(&peer_addr.to_string())
             .build();
         crate::control::server::session_auth::check_request_admission(
             &self.state,
@@ -171,7 +172,12 @@ impl NodeDbPgHandler {
         // context never received after the moment it was created.
         let mut scope_builder = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
-            .with_on_deny(session_on_deny);
+            .with_on_deny(session_on_deny)
+            // The planning scope is a different value than the one
+            // `admit_statement` built, so `$auth.risk_score` has to be
+            // stamped here too or RLS predicates that gate on it would
+            // fail closed on every pgwire statement.
+            .with_peer_addr(&peer_addr.to_string());
         if let Some(adopted) = adopted_auth_ctx {
             scope_builder = scope_builder.with_adopted_auth_context(adopted);
         }

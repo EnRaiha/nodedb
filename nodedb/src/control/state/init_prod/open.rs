@@ -98,6 +98,16 @@ impl SharedState {
             Arc::clone(&http_client),
         );
 
+        // `auth_config.risk` is `None` unless the operator configured an
+        // `[auth.risk]` section, and `RiskConfig::default()` has
+        // `enabled = false`, so scoring stays dormant either way. When it is
+        // configured the operator's weights and thresholds reach the scorer
+        // here — the one place they can, since `RiskScorer` reads its config
+        // only at construction.
+        let risk_scorer = crate::control::security::risk::RiskScorer::new(
+            auth_config.risk.clone().unwrap_or_default(),
+        );
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
@@ -290,7 +300,7 @@ impl SharedState {
             auth_metrics: crate::control::security::observability::AuthMetrics::new(),
             ceilings: crate::control::security::ceiling::CeilingStore::new(),
             redaction: redaction_store,
-            risk_scorer: crate::control::security::risk::RiskScorer::default(),
+            risk_scorer,
             tls_policy: crate::control::security::tls_policy::TlsPolicy::default(),
             siem,
             jwks_registry: None,

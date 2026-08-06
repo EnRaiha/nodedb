@@ -89,6 +89,23 @@ impl SharedState {
         Self::new_inner(dispatcher, wal)
     }
 
+    /// Create shared state whose risk scorer is built from `risk_config`
+    /// instead of the disabled default (for tests that exercise the risk
+    /// gate). Production wires the same configuration from `[auth.risk]`.
+    pub fn new_with_risk_config(
+        dispatcher: Dispatcher,
+        wal: Arc<WalManager>,
+        risk_config: crate::control::security::risk::RiskConfig,
+    ) -> crate::Result<Arc<Self>> {
+        let mut state = Self::new_inner(dispatcher, wal)?;
+        let s = Arc::get_mut(&mut state).ok_or_else(|| crate::Error::Internal {
+            detail: "shared state was already shared before the risk scorer could be installed"
+                .into(),
+        })?;
+        s.risk_scorer = crate::control::security::risk::RiskScorer::new(risk_config);
+        Ok(state)
+    }
+
     fn new_inner(dispatcher: Dispatcher, wal: Arc<WalManager>) -> crate::Result<Arc<Self>> {
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
         let loop_registry = Arc::new(crate::control::shutdown::LoopRegistry::new());

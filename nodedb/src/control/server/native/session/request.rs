@@ -169,6 +169,7 @@ impl NativeSession {
         .with_session_database(Some(current_database))
         .with_session_id(session_id)
         .with_optional_verified_jwt(self.verified_jwt.as_ref())
+        .with_peer_addr(&self.peer_addr.to_string())
         .build();
 
         // Request-admission gate: internal-service exemption, blacklist,

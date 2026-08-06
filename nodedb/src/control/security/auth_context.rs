@@ -114,6 +114,14 @@ pub struct AuthContext {
     /// `$auth.database_id` RLS predicates for per-database row isolation.
     /// `None` when the session has no explicit database (cluster-level queries).
     pub database_id: Option<DatabaseId>,
+    /// Adaptive-auth risk score for this request, as `$auth.risk_score`.
+    ///
+    /// Stamped by `RequestAuthScopeBuilder::build` when risk scoring is
+    /// enabled and the transport supplied a usable client address. `None`
+    /// means "not assessed" — never "zero risk"; predicates referencing
+    /// `$auth.risk_score` then resolve to `None` and deny, and the
+    /// request-admission gate refuses the request outright.
+    pub risk_score: Option<f64>,
 }
 
 impl AuthContext {
@@ -195,6 +203,7 @@ impl AuthContext {
             session_id,
             on_deny_override: None,
             database_id: None,
+            risk_score: None,
         }
     }
 
@@ -237,6 +246,7 @@ impl AuthContext {
             session_id,
             on_deny_override: None,
             database_id: None,
+            risk_score: None,
         }
     }
 
@@ -307,6 +317,10 @@ impl AuthContext {
             "auth_time" => self.auth_time.map(|t| serde_json::json!(t)),
             "session_id" => Some(serde_json::Value::String(self.session_id.clone())),
             "database_id" => self.database_id.map(|d| serde_json::json!(d.as_u64())),
+            // An unassessed request resolves to `None`, exactly like
+            // `database_id` above: predicates that gate on risk deny rather
+            // than reading a fabricated zero score as "no risk".
+            "risk_score" => self.risk_score.map(|s| serde_json::json!(s)),
             // Metadata sub-fields: $auth.metadata.<key>
             other if other.starts_with("metadata.") => {
                 let key = &other["metadata.".len()..];
@@ -433,6 +447,26 @@ mod tests {
         assert_eq!(
             ctx.resolve_variable("database_id"),
             Some(serde_json::json!(42u64))
+        );
+    }
+
+    /// Fail-closed: an unassessed request must resolve `$auth.risk_score` to
+    /// `None` (deny), never to `0` — a fabricated zero would read as "no
+    /// risk" and open every `$auth.risk_score < threshold` predicate.
+    #[test]
+    fn resolve_variable_risk_score_none_is_fail_closed() {
+        let ctx = AuthContext::from_identity(&test_identity(), "s_test_risk_none".into());
+        assert_eq!(ctx.risk_score, None);
+        assert_eq!(ctx.resolve_variable("risk_score"), None);
+    }
+
+    #[test]
+    fn resolve_variable_risk_score_some() {
+        let mut ctx = AuthContext::from_identity(&test_identity(), "s_test_risk_some".into());
+        ctx.risk_score = Some(0.35);
+        assert_eq!(
+            ctx.resolve_variable("risk_score"),
+            Some(serde_json::json!(0.35))
         );
     }
 
