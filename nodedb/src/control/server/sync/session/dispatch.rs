@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::control::security::audit::AuditLog;
-use crate::control::security::jwt::JwtValidator;
 use crate::control::security::rls::RlsPolicyStore;
 use crate::control::state::SharedState;
 
@@ -27,7 +26,10 @@ impl SyncSession {
     ///
     /// `shared` is forwarded to `handle_handshake` so the durable
     /// `SyncProducerRegistry` can be consulted during the Lite client
-    /// fencing decision.
+    /// fencing decision, and so the handshake and token-refresh paths can
+    /// authenticate a presented JWT against the configured `[auth.jwt]`
+    /// providers. Without it neither can verify a credential, and both
+    /// refuse.
     ///
     /// # Timeseries push
     ///
@@ -40,10 +42,9 @@ impl SyncSession {
     /// is audible rather than silently dropping data after ACKing.
     ///
     /// [`SharedStateTimeseriesDispatcher`]: super::super::timeseries_handler::SharedStateTimeseriesDispatcher
-    pub fn process_frame(
+    pub async fn process_frame(
         &mut self,
         frame: &SyncFrame,
-        jwt_validator: &JwtValidator,
         rls_store: Option<&RlsPolicyStore>,
         audit_log: Option<&mut AuditLog>,
         dlq: Option<&mut SyncDlq>,
@@ -52,7 +53,8 @@ impl SyncSession {
         match frame.msg_type {
             SyncMessageType::Handshake => match frame.decode_body::<HandshakeMsg>() {
                 Some(msg) => {
-                    self.handle_handshake(&msg, jwt_validator, self.server_clock.clone(), shared)
+                    self.handle_handshake(&msg, self.server_clock.clone(), shared)
+                        .await
                 }
                 None => {
                     // A malformed handshake is an authentication-boundary
@@ -193,7 +195,7 @@ impl SyncSession {
             }
             SyncMessageType::TokenRefresh => {
                 let msg: TokenRefreshMsg = frame.decode_body()?;
-                self.handle_token_refresh(&msg, jwt_validator)
+                self.handle_token_refresh(&msg, shared).await
             }
             SyncMessageType::Throttle => {
                 if let Some(msg) = frame.decode_body::<ThrottleMsg>() {

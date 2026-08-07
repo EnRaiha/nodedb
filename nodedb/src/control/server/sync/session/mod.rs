@@ -8,7 +8,8 @@
 //! The file split isolates:
 //! - `state.rs` — `SyncSession` struct + lifecycle (`new`,
 //!   `with_rate_limit`, `uptime_secs`, `idle_secs`).
-//! - `handshake.rs` — `handle_handshake` + `durable_fencing_decision`.
+//! - `handshake.rs` — `handle_handshake` + handshake rejection frames.
+//! - `fencing.rs` — `durable_fencing_decision` (Lite producer/epoch fencing).
 //! - `delta.rs` — `handle_delta_push` (rate limit, CRC32C, RLS, dedup).
 //! - `clock_ping.rs` — `handle_vector_clock_sync` + `handle_ping`.
 //! - `token.rs` — `handle_token_refresh`.
@@ -18,6 +19,7 @@ pub mod clock_ping;
 pub mod collection_schema;
 pub mod delta;
 pub mod dispatch;
+pub mod fencing;
 pub mod handshake;
 pub mod state;
 pub mod token;

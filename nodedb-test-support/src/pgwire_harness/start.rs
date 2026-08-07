@@ -47,6 +47,12 @@ pub(super) struct StartConfig {
     /// Absolute session lifetime in seconds applied to `SharedState` before it
     /// is shared. `0` (the default) disables the absolute cap.
     pub session_absolute_timeout_secs: u64,
+    /// When `Some`, installs the JWKS registry on `SharedState::jwks_registry`
+    /// before the state is shared, so bearer-token routes (HTTP, native, and
+    /// the sync WebSocket handshake) can authenticate JWTs. `None` leaves the
+    /// node without any `[auth.jwt]` provider, which makes every presented
+    /// bearer token unverifiable and therefore refused.
+    pub jwks_registry: Option<Arc<nodedb::control::security::jwks::registry::JwksRegistry>>,
 }
 
 impl Default for StartConfig {
@@ -59,6 +65,7 @@ impl Default for StartConfig {
             routing: None,
             idle_timeout_secs: 0,
             session_absolute_timeout_secs: 0,
+            jwks_registry: None,
         }
     }
 }
@@ -119,6 +126,20 @@ impl TestServer {
     pub async fn start_with_idle_timeout(idle_secs: u64) -> Self {
         Self::start_with_config(StartConfig {
             idle_timeout_secs: idle_secs,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Spawn a single-core NodeDB server whose `SharedState` carries a JWKS
+    /// registry, so bearer JWTs minted for one of its providers authenticate
+    /// through the real `[auth.jwt]` verification pipeline. All other settings
+    /// stay at their defaults (trust-mode auth, lockout disabled).
+    pub async fn start_with_jwks(
+        registry: Arc<nodedb::control::security::jwks::registry::JwksRegistry>,
+    ) -> Self {
+        Self::start_with_config(StartConfig {
+            jwks_registry: Some(registry),
             ..Default::default()
         })
         .await
@@ -188,6 +209,7 @@ impl TestServer {
             if let Some(routing) = cfg.routing {
                 s.cluster_routing = Some(std::sync::Arc::new(std::sync::RwLock::new(routing)));
             }
+            s.jwks_registry = cfg.jwks_registry;
             s.set_session_timeouts_for_test(
                 cfg.idle_timeout_secs,
                 cfg.session_absolute_timeout_secs,

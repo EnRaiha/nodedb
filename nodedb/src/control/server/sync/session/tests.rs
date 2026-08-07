@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use crate::control::security::audit::{AuditEvent, AuditLog};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
-use crate::control::security::jwt::{JwtConfig, JwtValidator};
 use crate::control::security::rls::{PolicyType, RlsPolicy, RlsPolicyStore};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -37,10 +36,9 @@ fn make_authenticated_session() -> SyncSession {
     session
 }
 
-#[test]
-fn handshake_rejects_invalid_jwt() {
+#[tokio::test]
+async fn handshake_rejects_invalid_jwt() {
     let mut session = make_session();
-    let validator = JwtValidator::new(JwtConfig::default());
 
     let msg = HandshakeMsg {
         jwt_token: "invalid.token.here".into(),
@@ -53,7 +51,8 @@ fn handshake_rejects_invalid_jwt() {
     };
 
     let response = session
-        .handle_handshake(&msg, &validator, HashMap::new(), None)
+        .handle_handshake(&msg, HashMap::new(), None)
+        .await
         .expect("handshake response");
     assert_eq!(response.msg_type, SyncMessageType::HandshakeAck);
 
@@ -131,19 +130,12 @@ async fn production_process_frame_denies_unauthorized_delta_before_provisional_a
         seq: 0,
     };
     let frame = SyncFrame::try_encode(SyncMessageType::DeltaPush, &msg).expect("encode frame");
-    let validator = JwtValidator::new(JwtConfig::default());
 
     // This is the production process_frame path: shared state is supplied,
     // while audit/DLQ are deliberately not pre-locked by the caller.
     let response = session
-        .process_frame(
-            &frame,
-            &validator,
-            Some(&shared.rls),
-            None,
-            None,
-            Some(&shared),
-        )
+        .process_frame(&frame, Some(&shared.rls), None, None, Some(&shared))
+        .await
         .expect("permission denial response");
 
     assert_eq!(response.msg_type, SyncMessageType::DeltaReject);

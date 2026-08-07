@@ -4,6 +4,8 @@
 //!
 //! - [`identity`] — resolve an identity from a TLS cert, an API key, or
 //!   trust mode.
+//! - [`bearer_jwt`] — verify a bearer JWT against the configured `[auth.jwt]`
+//!   providers and the stateful JWT policy.
 //! - [`native`] — the native-protocol JSON `authenticate` dispatcher and
 //!   the constant-time failure floor.
 //! - [`context`] — build and enrich `AuthContext` from an identity, plus
@@ -14,12 +16,14 @@
 //!   exemption, blacklist, account status, and rate limit, in order.
 
 pub mod admission;
+pub mod bearer_jwt;
 pub mod context;
 pub mod guards;
 pub mod identity;
 pub mod native;
 
 pub use admission::{check_blacklist_and_status, check_request_admission};
+pub use bearer_jwt::authenticate_bearer_jwt;
 pub use context::{
     apply_per_query_on_deny, build_auth_context, enrich_auth_context_with_scopes,
     extract_and_apply_on_deny, extract_on_deny, session_on_deny_override,

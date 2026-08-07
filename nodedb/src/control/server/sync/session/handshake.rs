@@ -8,53 +8,26 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use crate::control::security::jwt::JwtValidator;
 use crate::control::state::SharedState;
 
 use super::super::dlq::DeviceMetadata;
 use super::super::wire::*;
+use super::fencing::FencingDecision;
 use super::state::SyncSession;
-
-/// Decision returned by the durable fencing logic before building the ack.
-enum FencingDecision {
-    /// Accept with the given producer_id and accepted_epoch.
-    Accept {
-        producer_id: u64,
-        accepted_epoch: u64,
-    },
-    /// Reject: stale epoch from a cloned / forked device. PERMANENT — the
-    /// client's epoch is behind the durable record; it must regenerate its
-    /// LiteId. Surfaced to the client as `fork_detected = true`.
-    Reject,
-    /// Reject: a transient server-side error (registry I/O, Raft propose
-    /// failure / leader mid-election). NOT a fork — the client should simply
-    /// retry the handshake. Surfaced as `success = false, fork_detected = false`
-    /// so the client never wipes its state over a momentary server hiccup.
-    RejectTransient,
-}
-
-#[cfg(test)]
-fn producer_owner_matches(
-    registration: &crate::control::sync_producer::ProducerRegistration,
-    tenant_id: u64,
-    user_id: u64,
-) -> bool {
-    registration.tenant_id == tenant_id && registration.user_id == user_id
-}
 
 impl SyncSession {
     /// Process a handshake message: validate JWT, store client clock, detect forks.
     ///
-    /// `shared` is threaded in so the durable `SyncProducerRegistry` can be consulted
-    /// when the session is a Lite client.  When `shared` is `None` (non-Lite client
-    /// or unit-test path without SharedState) the handshake proceeds with no fencing
-    /// (`producer_id = 0`).
+    /// `shared` carries both the JWT verifier (the configured `[auth.jwt]`
+    /// providers) and the durable `SyncProducerRegistry` consulted when the
+    /// session is a Lite client. When it is `None` (unit-test path without
+    /// SharedState) the handshake proceeds with no fencing (`producer_id = 0`)
+    /// and any presented token is refused, since nothing can verify it.
     ///
     /// Returns a HandshakeAck frame to send back to the client.
-    pub fn handle_handshake(
+    pub async fn handle_handshake(
         &mut self,
         msg: &HandshakeMsg,
-        jwt_validator: &JwtValidator,
         current_server_clock: HashMap<String, u64>,
         shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
@@ -172,114 +145,125 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
         }
 
-        // Validate JWT.
-        match jwt_validator.validate(&msg.jwt_token) {
-            Ok(identity) => {
-                self.tenant_id = Some(identity.tenant_id);
-                self.username = Some(identity.username.clone());
-                self.identity = Some(identity.clone());
-                self.authenticated = true;
-                self.client_clock = msg.vector_clock.clone();
-                self.subscribed_shapes = msg.subscribed_shapes.clone();
-                self.server_clock = current_server_clock.clone();
-                self.last_seen_lsn = msg
-                    .vector_clock
-                    .values()
-                    .flat_map(|m| m.values().copied())
-                    .max()
-                    .unwrap_or(0);
-                self.device_metadata = DeviceMetadata {
-                    client_version: msg.client_version.clone(),
-                    // See the trust-mode branch above: preserve the
-                    // accept-time TCP peer address rather than wiping it.
-                    remote_addr: std::mem::take(&mut self.device_metadata.remote_addr),
-                    peer_id: 0,
-                };
+        // A presented token goes through the same gate as every other bearer
+        // route: the configured `[auth.jwt]` providers plus the stateful JWT
+        // policy. Without `SharedState` there is no gate at all, so the token
+        // is unverifiable and the handshake is refused rather than falling
+        // through to the trust branch above.
+        let identity = match shared {
+            Some(state) => {
+                crate::control::server::session_auth::authenticate_bearer_jwt(state, &msg.jwt_token)
+                    .await
+                    .map(|(identity, _claims)| identity)
+            }
+            None => None,
+        };
+        let Some(identity) = identity else {
+            warn!(
+                session = %self.session_id,
+                "sync handshake FAILED: bearer token not authenticated"
+            );
+            let ack = HandshakeAckMsg {
+                success: false,
+                session_id: self.session_id.clone(),
+                server_clock: HashMap::new(),
+                // Deliberately generic, matching the HTTP bearer route: the
+                // client learns it is unauthenticated, never why.
+                error: Some("invalid bearer token".into()),
+                fork_detected: false,
+                server_wire_version: crate::version::WIRE_FORMAT_VERSION,
+                producer_id: 0,
+                accepted_epoch: 0,
+                delta_signing_key: [0; 32],
+            };
+            return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
+        };
 
-                let tenant_id = identity.tenant_id.as_u64();
-                match self.durable_fencing_decision(msg, shared, tenant_id, identity.user_id) {
-                    Some(FencingDecision::Reject) => {
-                        return self.fork_reject_frame(
-                            &current_server_clock,
-                            "FORK_DETECTED: stale epoch — regenerate LiteId and reconnect",
-                        );
-                    }
-                    Some(FencingDecision::RejectTransient) => {
+        self.tenant_id = Some(identity.tenant_id);
+        self.username = Some(identity.username.clone());
+        self.identity = Some(identity.clone());
+        self.authenticated = true;
+        self.client_clock = msg.vector_clock.clone();
+        self.subscribed_shapes = msg.subscribed_shapes.clone();
+        self.server_clock = current_server_clock.clone();
+        self.last_seen_lsn = msg
+            .vector_clock
+            .values()
+            .flat_map(|m| m.values().copied())
+            .max()
+            .unwrap_or(0);
+        self.device_metadata = DeviceMetadata {
+            client_version: msg.client_version.clone(),
+            // See the trust-mode branch above: preserve the accept-time TCP
+            // peer address rather than wiping it.
+            remote_addr: std::mem::take(&mut self.device_metadata.remote_addr),
+            peer_id: 0,
+        };
+
+        let tenant_id = identity.tenant_id.as_u64();
+        match self.durable_fencing_decision(msg, shared, tenant_id, identity.user_id) {
+            Some(FencingDecision::Reject) => {
+                return self.fork_reject_frame(
+                    &current_server_clock,
+                    "FORK_DETECTED: stale epoch — regenerate LiteId and reconnect",
+                );
+            }
+            Some(FencingDecision::RejectTransient) => {
+                return self.transient_reject_frame(
+                    &current_server_clock,
+                    "SYNC_UNAVAILABLE: transient server error — retry the handshake",
+                );
+            }
+            Some(FencingDecision::Accept {
+                producer_id,
+                accepted_epoch,
+            }) => {
+                self.producer_id = producer_id;
+                self.accepted_epoch = accepted_epoch;
+            }
+            None => {}
+        }
+
+        self.delta_signing_key = match shared {
+            Some(state) if state.wal.payloads_authenticated() => {
+                match state
+                    .credentials
+                    .catalog()
+                    .get_or_create_crdt_signing_key(identity.tenant_id.as_u64(), identity.user_id)
+                {
+                    Ok(key) => Some(key),
+                    Err(error) => {
+                        warn!(session = %self.session_id, %error, "sync signing key unavailable");
                         return self.transient_reject_frame(
                             &current_server_clock,
-                            "SYNC_UNAVAILABLE: transient server error — retry the handshake",
+                            "SYNC_UNAVAILABLE: signing key persistence failed",
                         );
                     }
-                    Some(FencingDecision::Accept {
-                        producer_id,
-                        accepted_epoch,
-                    }) => {
-                        self.producer_id = producer_id;
-                        self.accepted_epoch = accepted_epoch;
-                    }
-                    None => {}
                 }
-
-                self.delta_signing_key = match shared {
-                    Some(state) if state.wal.payloads_authenticated() => {
-                        match state.credentials.catalog().get_or_create_crdt_signing_key(
-                            identity.tenant_id.as_u64(),
-                            identity.user_id,
-                        ) {
-                            Ok(key) => Some(key),
-                            Err(error) => {
-                                warn!(session = %self.session_id, %error, "sync signing key unavailable");
-                                return self.transient_reject_frame(
-                                    &current_server_clock,
-                                    "SYNC_UNAVAILABLE: signing key persistence failed",
-                                );
-                            }
-                        }
-                    }
-                    Some(_) | None => None,
-                };
-
-                info!(
-                    session = %self.session_id,
-                    user = %identity.username,
-                    tenant = identity.tenant_id.as_u64(),
-                    shapes = self.subscribed_shapes.len(),
-                    "sync handshake OK"
-                );
-
-                let ack = HandshakeAckMsg {
-                    success: true,
-                    session_id: self.session_id.clone(),
-                    server_clock: current_server_clock,
-                    error: None,
-                    fork_detected: false,
-                    server_wire_version: crate::version::WIRE_FORMAT_VERSION,
-                    producer_id: self.producer_id,
-                    accepted_epoch: self.accepted_epoch,
-                    delta_signing_key: self.delta_signing_key.unwrap_or([0; 32]),
-                };
-                SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
             }
-            Err(e) => {
-                warn!(
-                    session = %self.session_id,
-                    error = %e,
-                    "sync handshake FAILED"
-                );
-                let ack = HandshakeAckMsg {
-                    success: false,
-                    session_id: self.session_id.clone(),
-                    server_clock: HashMap::new(),
-                    error: Some(e.to_string()),
-                    fork_detected: false,
-                    server_wire_version: crate::version::WIRE_FORMAT_VERSION,
-                    producer_id: 0,
-                    accepted_epoch: 0,
-                    delta_signing_key: [0; 32],
-                };
-                SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
-            }
-        }
+            Some(_) | None => None,
+        };
+
+        info!(
+            session = %self.session_id,
+            user = %identity.username,
+            tenant = identity.tenant_id.as_u64(),
+            shapes = self.subscribed_shapes.len(),
+            "sync handshake OK"
+        );
+
+        let ack = HandshakeAckMsg {
+            success: true,
+            session_id: self.session_id.clone(),
+            server_clock: current_server_clock,
+            error: None,
+            fork_detected: false,
+            server_wire_version: crate::version::WIRE_FORMAT_VERSION,
+            producer_id: self.producer_id,
+            accepted_epoch: self.accepted_epoch,
+            delta_signing_key: self.delta_signing_key.unwrap_or([0; 32]),
+        };
+        SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
     }
 
     /// Clear all state derived from a successful handshake or from the
@@ -376,150 +360,10 @@ impl SyncSession {
         self.clear_handshake_binding();
         self.build_reject_frame(server_clock, message, false)
     }
-
-    /// Attempt to make a durable fencing decision via `SyncProducerRegistry`.
-    ///
-    /// Returns `Some(FencingDecision)` when the msg is a Lite handshake
-    /// (`!lite_id.is_empty() && epoch > 0`) and a registry is available via
-    /// `shared`.  Returns `None` when:
-    ///
-    /// * The msg is not a Lite handshake (non-Lite / legacy client).
-    /// * No `SharedState` is present (unit-test path) — handshake proceeds
-    ///   with no fencing.
-    /// * `shared` has no `producer_registry` — handshake proceeds with no fencing.
-    ///
-    /// On registry operation errors the decision is `Reject` (fail-closed) rather
-    /// than silently accepting.
-    fn durable_fencing_decision(
-        &self,
-        msg: &HandshakeMsg,
-        shared: Option<&Arc<SharedState>>,
-        tenant_id: u64,
-        user_id: u64,
-    ) -> Option<FencingDecision> {
-        if msg.lite_id.is_empty() || msg.epoch == 0 {
-            return None;
-        }
-
-        let registry = shared.and_then(|s| s.producer_registry.as_deref());
-
-        match registry {
-            Some(reg) => {
-                // `shared` is always `Some` when `registry` is `Some` (the
-                // registry was obtained via `shared.and_then(...)`); the `?`
-                // is just to recover the handle.
-                let shared_ref = shared?;
-
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-
-                let existing = match reg.get_or_register(
-                    &msg.lite_id,
-                    tenant_id,
-                    user_id,
-                    msg.epoch,
-                    now_ms,
-                ) {
-                    Ok((registration, _created)) => registration,
-                    Err(crate::Error::BadRequest { .. }) => {
-                        warn!(
-                            session = %self.session_id,
-                            lite_id = %msg.lite_id,
-                            authenticated_tenant = tenant_id,
-                            authenticated_user = user_id,
-                            "sync producer owner mismatch"
-                        );
-                        return Some(FencingDecision::Reject);
-                    }
-                    Err(e) => {
-                        warn!(
-                            session = %self.session_id,
-                            lite_id = %msg.lite_id,
-                            error = %e,
-                            "sync handshake: atomic producer registration failed; rejecting as retryable"
-                        );
-                        return Some(FencingDecision::RejectTransient);
-                    }
-                };
-
-                // Propose on both creation and retry. This closes the crash/error
-                // window between the local durable row and Raft replication;
-                // duplicate identical registrations are apply-idempotent.
-                if let Err(e) = crate::control::metadata_proposer::propose_sync_producer_register(
-                    shared_ref.as_ref(),
-                    &msg.lite_id,
-                    existing.producer_id,
-                    existing.tenant_id,
-                    existing.user_id,
-                    existing.current_epoch,
-                    existing.created_ms,
-                ) {
-                    warn!(
-                        session = %self.session_id,
-                        lite_id = %msg.lite_id,
-                        error = %e,
-                        "sync handshake: propose_sync_producer_register failed; rejecting as retryable"
-                    );
-                    return Some(FencingDecision::RejectTransient);
-                }
-
-                if msg.epoch < existing.current_epoch {
-                    warn!(
-                        session = %self.session_id,
-                        lite_id = %msg.lite_id,
-                        client_epoch = msg.epoch,
-                        current_epoch = existing.current_epoch,
-                        "FORK DETECTED: client epoch is behind persisted epoch"
-                    );
-                    return Some(FencingDecision::Reject);
-                }
-
-                if msg.epoch > existing.current_epoch
-                    && let Err(e) = reg.fence(&msg.lite_id, msg.epoch)
-                {
-                    warn!(
-                        session = %self.session_id,
-                        lite_id = %msg.lite_id,
-                        error = %e,
-                        "sync handshake: registry.fence failed; rejecting as retryable"
-                    );
-                    return Some(FencingDecision::RejectTransient);
-                }
-
-                // Re-propose even when the requested epoch already matches the
-                // local row. A prior proposal may have failed after the local
-                // fence was persisted; the idempotent max-wins Raft entry must
-                // reach followers before this node accepts the retry.
-                if let Err(e) = crate::control::metadata_proposer::propose_sync_producer_fence(
-                    shared_ref.as_ref(),
-                    &msg.lite_id,
-                    msg.epoch,
-                ) {
-                    warn!(
-                        session = %self.session_id,
-                        lite_id = %msg.lite_id,
-                        error = %e,
-                        "sync handshake: propose_sync_producer_fence failed; rejecting as retryable"
-                    );
-                    return Some(FencingDecision::RejectTransient);
-                }
-
-                Some(FencingDecision::Accept {
-                    producer_id: existing.producer_id,
-                    accepted_epoch: msg.epoch,
-                })
-            }
-            // No registry available: no fencing decision — handshake proceeds.
-            None => None,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::producer_owner_matches;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -529,7 +373,6 @@ mod tests {
 
     use crate::bridge::dispatch::Dispatcher;
     use crate::control::security::catalog::SystemCatalog;
-    use crate::control::security::jwt::{JwtConfig, JwtValidator};
     use crate::control::server::sync::session::state::SyncSession;
     use crate::control::server::sync::wire::CompensationHint;
     use crate::control::state::SharedState;
@@ -571,11 +414,11 @@ mod tests {
     async fn empty_token_uses_configured_durable_trust_identity() {
         let (state, _dir) = trust_state();
         let mut session = SyncSession::new("test-session".into());
-        let validator = JwtValidator::new(JwtConfig::default());
         let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
 
         let frame = session
-            .handle_handshake(&msg, &validator, HashMap::new(), Some(&state))
+            .handle_handshake(&msg, HashMap::new(), Some(&state))
+            .await
             .expect("handshake response");
         let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
 
@@ -596,11 +439,11 @@ mod tests {
         let (state, _dir) = trust_state();
         let mut session = SyncSession::new("test-session".into());
         session.device_metadata.remote_addr = "203.0.113.9:4433".into();
-        let validator = JwtValidator::new(JwtConfig::default());
         let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
 
         let frame = session
-            .handle_handshake(&msg, &validator, HashMap::new(), Some(&state))
+            .handle_handshake(&msg, HashMap::new(), Some(&state))
+            .await
             .expect("handshake response");
         let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
 
@@ -611,14 +454,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_token_without_configured_identity_fails_closed() {
+    #[tokio::test]
+    async fn empty_token_without_configured_identity_fails_closed() {
         let mut session = SyncSession::new("test-session".into());
-        let validator = JwtValidator::new(JwtConfig::default());
         let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
 
         let frame = session
-            .handle_handshake(&msg, &validator, HashMap::new(), None)
+            .handle_handshake(&msg, HashMap::new(), None)
+            .await
             .expect("handshake response");
         let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
 
@@ -627,14 +470,63 @@ mod tests {
         assert!(session.identity.is_none());
     }
 
-    #[test]
-    fn handshake_rejects_wire_version_zero() {
+    /// A deployment with no `[auth.jwt]` provider cannot verify a presented
+    /// credential. The token must be refused outright — never accepted, and
+    /// never quietly downgraded to the configured trust identity, which the
+    /// empty-token branch above would otherwise hand out.
+    #[tokio::test]
+    async fn presented_token_without_jwks_registry_is_refused() {
+        let (state, _dir) = trust_state();
+        assert!(
+            state.jwks_registry.is_none(),
+            "this fixture must have no JWT verifier for the refusal to be meaningful"
+        );
         let mut session = SyncSession::new("test-session".into());
-        let validator = JwtValidator::new(JwtConfig::default());
+        let mut msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into();
+
+        let frame = session
+            .handle_handshake(&msg, HashMap::new(), Some(&state))
+            .await
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(
+            !ack.success,
+            "an unverifiable bearer token authenticated the sync session"
+        );
+        assert!(!session.authenticated);
+        assert!(session.identity.is_none());
+        assert!(session.tenant_id.is_none());
+    }
+
+    /// The same refusal without any `SharedState`: there is no verifier at
+    /// all, so the token cannot be authenticated.
+    #[tokio::test]
+    async fn presented_token_without_shared_state_is_refused() {
+        let mut session = SyncSession::new("test-session".into());
+        let mut msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into();
+
+        let frame = session
+            .handle_handshake(&msg, HashMap::new(), None)
+            .await
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(!ack.success);
+        assert!(!session.authenticated);
+        assert!(session.identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_wire_version_zero() {
+        let mut session = SyncSession::new("test-session".into());
         let msg = make_handshake(0);
 
         let frame = session
-            .handle_handshake(&msg, &validator, HashMap::new(), None)
+            .handle_handshake(&msg, HashMap::new(), None)
+            .await
             .expect("should return a frame");
 
         let ack: HandshakeAckMsg = frame.decode_body().expect("should decode HandshakeAckMsg");
@@ -649,79 +541,17 @@ mod tests {
         );
     }
 
-    /// Uses the registry directly (not via SharedState) to exercise
-    /// `durable_fencing_decision` in isolation.
-    #[test]
-    fn registry_new_lite_id_assigns_producer_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = open_registry(dir.path());
-
-        // Simulate what durable_fencing_decision does for a new lite_id.
-        let r = reg.register("device-a", 1, 99, 10, 0).unwrap();
-        assert!(r.producer_id > 0);
-        assert_eq!(r.current_epoch, 10);
-    }
-
-    #[test]
-    fn producer_owner_binding_rejects_cross_tenant_and_cross_user_reuse() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = open_registry(dir.path());
-        let registration = reg.register("owned-device", 7, 11, 1, 0).unwrap();
-
-        assert!(producer_owner_matches(&registration, 7, 11));
-        assert!(!producer_owner_matches(&registration, 8, 11));
-        assert!(!producer_owner_matches(&registration, 7, 12));
-    }
-
-    #[test]
-    fn registry_same_epoch_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = open_registry(dir.path());
-
-        let first = reg.register("device-b", 1, 99, 5, 0).unwrap();
-        let loaded = reg.get("device-b").unwrap().unwrap();
-        assert_eq!(loaded.producer_id, first.producer_id);
-        assert_eq!(loaded.current_epoch, 5);
-    }
-
-    #[test]
-    fn registry_higher_epoch_fences() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = open_registry(dir.path());
-
-        let first = reg.register("device-c", 1, 99, 3, 0).unwrap();
-        reg.fence("device-c", 7).unwrap();
-        let loaded = reg.get("device-c").unwrap().unwrap();
-        assert_eq!(loaded.producer_id, first.producer_id);
-        assert_eq!(loaded.current_epoch, 7);
-    }
-
-    #[test]
-    fn registry_lower_epoch_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = open_registry(dir.path());
-
-        reg.register("device-d", 1, 99, 9, 0).unwrap();
-        let loaded = reg.get("device-d").unwrap().unwrap();
-        // A client presenting epoch < current_epoch (9) must be rejected.
-        assert!(
-            3 < loaded.current_epoch,
-            "epoch 3 is stale vs {}",
-            loaded.current_epoch
-        );
-    }
-
     #[tokio::test]
     async fn malformed_handshake_clears_binding_and_denies_following_delta() {
         let (shared, _dir) = trust_state();
-        let validator = JwtValidator::new(JwtConfig::default());
         let mut session = SyncSession::new("malformed-handshake-session".into());
 
         // Establish a real production-backed identity, then stage the
         // identity-bound state a prior authenticated Lite handshake can hold.
         let valid_handshake = make_handshake(crate::version::WIRE_FORMAT_VERSION);
         let valid_frame = session
-            .handle_handshake(&valid_handshake, &validator, HashMap::new(), Some(&shared))
+            .handle_handshake(&valid_handshake, HashMap::new(), Some(&shared))
+            .await
             .expect("valid handshake response");
         let valid_ack: HandshakeAckMsg = valid_frame.decode_body().expect("decode valid ack");
         assert!(valid_ack.success);
@@ -755,12 +585,12 @@ mod tests {
         let response = session
             .process_frame(
                 &malformed_frame,
-                &validator,
                 Some(&shared.rls),
                 None,
                 None,
                 Some(&shared),
             )
+            .await
             .expect("malformed handshake rejection");
 
         assert_eq!(response.msg_type, SyncMessageType::HandshakeAck);
@@ -806,14 +636,8 @@ mod tests {
         let delta_frame =
             SyncFrame::try_encode(SyncMessageType::DeltaPush, &delta).expect("encode delta frame");
         let response = session
-            .process_frame(
-                &delta_frame,
-                &validator,
-                Some(&shared.rls),
-                None,
-                None,
-                Some(&shared),
-            )
+            .process_frame(&delta_frame, Some(&shared.rls), None, None, Some(&shared))
+            .await
             .expect("permission denial response");
         assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
         let reject: DeltaRejectMsg = response.decode_body().expect("decode delta rejection");
@@ -843,7 +667,6 @@ mod tests {
             .expect("SharedState has a single owner while configuring test")
             .producer_registry = Some(registry);
 
-        let validator = JwtValidator::new(JwtConfig::default());
         let mut high_epoch_session = SyncSession::new("high-epoch-session".into());
         // Stamped once at accept time, as `handle_sync_session` does.
         high_epoch_session.device_metadata.remote_addr = "203.0.113.12:6666".into();
@@ -851,7 +674,8 @@ mod tests {
         high_epoch_msg.lite_id = "fenced-lite-id".into();
         high_epoch_msg.epoch = 9;
         let high_epoch_frame = high_epoch_session
-            .handle_handshake(&high_epoch_msg, &validator, HashMap::new(), Some(&shared))
+            .handle_handshake(&high_epoch_msg, HashMap::new(), Some(&shared))
+            .await
             .expect("high epoch handshake response");
         let high_epoch_ack: HandshakeAckMsg = high_epoch_frame.decode_body().expect("decode ack");
         assert!(high_epoch_ack.success, "higher epoch must be accepted");
@@ -880,7 +704,8 @@ mod tests {
         stale_msg.lite_id = "fenced-lite-id".into();
         stale_msg.epoch = 3;
         let stale_frame = high_epoch_session
-            .handle_handshake(&stale_msg, &validator, HashMap::new(), Some(&shared))
+            .handle_handshake(&stale_msg, HashMap::new(), Some(&shared))
+            .await
             .expect("stale handshake response");
         let stale_ack: HandshakeAckMsg = stale_frame.decode_body().expect("decode stale ack");
 
@@ -928,14 +753,8 @@ mod tests {
         let delta_frame =
             SyncFrame::try_encode(SyncMessageType::DeltaPush, &delta).expect("encode delta frame");
         let response = high_epoch_session
-            .process_frame(
-                &delta_frame,
-                &validator,
-                Some(&shared.rls),
-                None,
-                None,
-                Some(&shared),
-            )
+            .process_frame(&delta_frame, Some(&shared.rls), None, None, Some(&shared))
+            .await
             .expect("permission denial response");
         assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
         let reject: DeltaRejectMsg = response.decode_body().expect("decode delta rejection");

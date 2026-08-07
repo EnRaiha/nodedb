@@ -8,7 +8,6 @@ use futures::SinkExt;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::control::security::jwt::JwtValidator;
 use crate::control::server::sync::session::SyncSession;
 use crate::control::state::SharedState;
 
@@ -26,7 +25,6 @@ pub(super) struct InboundCtx<'a> {
     pub session: &'a mut SyncSession,
     pub channels: &'a mut SessionChannels,
     pub shared: &'a Option<Arc<SharedState>>,
-    pub jwt_validator: &'a JwtValidator,
     pub session_id: &'a str,
 }
 
@@ -42,7 +40,6 @@ pub(super) async fn handle_frame(ws: &mut Ws, ctx: InboundCtx<'_>, frame: &SyncF
         session,
         channels,
         shared,
-        jwt_validator,
         session_id,
     } = ctx;
 
@@ -98,7 +95,7 @@ pub(super) async fn handle_frame(ws: &mut Ws, ctx: InboundCtx<'_>, frame: &SyncF
         return handle_array(ws, session, channels, shared, session_id, frame).await;
     }
 
-    handle_crdt(ws, session, shared, jwt_validator, frame).await
+    handle_crdt(ws, session, shared, frame).await
 }
 
 async fn handle_resync(
@@ -226,7 +223,6 @@ async fn handle_crdt(
     ws: &mut Ws,
     session: &mut SyncSession,
     shared: &Option<Arc<SharedState>>,
-    jwt_validator: &JwtValidator,
     frame: &SyncFrame,
 ) -> Flow {
     // Decode the CRDT message once for authorization and final dispatch.
@@ -267,16 +263,11 @@ async fn handle_crdt(
     // mutexes — and every delta push hangs until the client's frame timeout.
     // The `shared`-absent path has no store to lock and keeps the old shape.
     let response = if let Some(shared) = shared.as_ref() {
-        session.process_frame(
-            frame,
-            jwt_validator,
-            Some(&shared.rls),
-            None,
-            None,
-            Some(shared),
-        )
+        session
+            .process_frame(frame, Some(&shared.rls), None, None, Some(shared))
+            .await
     } else {
-        session.process_frame(frame, jwt_validator, None, None, None, None)
+        session.process_frame(frame, None, None, None, None).await
     };
 
     let Some(response) = response else {

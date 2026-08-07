@@ -32,9 +32,6 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
     );
     session.device_metadata.remote_addr = addr.to_string();
 
-    let jwt_validator =
-        crate::control::security::jwt::JwtValidator::new(state.config.jwt_config.clone());
-
     let mut channels = SessionChannels::default();
 
     loop {
@@ -87,7 +84,6 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                         session: &mut session,
                         channels: &mut channels,
                         shared: &shared,
-                        jwt_validator: &jwt_validator,
                         session_id: &session_id,
                     };
                     match handle_frame(&mut ws, ctx, &frame).await {

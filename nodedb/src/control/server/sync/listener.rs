@@ -14,7 +14,6 @@ use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
-use crate::control::security::jwt::JwtConfig;
 use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::shutdown::{ShutdownBus, ShutdownPhase};
 use crate::control::state::SharedState;
@@ -23,12 +22,15 @@ use super::rate_limit::RateLimitConfig;
 use super::session_handler::handle_sync_session;
 
 /// Configuration for the sync WebSocket listener.
+///
+/// Sessions authenticate presented JWTs against the server-wide `[auth.jwt]`
+/// providers reached through `SharedState`, so this carries no verification
+/// material of its own.
 #[derive(Debug, Clone)]
 pub struct SyncListenerConfig {
     pub listen_addr: SocketAddr,
     pub max_sessions: usize,
     pub idle_timeout_secs: u64,
-    pub jwt_config: JwtConfig,
     pub rate_limit: RateLimitConfig,
 }
 
@@ -45,7 +47,6 @@ impl Default for SyncListenerConfig {
             )),
             max_sessions: 1024,
             idle_timeout_secs: 300,
-            jwt_config: JwtConfig::default(),
             rate_limit: RateLimitConfig::default(),
         }
     }

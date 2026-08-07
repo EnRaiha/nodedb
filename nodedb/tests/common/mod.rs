@@ -8,6 +8,6 @@
 
 #[allow(unused_imports)]
 pub use nodedb_test_support::{
-    array_sync, cluster_harness, make_cdc_event, native_harness, now_ms, pgwire_auth_helpers,
-    pgwire_harness, tx_batch_helpers,
+    array_sync, cluster_harness, jwks_fixture, make_cdc_event, native_harness, now_ms,
+    pgwire_auth_helpers, pgwire_harness, tx_batch_helpers,
 };

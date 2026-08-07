@@ -25,8 +25,9 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
+use common::jwks_fixture::{JwksFixture, now_secs};
 use common::pgwire_harness::TestServer;
-use nodedb::control::security::jwt::{JwtAlgorithm, JwtConfig};
+use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::server::sync::listener::{SyncListenerConfig, start_sync_listener};
 use nodedb::control::server::sync::shape::handler::{ShapeSnapshotMsg, ShapeSubscribeMsg};
 use nodedb_types::sync::shape::{ShapeDefinition, ShapeType};
@@ -38,40 +39,44 @@ use nodedb_types::sync::wire::{
 /// tenant the pgwire harness superuser writes into.
 const TENANT: u64 = 1;
 
-/// Shared HMAC secret for the test JWT provider.
-const JWT_SECRET: &[u8] = b"sync-shape-read-authorization-secret";
+/// Issuer and audience of the test JWT provider.
+const ISSUER: &str = "https://sync-shape-read-authorization.example/";
+const AUDIENCE: &str = "nodedb-sync";
 
 /// How long a test waits for a server frame before concluding none is coming.
 const FRAME_WAIT: Duration = Duration::from_secs(3);
 
 // ── JWT minting ────────────────────────────────────────────────────────────
 
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+/// A server whose `[auth.jwt]` provider accepts [`Jwt::mint`] output, so sync
+/// sessions authenticate through the same bearer gate as every other route.
+struct Jwt {
+    server: TestServer,
+    fixture: JwksFixture,
 }
 
-/// Mint an HS256 token for `subject` carrying `roles`.
-fn mint_token(subject: &str, roles: &[&str]) -> String {
-    use hmac::{Hmac, Mac};
+impl Jwt {
+    async fn start_server() -> Self {
+        let fixture = JwksFixture::spawn().await;
+        let registry = JwksRegistry::init(fixture.auth_config(ISSUER, AUDIENCE, TENANT))
+            .await
+            .expect("test JWKS registry must initialize");
+        let server = TestServer::start_with_jwks(std::sync::Arc::new(registry)).await;
+        Self { server, fixture }
+    }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is after the unix epoch")
-        .as_secs();
-    let roles_json = serde_json::to_string(roles).expect("role list serializes");
-    let header = b64(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let payload = b64(format!(
-        r#"{{"sub":"{subject}","roles":{roles_json},"iat":{now},"exp":{}}}"#,
-        now + 600
-    )
-    .as_bytes());
-    let signing_input = format!("{header}.{payload}");
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(JWT_SECRET)
-        .expect("HMAC accepts any key length");
-    mac.update(signing_input.as_bytes());
-    let signature = mac.finalize().into_bytes();
-    format!("{signing_input}.{}", b64(&signature))
+    /// Mint a token for `subject` carrying `roles`.
+    fn mint_token(&self, subject: &str, roles: &[&str]) -> String {
+        let now = now_secs();
+        self.fixture.mint(&serde_json::json!({
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "sub": subject,
+            "roles": roles,
+            "iat": now,
+            "exp": now + 600,
+        }))
+    }
 }
 
 // ── Sync WebSocket plumbing ────────────────────────────────────────────────
@@ -80,16 +85,10 @@ type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Start a sync listener bound to an ephemeral port, wired to `server`'s state
-/// and to a JWT provider that accepts [`mint_token`] output.
+/// — including the JWKS registry that verifies [`Jwt::mint_token`] output.
 async fn start_listener(server: &TestServer) -> SocketAddr {
     let config = SyncListenerConfig {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        jwt_config: JwtConfig {
-            algorithm: Some(JwtAlgorithm::Hs256),
-            hmac_secret: JWT_SECRET.to_vec(),
-            tenant_id: Some(TENANT),
-            ..Default::default()
-        },
         ..Default::default()
     };
     let (shutdown_bus, _shutdown_handle) = nodedb::control::shutdown::ShutdownBus::new(
@@ -227,9 +226,9 @@ async fn seed_collection(server: &TestServer, collection: &str, owner: &str) {
 /// loop's authentication gate, so this is the widest form of the gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unauthenticated_shape_subscribe_delivers_no_documents() {
-    let server = TestServer::start().await;
-    seed_collection(&server, "shape_anon_docs", "alice").await;
-    let addr = start_listener(&server).await;
+    let jwt = Jwt::start_server().await;
+    seed_collection(&jwt.server, "shape_anon_docs", "alice").await;
+    let addr = start_listener(&jwt.server).await;
 
     let mut ws = connect(addr).await;
     let snapshot = subscribe_shape(&mut ws, "anon-shape", "shape_anon_docs").await;
@@ -249,12 +248,12 @@ async fn unauthenticated_shape_subscribe_delivers_no_documents() {
 /// be able to read it by naming it in a shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shape_subscribe_without_read_grant_delivers_no_documents() {
-    let server = TestServer::start().await;
-    seed_collection(&server, "shape_ungranted_docs", "alice").await;
-    let addr = start_listener(&server).await;
+    let jwt = Jwt::start_server().await;
+    seed_collection(&jwt.server, "shape_ungranted_docs", "alice").await;
+    let addr = start_listener(&jwt.server).await;
 
     let mut ws = connect(addr).await;
-    handshake(&mut ws, &mint_token("shape_intruder", &[])).await;
+    handshake(&mut ws, &jwt.mint_token("shape_intruder", &[])).await;
     let snapshot = subscribe_shape(&mut ws, "ungranted-shape", "shape_ungranted_docs").await;
 
     assert_eq!(
@@ -269,19 +268,19 @@ async fn shape_subscribe_without_read_grant_delivers_no_documents() {
 /// every row — the snapshot is delivered, and it is empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shape_subscribe_applies_row_level_security() {
-    let server = TestServer::start().await;
-    seed_collection(&server, "shape_rls_docs", "alice").await;
-    server
+    let jwt = Jwt::start_server().await;
+    seed_collection(&jwt.server, "shape_rls_docs", "alice").await;
+    jwt.server
         .exec(
             "CREATE RLS POLICY shape_owner_only ON shape_rls_docs FOR READ \
              USING (owner = $auth.id)",
         )
         .await
         .expect("create RLS policy");
-    let addr = start_listener(&server).await;
+    let addr = start_listener(&jwt.server).await;
 
     let mut ws = connect(addr).await;
-    handshake(&mut ws, &mint_token("shape_reader", &["readwrite"])).await;
+    handshake(&mut ws, &jwt.mint_token("shape_reader", &["readwrite"])).await;
     let snapshot = subscribe_shape(&mut ws, "rls-shape", "shape_rls_docs").await;
 
     assert_eq!(
@@ -295,12 +294,12 @@ async fn shape_subscribe_applies_row_level_security() {
 /// to the same data and must be closed the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resync_without_read_grant_delivers_no_documents() {
-    let server = TestServer::start().await;
-    seed_collection(&server, "shape_resync_docs", "alice").await;
-    let addr = start_listener(&server).await;
+    let jwt = Jwt::start_server().await;
+    seed_collection(&jwt.server, "shape_resync_docs", "alice").await;
+    let addr = start_listener(&jwt.server).await;
 
     let mut ws = connect(addr).await;
-    handshake(&mut ws, &mint_token("resync_intruder", &[])).await;
+    handshake(&mut ws, &jwt.mint_token("resync_intruder", &[])).await;
     let _ = subscribe_shape(&mut ws, "resync-shape", "shape_resync_docs").await;
 
     send(

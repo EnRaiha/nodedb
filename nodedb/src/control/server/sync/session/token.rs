@@ -2,38 +2,61 @@
 
 //! Token refresh: rotate JWT without reconnecting.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{info, warn};
 
-use crate::control::security::jwt::JwtValidator;
+use crate::control::state::SharedState;
 
 use super::super::wire::*;
 use super::state::SyncSession;
+
+/// Build a failed `TokenRefreshAckMsg` carrying `message` in `error`, so every
+/// refusal branch below produces the same envelope shape.
+fn refusal_ack(message: &str) -> Option<SyncFrame> {
+    let ack = TokenRefreshAckMsg {
+        success: false,
+        error: Some(message.into()),
+        expires_in_secs: 0,
+    };
+    SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack)
+}
 
 impl SyncSession {
     /// Handle a token refresh request. Validate the new JWT, and if
     /// it belongs to the same tenant, upgrade the session with the
     /// new credentials. Invalid tokens keep the existing session
     /// credentials and respond with an error.
-    pub fn handle_token_refresh(
+    ///
+    /// The replacement token is authenticated through the same gate as the
+    /// handshake, so a session cannot rotate onto a credential the server
+    /// would have refused at connect time.
+    pub async fn handle_token_refresh(
         &mut self,
         msg: &TokenRefreshMsg,
-        jwt_validator: &JwtValidator,
+        shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
         self.last_activity = Instant::now();
 
         if msg.new_token.is_empty() {
-            let ack = TokenRefreshAckMsg {
-                success: false,
-                error: Some("empty token".into()),
-                expires_in_secs: 0,
-            };
-            return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+            return refusal_ack("empty token");
         }
 
-        match jwt_validator.validate(&msg.new_token) {
-            Ok(new_identity) => {
+        // No verifier (no `SharedState`, or no `[auth.jwt]` provider) means the
+        // replacement credential cannot be checked, so the rotation is refused
+        // and the session keeps the identity it already proved.
+        let new_identity = match shared {
+            Some(state) => {
+                crate::control::server::session_auth::authenticate_bearer_jwt(state, &msg.new_token)
+                    .await
+                    .map(|(identity, _claims)| identity)
+            }
+            None => None,
+        };
+
+        match new_identity {
+            Some(new_identity) => {
                 if let Some(current_tenant) = self.tenant_id
                     && new_identity.tenant_id != current_tenant
                 {
@@ -43,12 +66,7 @@ impl SyncSession {
                         new_tenant = new_identity.tenant_id.as_u64(),
                         "token refresh rejected: tenant mismatch"
                     );
-                    let ack = TokenRefreshAckMsg {
-                        success: false,
-                        error: Some("tenant mismatch".into()),
-                        expires_in_secs: 0,
-                    };
-                    return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                    return refusal_ack("tenant mismatch");
                 }
                 if let Some(current) = self.identity.as_ref() {
                     if new_identity.user_id != current.user_id {
@@ -58,12 +76,7 @@ impl SyncSession {
                             new_user_id = new_identity.user_id,
                             "token refresh rejected: user mismatch"
                         );
-                        let ack = TokenRefreshAckMsg {
-                            success: false,
-                            error: Some("user mismatch".into()),
-                            expires_in_secs: 0,
-                        };
-                        return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                        return refusal_ack("user mismatch");
                     }
 
                     let current_database = current
@@ -79,12 +92,7 @@ impl SyncSession {
                             new_database = new_database.as_u64(),
                             "token refresh rejected: database mismatch"
                         );
-                        let ack = TokenRefreshAckMsg {
-                            success: false,
-                            error: Some("database mismatch".into()),
-                            expires_in_secs: 0,
-                        };
-                        return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                        return refusal_ack("database mismatch");
                     }
                 }
                 self.username = Some(new_identity.username.clone());
@@ -100,18 +108,14 @@ impl SyncSession {
                 };
                 SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack)
             }
-            Err(e) => {
+            None => {
                 warn!(
                     session = %self.session_id,
-                    error = %e,
                     "token refresh FAILED — keeping existing credentials"
                 );
-                let ack = TokenRefreshAckMsg {
-                    success: false,
-                    error: Some(e.to_string()),
-                    expires_in_secs: 0,
-                };
-                SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack)
+                // Generic on purpose, as on the handshake path: the client
+                // learns the rotation failed, never why.
+                refusal_ack("invalid bearer token")
             }
         }
     }

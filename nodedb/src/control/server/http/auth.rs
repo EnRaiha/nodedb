@@ -36,6 +36,14 @@ pub struct AppState {
 /// Returns `None` otherwise — a policy refusal falls through to the remaining
 /// credential kinds and ends as a generic `invalid bearer token`, disclosing
 /// nothing about why the token was refused.
+///
+/// The dot-count check gates entry into the shared two-stage validator
+/// ([`authenticate_bearer_jwt`](session_auth::authenticate_bearer_jwt)) rather
+/// than being folded into it: API keys (`ndb_...`) never have 2 dots, so this
+/// keeps every non-JWT bearer token out of JWKS validation entirely instead of
+/// paying for (and logging) a doomed verification attempt on each one. This
+/// handler's caller is sync, so the shared async validator is driven via
+/// `block_on`; the surrounding request-handling stays synchronous.
 fn try_validate_jwt(
     state: &AppState,
     token: &str,
@@ -43,23 +51,11 @@ fn try_validate_jwt(
     AuthenticatedIdentity,
     crate::control::security::jwks::registry::VerifiedJwtClaims,
 )> {
-    if token.matches('.').count() == 2
-        && let Some(ref registry) = state.shared.jwks_registry
-        && let Ok((identity, verified)) =
-            tokio::runtime::Handle::current().block_on(registry.validate_with_claims(token))
-    {
-        if let Err(error) = crate::control::security::jwt_policy::enforce_stateful_jwt_policy(
-            &state.shared,
-            verified.claims(),
-            identity.tenant_id,
-        ) {
-            tracing::debug!(error = %error, "JWT bearer token refused by auth.jwt policy");
-            return None;
-        }
-        Some((identity, verified))
-    } else {
-        None
+    if token.matches('.').count() != 2 {
+        return None;
     }
+    tokio::runtime::Handle::current()
+        .block_on(session_auth::authenticate_bearer_jwt(&state.shared, token))
 }
 
 /// Enforce the TLS policy for a resolved HTTP identity.
