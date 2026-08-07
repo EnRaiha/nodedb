@@ -42,11 +42,16 @@ impl Default for JitConfig {
 /// exist (when JIT is enabled), or updates `last_seen` and syncs claims.
 /// Also populates `_system.org_members` from `$auth.org_ids` if present.
 ///
+/// `tenant_id` is the tenant the provider binds this identity to, server-side.
+/// The token's own `tenant_id` claim is never authoritative and is not what
+/// gets written to the record.
+///
 /// Returns the user's `AuthStatus` for the auth flow to check.
 pub fn provision_from_jwt(
     store: &AuthUserStore,
     claims: &JwtClaims,
     provider_name: &str,
+    tenant_id: crate::types::TenantId,
     config: &JitConfig,
     org_store: Option<&crate::control::security::org::store::OrgStore>,
 ) -> crate::Result<AuthStatus> {
@@ -110,7 +115,7 @@ pub fn provision_from_jwt(
         id: user_id.clone(),
         username,
         email,
-        tenant_id: claims.tenant_id,
+        tenant_id: tenant_id.as_u64(),
         provider: provider_name.into(),
         first_seen: now,
         last_seen: now,
@@ -125,7 +130,7 @@ pub fn provision_from_jwt(
     info!(
         user_id = %user_id,
         provider = %provider_name,
-        tenant_id = claims.tenant_id,
+        tenant_id = tenant_id.as_u64(),
         "JIT user provisioned"
     );
 
@@ -144,7 +149,7 @@ pub fn provision_from_jwt(
 
         for org_id in &org_ids {
             // JIT create org if needed.
-            org_store.ensure_org(org_id, claims.tenant_id)?;
+            org_store.ensure_org(org_id, tenant_id.as_u64())?;
             // Add membership (idempotent — upsert pattern).
             let _ = org_store.add_member(org_id, &user_id, "member");
         }
@@ -223,6 +228,7 @@ fn extract_sync_claims(claims: &JwtClaims) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TenantId;
 
     fn test_claims(sub: &str, user_id: u64) -> JwtClaims {
         let mut extra = HashMap::new();
@@ -251,7 +257,8 @@ mod tests {
             sync_claims: true,
         };
 
-        let status = provision_from_jwt(&store, &claims, "test", &config, None).unwrap();
+        let status =
+            provision_from_jwt(&store, &claims, "test", TenantId::new(1), &config, None).unwrap();
         assert_eq!(status, AuthStatus::Active);
         assert!(store.is_active("42"));
 
@@ -270,7 +277,8 @@ mod tests {
             sync_claims: true,
         };
 
-        let status = provision_from_jwt(&store, &claims, "test", &config, None).unwrap();
+        let status =
+            provision_from_jwt(&store, &claims, "test", TenantId::new(1), &config, None).unwrap();
         assert_eq!(status, AuthStatus::Active);
         assert!(store.get("99").is_none()); // Not created.
     }
@@ -285,13 +293,14 @@ mod tests {
         };
 
         // First auth → create.
-        provision_from_jwt(&store, &claims, "test", &config, None).unwrap();
+        provision_from_jwt(&store, &claims, "test", TenantId::new(1), &config, None).unwrap();
 
         // Deactivate.
         store.deactivate("42").unwrap();
 
         // Second auth → returns Suspended status.
-        let status = provision_from_jwt(&store, &claims, "test", &config, None).unwrap();
+        let status =
+            provision_from_jwt(&store, &claims, "test", TenantId::new(1), &config, None).unwrap();
         assert_eq!(status, AuthStatus::Suspended);
     }
 
@@ -304,7 +313,7 @@ mod tests {
         };
 
         let claims1 = test_claims("alice", 42);
-        provision_from_jwt(&store, &claims1, "test", &config, None).unwrap();
+        provision_from_jwt(&store, &claims1, "test", TenantId::new(1), &config, None).unwrap();
         assert_eq!(store.get("42").unwrap().email, "test@example.com");
 
         // Second auth with changed email.
@@ -312,7 +321,7 @@ mod tests {
         claims2
             .extra
             .insert("email".into(), serde_json::json!("alice@new.com"));
-        provision_from_jwt(&store, &claims2, "test", &config, None).unwrap();
+        provision_from_jwt(&store, &claims2, "test", TenantId::new(1), &config, None).unwrap();
         assert_eq!(store.get("42").unwrap().email, "alice@new.com");
     }
 }

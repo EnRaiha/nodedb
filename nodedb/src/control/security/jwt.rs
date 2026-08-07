@@ -127,7 +127,10 @@ pub struct JwtClaims {
     /// Captures provider-specific claims (email, org_id, groups, permissions,
     /// status, metadata) that verified JWT context construction maps to
     /// session variables. Different providers use different claim names — the
-    /// `[auth.jwt.claims]` config section remaps them after verification.
+    /// `[auth.jwt.claims]` config section renames them onto the fields read
+    /// here, applied by `jwt_policy::remap_claims` from the JWKS registry
+    /// immediately after signature, route, and time validation. Top-level
+    /// claim names only; dotted paths are not traversed.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -313,6 +316,8 @@ pub enum JwtError {
     InvalidIssuedAt,
     #[error("JWT token lifetime exceeds provider maximum")]
     TokenLifetimeExceeded,
+    #[error("JWT status claim carries a blocked value")]
+    BlockedStatus,
     #[error("JWT base64 decoding error")]
     DecodingError,
     #[error("JWT algorithm not supported or not configured")]

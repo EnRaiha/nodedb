@@ -36,6 +36,8 @@ use super::claim_mapping::apply_claim_mapping;
 /// 4. Re-check the verified issuer and audience against the selected provider.
 /// 5. Apply claim-mapping rules to derive `default_database`, `accessible_databases`, `roles`.
 /// 6. Construct `AuthenticatedIdentity` with `auth_method = OidcBearer`.
+/// 7. Apply the state-dependent `[auth.jwt]` policy: declared-scope
+///    enforcement and JIT provisioning / account-status gating.
 ///
 /// The returned [`VerifiedJwtClaims`] lets callers enrich a downstream
 /// `AuthContext` (email, org, groups, permissions, metadata) via
@@ -147,6 +149,16 @@ pub async fn verify_bearer_token(
             DatabaseSet::Some(accessible),
         ),
     );
+
+    // 7. Apply the state-dependent `[auth.jwt]` policy (declared scopes,
+    // JIT-provisioned account status) against the provider-bound tenant. The
+    // config-only half — claim remapping and blocked status values — already
+    // ran inside `validate_with_catalog_provider`.
+    crate::control::security::jwt_policy::enforce_stateful_jwt_policy(
+        state,
+        verified_claims,
+        identity.tenant_id,
+    )?;
 
     Ok((identity, verified))
 }

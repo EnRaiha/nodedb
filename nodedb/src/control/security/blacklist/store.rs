@@ -82,10 +82,6 @@ pub struct BlacklistStore {
     cidr_entries: RwLock<CidrSet<BlacklistEntry>>,
     /// Optional catalog for persistence.
     catalog: Option<SystemCatalog>,
-    /// JWT claim-based blocking: status values that deny access.
-    blocked_statuses: Vec<String>,
-    /// JWT claim name for status (e.g., "account_status").
-    status_claim: Option<String>,
 }
 
 impl BlacklistStore {
@@ -95,43 +91,6 @@ impl BlacklistStore {
             entries: RwLock::new(HashMap::new()),
             cidr_entries: RwLock::new(CidrSet::new()),
             catalog: None,
-            blocked_statuses: Vec::new(),
-            status_claim: None,
-        }
-    }
-
-    /// Configure JWT claim-based blocking.
-    pub fn set_claim_blocking(
-        &mut self,
-        status_claim: Option<String>,
-        blocked_statuses: Vec<String>,
-    ) {
-        self.status_claim = status_claim;
-        self.blocked_statuses = blocked_statuses;
-    }
-
-    /// Check if a JWT status claim value is blocked.
-    /// Returns `Some(status_value)` if blocked, `None` if allowed.
-    pub fn check_jwt_status(
-        &self,
-        auth_ctx: &super::super::auth_context::AuthContext,
-    ) -> Option<String> {
-        let claim = self.status_claim.as_deref()?;
-        if self.blocked_statuses.is_empty() {
-            return None;
-        }
-        // Check metadata first (custom claims land there).
-        let val = auth_ctx.metadata.get(claim).cloned().or_else(|| {
-            if claim == "status" {
-                Some(auth_ctx.status.to_string())
-            } else {
-                None
-            }
-        })?;
-        if self.blocked_statuses.contains(&val) {
-            Some(val)
-        } else {
-            None
         }
     }
 

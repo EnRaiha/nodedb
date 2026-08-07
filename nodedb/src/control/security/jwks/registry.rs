@@ -10,11 +10,16 @@
 //! in [`Self::decode_unverified`] and [`Self::verify_signature_and_time`].
 
 mod cache_identity;
+mod header;
+mod verified;
 
 use std::sync::Arc;
 
 use cache_identity::{catalog_cache_identity, static_cache_identity};
+use header::{JwtHeader, decode_jwt_header};
 use tracing::{debug, warn};
+
+pub use verified::VerifiedJwtClaims;
 
 use crate::config::auth::{JwtAuthConfig, JwtProviderConfig};
 use crate::control::security::identity::{
@@ -50,36 +55,6 @@ struct DecodedToken<'a> {
     parts: [&'a str; 3],
     header: JwtHeader,
     claims: JwtClaims,
-}
-
-/// Opaque proof that claims passed JWKS signature, route, and time validation.
-pub struct VerifiedJwtClaims(JwtClaims);
-
-impl VerifiedJwtClaims {
-    pub(crate) fn claims(&self) -> &JwtClaims {
-        &self.0
-    }
-
-    /// Test-only constructor: wraps already-"verified" claims without going
-    /// through JWKS signature verification. Exists so callers elsewhere in
-    /// the crate (e.g. `request_scope::builder` tests) can exercise the
-    /// verified-JWT construction path without standing up a full JWKS
-    /// registry.
-    #[cfg(test)]
-    pub(crate) fn new_for_test(claims: JwtClaims) -> Self {
-        Self(claims)
-    }
-}
-
-/// Deliberately opaque: the wrapped claims carry the subject, audience, and
-/// whatever custom fields the provider issues, so a derived `Debug` would put
-/// them into any log line, panic message, or error report that formats a value
-/// containing one. `Debug` exists only so `Result<VerifiedJwtClaims, _>` can be
-/// unwrapped in tests; it intentionally reveals nothing.
-impl std::fmt::Debug for VerifiedJwtClaims {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerifiedJwtClaims").finish_non_exhaustive()
-    }
 }
 
 impl JwksRegistry {
@@ -172,7 +147,8 @@ impl JwksRegistry {
         self.verify_signature_and_time(&decoded, &key, &provider.name)?;
         validate_provider_claims(provider, &decoded.claims)?;
 
-        let claims = decoded.claims;
+        let mut claims = decoded.claims;
+        self.apply_claim_policy(&mut claims)?;
         let kid = decoded.header.kid.as_deref().unwrap_or("");
         let identity = build_identity(&claims, provider.tenant_id);
 
@@ -211,18 +187,47 @@ impl JwksRegistry {
         };
         self.verify_signature_and_time(&decoded, &key, provider_name)?;
 
+        let mut claims = decoded.claims;
+        self.apply_claim_policy(&mut claims)?;
+
         debug!(
             provider = %provider_name,
             kid = %kid,
-            sub = %decoded.claims.sub,
+            sub = %claims.sub,
             "JWKS JWT validated via catalog provider"
         );
-        Ok(VerifiedJwtClaims(decoded.claims))
+        Ok(VerifiedJwtClaims(claims))
     }
 
     /// Check if any providers are configured.
     pub fn is_configured(&self) -> bool {
         !self.providers.is_empty()
+    }
+
+    /// The `[auth.jwt]` section this registry was built from.
+    ///
+    /// Exposed so the post-verification gate that needs server state
+    /// (`jwt_policy::enforce_stateful_jwt_policy`) reads the same config the
+    /// verification pipeline does, instead of a second copy that could drift.
+    pub(crate) fn jwt_config(&self) -> &JwtAuthConfig {
+        &self.config
+    }
+
+    /// Apply the config-only claim policy to a token that has passed
+    /// signature, route, and time validation: remap the provider's claim names
+    /// onto the fields NodeDB reads, then refuse a token whose status claim
+    /// carries a blocked value.
+    ///
+    /// Both bearer routes converge here — the HTTP static-provider path via
+    /// [`Self::validate_with_claims`] and the native/OIDC catalog path via
+    /// [`Self::validate_with_catalog_provider`] — so neither can skip it.
+    fn apply_claim_policy(&self, claims: &mut JwtClaims) -> Result<(), JwtError> {
+        crate::control::security::jwt_policy::remap_claims(&self.config.claims, claims);
+        crate::control::security::jwt_policy::check_blocked_status(
+            self.config.status_claim.as_deref(),
+            &self.config.blocked_statuses,
+            claims,
+        )
     }
 
     /// Re-check the `exp` (and the rest of the time-claim envelope) of
@@ -483,20 +488,6 @@ fn build_identity(claims: &JwtClaims, tenant_id: u64) -> AuthenticatedIdentity {
     )
 }
 
-// ── JWT Header Parsing ──────────────────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct JwtHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
-}
-
-fn decode_jwt_header(encoded: &str) -> Result<JwtHeader, JwtError> {
-    let bytes = base64_url_decode(encoded).ok_or(JwtError::DecodingError)?;
-    crate::util::bounded_json::from_slice(&bytes).map_err(|_| JwtError::InvalidClaims)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +544,96 @@ mod tests {
         let valid = VerifiedJwtClaims(claims(now - 10, now + 3_600));
 
         assert_eq!(registry.check_not_expired(&valid), Ok(()));
+    }
+
+    /// Parse an `[auth.jwt]` section exactly as the server-config loader does,
+    /// so these tests prove the knobs travel from a config file into the
+    /// verification pipeline — not merely that a hand-built struct works.
+    fn config_from_toml(body: &str) -> JwtAuthConfig {
+        let parsed: JwtAuthConfig =
+            toml::from_str(body).expect("the [auth.jwt] section must deserialize");
+        parsed.validate().expect("the section must be valid");
+        parsed
+    }
+
+    fn claims_with_extra(pairs: &[(&str, serde_json::Value)]) -> JwtClaims {
+        let mut claims = claims(1, 9_999_999_999);
+        for (key, value) in pairs {
+            claims.extra.insert((*key).to_owned(), value.clone());
+        }
+        claims
+    }
+
+    /// The assertion that would have caught the original defect: a
+    /// `status_claim` / `blocked_statuses` pair supplied through server config
+    /// must actually reject a token carrying a blocked value.
+    #[tokio::test]
+    async fn blocked_status_from_server_config_rejects_the_token() {
+        let registry = JwksRegistry::init(config_from_toml(
+            r#"
+            status_claim = "account_status"
+            blocked_statuses = ["suspended", "banned"]
+            "#,
+        ))
+        .await
+        .expect("registry with no configured providers must still initialize");
+
+        let mut blocked = claims_with_extra(&[("account_status", serde_json::json!("suspended"))]);
+        assert_eq!(
+            registry.apply_claim_policy(&mut blocked),
+            Err(JwtError::BlockedStatus)
+        );
+
+        let mut allowed = claims_with_extra(&[("account_status", serde_json::json!("active"))]);
+        assert_eq!(registry.apply_claim_policy(&mut allowed), Ok(()));
+
+        // A token that never carries the claim is not blocked.
+        let mut absent = claims_with_extra(&[]);
+        assert_eq!(registry.apply_claim_policy(&mut absent), Ok(()));
+    }
+
+    /// A `[auth.jwt.claims]` table supplied through server config must move a
+    /// provider-named claim onto the field NodeDB reads.
+    #[tokio::test]
+    async fn claim_remap_from_server_config_reaches_the_verification_pipeline() {
+        let registry = JwksRegistry::init(config_from_toml(
+            r#"
+            [claims]
+            upn = "email"
+            "#,
+        ))
+        .await
+        .expect("registry with no configured providers must still initialize");
+
+        let mut remapped = claims_with_extra(&[("upn", serde_json::json!("alice@example.com"))]);
+        assert_eq!(registry.apply_claim_policy(&mut remapped), Ok(()));
+        assert_eq!(
+            remapped.extra.get("email").and_then(|v| v.as_str()),
+            Some("alice@example.com")
+        );
+    }
+
+    /// Remapping runs before the status check, so an operator may block on a
+    /// provider claim after renaming it onto `status`.
+    #[tokio::test]
+    async fn remap_feeds_the_status_check() {
+        let registry = JwksRegistry::init(config_from_toml(
+            r#"
+            status_claim = "status"
+            blocked_statuses = ["deactivated"]
+
+            [claims]
+            acct_state = "status"
+            "#,
+        ))
+        .await
+        .expect("registry with no configured providers must still initialize");
+
+        let mut claims = claims_with_extra(&[("acct_state", serde_json::json!("deactivated"))]);
+        assert_eq!(
+            registry.apply_claim_policy(&mut claims),
+            Err(JwtError::BlockedStatus)
+        );
     }
 
     /// `check_not_expired` must apply the registry's own configured clock

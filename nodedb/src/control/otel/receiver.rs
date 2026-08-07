@@ -398,8 +398,14 @@ pub(super) async fn authenticate_otel(
 
     if token.matches('.').count() == 2
         && let Some(registry) = &shared.jwks_registry
-        && let Ok(identity) = registry.validate(token).await
+        && let Ok((identity, verified)) = registry.validate_with_claims(token).await
     {
+        crate::control::security::jwt_policy::enforce_stateful_jwt_policy(
+            shared,
+            verified.claims(),
+            identity.tenant_id,
+        )
+        .map_err(|_| "invalid bearer token".to_owned())?;
         return Ok(identity);
     }
     session_auth::verify_api_key_identity(shared, token, "otlp", "OTLP")

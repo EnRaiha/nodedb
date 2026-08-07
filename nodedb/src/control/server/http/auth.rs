@@ -30,8 +30,12 @@ pub struct AppState {
 
 /// Try to validate a Bearer token as a JWT via the JWKS registry.
 ///
-/// Returns `Some(identity)` if the token is a valid JWT with 2 dots and
-/// the registry verifies the signature. Returns `None` otherwise.
+/// Returns `Some(identity)` if the token is a valid JWT with 2 dots, the
+/// registry verifies the signature, and the token passes the state-dependent
+/// `[auth.jwt]` policy (declared scopes, JIT-provisioned account status).
+/// Returns `None` otherwise — a policy refusal falls through to the remaining
+/// credential kinds and ends as a generic `invalid bearer token`, disclosing
+/// nothing about why the token was refused.
 fn try_validate_jwt(
     state: &AppState,
     token: &str,
@@ -41,10 +45,18 @@ fn try_validate_jwt(
 )> {
     if token.matches('.').count() == 2
         && let Some(ref registry) = state.shared.jwks_registry
-        && let Ok(verified) =
+        && let Ok((identity, verified)) =
             tokio::runtime::Handle::current().block_on(registry.validate_with_claims(token))
     {
-        Some(verified)
+        if let Err(error) = crate::control::security::jwt_policy::enforce_stateful_jwt_policy(
+            &state.shared,
+            verified.claims(),
+            identity.tenant_id,
+        ) {
+            tracing::debug!(error = %error, "JWT bearer token refused by auth.jwt policy");
+            return None;
+        }
+        Some((identity, verified))
     } else {
         None
     }

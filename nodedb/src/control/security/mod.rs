@@ -21,6 +21,7 @@ pub mod impersonation;
 pub mod jit;
 pub mod jwks;
 pub mod jwt;
+pub mod jwt_policy;
 pub mod keystore;
 pub mod metering;
 pub mod mtls;
