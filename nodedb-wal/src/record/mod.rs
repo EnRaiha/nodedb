@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod aborted;
 pub mod anchor;
 pub mod calvin;
 pub mod fts_spatial;
@@ -10,6 +11,7 @@ pub mod sync_seq;
 pub mod types;
 pub mod wal_record;
 
+pub use aborted::{WRITE_ABORTED_PAYLOAD_SIZE, WriteAbortedPayload};
 pub use anchor::{ANCHOR_PAYLOAD_SIZE, LsnMsAnchorPayload};
 pub use calvin::CalvinAppliedPayload;
 pub use fts_spatial::{FtsDeletePayload, FtsIndexPayload, SpatialDeletePayload, SpatialPutPayload};

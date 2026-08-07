@@ -262,7 +262,11 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         | RecordType::SpatialPut
         | RecordType::SpatialDelete
         | RecordType::SparseVectorPut
-        | RecordType::SparseVectorDelete => Vec::new(),
+        | RecordType::SparseVectorDelete
+        // WriteAborted names a refused write; the record it names has already
+        // been dropped from this stream by the replay-source filter (see
+        // `WalManager::replay_from`). The marker itself is not a row write.
+        | RecordType::WriteAborted => Vec::new(),
     }
 }
 

@@ -63,18 +63,50 @@ impl WalManager {
         Ok(())
     }
 
+    /// Drop every record named by a `WriteAborted` marker in the same stream.
+    ///
+    /// A forward write record is appended before the Data Plane decides whether
+    /// to accept the write, so a refusal always arrives with the record already
+    /// in the log. Every replay stream this manager hands out is filtered here,
+    /// at its source, rather than re-checked inside each engine's replay arm:
+    /// the predicate is the record header's LSN and nothing else, so a per-arm
+    /// gate would be dozens of identical checks and the first one forgotten
+    /// silently resurrects that engine's refused writes.
+    ///
+    /// Requires the whole stream in hand — the abort marker is always at a
+    /// HIGHER LSN than the record it names, so a streaming filter could not see
+    /// it in time. The paginated `replay_*_limit` readers below therefore
+    /// cannot use this and gate at their own call site.
+    fn without_aborted_writes(records: Vec<WalRecord>) -> crate::Result<Vec<WalRecord>> {
+        let filters = nodedb_wal::extract_replay_filters(&records).map_err(crate::Error::Wal)?;
+        if filters.aborted.is_empty() {
+            return Ok(records);
+        }
+        let before = records.len();
+        let kept = nodedb_wal::drop_aborted_records(records, &filters.aborted);
+        info!(
+            dropped = before - kept.len(),
+            "WAL replay excluded records for writes the engine refused"
+        );
+        Ok(kept)
+    }
+
     /// Replay all committed records from the WAL.
     ///
     /// Payloads come back as plaintext: the manager's key ring is handed to the
     /// replay driver, which decrypts each record inside the WAL layer. Every
     /// record type is encrypted when a key is configured, so replaying without
     /// the ring would hand ciphertext to every engine's decoder.
+    ///
+    /// Records naming a refused write are excluded — see
+    /// [`Self::without_aborted_writes`].
     pub fn replay(&self) -> crate::Result<Vec<WalRecord>> {
         let records = nodedb_wal::segmented::replay_all_segments(
             &self.wal_dir,
             self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)?;
+        let records = Self::without_aborted_writes(records)?;
         info!(records = records.len(), "WAL replay complete");
         Ok(records)
     }
@@ -89,11 +121,12 @@ impl WalManager {
     /// complete one. The same applies to [`Self::replay_mmap_from`],
     /// [`Self::replay_from_limit`], and [`Self::replay_mmap_from_limit`].
     pub fn replay_from(&self, from_lsn: Lsn) -> crate::Result<Vec<WalRecord>> {
-        let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
-        let records = wal
-            .replay_from(from_lsn.as_u64())
-            .map_err(crate::Error::Wal)?;
-        Ok(records)
+        let records = {
+            let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
+            wal.replay_from(from_lsn.as_u64())
+                .map_err(crate::Error::Wal)?
+        };
+        Self::without_aborted_writes(records)
     }
 
     /// Replay WAL records from `from_lsn` using mmap (tier-2 catchup).
@@ -104,7 +137,7 @@ impl WalManager {
             self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)?;
-        Ok(records)
+        Self::without_aborted_writes(records)
     }
 
     /// Paginated mmap replay: reads at most `max_records` from `from_lsn`.
@@ -126,6 +159,11 @@ impl WalManager {
     }
 
     /// Paginated sequential replay: reads at most `max_records` from `from_lsn`.
+    ///
+    /// Unlike [`Self::replay`] / [`Self::replay_from`], the page is NOT filtered
+    /// for refused writes: a page can end between a forward record and the
+    /// abort marker that names it, so the filter has to run where the caller
+    /// decides what to do with the page.
     pub fn replay_from_limit(
         &self,
         from_lsn: Lsn,

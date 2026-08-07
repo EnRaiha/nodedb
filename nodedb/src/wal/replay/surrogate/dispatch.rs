@@ -105,7 +105,11 @@ pub fn replay_surrogate_records(
             | RecordType::SpatialPut
             | RecordType::SpatialDelete
             | RecordType::GraphNodeLabelSet
-            | RecordType::GraphNodeLabelRemove => {}
+            | RecordType::GraphNodeLabelRemove
+            // WriteAborted only names a refused write's LSN; the record it
+            // names is already gone from this stream (the replay source drops
+            // it), and the marker itself binds no surrogate.
+            | RecordType::WriteAborted => {}
         }
     }
     Ok(stats)

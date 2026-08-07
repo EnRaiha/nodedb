@@ -119,7 +119,9 @@ pub fn replay_sync_hwm_records(
             | RecordType::SpatialPut
             | RecordType::SpatialDelete
             | RecordType::GraphNodeLabelSet
-            | RecordType::GraphNodeLabelRemove => {}
+            | RecordType::GraphNodeLabelRemove
+            // WriteAborted carries only a refused write's LSN, no sync HWM.
+            | RecordType::WriteAborted => {}
         }
     }
 

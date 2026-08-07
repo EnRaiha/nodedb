@@ -60,10 +60,13 @@ pub use preamble::{
 pub use reader::{StopReason, WalReader};
 pub use record::{
     CalvinAppliedPayload, FtsDeletePayload, FtsIndexPayload, RecordHeader, RecordType,
-    SpatialDeletePayload, SpatialPutPayload, WalRecord, WalRecordArgs,
+    SpatialDeletePayload, SpatialPutPayload, WalRecord, WalRecordArgs, WriteAbortedPayload,
 };
 pub use recovery::{RecoveryInfo, recover};
-pub use replay::{DatabaseTombstones, TombstoneSet, extract_tombstones};
+pub use replay::{
+    AbortedWrites, DatabaseTombstones, ReplayFilters, TombstoneSet, drop_aborted_records,
+    extract_replay_filters, extract_tombstones,
+};
 pub use secure_mem::SecureKey;
 pub use segmented::{SegmentedWal, SegmentedWalConfig};
 pub use temporal_purge::{TemporalPurgeEngine, TemporalPurgePayload};

@@ -7,6 +7,11 @@
 //! owns the tombstone primitive, consumers query it after decoding the
 //! collection field from their own payload format.
 
+pub mod aborted;
 pub mod filter;
 
-pub use filter::{DatabaseTombstones, TombstoneSet, extract_tombstones};
+pub use aborted::AbortedWrites;
+pub use filter::{
+    DatabaseTombstones, ReplayFilters, TombstoneSet, drop_aborted_records, extract_replay_filters,
+    extract_tombstones,
+};

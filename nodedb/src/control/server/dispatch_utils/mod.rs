@@ -8,6 +8,7 @@ mod dispatch;
 mod durability_barrier;
 mod submit_write;
 mod types;
+mod write_abort;
 
 pub(crate) use change_events::{
     WriteChangeSet, extract_write_change_set, publish_change_set_with_lsn,

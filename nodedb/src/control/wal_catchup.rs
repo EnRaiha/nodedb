@@ -132,10 +132,28 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         return CatchupResult::Idle;
     }
 
+    // A batch the Data Plane refused after its record was appended carries a
+    // `WriteAborted` marker naming it; re-dispatching such a record here would
+    // ingest a write the client was told was rejected. Unlike restart replay,
+    // this reader is paginated, so a marker that lands in a LATER page cannot
+    // gate its record in this one — that record is still excluded from restart
+    // replay, which is where a refused write becomes durable state.
+    let aborted = match nodedb_wal::extract_replay_filters(&records) {
+        Ok(filters) => filters.aborted,
+        Err(e) => {
+            debug!(error = %e, "WAL catch-up abort-marker extraction failed");
+            return CatchupResult::Idle;
+        }
+    };
+
     let mut dispatched = 0usize;
     let mut max_lsn = catchup_lsn;
 
     for record in &records {
+        if aborted.contains(record.header.lsn) {
+            max_lsn = max_lsn.max(record.header.lsn);
+            continue;
+        }
         // Only process TimeseriesBatch records.
         let record_type = nodedb_wal::record::RecordType::from_raw(record.logical_record_type());
         if record_type != Some(nodedb_wal::record::RecordType::TimeseriesBatch) {

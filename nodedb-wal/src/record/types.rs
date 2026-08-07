@@ -290,6 +290,21 @@ pub enum RecordType {
 
     /// Graph engine: remove one or more node labels. See `GraphNodeLabelSet`.
     GraphNodeLabelRemove = 60 | 0x8000,
+
+    /// Names an already-appended write record that must NEVER be replayed.
+    /// Payload: `WriteAbortedPayload` (fixed 8 bytes, little-endian
+    /// `aborted_lsn`).
+    ///
+    /// The forward record is appended before the executing engine decides
+    /// whether to accept the write, so a refusal arrives with the record
+    /// already in the log. Without this marker, replay re-applies a write the
+    /// server told the client it refused — a row that a policy, constraint, or
+    /// type guard rejected reappears after a restart.
+    ///
+    /// Required: silently skipping this record IS the resurrection bug it
+    /// exists to prevent, so an older binary pointed at a WAL containing one
+    /// must fail to start loudly rather than readmit refused data.
+    WriteAborted = 61 | 0x8000,
 }
 
 impl RecordType {
@@ -337,6 +352,7 @@ impl RecordType {
             x if x == 57 | 0x8000 => Some(Self::SpatialDelete),
             x if x == 59 | 0x8000 => Some(Self::GraphNodeLabelSet),
             x if x == 60 | 0x8000 => Some(Self::GraphNodeLabelRemove),
+            x if x == 61 | 0x8000 => Some(Self::WriteAborted),
             _ => None,
         }
     }
@@ -370,6 +386,9 @@ mod tests {
         ));
         assert!(RecordType::is_required(RecordType::CrdtListOp as u32));
         assert!(RecordType::is_required(RecordType::CrdtDocOp as u32));
+        // Without the flag an older reader skips the abort marker and replays
+        // the refused write it names — the exact bug it exists to prevent.
+        assert!(RecordType::is_required(RecordType::WriteAborted as u32));
     }
 
     #[test]
@@ -411,6 +430,7 @@ mod tests {
             RecordType::SpatialDelete,
             RecordType::GraphNodeLabelSet,
             RecordType::GraphNodeLabelRemove,
+            RecordType::WriteAborted,
         ] {
             assert_eq!(RecordType::from_raw(ty as u32), Some(ty));
         }

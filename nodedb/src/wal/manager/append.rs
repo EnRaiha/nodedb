@@ -474,6 +474,25 @@ impl WalManager {
         self.append_record(RecordType::GraphNodeLabelRemove, tid, vs, db, p)
     }
 
+    /// Append a `WriteAborted` record naming `aborted_lsn`, the LSN of a
+    /// forward write record the executing engine refused after it was already
+    /// appended.
+    ///
+    /// The returned LSN must be made durable before the refusal is
+    /// acknowledged: the forward record may already have been fsynced by a
+    /// concurrent writer's group commit, so an abort that is still only
+    /// buffered leaves the refused write recoverable.
+    pub fn append_write_aborted(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        aborted_lsn: Lsn,
+    ) -> crate::Result<Lsn> {
+        let payload = nodedb_wal::WriteAbortedPayload::new(aborted_lsn.as_u64()).to_bytes();
+        self.append_record(RecordType::WriteAborted, tid, vs, db, &payload)
+    }
+
     pub fn append_collection_tombstone(
         &self,
         tid: TenantId,
