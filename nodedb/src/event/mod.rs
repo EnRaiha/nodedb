@@ -20,7 +20,7 @@ pub mod scheduler;
 pub mod slab_budget;
 pub mod streaming_mv;
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 pub mod topic;
 pub mod trigger;
 pub mod types;

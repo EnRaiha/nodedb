@@ -70,6 +70,17 @@ impl SharedState {
             .any(|g| g.group_id == nodedb_cluster::METADATA_GROUP_ID && g.role == "Leader")
     }
 
+    /// Whether this node should perform work that must happen exactly once
+    /// cluster-wide.
+    ///
+    /// Standalone deployments never install a metadata Raft group, so
+    /// `is_metadata_leader` is permanently false there. Gating a singleton job
+    /// on leadership alone therefore disables it entirely on single-node
+    /// deployments — the job must run when there is no group to elect from.
+    pub fn is_singleton_worker(&self) -> bool {
+        self.metadata_raft.get().is_none() || self.is_metadata_leader()
+    }
+
     /// Snapshot the configured global quota ceiling.
     ///
     /// Callers (notably `ALTER DATABASE … SET QUOTA`) pass the result to

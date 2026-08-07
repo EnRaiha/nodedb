@@ -5,11 +5,10 @@
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::catalog::StoredScopeGrant;
 use crate::control::security::conditional::{parse_conditions, render_conditions};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::scope::grant::replication::{propose_grant, propose_revoke};
 use crate::control::security::scope::grant::{RenewOutcome, ScopeGrantParams};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -18,29 +17,13 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::support::{err, status};
 
 /// Replicate a scope-grant upsert (`GRANT SCOPE`, and `RENEW SCOPE`, which
-/// is the same upsert with a later expiry).
+/// is the same upsert with a later expiry), surfacing failures as SQL errors.
 ///
-/// A grant that only reached the node handling the statement would authorize
-/// there and nowhere else, so the catalog write is the applier's job on every
-/// node. The `log_index == 0` branch is the standalone-origin path, where
-/// there is no raft group to apply the entry.
+/// The replication itself lives with the rest of the scope-grant apply path so
+/// the expiry sweep and the DDL handlers cannot drift apart; this wrapper only
+/// translates the error into what pgwire reports.
 fn propose_scope_grant(state: &SharedState, stored: &StoredScopeGrant) -> Result<(), DdlError> {
-    let entry = CatalogEntry::PutScopeGrant(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
-    if log_index == 0 {
-        {
-            let catalog = state.credentials.catalog();
-            catalog.put_scope_grant(stored).map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
-        }
-        state.scope_grants.install_replicated_grant(stored);
-    }
-    Ok(())
+    propose_grant(state, stored).map_err(|e| err("XX000", e.to_string()))
 }
 
 /// Replicate a scope-grant removal. Same dual path as [`propose_scope_grant`].
@@ -50,30 +33,8 @@ fn propose_scope_revoke(
     grantee_type: &str,
     grantee_id: &str,
 ) -> Result<(), DdlError> {
-    let entry = CatalogEntry::DeleteScopeGrant {
-        scope_name: scope_name.to_string(),
-        grantee_type: grantee_type.to_string(),
-        grantee_id: grantee_id.to_string(),
-    };
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
-    if log_index == 0 {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_scope_grant(scope_name, grantee_type, grantee_id)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog write: {e}"),
-                })?;
-        }
-        state
-            .scope_grants
-            .install_replicated_revoke(scope_name, grantee_type, grantee_id);
-    }
-    Ok(())
+    propose_revoke(state, scope_name, grantee_type, grantee_id)
+        .map_err(|e| err("XX000", e.to_string()))
 }
 
 /// GRANT SCOPE '<scope>' TO <ORG|USER|ROLE> '<id>'

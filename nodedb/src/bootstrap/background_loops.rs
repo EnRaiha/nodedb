@@ -323,12 +323,17 @@ pub fn spawn_background_loops(
         );
     }
 
-    // CRDT constraint reconcile (1-second timer, leader-gated).
-    // The metadata leader re-derives each collection's constraint set from the
+    // CRDT constraint reconcile (1-second timer, one node cluster-wide).
+    // That node re-derives each collection's constraint set from the
     // catalog and replicates it to every data-group replica's CRDT validator,
     // so a collection created/altered under any leader converges everywhere.
     crate::bootstrap::constraint_reconcile::spawn_constraint_reconcile(Arc::clone(shared));
     info!("constraint reconcile loop running");
+
+    // Scope grant expiry sweep. Executes each expired grant's ON EXPIRE
+    // action (hard revoke or downgrade to a lesser scope) through the
+    // replicated propose path, so the change is durable and cluster-wide.
+    crate::control::security::scope::expiry::spawn_expiry_task(Arc::clone(shared));
 
     // Cold tier task (if configured).
     if let Some(ref cold_settings) = config.cold_storage {

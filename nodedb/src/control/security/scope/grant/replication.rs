@@ -8,12 +8,63 @@
 //! the in-memory map, and runs on every node from the post-apply hook. Durable
 //! state is written exclusively by the applier, so the grant a node authorizes
 //! with is always one the cluster agreed on.
+//!
+//! `propose_grant` / `propose_revoke` are the single entry points that turn a
+//! prepared record into that replicated write. Every producer of a scope-grant
+//! mutation — the DDL handlers and the expiry sweep alike — goes through them,
+//! so there is exactly one place that knows how a grant reaches durable state.
 
+use crate::control::catalog_entry::CatalogEntry;
+use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::catalog::StoredScopeGrant;
 use crate::control::security::time::now_secs;
+use crate::control::state::SharedState;
 
 use super::store::ScopeGrantStore;
 use super::types::{ScopeGrant, ScopeGrantParams, grant_key};
+
+/// Replicate a scope-grant upsert (`GRANT SCOPE`, and `RENEW SCOPE`, which is
+/// the same upsert with a later expiry, and the automatic downgrade the expiry
+/// sweep issues).
+///
+/// A grant that only reached the node that decided on it would authorize there
+/// and nowhere else, so the catalog write is the applier's job on every node.
+/// The `log_index == 0` branch is the standalone-origin path, where there is
+/// no raft group to apply the entry.
+pub(crate) fn propose_grant(state: &SharedState, stored: &StoredScopeGrant) -> crate::Result<()> {
+    let entry = CatalogEntry::PutScopeGrant(Box::new(stored.clone()));
+    let log_index = propose_catalog_entry(state, &entry)?;
+    if log_index == 0 {
+        state.credentials.catalog().put_scope_grant(stored)?;
+        state.scope_grants.install_replicated_grant(stored);
+    }
+    Ok(())
+}
+
+/// Replicate a scope-grant removal. Same dual path as [`propose_grant`].
+pub(crate) fn propose_revoke(
+    state: &SharedState,
+    scope_name: &str,
+    grantee_type: &str,
+    grantee_id: &str,
+) -> crate::Result<()> {
+    let entry = CatalogEntry::DeleteScopeGrant {
+        scope_name: scope_name.to_string(),
+        grantee_type: grantee_type.to_string(),
+        grantee_id: grantee_id.to_string(),
+    };
+    let log_index = propose_catalog_entry(state, &entry)?;
+    if log_index == 0 {
+        state
+            .credentials
+            .catalog()
+            .delete_scope_grant(scope_name, grantee_type, grantee_id)?;
+        state
+            .scope_grants
+            .install_replicated_revoke(scope_name, grantee_type, grantee_id);
+    }
+    Ok(())
+}
 
 /// What a `RENEW SCOPE` resolves to against the current in-memory state.
 pub enum RenewOutcome {

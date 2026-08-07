@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Leader-gated CRDT constraint reconcile loop.
+//! Singleton CRDT constraint reconcile loop.
 //!
-//! The metadata-group leader periodically re-derives each collection's
+//! Exactly one node runs it — the metadata-group leader in a cluster, and the
+//! sole node in a standalone deployment, which has no group to elect from.
+//! That node periodically re-derives each collection's
 //! constraint set from the catalog and replicates it to every data-group
 //! replica via a `ConstraintChange` entry on the collection's vshard data
 //! Raft log. Each replica installs the set into its per-core CRDT validator,
@@ -38,7 +40,7 @@ use crate::control::wal_replication::{
 /// large catalog churn cannot monopolize the loop or the Raft proposer.
 const MAX_RECONCILE_PROPOSALS_PER_PASS: usize = 64;
 
-/// Spawn the leader-gated constraint reconcile loop.
+/// Spawn the singleton constraint reconcile loop.
 ///
 /// Control-Plane task (Tokio): it reads the catalog (Control Plane owns it) and
 /// dispatches Control → Data proposes. The catalog read runs in
@@ -83,8 +85,8 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
 /// for each collection whose `constraint_version` exceeds what `delivered`
 /// records. `delivered` is updated in place on each accepted proposal. Returns
 /// the number of proposals accepted this pass. A no-op (returns 0) when this
-/// node is not the metadata leader, the catalog is absent, or the async Raft
-/// proposer is not yet installed.
+/// node is not the one elected to reconcile, the catalog is absent, or the
+/// async Raft proposer is not yet installed.
 ///
 /// Exposed (crate-public) so tests can drive constraint installation
 /// deterministically instead of waiting on the background timer.
@@ -92,9 +94,11 @@ pub async fn reconcile_once(
     shared: &Arc<SharedState>,
     delivered: &mut HashMap<(TenantId, String), u64>,
 ) -> usize {
-    // Only the metadata leader reconciles — every replica installing
-    // would duplicate proposals onto the data log for no gain.
-    if !shared.is_metadata_leader() {
+    // Only one node reconciles — every replica installing would duplicate
+    // proposals onto the data log for no gain. In a cluster that node is the
+    // metadata leader; standalone has no group to elect from, so the sole
+    // node does it.
+    if !shared.is_singleton_worker() {
         return 0;
     }
     let catalog = shared.credentials.catalog().clone();
