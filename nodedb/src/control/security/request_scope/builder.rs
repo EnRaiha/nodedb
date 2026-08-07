@@ -259,7 +259,7 @@ mod tests {
             nbf: 0,
             iat: 0,
             iss: "nodedb-auth".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id: 42,
             is_superuser,
             extra: HashMap::new(),

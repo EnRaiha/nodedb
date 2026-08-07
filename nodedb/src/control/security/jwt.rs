@@ -110,9 +110,11 @@ pub struct JwtClaims {
     /// Issuer.
     #[serde(default)]
     pub iss: String,
-    /// Audience.
-    #[serde(default)]
-    pub aud: String,
+    /// Audience. RFC 7519 allows either a single string or an array of
+    /// strings; both deserialize into this list so an array-audience token
+    /// reaches audience matching instead of being rejected as malformed.
+    #[serde(default, deserialize_with = "deserialize_audience")]
+    pub aud: Vec<String>,
     /// User ID (NodeDB-specific claim).
     #[serde(default)]
     pub user_id: u64,
@@ -129,10 +131,62 @@ pub struct JwtClaims {
     /// session variables. Different providers use different claim names — the
     /// `[auth.jwt.claims]` config section renames them onto the fields read
     /// here, applied by `jwt_policy::remap_claims` from the JWKS registry
-    /// immediately after signature, route, and time validation. Top-level
-    /// claim names only; dotted paths are not traversed.
+    /// immediately after signature, route, and time validation.
+    ///
+    /// Because the payload is flattened, nested provider claims land under
+    /// their outermost key — read them through `jwt_policy::resolve_claim`,
+    /// which resolves an exact key first and a dotted path second, rather than
+    /// indexing this map directly.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Accept both RFC 7519 shapes of the `aud` claim — `"aud": "x"` and
+/// `"aud": ["x", "y"]` — as one list.
+///
+/// A hand-written visitor rather than an untagged enum: the claim set is
+/// deserialized through serde's flatten buffer, and a visitor keeps the
+/// accepted shapes explicit instead of depending on untagged fallthrough.
+fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AudienceVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for AudienceVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JWT audience: a string or an array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut audiences = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+            while let Some(entry) = seq.next_element::<String>()? {
+                audiences.push(entry);
+            }
+            Ok(audiences)
+        }
+    }
+
+    deserializer.deserialize_any(AudienceVisitor)
 }
 
 /// JWT validator.
@@ -222,8 +276,16 @@ impl JwtValidator {
             return Err(JwtError::InvalidIssuer);
         }
 
-        // Validate audience.
-        if !self.config.expected_audience.is_empty() && claims.aud != self.config.expected_audience
+        // Validate audience: exact equality against one element of the token's
+        // audience list. Never a substring, prefix, or joined-string test — a
+        // token issued for an unrelated audience must not authenticate here
+        // merely because this provider's audience appears inside one of its
+        // values.
+        if !self.config.expected_audience.is_empty()
+            && !claims
+                .aud
+                .iter()
+                .any(|audience| audience == &self.config.expected_audience)
         {
             return Err(JwtError::InvalidAudience);
         }
@@ -425,6 +487,13 @@ mod tests {
     const TEST_RSA_BITS: usize = 1024;
 
     fn validate_rs256_payload(payload_json: &str) -> AuthenticatedIdentity {
+        validate_rs256_payload_for_audience(payload_json, "").unwrap()
+    }
+
+    fn validate_rs256_payload_for_audience(
+        payload_json: &str,
+        expected_audience: &str,
+    ) -> Result<AuthenticatedIdentity, JwtError> {
         use rsa::pkcs1v15::SigningKey;
         use rsa::signature::{SignatureEncoding, Signer};
 
@@ -447,11 +516,74 @@ mod tests {
         let validator = JwtValidator::new(JwtConfig {
             algorithm: Some(JwtAlgorithm::Rs256),
             rsa_public_key_der: pub_der,
+            expected_audience: expected_audience.to_owned(),
             tenant_id: Some(2),
             max_token_lifetime_seconds: u64::MAX,
             ..Default::default()
         });
-        validator.validate(&token).unwrap()
+        validator.validate(&token)
+    }
+
+    /// RFC 7519 allows `aud` to be an array. A token listing the configured
+    /// audience alongside others must authenticate.
+    #[test]
+    fn array_audience_containing_the_expected_value_authenticates() {
+        let identity = validate_rs256_payload_for_audience(
+            r#"{"sub":"alice","aud":["other","nodedb"],"iat":1,"exp":9999999999,"user_id":5}"#,
+            "nodedb",
+        )
+        .expect("an array audience listing the expected value must authenticate");
+
+        assert_eq!(identity.username, "alice");
+    }
+
+    /// The match is exact equality against one element — an array audience
+    /// with no matching element is rejected, however its values are shaped.
+    #[test]
+    fn array_audience_without_the_expected_value_is_rejected() {
+        assert_eq!(
+            validate_rs256_payload_for_audience(
+                r#"{"sub":"alice","aud":["other"],"iat":1,"exp":9999999999,"user_id":5}"#,
+                "nodedb",
+            )
+            .err(),
+            Some(JwtError::InvalidAudience)
+        );
+        // A value that merely contains the expected audience is not a match.
+        assert_eq!(
+            validate_rs256_payload_for_audience(
+                r#"{"sub":"alice","aud":["nodedb-staging"],"iat":1,"exp":9999999999,"user_id":5}"#,
+                "nodedb",
+            )
+            .err(),
+            Some(JwtError::InvalidAudience)
+        );
+    }
+
+    #[test]
+    fn string_audience_still_authenticates() {
+        let identity = validate_rs256_payload_for_audience(
+            r#"{"sub":"alice","aud":"nodedb","iat":1,"exp":9999999999,"user_id":5}"#,
+            "nodedb",
+        )
+        .expect("a single-string audience must keep working");
+
+        assert_eq!(identity.username, "alice");
+    }
+
+    #[test]
+    fn audience_claim_accepts_both_rfc_shapes() {
+        let single: JwtClaims =
+            sonic_rs::from_str(r#"{"sub":"alice","aud":"nodedb"}"#).expect("string aud parses");
+        assert_eq!(single.aud, vec!["nodedb".to_owned()]);
+
+        let multiple: JwtClaims =
+            sonic_rs::from_str(r#"{"sub":"alice","aud":["a","b"]}"#).expect("array aud parses");
+        assert_eq!(multiple.aud, vec!["a".to_owned(), "b".to_owned()]);
+
+        let absent: JwtClaims =
+            sonic_rs::from_str(r#"{"sub":"alice"}"#).expect("absent aud parses");
+        assert!(absent.aud.is_empty());
     }
 
     #[test]
@@ -570,7 +702,7 @@ mod tests {
             nbf: 0,
             iat,
             iss: String::new(),
-            aud: String::new(),
+            aud: Vec::new(),
             user_id: 1,
             is_superuser: false,
             extra: std::collections::HashMap::new(),

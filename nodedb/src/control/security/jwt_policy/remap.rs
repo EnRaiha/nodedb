@@ -11,13 +11,14 @@
 //! claim is left in place after the copy, so catalog claim-mapping rules that
 //! reference a provider's own claim names keep matching.
 //!
-//! **Top-level claims only.** A source name is looked up as a single key in the
-//! token payload; dotted paths (`"realm_access.roles"`) are not traversed. This
-//! is the same limitation the catalog claim-mapping rules have.
+//! Source names are resolved by [`resolve_claim`], so a nested provider claim
+//! (`"realm_access.roles"`) is reachable and a claim name that literally
+//! contains a dot still resolves by exact match.
 
 use std::collections::HashMap;
 
 use crate::control::security::jwt::JwtClaims;
+use crate::control::security::jwt_policy::{resolve_claim, string_list};
 
 /// The fields a remap may target: everything NodeDB reads out of a verified
 /// token when building session context, plus the `roles` claim consumed when
@@ -94,7 +95,7 @@ pub fn remap_claims(map: &HashMap<String, String>, claims: &mut JwtClaims) {
         if source == target {
             continue;
         }
-        let Some(value) = claims.extra.get(source.as_str()).cloned() else {
+        let Some(value) = resolve_claim(&claims.extra, source).cloned() else {
             continue;
         };
         if target == "roles" {
@@ -104,21 +105,6 @@ pub fn remap_claims(map: &HashMap<String, String>, claims: &mut JwtClaims) {
             continue;
         }
         claims.extra.insert(target.clone(), value);
-    }
-}
-
-/// Interpret a claim value as a list of role names: either a JSON array of
-/// strings or a single string. Anything else leaves the roles untouched.
-fn string_list(value: &serde_json::Value) -> Option<Vec<String>> {
-    match value {
-        serde_json::Value::String(single) => Some(vec![single.clone()]),
-        serde_json::Value::Array(items) => Some(
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect(),
-        ),
-        _ => None,
     }
 }
 
@@ -135,7 +121,7 @@ mod tests {
             nbf: 0,
             iat: 1,
             iss: "https://idp.example.com".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id: 7,
             is_superuser: false,
             extra: extra
@@ -187,16 +173,33 @@ mod tests {
         assert!(!claims.extra.contains_key("email"));
     }
 
-    /// Dotted paths are not traversed — a nested claim is not reachable.
+    /// Keycloak nests roles under `realm_access`, so a dotted source path must
+    /// reach them; a flat lookup would silently map nothing.
     #[test]
-    fn dotted_source_path_is_not_traversed() {
+    fn dotted_source_path_resolves_nested_claim() {
         let mut claims = claims_with(vec![(
             "realm_access",
             serde_json::json!({ "roles": ["admin"] }),
         )]);
         remap_claims(&map(&[("realm_access.roles", "roles")]), &mut claims);
 
-        assert!(claims.roles.is_empty());
+        assert_eq!(claims.roles, vec!["admin".to_owned()]);
+    }
+
+    /// A claim name that legally contains a dot resolves by exact match and
+    /// shadows the traversal reading of the same string.
+    #[test]
+    fn literal_dotted_claim_name_wins_over_traversal() {
+        let mut claims = claims_with(vec![
+            ("realm_access.roles", serde_json::json!(["literal"])),
+            (
+                "realm_access",
+                serde_json::json!({ "roles": ["traversed"] }),
+            ),
+        ]);
+        remap_claims(&map(&[("realm_access.roles", "roles")]), &mut claims);
+
+        assert_eq!(claims.roles, vec!["literal".to_owned()]);
     }
 
     #[test]

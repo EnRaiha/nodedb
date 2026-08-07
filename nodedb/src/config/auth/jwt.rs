@@ -75,9 +75,11 @@ pub struct JwtAuthConfig {
     /// `control::security::jwt_policy::remap_claims`, on both bearer routes.
     ///
     /// Entries are `"<provider claim>" = "<NodeDB field>"`. The source claim is
-    /// kept alongside the copy. Top-level claim names only — a dotted path is
-    /// treated as a literal key, not traversed. A target outside the field list
-    /// above, or two claims competing for one target, fails startup.
+    /// kept alongside the copy. A source name resolves as an exact claim key
+    /// first, then as a dotted path through nested claims
+    /// (`"realm_access.roles"`), so a claim name containing a dot needs no
+    /// escaping. A target outside the field list above, or two claims competing
+    /// for one target, fails startup.
     #[serde(default)]
     pub claims: std::collections::HashMap<String, String>,
 
@@ -85,6 +87,8 @@ pub struct JwtAuthConfig {
     /// If present in the JWT, its value is checked against `blocked_statuses`
     /// and a match rejects the token before any identity is issued.
     /// A token that does not carry the claim is not blocked.
+    /// Resolved as an exact claim key first, then as a dotted path through
+    /// nested claims.
     #[serde(default)]
     pub status_claim: Option<String>,
 

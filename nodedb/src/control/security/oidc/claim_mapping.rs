@@ -7,6 +7,7 @@
 
 use crate::control::security::catalog::oidc_providers::StoredClaimMappingRule;
 use crate::control::security::jwt::JwtClaims;
+use crate::control::security::jwt_policy::{resolve_claim, string_list};
 
 /// Result of applying claim-mapping rules to a verified JWT.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +28,11 @@ pub struct ClaimMappingResult {
 /// accumulate across all matching rules.
 ///
 /// `claim_value = "*"` matches any non-empty claim value.
+///
+/// A claim may carry one string or an array of them (`cognito:groups`, `aud`),
+/// and a rule matches when ANY element matches. Names are resolved through the
+/// shared claim resolver, so nested paths (`realm_access.roles`) work here
+/// exactly as they do in `[auth.jwt.claims]` remapping.
 pub fn apply_claim_mapping(
     claims: &JwtClaims,
     rules: &[StoredClaimMappingRule],
@@ -34,26 +40,25 @@ pub fn apply_claim_mapping(
     let mut result = ClaimMappingResult::default();
 
     for rule in rules {
-        // Resolve the actual claim value from the JWT payload.
-        let actual_value: Option<String> = match rule.claim_name.as_str() {
-            "sub" => Some(claims.sub.clone()),
-            "iss" => Some(claims.iss.clone()),
+        // Resolve the actual claim values from the JWT payload.
+        let actual_values: Option<Vec<String>> = match rule.claim_name.as_str() {
+            "sub" => Some(vec![claims.sub.clone()]),
+            "iss" => Some(vec![claims.iss.clone()]),
             "aud" => Some(claims.aud.clone()),
-            other => claims
-                .extra
-                .get(other)
-                .and_then(|v| v.as_str().map(str::to_owned)),
+            other => resolve_claim(&claims.extra, other).and_then(string_list),
         };
 
-        let Some(val) = actual_value else {
+        let Some(values) = actual_values else {
             continue;
         };
 
-        // Match: exact value or wildcard.
+        // Match: exact value or wildcard. Equality is per element and exact —
+        // never a substring or prefix test, so a rule for one value cannot be
+        // satisfied by an unrelated value that merely contains it.
         let matches = if rule.claim_value == "*" {
-            !val.is_empty()
+            values.iter().any(|value| !value.is_empty())
         } else {
-            val == rule.claim_value
+            values.iter().any(|value| value == &rule.claim_value)
         };
 
         if !matches {
@@ -92,8 +97,14 @@ mod tests {
     use crate::control::security::jwt::JwtClaims;
 
     fn claims_with_org(org: &str) -> JwtClaims {
+        claims_with_extra(&[("org_id", serde_json::Value::String(org.to_owned()))])
+    }
+
+    fn claims_with_extra(pairs: &[(&str, serde_json::Value)]) -> JwtClaims {
         let mut extra = std::collections::HashMap::new();
-        extra.insert("org_id".into(), serde_json::Value::String(org.to_owned()));
+        for (key, value) in pairs {
+            extra.insert((*key).to_owned(), value.clone());
+        }
         JwtClaims {
             sub: "alice".into(),
             tenant_id: 1,
@@ -102,7 +113,7 @@ mod tests {
             nbf: 0,
             iat: 0,
             iss: "https://idp.example.com".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id: 0,
             is_superuser: false,
             extra,
@@ -186,6 +197,88 @@ mod tests {
         let res = apply_claim_mapping(&claims_with_org("x"), &rules);
         // First rule wins for default_database.
         assert_eq!(res.default_database, Some(10));
+    }
+
+    /// Cognito emits group membership as an array. A rule naming one group
+    /// must match when that group is anywhere in the list.
+    #[test]
+    fn array_valued_claim_matches_any_element() {
+        let rules = vec![StoredClaimMappingRule {
+            claim_name: "cognito:groups".into(),
+            claim_value: "engineering".into(),
+            default_database: Some(7),
+            add_databases: vec![],
+            add_roles: vec!["readwrite".into()],
+        }];
+        let claims = claims_with_extra(&[(
+            "cognito:groups",
+            serde_json::json!(["sales", "engineering"]),
+        )]);
+
+        let res = apply_claim_mapping(&claims, &rules);
+        assert_eq!(res.default_database, Some(7));
+        assert_eq!(res.roles, vec!["readwrite"]);
+    }
+
+    /// The match is exact per element: an unrelated value that merely contains
+    /// the configured one must not satisfy the rule.
+    #[test]
+    fn array_valued_claim_does_not_match_on_substring() {
+        let rules = vec![StoredClaimMappingRule {
+            claim_name: "cognito:groups".into(),
+            claim_value: "eng".into(),
+            default_database: Some(7),
+            add_databases: vec![],
+            add_roles: vec![],
+        }];
+        let claims = claims_with_extra(&[("cognito:groups", serde_json::json!(["engineering"]))]);
+
+        assert!(
+            apply_claim_mapping(&claims, &rules)
+                .default_database
+                .is_none()
+        );
+    }
+
+    /// Keycloak nests roles; the shared resolver makes them reachable from a
+    /// catalog rule too, not only from `[auth.jwt.claims]` remapping.
+    #[test]
+    fn nested_claim_path_matches() {
+        let rules = vec![StoredClaimMappingRule {
+            claim_name: "realm_access.roles".into(),
+            claim_value: "admin".into(),
+            default_database: Some(3),
+            add_databases: vec![],
+            add_roles: vec![],
+        }];
+        let claims = claims_with_extra(&[(
+            "realm_access",
+            serde_json::json!({ "roles": ["admin", "ops"] }),
+        )]);
+
+        assert_eq!(
+            apply_claim_mapping(&claims, &rules).default_database,
+            Some(3)
+        );
+    }
+
+    /// `aud` is a list; a rule on it matches any element.
+    #[test]
+    fn audience_rule_matches_any_element() {
+        let rules = vec![StoredClaimMappingRule {
+            claim_name: "aud".into(),
+            claim_value: "nodedb".into(),
+            default_database: Some(5),
+            add_databases: vec![],
+            add_roles: vec![],
+        }];
+        let mut claims = claims_with_org("acme");
+        claims.aud = vec!["other".into(), "nodedb".into()];
+
+        assert_eq!(
+            apply_claim_mapping(&claims, &rules).default_database,
+            Some(5)
+        );
     }
 
     #[test]

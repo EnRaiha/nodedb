@@ -65,7 +65,7 @@ mod tests {
             nbf: 0,
             iat: 1,
             iss: "https://idp.example.com".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id: 7,
             is_superuser: false,
             extra,

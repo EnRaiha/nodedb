@@ -18,6 +18,7 @@
 //! the value cannot be evaluated.
 
 use crate::control::security::jwt::{JwtClaims, JwtError};
+use crate::control::security::jwt_policy::resolve_claim;
 
 /// Reject a verified token whose status claim carries a blocked value.
 ///
@@ -33,7 +34,11 @@ pub fn check_blocked_status(
     if blocked_statuses.is_empty() {
         return Ok(());
     }
-    let Some(value) = claims.extra.get(claim_name) else {
+    // `status_claim` is an operator-supplied claim name, so it is resolved the
+    // same way every other configured claim name is: exact key first, dotted
+    // path second. A nested provider status must not be silently unreachable —
+    // that would turn status blocking off without any signal.
+    let Some(value) = resolve_claim(&claims.extra, claim_name) else {
         return Ok(());
     };
 
@@ -90,7 +95,7 @@ mod tests {
             nbf: 0,
             iat: 1,
             iss: "https://idp.example.com".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id: 7,
             is_superuser: false,
             extra,

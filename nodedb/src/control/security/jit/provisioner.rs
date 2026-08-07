@@ -241,7 +241,7 @@ mod tests {
             nbf: 0,
             iat: 1_700_000_000,
             iss: "test-provider".into(),
-            aud: "nodedb".into(),
+            aud: vec!["nodedb".into()],
             user_id,
             is_superuser: false,
             extra,

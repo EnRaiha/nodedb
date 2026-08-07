@@ -169,10 +169,12 @@ pub async fn verify_bearer_token(
 /// is the sole provider for that issuer. Catalog corruption or legacy data
 /// cannot silently change routing because every duplicate or wildcard-sharing
 /// issuer route is rejected here.
+///
+/// `aud` is the token's full audience list (RFC 7519 permits several).
 fn select_catalog_provider(
     providers: Vec<StoredOidcProvider>,
     iss: &str,
-    aud: &str,
+    aud: &[String],
 ) -> Result<StoredOidcProvider, JwtError> {
     if iss.is_empty() {
         return Err(JwtError::InvalidIssuer);
@@ -195,13 +197,15 @@ fn select_catalog_provider(
         return Err(JwtError::InvalidIssuer);
     }
 
+    // Exact equality against one element of the token's audience list — never
+    // a substring or prefix test, which would route a token issued for an
+    // unrelated audience to this provider.
     let mut exact_matches: Vec<StoredOidcProvider> = issuer_providers
         .iter()
         .filter(|provider| {
-            provider
-                .audience
-                .as_deref()
-                .is_some_and(|expected| !expected.is_empty() && expected == aud)
+            provider.audience.as_deref().is_some_and(|expected| {
+                !expected.is_empty() && aud.iter().any(|value| value == expected)
+            })
         })
         .cloned()
         .collect();
@@ -230,11 +234,12 @@ fn validate_selected_provider_claims(
     if claims.iss != provider.issuer {
         return Err(JwtError::InvalidIssuer);
     }
-    if provider
-        .audience
-        .as_deref()
-        .is_some_and(|expected| !expected.is_empty() && claims.aud != expected)
-    {
+    // Exact equality against one element of the token's audience list — never
+    // a substring or prefix test: a token whose audience list carries an
+    // unrelated value must not pass this provider's audience constraint.
+    if provider.audience.as_deref().is_some_and(|expected| {
+        !expected.is_empty() && !claims.aud.iter().any(|value| value == expected)
+    }) {
         return Err(JwtError::InvalidAudience);
     }
     Ok(())
