@@ -17,7 +17,7 @@ use nodedb_types::Surrogate;
 
 use super::super::merge::MergeParams;
 use super::super::returning_rows;
-use super::apply_support::{MergePutEvent, record_put_index_undo, returning_doc};
+use super::apply_support::{MergePutEvent, gate_merge_arms, record_put_index_undo, returning_doc};
 
 /// Everything [`CoreLoop::abort_merge_apply`] needs to unwind a partially
 /// applied MERGE and surface the terminating error.
@@ -123,6 +123,15 @@ impl CoreLoop {
         // (the schemaless half scans `vector_params` unindexed) and threaded into
         // the per-row UPDATE re-index below.
         let has_vectors = self.collection_has_vectors(database_id, tid, params.target_collection);
+
+        // Gate every arm on the target's write policy BEFORE the apply
+        // transaction opens, so a rejected row leaves nothing written and
+        // nothing to unwind.
+        if let Err(e) =
+            gate_merge_arms(&plan, params.rls_write_check, tid, params.target_collection)
+        {
+            return self.response_error(task, e);
+        }
 
         // One post-apply redo entry per indexed row — a `Put` for each
         // UPDATE/INSERT post-image, a `Delete` for each removed row — carried

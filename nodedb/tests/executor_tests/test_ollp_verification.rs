@@ -131,6 +131,7 @@ fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         ollp_predicted_surrogates: predicted,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     })
 }
 
@@ -143,6 +144,7 @@ fn bulk_delete_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         ollp_predicted_surrogates: predicted,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     })
 }
 
@@ -159,6 +161,7 @@ fn bulk_delete_plan_with_edges(
         ollp_predicted_surrogates: predicted,
         ollp_predicted_edges: edges,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     })
 }
 
@@ -583,6 +586,7 @@ fn bulk_update_superset_prediction_returns_ollp_retry_required() {
             pk_bytes: "s2".as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 

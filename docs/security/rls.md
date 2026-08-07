@@ -34,6 +34,34 @@ CREATE RLS POLICY admin_bypass ON orders FOR READ
 | `WRITE` | INSERT, UPDATE, DELETE |
 | `ALL`   | Both read and write    |
 
+### What a `WRITE` policy decides
+
+The predicate is evaluated against the **row image the statement persists** —
+the new row for an insert or update, the removed row for a delete, the merged
+row for an upsert's conflict branch. A row that fails the predicate fails the
+whole statement; it is never silently skipped, so an affected-row count never
+reports a write that did not happen.
+
+Document `UPDATE`, `DELETE`, `UPSERT`, `MERGE`, and `UPDATE ... FROM` build that
+image inside the storage engine — the row is read, the statement's changes are
+applied, and only then does the row the predicate decides exist. The compiled
+predicate travels with the query plan and is evaluated there, against the exact
+bytes about to be written, including any generated columns recomputed by the
+statement. A predicate may therefore reference a column the statement never
+mentions.
+
+Some write shapes carry no such row body at all: a key-value atomic computes
+from the stored value, `TRUNCATE` removes every row without reading one, and
+vector, FTS, graph, columnar, timeseries, and spatial writes carry an embedding,
+extracted text, edge endpoints, or column vectors instead of the row the
+predicate names. A write policy on the collection **refuses** those statements
+rather than letting them persist rows the predicate was never evaluated against.
+The refusal names the collection and says which image was unavailable.
+
+Externally submitted CRDT deltas are the exception: they are admitted against
+the storage engine's authoritative post-merge image, so the predicate decides
+the merged row exactly as it decides an inserted one.
+
 ## Permissive vs Restrictive
 
 By default, multiple policies on the same collection are **OR-combined** (permissive). If ANY policy passes, the row is visible.

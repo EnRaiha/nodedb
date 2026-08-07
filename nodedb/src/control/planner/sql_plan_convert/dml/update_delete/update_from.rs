@@ -102,8 +102,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
             // The source rows are shipped in by the Control-Plane orchestrator
             // (cross-core source-ship); the neutral plan carries none.
             source_rows: None,
-            // Filled in by the RLS injection pass, which runs after conversion.
+            // Both filled in by the RLS injection pass, which runs after
+            // conversion — the read filter gating `returning` and the write
+            // predicate gating the persist are separate slots.
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

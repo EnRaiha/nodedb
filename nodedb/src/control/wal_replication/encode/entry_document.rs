@@ -54,6 +54,9 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             on_conflict_updates,
             surrogate,
+            // The leader already decided this row against the write policy; the
+            // replicated record carries the row, not the policy.
+            rls_write_check: _,
         } => document::upsert(
             collection,
             document_id,
@@ -68,6 +71,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: _,
+            rls_write_check: _,
         } => document::bulk_delete(collection, filters),
         DocumentOp::BulkUpdate {
             collection,
@@ -77,6 +81,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: _,
+            rls_write_check: _,
         } => document::bulk_update(collection, filters, updates),
         DocumentOp::InsertSelect {
             target_collection,

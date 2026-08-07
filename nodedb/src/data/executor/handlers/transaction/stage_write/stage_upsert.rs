@@ -32,6 +32,7 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         value: &[u8],
         on_conflict_updates: &[(String, UpdateValue)],
+        rls_write_check: &[u8],
     ) -> Response {
         let existing_bytes = match self.resolve_doc_current(ctx) {
             Ok(b) => b,
@@ -60,6 +61,20 @@ impl CoreLoop {
             }
         };
 
+        // Gate whichever body this branch actually resolved — the incoming row
+        // when absent, the merge with the stored row when present. The merged
+        // image exists only here, which is why the plan cannot admit it.
+        if let Err(e) = self.stage_admit_write(
+            rls_write_check,
+            &stored_bytes,
+            &ctx.document_id,
+            ctx.database_id,
+            ctx.tid,
+            ctx.collection,
+        ) {
+            return self.response_error(ctx.task, e);
+        }
+
         if let Err(e) = self.stage_put_capped(ctx, stored_bytes) {
             return self.response_error(ctx.task, e);
         }
@@ -77,7 +92,7 @@ impl CoreLoop {
     /// Resolve the current stored body for `ctx` under BASE ∪ OVERLAY: a
     /// staged put wins, a staged tombstone means absent, otherwise fall back
     /// to durable storage (bitemporal-aware, mirroring `execute_upsert`).
-    fn resolve_doc_current(&self, ctx: &StageCtx<'_>) -> crate::Result<Option<Vec<u8>>> {
+    pub(super) fn resolve_doc_current(&self, ctx: &StageCtx<'_>) -> crate::Result<Option<Vec<u8>>> {
         match self
             .txn_overlays
             .get(&ctx.txn_id)

@@ -6,8 +6,12 @@
 //! enabled read policies into a single `ScanFilter` list injected
 //! into `DocumentScan`.
 //!
-//! **Write path**: `check_write_with_auth` evaluates each write policy
-//! against the document; failures return `Error::RejectedAuthz`.
+//! **Write path**: `combined_write_predicate_with_auth` compiles the same
+//! policies into filter bytes for the planner's write gate, which evaluates
+//! them against the row image a statement is about to persist.
+//! `check_write_with_auth` is the ready-made-document form of the same check,
+//! used where the post-image is already materialized (CRDT admission).
+//! Both deny with `Error::RejectedAuthz`.
 
 use tracing::info;
 
@@ -58,6 +62,69 @@ impl RlsPolicyStore {
         }
     }
 
+    /// Compile the collection's write policies into the `ScanFilter` bytes a
+    /// write gate evaluates against a row image.
+    ///
+    /// The write-path twin of [`Self::combined_read_predicate_with_auth`] and
+    /// resolved identically — superuser bypass, vacuous policies, and the
+    /// fail-closed `None` on an unresolvable `$auth.*` reference all behave the
+    /// same — so a `FOR ALL` policy cannot compile to one predicate for reads
+    /// and a different one for writes.
+    ///
+    /// Empty bytes mean "no write policy restricts this identity here"; `None`
+    /// means deny.
+    pub fn combined_write_predicate_with_auth(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        auth: &AuthContext,
+    ) -> Option<Vec<u8>> {
+        if auth.is_superuser() {
+            return Some(Vec::new());
+        }
+
+        let policies = self.write_policies(tenant_id, collection);
+        if policies.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let compiled_policies: Vec<(RlsPredicate, PolicyMode)> = policies
+            .iter()
+            .filter_map(|p| p.compiled_predicate.as_ref().map(|c| (c.clone(), p.mode)))
+            .collect();
+
+        let all_filters = if !compiled_policies.is_empty() {
+            combine_policies(&compiled_policies, auth)?
+        } else {
+            Vec::new()
+        };
+
+        if all_filters.is_empty() {
+            Some(Vec::new())
+        } else {
+            Some(zerompk::to_msgpack_vec(&all_filters).unwrap_or_default())
+        }
+    }
+
+    /// Whether any enabled, non-vacuous write policy exists in this tenant.
+    ///
+    /// For a write plan that names no collection, so the narrow per-collection
+    /// question cannot be asked and the write cannot be shown to avoid a
+    /// protected collection. A policy with no compiled predicate restricts
+    /// nothing, so it is ignored here exactly as the compilers above ignore it.
+    pub fn tenant_has_write_policy(&self, tenant_id: u64) -> bool {
+        self.all_policies_for_tenant(tenant_id)
+            .iter()
+            .any(|policy| {
+                policy.enabled
+                    && policy.compiled_predicate.is_some()
+                    && matches!(
+                        policy.policy_type,
+                        super::types::PolicyType::Write | super::types::PolicyType::All
+                    )
+            })
+    }
+
     /// Write-path RLS check with `$auth.*` support. Evaluates compiled
     /// write policies; fail-closed on unresolved auth references.
     ///
@@ -89,6 +156,41 @@ impl RlsPolicyStore {
 
         Ok(())
     }
+}
+
+/// Decide one row image against ALREADY-COMPILED write-policy filter bytes.
+///
+/// For Control-Plane paths that hold a post-image but not the policy store: the
+/// planner's plan-time write admission, and the COMMIT-time expanders that
+/// rewrite a staged MERGE / `UPDATE ... FROM` into concrete point ops. Those
+/// expansions run after the injection pass, so the statement's compiled
+/// predicate is the only thing left that can gate their rows — without this the
+/// rewrite would launder a governed write into an ungoverned one.
+///
+/// `image` is the MessagePack row body. Empty `compiled` means no write policy
+/// restricts this identity here. Fails closed on an undecodable payload or an
+/// evaluation error, so an adversarial predicate cannot become an admitted
+/// write by erroring out of the check.
+pub fn admit_compiled_write_image(
+    compiled: &[u8],
+    image: &[u8],
+    tenant_id: u64,
+    collection: &str,
+) -> crate::Result<()> {
+    if compiled.is_empty() {
+        return Ok(());
+    }
+    let filters: Vec<crate::bridge::scan_filter::ScanFilter> = zerompk::from_msgpack(compiled)
+        .map_err(|error| crate::Error::PlanError {
+            detail: format!("RLS write filter deserialization failed: {error}"),
+        })?;
+    if crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, image).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(crate::Error::RejectedAuthz {
+        tenant_id: crate::types::TenantId::new(tenant_id),
+        resource: format!("RLS write policy on '{collection}' rejected the row"),
+    })
 }
 
 fn check_compiled_write(

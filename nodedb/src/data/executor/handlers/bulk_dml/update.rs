@@ -10,6 +10,7 @@ use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateR
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec};
@@ -29,6 +30,11 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     pub ollp_predicted_edges: Option<&'a [OllpPredictedEdge]>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy gating the PERSIST, decided per row against
+    /// its post-update image. A separate slot from `rls_filters`: that one
+    /// bounds what may be shown back, this one bounds what may be written.
+    /// Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -54,6 +60,7 @@ impl CoreLoop {
             ollp_predicted_surrogates,
             ollp_predicted_edges,
             rls_filters,
+            rls_write_check,
         } = params;
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk update");
 
@@ -305,6 +312,18 @@ impl CoreLoop {
                     } else {
                         doc_format::encode_to_msgpack(&doc)
                     };
+                    // Gate the persist on the collection's write policy, decided
+                    // against this row's post-update image — `doc` already has
+                    // the assignments and any regenerated columns applied, so it
+                    // is the row that would exist afterwards. A rejected row
+                    // fails the statement rather than being skipped: a skipped
+                    // row would be reported as unaffected while the rest of the
+                    // predicate's matches were rewritten.
+                    if let Err(e) =
+                        rls_write_gate::admit_row(rls_write_check, &doc, tid, collection)
+                    {
+                        return self.response_error(task, e);
+                    }
                     if let Err(e) = self.nonbitemporal_update_reindex(NonbitemporalUpdateReindex {
                         database_id,
                         tid,

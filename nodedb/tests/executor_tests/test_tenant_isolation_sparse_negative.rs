@@ -108,6 +108,7 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
     let ok_or_not_found = resp_del.status == Status::Ok

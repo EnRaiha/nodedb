@@ -39,10 +39,20 @@ pub(super) fn inject_text(ctx: &RlsCtx<'_>, op: &mut TextOp) -> crate::Result<()
                  no row filter",
             ),
 
-        // No-op: index writes and per-collection analyzer configuration.
-        TextOp::FtsIndexDoc { .. } | TextOp::FtsDeleteDoc { .. } | TextOp::SetTextConfig { .. } => {
-            Ok(())
-        }
+        // Refuse: an index write carries the extracted text and a surrogate,
+        // not the row body the policy names. Indexing a row the policy hides
+        // makes it reachable by search, which is the disclosure the policy
+        // exists to prevent, so a policy on the collection refuses the write.
+        TextOp::FtsIndexDoc { collection, .. } | TextOp::FtsDeleteDoc { collection, .. } => ctx
+            .refuse_if_write_policy(
+                collection,
+                "an index write carries extracted text and a surrogate rather than the row body \
+                 the policy names, so no row image is available for it to be evaluated against",
+            ),
+
+        // No-op: the per-collection analyzer binding is configuration, not a
+        // user row.
+        TextOp::SetTextConfig { .. } => Ok(()),
     }
 }
 
@@ -50,8 +60,38 @@ pub(super) fn inject_text(ctx: &RlsCtx<'_>, op: &mut TextOp) -> crate::Result<()
 mod tests {
     use nodedb_physical::physical_plan::TextOp;
 
-    use super::super::plan::test_support::{assert_refused, inject, store_with_read_policy};
+    use super::super::plan::test_support::{
+        assert_refused, assert_write_refused, inject, inject_without_policy,
+        store_with_read_policy, store_with_write_policy,
+    };
     use crate::bridge::envelope::PhysicalPlan;
+
+    fn index_doc(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Text(TextOp::FtsIndexDoc {
+            collection: collection.into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            text: "hello".into(),
+            provenance: None,
+        })
+    }
+
+    /// An index write carries extracted text and a surrogate, not the row body
+    /// the policy names, so a write policy refuses it.
+    #[test]
+    fn fts_index_doc_is_refused_under_a_write_policy() {
+        let store = store_with_write_policy("articles");
+        let mut plan = index_doc("articles");
+        assert_write_refused(inject(&mut plan, &store), "articles");
+    }
+
+    /// …and is untouched when no policy applies.
+    #[test]
+    fn fts_index_doc_without_a_policy_is_untouched() {
+        let mut plan = index_doc("articles");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
+    }
 
     /// A BM25 score scan returns every row of the collection with no slot for
     /// the policy, so it is refused rather than silently over-returning.

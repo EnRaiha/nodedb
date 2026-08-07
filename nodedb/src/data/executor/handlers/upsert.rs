@@ -10,6 +10,7 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
@@ -22,6 +23,10 @@ pub(in crate::data::executor) struct UpsertParams<'a> {
     pub surrogate: Surrogate,
     pub value: &'a [u8],
     pub on_conflict_updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
+    /// Compiled RLS write policy gating the PERSIST, decided against whichever
+    /// body this call actually stores — the merged row on the conflict branch,
+    /// the incoming body on the insert branch. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -45,6 +50,7 @@ impl CoreLoop {
             surrogate,
             value,
             on_conflict_updates,
+            rls_write_check,
         } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -199,6 +205,22 @@ impl CoreLoop {
                     }
                 };
 
+                // Gate the persist on the collection's write policy, decided
+                // against the MERGED body — the row that will exist afterwards.
+                // The insert body alone would clear a write whose actual
+                // post-image the policy never saw, which is why this branch
+                // cannot be admitted at plan time.
+                if let Err(e) = rls_write_gate::admit_stored_row(
+                    rls_write_check,
+                    &stored_bytes,
+                    row_key,
+                    strict_schema.as_ref(),
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
+
                 // Write directly to storage. `current_bytes` is the
                 // pre-merge stored row, already read above — thread it to
                 // the Event Plane as `old_value` so the emitted WriteOp
@@ -287,6 +309,20 @@ impl CoreLoop {
             }
             Ok(None) => {
                 // Insert: document doesn't exist, create new (same as PointPut).
+                // The incoming body IS the post-image here, and the planner
+                // emits it as MessagePack for both storage modes (the strict
+                // tuple is encoded on the way to disk), so it is decoded
+                // without a schema.
+                if let Err(e) = rls_write_gate::admit_stored_row(
+                    rls_write_check,
+                    value,
+                    row_key,
+                    None,
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
                 let txn = match self.sparse.begin_write() {
                     Ok(t) => t,
                     Err(e) => {

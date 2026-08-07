@@ -62,7 +62,9 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
     task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-        target_collection, ..
+        target_collection,
+        rls_write_check,
+        ..
     }) = &task.plan
     else {
         // Callers only pass an `UpdateFromJoin` task; a mismatch is a bug.
@@ -71,8 +73,26 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
         });
     };
     let target_collection = target_collection.clone();
+    let rls_write_check = rls_write_check.clone();
 
     let resolved = resolve_update_rows(state, tenant_id, task).await?;
+
+    // Gate every matched row's post-image on the target's write policy. This
+    // expansion rewrites the statement into concrete `PointPut` ops the RLS
+    // injection pass has already run past, so the predicate compiled into the
+    // `UpdateFromJoin` plan is the last thing that can decide these rows;
+    // without the check here, expanding a governed update would launder it into
+    // ungoverned point writes.
+    if !rls_write_check.is_empty() {
+        for (_, _, body) in &resolved {
+            crate::control::security::rls::admit_compiled_write_image(
+                &rls_write_check,
+                body,
+                tenant_id.as_u64(),
+                &target_collection,
+            )?;
+        }
+    }
 
     let catalog = state.credentials.catalog();
     let target_bare = bare_collection_name(task.database_id, &target_collection);
@@ -165,9 +185,12 @@ async fn resolve_update_rows(
         returning: None,
         resolve_only: true,
         source_rows: Some(source_rows),
-        // Read-only resolve pass: it emits no rows to the client, so there is
-        // nothing for a read policy to gate here.
+        // Read-only resolve pass: it emits no rows to the client and writes
+        // nothing, so neither policy has anything to gate here. The caller
+        // decides the resolved post-images against the statement's write
+        // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets the target scan fold rows this transaction staged

@@ -230,6 +230,7 @@ pub async fn query(
                     resolved_inserts: None,
                     source_rows: _,
                     rls_filters: _,
+                    rls_write_check: _,
                 },
             ) = &task.plan
             {
@@ -280,6 +281,7 @@ pub async fn query(
                     resolve_only: false,
                     source_rows: None,
                     rls_filters: _,
+                    rls_write_check: _,
                 },
             ) = &task.plan
             {

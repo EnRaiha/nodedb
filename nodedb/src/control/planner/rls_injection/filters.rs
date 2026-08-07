@@ -18,6 +18,22 @@ pub(super) fn get_rls(
         .ok_or_else(|| rls_deny_error(tenant_id, collection))
 }
 
+/// Fetch the compiled write-policy bytes for a (tenant, collection) pair.
+///
+/// Fails closed on an unresolvable `$auth.*` reference through the same deny
+/// error the read fetch raises, so a write can never proceed on a predicate
+/// that could not be resolved.
+pub(super) fn get_rls_write(
+    rls_store: &RlsPolicyStore,
+    tenant_id: u64,
+    collection: &str,
+    auth: &AuthContext,
+) -> crate::Result<Vec<u8>> {
+    rls_store
+        .combined_write_predicate_with_auth(tenant_id, collection, auth)
+        .ok_or_else(|| rls_deny_error(tenant_id, collection))
+}
+
 /// Merge RLS filter bytes into existing filter bytes.
 ///
 /// If existing filters are empty, replace. Otherwise deserialize both,

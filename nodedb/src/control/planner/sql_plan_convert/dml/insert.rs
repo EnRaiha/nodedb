@@ -419,6 +419,9 @@ pub(in super::super) fn convert_upsert(
                         value: value_bytes,
                         on_conflict_updates: on_conflict_values.clone(),
                         surrogate,
+                        // Filled in by the RLS injection pass, which runs after
+                        // conversion.
+                        rls_write_check: Vec::new(),
                     })
                 };
                 tasks.push(PhysicalTask {

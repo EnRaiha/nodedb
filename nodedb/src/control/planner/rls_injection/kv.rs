@@ -73,38 +73,99 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              and the plan names only the index",
         ),
 
-        // No-op: writes, atomics, TTL mutations, transfers, and index DDL. The
-        // read policy does not apply; write policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`.
-        KvOp::Put { .. }
-        | KvOp::Insert { .. }
-        | KvOp::InsertIfAbsent { .. }
-        | KvOp::InsertOnConflictUpdate { .. }
-        | KvOp::Delete { .. }
-        | KvOp::Expire { .. }
-        | KvOp::Persist { .. }
-        | KvOp::BatchPut { .. }
-        | KvOp::FieldSet { .. }
-        | KvOp::Truncate { .. }
-        | KvOp::Incr { .. }
-        | KvOp::IncrFloat { .. }
-        | KvOp::Cas { .. }
-        | KvOp::GetSet { .. }
-        | KvOp::Transfer { .. }
-        | KvOp::TransferItem { .. }
-        | KvOp::RegisterIndex { .. }
+        // Refuse: the key-value engine stores opaque values rather than the
+        // field-addressed rows a policy predicate names, and the atomics,
+        // TTL mutations, and transfers derive their post-image from the stored
+        // value inside the handler. There is no point in this plan where the
+        // image a write policy decides can be evaluated, so a policy on the
+        // collection refuses the write instead of letting it through unchecked.
+        KvOp::Put { collection, .. }
+        | KvOp::Insert { collection, .. }
+        | KvOp::InsertIfAbsent { collection, .. }
+        | KvOp::InsertOnConflictUpdate { collection, .. }
+        | KvOp::Delete { collection, .. }
+        | KvOp::Expire { collection, .. }
+        | KvOp::Persist { collection, .. }
+        | KvOp::BatchPut { collection, .. }
+        | KvOp::FieldSet { collection, .. }
+        | KvOp::Truncate { collection, .. }
+        | KvOp::Incr { collection, .. }
+        | KvOp::IncrFloat { collection, .. }
+        | KvOp::Cas { collection, .. }
+        | KvOp::GetSet { collection, .. }
+        | KvOp::Transfer { collection, .. } => {
+            ctx.refuse_if_write_policy(collection, KV_WRITE_REASON)
+        }
+
+        // Refuse: a transfer moves an item between two collections, so a policy
+        // on either end restricts it.
+        KvOp::TransferItem {
+            source_collection,
+            dest_collection,
+            ..
+        } => {
+            ctx.refuse_if_write_policy(source_collection, KV_WRITE_REASON)?;
+            ctx.refuse_if_write_policy(dest_collection, KV_WRITE_REASON)
+        }
+
+        // No-op: index DDL writes no user row, so no row policy restricts it.
+        KvOp::RegisterIndex { .. }
         | KvOp::DropIndex { .. }
         | KvOp::RegisterSortedIndex { .. }
         | KvOp::DropSortedIndex { .. } => Ok(()),
     }
 }
 
+/// Why a key-value write cannot be gated by a row policy.
+const KV_WRITE_REASON: &str = "the key-value engine persists opaque values and derives every mutated image inside the \
+     handler, so no row image is available for the policy to be evaluated against";
+
 #[cfg(test)]
 mod tests {
     use nodedb_physical::physical_plan::KvOp;
 
-    use super::super::plan::test_support::{assert_refused, inject, store_with_read_policy};
+    use super::super::plan::test_support::{
+        assert_refused, assert_write_refused, inject, inject_without_policy,
+        store_with_read_policy, store_with_write_policy,
+    };
     use crate::bridge::envelope::PhysicalPlan;
+
+    fn kv_put(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Kv(KvOp::Put {
+            collection: collection.into(),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            ttl_ms: 0,
+            surrogate: nodedb_types::Surrogate::ZERO,
+        })
+    }
+
+    /// The key-value engine cannot evaluate a row predicate against the opaque
+    /// value it stores, so a write policy refuses the write rather than letting
+    /// it land unchecked.
+    #[test]
+    fn kv_put_is_refused_under_a_write_policy() {
+        let store = store_with_write_policy("sessions");
+        let mut plan = kv_put("sessions");
+        assert_write_refused(inject(&mut plan, &store), "sessions");
+    }
+
+    /// A policy on a different collection must not refuse this one.
+    #[test]
+    fn kv_put_on_an_unpoliced_collection_runs() {
+        let store = store_with_write_policy("other");
+        let mut plan = kv_put("sessions");
+        assert!(inject(&mut plan, &store).is_ok());
+    }
+
+    /// With no policy the write is untouched.
+    #[test]
+    fn kv_put_without_a_policy_is_untouched() {
+        let mut plan = kv_put("sessions");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
+    }
 
     /// A TTL probe on a policed collection discloses that a hidden key exists.
     #[test]
@@ -165,8 +226,6 @@ mod tests {
     /// caller sees exactly what it saw before.
     #[test]
     fn sorted_index_read_without_a_policy_is_untouched() {
-        use super::super::plan::test_support::inject_without_policy;
-
         let mut plan = PhysicalPlan::Kv(KvOp::SortedIndexTopK {
             index_name: "leaderboard".into(),
             k: 10,

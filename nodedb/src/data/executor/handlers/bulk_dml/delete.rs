@@ -8,6 +8,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec, StorageMode};
@@ -31,6 +32,11 @@ pub(in crate::data::executor) struct BulkDeleteParams<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy gating the REMOVAL, decided per row against
+    /// its pre-deletion image. A separate slot from `rls_filters`: that one
+    /// bounds what may be shown back, this one bounds what may be removed.
+    /// Empty = no write policy.
+    pub rls_write_check: &'a [u8],
     pub ollp: OllpPrediction<'a>,
 }
 
@@ -51,6 +57,7 @@ impl CoreLoop {
             filter_bytes,
             returning,
             rls_filters,
+            rls_write_check,
             ollp,
         } = params;
         let ollp_predicted_surrogates = ollp.surrogates;
@@ -180,6 +187,31 @@ impl CoreLoop {
                 StorageMode::Strict { schema } => Some(schema.clone()),
                 StorageMode::Schemaless => None,
             });
+
+        // Gate every matched row on the collection's write policy BEFORE any
+        // removal, so a rejected row cannot leave the rows ahead of it already
+        // deleted. The pre-deletion image is the only image a delete has. A row
+        // that is already absent is admitted: it removes nothing, so there is
+        // no image for the policy to restrict.
+        if !rls_write_check.is_empty() {
+            for doc_id in &apply_ids {
+                let stored = match self.sparse.get(database_id, tid, collection, doc_id) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
+                    Err(e) => return self.response_error(task, e),
+                };
+                if let Err(e) = rls_write_gate::admit_stored_row(
+                    rls_write_check,
+                    &stored,
+                    doc_id,
+                    strict_schema.as_ref(),
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
+            }
+        }
 
         // Delete each matching document with full cascade.
         let mut affected = 0u64;

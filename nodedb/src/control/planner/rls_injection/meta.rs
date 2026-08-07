@@ -66,8 +66,9 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         // No-op: durability, cancellation, snapshot install, purge, retention,
         // index and synonym maintenance, transaction-overlay bookkeeping, and
         // continuous-aggregate administration. None of these returns stored
-        // rows to a caller; write policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`.
+        // rows to a caller, and none writes a user row a policy predicate could
+        // be evaluated against — they are authorized by the permission check
+        // that precedes this pass.
         MetaOp::WalAppend { .. }
         | MetaOp::Cancel { .. }
         | MetaOp::CreateSnapshot

@@ -198,20 +198,22 @@ impl CoreLoop {
                 collection,
                 document_id,
                 surrogate,
+                rls_write_check,
                 ..
             } => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                self.stage_point_delete(&ctx)
+                self.stage_point_delete(&ctx, rls_write_check)
             }
             DocumentOp::PointUpdate {
                 collection,
                 document_id,
                 surrogate,
                 updates,
+                rls_write_check,
                 ..
             } => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                self.stage_point_update(&ctx, updates)
+                self.stage_point_update(&ctx, updates, rls_write_check)
             }
             // Predicate UPDATE staged at statement time — same treatment as a
             // point update, resolved against the BASE ∪ OVERLAY matching set.
@@ -227,6 +229,7 @@ impl CoreLoop {
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
                 rls_filters: _,
+                rls_write_check,
             } => self.stage_bulk_update(StageBulkUpdateParams {
                 task,
                 tid,
@@ -234,6 +237,7 @@ impl CoreLoop {
                 collection,
                 filter_bytes: filters,
                 updates,
+                rls_write_check,
             }),
 
             // Predicate DELETE staged at statement time — same treatment as a
@@ -247,12 +251,14 @@ impl CoreLoop {
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
                 rls_filters: _,
+                rls_write_check,
             } => self.stage_bulk_delete(StageBulkDeleteParams {
                 task,
                 tid,
                 txn_id,
                 collection,
                 filter_bytes: filters,
+                rls_write_check,
             }),
 
             // `UPSERT INTO` staged at statement time -- resolve the current
@@ -266,9 +272,10 @@ impl CoreLoop {
                 value,
                 on_conflict_updates,
                 surrogate,
+                rls_write_check,
             } => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                self.stage_document_upsert(&ctx, value, on_conflict_updates)
+                self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check)
             }
 
             // `INSERT ... SELECT` is resolved + staged as concrete
@@ -320,6 +327,41 @@ impl CoreLoop {
             Some(Staged::Tombstone) => OverlayPk::Absent,
             None => OverlayPk::Unstaged,
         }
+    }
+
+    /// Decide one staged row body against the compiled RLS write policy.
+    ///
+    /// Staging is where an in-transaction statement's row image is produced, so
+    /// it is where the write policy has to decide it: the COMMIT install writes
+    /// the overlay's bodies as they stand rather than re-deriving them, and the
+    /// Control-Plane injection pass never sees them at all. A rejected row fails
+    /// the statement, leaving the transaction to be rolled back — the overlay is
+    /// never durable, so nothing it holds survives that.
+    ///
+    /// `body` is the STORED form, so the decode resolves the collection's
+    /// storage mode; a strict collection's Binary Tuple read as MessagePack
+    /// would yield a document with no columns and reject permitted writes.
+    pub(in crate::data::executor) fn stage_admit_write(
+        &self,
+        rls_write_check: &[u8],
+        body: &[u8],
+        doc_id: &str,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<()> {
+        if rls_write_check.is_empty() {
+            return Ok(());
+        }
+        let schema = self.resolve_strict_schema(database_id, tid, collection);
+        crate::data::executor::handlers::rls_write_gate::admit_stored_row(
+            rls_write_check,
+            body,
+            doc_id,
+            schema.as_ref(),
+            tid,
+            collection,
+        )
     }
 
     /// Stage a put after enforcing the per-transaction overlay memory cap.

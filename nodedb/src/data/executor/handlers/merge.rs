@@ -64,6 +64,12 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// Compiled RLS read policy of the TARGET collection, gating the
     /// `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy of the TARGET collection, gating the PERSIST.
+    /// Every arm writes a target row, decided against the image it stores: the
+    /// post-image for an UPDATE or INSERT arm, the pre-image for a DELETE arm.
+    /// A separate slot from `rls_filters`: that one bounds what may be shown
+    /// back, this one bounds what may be written. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -117,6 +123,7 @@ impl CoreLoop {
             // rewrites the statement into concrete point ops before dispatch).
             returning: _,
             rls_filters: _,
+            rls_write_check,
         } = params;
 
         debug!(
@@ -219,6 +226,7 @@ impl CoreLoop {
                             clause: arm,
                             strict_schema: &strict_schema,
                             has_vectors,
+                            rls_write_check,
                         },
                     ) {
                         Ok(true) => affected += 1,
@@ -248,6 +256,7 @@ impl CoreLoop {
                             clause: arm,
                             strict_schema: &strict_schema,
                             has_vectors,
+                            rls_write_check,
                         },
                     ) {
                         Ok(true) => affected += 1,
@@ -278,6 +287,7 @@ impl CoreLoop {
                         source_alias,
                         clause: arm,
                         strict_schema: &strict_schema,
+                        rls_write_check,
                     },
                 ) {
                     Ok(true) => affected += 1,

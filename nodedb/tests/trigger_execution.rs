@@ -152,6 +152,7 @@ fn classify_point_delete() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "orders");
@@ -172,6 +173,7 @@ fn classify_point_update() {
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "users");
@@ -190,6 +192,7 @@ fn classify_bulk_delete() {
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "logs");

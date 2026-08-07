@@ -10,6 +10,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningSpec, StorageMode};
 use nodedb_types::Surrogate;
@@ -24,6 +25,11 @@ pub(in crate::data::executor) struct PointDeleteExec<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy gating the REMOVAL, decided against the row's
+    /// pre-deletion image — the only image a delete has. A separate slot from
+    /// `rls_filters`: that one bounds what may be shown back, this one bounds
+    /// what may be removed. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -39,10 +45,19 @@ impl CoreLoop {
             surrogate,
             returning,
             rls_filters,
+            rls_write_check,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, "point delete");
 
         let database_id = task.request.database_id.as_u64();
+
+        // Gate the removal on the collection's write policy, decided against
+        // the row's pre-deletion image. The read happens BEFORE the cascade:
+        // `apply_point_delete` commits the doc-store removal internally, so
+        // checking its returned prior value would decide a row already gone.
+        if let Err(e) = self.gate_point_delete(task, tid, collection, surrogate, rls_write_check) {
+            return self.response_error(task, e);
+        }
 
         // Doc-store write + all index cascades, via `apply_point_delete`.
         // The doc-store transaction is committed internally before any
@@ -162,5 +177,56 @@ impl CoreLoop {
             // so the surrogate is no evidence a row was there to remove.
             self.response_affected(task, u64::from(prior.is_some()))
         }
+    }
+
+    /// Decide a single row's removal against the compiled write policy.
+    ///
+    /// A row that is already absent is admitted: the delete removes nothing, so
+    /// there is no image for the policy to restrict and no state change to
+    /// refuse. Reads through the same current-state view the delete cascade
+    /// uses, so a bitemporal collection is decided on its live version rather
+    /// than a superseded one.
+    fn gate_point_delete(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        surrogate: Surrogate,
+        rls_write_check: &[u8],
+    ) -> crate::Result<()> {
+        if rls_write_check.is_empty() {
+            return Ok(());
+        }
+        let database_id = task.request.database_id.as_u64();
+        let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
+        let row_key = row_key.as_str();
+        let stored = if self.is_bitemporal(database_id, tid, collection) {
+            self.sparse
+                .versioned_get_current(database_id, tid, collection, row_key)?
+        } else {
+            self.sparse.get(database_id, tid, collection, row_key)?
+        };
+        let Some(body) = stored else {
+            return Ok(());
+        };
+        let strict_schema = self
+            .doc_configs
+            .get(&(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection.to_string(),
+            ))
+            .and_then(|c| match &c.storage_mode {
+                StorageMode::Strict { schema } => Some(schema),
+                StorageMode::Schemaless => None,
+            });
+        rls_write_gate::admit_stored_row(
+            rls_write_check,
+            &body,
+            row_key,
+            strict_schema,
+            tid,
+            collection,
+        )
     }
 }

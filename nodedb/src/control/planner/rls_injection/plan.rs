@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Read-path RLS injection into physical plans.
+//! RLS resolution for physical plans — both halves of it.
 //!
 //! The walk is exhaustive over [`PhysicalPlan`] and over every engine's own
 //! operation enum, split one module per engine. Each variant resolves to
-//! exactly one of three outcomes:
+//! exactly one outcome:
 //!
 //! - **Inject** — the op reads rows and its plan node carries a filter slot
 //!   (`filters` for storage pushdown, `rls_filters` for post-fetch evaluation).
 //! - **Refuse** — the op reads protected data through a result shape that
-//!   cannot carry a row filter, so the plan is rejected with
-//!   `Error::PlanError` while a policy applies.
-//! - **No-op** — the op is a write, a DDL/maintenance action, or a control
-//!   operation that returns no stored rows.
+//!   cannot carry a row filter, or writes a row whose post-image the plan does
+//!   not carry, so the plan is rejected with `Error::PlanError` while a policy
+//!   applies.
+//! - **Admit** — the op writes a row the plan carries in full, so the write
+//!   policy is evaluated against that image and a violating row fails the
+//!   statement with `Error::RejectedAuthz`.
+//! - **No-op** — the op is a DDL/maintenance action or a control operation
+//!   that neither returns nor writes a stored row.
+//!
+//! A write is never a silent no-op: a write policy that changes nothing is
+//! indistinguishable from no policy at all, which is the failure this pass
+//! exists to prevent.
 //!
 //! The redaction pass in `redaction_refusal` walks the same plan for the same
 //! identity and had to make the same per-variant calls; the two stay
@@ -29,7 +37,8 @@ use super::context::RlsCtx;
 
 /// Inject RLS predicates into physical tasks after plan conversion.
 ///
-/// This is the read-path RLS enforcement entry point. For each task:
+/// This is the RLS enforcement entry point for planner-produced work. For each
+/// read task:
 /// 1. Extracts the collection name from the physical plan.
 /// 2. Fetches RLS read policies for `(tenant_id, collection)`.
 /// 3. Substitutes `$auth.*` references using the `AuthContext`.
@@ -41,8 +50,13 @@ use super::context::RlsCtx;
 /// **Caller**: Session query execution, after DataFusion logical planning.
 /// **Superuser bypass**: Handled inside `combined_read_predicate_with_auth`.
 ///
-/// Returns `Err` if a required `$auth` field is missing (fail-closed), or if
-/// the plan reads protected data through a shape no row filter can cover.
+/// For each write task, the collection's write policy either admits the row
+/// image the plan carries or refuses the statement when it carries none.
+///
+/// Returns `Err` if a required `$auth` field is missing (fail-closed), if the
+/// plan reads protected data through a shape no row filter can cover, if it
+/// writes a row a write policy rejects, or if it writes through a shape whose
+/// post-image the write policy cannot be evaluated against.
 pub fn inject_rls(
     tasks: &mut [PhysicalTask],
     rls_store: &RlsPolicyStore,
@@ -132,6 +146,71 @@ pub(super) mod test_support {
             .create_policy(policy)
             .expect("create read policy for test");
         store
+    }
+
+    /// A store holding one policy of `policy_type` restricting `collection` to
+    /// `owner_id = $auth.id`.
+    pub(in crate::control::planner::rls_injection) fn store_with_policy(
+        collection: &str,
+        policy_type: PolicyType,
+    ) -> RlsPolicyStore {
+        store_with_predicate(
+            collection,
+            policy_type,
+            RlsPredicate::Compare {
+                field: "owner_id".into(),
+                op: CompareOp::Eq,
+                value: PredicateValue::AuthRef("id".into()),
+            },
+        )
+    }
+
+    /// A store holding one `Write` policy restricting `collection`.
+    pub(in crate::control::planner::rls_injection) fn store_with_write_policy(
+        collection: &str,
+    ) -> RlsPolicyStore {
+        store_with_policy(collection, PolicyType::Write)
+    }
+
+    /// A store holding one policy carrying an arbitrary predicate.
+    pub(in crate::control::planner::rls_injection) fn store_with_predicate(
+        collection: &str,
+        policy_type: PolicyType,
+        predicate: RlsPredicate,
+    ) -> RlsPolicyStore {
+        let store = RlsPolicyStore::new();
+        store
+            .create_policy(RlsPolicy {
+                name: format!("{collection}_{policy_type:?}"),
+                collection: collection.into(),
+                tenant_id: TENANT,
+                policy_type,
+                compiled_predicate: Some(predicate),
+                mode: Default::default(),
+                on_deny: Default::default(),
+                enabled: true,
+                created_by: "admin".into(),
+                created_at: 0,
+            })
+            .expect("create policy for test");
+        store
+    }
+
+    /// Assert the injector refused the write with a typed plan error naming
+    /// `collection`.
+    pub(in crate::control::planner::rls_injection) fn assert_write_refused(
+        result: crate::Result<()>,
+        collection: &str,
+    ) {
+        match result {
+            Err(crate::Error::PlanError { detail }) => {
+                assert!(
+                    detail.contains(collection) && detail.contains("write policy"),
+                    "refusal must name the collection and the write policy; got {detail}"
+                )
+            }
+            other => panic!("expected PlanError write refusal, got {other:?}"),
+        }
     }
 
     /// An ordinary (non-superuser) authenticated session.
@@ -304,8 +383,9 @@ mod tests {
         assert_refused(inject(&mut plan, &store), "docs");
     }
 
-    /// A write op under a policed collection is untouched: write RLS is
-    /// enforced separately by `check_write_with_auth`.
+    /// A read policy restricts only reads: a write op under a collection that
+    /// carries one is left exactly as planned. The write half of this pass is
+    /// keyed on write policies, which this store holds none of.
     #[test]
     fn a_write_op_is_untouched_by_the_read_pass() {
         let store = store_with_read_policy("docs");

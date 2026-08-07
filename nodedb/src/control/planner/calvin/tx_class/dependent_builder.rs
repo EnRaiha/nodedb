@@ -262,6 +262,7 @@ mod tests {
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: vec![],
+                rls_write_check: vec![],
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

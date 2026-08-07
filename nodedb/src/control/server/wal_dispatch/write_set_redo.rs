@@ -174,6 +174,7 @@ mod tests {
             updates: Vec::new(),
             returning: None::<ReturningSpec>,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -188,6 +189,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -206,6 +208,7 @@ mod tests {
             resolve_only: false,
             source_rows: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -219,6 +222,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }

@@ -191,6 +191,39 @@ impl<'a> CollectionReadGate<'a> {
         ))
     }
 
+    /// Fail closed when a write policy exists on `collection`.
+    ///
+    /// A hand-built write reaches the Data Plane without the planner's RLS
+    /// pass, so the write-policy verdict that pass reaches for the same shape
+    /// has to be reached here too. None of these handlers holds the row image a
+    /// write policy decides — an atomic increment, a compare-and-swap, and a
+    /// version restore all derive their post-image from stored state inside the
+    /// handler — so the verdict is refusal.
+    ///
+    /// `what` names the operation, completing "…cannot be enforced for {what}".
+    pub fn refuse_if_write_policy(&self, collection: &str, what: &str) -> Result<(), DdlError> {
+        let unrestricted = self
+            .state
+            .rls
+            .combined_write_predicate_with_auth(
+                self.tenant_id().as_u64(),
+                collection,
+                self.scope.auth(),
+            )
+            .is_some_and(|filters| filters.is_empty());
+        if unrestricted {
+            return Ok(());
+        }
+        Err(gate_err(
+            FEATURE_NOT_SUPPORTED,
+            format!(
+                "RLS write policies on '{collection}' cannot be enforced for {what}: it derives \
+                 the row it persists from stored state, so no row image is available for the \
+                 policy to be evaluated against"
+            ),
+        ))
+    }
+
     /// The redaction inputs for rows delivered from `collections`.
     pub fn redaction_for<'c, I>(&self, collections: I) -> QueryRedaction
     where

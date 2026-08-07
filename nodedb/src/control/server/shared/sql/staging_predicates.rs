@@ -371,6 +371,7 @@ mod tests {
             updates: Vec::new(),
             returning: ret(),
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert!(is_point_write(&point_update));
         assert!(is_stageable_write(&point_update));
@@ -383,6 +384,7 @@ mod tests {
             pk_bytes: Vec::new(),
             returning: ret(),
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert!(is_stageable_write(&point_delete));
         assert_eq!(staged_tag_kind(&point_delete, &[]), StagedTagKind::Delete);
@@ -395,6 +397,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert!(is_stageable_write(&bulk_update));
         assert_eq!(staged_tag_kind(&bulk_update, &[]), StagedTagKind::Update);
@@ -406,6 +409,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert!(is_stageable_write(&bulk_delete));
         assert_eq!(staged_tag_kind(&bulk_delete, &[]), StagedTagKind::Delete);

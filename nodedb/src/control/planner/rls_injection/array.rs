@@ -25,7 +25,10 @@ pub(super) fn inject_array(_ctx: &RlsCtx<'_>, op: &ArrayOp) -> crate::Result<()>
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => Ok(()),
 
-        // No-op: cell writes, array DDL, and storage maintenance.
+        // No-op: cell writes, array DDL, and storage maintenance. An array is
+        // addressed by `ArrayId` rather than a collection name, and RLS
+        // policies are keyed on collections, so no policy — read or write — can
+        // name what these touch.
         ArrayOp::OpenArray { .. }
         | ArrayOp::Put { .. }
         | ArrayOp::Delete { .. }

@@ -24,6 +24,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
@@ -80,6 +81,11 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     /// Compiled RLS read policy of the TARGET collection, gating the
     /// `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy of the TARGET collection, gating the PERSIST,
+    /// decided per matched row against its post-image. A separate slot from
+    /// `rls_filters`: that one bounds what may be shown back, this one bounds
+    /// what may be written. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -102,6 +108,7 @@ impl CoreLoop {
             resolve_only,
             source_rows,
             rls_filters,
+            rls_write_check,
         } = params;
 
         debug!(
@@ -216,6 +223,22 @@ impl CoreLoop {
         // No `sparse.put`, no vector re-index, no write-set, no events.
         if resolve_only {
             return self.encode_resolved_update_rows(task, rows);
+        }
+
+        // Gate every matched target row on the TARGET's write policy before any
+        // write, so a rejected row cannot leave the rows ahead of it rewritten.
+        // `row.doc` carries the assignments and any regenerated columns already
+        // applied, so it is the row that would exist afterwards. The RESOLVE
+        // pass returns above without writing; the Control-Plane expander that
+        // consumes it gates the point ops it emits.
+        if !rls_write_check.is_empty() {
+            for row in &rows {
+                if let Err(e) =
+                    rls_write_gate::admit_row(rls_write_check, &row.doc, tid, target_collection)
+                {
+                    return self.response_error(task, e);
+                }
+            }
         }
 
         // Gate secondary-vector maintenance once for the whole statement so a

@@ -154,6 +154,7 @@ pub(crate) fn build_point_delete(
                 pk_bytes,
                 returning: None,
                 rls_filters: Vec::new(),
+                rls_write_check: Vec::new(),
             }))
         }
     }
@@ -254,6 +255,7 @@ pub(crate) fn build_update(
         updates,
         returning: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -297,6 +299,7 @@ pub(crate) fn build_upsert(
         // merge semantics apply.
         on_conflict_updates: Vec::new(),
         surrogate,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -333,6 +336,7 @@ pub(crate) fn build_bulk_update(
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -354,6 +358,7 @@ pub(crate) fn build_bulk_delete(
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     }))
 }
 

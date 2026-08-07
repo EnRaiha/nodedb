@@ -33,6 +33,9 @@ pub(in crate::data::executor) struct StageBulkUpdateParams<'a> {
     pub collection: &'a str,
     pub filter_bytes: &'a [u8],
     pub updates: &'a [(String, UpdateValue)],
+    /// Compiled RLS write policy gating each matched row's staged post-image.
+    /// Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -51,6 +54,7 @@ impl CoreLoop {
             collection,
             filter_bytes,
             updates,
+            rls_write_check,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
@@ -137,6 +141,20 @@ impl CoreLoop {
                 Ok(b) => b,
                 Err(e) => return self.response_error(task, e),
             };
+            // Gate this row's staged post-image on the collection's write
+            // policy. A rejected row fails the statement rather than being
+            // skipped: skipping would under-report `affected` while the rest of
+            // the predicate's matches were still rewritten.
+            if let Err(e) = self.stage_admit_write(
+                rls_write_check,
+                &new_body,
+                row_key,
+                database_id.as_u64(),
+                tid,
+                collection,
+            ) {
+                return self.response_error(task, e);
+            }
             if let Err(e) =
                 self.stage_bulk_put_capped(txn_id, &coll_key, surrogate, row_key, new_body)
             {

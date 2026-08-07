@@ -8,9 +8,14 @@
 //! of collection configuration — the installed constraint set, the conflict
 //! policy, the oplog version vector — carry no row content and pass.
 //!
-//! The two DML ops are the exception: a `RETURNING` clause on them emits row
-//! bodies the handler holds in full, so they carry a post-fetch filter slot and
-//! the policy lands there rather than refusing the statement.
+//! The two DML ops are the exception for the read half: a `RETURNING` clause on
+//! them emits row bodies the handler holds in full, so they carry a post-fetch
+//! filter slot and the policy lands there rather than refusing the statement.
+//!
+//! No CRDT write can be gated here at all: what gets persisted is always the
+//! merge of the submitted change with the document's existing state, and that
+//! merge runs in the Data Plane. A write policy on the collection therefore
+//! refuses the statement rather than admitting an image it never saw.
 
 use nodedb_physical::physical_plan::CrdtOp;
 
@@ -18,6 +23,9 @@ use super::context::RlsCtx;
 
 const ROW_CONTENT_REASON: &str =
     "the CRDT read returns merged document state through a payload that carries no row filter";
+
+const MERGED_IMAGE_REASON: &str = "the persisted state is the merge of this change with the document's existing CRDT state, so \
+     no row image is available for the policy to be evaluated against";
 
 /// Exhaustive over [`CrdtOp`] so a new CRDT operation forces a decision
 /// between injecting, refusing, and no-op.
@@ -56,22 +64,36 @@ pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &mut CrdtOp) -> crate::Result<()
             collection,
             rls_filters,
             ..
-        } => ctx.set_post_filters(collection, rls_filters),
+        } => {
+            ctx.set_post_filters(collection, rls_filters)?;
+            ctx.refuse_if_write_policy(collection, MERGED_IMAGE_REASON)
+        }
 
-        // No-op: writes that surface no row, snapshot install, history
-        // maintenance, and the constraint / policy DDL. Write policies are
-        // enforced separately by `RlsPolicyStore::check_write_with_auth`.
-        CrdtOp::Apply { .. }
-        | CrdtOp::ApplyAuthenticated { .. }
-        | CrdtOp::ImportSnapshot { .. }
-        | CrdtOp::SetConstraints { .. }
+        // Refuse: every one of these persists a state produced by merging a
+        // delta, a list edit, a snapshot, or a historical version into the
+        // document's existing Loro state, so the image a write policy decides
+        // exists only after that merge runs in the Data Plane.
+        //
+        // The externally-submitted deltas that arrive over the sync transports
+        // do not reach this pass: they are admitted through
+        // `ExternalCrdtPostImagePolicy`, which evaluates the same write
+        // policies against the Data Plane's authoritative post-image preview.
+        CrdtOp::Apply { collection, .. }
+        | CrdtOp::ApplyAuthenticated { collection, .. }
+        | CrdtOp::ImportSnapshot { collection, .. }
+        | CrdtOp::RestoreToVersion { collection, .. }
+        | CrdtOp::CompactAtVersion { collection, .. }
+        | CrdtOp::ListInsert { collection, .. }
+        | CrdtOp::ListDelete { collection, .. }
+        | CrdtOp::ListMove { collection, .. } => {
+            ctx.refuse_if_write_policy(collection, MERGED_IMAGE_REASON)
+        }
+
+        // No-op: the constraint set and the conflict-resolution policy describe
+        // the collection, not its rows, so no row policy restricts writing them.
+        CrdtOp::SetConstraints { .. }
         | CrdtOp::DropConstraints { .. }
-        | CrdtOp::SetPolicy { .. }
-        | CrdtOp::RestoreToVersion { .. }
-        | CrdtOp::CompactAtVersion { .. }
-        | CrdtOp::ListInsert { .. }
-        | CrdtOp::ListDelete { .. }
-        | CrdtOp::ListMove { .. } => Ok(()),
+        | CrdtOp::SetPolicy { .. } => Ok(()),
     }
 }
 
@@ -127,6 +149,26 @@ mod tests {
             }
             other => panic!("plan shape changed: {other:?}"),
         }
+    }
+
+    /// What a CRDT write persists is the merge of the submitted change with
+    /// the document's existing state, so a write policy refuses the statement
+    /// rather than admitting an image the planner never saw.
+    #[test]
+    fn doc_upsert_is_refused_under_a_write_policy() {
+        use super::super::plan::test_support::{assert_write_refused, store_with_write_policy};
+
+        let store = store_with_write_policy("notes");
+        let mut plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            collection: "notes".into(),
+            document_id: "d1".into(),
+            fields_json: "{}".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            partial: false,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        assert_write_refused(inject(&mut plan, &store), "notes");
     }
 
     /// Reading the conflict policy discloses configuration, not rows.

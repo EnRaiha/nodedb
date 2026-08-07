@@ -380,6 +380,7 @@ fn document_indexes_consistent_after_simulated_crash() {
             pk_bytes: b"a1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 

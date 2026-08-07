@@ -60,6 +60,20 @@ fn missing_prediction_error(collection: &str) -> crate::Error {
     }
 }
 
+/// Borrowed inputs for [`CoreLoop::stage_calvin_bulk_update`], grouped so the
+/// method stays within the argument-count limit.
+pub(in crate::data::executor) struct CalvinBulkUpdateStage<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub txn_id: TxnId,
+    pub collection: &'a str,
+    pub updates: &'a [(String, UpdateValue)],
+    pub ollp_predicted_surrogates: Option<&'a [u32]>,
+    /// Compiled RLS write policy gating each staged post-image. Empty = no
+    /// write policy.
+    pub rls_write_check: &'a [u8],
+}
+
 impl CoreLoop {
     /// Stage a Calvin `BulkDelete` into the overlay: one tombstone per
     /// predicted surrogate, resolved to its doc-id via
@@ -72,6 +86,7 @@ impl CoreLoop {
         txn_id: TxnId,
         collection: &str,
         ollp_predicted_surrogates: Option<&[u32]>,
+        rls_write_check: &[u8],
     ) -> crate::Result<()> {
         let Some(predicted) = ollp_predicted_surrogates else {
             return Err(missing_prediction_error(collection));
@@ -85,6 +100,28 @@ impl CoreLoop {
         let mut predicted_sorted: Vec<u32> = predicted.to_vec();
         predicted_sorted.sort_unstable();
         let doc_ids = ollp_predicted_doc_ids(predicted);
+
+        // Decide every predicted row's pre-deletion image against the write
+        // policy BEFORE any tombstone is staged, so a rejected row cannot leave
+        // the rows ahead of it hidden from the rest of the transaction. A row
+        // with no current body removes nothing and is admitted.
+        if !rls_write_check.is_empty() {
+            for doc_id in &doc_ids {
+                if let Some(body) =
+                    self.sparse
+                        .get(task.request.database_id.as_u64(), tid, collection, doc_id)?
+                {
+                    self.stage_admit_write(
+                        rls_write_check,
+                        &body,
+                        doc_id,
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                    )?;
+                }
+            }
+        }
 
         let overlay = self.txn_overlay_mut(txn_id);
         for (surrogate, doc_id) in predicted_sorted.into_iter().zip(doc_ids) {
@@ -109,13 +146,17 @@ impl CoreLoop {
     /// for its own `apply_ids` loop.
     pub(in crate::data::executor) fn stage_calvin_bulk_update(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        updates: &[(String, UpdateValue)],
-        ollp_predicted_surrogates: Option<&[u32]>,
+        params: CalvinBulkUpdateStage<'_>,
     ) -> crate::Result<()> {
+        let CalvinBulkUpdateStage {
+            task,
+            tid,
+            txn_id,
+            collection,
+            updates,
+            ollp_predicted_surrogates,
+            rls_write_check,
+        } = params;
         let Some(predicted) = ollp_predicted_surrogates else {
             return Err(missing_prediction_error(collection));
         };
@@ -166,6 +207,16 @@ impl CoreLoop {
                 collection,
                 &current_bytes,
                 updates,
+            )?;
+            // Decide the staged post-image against the write policy: this is
+            // the row the Calvin flush will install.
+            self.stage_admit_write(
+                rls_write_check,
+                &new_body,
+                &doc_id,
+                database_id.as_u64(),
+                tid,
+                collection,
             )?;
             self.stage_bulk_put_capped(txn_id, &coll_key, surrogate, &doc_id, new_body)?;
         }

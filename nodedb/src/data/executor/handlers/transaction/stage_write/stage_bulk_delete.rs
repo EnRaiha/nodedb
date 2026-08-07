@@ -27,6 +27,9 @@ pub(in crate::data::executor) struct StageBulkDeleteParams<'a> {
     pub txn_id: TxnId,
     pub collection: &'a str,
     pub filter_bytes: &'a [u8],
+    /// Compiled RLS write policy gating each matched row's removal, decided
+    /// against its pre-deletion image. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -44,6 +47,7 @@ impl CoreLoop {
             txn_id,
             collection,
             filter_bytes,
+            rls_write_check,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
@@ -98,6 +102,26 @@ impl CoreLoop {
             self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
             if predicate_err.take().is_some() {
                 return self.response_error(task, ErrorCode::DivisionByZero);
+            }
+        }
+
+        // Gate every matched row on the collection's write policy BEFORE any
+        // tombstone is staged, so a rejected row cannot leave the rows ahead of
+        // it already hidden from the rest of the transaction. Each row's
+        // current BASE ∪ OVERLAY body is the pre-deletion image the policy
+        // decides — the only image a delete has.
+        if !rls_write_check.is_empty() {
+            for (row_key, body) in &rows {
+                if let Err(e) = self.stage_admit_write(
+                    rls_write_check,
+                    body,
+                    row_key,
+                    database_id.as_u64(),
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
             }
         }
 

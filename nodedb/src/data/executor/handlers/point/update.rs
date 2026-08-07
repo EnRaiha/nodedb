@@ -14,6 +14,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_physical::physical_plan::{ReturningSpec, StorageMode, UpdateValue};
@@ -29,6 +30,11 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Compiled RLS write policy gating the PERSIST, decided against the
+    /// post-update image. A separate slot from `rls_filters`: that one bounds
+    /// what may be shown back, this one bounds what may be written. Empty = no
+    /// write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 use super::update_reindex_secondary::UpdateSecondaryReindex;
@@ -47,6 +53,7 @@ impl CoreLoop {
             updates,
             returning,
             rls_filters,
+            rls_write_check,
         } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -273,6 +280,22 @@ impl CoreLoop {
                         doc_format::encode_to_msgpack(&doc)
                     }
                 };
+
+                // Gate the persist on the collection's write policy, decided
+                // against the post-update image the row will actually hold.
+                // Placed after the generated columns are recomputed — a policy
+                // may reference one — and before any store or index is touched,
+                // so a rejected row leaves nothing behind.
+                if let Err(e) = rls_write_gate::admit_stored_row(
+                    rls_write_check,
+                    &updated_bytes,
+                    document_id,
+                    strict_schema.as_ref(),
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
 
                 // The plain `INDEXES` secondary-index paths for this collection.
                 // The non-bitemporal write must reconcile these atomically with

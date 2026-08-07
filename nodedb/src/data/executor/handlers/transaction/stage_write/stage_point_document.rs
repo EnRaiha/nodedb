@@ -86,7 +86,11 @@ impl CoreLoop {
         self.stage_encode_and_commit(ctx, value)
     }
 
-    pub(in crate::data::executor) fn stage_point_delete(&mut self, ctx: &StageCtx<'_>) -> Response {
+    pub(in crate::data::executor) fn stage_point_delete(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        rls_write_check: &[u8],
+    ) -> Response {
         // Resolve the row against BASE ∪ OVERLAY first — the same probe the
         // staged INSERT runs. A delete only affects a row that is actually
         // there: the primary key resolves to a surrogate whether or not the row
@@ -111,6 +115,28 @@ impl CoreLoop {
             return self.stage_count_response(ctx.task, 0);
         }
 
+        // Gate the removal on the collection's write policy, decided against
+        // the row as this transaction currently sees it (BASE ∪ OVERLAY) — the
+        // only image a delete has, and the one the COMMIT install will remove.
+        if !rls_write_check.is_empty() {
+            let current = match self.resolve_doc_current(ctx) {
+                Ok(body) => body,
+                Err(e) => return self.response_error(ctx.task, e),
+            };
+            if let Some(body) = current
+                && let Err(e) = self.stage_admit_write(
+                    rls_write_check,
+                    &body,
+                    row_key.as_str(),
+                    ctx.database_id,
+                    ctx.tid,
+                    ctx.collection,
+                )
+            {
+                return self.response_error(ctx.task, e);
+            }
+        }
+
         self.txn_overlay_mut(ctx.txn_id).insert_tombstone(
             ctx.coll_key.clone(),
             ctx.surrogate.0,
@@ -123,6 +149,7 @@ impl CoreLoop {
         &mut self,
         ctx: &StageCtx<'_>,
         updates: &[(String, UpdateValue)],
+        rls_write_check: &[u8],
     ) -> Response {
         let config_key = (
             crate::types::DatabaseId::new(ctx.database_id),
@@ -180,6 +207,19 @@ impl CoreLoop {
             Ok(b) => b,
             Err(e) => return self.response_error(ctx.task, e),
         };
+        // Gate the staged post-image on the collection's write policy: this is
+        // the row the COMMIT install will write, and the assignments and any
+        // regenerated columns are already applied to it.
+        if let Err(e) = self.stage_admit_write(
+            rls_write_check,
+            &body,
+            row_key.as_str(),
+            ctx.database_id,
+            ctx.tid,
+            ctx.collection,
+        ) {
+            return self.response_error(ctx.task, e);
+        }
         if let Err(e) = self.stage_put_capped(ctx, body) {
             return self.response_error(ctx.task, e);
         }

@@ -23,6 +23,9 @@ use super::context::RlsCtx;
 const TRAVERSAL_REASON: &str =
     "a traversal returns graph topology, which the row filter cannot be evaluated against";
 
+const EDGE_WRITE_REASON: &str = "an edge write carries endpoints and a label rather than the row body the policy names, so no \
+     row image is available for it to be evaluated against";
+
 const ALGORITHM_REASON: &str = "an algorithm returns per-node scalars computed over every edge, which the row filter cannot \
      be evaluated against";
 
@@ -107,15 +110,28 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &GraphOp) -> crate::Result<()> 
             ),
         },
 
-        // No-op: edge and node-label writes carry no read result. Write
-        // policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`.
-        GraphOp::EdgePut { .. }
-        | GraphOp::EdgePutBatch { .. }
-        | GraphOp::EdgeDelete { .. }
-        | GraphOp::EdgeDeleteBatch { .. }
-        | GraphOp::SetNodeLabels { .. }
-        | GraphOp::RemoveNodeLabels { .. } => Ok(()),
+        // Refuse: an edge write carries endpoints and a label, not the row body
+        // a policy predicate names, so there is no image the write policy can
+        // be evaluated against. Topology is exactly what a read policy on this
+        // collection already refuses to disclose, and writing it is the same
+        // claim in reverse.
+        GraphOp::EdgePut { collection, .. } | GraphOp::EdgeDelete { collection, .. } => {
+            ctx.refuse_if_write_policy(collection, EDGE_WRITE_REASON)
+        }
+
+        // Refuse: the batch forms name no collection — each edge carries its
+        // own — so the narrow question cannot be asked, and node labels are
+        // keyed on a node id that no plan field binds to a collection. Both
+        // fall back to the tenant-wide question, the same fallback every
+        // collection-less shape in this pass uses.
+        GraphOp::EdgePutBatch { .. } | GraphOp::EdgeDeleteBatch { .. } => {
+            ctx.refuse_if_any_write_policy(EDGE_WRITE_REASON)
+        }
+        GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => ctx
+            .refuse_if_any_write_policy(
+                "a node-label write is keyed on a node id that names no collection, and it carries \
+                 no row body for the policy to be evaluated against",
+            ),
     }
 }
 
@@ -231,6 +247,25 @@ mod tests {
             assert!(inject_without_policy(&mut plan).is_ok());
             assert_eq!(plan, before);
         }
+    }
+
+    /// An edge write carries endpoints and a label rather than the row body a
+    /// write policy names, so it is refused rather than persisted unchecked.
+    #[test]
+    fn edge_put_is_refused_under_a_write_policy() {
+        use super::super::plan::test_support::{assert_write_refused, store_with_write_policy};
+
+        let store = store_with_write_policy("users");
+        let mut plan = PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: "users".into(),
+            src_id: "a".into(),
+            label: "knows".into(),
+            dst_id: "b".into(),
+            properties: Vec::new(),
+            src_surrogate: nodedb_types::Surrogate::ZERO,
+            dst_surrogate: nodedb_types::Surrogate::ZERO,
+        });
+        assert_write_refused(inject(&mut plan, &store), "users");
     }
 
     /// A graph algorithm runs over every edge of the collection.

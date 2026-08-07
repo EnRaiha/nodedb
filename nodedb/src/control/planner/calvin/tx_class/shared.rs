@@ -375,6 +375,7 @@ mod lockstep_tests {
             value: vec![],
             on_conflict_updates: vec![],
             surrogate: Surrogate::new(9),
+            rls_write_check: vec![],
         }));
     }
 }

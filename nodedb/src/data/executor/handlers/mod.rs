@@ -44,6 +44,7 @@ pub mod recursive_value;
 pub mod returning_doc;
 pub mod returning_rows;
 pub mod rls_eval;
+pub mod rls_write_gate;
 pub mod scan_budget;
 pub mod snapshot;
 pub mod sort_utils;

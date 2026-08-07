@@ -58,7 +58,9 @@ pub(crate) async fn resolve_and_emit_merge_ops(
     task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let PhysicalPlan::Document(DocumentOp::Merge {
-        target_collection, ..
+        target_collection,
+        rls_write_check,
+        ..
     }) = &task.plan
     else {
         // Callers only pass a `Merge` task; a mismatch is a programmer error.
@@ -67,8 +69,33 @@ pub(crate) async fn resolve_and_emit_merge_ops(
         });
     };
     let target_collection = target_collection.clone();
+    let rls_write_check = rls_write_check.clone();
 
     let arms = resolve_merge_arms(state, tenant_id, task).await?;
+
+    // Gate every resolved arm on the target's write policy, against the image
+    // that arm stores — the post-image for an UPDATE or INSERT arm, the
+    // pre-image for a DELETE arm. This expansion rewrites the statement into
+    // concrete point ops the RLS injection pass has already run past, so the
+    // predicate compiled into the MERGE plan is the last thing that can decide
+    // these rows; without the check here, expanding a governed MERGE would
+    // launder it into ungoverned point writes.
+    if !rls_write_check.is_empty() {
+        let bodies = arms
+            .updates
+            .iter()
+            .map(|(_, _, body)| body)
+            .chain(arms.deletes.iter().map(|(_, _, body)| body))
+            .chain(arms.inserts.iter().map(|(_, body)| body));
+        for body in bodies {
+            crate::control::security::rls::admit_compiled_write_image(
+                &rls_write_check,
+                body,
+                tenant_id.as_u64(),
+                &target_collection,
+            )?;
+        }
+    }
 
     let catalog = state.credentials.catalog();
     let target_bare = bare_collection_name(task.database_id, &target_collection);
@@ -145,9 +172,12 @@ async fn resolve_merge_arms(
         resolve_only: true,
         resolved_inserts: None,
         source_rows: Some(source_rows),
-        // Read-only classification pass: it emits no rows to the client, so
-        // there is nothing for a read policy to gate here.
+        // Read-only classification pass: it emits no rows to the client and
+        // writes nothing, so neither policy has anything to gate here. The
+        // caller decides the resolved arms against the statement's write
+        // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets `collect_target_docs` fold rows this transaction
@@ -242,6 +272,10 @@ fn emit_arms(
                 pk_bytes,
                 returning: None,
                 rls_filters: Vec::new(),
+                // The arm's pre-image was already decided against the merge's
+                // write predicate before this op was emitted, so re-checking it
+                // in the staging path would only re-run the same test.
+                rls_write_check: Vec::new(),
             }),
         ));
     }

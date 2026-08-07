@@ -2,15 +2,19 @@
 
 //! The policy-store and identity inputs every injection arm keys on.
 //!
-//! Each engine module receives an [`RlsCtx`] and resolves one of exactly three
-//! outcomes per plan variant: inject the policy into a filter slot, refuse the
-//! plan because its result cannot carry a row filter, or no-op because the op
-//! reads no user rows.
+//! Each engine module receives an [`RlsCtx`] and resolves one outcome per plan
+//! variant. A read either injects the policy into a filter slot, refuses
+//! because its result cannot carry a row filter, or no-ops because the op reads
+//! no user rows. A write either admits its post-image against the write policy
+//! when the plan carries that image, ships the compiled predicate along for the
+//! Data Plane to evaluate against the row bytes it is about to persist, or
+//! refuses because neither is possible — never a silent no-op, which is
+//! indistinguishable from having no policy at all.
 
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::rls::{PolicyType, RlsPolicyStore};
 
-use super::filters::{get_rls, merge_filters};
+use super::filters::{get_rls, get_rls_write, merge_filters};
 
 /// Policy registry plus the requester's tenant and authenticated identity.
 ///
@@ -84,6 +88,84 @@ impl RlsCtx<'_> {
             detail: format!(
                 "RLS is not supported with this operation while a read policy applies to this \
                  identity and the plan names no collection: {why}"
+            ),
+        })
+    }
+
+    /// Admit a write whose post-image the plan already carries.
+    ///
+    /// `image` is the MessagePack row body the statement is about to persist,
+    /// so the predicate decides the row that will exist after the write —
+    /// matching the CRDT admission path, which evaluates the same policies
+    /// against the merged post-image.
+    ///
+    /// A row the policy rejects fails the whole statement rather than being
+    /// skipped: a silently dropped row would report a write that never
+    /// happened.
+    pub(super) fn admit_write_image(&self, collection: &str, image: &[u8]) -> crate::Result<()> {
+        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        crate::control::security::rls::admit_compiled_write_image(
+            &check,
+            image,
+            self.tenant_id,
+            collection,
+        )
+    }
+
+    /// Compile the collection's write policy into a plan's write-gate slot.
+    ///
+    /// For a write whose row image is produced where it is persisted: an
+    /// update's post-image exists only after the stored row is read and the
+    /// statement's changes are applied, and a delete's image only after the row
+    /// being removed is read. The predicate therefore travels with the plan and
+    /// the Data Plane evaluates it against the actual row bytes before
+    /// persisting, rather than the plan being refused outright.
+    ///
+    /// Resolved through the same [`get_rls_write`] as [`Self::admit_write_image`],
+    /// so superuser bypass and the fail-closed deny on an unresolvable
+    /// `$auth.*` reference behave identically on both paths. Empty bytes mean
+    /// no write policy restricts this identity here.
+    pub(super) fn set_write_check(
+        &self,
+        collection: &str,
+        rls_write_check: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        *rls_write_check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        Ok(())
+    }
+
+    /// Refuse the write while a write policy restricts this identity on
+    /// `collection`.
+    ///
+    /// `why` completes the sentence "…cannot be enforced for this operation:
+    /// {why}", so it must state why the row image the policy decides is not
+    /// available where the write happens.
+    pub(super) fn refuse_if_write_policy(&self, collection: &str, why: &str) -> crate::Result<()> {
+        if collection.is_empty()
+            || get_rls_write(self.store, self.tenant_id, collection, self.auth)?.is_empty()
+        {
+            return Ok(());
+        }
+        Err(crate::Error::PlanError {
+            detail: format!(
+                "RLS write policy on '{collection}' cannot be enforced for this operation: {why}"
+            ),
+        })
+    }
+
+    /// Refuse while this identity holds any write policy anywhere in the tenant.
+    ///
+    /// Used only where the write does not name the collection it mutates, so
+    /// the narrow per-collection question cannot be asked and the write cannot
+    /// be shown to avoid a protected collection.
+    pub(super) fn refuse_if_any_write_policy(&self, why: &str) -> crate::Result<()> {
+        if self.auth.is_superuser() || !self.store.tenant_has_write_policy(self.tenant_id) {
+            return Ok(());
+        }
+        Err(crate::Error::PlanError {
+            detail: format!(
+                "an RLS write policy applies to this identity and the plan names no collection, so \
+                 it cannot be enforced for this operation: {why}"
             ),
         })
     }

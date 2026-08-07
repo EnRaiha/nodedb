@@ -5,6 +5,7 @@
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::rls_write_gate;
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_plan::document::merge_types::{
     MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp,
@@ -62,6 +63,10 @@ pub(super) struct ApplyActionParams<'a> {
     /// UPDATE / DELETE branches maintain the row's HNSW vectors (the merge path
     /// otherwise never touches the vector index).
     pub has_vectors: bool,
+    /// Compiled RLS write policy of the target collection. Each arm is decided
+    /// against the image it stores — the post-image for UPDATE, the pre-image
+    /// for DELETE. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Apply a MATCHED / NOT MATCHED BY SOURCE arm (UPDATE or DELETE) to a target row.
@@ -81,10 +86,14 @@ pub(super) fn apply_action(
         clause,
         strict_schema,
         has_vectors,
+        rls_write_check,
     } = params;
     match &clause.action {
         MergeActionOp::DoNothing => Ok(false),
         MergeActionOp::Delete => {
+            // The row being removed is the only image a delete has, and it is
+            // already decoded here — gate before the store is touched.
+            rls_write_gate::admit_row(rls_write_check, target_doc, tid, collection)?;
             core.sparse
                 .delete(database_id, tid, collection, doc_id)
                 .map_err(|e| crate::Error::Storage {
@@ -101,6 +110,9 @@ pub(super) fn apply_action(
         }
         MergeActionOp::Update { updates } => {
             let updated = build_update_doc(target_doc, source_doc, source_alias, updates)?;
+            // Decide the post-image — the row that will exist afterwards —
+            // before it is encoded or stored.
+            rls_write_gate::admit_row(rls_write_check, &updated, tid, collection)?;
 
             let updated_bytes = if let Some(schema) = strict_schema {
                 let ndb_val: nodedb_types::Value = updated.clone().into();
@@ -160,6 +172,9 @@ pub(super) struct ApplyInsertActionParams<'a> {
     pub source_alias: &'a str,
     pub clause: &'a MergeClauseOp,
     pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
+    /// Compiled RLS write policy of the target collection, decided against the
+    /// inserted row. Empty = no write policy.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Apply a NOT MATCHED arm (INSERT) using the source document.
@@ -175,6 +190,7 @@ pub(super) fn apply_insert_action(
         source_alias,
         clause,
         strict_schema,
+        rls_write_check,
     } = params;
     match &clause.action {
         MergeActionOp::DoNothing => Ok(false),
@@ -184,6 +200,9 @@ pub(super) fn apply_insert_action(
         }
         MergeActionOp::Insert { columns, values } => {
             let json_doc = build_insert_doc(columns, values, source_doc, source_alias)?;
+            // The inserted row is the image the policy decides; gate it before
+            // it is encoded or stored.
+            rls_write_gate::admit_row(rls_write_check, &json_doc, tid, collection)?;
             let doc_id = json_doc
                 .get("id")
                 .map(json_to_str)

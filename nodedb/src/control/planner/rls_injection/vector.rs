@@ -52,19 +52,27 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
              evaluated against",
         ),
 
-        // No-op: index writes and index maintenance. The read policy does not
-        // apply; write policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`.
-        VectorOp::Insert { .. }
-        | VectorOp::BatchInsert { .. }
-        | VectorOp::Delete { .. }
-        | VectorOp::DeleteBySurrogate { .. }
-        | VectorOp::SparseInsert { .. }
-        | VectorOp::SparseDelete { .. }
-        | VectorOp::MultiVectorInsert { .. }
-        | VectorOp::MultiVectorDelete { .. }
-        | VectorOp::DirectUpsert { .. }
-        | VectorOp::SetParams { .. }
+        // Refuse: an index write carries an embedding and a surrogate, not the
+        // row body a policy predicate names, so there is nothing here for the
+        // write policy to be evaluated against. The vector entry is a claim
+        // about a row, and admitting it unchecked would let an identity the
+        // policy restricts make a hidden row reachable by search.
+        VectorOp::Insert { collection, .. }
+        | VectorOp::BatchInsert { collection, .. }
+        | VectorOp::Delete { collection, .. }
+        | VectorOp::DeleteBySurrogate { collection, .. }
+        | VectorOp::SparseInsert { collection, .. }
+        | VectorOp::SparseDelete { collection, .. }
+        | VectorOp::MultiVectorInsert { collection, .. }
+        | VectorOp::MultiVectorDelete { collection, .. }
+        | VectorOp::DirectUpsert { collection, .. } => ctx.refuse_if_write_policy(
+            collection,
+            "a vector write carries an embedding and a surrogate rather than the row body the \
+             policy names, so no row image is available for it to be evaluated against",
+        ),
+
+        // No-op: index parameters and index maintenance write no user row.
+        VectorOp::SetParams { .. }
         | VectorOp::DropIndex { .. }
         | VectorOp::Seal { .. }
         | VectorOp::CompactIndex { .. }
@@ -76,8 +84,42 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
 mod tests {
     use nodedb_physical::physical_plan::{DocumentOp, VectorOp};
 
-    use super::super::plan::test_support::{assert_refused, inject, store_with_read_policy};
+    use super::super::plan::test_support::{
+        assert_refused, assert_write_refused, inject, inject_without_policy,
+        store_with_read_policy, store_with_write_policy,
+    };
     use crate::bridge::envelope::PhysicalPlan;
+
+    fn vector_insert(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Vector(VectorOp::Insert {
+            collection: collection.into(),
+            vector: vec![0.0],
+            dim: 1,
+            field_name: String::new(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: None,
+            provenance: None,
+        })
+    }
+
+    /// Indexing a row the policy hides makes it reachable by search, which is
+    /// the disclosure the policy exists to prevent — and the plan carries an
+    /// embedding, not the row body, so nothing here can be evaluated.
+    #[test]
+    fn vector_insert_is_refused_under_a_write_policy() {
+        let store = store_with_write_policy("docs");
+        let mut plan = vector_insert("docs");
+        assert_write_refused(inject(&mut plan, &store), "docs");
+    }
+
+    /// …and is untouched when no policy applies.
+    #[test]
+    fn vector_insert_without_a_policy_is_untouched() {
+        let mut plan = vector_insert("docs");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
+    }
 
     fn search_with_prefilter(collection: &str, prefilter: Option<PhysicalPlan>) -> PhysicalPlan {
         PhysicalPlan::Vector(VectorOp::Search {

@@ -81,10 +81,11 @@ impl CoreLoop {
                 collection,
                 document_id,
                 surrogate,
+                rls_write_check,
                 ..
             }) => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                let resp = self.stage_point_delete(&ctx);
+                let resp = self.stage_point_delete(&ctx, rls_write_check);
                 Self::stage_result(&resp)
             }
             PhysicalPlan::Document(DocumentOp::PointUpdate {
@@ -92,10 +93,11 @@ impl CoreLoop {
                 document_id,
                 surrogate,
                 updates,
+                rls_write_check,
                 ..
             }) => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                let resp = self.stage_point_update(&ctx, updates);
+                let resp = self.stage_point_update(&ctx, updates, rls_write_check);
                 Self::stage_result(&resp)
             }
             PhysicalPlan::Document(DocumentOp::Upsert {
@@ -104,14 +106,17 @@ impl CoreLoop {
                 value,
                 on_conflict_updates,
                 surrogate,
+                rls_write_check,
             }) => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
-                let resp = self.stage_document_upsert(&ctx, value, on_conflict_updates);
+                let resp =
+                    self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check);
                 Self::stage_result(&resp)
             }
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection,
                 ollp_predicted_surrogates,
+                rls_write_check,
                 ..
             }) => self
                 .stage_calvin_bulk_delete(
@@ -120,22 +125,25 @@ impl CoreLoop {
                     txn_id,
                     collection,
                     ollp_predicted_surrogates.as_deref(),
+                    rls_write_check,
                 )
                 .map_err(ErrorCode::from),
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
                 collection,
                 updates,
                 ollp_predicted_surrogates,
+                rls_write_check,
                 ..
             }) => self
-                .stage_calvin_bulk_update(
+                .stage_calvin_bulk_update(super::calvin_overlay_stage_bulk::CalvinBulkUpdateStage {
                     task,
                     tid,
                     txn_id,
                     collection,
                     updates,
-                    ollp_predicted_surrogates.as_deref(),
-                )
+                    ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
+                    rls_write_check,
+                })
                 .map_err(ErrorCode::from),
             PhysicalPlan::Kv(op) => {
                 let resp = self.execute_stage_kv(task, tid, txn_id, op);

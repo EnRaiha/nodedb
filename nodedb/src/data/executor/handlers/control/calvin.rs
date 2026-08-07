@@ -583,6 +583,7 @@ mod tests {
             ollp_predicted_surrogates: predicted,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         })
     }
 

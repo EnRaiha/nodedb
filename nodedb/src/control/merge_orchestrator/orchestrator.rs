@@ -77,6 +77,11 @@ pub struct MergeArgs<'a> {
     /// Carried onto the apply pass so the rows a `RETURNING` merge shows are
     /// gated exactly as a `SELECT` by the same principal would be.
     pub rls_filters: &'a [u8],
+    /// Target-collection RLS write predicate injected into the intercepted
+    /// plan. Carried onto the apply pass, which decides every arm's row image
+    /// against it before writing. A separate slot from `rls_filters`: that one
+    /// bounds what may be shown back, this one bounds what may be written.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Consume an authorized autocommit `MERGE` at the orchestration boundary.
@@ -97,6 +102,7 @@ pub async fn run_authorized_merge(
         source_rows: _,
         returning,
         rls_filters,
+        rls_write_check,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -116,6 +122,7 @@ pub async fn run_authorized_merge(
             clauses: &clauses,
             returning: returning.as_ref(),
             rls_filters: &rls_filters,
+            rls_write_check: &rls_write_check,
         },
     )
     .await
@@ -261,5 +268,10 @@ fn merge_plan(
         resolved_inserts,
         source_rows,
         rls_filters: args.rls_filters.to_vec(),
+        // Carried on both passes. The RESOLVE pass writes nothing, so the check
+        // is inert there; carrying it unconditionally keeps the two passes
+        // byte-identical apart from the fields that must differ, so a future
+        // writing resolve cannot silently lose the gate.
+        rls_write_check: args.rls_write_check.to_vec(),
     })
 }

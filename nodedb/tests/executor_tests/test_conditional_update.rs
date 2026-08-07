@@ -117,6 +117,7 @@ fn bulk_update_returns_affected_count() {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -161,6 +162,7 @@ fn conditional_decrement_stops_at_zero() {
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
         );
 
@@ -207,6 +209,7 @@ fn bulk_update_zero_match_returns_zero_affected() {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -240,6 +243,7 @@ fn bulk_update_returning_returns_updated_documents() {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -272,6 +276,7 @@ fn bulk_update_returning_zero_match_returns_affected_zero() {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -300,6 +305,7 @@ fn point_update_returns_affected_count() {
             updates,
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
             surrogate: surrogate_for("pu1"),
             pk_bytes: b"pu1".to_vec(),
         }),
@@ -331,6 +337,7 @@ fn point_update_returning_returns_updated_document() {
             updates,
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
             surrogate: surrogate_for("pu2"),
             pk_bytes: b"pu2".to_vec(),
         }),
@@ -383,6 +390,7 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
                     ollp_predicted_surrogates: None,
                     ollp_predicted_edges: None,
                     rls_filters: Vec::new(),
+                    rls_write_check: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::BulkUpdate {
                     collection: "products".into(),
@@ -397,6 +405,7 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
                     ollp_predicted_surrogates: None,
                     ollp_predicted_edges: None,
                     rls_filters: Vec::new(),
+                    rls_write_check: Vec::new(),
                 }),
             ],
         }),

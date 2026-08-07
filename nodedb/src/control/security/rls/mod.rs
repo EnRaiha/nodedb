@@ -20,6 +20,7 @@ pub mod replication;
 pub mod store;
 pub mod types;
 
+pub use eval::admit_compiled_write_image;
 pub use namespace::check_namespace_authz;
 pub use store::RlsPolicyStore;
 pub use types::{PolicyType, RlsPolicy};

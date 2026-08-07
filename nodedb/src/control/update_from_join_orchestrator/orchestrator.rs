@@ -54,6 +54,12 @@ pub struct UpdateFromJoinArgs<'a> {
     /// Carried onto the dispatched plan so the rows a `RETURNING` update shows
     /// are gated exactly as a `SELECT` by the same principal would be.
     pub rls_filters: &'a [u8],
+    /// Target-collection RLS write predicate injected into the intercepted
+    /// plan. Carried onto the dispatched plan, which decides every matched
+    /// row's post-image against it before writing. A separate slot from
+    /// `rls_filters`: that one bounds what may be shown back, this one bounds
+    /// what may be written.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Consume an authorized autocommit `UPDATE ... FROM` at orchestration.
@@ -74,6 +80,7 @@ pub async fn run_authorized_update_from_join(
         resolve_only: false,
         source_rows: _,
         rls_filters,
+        rls_write_check,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -94,6 +101,7 @@ pub async fn run_authorized_update_from_join(
             target_filters: &target_filters,
             returning: returning.as_ref(),
             rls_filters: &rls_filters,
+            rls_write_check: &rls_write_check,
         },
     )
     .await
@@ -134,6 +142,7 @@ pub(crate) async fn run_update_from_join(
         resolve_only: false,
         source_rows: Some(source_rows),
         rls_filters: args.rls_filters.to_vec(),
+        rls_write_check: args.rls_write_check.to_vec(),
     });
 
     // Dispatch to the TARGET's core: the join-map is now built from the shipped

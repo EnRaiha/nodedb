@@ -224,6 +224,7 @@ fn linearizability_delete_visibility() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
     );
 

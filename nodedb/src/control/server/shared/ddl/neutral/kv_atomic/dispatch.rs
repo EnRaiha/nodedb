@@ -66,12 +66,16 @@ pub(crate) async fn dispatch_and_respond(
     // a cross-collection move needs them on each side, hence the slice.
     // None of these `KvOp`s carries a filter slot for a row predicate to live
     // in, so a read policy on the collection cannot be honored and the call
-    // fails closed rather than answering from rows the policy hides.
+    // fails closed rather than answering from rows the policy hides. The write
+    // half fails closed for the mirror-image reason: the value each op persists
+    // is computed from the stored one inside the handler, so a write policy
+    // never sees the image it is supposed to decide.
     let gate = CollectionReadGate::for_request(state, identity, database_id);
     for collection in collections {
         gate.authorize(collection)?;
         gate.authorize_permission(collection, Permission::Write)?;
         gate.refuse_if_read_policy(collection, func_name)?;
+        gate.refuse_if_write_policy(collection, func_name)?;
     }
 
     let task = PhysicalTask {

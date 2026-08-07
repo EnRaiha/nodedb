@@ -100,6 +100,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

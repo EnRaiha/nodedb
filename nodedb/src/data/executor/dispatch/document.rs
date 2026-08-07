@@ -111,6 +111,7 @@ impl CoreLoop {
                 surrogate,
                 returning,
                 rls_filters,
+                rls_write_check,
                 ..
             } => self.execute_point_delete(
                 task,
@@ -121,6 +122,7 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     returning: returning.as_ref(),
                     rls_filters,
+                    rls_write_check,
                 },
             ),
 
@@ -132,6 +134,7 @@ impl CoreLoop {
                 updates,
                 returning,
                 rls_filters,
+                rls_write_check,
             } => self.execute_point_update(
                 task,
                 crate::data::executor::handlers::point::update::PointUpdateParams {
@@ -142,6 +145,7 @@ impl CoreLoop {
                     updates,
                     returning: returning.as_ref(),
                     rls_filters,
+                    rls_write_check,
                 },
             ),
 
@@ -231,6 +235,7 @@ impl CoreLoop {
                 resolve_only,
                 source_rows,
                 rls_filters,
+                rls_write_check,
             } => self.execute_update_from_join(
                 task,
                 tid,
@@ -246,6 +251,7 @@ impl CoreLoop {
                     resolve_only: *resolve_only,
                     source_rows: source_rows.as_deref(),
                     rls_filters,
+                    rls_write_check,
                 },
             ),
 
@@ -257,6 +263,7 @@ impl CoreLoop {
                 ollp_predicted_surrogates,
                 ollp_predicted_edges,
                 rls_filters,
+                rls_write_check,
             } => self.execute_bulk_update(
                 task,
                 tid,
@@ -268,6 +275,7 @@ impl CoreLoop {
                     ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
                     ollp_predicted_edges: ollp_predicted_edges.as_deref(),
                     rls_filters,
+                    rls_write_check,
                 },
             ),
 
@@ -278,6 +286,7 @@ impl CoreLoop {
                 ollp_predicted_surrogates,
                 ollp_predicted_edges,
                 rls_filters,
+                rls_write_check,
             } => self.execute_bulk_delete(
                 task,
                 tid,
@@ -286,6 +295,7 @@ impl CoreLoop {
                     filter_bytes: filters,
                     returning: returning.as_ref(),
                     rls_filters,
+                    rls_write_check,
                     ollp: crate::data::executor::handlers::bulk_dml::OllpPrediction {
                         surrogates: ollp_predicted_surrogates.as_deref(),
                         edges: ollp_predicted_edges.as_deref(),
@@ -299,6 +309,7 @@ impl CoreLoop {
                 value,
                 on_conflict_updates,
                 surrogate,
+                rls_write_check,
             } => self.execute_upsert(
                 task,
                 crate::data::executor::handlers::upsert::UpsertParams {
@@ -308,6 +319,7 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     value,
                     on_conflict_updates,
+                    rls_write_check,
                 },
             ),
 
@@ -406,6 +418,7 @@ impl CoreLoop {
                 resolved_inserts,
                 source_rows,
                 rls_filters,
+                rls_write_check,
             } => self.execute_merge(
                 task,
                 tid,
@@ -421,6 +434,7 @@ impl CoreLoop {
                     source_rows: source_rows.as_deref(),
                     returning: returning.as_ref(),
                     rls_filters,
+                    rls_write_check,
                 },
             ),
 

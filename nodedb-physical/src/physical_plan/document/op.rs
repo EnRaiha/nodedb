@@ -99,6 +99,18 @@ pub enum DocumentOp {
         /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Compiled write policy gating the PERSIST, evaluated in the Data
+        /// Plane against the row image the statement actually writes — the
+        /// pre-image for a delete, the post-image for an update. A row that
+        /// fails it fails the whole statement with `RejectedAuthz`; never a
+        /// silent skip, which would report a write that did happen as one that
+        /// did not. Empty = no write policy restricts this identity here.
+        ///
+        /// A slot of its own, never an alias of `rls_filters`: that field is
+        /// the READ policy bounding what `RETURNING` may show. Conflating the
+        /// two would turn a write gate into row redaction, or the reverse.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Point update: read-modify-write with field-level changes.
@@ -118,6 +130,10 @@ pub enum DocumentOp {
         /// Read filters gating `returning` — see `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Write policy gating the persist, evaluated against the post-update
+        /// image — see `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Full collection scan with filtering, sorting, and pagination.
@@ -300,6 +316,12 @@ pub enum DocumentOp {
         /// Stable cross-engine identity assigned by the CP-side
         /// `SurrogateAssigner`. `Surrogate::ZERO` only in test fixtures.
         surrogate: Surrogate,
+        /// Write policy gating the persist, evaluated against the body actually
+        /// stored by whichever branch runs: the insert body when the row is
+        /// absent, the merge with the stored row (or the `on_conflict_updates`
+        /// result) when it is present. See `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Update target rows matched by a join with a source collection.
@@ -358,6 +380,11 @@ pub enum DocumentOp {
         /// every returned row is a target row. See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Write policy of `target_collection` gating the persist, evaluated
+        /// against each matched target row's post-image — every row this op
+        /// writes is a target row. See `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Bulk update: scan + apply field updates to all matches.
@@ -387,6 +414,10 @@ pub enum DocumentOp {
         /// Read filters gating `returning` — see `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Write policy gating the persist, evaluated against each matched
+        /// row's post-update image — see `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Bulk delete: scan + delete all matches.
@@ -417,6 +448,11 @@ pub enum DocumentOp {
         /// Read filters gating `returning` — see `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Write policy gating the persist, evaluated against each matched
+        /// row's pre-deletion image — the only image a delete has. See
+        /// `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// MERGE: join-based multi-action DML (INSERT / UPDATE / DELETE per WHEN arm).
@@ -482,6 +518,12 @@ pub enum DocumentOp {
         /// every returned row is a target row. See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Write policy of `target_collection` gating the persist: every arm
+        /// writes a target row, gated against the image it stores — post for an
+        /// UPDATE/INSERT arm, pre for a DELETE arm. See
+        /// `PointDelete::rls_write_check`.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.
