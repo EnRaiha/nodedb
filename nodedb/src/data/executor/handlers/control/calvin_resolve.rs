@@ -164,6 +164,7 @@ mod tests {
             returning: None,
             ollp_predicted_surrogates,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -179,6 +180,7 @@ mod tests {
             returning: None,
             ollp_predicted_surrogates,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         })
     }
 

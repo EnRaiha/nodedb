@@ -50,6 +50,10 @@ pub struct UpdateFromJoinArgs<'a> {
     pub updates: &'a [(String, UpdateValue)],
     pub target_filters: &'a [u8],
     pub returning: Option<&'a ReturningSpec>,
+    /// Target-collection RLS read filters injected into the intercepted plan.
+    /// Carried onto the dispatched plan so the rows a `RETURNING` update shows
+    /// are gated exactly as a `SELECT` by the same principal would be.
+    pub rls_filters: &'a [u8],
 }
 
 /// Consume an authorized autocommit `UPDATE ... FROM` at orchestration.
@@ -69,6 +73,7 @@ pub async fn run_authorized_update_from_join(
         returning,
         resolve_only: false,
         source_rows: _,
+        rls_filters,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -88,6 +93,7 @@ pub async fn run_authorized_update_from_join(
             updates: &updates,
             target_filters: &target_filters,
             returning: returning.as_ref(),
+            rls_filters: &rls_filters,
         },
     )
     .await
@@ -127,6 +133,7 @@ pub(crate) async fn run_update_from_join(
         returning: args.returning.cloned(),
         resolve_only: false,
         source_rows: Some(source_rows),
+        rls_filters: args.rls_filters.to_vec(),
     });
 
     // Dispatch to the TARGET's core: the join-map is now built from the shipped

@@ -155,6 +155,7 @@ fn point_delete_removes() {
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
             returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

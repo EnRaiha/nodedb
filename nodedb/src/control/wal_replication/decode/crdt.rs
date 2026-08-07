@@ -179,6 +179,7 @@ pub(super) fn doc_upsert(
         surrogate: nodedb_types::Surrogate::new(surrogate),
         partial,
         returning: None,
+        rls_filters: Vec::new(),
     })
 }
 
@@ -190,6 +191,7 @@ pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) ->
         document_id: document_id.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
         returning: None,
+        rls_filters: Vec::new(),
     })
 }
 

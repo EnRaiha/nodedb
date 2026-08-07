@@ -153,6 +153,7 @@ pub(crate) fn build_point_delete(
                 surrogate,
                 pk_bytes,
                 returning: None,
+                rls_filters: Vec::new(),
             }))
         }
     }
@@ -252,6 +253,7 @@ pub(crate) fn build_update(
         pk_bytes,
         updates,
         returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -330,6 +332,7 @@ pub(crate) fn build_bulk_update(
         returning: None,
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -350,6 +353,7 @@ pub(crate) fn build_bulk_delete(
         returning: None,
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
+        rls_filters: Vec::new(),
     }))
 }
 

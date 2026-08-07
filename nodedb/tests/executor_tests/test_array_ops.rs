@@ -116,6 +116,7 @@ fn array_contains_filter() {
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -151,6 +152,7 @@ fn array_contains_all_filter() {
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -186,6 +188,7 @@ fn array_overlap_filter() {
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -308,6 +311,7 @@ fn no_match_returns_zero() {
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         }),
     );
 

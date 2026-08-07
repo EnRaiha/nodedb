@@ -379,6 +379,7 @@ fn document_indexes_consistent_after_simulated_crash() {
             surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"a1".to_vec(),
             returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

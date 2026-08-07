@@ -107,6 +107,7 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
             returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     let ok_or_not_found = resp_del.status == Status::Ok

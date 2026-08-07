@@ -8,6 +8,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateReindex;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -26,6 +27,8 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     /// applying writes — closing the recon→execute TOCTOU on `_from`/`_to`/
     /// `_type` so the Control-Plane-derived edge reconciliation stays valid.
     pub ollp_predicted_edges: Option<&'a [OllpPredictedEdge]>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -50,6 +53,7 @@ impl CoreLoop {
             returning,
             ollp_predicted_surrogates,
             ollp_predicted_edges,
+            rls_filters,
         } = params;
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk update");
 
@@ -374,10 +378,11 @@ impl CoreLoop {
                     );
                     affected += 1;
                     if returning.is_some() {
-                        // Include document ID in the returned document.
-                        if let Some(obj) = doc.as_object_mut() {
-                            obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
-                        }
+                        // `doc_id` is the surrogate hex storage key, which only
+                        // stands in as `id` for a row that declares no primary
+                        // key of its own — overwriting a declared key would
+                        // return a value the client never wrote.
+                        returning_doc::attach_row_id(&mut doc, doc_id);
                         returned_docs.push(doc);
                     }
                     // Carry the surrogate + post-image back for a post-apply
@@ -400,7 +405,7 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, affected, "bulk update complete");
 
         let mut response = if let Some(spec) = returning {
-            match returning_rows::build_rows_payload(spec, &returned_docs) {
+            match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(

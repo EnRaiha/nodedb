@@ -41,6 +41,7 @@ pub mod query_collection_size;
 pub mod reclaim;
 pub mod recursive;
 pub mod recursive_value;
+pub mod returning_doc;
 pub mod returning_rows;
 pub mod rls_eval;
 pub mod scan_budget;

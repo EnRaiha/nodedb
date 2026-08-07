@@ -468,6 +468,7 @@ mod tests {
                     surrogate: Surrogate::new(2),
                     pk_bytes: Vec::new(),
                     returning: None,
+                    rls_filters: Vec::new(),
                 }),
             ],
             txn_id: None,

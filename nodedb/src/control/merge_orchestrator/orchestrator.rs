@@ -73,6 +73,10 @@ pub struct MergeArgs<'a> {
     /// Projection for a `MERGE ... RETURNING`, attached by the RETURNING
     /// pre-processor. `None` selects the affected-count response.
     pub returning: Option<&'a ReturningSpec>,
+    /// Target-collection RLS read filters injected into the intercepted plan.
+    /// Carried onto the apply pass so the rows a `RETURNING` merge shows are
+    /// gated exactly as a `SELECT` by the same principal would be.
+    pub rls_filters: &'a [u8],
 }
 
 /// Consume an authorized autocommit `MERGE` at the orchestration boundary.
@@ -92,6 +96,7 @@ pub async fn run_authorized_merge(
         resolved_inserts: None,
         source_rows: _,
         returning,
+        rls_filters,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -110,6 +115,7 @@ pub async fn run_authorized_merge(
             source_join_col: &source_join_col,
             clauses: &clauses,
             returning: returning.as_ref(),
+            rls_filters: &rls_filters,
         },
     )
     .await
@@ -254,5 +260,6 @@ fn merge_plan(
         resolve_only,
         resolved_inserts,
         source_rows,
+        rls_filters: args.rls_filters.to_vec(),
     })
 }

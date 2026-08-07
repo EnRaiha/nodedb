@@ -78,6 +78,7 @@ pub(super) fn point_delete(
         surrogate,
         pk_bytes,
         returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -98,6 +99,7 @@ pub(super) fn point_update(
         pk_bytes,
         updates: updates.to_vec(),
         returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -179,6 +181,7 @@ pub(super) fn bulk_dml(
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         })
     } else {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -187,6 +190,7 @@ pub(super) fn bulk_dml(
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         })
     }
 }

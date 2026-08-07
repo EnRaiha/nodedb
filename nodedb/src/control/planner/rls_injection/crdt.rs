@@ -7,6 +7,10 @@
 //! Reads of row content therefore refuse while a policy applies, while reads
 //! of collection configuration — the installed constraint set, the conflict
 //! policy, the oplog version vector — carry no row content and pass.
+//!
+//! The two DML ops are the exception: a `RETURNING` clause on them emits row
+//! bodies the handler holds in full, so they carry a post-fetch filter slot and
+//! the policy lands there rather than refusing the statement.
 
 use nodedb_physical::physical_plan::CrdtOp;
 
@@ -17,7 +21,7 @@ const ROW_CONTENT_REASON: &str =
 
 /// Exhaustive over [`CrdtOp`] so a new CRDT operation forces a decision
 /// between injecting, refusing, and no-op.
-pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &CrdtOp) -> crate::Result<()> {
+pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &mut CrdtOp) -> crate::Result<()> {
     match op {
         // Refuse: all four return stored row content — the current state, a
         // historical state, the oplog deltas those states were built from, or
@@ -38,9 +42,25 @@ pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &CrdtOp) -> crate::Result<()> {
         | CrdtOp::GetPolicy { .. }
         | CrdtOp::GetVersionVector { .. } => Ok(()),
 
-        // No-op: writes, snapshot install, history maintenance, and the
-        // constraint / policy DDL. Write policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`.
+        // Inject: both surface stored row content through a `RETURNING` clause,
+        // and that output is a read — the handler evaluates the filter against
+        // each full pre-projection document, so a predicate on a column the
+        // `RETURNING` list omits still decides the row. The row set shown
+        // shrinks; the write and its affected count do not.
+        CrdtOp::DocUpsert {
+            collection,
+            rls_filters,
+            ..
+        }
+        | CrdtOp::DocDelete {
+            collection,
+            rls_filters,
+            ..
+        } => ctx.set_post_filters(collection, rls_filters),
+
+        // No-op: writes that surface no row, snapshot install, history
+        // maintenance, and the constraint / policy DDL. Write policies are
+        // enforced separately by `RlsPolicyStore::check_write_with_auth`.
         CrdtOp::Apply { .. }
         | CrdtOp::ApplyAuthenticated { .. }
         | CrdtOp::ImportSnapshot { .. }
@@ -51,9 +71,7 @@ pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &CrdtOp) -> crate::Result<()> {
         | CrdtOp::CompactAtVersion { .. }
         | CrdtOp::ListInsert { .. }
         | CrdtOp::ListDelete { .. }
-        | CrdtOp::ListMove { .. }
-        | CrdtOp::DocUpsert { .. }
-        | CrdtOp::DocDelete { .. } => Ok(()),
+        | CrdtOp::ListMove { .. } => Ok(()),
     }
 }
 
@@ -88,6 +106,27 @@ mod tests {
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
         assert_eq!(plan, before);
+    }
+
+    /// A CRDT `RETURNING` write ships row bodies back, so the policy lands in
+    /// its post-filter slot rather than refusing the statement.
+    #[test]
+    fn doc_delete_receives_the_policy_filter() {
+        let store = store_with_read_policy("notes");
+        let mut plan = PhysicalPlan::Crdt(CrdtOp::DocDelete {
+            collection: "notes".into(),
+            document_id: "d1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Crdt(CrdtOp::DocDelete { rls_filters, .. }) => {
+                assert!(!rls_filters.is_empty(), "policy filter must be injected")
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
     }
 
     /// Reading the conflict policy discloses configuration, not rows.

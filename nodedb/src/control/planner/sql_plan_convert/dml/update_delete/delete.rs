@@ -107,6 +107,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 returning: None,
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -131,6 +132,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                     document_id: pk_string,
                     surrogate,
                     returning: None,
+                    rls_filters: Vec::new(),
                 })
             } else {
                 PhysicalPlan::Document(DocumentOp::PointDelete {
@@ -139,6 +141,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                     surrogate,
                     pk_bytes,
                     returning: None,
+                    rls_filters: Vec::new(),
                 })
             };
             tasks.push(PhysicalTask {
@@ -163,6 +166,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 returning: None,
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

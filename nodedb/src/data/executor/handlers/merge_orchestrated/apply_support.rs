@@ -3,7 +3,6 @@
 //! Row-level helpers for the MERGE APPLY pass: undo capture for the in-memory
 //! indexes, and post/pre-image projection for a `RETURNING` clause.
 
-use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::apply_put::PointPutOutcome;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 
@@ -35,13 +34,13 @@ pub(super) fn record_put_index_undo(undo_log: &mut Vec<UndoEntry>, outcome: &mut
 }
 
 /// Decode one merge row body into the JSON document a RETURNING projection
-/// reads, with the row's storage key injected as `id`. Same shape the point and
-/// bulk DML RETURNING paths emit, so a MERGE row projects identically.
+/// reads. Same shape the point and bulk DML RETURNING paths emit, so a MERGE
+/// row projects identically.
 ///
-/// Injection is a no-op when the body already carries an `id` field, so a
-/// collection with a declared primary key keeps its own key rather than the
-/// surrogate storage key.
+/// The schema argument is `None` unconditionally: a merge plan's captured
+/// bodies are MessagePack for BOTH storage modes (`collect_merge_plan` decodes
+/// a strict target's Binary Tuple and re-encodes the resolved row before the
+/// apply pass ever sees it), so the strict decoder would have nothing to read.
 pub(super) fn returning_doc(body: &[u8], doc_id: &str) -> Option<serde_json::Value> {
-    let with_id = nodedb_query::msgpack_scan::inject_str_field(body, "id", doc_id);
-    doc_format::decode_document(&with_id)
+    super::super::returning_doc::from_stored(body, doc_id, None)
 }

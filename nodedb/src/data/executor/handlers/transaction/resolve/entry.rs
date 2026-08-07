@@ -728,6 +728,7 @@ mod tests {
             returning: Some(ReturningSpec {
                 columns: ReturningColumns::Star,
             }),
+            rls_filters: Vec::new(),
         });
 
         let resp = core.execute_resolve_txn(&task, TID, txn, &[doc_plan]);
@@ -794,6 +795,7 @@ mod tests {
             returning: Some(ReturningSpec {
                 columns: ReturningColumns::Star,
             }),
+            rls_filters: Vec::new(),
         });
 
         let resp = core.execute_stage_write(&task, TID, &plan);
@@ -847,6 +849,7 @@ mod tests {
             }),
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         });
 
         let resp = core.execute_stage_write(&task, TID, &plan);
@@ -899,6 +902,7 @@ mod tests {
             }),
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         });
 
         let resp = core.execute_stage_write(&task, TID, &plan);
@@ -947,6 +951,7 @@ mod tests {
             }),
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         });
 
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
@@ -1003,6 +1008,7 @@ mod tests {
                 returning: None,
                 resolve_only: false,
                 source_rows: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: "t".to_string(),
@@ -1015,6 +1021,7 @@ mod tests {
                 resolve_only: false,
                 resolved_inserts: None,
                 source_rows: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "notes".to_string(),
@@ -1485,6 +1492,7 @@ mod tests {
             surrogate: Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
             returning: None,
+            rls_filters: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[delete_plan]);
         let redo = decode_redo(&resp);

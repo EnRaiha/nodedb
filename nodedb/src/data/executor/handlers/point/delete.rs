@@ -7,23 +7,39 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::ReturningSpec;
+use nodedb_physical::physical_plan::{ReturningSpec, StorageMode};
 use nodedb_types::Surrogate;
+
+/// Borrowed arguments for [`CoreLoop::execute_point_delete`], grouped so the
+/// handler stays within the argument-count limit.
+pub(in crate::data::executor) struct PointDeleteExec<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
+}
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_point_delete(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        returning: Option<&ReturningSpec>,
+        args: PointDeleteExec<'_>,
     ) -> Response {
+        let PointDeleteExec {
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            returning,
+            rls_filters,
+        } = args;
         debug!(core = self.core_id, %collection, %document_id, "point delete");
 
         let database_id = task.request.database_id.as_u64();
@@ -98,14 +114,27 @@ impl CoreLoop {
         }
 
         if let (Some(spec), Some(prior_bytes)) = (returning, prior.as_deref()) {
-            // Decode the pre-deletion document and project per spec.
-            let prior_with_id =
-                nodedb_query::msgpack_scan::inject_str_field(prior_bytes, "id", document_id);
-            let doc = match doc_format::decode_document(&prior_with_id) {
-                Some(v) => v,
-                None => serde_json::json!({"id": document_id}),
-            };
-            match returning_rows::build_rows_payload(spec, &[doc]) {
+            // Decode the pre-deletion image with the collection's storage mode:
+            // on a strict collection the prior bytes are a Binary Tuple, which
+            // the MessagePack decoder accepts without erroring and turns into a
+            // document with none of the row's real columns. The schema borrow is
+            // scoped so the response build below can take `self` mutably.
+            let doc = {
+                let strict_schema = self
+                    .doc_configs
+                    .get(&(
+                        task.request.database_id,
+                        crate::types::TenantId::new(tid),
+                        collection.to_string(),
+                    ))
+                    .and_then(|c| match &c.storage_mode {
+                        StorageMode::Strict { schema } => Some(schema),
+                        StorageMode::Schemaless => None,
+                    });
+                returning_doc::from_stored(prior_bytes, document_id, strict_schema)
+            }
+            .unwrap_or_else(|| serde_json::json!({"id": document_id}));
+            match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
                     task,
@@ -116,7 +145,7 @@ impl CoreLoop {
             }
         } else if let Some(spec) = returning {
             // Row did not exist — return empty rows payload.
-            match returning_rows::build_rows_payload(spec, &[]) {
+            match returning_rows::build_rows_payload(spec, rls_filters, &[]) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
                     task,

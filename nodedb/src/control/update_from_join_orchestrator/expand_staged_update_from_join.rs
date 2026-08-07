@@ -165,6 +165,9 @@ async fn resolve_update_rows(
         returning: None,
         resolve_only: true,
         source_rows: Some(source_rows),
+        // Read-only resolve pass: it emits no rows to the client, so there is
+        // nothing for a read policy to gate here.
+        rls_filters: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets the target scan fold rows this transaction staged

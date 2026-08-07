@@ -261,6 +261,7 @@ mod tests {
                 returning: None,
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
+                rls_filters: vec![],
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

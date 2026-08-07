@@ -226,6 +226,7 @@ impl CoreLoop {
                 returning: _,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
+                rls_filters: _,
             } => self.stage_bulk_update(StageBulkUpdateParams {
                 task,
                 tid,
@@ -245,6 +246,7 @@ impl CoreLoop {
                 returning: _,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
+                rls_filters: _,
             } => self.stage_bulk_delete(StageBulkDeleteParams {
                 task,
                 tid,

@@ -208,6 +208,7 @@ mod tests {
             surrogate: Surrogate::new(5),
             pk_bytes: vec![],
             returning: None,
+            rls_filters: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(

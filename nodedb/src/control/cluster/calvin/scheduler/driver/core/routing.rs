@@ -615,6 +615,7 @@ mod tests {
             resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }
@@ -643,6 +644,7 @@ mod tests {
             returning: None,
             resolve_only: false,
             source_rows: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

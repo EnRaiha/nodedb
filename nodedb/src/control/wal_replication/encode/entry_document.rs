@@ -67,6 +67,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             returning: _,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: _,
         } => document::bulk_delete(collection, filters),
         DocumentOp::BulkUpdate {
             collection,
@@ -75,6 +76,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             returning: _,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: _,
         } => document::bulk_update(collection, filters, updates),
         DocumentOp::InsertSelect {
             target_collection,

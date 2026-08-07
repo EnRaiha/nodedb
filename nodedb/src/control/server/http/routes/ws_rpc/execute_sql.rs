@@ -143,6 +143,7 @@ pub async fn execute_sql(
                 resolve_only: false,
                 resolved_inserts: None,
                 source_rows: _,
+                rls_filters: _,
             },
         ) = &task.plan
         {
@@ -185,6 +186,7 @@ pub async fn execute_sql(
                 returning: _,
                 resolve_only: false,
                 source_rows: None,
+                rls_filters: _,
             },
         ) = &task.plan
         {

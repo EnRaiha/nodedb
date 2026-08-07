@@ -93,6 +93,7 @@ impl CoreLoop {
                     surrogate: Surrogate::new(*surrogate),
                     partial: *partial,
                     returning: None,
+                    rls_filters: Vec::new(),
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
@@ -105,6 +106,7 @@ impl CoreLoop {
                         surrogate: Surrogate::new(*surrogate),
                         partial: *partial,
                         returning: None,
+                        rls_filters: &[],
                     },
                 );
                 (collection, document_id, response)
@@ -119,15 +121,19 @@ impl CoreLoop {
                     document_id: document_id.clone(),
                     surrogate: Surrogate::new(*surrogate),
                     returning: None,
+                    rls_filters: Vec::new(),
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
                 let response = self.execute_crdt_doc_delete(
                     &task,
-                    collection,
-                    document_id,
-                    Surrogate::new(*surrogate),
-                    None,
+                    crate::data::executor::handlers::control::crdt_doc::CrdtDocDelete {
+                        collection,
+                        document_id,
+                        surrogate: Surrogate::new(*surrogate),
+                        returning: None,
+                        rls_filters: &[],
+                    },
                 );
                 (collection, document_id, response)
             }
@@ -232,6 +238,7 @@ mod tests {
             surrogate: Surrogate::new(SURROGATE),
             partial,
             returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -241,6 +248,7 @@ mod tests {
             document_id: DOCUMENT_ID.to_string(),
             surrogate: Surrogate::new(SURROGATE),
             returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

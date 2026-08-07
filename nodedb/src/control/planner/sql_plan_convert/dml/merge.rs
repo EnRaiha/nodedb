@@ -97,6 +97,8 @@ pub(in super::super) fn convert_merge(
             // The source rows are shipped in by the Control-Plane orchestrator
             // (cross-core source-ship); the neutral plan carries none.
             source_rows: None,
+            // Filled in by the RLS injection pass, which runs after conversion.
+            rls_filters: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

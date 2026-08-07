@@ -281,6 +281,7 @@ mod tests {
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
             returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(!is_calvin_foldable(&point_delete));
         assert!(calvin_tag_for_plan(&point_delete).is_err());

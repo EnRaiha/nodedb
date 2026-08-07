@@ -6,10 +6,11 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec};
+use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec, StorageMode};
 
 /// OLLP prediction inputs threaded to `execute_bulk_delete`: the predicted
 /// matched-doc surrogate set and the predicted implicit-edge set. Both are
@@ -22,6 +23,17 @@ pub(in crate::data::executor) struct OllpPrediction<'a> {
     pub edges: Option<&'a [OllpPredictedEdge]>,
 }
 
+/// Borrowed arguments for [`CoreLoop::execute_bulk_delete`], grouped so the
+/// handler stays within the argument-count limit.
+pub(in crate::data::executor) struct BulkDeleteParams<'a> {
+    pub collection: &'a str,
+    pub filter_bytes: &'a [u8],
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
+    pub ollp: OllpPrediction<'a>,
+}
+
 impl CoreLoop {
     /// Bulk delete: scan documents matching filters, delete all matches.
     ///
@@ -32,11 +44,15 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         tid: u64,
-        collection: &str,
-        filter_bytes: &[u8],
-        returning: Option<&ReturningSpec>,
-        ollp: OllpPrediction<'_>,
+        params: BulkDeleteParams<'_>,
     ) -> Response {
+        let BulkDeleteParams {
+            collection,
+            filter_bytes,
+            returning,
+            rls_filters,
+            ollp,
+        } = params;
         let ollp_predicted_surrogates = ollp.surrogates;
         let ollp_predicted_edges = ollp.edges;
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk delete");
@@ -152,6 +168,19 @@ impl CoreLoop {
             .map(|c| c.index_paths.clone())
             .unwrap_or_default();
 
+        // The stored pre-image is a Binary Tuple on a strict collection and
+        // MessagePack otherwise. Hoisted once for the whole statement so the
+        // per-row decode below picks the matching decoder — the MessagePack
+        // decoder accepts a Binary Tuple without erroring and yields a document
+        // with none of the row's real columns.
+        let strict_schema = self
+            .doc_configs
+            .get(&config_key)
+            .and_then(|c| match &c.storage_mode {
+                StorageMode::Strict { schema } => Some(schema.clone()),
+                StorageMode::Schemaless => None,
+            });
+
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
         // One post-apply `Delete` redo entry per removed row on a vector
@@ -179,9 +208,7 @@ impl CoreLoop {
                         .ok()
                         .flatten()
                         .and_then(|bytes| {
-                            let with_id =
-                                nodedb_query::msgpack_scan::inject_str_field(&bytes, "id", doc_id);
-                            doc_format::decode_document(&with_id)
+                            returning_doc::from_stored(&bytes, doc_id, strict_schema.as_ref())
                         })
                 } else {
                     None
@@ -325,7 +352,7 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, affected, "bulk delete complete");
 
         let mut response = if let Some(spec) = returning {
-            match returning_rows::build_rows_payload(spec, &returned_docs) {
+            match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(

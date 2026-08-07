@@ -348,6 +348,7 @@ mod tests {
             resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
+            rls_filters: Vec::new(),
         })
     }
 

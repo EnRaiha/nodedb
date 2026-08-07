@@ -389,6 +389,7 @@ async fn dispatch_task(
             resolve_only: false,
             resolved_inserts: None,
             source_rows: _,
+            rls_filters: _,
         },
     ) = &task.plan
     {
@@ -415,6 +416,7 @@ async fn dispatch_task(
             returning: _,
             resolve_only: false,
             source_rows: None,
+            rls_filters: _,
         },
     ) = &task.plan
     {

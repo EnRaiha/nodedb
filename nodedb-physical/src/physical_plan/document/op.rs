@@ -94,6 +94,11 @@ pub enum DocumentOp {
         /// When `Some`, return the pre-deletion document projected per spec.
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. The write policy
+        /// governs the write; this bounds what may be shown back, so a
+        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Point update: read-modify-write with field-level changes.
@@ -110,6 +115,9 @@ pub enum DocumentOp {
         /// When `Some`, return the post-update document projected per spec.
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// Read filters gating `returning` — see `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Full collection scan with filtering, sorting, and pagination.
@@ -346,6 +354,10 @@ pub enum DocumentOp {
         /// in-transaction buffered replay).
         #[serde(default)]
         source_rows: Option<Vec<(String, Vec<u8>)>>,
+        /// Read filters gating `returning`, keyed on `target_collection` —
+        /// every returned row is a target row. See `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Bulk update: scan + apply field updates to all matches.
@@ -372,6 +384,9 @@ pub enum DocumentOp {
         /// `BulkUpdate`. `None` on the non-OLLP path.
         #[serde(default)]
         ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
+        /// Read filters gating `returning` — see `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Bulk delete: scan + delete all matches.
@@ -399,6 +414,9 @@ pub enum DocumentOp {
         /// non-OLLP path (no edge-content verification).
         #[serde(default)]
         ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
+        /// Read filters gating `returning` — see `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// MERGE: join-based multi-action DML (INSERT / UPDATE / DELETE per WHEN arm).
@@ -460,6 +478,10 @@ pub enum DocumentOp {
         /// in-transaction buffered replay).
         #[serde(default)]
         source_rows: Option<Vec<(String, Vec<u8>)>>,
+        /// Read filters gating `returning`, keyed on `target_collection` —
+        /// every returned row is a target row. See `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.

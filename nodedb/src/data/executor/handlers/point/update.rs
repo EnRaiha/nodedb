@@ -12,10 +12,11 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{ReturningSpec, StorageMode, UpdateValue};
 use nodedb_types::Surrogate;
 
 /// Parameters for `execute_point_update`.
@@ -26,6 +27,8 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     pub surrogate: Surrogate,
     pub updates: &'a [(String, UpdateValue)],
     pub returning: Option<&'a ReturningSpec>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
 }
 
 use super::update_reindex_secondary::UpdateSecondaryReindex;
@@ -43,6 +46,7 @@ impl CoreLoop {
             surrogate,
             updates,
             returning,
+            rls_filters,
         } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -60,12 +64,19 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        let is_strict = self.doc_configs.get(&config_key).is_some_and(|c| {
-            matches!(
-                c.storage_mode,
-                nodedb_physical::physical_plan::StorageMode::Strict { .. }
-            )
-        });
+        // `Some` exactly when the collection stores Binary Tuples. Held (not
+        // just a bool) because the RETURNING projection below has to decode the
+        // re-encoded post-image, and the MessagePack decoder accepts a Binary
+        // Tuple without erroring — it would return a document with none of the
+        // row's real columns rather than fail.
+        let strict_schema = self
+            .doc_configs
+            .get(&config_key)
+            .and_then(|c| match &c.storage_mode {
+                StorageMode::Strict { schema } => Some(schema.clone()),
+                StorageMode::Schemaless => None,
+            });
+        let is_strict = strict_schema.is_some();
 
         // Reject direct updates to generated columns.
         if let Some(config) = self.doc_configs.get(&config_key)
@@ -428,17 +439,16 @@ impl CoreLoop {
                         // pre-update body and resurrects the old embedding.
                         // `updated_bytes` is moved in as its last use.
                         let mut response = if let Some(spec) = returning {
-                            // Build the post-update document with id injected.
-                            let with_id = nodedb_query::msgpack_scan::inject_str_field(
+                            // Post-update image, decoded in the collection's
+                            // storage mode; the user-visible key only fills in
+                            // as `id` when the row declares none of its own.
+                            let doc = returning_doc::from_stored(
                                 &updated_bytes,
-                                "id",
                                 document_id,
-                            );
-                            let doc = match doc_format::decode_document(&with_id) {
-                                Some(v) => v,
-                                None => serde_json::json!({"id": document_id}),
-                            };
-                            match returning_rows::build_rows_payload(spec, &[doc]) {
+                                strict_schema.as_ref(),
+                            )
+                            .unwrap_or_else(|| serde_json::json!({"id": document_id}));
+                            match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                                 Ok(payload) => self.response_with_payload(task, payload),
                                 Err(e) => {
                                     return self.response_error(

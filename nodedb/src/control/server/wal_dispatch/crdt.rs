@@ -168,6 +168,7 @@ pub(super) fn wal_append_crdt_op(
             surrogate,
             partial,
             returning: _,
+            rls_filters: _,
         } => {
             // Intent-logged like the block-list ops: the Data Plane builds the
             // Loro mutation and the Control Plane has no `LoroDoc`, so the
@@ -188,6 +189,7 @@ pub(super) fn wal_append_crdt_op(
             document_id,
             surrogate,
             returning: _,
+            rls_filters: _,
         } => {
             let payload = crate::wal::CrdtDocOpWalRecord::Delete {
                 collection: collection.clone(),
@@ -328,6 +330,7 @@ mod tests {
             surrogate: Surrogate::new(3),
             partial: false,
             returning: None,
+            rls_filters: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(

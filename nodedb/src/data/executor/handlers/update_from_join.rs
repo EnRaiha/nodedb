@@ -22,6 +22,7 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
@@ -76,6 +77,9 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     /// `None` selects the legacy local-storage read (co-resident / in-txn
     /// buffered replay).
     pub source_rows: Option<&'a [(String, Vec<u8>)]>,
+    /// Compiled RLS read policy of the TARGET collection, gating the
+    /// `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -97,6 +101,7 @@ impl CoreLoop {
             returning,
             resolve_only,
             source_rows,
+            rls_filters,
         } = params;
 
         debug!(
@@ -305,16 +310,18 @@ impl CoreLoop {
                 }
                 affected += 1;
                 if returning.is_some() {
-                    if let Some(obj) = doc.as_object_mut() {
-                        obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
-                    }
+                    // `doc_id` is the surrogate hex storage key, which only
+                    // stands in as `id` for a row that declares no primary key
+                    // of its own — overwriting a declared key would return a
+                    // value the client never wrote.
+                    returning_doc::attach_row_id(&mut doc, &doc_id);
                     returned_docs.push(doc);
                 }
             }
         }
 
         let mut response = if let Some(spec) = returning {
-            match returning_rows::build_rows_payload(spec, &returned_docs) {
+            match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
                     task,

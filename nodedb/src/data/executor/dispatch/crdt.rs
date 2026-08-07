@@ -199,6 +199,7 @@ impl CoreLoop {
                 surrogate,
                 partial,
                 returning,
+                rls_filters,
             } => self.execute_crdt_doc_upsert(
                 task,
                 crate::data::executor::handlers::control::crdt_doc::CrdtDocUpsert {
@@ -208,6 +209,7 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     partial: *partial,
                     returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 
@@ -216,12 +218,16 @@ impl CoreLoop {
                 document_id,
                 surrogate,
                 returning,
+                rls_filters,
             } => self.execute_crdt_doc_delete(
                 task,
-                collection,
-                document_id,
-                *surrogate,
-                returning.as_ref(),
+                crate::data::executor::handlers::control::crdt_doc::CrdtDocDelete {
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
             ),
         }
     }

@@ -228,6 +228,13 @@ pub enum CrdtOp {
         /// persisted/replicated — WAL/replication reconstruct with None.
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// RLS read filters gating the rows `returning` emits. The write is
+        /// governed by the write policy; this bounds what the statement may
+        /// show back, so a `RETURNING` row set never exceeds what a `SELECT`
+        /// by the same principal would return. Response-only, like
+        /// `returning` — empty means no policy applies.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     /// Delete a document row: tombstone in the collection's Loro doc + remove
     /// from the sparse document store.
@@ -239,6 +246,10 @@ pub enum CrdtOp {
         /// persisted/replicated — WAL/replication reconstruct with None.
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// RLS read filters gating the rows `returning` emits — same contract
+        /// as `DocUpsert::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Bounded, read-only preview of a CRDT delta against its target state.

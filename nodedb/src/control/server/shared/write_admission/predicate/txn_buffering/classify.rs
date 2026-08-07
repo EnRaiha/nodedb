@@ -544,6 +544,7 @@ mod tests {
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
                 returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 collection: "c".into(),
@@ -552,6 +553,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 updates: Vec::new(),
                 returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Scan {
                 collection: "c".into(),
@@ -636,6 +638,7 @@ mod tests {
                 returning: None,
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -643,6 +646,7 @@ mod tests {
                 returning: None,
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP surrogate set present — the
             // Calvin-routed, not-buffered case.
@@ -653,6 +657,7 @@ mod tests {
                 returning: None,
                 ollp_predicted_surrogates: Some(vec![1, 2]),
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -660,6 +665,7 @@ mod tests {
                 returning: None,
                 ollp_predicted_surrogates: Some(vec![1, 2]),
                 ollp_predicted_edges: None,
+                rls_filters: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP edge set present, surrogates None —
             // the other half of the `Some` guard.
@@ -675,6 +681,7 @@ mod tests {
                     to: "b".into(),
                     label: None,
                 }]),
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -687,6 +694,7 @@ mod tests {
                     to: "b".into(),
                     label: None,
                 }]),
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::MaterializeScan {
                 collection: "c".into(),
@@ -944,12 +952,14 @@ mod tests {
                 surrogate: Surrogate::ZERO,
                 partial: false,
                 returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::DocDelete {
                 collection: "c".into(),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
                 returning: None,
+                rls_filters: Vec::new(),
             }),
         ];
         for p in &plans {
@@ -1942,6 +1952,7 @@ mod tests {
                 resolve_only: false,
                 resolved_inserts: None,
                 source_rows: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: "t".into(),
@@ -1954,6 +1965,7 @@ mod tests {
                 returning: None,
                 resolve_only: false,
                 source_rows: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                 collection: "c".into(),

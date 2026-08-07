@@ -110,14 +110,18 @@ impl CoreLoop {
                 document_id,
                 surrogate,
                 returning,
+                rls_filters,
                 ..
             } => self.execute_point_delete(
                 task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
-                returning.as_ref(),
+                crate::data::executor::handlers::point::delete::PointDeleteExec {
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
             ),
 
             DocumentOp::PointUpdate {
@@ -127,6 +131,7 @@ impl CoreLoop {
                 pk_bytes: _,
                 updates,
                 returning,
+                rls_filters,
             } => self.execute_point_update(
                 task,
                 crate::data::executor::handlers::point::update::PointUpdateParams {
@@ -136,6 +141,7 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     updates,
                     returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 
@@ -224,6 +230,7 @@ impl CoreLoop {
                 returning,
                 resolve_only,
                 source_rows,
+                rls_filters,
             } => self.execute_update_from_join(
                 task,
                 tid,
@@ -238,6 +245,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     resolve_only: *resolve_only,
                     source_rows: source_rows.as_deref(),
+                    rls_filters,
                 },
             ),
 
@@ -248,6 +256,7 @@ impl CoreLoop {
                 returning,
                 ollp_predicted_surrogates,
                 ollp_predicted_edges,
+                rls_filters,
             } => self.execute_bulk_update(
                 task,
                 tid,
@@ -258,6 +267,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
                     ollp_predicted_edges: ollp_predicted_edges.as_deref(),
+                    rls_filters,
                 },
             ),
 
@@ -267,15 +277,19 @@ impl CoreLoop {
                 returning,
                 ollp_predicted_surrogates,
                 ollp_predicted_edges,
+                rls_filters,
             } => self.execute_bulk_delete(
                 task,
                 tid,
-                collection,
-                filters,
-                returning.as_ref(),
-                crate::data::executor::handlers::bulk_dml::OllpPrediction {
-                    surrogates: ollp_predicted_surrogates.as_deref(),
-                    edges: ollp_predicted_edges.as_deref(),
+                super::super::handlers::bulk_dml::BulkDeleteParams {
+                    collection,
+                    filter_bytes: filters,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                    ollp: crate::data::executor::handlers::bulk_dml::OllpPrediction {
+                        surrogates: ollp_predicted_surrogates.as_deref(),
+                        edges: ollp_predicted_edges.as_deref(),
+                    },
                 },
             ),
 
@@ -391,6 +405,7 @@ impl CoreLoop {
                 resolve_only,
                 resolved_inserts,
                 source_rows,
+                rls_filters,
             } => self.execute_merge(
                 task,
                 tid,
@@ -405,6 +420,7 @@ impl CoreLoop {
                     resolved_inserts: resolved_inserts.as_deref(),
                     source_rows: source_rows.as_deref(),
                     returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 

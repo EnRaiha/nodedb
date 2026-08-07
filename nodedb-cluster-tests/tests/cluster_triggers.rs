@@ -196,6 +196,7 @@ fn replicated_entry_roundtrip_point_delete() {
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
         returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),

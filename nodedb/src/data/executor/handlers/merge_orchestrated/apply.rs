@@ -428,7 +428,7 @@ impl CoreLoop {
         }
 
         let mut response = if let Some(spec) = params.returning {
-            match returning_rows::build_rows_payload(spec, &returned_docs) {
+            match returning_rows::build_rows_payload(spec, params.rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(

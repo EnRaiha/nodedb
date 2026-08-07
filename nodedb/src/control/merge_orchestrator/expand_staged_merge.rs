@@ -145,6 +145,9 @@ async fn resolve_merge_arms(
         resolve_only: true,
         resolved_inserts: None,
         source_rows: Some(source_rows),
+        // Read-only classification pass: it emits no rows to the client, so
+        // there is nothing for a read policy to gate here.
+        rls_filters: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets `collect_target_docs` fold rows this transaction
@@ -238,6 +241,7 @@ fn emit_arms(
                 surrogate,
                 pk_bytes,
                 returning: None,
+                rls_filters: Vec::new(),
             }),
         ));
     }

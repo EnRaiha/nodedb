@@ -213,6 +213,7 @@ mod tests {
             returning: None,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
         });
         assert!(apply(&mut plan, &cache).is_ok());
         match &plan {

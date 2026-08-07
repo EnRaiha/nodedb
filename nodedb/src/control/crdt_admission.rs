@@ -1218,12 +1218,14 @@ mod tests {
             surrogate,
             partial: false,
             returning: None,
+            rls_filters: Vec::new(),
         });
         assert_frontier_mutation(CrdtOp::DocDelete {
             collection: collection(),
             document_id: "id".into(),
             surrogate,
             returning: None,
+            rls_filters: Vec::new(),
         });
 
         assert_frontier_read(CrdtOp::Read {

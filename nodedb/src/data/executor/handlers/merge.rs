@@ -61,6 +61,9 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// apply pass — the only pass that walks every arm's row bodies. `None`
     /// selects the affected-count payload.
     pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled RLS read policy of the TARGET collection, gating the
+    /// `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -113,6 +116,7 @@ impl CoreLoop {
             // which never carries a RETURNING projection (the COMMIT expander
             // rewrites the statement into concrete point ops before dispatch).
             returning: _,
+            rls_filters: _,
         } = params;
 
         debug!(

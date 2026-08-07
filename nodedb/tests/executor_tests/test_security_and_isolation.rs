@@ -223,6 +223,7 @@ fn linearizability_delete_visibility() {
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
             returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

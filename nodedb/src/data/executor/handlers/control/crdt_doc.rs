@@ -13,8 +13,8 @@ use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
+use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
@@ -29,6 +29,19 @@ pub(in crate::data::executor) struct CrdtDocUpsert<'a> {
     pub surrogate: Surrogate,
     pub partial: bool,
     pub returning: Option<&'a ReturningSpec>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
+}
+
+/// Borrowed arguments for [`CoreLoop::execute_crdt_doc_delete`], grouped so the
+/// handler stays within the argument-count limit.
+pub(in crate::data::executor) struct CrdtDocDelete<'a> {
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -46,6 +59,7 @@ impl CoreLoop {
             surrogate,
             partial,
             returning,
+            rls_filters,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, partial, "crdt doc upsert");
         let tenant_id = task.request.tenant_id;
@@ -106,11 +120,12 @@ impl CoreLoop {
                 true,
             );
             if let Some(spec) = returning {
-                let with_id =
-                    nodedb_query::msgpack_scan::inject_str_field(&bytes, "id", document_id);
-                let doc = doc_format::decode_document(&with_id)
+                // No strict schema: a CRDT row's stored body is whatever
+                // `encode_crdt_row` materialized from Loro, which is always
+                // MessagePack regardless of the collection's storage mode.
+                let doc = returning_doc::from_stored(&bytes, document_id, None)
                     .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
-                match returning_rows::build_rows_payload(spec, &[doc]) {
+                match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {
                         return self.response_error(
@@ -125,7 +140,7 @@ impl CoreLoop {
                 self.response_ok(task)
             }
         } else if let Some(spec) = returning {
-            match returning_rows::build_rows_payload(spec, &[]) {
+            match returning_rows::build_rows_payload(spec, rls_filters, &[]) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(
@@ -150,11 +165,15 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_doc_delete(
         &mut self,
         task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        returning: Option<&ReturningSpec>,
+        args: CrdtDocDelete<'_>,
     ) -> Response {
+        let CrdtDocDelete {
+            collection,
+            document_id,
+            surrogate,
+            returning,
+            rls_filters,
+        } = args;
         debug!(core = self.core_id, %collection, %document_id, "crdt doc delete");
         let tenant_id = task.request.tenant_id;
         {
@@ -228,11 +247,11 @@ impl CoreLoop {
         // `id` exactly like PointDelete.
         let response = if let Some(spec) = returning {
             if let Some(prior_bytes) = outcome.prior_value.as_deref() {
-                let with_id =
-                    nodedb_query::msgpack_scan::inject_str_field(prior_bytes, "id", document_id);
-                let doc = doc_format::decode_document(&with_id)
+                // No strict schema — see the upsert path: a CRDT row is
+                // materialized as MessagePack in either storage mode.
+                let doc = returning_doc::from_stored(prior_bytes, document_id, None)
                     .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
-                match returning_rows::build_rows_payload(spec, &[doc]) {
+                match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {
                         return self.response_error(
@@ -244,7 +263,7 @@ impl CoreLoop {
                     }
                 }
             } else {
-                match returning_rows::build_rows_payload(spec, &[]) {
+                match returning_rows::build_rows_payload(spec, rls_filters, &[]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {
                         return self.response_error(

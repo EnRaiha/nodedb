@@ -42,6 +42,47 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
+        // Inject: these writes surface rows through a `RETURNING` clause, and
+        // that output is a read — a row the policy hides must not become
+        // visible just because the statement wrote it. The handler evaluates
+        // the filter against each full pre-projection document, so a predicate
+        // on a column the `RETURNING` list omits still decides the row. Only
+        // the returned set shrinks: the write is admitted separately by
+        // `RlsPolicyStore::check_write_with_auth`, and the affected count keeps
+        // reporting rows written.
+        DocumentOp::PointDelete {
+            collection,
+            rls_filters,
+            ..
+        }
+        | DocumentOp::PointUpdate {
+            collection,
+            rls_filters,
+            ..
+        }
+        | DocumentOp::BulkUpdate {
+            collection,
+            rls_filters,
+            ..
+        }
+        | DocumentOp::BulkDelete {
+            collection,
+            rls_filters,
+            ..
+        }
+        // The joined source is read, but every row these two return belongs to
+        // the TARGET, so the target's policy is the one that gates the output.
+        | DocumentOp::UpdateFromJoin {
+            target_collection: collection,
+            rls_filters,
+            ..
+        }
+        | DocumentOp::Merge {
+            target_collection: collection,
+            rls_filters,
+            ..
+        } => ctx.set_post_filters(collection, rls_filters),
+
         // Refuse: returns index entries rather than rows, so there is no row
         // body to evaluate a policy against.
         DocumentOp::IndexLookup { collection, .. } => ctx.refuse_if_policy(
@@ -68,22 +109,16 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
              carries no row filter",
         ),
 
-        // No-op: writes, bulk DML, and index DDL. The read policy does not
-        // apply to them; write policies are enforced separately by
-        // `RlsPolicyStore::check_write_with_auth`, and their `filters` /
-        // `source_filters` / `target_filters` slots are the statement's own
-        // write predicate, not a read filter slot.
+        // No-op: writes that surface no row and index DDL. The read policy has
+        // nothing to restrict in them; write policies are enforced separately
+        // by `RlsPolicyStore::check_write_with_auth`, and their `filters` /
+        // `source_filters` slots are the statement's own write predicate, not a
+        // read filter slot.
         DocumentOp::PointPut { .. }
         | DocumentOp::PointInsert { .. }
-        | DocumentOp::PointDelete { .. }
-        | DocumentOp::PointUpdate { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::Upsert { .. }
-        | DocumentOp::UpdateFromJoin { .. }
-        | DocumentOp::BulkUpdate { .. }
-        | DocumentOp::BulkDelete { .. }
-        | DocumentOp::Merge { .. }
         | DocumentOp::Truncate { .. }
         | DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
@@ -134,6 +169,67 @@ mod tests {
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
         assert_eq!(plan, before);
+    }
+
+    /// A `RETURNING` write ships rows back, so the policy lands in its
+    /// post-filter slot — leaving the statement's own write predicate alone.
+    #[test]
+    fn bulk_update_receives_the_policy_filter() {
+        let store = store_with_read_policy("users");
+        let mut plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection: "users".into(),
+            filters: Vec::new(),
+            updates: Vec::new(),
+            returning: None,
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Document(DocumentOp::BulkUpdate {
+                filters,
+                rls_filters,
+                ..
+            }) => {
+                assert!(
+                    !rls_filters.is_empty(),
+                    "policy must land in the post-filter slot"
+                );
+                assert!(
+                    filters.is_empty(),
+                    "the statement's own write predicate must stay untouched"
+                );
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
+    }
+
+    /// Every row a MERGE returns belongs to the target, so the target's policy
+    /// is the one injected — a policy on the source gates nothing here.
+    #[test]
+    fn merge_receives_the_target_collection_policy() {
+        let store = store_with_read_policy("target");
+        let mut plan = PhysicalPlan::Document(DocumentOp::Merge {
+            target_collection: "target".into(),
+            source_collection: "source".into(),
+            source_alias: "s".into(),
+            target_join_col: "id".into(),
+            source_join_col: "id".into(),
+            clauses: Vec::new(),
+            returning: None,
+            resolve_only: false,
+            resolved_inserts: None,
+            source_rows: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Document(DocumentOp::Merge { rls_filters, .. }) => {
+                assert!(!rls_filters.is_empty(), "target policy must be injected")
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
     }
 
     /// A cardinality estimate counts rows the policy hides.

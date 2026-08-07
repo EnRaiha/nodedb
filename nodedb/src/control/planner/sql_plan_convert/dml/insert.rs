@@ -267,6 +267,7 @@ pub(in super::super) fn convert_insert(
                         surrogate,
                         partial: false,
                         returning: None,
+                        rls_filters: Vec::new(),
                     })
                 } else {
                     PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -409,6 +410,7 @@ pub(in super::super) fn convert_upsert(
                         surrogate,
                         partial: false,
                         returning: None,
+                        rls_filters: Vec::new(),
                     })
                 } else {
                     PhysicalPlan::Document(DocumentOp::Upsert {

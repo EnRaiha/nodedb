@@ -111,6 +111,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             surrogate,
             partial,
             returning: _,
+            rls_filters: _,
         } => doc_upsert(
             collection,
             document_id,
@@ -123,6 +124,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             document_id,
             surrogate,
             returning: _,
+            rls_filters: _,
         } => doc_delete(collection, document_id, surrogate.as_u32()),
         CrdtOp::SetConstraints {
             collection,
