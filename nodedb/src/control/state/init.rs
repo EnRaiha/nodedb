@@ -85,7 +85,7 @@ impl SharedState {
             s.auth_users =
                 crate::control::security::jit::auth_user::AuthUserStore::open(catalog.clone())?;
             s.scope_grants =
-                crate::control::security::scope::grant::ScopeGrantStore::open(catalog.clone())?;
+                crate::control::security::scope::grant::ScopeGrantStore::open(catalog)?;
             s.credentials = credentials;
             s.ep_topic_registry
                 .load_from_catalog(s.credentials.catalog())?;

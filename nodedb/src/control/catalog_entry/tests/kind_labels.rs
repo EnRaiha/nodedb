@@ -3,9 +3,9 @@
 //! Stable `kind()` label coverage across variants.
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::security::catalog::StoredCollection;
 use crate::control::security::catalog::oidc_providers::StoredOidcProvider;
 use crate::control::security::catalog::sequence_types::StoredSequence;
+use crate::control::security::catalog::{StoredCollection, StoredScopeGrant};
 
 #[test]
 fn kind_label_is_stable() {
@@ -53,5 +53,29 @@ fn kind_label_is_stable() {
         }
         .kind(),
         "delete_oidc_provider"
+    );
+    let scope_grant = StoredScopeGrant {
+        scope_name: "pro:all".into(),
+        grantee_type: "org".into(),
+        grantee_id: "acme".into(),
+        granted_by: "admin".into(),
+        granted_at: 1_000,
+        expires_at: 0,
+        grace_period_secs: 0,
+        on_expire_action: String::new(),
+        conditions_json: String::new(),
+    };
+    assert_eq!(
+        CatalogEntry::PutScopeGrant(Box::new(scope_grant)).kind(),
+        "put_scope_grant"
+    );
+    assert_eq!(
+        CatalogEntry::DeleteScopeGrant {
+            scope_name: "pro:all".into(),
+            grantee_type: "org".into(),
+            grantee_id: "acme".into(),
+        }
+        .kind(),
+        "delete_scope_grant"
     );
 }

@@ -21,7 +21,7 @@ use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
     function, materialized_view, owner, permission, procedure, redaction, rls, role, schedule,
-    sequence, streaming_materialized_view, synonym_group, tenant, trigger, user,
+    scope_grant, sequence, streaming_materialized_view, synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -246,6 +246,21 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
                 target.clone(),
                 grantee.clone(),
                 perm.clone(),
+                Arc::clone(shared),
+            );
+        }
+        CatalogEntry::PutScopeGrant(stored) => {
+            scope_grant::put((**stored).clone(), Arc::clone(shared));
+        }
+        CatalogEntry::DeleteScopeGrant {
+            scope_name,
+            grantee_type,
+            grantee_id,
+        } => {
+            scope_grant::delete(
+                scope_name.clone(),
+                grantee_type.clone(),
+                grantee_id.clone(),
                 Arc::clone(shared),
             );
         }

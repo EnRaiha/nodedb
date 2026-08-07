@@ -145,9 +145,8 @@ impl SharedState {
         // the `WHEN` / `REQUIRE` conditions restricting it — has to survive a
         // restart, and a memory-only store silently drops every grant the
         // operator issued.
-        let scope_grants = crate::control::security::scope::grant::ScopeGrantStore::open(
-            credentials.catalog().clone(),
-        )?;
+        let scope_grants =
+            crate::control::security::scope::grant::ScopeGrantStore::open(credentials.catalog())?;
 
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),

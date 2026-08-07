@@ -110,6 +110,11 @@ fn process_expired_grants_inner(store: &ScopeGrantStore, events: &mut Vec<ScopeE
 }
 
 /// Execute the `on_expire_action` for a fully expired grant.
+///
+/// Touches the in-memory store only. Durable scope-grant state is written by
+/// the `PutScopeGrant` / `DeleteScopeGrant` applier, so making these actions
+/// survive a restart means proposing those entries — which needs a
+/// `SharedState` this processor does not take.
 fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) {
     let action = &grant.on_expire_action;
 
@@ -121,28 +126,18 @@ fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) 
 
     if action == "revoke_all" {
         // Hard cutoff: remove the grant entirely.
-        match store.revoke(&grant.scope_name, &grant.grantee_type, &grant.grantee_id) {
-            Ok(_) => {
-                info!(
-                    scope = %grant.scope_name,
-                    grantee = %grant.grantee_id,
-                    "expired scope grant revoked (ON EXPIRE REVOKE ALL)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    scope = %grant.scope_name,
-                    error = %e,
-                    "failed to revoke expired scope grant"
-                );
-            }
-        }
+        store.install_replicated_revoke(&grant.scope_name, &grant.grantee_type, &grant.grantee_id);
+        info!(
+            scope = %grant.scope_name,
+            grantee = %grant.grantee_id,
+            "expired scope grant revoked (ON EXPIRE REVOKE ALL)"
+        );
         return;
     }
 
     if let Some(downgrade_scope) = action.strip_prefix("grant:") {
         // Automatic downgrade: grant a replacement scope.
-        match store.grant(ScopeGrantParams {
+        match store.prepare_grant(ScopeGrantParams {
             scope_name: downgrade_scope,
             grantee_type: &grant.grantee_type,
             grantee_id: &grant.grantee_id,
@@ -155,7 +150,8 @@ fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) 
             // retired, so they are not carried over.
             conditions: Vec::new(),
         }) {
-            Ok(_) => {
+            Ok(stored) => {
+                store.install_replicated_grant(&stored);
                 info!(
                     old_scope = %grant.scope_name,
                     new_scope = %downgrade_scope,
@@ -174,7 +170,7 @@ fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) 
         }
 
         // Remove the expired original grant.
-        let _ = store.revoke(&grant.scope_name, &grant.grantee_type, &grant.grantee_id);
+        store.install_replicated_revoke(&grant.scope_name, &grant.grantee_type, &grant.grantee_id);
     }
 }
 

@@ -42,6 +42,7 @@ use crate::control::state::SharedState;
 /// | PutRlsPolicy / DeleteRlsPolicy          | ❌ no       | `execute_sql` is only called from CDC path (no RLS injection via `inject_rls`); per-session pgwire cache has its own DDL invalidation |
 /// | PutRedactionPolicy / DeleteRedactionPolicy | ❌ no    | redaction rules are applied post-scan on the decoded document by role, so they are not baked into `PhysicalPlan` shape; the fail-closed refusal is re-evaluated against the live store on every execution, so no cached plan goes stale either |
 /// | PutPermission / DeletePermission        | ❌ no       | permission checked at exec time |
+/// | PutScopeGrant / DeleteScopeGrant        | ❌ no       | scope enrichment resolves grants per request against the live store; no scope field in any PhysicalPlan variant |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
     let Some(inv) = shared.gateway_invalidator.get() else {
@@ -211,6 +212,14 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::DeletePermission { .. } => {
             // no-op: same as PutPermission.
+        }
+        CatalogEntry::PutScopeGrant(_) => {
+            // no-op: scope grants are resolved per request by scope
+            // enrichment against the live store, so they are not baked into
+            // `PhysicalPlan` shape and no cached plan goes stale on a write.
+        }
+        CatalogEntry::DeleteScopeGrant { .. } => {
+            // no-op: same as PutScopeGrant.
         }
         // ── Index registry: index availability changes plan shape ────────────
         CatalogEntry::PutIndexRecord(record) => {

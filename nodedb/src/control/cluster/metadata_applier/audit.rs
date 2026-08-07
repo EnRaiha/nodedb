@@ -237,6 +237,20 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             grantee,
             permission,
         } => (format!("{grantee}@{target}:{permission}"), 0, String::new()),
+        E::PutScopeGrant(g) => (
+            format!("{}:{}@{}", g.grantee_type, g.grantee_id, g.scope_name),
+            0,
+            String::new(),
+        ),
+        E::DeleteScopeGrant {
+            scope_name,
+            grantee_type,
+            grantee_id,
+        } => (
+            format!("{grantee_type}:{grantee_id}@{scope_name}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

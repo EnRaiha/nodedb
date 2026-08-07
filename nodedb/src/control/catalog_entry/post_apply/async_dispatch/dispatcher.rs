@@ -199,6 +199,9 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteRedactionPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
+        // Scope grants: the store install happens in `sync.rs`.
+        | CatalogEntry::PutScopeGrant(_)
+        | CatalogEntry::DeleteScopeGrant { .. }
         | CatalogEntry::PutIndexRecord(_)
         | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)

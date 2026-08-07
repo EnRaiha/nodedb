@@ -5,14 +5,76 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::catalog_entry::CatalogEntry;
+use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::security::catalog::StoredScopeGrant;
 use crate::control::security::conditional::{parse_conditions, render_conditions};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::scope::grant::ScopeGrantParams;
+use crate::control::security::scope::grant::{RenewOutcome, ScopeGrantParams};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::support::{err, status};
+
+/// Replicate a scope-grant upsert (`GRANT SCOPE`, and `RENEW SCOPE`, which
+/// is the same upsert with a later expiry).
+///
+/// A grant that only reached the node handling the statement would authorize
+/// there and nowhere else, so the catalog write is the applier's job on every
+/// node. The `log_index == 0` branch is the standalone-origin path, where
+/// there is no raft group to apply the entry.
+fn propose_scope_grant(state: &SharedState, stored: &StoredScopeGrant) -> Result<(), DdlError> {
+    let entry = CatalogEntry::PutScopeGrant(Box::new(stored.clone()));
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
+    if log_index == 0 {
+        {
+            let catalog = state.credentials.catalog();
+            catalog.put_scope_grant(stored).map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("catalog write: {e}"),
+            })?;
+        }
+        state.scope_grants.install_replicated_grant(stored);
+    }
+    Ok(())
+}
+
+/// Replicate a scope-grant removal. Same dual path as [`propose_scope_grant`].
+fn propose_scope_revoke(
+    state: &SharedState,
+    scope_name: &str,
+    grantee_type: &str,
+    grantee_id: &str,
+) -> Result<(), DdlError> {
+    let entry = CatalogEntry::DeleteScopeGrant {
+        scope_name: scope_name.to_string(),
+        grantee_type: grantee_type.to_string(),
+        grantee_id: grantee_id.to_string(),
+    };
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
+    if log_index == 0 {
+        {
+            let catalog = state.credentials.catalog();
+            catalog
+                .delete_scope_grant(scope_name, grantee_type, grantee_id)
+                .map_err(|e| DdlError {
+                    sqlstate: "XX000".to_string(),
+                    message: format!("catalog write: {e}"),
+                })?;
+        }
+        state
+            .scope_grants
+            .install_replicated_revoke(scope_name, grantee_type, grantee_id);
+    }
+    Ok(())
+}
 
 /// GRANT SCOPE '<scope>' TO <ORG|USER|ROLE> '<id>'
 ///     [EXPIRES '<unix ts>'] [GRACE PERIOD <duration>] [ON EXPIRE <action>]
@@ -57,9 +119,9 @@ pub fn grant_scope(
     let conditions = parse_conditions(&parts[6..]).map_err(|e| err("42601", e.to_string()))?;
     let rendered_conditions = render_conditions(&conditions);
 
-    state
+    let stored = state
         .scope_grants
-        .grant(ScopeGrantParams {
+        .prepare_grant(ScopeGrantParams {
             scope_name,
             grantee_type: &grantee_type,
             grantee_id,
@@ -70,6 +132,7 @@ pub fn grant_scope(
             conditions,
         })
         .map_err(|e| err("XX000", e.to_string()))?;
+    propose_scope_grant(state, &stored)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -103,10 +166,7 @@ pub fn revoke_scope(
     let grantee_type = parts[4].to_lowercase();
     let grantee_id = parts[5].trim_matches('\'');
 
-    state
-        .scope_grants
-        .revoke(scope_name, &grantee_type, grantee_id)
-        .map_err(|e| err("XX000", e.to_string()))?;
+    propose_scope_revoke(state, scope_name, &grantee_type, grantee_id)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -144,12 +204,15 @@ pub fn renew_scope(
         )
         .ok_or_else(|| err("42601", format!("invalid duration: '{duration_str}'")))?;
 
-    let found = state
+    let outcome = state
         .scope_grants
-        .renew(scope_name, &grantee_type, grantee_id, extend_secs)
+        .prepare_renew(scope_name, &grantee_type, grantee_id, extend_secs)
         .map_err(|e| err("XX000", e.to_string()))?;
-    if !found {
-        return Err(err("42704", "scope grant not found"));
+    match outcome {
+        RenewOutcome::NotFound => return Err(err("42704", "scope grant not found")),
+        // Nothing to move: a permanent grant has no deadline to extend.
+        RenewOutcome::AlreadyPermanent => {}
+        RenewOutcome::Extend(stored) => propose_scope_grant(state, &stored)?,
     }
 
     state.audit_record(

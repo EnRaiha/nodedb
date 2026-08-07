@@ -203,6 +203,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRedactionPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
+        // Scope grants carry no descriptor version, same as permissions.
+        | CatalogEntry::PutScopeGrant(_)
+        | CatalogEntry::DeleteScopeGrant { .. }
         | CatalogEntry::PutIndexRecord(_)
         | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)

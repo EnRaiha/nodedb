@@ -11,7 +11,7 @@
 use crate::control::security::catalog::{
     StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
     StoredMaterializedView, StoredOidcProvider, StoredRedactionPolicy, StoredRlsPolicy,
-    StoredSynonymGroup,
+    StoredScopeGrant, StoredSynonymGroup,
     auth_types::{
         StoredApiKey, StoredAuthUser, StoredOwner, StoredPermission, StoredRole, StoredTenant,
         StoredUser,
@@ -423,69 +423,23 @@ pub enum CatalogEntry {
         tenant_id: u64,
         name: String,
     },
-}
 
-impl CatalogEntry {
-    /// Short, human-readable descriptor of this entry — used in
-    /// trace / metric labels.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::PutCollection(_) => "put_collection",
-            Self::PutCollectionIfAbsent(_) => "put_collection_if_absent",
-            Self::DeactivateCollection { .. } => "deactivate_collection",
-            Self::PurgeCollection { .. } => "purge_collection",
-            Self::PutSequence(_) => "put_sequence",
-            Self::DeleteSequence { .. } => "delete_sequence",
-            Self::PutSequenceState(_) => "put_sequence_state",
-            Self::PutTrigger(_) => "put_trigger",
-            Self::DeleteTrigger { .. } => "delete_trigger",
-            Self::PutFunction(_) => "put_function",
-            Self::DeleteFunction { .. } => "delete_function",
-            Self::PutProcedure(_) => "put_procedure",
-            Self::DeleteProcedure { .. } => "delete_procedure",
-            Self::PutSchedule(_) => "put_schedule",
-            Self::DeleteSchedule { .. } => "delete_schedule",
-            Self::PutChangeStream(_) => "put_change_stream",
-            Self::DeleteChangeStream { .. } => "delete_change_stream",
-            Self::PutUser(_) => "put_user",
-            Self::DropUser { .. } => "drop_user",
-            Self::PutRole(_) => "put_role",
-            Self::DeleteRole { .. } => "delete_role",
-            Self::PutApiKey(_) => "put_api_key",
-            Self::RevokeApiKey { .. } => "revoke_api_key",
-            Self::PutAuthUser(_) => "put_auth_user",
-            Self::PutMaterializedView(_) => "put_materialized_view",
-            Self::DeleteMaterializedView { .. } => "delete_materialized_view",
-            Self::PutStreamingMaterializedView(_) => "put_streaming_materialized_view",
-            Self::DeleteStreamingMaterializedView { .. } => "delete_streaming_materialized_view",
-            Self::PutContinuousAggregate(_) => "put_continuous_aggregate",
-            Self::DeleteContinuousAggregate { .. } => "delete_continuous_aggregate",
-            Self::PutTenant(_) => "put_tenant",
-            Self::PutTenantWithAdmin { .. } => "put_tenant_with_admin",
-            Self::DeleteTenant { .. } => "delete_tenant",
-            Self::PutRlsPolicy(_) => "put_rls_policy",
-            Self::DeleteRlsPolicy { .. } => "delete_rls_policy",
-            Self::PutRedactionPolicy(_) => "put_redaction_policy",
-            Self::DeleteRedactionPolicy { .. } => "delete_redaction_policy",
-            Self::PutPermission(_) => "put_permission",
-            Self::DeletePermission { .. } => "delete_permission",
-            Self::PutIndexRecord(_) => "put_index_record",
-            Self::DeleteIndexRecord { .. } => "delete_index_record",
-            Self::PutOwner(_) => "put_owner",
-            Self::DeleteOwner { .. } => "delete_owner",
-            Self::PutDatabase(_) => "put_database",
-            Self::DeleteDatabase { .. } => "delete_database",
-            Self::PutDatabaseGrant { .. } => "put_database_grant",
-            Self::DeleteDatabaseGrant { .. } => "delete_database_grant",
-            Self::PutSynonymGroup(_) => "put_synonym_group",
-            Self::DeleteSynonymGroup { .. } => "delete_synonym_group",
-            Self::PutCustomType(_) => "put_custom_type",
-            Self::DeleteCustomType { .. } => "delete_custom_type",
-            Self::PutOidcProvider(_) => "put_oidc_provider",
-            Self::DeleteOidcProvider { .. } => "delete_oidc_provider",
-            Self::RecordWalTombstone { .. } => "record_wal_tombstone",
-            Self::MoveTenantCutover { .. } => "move_tenant_cutover",
-            Self::CloneDatabase { .. } => "clone_database",
-        }
-    }
+    // ── Scope grant ────────────────────────────────────────────────
+    // Also appended rather than filed next to the permission variants,
+    // for the same discriminant-stability reason.
+    /// Upsert a scope grant (`GRANT SCOPE`, and `RENEW SCOPE`, which is
+    /// the same upsert carrying a later `expires_at`). The catalog row is
+    /// the authoritative copy on every node; the in-memory
+    /// `ScopeGrantStore` map is installed from it on apply, so a grant
+    /// authorizes identically on the node that received the statement and
+    /// on every other node.
+    PutScopeGrant(Box<StoredScopeGrant>),
+    /// Delete a scope grant by `(scope_name, grantee_type, grantee_id)` —
+    /// the same triple the catalog and the in-memory map are keyed on.
+    /// `grantee_type` is the lowercase form (`user|role|org|team`).
+    DeleteScopeGrant {
+        scope_name: String,
+        grantee_type: String,
+        grantee_id: String,
+    },
 }

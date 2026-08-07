@@ -327,6 +327,18 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         "DeletePermission",
     );
 
+    // DeleteScopeGrant
+    assert_noop(
+        &shared,
+        &cache,
+        CatalogEntry::DeleteScopeGrant {
+            scope_name: "pro:all".into(),
+            grantee_type: "org".into(),
+            grantee_id: "acme".into(),
+        },
+        "DeleteScopeGrant",
+    );
+
     // DeleteOwner
     assert_noop(
         &shared,

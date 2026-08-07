@@ -206,6 +206,10 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutAuthUser(_) => VariantClass::Exempt,
         CatalogEntry::PutPermission(_) => VariantClass::Exempt,
         CatalogEntry::DeletePermission { .. } => VariantClass::Exempt,
+        // Scope grants are their own row keyed by (scope, grantee); no
+        // parent object and no owner row to verify.
+        CatalogEntry::PutScopeGrant(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteScopeGrant { .. } => VariantClass::Exempt,
         CatalogEntry::PutTenant(_) => VariantClass::Exempt,
         CatalogEntry::PutTenantWithAdmin { .. } => VariantClass::Exempt,
         CatalogEntry::DeleteTenant { .. } => VariantClass::Exempt,

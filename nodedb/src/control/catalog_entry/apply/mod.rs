@@ -28,6 +28,7 @@ pub mod redaction;
 pub mod rls;
 pub mod role;
 pub mod schedule;
+pub mod scope_grant;
 pub mod sequence;
 pub mod streaming_materialized_view;
 pub mod synonym_group;
@@ -202,6 +203,12 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             grantee,
             permission: perm,
         } => permission::delete(target, grantee, perm, catalog),
+        CatalogEntry::PutScopeGrant(stored) => scope_grant::put(stored, catalog),
+        CatalogEntry::DeleteScopeGrant {
+            scope_name,
+            grantee_type,
+            grantee_id,
+        } => scope_grant::delete(scope_name, grantee_type, grantee_id, catalog),
         CatalogEntry::PutIndexRecord(record) => index_registry::put(record, catalog),
         CatalogEntry::DeleteIndexRecord {
             database_id,
