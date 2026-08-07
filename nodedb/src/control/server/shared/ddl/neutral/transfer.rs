@@ -97,6 +97,9 @@ pub async fn transfer(
         amount,
         debit_surrogate,
         credit_surrogate,
+        // Filled by `dispatch_and_respond`, which runs the same RLS injection
+        // pass the planner-driven path runs.
+        rls_write_check: Vec::new(),
     });
 
     dispatch_and_respond(
@@ -171,6 +174,10 @@ pub async fn transfer_item(
         item_key: item_key.into_bytes(),
         dest_key: dest_bytes,
         surrogate,
+        // One predicate per side, both filled by `dispatch_and_respond`: the
+        // two collections carry independent policies.
+        source_rls_write_check: Vec::new(),
+        dest_rls_write_check: Vec::new(),
     });
 
     dispatch_and_respond(

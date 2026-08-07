@@ -23,6 +23,8 @@ mod stage_columnar_dml;
 mod stage_graph;
 mod stage_kv;
 mod stage_kv_atomic;
+mod stage_kv_conflict;
+mod stage_kv_delete;
 mod stage_kv_transfer;
 mod stage_kv_ttl;
 mod stage_point_document;

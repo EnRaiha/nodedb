@@ -29,6 +29,7 @@ impl CoreLoop {
             ttl_ms,
             updates,
             surrogate,
+            rls_write_check,
         } = params;
         debug!(core = self.core_id, %collection, "kv insert-on-conflict-update");
 
@@ -96,6 +97,16 @@ impl CoreLoop {
                 }
             }
         };
+
+        // `stored_bytes` is whichever body this op actually persists — the
+        // incoming row when the key was absent, the merge when it was present.
+        // Deciding the merge is the point: admitting only the incoming row
+        // would clear a write whose real post-image the policy never saw.
+        if let Err(e) =
+            super::super::rls::admit_kv_row(rls_write_check, &stored_bytes, key, tid, collection)
+        {
+            return self.response_error(task, e);
+        }
 
         self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,

@@ -423,6 +423,7 @@ mod tests {
             amount: 30.0,
             debit_surrogate: Surrogate::new(1),
             credit_surrogate: Surrogate::new(2),
+            rls_write_check: Vec::new(),
         });
 
         // The `wal_append_kv_op` assertion the pre-fix code fails: `Transfer`
@@ -485,6 +486,8 @@ mod tests {
             item_key: b"sword_1".to_vec(),
             dest_key: b"sword_1_moved".to_vec(),
             surrogate: Surrogate::new(7),
+            source_rls_write_check: Vec::new(),
+            dest_rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_item, transfer_item]);

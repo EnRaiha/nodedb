@@ -105,6 +105,8 @@ pub(super) async fn handle_zrem(
     let plan = PhysicalPlan::Kv(KvOp::Delete {
         collection: session.collection.clone(),
         keys,
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

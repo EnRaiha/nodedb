@@ -426,6 +426,7 @@ mod tests {
             ttl_ms: 0,
             updates: updates.clone(),
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p1, upsert]);
@@ -467,6 +468,7 @@ mod tests {
             ttl_ms: 0,
             updates,
             surrogate: Surrogate::new(3),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[upsert]);

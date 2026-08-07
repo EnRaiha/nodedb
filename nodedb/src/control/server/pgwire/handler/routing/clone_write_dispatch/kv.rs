@@ -36,7 +36,11 @@ impl NodeDbPgHandler {
             PhysicalPlan::Kv(KvOp::FieldSet {
                 collection, key, ..
             }) => (collection.as_str(), key.clone(), false),
-            PhysicalPlan::Kv(KvOp::Delete { collection, keys }) => {
+            PhysicalPlan::Kv(KvOp::Delete {
+                collection,
+                keys,
+                rls_write_check,
+            }) => {
                 // Delete may have multiple keys; handle each. We serialize here
                 // (one tombstone per key) and return Handled with synthetic OK.
                 let collection_qualified = collection.as_str();
@@ -143,6 +147,12 @@ impl NodeDbPgHandler {
                     let delete_plan = PhysicalPlan::Kv(KvOp::Delete {
                         collection: collection_qualified.to_string(),
                         keys: keys_to_dispatch,
+                        // The narrowed delete is the same statement's write, so
+                        // it carries the same compiled predicate: dropping it
+                        // here would launder a governed delete into an
+                        // ungoverned one for exactly the keys that resolve to
+                        // real target rows.
+                        rls_write_check: rls_write_check.clone(),
                     });
                     let vshard_id =
                         VShardId::from_collection_in_database(db_id, collection_qualified);

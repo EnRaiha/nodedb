@@ -33,21 +33,50 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 use crate::types::TxnId;
 
+/// The row a staged TTL mutation targets, plus the policy that decides it.
+///
+/// The staging twin of `handlers::kv::ttl::KvTtlTarget`, and deliberately not
+/// the same type: staging addresses a row by the transaction whose overlay
+/// holds it, so it carries `txn_id` and no `database_id` — the latter is
+/// resolved from `task` by [`CoreLoop::kv_atomic_stage_ctx`]. Sharing one
+/// struct would mean carrying a field that is meaningless on one of the two
+/// sides.
+///
+/// `Copy` for the same reason its sibling is: `EXPIRE` and `PERSIST` hand the
+/// same address to the shared admission check rather than rebuilding it.
+#[derive(Clone, Copy)]
+pub(in crate::data::executor) struct StageKvTtlTarget<'a> {
+    pub tid: u64,
+    pub txn_id: TxnId,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    /// Compiled row-level-security WRITE predicate. Empty means no write
+    /// policy restricts this identity here.
+    pub rls_write_check: &'a [u8],
+}
+
 impl CoreLoop {
     /// Stage `KvOp::Expire`: record an absolute expiry instant in the
     /// overlay's KV TTL delta map.
     pub(in crate::data::executor) fn execute_stage_kv_expire(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        key: &[u8],
+        target: StageKvTtlTarget<'_>,
         ttl_ms: u64,
     ) -> Response {
+        let StageKvTtlTarget {
+            tid,
+            txn_id,
+            collection,
+            key,
+            rls_write_check,
+        } = target;
         let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
         if !self.stage_kv_pk_present(&ctx, key) {
             return self.response_error(task, ErrorCode::NotFound);
+        }
+        if let Err(e) = self.stage_admit_kv_ttl_target(&ctx, key, rls_write_check) {
+            return self.response_error(task, e);
         }
 
         let now_ms: u64 = self
@@ -71,14 +100,21 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_stage_kv_persist(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        key: &[u8],
+        target: StageKvTtlTarget<'_>,
     ) -> Response {
+        let StageKvTtlTarget {
+            tid,
+            txn_id,
+            collection,
+            key,
+            rls_write_check,
+        } = target;
         let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
         if !self.stage_kv_pk_present(&ctx, key) {
             return self.response_error(task, ErrorCode::NotFound);
+        }
+        if let Err(e) = self.stage_admit_kv_ttl_target(&ctx, key, rls_write_check) {
+            return self.response_error(task, e);
         }
 
         let coll_key = ctx.coll_key.clone();
@@ -91,5 +127,26 @@ impl CoreLoop {
             StagedTtl::Persist,
         );
         self.response_ok(task)
+    }
+
+    /// Decide the row a staged TTL mutation targets against the write policy.
+    ///
+    /// A TTL change leaves the body untouched, so the current row under
+    /// BASE ∪ OVERLAY is both the pre- and the post-image. Presence was already
+    /// established by the caller, so an image that has since resolved to absent
+    /// leaves nothing to decide.
+    fn stage_admit_kv_ttl_target(
+        &self,
+        ctx: &super::context::StageCtx<'_>,
+        key: &[u8],
+        rls_write_check: &[u8],
+    ) -> crate::Result<()> {
+        if rls_write_check.is_empty() {
+            return Ok(());
+        }
+        let Some(body) = self.resolve_kv_current(ctx, key) else {
+            return Ok(());
+        };
+        self.stage_admit_kv_image(ctx, &body, rls_write_check)
     }
 }

@@ -122,7 +122,9 @@ mod tests {
 
     #[test]
     fn a_genuine_refusal_stays_terminal_and_carries_its_reason() {
-        let error = crate::Error::DataPlane(ErrorCode::RejectedAuthz);
+        let error = crate::Error::DataPlane(ErrorCode::RejectedAuthz {
+            resource: "RLS write policy on 'orders' rejected the row".into(),
+        });
         match ack_status_for_dispatch_error(&error, 4) {
             AckStatus::Rejected { reason } => assert!(!reason.is_empty()),
             other => panic!("expected a terminal rejection, got {other:?}"),

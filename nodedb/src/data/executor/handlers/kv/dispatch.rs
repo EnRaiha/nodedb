@@ -94,6 +94,7 @@ impl CoreLoop {
                 ttl_ms,
                 updates,
                 surrogate,
+                rls_write_check,
             } => self.execute_kv_insert_on_conflict_update(
                 task,
                 super::crud::KvInsertOnConflictUpdateParams {
@@ -105,11 +106,14 @@ impl CoreLoop {
                     ttl_ms: *ttl_ms,
                     updates,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
             ),
-            KvOp::Delete { collection, keys } => {
-                self.execute_kv_delete(task, did, tid, collection, keys)
-            }
+            KvOp::Delete {
+                collection,
+                keys,
+                rls_write_check,
+            } => self.execute_kv_delete(task, did, tid, collection, keys, rls_write_check),
             KvOp::Scan {
                 collection,
                 cursor,
@@ -136,10 +140,32 @@ impl CoreLoop {
                 collection,
                 key,
                 ttl_ms,
-            } => self.execute_kv_expire(task, did, tid, collection, key, *ttl_ms),
-            KvOp::Persist { collection, key } => {
-                self.execute_kv_persist(task, did, tid, collection, key)
-            }
+                rls_write_check,
+            } => self.execute_kv_expire(
+                task,
+                super::ttl::KvTtlTarget {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    rls_write_check,
+                },
+                *ttl_ms,
+            ),
+            KvOp::Persist {
+                collection,
+                key,
+                rls_write_check,
+            } => self.execute_kv_persist(
+                task,
+                super::ttl::KvTtlTarget {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    rls_write_check,
+                },
+            ),
             KvOp::BatchGet {
                 collection,
                 keys,
@@ -201,6 +227,7 @@ impl CoreLoop {
                 key,
                 updates,
                 surrogate,
+                rls_write_check,
             } => self.execute_kv_field_set(
                 super::atomic::KvAtomicCtx {
                     task,
@@ -209,6 +236,7 @@ impl CoreLoop {
                     collection,
                     key,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
                 updates,
             ),
@@ -222,6 +250,7 @@ impl CoreLoop {
                 delta,
                 ttl_ms,
                 surrogate,
+                rls_write_check,
             } => self.execute_kv_incr(
                 super::atomic::KvAtomicCtx {
                     task,
@@ -230,6 +259,7 @@ impl CoreLoop {
                     collection,
                     key,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
                 *delta,
                 *ttl_ms,
@@ -239,6 +269,7 @@ impl CoreLoop {
                 key,
                 delta,
                 surrogate,
+                rls_write_check,
             } => self.execute_kv_incr_float(
                 super::atomic::KvAtomicCtx {
                     task,
@@ -247,6 +278,7 @@ impl CoreLoop {
                     collection,
                     key,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
                 *delta,
             ),
@@ -256,6 +288,7 @@ impl CoreLoop {
                 expected,
                 new_value,
                 surrogate,
+                rls_write_check,
             } => self.execute_kv_cas(
                 super::atomic::KvAtomicCtx {
                     task,
@@ -264,6 +297,7 @@ impl CoreLoop {
                     collection,
                     key,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
                 expected,
                 new_value,
@@ -273,6 +307,8 @@ impl CoreLoop {
                 key,
                 new_value,
                 surrogate,
+                rls_filters,
+                rls_write_check,
             } => self.execute_kv_getset(
                 super::atomic::KvAtomicCtx {
                     task,
@@ -281,8 +317,10 @@ impl CoreLoop {
                     collection,
                     key,
                     surrogate: *surrogate,
+                    rls_write_check,
                 },
                 new_value,
+                rls_filters,
             ),
             KvOp::RegisterSortedIndex {
                 collection,
@@ -347,6 +385,7 @@ impl CoreLoop {
                 amount,
                 debit_surrogate,
                 credit_surrogate,
+                rls_write_check,
             } => self.execute_kv_transfer(
                 task,
                 super::transfer::TransferParams {
@@ -359,6 +398,7 @@ impl CoreLoop {
                     amount: *amount,
                     debit_surrogate: *debit_surrogate,
                     credit_surrogate: *credit_surrogate,
+                    rls_write_check,
                 },
             ),
             KvOp::TransferItem {
@@ -367,6 +407,8 @@ impl CoreLoop {
                 item_key,
                 dest_key,
                 surrogate,
+                source_rls_write_check,
+                dest_rls_write_check,
             } => self.execute_kv_transfer_item(
                 task,
                 super::transfer::TransferItemParams {
@@ -377,6 +419,8 @@ impl CoreLoop {
                     item_key,
                     dest_key,
                     surrogate: *surrogate,
+                    source_rls_write_check,
+                    dest_rls_write_check,
                 },
             ),
             KvOp::MaterializeScan {

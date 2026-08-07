@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Statement-time staging for the five stageable KV point writes: `Put`,
-//! `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete`.
+//! Statement-time staging for the stageable KV point puts: `Put`, `Insert`,
+//! `InsertIfAbsent`, plus the [`CoreLoop::execute_stage_kv`] router all
+//! fourteen stageable `KvOp`s enter through. `InsertOnConflictUpdate`
+//! itself stages in the sibling `stage_kv_conflict.rs` (split out to stay
+//! under the file-size limit) -- its match arm here just builds the
+//! [`StageCtx`] and calls into it.
 //!
 //! KV is the first non-Document engine to stage into the transaction
 //! overlay -- it reuses the exact same overlay ([`TxnOverlay`],
@@ -11,10 +15,9 @@
 //! KV row's overlay doc-id is the lowercase-hex encoding of its key
 //! ([`hex_key`]), applied symmetrically here (stage) and in the read-merge
 //! paths (`overlay_point_lookup`, `merge_overlay_into_scan`). The
-//! surrogate is the plan's own KV identity for every op except `Delete`,
-//! which carries no surrogate on the plan -- resolved from the overlay's
-//! `doc_id_to_surrogate` map first, falling back to the base KV engine's
-//! key→surrogate binding (`get_with_surrogate`).
+//! surrogate is the plan's own KV identity for every op staged here; `Delete`
+//! carries none on the plan and has to resolve one, which is part of why it
+//! lives in the sibling `stage_kv_delete.rs`.
 //!
 //! `ttl_ms` on `Put` / `Insert` / `InsertIfAbsent` / `InsertOnConflictUpdate`
 //! lives outside the value body (`KvEntry.expire_at_ms`), so a non-zero
@@ -29,18 +32,18 @@
 //! their surrogate-resolution and value-computation reuse. `FieldSet` /
 //! `Transfer` / `TransferItem` are stageable too, in the sibling
 //! `stage_kv_transfer.rs`. `Expire` / `Persist` are stageable too, in the
-//! sibling `stage_kv_ttl.rs`. Every other `KvOp` (the sorted-index family,
+//! sibling `stage_kv_ttl.rs`, and `Delete` in `stage_kv_delete.rs`. Every
+//! other `KvOp` (the sorted-index family,
 //! etc.) is out of scope: it never reaches this file because
 //! `is_stageable_write` only routes the fourteen ops above here.
 
-use nodedb_physical::physical_plan::{KvOp, UpdateValue};
+use nodedb_physical::physical_plan::KvOp;
 use nodedb_types::Surrogate;
 
 use super::context::StageCtx;
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::Staged;
-use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 use crate::types::TxnId;
@@ -131,14 +134,23 @@ impl CoreLoop {
                 updates,
                 ttl_ms,
                 surrogate,
-                ..
+                rls_write_check,
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
-                self.stage_kv_insert_on_conflict_update(&ctx, key, value, updates, *ttl_ms)
+                self.stage_kv_insert_on_conflict_update(
+                    &ctx,
+                    key,
+                    value,
+                    updates,
+                    *ttl_ms,
+                    rls_write_check,
+                )
             }
-            KvOp::Delete { collection, keys } => {
-                self.stage_kv_delete(task, tid, txn_id, collection, keys)
-            }
+            KvOp::Delete {
+                collection,
+                keys,
+                rls_write_check,
+            } => self.stage_kv_delete(task, tid, txn_id, collection, keys, rls_write_check),
             KvOp::BatchPut { .. }
             | KvOp::Incr { .. }
             | KvOp::IncrFloat { .. }
@@ -151,10 +163,32 @@ impl CoreLoop {
                 collection,
                 key,
                 ttl_ms,
-            } => self.execute_stage_kv_expire(task, tid, txn_id, collection, key, *ttl_ms),
-            KvOp::Persist { collection, key } => {
-                self.execute_stage_kv_persist(task, tid, txn_id, collection, key)
-            }
+                rls_write_check,
+            } => self.execute_stage_kv_expire(
+                task,
+                super::stage_kv_ttl::StageKvTtlTarget {
+                    tid,
+                    txn_id,
+                    collection,
+                    key,
+                    rls_write_check,
+                },
+                *ttl_ms,
+            ),
+            KvOp::Persist {
+                collection,
+                key,
+                rls_write_check,
+            } => self.execute_stage_kv_persist(
+                task,
+                super::stage_kv_ttl::StageKvTtlTarget {
+                    tid,
+                    txn_id,
+                    collection,
+                    key,
+                    rls_write_check,
+                },
+            ),
             KvOp::Get { .. }
             | KvOp::Scan { .. }
             | KvOp::BatchGet { .. }
@@ -249,160 +283,6 @@ impl CoreLoop {
             return self.response_error(ctx.task, e);
         }
         self.stage_count_response(ctx.task, 1)
-    }
-
-    // ── InsertOnConflictUpdate: resolve current, merge, tag by outcome ──────
-
-    fn stage_kv_insert_on_conflict_update(
-        &mut self,
-        ctx: &StageCtx<'_>,
-        key: &[u8],
-        value: &[u8],
-        updates: &[(String, UpdateValue)],
-        ttl_ms: u64,
-    ) -> Response {
-        let existing = self.resolve_kv_current(ctx, key);
-        let (stored_bytes, op) = match &existing {
-            None => (value.to_vec(), "insert"),
-            Some(existing_raw) => {
-                let existing_val = match nodedb_types::value_from_msgpack(existing_raw) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return self.response_error(
-                            ctx.task,
-                            ErrorCode::Internal {
-                                detail: "failed to decode existing KV value for staged \
-                                         ON CONFLICT DO UPDATE"
-                                    .into(),
-                            },
-                        );
-                    }
-                };
-                let excluded_val = match nodedb_types::value_from_msgpack(value) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return self.response_error(
-                            ctx.task,
-                            ErrorCode::Internal {
-                                detail: "failed to decode incoming KV value for staged \
-                                         ON CONFLICT DO UPDATE"
-                                    .into(),
-                            },
-                        );
-                    }
-                };
-                let merged =
-                    match crate::data::executor::handlers::upsert::apply_on_conflict_updates(
-                        existing_val,
-                        &excluded_val,
-                        updates,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return self.response_error(ctx.task, e),
-                    };
-                match nodedb_types::value_to_msgpack(&merged) {
-                    Ok(b) => (b, "update"),
-                    Err(_) => {
-                        return self.response_error(
-                            ctx.task,
-                            ErrorCode::Internal {
-                                detail: "failed to encode merged KV value for staged \
-                                         ON CONFLICT DO UPDATE"
-                                    .into(),
-                            },
-                        );
-                    }
-                }
-            }
-        };
-
-        // `ttl_ms` applies unconditionally, on both the insert and the
-        // update branch above -- mirrors `execute_kv_insert_on_conflict_update`,
-        // which passes `ttl_ms` straight into `kv_engine.put(..)` regardless
-        // of whether `existing_bytes` was `None` or `Some`.
-        self.stage_kv_ttl_side_effect(ctx, ttl_ms);
-        if let Err(e) = self.stage_put_capped(ctx, stored_bytes) {
-            return self.response_error(ctx.task, e);
-        }
-
-        let payload = match response_codec::encode_json(&serde_json::json!({
-            "affected": 1,
-            "op": op,
-        })) {
-            Ok(p) => p,
-            Err(e) => return self.response_error(ctx.task, e),
-        };
-        self.response_with_payload(ctx.task, payload)
-    }
-
-    // ── Delete: resolve surrogate (overlay, then base), tombstone ───────────
-
-    fn stage_kv_delete(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        keys: &[Vec<u8>],
-    ) -> Response {
-        let did = task.request.database_id;
-        let mut deleted = 0usize;
-        for key in keys {
-            let doc_id = hex_key(key);
-            let coll_key = (
-                did,
-                crate::types::TenantId::new(tid),
-                collection.to_string(),
-            );
-
-            let overlay_staged = self
-                .txn_overlays
-                .get(&txn_id)
-                .and_then(|o| o.get_by_doc_id(&coll_key, &doc_id))
-                .cloned();
-
-            let (surrogate, present) = match overlay_staged {
-                // A staged put exists: resolve its bound surrogate through
-                // the overlay's own doc_id -> surrogate map so the
-                // tombstone lands on the same row.
-                Some(Staged::Put(_)) => {
-                    let s = self
-                        .txn_overlays
-                        .get(&txn_id)
-                        .and_then(|o| o.surrogate_for_doc_id(&coll_key, &doc_id))
-                        .unwrap_or(0);
-                    (Surrogate::new(s), true)
-                }
-                // Already staged-deleted in this transaction: absent,
-                // matching PostgreSQL/Document DELETE semantics for a
-                // missing key (DELETE 0, not an error).
-                Some(Staged::Tombstone) => (Surrogate::ZERO, false),
-                // Nothing staged: resolve via the base KV engine's own
-                // key -> surrogate binding.
-                None => {
-                    let now_ms = current_ms();
-                    match self.kv_engine.get_with_surrogate(
-                        did.as_u64(),
-                        tid,
-                        collection,
-                        key,
-                        now_ms,
-                    ) {
-                        Some((_, s)) => (s, true),
-                        None => (Surrogate::ZERO, false),
-                    }
-                }
-            };
-
-            if !present {
-                continue;
-            }
-
-            self.txn_overlay_mut(txn_id)
-                .insert_tombstone(coll_key, surrogate.0, &doc_id);
-            deleted += 1;
-        }
-        self.stage_count_response(task, deleted)
     }
 
     // ── Shared KV constraint / resolution helpers ───────────────────────────

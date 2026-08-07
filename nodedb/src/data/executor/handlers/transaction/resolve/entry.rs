@@ -534,6 +534,7 @@ mod tests {
                     delta,
                     ttl_ms: 0,
                     surrogate: Surrogate::ZERO,
+                    rls_write_check: Vec::new(),
                 },
             );
             assert_eq!(resp.status, Status::Ok, "stage incr: {resp:?}");
@@ -651,6 +652,7 @@ mod tests {
             &[PhysicalPlan::Kv(KvOp::Delete {
                 collection: "kvc".to_string(),
                 keys: vec![b"gone".to_vec()],
+                rls_write_check: Vec::new(),
             })],
         );
         let redo = decode_redo(&resp);

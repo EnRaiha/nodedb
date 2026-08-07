@@ -157,7 +157,11 @@ impl CoreLoop {
                 Ok(resp)
             }
 
-            KvOp::Delete { collection, keys } => {
+            KvOp::Delete {
+                collection,
+                keys,
+                rls_write_check,
+            } => {
                 let now_ms = current_ms();
                 // Capture prior values for all keys that exist before deleting.
                 let priors: Vec<(Vec<u8>, Vec<u8>)> = keys
@@ -167,7 +171,8 @@ impl CoreLoop {
                         Some((k.clone(), v))
                     })
                     .collect();
-                let resp = self.execute_kv_delete(task, did, tid, collection, keys);
+                let resp =
+                    self.execute_kv_delete(task, did, tid, collection, keys, rls_write_check);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv delete failed".into(),
@@ -225,6 +230,7 @@ impl CoreLoop {
                 key,
                 updates,
                 surrogate,
+                rls_write_check,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
@@ -236,6 +242,7 @@ impl CoreLoop {
                         collection,
                         key,
                         surrogate: *surrogate,
+                        rls_write_check,
                     },
                     updates,
                 );
@@ -252,137 +259,11 @@ impl CoreLoop {
                 Ok(resp)
             }
 
-            KvOp::Incr {
-                collection,
-                key,
-                delta,
-                ttl_ms,
-                surrogate,
-            } => {
-                let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr(
-                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
-                        task,
-                        did,
-                        tid,
-                        collection,
-                        key,
-                        surrogate: *surrogate,
-                    },
-                    *delta,
-                    *ttl_ms,
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
-                        detail: "kv incr failed".into(),
-                    }));
-                }
-                undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
-                    key: key.clone(),
-                    prior_value: prior,
-                });
-                Ok(resp)
-            }
-
-            KvOp::IncrFloat {
-                collection,
-                key,
-                delta,
-                surrogate,
-            } => {
-                let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr_float(
-                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
-                        task,
-                        did,
-                        tid,
-                        collection,
-                        key,
-                        surrogate: *surrogate,
-                    },
-                    *delta,
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
-                        detail: "kv incr float failed".into(),
-                    }));
-                }
-                undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
-                    key: key.clone(),
-                    prior_value: prior,
-                });
-                Ok(resp)
-            }
-
-            KvOp::Cas {
-                collection,
-                key,
-                expected,
-                new_value,
-                surrogate,
-            } => {
-                let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_cas(
-                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
-                        task,
-                        did,
-                        tid,
-                        collection,
-                        key,
-                        surrogate: *surrogate,
-                    },
-                    expected,
-                    new_value,
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
-                        detail: "kv cas failed".into(),
-                    }));
-                }
-                // CAS only mutates on success (which we verified above).
-                undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
-                    key: key.clone(),
-                    prior_value: prior,
-                });
-                Ok(resp)
-            }
-
-            KvOp::GetSet {
-                collection,
-                key,
-                new_value,
-                surrogate,
-            } => {
-                let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_getset(
-                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
-                        task,
-                        did,
-                        tid,
-                        collection,
-                        key,
-                        surrogate: *surrogate,
-                    },
-                    new_value,
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
-                        detail: "kv get-set failed".into(),
-                    }));
-                }
-                undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
-                    key: key.clone(),
-                    prior_value: prior,
-                });
-                Ok(resp)
+            // The four read-modify-write atomics capture and restore their
+            // prior value identically, so they share one handler in the
+            // sibling `sub_plan_kv_atomics.rs`.
+            KvOp::Incr { .. } | KvOp::IncrFloat { .. } | KvOp::Cas { .. } | KvOp::GetSet { .. } => {
+                self.execute_tx_kv_atomic(task, did, tid, op, undo_log)
             }
 
             KvOp::Transfer {
@@ -422,6 +303,8 @@ impl CoreLoop {
                 item_key,
                 dest_key,
                 surrogate,
+                source_rls_write_check,
+                dest_rls_write_check,
             } => {
                 let now_ms = current_ms();
                 let source_prior =
@@ -440,6 +323,8 @@ impl CoreLoop {
                         item_key,
                         dest_key,
                         surrogate: *surrogate,
+                        source_rls_write_check,
+                        dest_rls_write_check,
                     },
                 );
                 if resp.status == Status::Error {

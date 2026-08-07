@@ -84,19 +84,21 @@ impl CoreLoop {
                 // COMMIT-time replay through `execute_kv_incr`; the staging
                 // overlay keys its own slots (see module doc) and ignores it.
                 surrogate: _,
+                rls_write_check,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_ttl_side_effect(&ctx, *ttl_ms);
-                self.stage_kv_incr(&ctx, key, *delta)
+                self.stage_kv_incr(&ctx, key, *delta, rls_write_check)
             }
             KvOp::IncrFloat {
                 collection,
                 key,
                 delta,
                 surrogate: _,
+                rls_write_check,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
-                self.stage_kv_incr_float(&ctx, key, *delta)
+                self.stage_kv_incr_float(&ctx, key, *delta, rls_write_check)
             }
             KvOp::Cas {
                 collection,
@@ -104,18 +106,21 @@ impl CoreLoop {
                 expected,
                 new_value,
                 surrogate: _,
+                rls_write_check,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
-                self.stage_kv_cas(&ctx, key, expected, new_value)
+                self.stage_kv_cas(&ctx, key, expected, new_value, rls_write_check)
             }
             KvOp::GetSet {
                 collection,
                 key,
                 new_value,
                 surrogate: _,
+                rls_filters,
+                rls_write_check,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
-                self.stage_kv_getset(&ctx, key, new_value)
+                self.stage_kv_getset(&ctx, key, new_value, rls_filters, rls_write_check)
             }
             KvOp::BatchPut {
                 collection,
@@ -172,10 +177,19 @@ impl CoreLoop {
     // ── Incr / IncrFloat: read-modify-write, computed via the shared engine
     //    value-computation module so staged == commit-replay ─────────────
 
-    fn stage_kv_incr(&mut self, ctx: &StageCtx<'_>, key: &[u8], delta: i64) -> Response {
+    fn stage_kv_incr(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        key: &[u8],
+        delta: i64,
+        rls_write_check: &[u8],
+    ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr(current.as_deref(), delta) {
             Ok((new_i64, new_bytes)) => {
+                if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
+                    return self.response_error(ctx.task, e);
+                }
                 if let Err(e) = self.stage_put_capped(ctx, new_bytes) {
                     return self.response_error(ctx.task, e);
                 }
@@ -185,10 +199,19 @@ impl CoreLoop {
         }
     }
 
-    fn stage_kv_incr_float(&mut self, ctx: &StageCtx<'_>, key: &[u8], delta: f64) -> Response {
+    fn stage_kv_incr_float(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        key: &[u8],
+        delta: f64,
+        rls_write_check: &[u8],
+    ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr_float(current.as_deref(), delta) {
             Ok((new_f64, new_bytes)) => {
+                if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
+                    return self.response_error(ctx.task, e);
+                }
                 if let Err(e) = self.stage_put_capped(ctx, new_bytes) {
                     return self.response_error(ctx.task, e);
                 }
@@ -196,6 +219,28 @@ impl CoreLoop {
             }
             Err(e) => self.kv_atomic_error(ctx.task, ctx.collection, e),
         }
+    }
+
+    /// Decide one staged KV image against the compiled write policy, naming
+    /// the row by the overlay's own doc-id so a rejection reports the same
+    /// identity the overlay filed it under.
+    ///
+    /// `pub(super)` so every KV staging handler in this directory decides its
+    /// image the same way rather than re-deriving the call.
+    pub(super) fn stage_admit_kv_image(
+        &self,
+        ctx: &StageCtx<'_>,
+        image: &[u8],
+        rls_write_check: &[u8],
+    ) -> crate::Result<()> {
+        self.stage_admit_write(
+            rls_write_check,
+            image,
+            &ctx.document_id,
+            ctx.database_id,
+            ctx.tid,
+            ctx.collection,
+        )
     }
 
     // ── Cas: compare BASE ∪ OVERLAY current, stage on match ─────────────
@@ -206,12 +251,18 @@ impl CoreLoop {
         key: &[u8],
         expected: &[u8],
         new_value: &[u8],
+        rls_write_check: &[u8],
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let (matches, write_bytes) = atomic_compute::cas(current.as_deref(), expected, new_value);
 
-        if matches && let Err(e) = self.stage_put_capped(ctx, write_bytes) {
-            return self.response_error(ctx.task, e);
+        if matches {
+            if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
+                return self.response_error(ctx.task, e);
+            }
+            if let Err(e) = self.stage_put_capped(ctx, write_bytes) {
+                return self.response_error(ctx.task, e);
+            }
         }
 
         let current_b64 = current
@@ -228,14 +279,35 @@ impl CoreLoop {
 
     // ── GetSet: stage new value, return BASE ∪ OVERLAY old value ────────
 
-    fn stage_kv_getset(&mut self, ctx: &StageCtx<'_>, key: &[u8], new_value: &[u8]) -> Response {
+    fn stage_kv_getset(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        key: &[u8],
+        new_value: &[u8],
+        rls_filters: &[u8],
+        rls_write_check: &[u8],
+    ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let write_bytes = atomic_compute::getset(current.as_deref(), new_value);
+        if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
+            return self.response_error(ctx.task, e);
+        }
         if let Err(e) = self.stage_put_capped(ctx, write_bytes) {
             return self.response_error(ctx.task, e);
         }
-        let old_b64 = current
-            .as_ref()
+
+        // The old value is a row body, so the read policy decides it here the
+        // same way the autocommit handler does: an excluded row comes back
+        // absent rather than being disclosed by the write that replaced it.
+        let disclosable_old = match &current {
+            Some(bytes) => match self.row_passes_rls(bytes, rls_filters) {
+                Ok(true) => current.as_deref(),
+                Ok(false) => None,
+                Err(e) => return self.response_error(ctx.task, e),
+            },
+            None => None,
+        };
+        let old_b64 = disclosable_old
             .map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v));
         self.kv_atomic_json_response(ctx.task, &serde_json::json!({ "old_value": old_b64 }))
     }
@@ -311,6 +383,11 @@ impl CoreLoop {
             AtomicError::Encode { detail } => {
                 self.response_error(task, ErrorCode::Internal { detail })
             }
+            // Staging computes its image through `atomic_compute` and decides
+            // the policy itself, so the engine's own admission gate never
+            // reaches this path — the arm exists so a new engine-side refusal
+            // cannot be silently dropped here.
+            AtomicError::Rejected(error) => self.response_error(task, *error),
         }
     }
 }

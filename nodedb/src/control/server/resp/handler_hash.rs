@@ -137,6 +137,8 @@ pub(super) async fn handle_hset(
         key,
         updates,
         surrogate,
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

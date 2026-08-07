@@ -109,6 +109,7 @@ impl CoreLoop {
             collection,
             key,
             surrogate,
+            rls_write_check,
         } = ctx;
         debug!(core = self.core_id, %collection, field_count = updates.len(), "kv field set");
         let now_ms = current_ms();
@@ -124,6 +125,15 @@ impl CoreLoop {
             Ok(c) => c,
             Err(e) => return self.response_error(task, e),
         };
+
+        // The merged body is the row that will exist afterwards, and it exists
+        // only now — decided before it is persisted, so a rejected merge leaves
+        // the stored row untouched.
+        if let Err(e) =
+            super::rls::admit_kv_row(rls_write_check, &computed.new_value, key, tid, collection)
+        {
+            return self.response_error(task, e);
+        }
 
         self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,

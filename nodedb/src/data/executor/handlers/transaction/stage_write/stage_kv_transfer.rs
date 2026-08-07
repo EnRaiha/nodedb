@@ -42,6 +42,31 @@ struct StageKvTxn<'a> {
     txn_id: TxnId,
 }
 
+/// The per-statement inputs of a staged fungible transfer, bundled so the
+/// handler stays within the argument-count bound now that it also carries the
+/// collection's compiled write predicate.
+struct StageTransfer<'a> {
+    collection: &'a str,
+    source_key: &'a [u8],
+    dest_key: &'a [u8],
+    field: &'a str,
+    amount: f64,
+    /// Compiled RLS write predicate for the collection both rows live in.
+    rls_write_check: &'a [u8],
+}
+
+/// The per-statement inputs of a staged cross-collection item move. The two
+/// write predicates stay separate because the two collections carry
+/// independent policies.
+struct StageTransferItem<'a> {
+    source_collection: &'a str,
+    dest_collection: &'a str,
+    item_key: &'a [u8],
+    dest_key: &'a [u8],
+    source_rls_write_check: &'a [u8],
+    dest_rls_write_check: &'a [u8],
+}
+
 impl CoreLoop {
     /// Route `FieldSet` / `Transfer` / `TransferItem` to their staging
     /// handler.
@@ -63,9 +88,10 @@ impl CoreLoop {
                 // Durable identity binds at COMMIT-time replay; the overlay
                 // keys its own slots (see module doc) and ignores it.
                 surrogate: _,
+                rls_write_check,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
-                self.stage_kv_field_set(&ctx, key, updates)
+                self.stage_kv_field_set(&ctx, key, updates, rls_write_check)
             }
             KvOp::Transfer {
                 collection,
@@ -75,19 +101,36 @@ impl CoreLoop {
                 amount,
                 debit_surrogate: _,
                 credit_surrogate: _,
-            } => self.stage_kv_transfer(&cx, collection, source_key, dest_key, field, *amount),
+                rls_write_check,
+            } => self.stage_kv_transfer(
+                &cx,
+                StageTransfer {
+                    collection,
+                    source_key,
+                    dest_key,
+                    field,
+                    amount: *amount,
+                    rls_write_check,
+                },
+            ),
             KvOp::TransferItem {
                 source_collection,
                 dest_collection,
                 item_key,
                 dest_key,
                 surrogate: _,
+                source_rls_write_check,
+                dest_rls_write_check,
             } => self.stage_kv_transfer_item(
                 &cx,
-                source_collection,
-                dest_collection,
-                item_key,
-                dest_key,
+                StageTransferItem {
+                    source_collection,
+                    dest_collection,
+                    item_key,
+                    dest_key,
+                    source_rls_write_check,
+                    dest_rls_write_check,
+                },
             ),
             other => unreachable!(
                 "execute_stage_kv_transfer called on an unexpected KvOp; \
@@ -103,12 +146,16 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         updates: &[(String, Vec<u8>)],
+        rls_write_check: &[u8],
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let computed = match merge_field_updates(current.as_deref(), updates) {
             Ok(c) => c,
             Err(e) => return self.response_error(ctx.task, e),
         };
+        if let Err(e) = self.stage_admit_kv_image(ctx, &computed.new_value, rls_write_check) {
+            return self.response_error(ctx.task, e);
+        }
         if let Err(e) = self.stage_put_capped(ctx, computed.new_value) {
             return self.response_error(ctx.task, e);
         }
@@ -122,15 +169,15 @@ impl CoreLoop {
 
     // ── Transfer: two-key read-modify-write in one collection ───────────
 
-    fn stage_kv_transfer(
-        &mut self,
-        cx: &StageKvTxn<'_>,
-        collection: &str,
-        source_key: &[u8],
-        dest_key: &[u8],
-        field: &str,
-        amount: f64,
-    ) -> Response {
+    fn stage_kv_transfer(&mut self, cx: &StageKvTxn<'_>, params: StageTransfer<'_>) -> Response {
+        let StageTransfer {
+            collection,
+            source_key,
+            dest_key,
+            field,
+            amount,
+            rls_write_check,
+        } = params;
         let task = cx.task;
         let source_ctx = self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, collection, source_key);
         let Some(source_bytes) = self.resolve_kv_current(&source_ctx, source_key) else {
@@ -161,6 +208,18 @@ impl CoreLoop {
             }
         };
 
+        // Both post-images are decided before either is staged: a transfer is
+        // one write, so a policy that rejects the credit must not leave the
+        // debit staged behind it.
+        if let Err(e) =
+            self.stage_admit_kv_image(&source_ctx, &computed.new_source, rls_write_check)
+        {
+            return self.response_error(task, e);
+        }
+        if let Err(e) = self.stage_admit_kv_image(&dest_ctx, &computed.new_dest, rls_write_check) {
+            return self.response_error(task, e);
+        }
+
         if let Err(e) = self.stage_put_capped(&source_ctx, computed.new_source) {
             return self.response_error(task, e);
         }
@@ -188,17 +247,35 @@ impl CoreLoop {
     fn stage_kv_transfer_item(
         &mut self,
         cx: &StageKvTxn<'_>,
-        source_collection: &str,
-        dest_collection: &str,
-        item_key: &[u8],
-        dest_key: &[u8],
+        params: StageTransferItem<'_>,
     ) -> Response {
+        let StageTransferItem {
+            source_collection,
+            dest_collection,
+            item_key,
+            dest_key,
+            source_rls_write_check,
+            dest_rls_write_check,
+        } = params;
         let task = cx.task;
         let source_ctx =
             self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, source_collection, item_key);
         let Some(item_bytes) = self.resolve_kv_current(&source_ctx, item_key) else {
             return self.response_error(task, ErrorCode::NotFound);
         };
+        let dest_ctx = self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, dest_collection, dest_key);
+
+        // The same bytes are two different images to two independent policies:
+        // the row leaving the source and the row arriving at the destination.
+        // Both are decided before the source is tombstoned, so a rejected move
+        // never removes the row it could not deliver.
+        if let Err(e) = self.stage_admit_kv_image(&source_ctx, &item_bytes, source_rls_write_check)
+        {
+            return self.response_error(task, e);
+        }
+        if let Err(e) = self.stage_admit_kv_image(&dest_ctx, &item_bytes, dest_rls_write_check) {
+            return self.response_error(task, e);
+        }
 
         self.txn_overlay_mut(cx.txn_id).insert_tombstone(
             source_ctx.coll_key.clone(),
@@ -206,7 +283,6 @@ impl CoreLoop {
             &source_ctx.document_id,
         );
 
-        let dest_ctx = self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, dest_collection, dest_key);
         if let Err(e) = self.stage_put_capped(&dest_ctx, item_bytes) {
             return self.response_error(task, e);
         }

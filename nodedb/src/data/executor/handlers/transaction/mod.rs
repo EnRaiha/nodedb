@@ -11,6 +11,7 @@ pub(in crate::data::executor) mod stage_write;
 mod sub_plan;
 mod sub_plan_doc;
 mod sub_plan_kv;
+mod sub_plan_kv_atomics;
 mod sub_plan_kv_ops;
 mod sub_plan_kv_ttl_sorted;
 mod sub_plan_kv_writes;

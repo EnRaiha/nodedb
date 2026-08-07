@@ -22,7 +22,14 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             ttl_ms,
             surrogate,
         } => kv::put(collection, key, value, *ttl_ms, surrogate.as_u32()),
-        KvOp::Delete { collection, keys } => kv::delete(collection, keys),
+        // The compiled RLS predicate every write below carries is a property of
+        // the requesting session, not of the row: it is deliberately absent
+        // from the durable record, so a replay re-applies the write that was
+        // already admitted rather than re-deciding it against whoever happens
+        // to be connected at recovery time.
+        KvOp::Delete {
+            collection, keys, ..
+        } => kv::delete(collection, keys),
         KvOp::Insert {
             collection,
             key,
@@ -44,6 +51,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             ttl_ms,
             updates,
             surrogate,
+            ..
         } => kv::insert_on_conflict_update(
             collection,
             key,
@@ -62,20 +70,25 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             collection,
             key,
             ttl_ms,
+            ..
         } => kv::expire(collection, key, *ttl_ms),
-        KvOp::Persist { collection, key } => kv::persist(collection, key),
+        KvOp::Persist {
+            collection, key, ..
+        } => kv::persist(collection, key),
         KvOp::Incr {
             collection,
             key,
             delta,
             ttl_ms,
             surrogate,
+            ..
         } => kv::incr(collection, key, *delta, *ttl_ms, surrogate.as_u32()),
         KvOp::IncrFloat {
             collection,
             key,
             delta,
             surrogate,
+            ..
         } => kv::incr_float(collection, key, *delta, surrogate.as_u32()),
         KvOp::Cas {
             collection,
@@ -83,12 +96,14 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             expected,
             new_value,
             surrogate,
+            ..
         } => kv::cas(collection, key, expected, new_value, surrogate.as_u32()),
         KvOp::GetSet {
             collection,
             key,
             new_value,
             surrogate,
+            ..
         } => kv::get_set(collection, key, new_value, surrogate.as_u32()),
         KvOp::RegisterSortedIndex {
             collection,
@@ -122,6 +137,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             key,
             updates,
             surrogate,
+            ..
         } => kv::field_set(collection, key, updates, surrogate.as_u32()),
         KvOp::Transfer {
             collection,
@@ -131,6 +147,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             amount,
             debit_surrogate,
             credit_surrogate,
+            ..
         } => kv::transfer(
             collection,
             source_key,
@@ -146,6 +163,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             item_key,
             dest_key,
             surrogate,
+            ..
         } => kv::transfer_item(
             source_collection,
             dest_collection,

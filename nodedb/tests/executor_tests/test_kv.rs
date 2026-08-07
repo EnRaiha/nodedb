@@ -51,6 +51,7 @@ fn kv_put_get_delete() {
         PhysicalPlan::Kv(KvOp::Delete {
             collection: "cache".into(),
             keys: vec![b"key1".to_vec()],
+            rls_write_check: Vec::new(),
         }),
     );
     let json = payload_value(&payload);
@@ -271,6 +272,7 @@ fn kv_expire_and_persist() {
             collection: "c".into(),
             key: b"k".to_vec(),
             ttl_ms: 60_000,
+            rls_write_check: Vec::new(),
         }),
     );
     assert_eq!(resp.status, Status::Ok);
@@ -283,6 +285,7 @@ fn kv_expire_and_persist() {
         PhysicalPlan::Kv(KvOp::Persist {
             collection: "c".into(),
             key: b"k".to_vec(),
+            rls_write_check: Vec::new(),
         }),
     );
     assert_eq!(resp.status, Status::Ok);

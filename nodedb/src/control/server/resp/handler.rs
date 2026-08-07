@@ -208,6 +208,8 @@ async fn handle_expire(
         collection: session.collection.clone(),
         key,
         ttl_ms,
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -265,6 +267,8 @@ async fn handle_persist(
     let plan = PhysicalPlan::Kv(KvOp::Persist {
         collection: session.collection.clone(),
         key: key.to_vec(),
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

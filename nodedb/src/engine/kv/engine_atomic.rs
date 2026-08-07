@@ -30,6 +30,29 @@ pub enum AtomicError {
     Overflow,
     /// The computed new value failed to re-encode as MessagePack.
     Encode { detail: String },
+    /// The [`IncrAdmission`] gate refused the computed post-image, so nothing
+    /// was written. Boxed to keep the error small on the success path.
+    Rejected(Box<crate::Error>),
+}
+
+/// A gate consulted with the computed post-image before an increment commits.
+///
+/// INCR computes the value it stores from the stored one, so the row a
+/// row-level-security write policy has to decide does not exist until the
+/// arithmetic has run — and the arithmetic runs here, inside the engine, in the
+/// same pass that persists the result. Passing the decision in is what keeps
+/// that arithmetic in one place: pre-computing the increment at the call site
+/// just to check it would leave two copies of it to drift apart.
+pub type IncrAdmission<'a> = &'a dyn Fn(&[u8]) -> crate::Result<()>;
+
+/// An admission that accepts every image.
+///
+/// For replaying a write that was already decided: a WAL redo re-applies a
+/// write whose policy verdict was reached when it was first accepted, and
+/// re-deciding it against the *current* session's policies would make recovery
+/// depend on who happens to be connected.
+pub fn admit_any(_image: &[u8]) -> crate::Result<()> {
+    Ok(())
 }
 
 /// Shared key-identity context for a single-key atomic KV operation
@@ -58,13 +81,16 @@ impl KvEngine {
     /// - On i64 overflow: returns `Overflow` (never wraps silently).
     /// - TTL behavior: if `ttl_ms > 0` and key is new, sets TTL.
     ///   If key exists and `ttl_ms > 0`, resets TTL. If `ttl_ms == 0`, preserves.
+    /// - If `admit` refuses the computed value: returns `Rejected` and writes
+    ///   nothing.
     pub fn incr(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
         delta: i64,
         ttl_ms: u64,
+        admit: IncrAdmission<'_>,
     ) -> Result<i64, AtomicError> {
-        self.incr_resolved(ctx, delta, ttl_ms, None)
+        self.incr_resolved(ctx, delta, ttl_ms, None, admit)
     }
 
     /// Atomically increment an i64 value by `delta`, installing an
@@ -85,8 +111,9 @@ impl KvEngine {
         delta: i64,
         ttl_ms: u64,
         expire_at_ms: u64,
+        admit: IncrAdmission<'_>,
     ) -> Result<i64, AtomicError> {
-        self.incr_resolved(ctx, delta, ttl_ms, Some(expire_at_ms))
+        self.incr_resolved(ctx, delta, ttl_ms, Some(expire_at_ms), admit)
     }
 
     /// Shared INCR body: computes the new value, then installs it via
@@ -98,12 +125,16 @@ impl KvEngine {
         delta: i64,
         ttl_ms: u64,
         expire_override: Option<u64>,
+        admit: IncrAdmission<'_>,
     ) -> Result<i64, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_i64, new_bytes) = compute::incr(current.as_deref(), delta)?;
+        // Decided before `atomic_put`, so a refused image is never durable and
+        // never reaches the expiry wheel or the secondary indexes.
+        admit(&new_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
         self.atomic_put(
             ctx,
             tkey,
@@ -122,12 +153,21 @@ impl KvEngine {
     /// - If value is not a MessagePack float or integer: returns `TypeMismatch`.
     /// - f64 does not overflow in the traditional sense (it goes to infinity),
     ///   but NaN/Infinity results are rejected as `Overflow`.
-    pub fn incr_float(&mut self, ctx: AtomicKeyCtx<'_>, delta: f64) -> Result<f64, AtomicError> {
+    /// - If `admit` refuses the computed value: returns `Rejected` and writes
+    ///   nothing.
+    pub fn incr_float(
+        &mut self,
+        ctx: AtomicKeyCtx<'_>,
+        delta: f64,
+        admit: IncrAdmission<'_>,
+    ) -> Result<f64, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_f64, new_bytes) = compute::incr_float(current.as_deref(), delta)?;
+        // Decided before the value is installed — see `incr_resolved`.
+        admit(&new_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
         // incr_float always preserves existing TTL (ttl_ms = 0).
         self.atomic_put(ctx, tkey, &new_bytes, 0, current.is_none(), None);
 
@@ -337,24 +377,54 @@ mod tests {
     #[test]
     fn incr_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr(ctx("counters", b"hits"), 10, 0);
+        let result = engine.incr(ctx("counters", b"hits"), 10, 0, &admit_any);
         assert_eq!(result.unwrap(), 10);
     }
 
     #[test]
     fn incr_existing_key() {
         let mut engine = make_engine();
-        engine.incr(ctx("counters", b"hits"), 10, 0).unwrap();
-        let result = engine.incr(ctx("counters", b"hits"), 5, 0);
+        engine
+            .incr(ctx("counters", b"hits"), 10, 0, &admit_any)
+            .unwrap();
+        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &admit_any);
         assert_eq!(result.unwrap(), 15);
     }
 
     #[test]
     fn incr_negative_delta() {
         let mut engine = make_engine();
-        engine.incr(ctx("counters", b"gold"), 100, 0).unwrap();
-        let result = engine.incr(ctx("counters", b"gold"), -30, 0);
+        engine
+            .incr(ctx("counters", b"gold"), 100, 0, &admit_any)
+            .unwrap();
+        let result = engine.incr(ctx("counters", b"gold"), -30, 0, &admit_any);
         assert_eq!(result.unwrap(), 70);
+    }
+
+    /// The increment is computed inside the engine, so the gate is the only
+    /// place the resulting row can be decided — and a refusal must leave the
+    /// stored value exactly as it was.
+    #[test]
+    fn a_refused_increment_writes_nothing() {
+        let mut engine = make_engine();
+        engine
+            .incr(ctx("counters", b"hits"), 7, 0, &admit_any)
+            .unwrap();
+
+        let deny = |_: &[u8]| {
+            Err(crate::Error::RejectedAuthz {
+                tenant_id: crate::types::TenantId::new(1),
+                resource: "test".into(),
+            })
+        };
+        let result = engine.incr(ctx("counters", b"hits"), 5, 0, &deny);
+        assert!(matches!(result, Err(AtomicError::Rejected(_))));
+
+        let stored = engine
+            .get(0, 1, "counters", b"hits", 1000)
+            .expect("the refused increment must leave the prior row in place");
+        let value: i64 = zerompk::from_msgpack(&stored).unwrap();
+        assert_eq!(value, 7, "a refused increment must not be applied");
     }
 
     #[test]
@@ -372,7 +442,7 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr(ctx("counters", b"max"), 1, 0);
+        let result = engine.incr(ctx("counters", b"max"), 1, 0, &admit_any);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 
@@ -390,7 +460,7 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr(ctx("counters", b"str"), 1, 0);
+        let result = engine.incr(ctx("counters", b"str"), 1, 0, &admit_any);
         assert!(matches!(result, Err(AtomicError::TypeMismatch { .. })));
     }
 
@@ -398,7 +468,7 @@ mod tests {
     fn incr_with_ttl_new_key() {
         let mut engine = make_engine();
         engine
-            .incr(ctx("counters", b"daily"), 1, 86_400_000)
+            .incr(ctx("counters", b"daily"), 1, 86_400_000, &admit_any)
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert!(ttl.is_some());
@@ -421,7 +491,9 @@ mod tests {
             surrogate: Surrogate::ZERO,
         });
         // Incr with ttl_ms=0 should preserve existing TTL.
-        engine.incr(ctx("counters", b"temp"), 10, 0).unwrap();
+        engine
+            .incr(ctx("counters", b"temp"), 10, 0, &admit_any)
+            .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert!(ttl.is_some());
         assert!(ttl.unwrap() > 0);
@@ -434,7 +506,7 @@ mod tests {
         // 1000 + 5000 = 6000. Passing an explicit absolute instant must
         // override that derivation entirely.
         engine
-            .incr_with_absolute_expiry(ctx("counters", b"daily"), 1, 5_000, 1_000_000)
+            .incr_with_absolute_expiry(ctx("counters", b"daily"), 1, 5_000, 1_000_000, &admit_any)
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert_eq!(
@@ -463,7 +535,7 @@ mod tests {
         // ttl_ms == 0 must ignore the supplied absolute instant and preserve
         // the existing expiry exactly as `incr` does.
         engine
-            .incr_with_absolute_expiry(ctx("counters", b"temp"), 10, 0, 999_999_999)
+            .incr_with_absolute_expiry(ctx("counters", b"temp"), 10, 0, 999_999_999, &admit_any)
             .unwrap();
         let ttl_after = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert_eq!(
@@ -475,15 +547,17 @@ mod tests {
     #[test]
     fn incr_float_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr_float(ctx("scores", b"dmg"), 3.125);
+        let result = engine.incr_float(ctx("scores", b"dmg"), 3.125, &admit_any);
         assert!((result.unwrap() - 3.125).abs() < f64::EPSILON);
     }
 
     #[test]
     fn incr_float_existing() {
         let mut engine = make_engine();
-        engine.incr_float(ctx("scores", b"dmg"), 3.0).unwrap();
-        let result = engine.incr_float(ctx("scores", b"dmg"), 1.5);
+        engine
+            .incr_float(ctx("scores", b"dmg"), 3.0, &admit_any)
+            .unwrap();
+        let result = engine.incr_float(ctx("scores", b"dmg"), 1.5, &admit_any);
         assert!((result.unwrap() - 4.5).abs() < f64::EPSILON);
     }
 
@@ -501,7 +575,7 @@ mod tests {
             now_ms: 1000,
             surrogate: Surrogate::ZERO,
         });
-        let result = engine.incr_float(ctx("scores", b"big"), f64::MAX);
+        let result = engine.incr_float(ctx("scores", b"big"), f64::MAX, &admit_any);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 

@@ -37,10 +37,14 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             format!("write refused without applying, retry: {reason}"),
         ),
         ErrorCode::NotFound => ("ERROR", sqlstate::NO_DATA, "not found".into()),
-        ErrorCode::RejectedAuthz => (
+        // `resource` is what makes the denial actionable: it says whether a
+        // row-level-security policy refused the row or a grant is missing, and
+        // on which collection. A bare "authorization denied" tells the client
+        // nothing it can respond to.
+        ErrorCode::RejectedAuthz { resource } => (
             "ERROR",
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "authorization denied".into(),
+            format!("authorization denied: {resource}"),
         ),
         ErrorCode::ConflictRetry => (
             "ERROR",

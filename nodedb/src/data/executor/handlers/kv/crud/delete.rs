@@ -11,6 +11,11 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 
 impl CoreLoop {
+    /// `rls_write_check` is the compiled RLS write policy. The row a delete
+    /// removes is the image the policy decides, and a delete otherwise reads
+    /// nothing at all — so a non-empty check is what makes the pre-image be
+    /// read in the first place, and one rejected key fails the whole statement
+    /// before any key is removed.
     pub(in crate::data::executor) fn execute_kv_delete(
         &mut self,
         task: &ExecutionTask,
@@ -18,9 +23,26 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         keys: &[Vec<u8>],
+        rls_write_check: &[u8],
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv delete");
         let now_ms = current_ms();
+
+        if !rls_write_check.is_empty() {
+            for key in keys {
+                // An absent key removes no row, so there is no image to decide;
+                // the delete simply counts it as not-deleted.
+                let Some(body) = self.kv_engine.get(did, tid, collection, key, now_ms) else {
+                    continue;
+                };
+                if let Err(e) =
+                    super::super::rls::admit_kv_row(rls_write_check, &body, key, tid, collection)
+                {
+                    return self.response_error(task, e);
+                }
+            }
+        }
+
         let count = self.kv_engine.delete(did, tid, collection, keys, now_ms);
         if let Some(ref m) = self.metrics {
             m.record_kv_delete();

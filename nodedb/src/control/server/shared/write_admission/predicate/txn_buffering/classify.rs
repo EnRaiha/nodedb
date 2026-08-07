@@ -1164,10 +1164,12 @@ mod tests {
                 ttl_ms: 0,
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Delete {
                 collection: "c".into(),
                 keys: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Scan {
                 collection: "c".into(),
@@ -1182,10 +1184,12 @@ mod tests {
                 collection: "c".into(),
                 key: Vec::new(),
                 ttl_ms: 0,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Persist {
                 collection: "c".into(),
                 key: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::GetTtl {
                 collection: "c".into(),
@@ -1213,6 +1217,7 @@ mod tests {
                 key: Vec::new(),
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Incr {
                 collection: "c".into(),
@@ -1220,12 +1225,14 @@ mod tests {
                 delta: 0,
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::IncrFloat {
                 collection: "c".into(),
                 key: Vec::new(),
                 delta: 0.0,
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Cas {
                 collection: "c".into(),
@@ -1233,12 +1240,15 @@ mod tests {
                 expected: Vec::new(),
                 new_value: Vec::new(),
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::GetSet {
                 collection: "c".into(),
                 key: Vec::new(),
                 new_value: Vec::new(),
                 surrogate: Surrogate::ZERO,
+                rls_filters: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Transfer {
                 collection: "c".into(),
@@ -1248,6 +1258,7 @@ mod tests {
                 amount: 0.0,
                 debit_surrogate: Surrogate::ZERO,
                 credit_surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::TransferItem {
                 source_collection: "s".into(),
@@ -1255,6 +1266,8 @@ mod tests {
                 item_key: Vec::new(),
                 dest_key: Vec::new(),
                 surrogate: Surrogate::ZERO,
+                source_rls_write_check: Vec::new(),
+                dest_rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
                 collection: "c".into(),

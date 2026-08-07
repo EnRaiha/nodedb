@@ -102,6 +102,8 @@ async fn dispatch_incr(
         delta,
         ttl_ms: 0,
         surrogate,
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -149,6 +151,8 @@ pub(in crate::control::server::resp) async fn handle_incrbyfloat(
         key,
         delta,
         surrogate,
+        // Filled by the RLS injection pass `dispatch_kv_write` runs.
+        rls_write_check: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

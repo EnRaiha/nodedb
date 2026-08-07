@@ -92,6 +92,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     key: key_bytes,
                     updates: field_updates,
                     surrogate,
+                    // Filled by the RLS injection pass, which runs after plan
+                    // conversion.
+                    rls_write_check: Vec::new(),
                 }),
                 post_set_op: PostSetOp::None,
                 txn_id: None,

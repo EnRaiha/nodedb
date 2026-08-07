@@ -14,22 +14,10 @@
 use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::kv::sorted::KvRegisterSortedIndexParams;
+use crate::data::executor::handlers::kv::ttl::KvTtlTarget;
 use crate::data::executor::task::ExecutionTask;
 
 use super::undo::UndoEntry;
-
-/// Parameters for [`CoreLoop::execute_tx_kv_expire`], bundled so the method
-/// stays under the `too_many_arguments` clippy threshold. `undo_log` stays a
-/// separate trailing `&mut` parameter -- bundling a mutable borrow alongside
-/// borrowed fields of the same struct fights the borrow checker at the call
-/// site for no benefit.
-pub(super) struct TxExpireParams<'a> {
-    pub did: u64,
-    pub tid: u64,
-    pub collection: &'a str,
-    pub key: &'a [u8],
-    pub ttl_ms: u64,
-}
 
 /// Parameters for [`CoreLoop::execute_tx_kv_register_sorted_index`], bundled
 /// so the method stays under the `too_many_arguments` clippy threshold.
@@ -60,21 +48,28 @@ impl CoreLoop {
     /// the correct semantics for when the write becomes visible, but one that
     /// can differ from what a same-transaction `GET_TTL` observed against the
     /// staging overlay before COMMIT.
+    ///
+    /// `target` is the same bundle the autocommit handler takes and is handed
+    /// straight through, so the row this addresses and the row the write policy
+    /// decides cannot drift apart. `undo_log` stays a separate trailing `&mut`
+    /// parameter -- bundling a mutable borrow alongside borrowed fields of the
+    /// same struct fights the borrow checker at the call site for no benefit.
     pub(super) fn execute_tx_kv_expire(
         &mut self,
         task: &ExecutionTask,
-        params: TxExpireParams<'_>,
+        target: KvTtlTarget<'_>,
+        ttl_ms: u64,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
-        let TxExpireParams {
+        let KvTtlTarget {
             did,
             tid,
             collection,
             key,
-            ttl_ms,
-        } = params;
+            ..
+        } = target;
         let prior_meta = self.kv_engine.get_ttl_meta(did, tid, collection, key);
-        let resp = self.execute_kv_expire(task, did, tid, collection, key, ttl_ms);
+        let resp = self.execute_kv_expire(task, target, ttl_ms);
         if resp.status == Status::Error {
             // Mirrors the live handler: EXPIRE on an absent key returns
             // `ErrorCode::NotFound` (see `handlers/kv/ttl.rs`), not a
@@ -99,14 +94,18 @@ impl CoreLoop {
     pub(super) fn execute_tx_kv_persist(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        target: KvTtlTarget<'_>,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
+        let KvTtlTarget {
+            did,
+            tid,
+            collection,
+            key,
+            ..
+        } = target;
         let prior_meta = self.kv_engine.get_ttl_meta(did, tid, collection, key);
-        let resp = self.execute_kv_persist(task, did, tid, collection, key);
+        let resp = self.execute_kv_persist(task, target);
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "kv persist failed".into(),

@@ -423,12 +423,14 @@ mod tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::IncrFloat {
             collection: "c".into(),
             key: b"k".to_vec(),
             delta: 1.0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::Cas {
             collection: "c".into(),
@@ -436,12 +438,15 @@ mod tests {
             expected: vec![],
             new_value: b"v".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::GetSet {
             collection: "c".into(),
             key: b"k".to_vec(),
             new_value: b"v".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::BatchPut {
             collection: "c".into(),
@@ -461,12 +466,14 @@ mod tests {
                 delta: 1,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             },
             KvOp::IncrFloat {
                 collection: "c".into(),
                 key: b"k".to_vec(),
                 delta: 1.0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             },
             KvOp::Cas {
                 collection: "c".into(),
@@ -474,12 +481,15 @@ mod tests {
                 expected: vec![],
                 new_value: b"v".to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             },
             KvOp::GetSet {
                 collection: "c".into(),
                 key: b"k".to_vec(),
                 new_value: b"v".to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                rls_filters: Vec::new(),
+                rls_write_check: Vec::new(),
             },
         ] {
             assert_eq!(
@@ -508,10 +518,12 @@ mod tests {
             collection: "c".into(),
             key: b"k".to_vec(),
             ttl_ms: 1_000,
+            rls_write_check: Vec::new(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::Persist {
             collection: "c".into(),
             key: b"k".to_vec(),
+            rls_write_check: Vec::new(),
         })));
     }
 
@@ -522,10 +534,12 @@ mod tests {
             collection: "c".into(),
             key: b"k".to_vec(),
             ttl_ms: 1_000,
+            rls_write_check: Vec::new(),
         };
         let persist = KvOp::Persist {
             collection: "c".into(),
             key: b"k".to_vec(),
+            rls_write_check: Vec::new(),
         };
         assert_eq!(staged_kv_tag_kind(&expire, &payload), StagedTagKind::Update);
         assert_eq!(

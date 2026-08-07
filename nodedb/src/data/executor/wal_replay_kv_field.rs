@@ -184,6 +184,7 @@ mod tests {
             key: b"p1".to_vec(),
             updates: vec![("mana".to_string(), json_field_bytes(serde_json::json!(5)))],
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p1, field_set]);
@@ -216,6 +217,7 @@ mod tests {
             key: b"fresh".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(100)))],
             surrogate: Surrogate::new(3),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[field_set]);
@@ -254,6 +256,7 @@ mod tests {
             key: b"p2".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(1)))],
             surrogate: Surrogate::new(2),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_scalar, field_set]);
@@ -284,6 +287,7 @@ mod tests {
             key: b"p3".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(7)))],
             surrogate: Surrogate::new(99),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[field_set]);

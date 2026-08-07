@@ -193,7 +193,7 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
                 constraint: "prevalidation".into(),
                 detail: reason.clone(),
             },
-            ErrorCode::RejectedAuthz => CompensationHint::PermissionDenied,
+            ErrorCode::RejectedAuthz { .. } => CompensationHint::PermissionDenied,
             ErrorCode::RateExceeded { retry_after_ms, .. } => CompensationHint::RateLimited {
                 retry_after_ms: *retry_after_ms,
             },
@@ -355,7 +355,9 @@ mod tests {
 
     #[test]
     fn data_plane_authz_maps_to_permission_denied() {
-        let e = crate::Error::DataPlane(ErrorCode::RejectedAuthz);
+        let e = crate::Error::DataPlane(ErrorCode::RejectedAuthz {
+            resource: "RLS write policy on 'orders' rejected the row".into(),
+        });
         assert_eq!(
             compensation_hint_for_dispatch_error(&e),
             CompensationHint::PermissionDenied

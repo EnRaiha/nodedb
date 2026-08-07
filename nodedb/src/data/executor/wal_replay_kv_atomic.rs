@@ -21,6 +21,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::replay_abort::abort_replay;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -151,6 +152,10 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::new(surrogate),
             },
             delta,
+            // Replay re-applies a write the policy already admitted when it was
+            // first accepted; re-deciding it here would make recovery depend on
+            // the policies of whoever happens to be connected.
+            &crate::engine::kv::admit_any,
         ) {
             Ok(_) => {
                 self.note_replay_write_lsn(
@@ -191,6 +196,26 @@ impl CoreLoop {
                 );
                 Some(0)
             }
+            // Unreachable by construction: replay hands the engine
+            // `admit_any`, so there is no predicate here that could refuse an
+            // image. Reaching this arm means a redo path acquired a real
+            // write policy, and recovery would then be re-deciding writes that
+            // were already admitted when they were accepted — against
+            // whichever identity happens to be connected at restart. Every
+            // record it disagreed with would be dropped, leaving a hole in the
+            // replayed suffix that no later read can tell apart from data
+            // never written. So it takes the same exit every other unapplyable
+            // committed record takes, which files a forensic report first.
+            Err(AtomicError::Rejected(error)) => abort_replay(
+                "kv",
+                "incr_float_admission",
+                self.core_id,
+                record_lsn,
+                &format!(
+                    "the RLS write gate refused a committed float increment on \
+                     '{collection}': {error}"
+                ),
+            ),
         }
     }
 
@@ -335,6 +360,7 @@ mod tests {
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p1, cas]);
@@ -367,6 +393,7 @@ mod tests {
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p1, cas]);
@@ -390,6 +417,7 @@ mod tests {
             expected: Vec::new(),
             new_value: b"idle".to_vec(),
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[cas]);
@@ -411,12 +439,14 @@ mod tests {
             key: b"dmg".to_vec(),
             delta: 3.0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: "scores".into(),
             key: b"dmg".to_vec(),
             delta: 1.5,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[incr1, incr2]);
@@ -446,6 +476,7 @@ mod tests {
             key: b"str".to_vec(),
             delta: 1.0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_str, incr]);
@@ -475,6 +506,8 @@ mod tests {
             key: b"tok".to_vec(),
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),
+            rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_tok, getset]);
@@ -496,6 +529,8 @@ mod tests {
             key: b"fresh".to_vec(),
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),
+            rls_filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[getset]);

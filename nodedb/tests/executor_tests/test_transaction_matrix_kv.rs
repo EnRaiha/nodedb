@@ -171,6 +171,7 @@ fn rollback_matrix_kv_delete_then_doc_fail() {
                 PhysicalPlan::Kv(KvOp::Delete {
                     collection: "kv_coll".into(),
                     keys: vec![b"del_key".to_vec()],
+                    rls_write_check: Vec::new(),
                 }),
                 doc_insert_conflict("docs"),
             ],

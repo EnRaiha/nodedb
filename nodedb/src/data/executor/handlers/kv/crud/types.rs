@@ -14,6 +14,10 @@ pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
     pub ttl_ms: u64,
     pub updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
     pub surrogate: Surrogate,
+    /// Compiled row-level-security WRITE predicate. Whichever body this op
+    /// ends up persisting — the incoming row or its merge with the stored one
+    /// — is decided against it. Empty means no write policy applies.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Parameters for a KV point `GET`.

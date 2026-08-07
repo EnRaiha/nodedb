@@ -163,7 +163,9 @@ pub(super) fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
         | KvOp::FieldSet {
             collection, key, ..
         } => Some((collection.clone(), vec![key.clone()])),
-        KvOp::Delete { collection, keys } => Some((collection.clone(), keys.clone())),
+        KvOp::Delete {
+            collection, keys, ..
+        } => Some((collection.clone(), keys.clone())),
         _ => None,
     }
 }
@@ -353,6 +355,7 @@ mod lockstep_tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: Surrogate::new(3),
+            rls_write_check: Vec::new(),
         }));
     }
 
@@ -364,6 +367,7 @@ mod lockstep_tests {
             expected: vec![],
             new_value: vec![],
             surrogate: Surrogate::new(3),
+            rls_write_check: Vec::new(),
         }));
     }
 

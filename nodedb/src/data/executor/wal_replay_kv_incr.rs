@@ -32,6 +32,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::replay_abort::abort_replay;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -107,8 +108,12 @@ impl CoreLoop {
             delta,
             ttl_ms,
             expire_at_ms,
+            // Replay re-applies a write the policy already admitted when it was
+            // first accepted; re-deciding it here would make recovery depend on
+            // the policies of whoever happens to be connected.
+            &crate::engine::kv::admit_any,
         );
-        let applied = self.log_kv_incr_result(&collection, &key, delta, result);
+        let applied = self.log_kv_incr_result(&collection, &key, delta, record_lsn, result);
         if applied > 0 {
             self.note_replay_write_lsn(
                 database_id,
@@ -157,8 +162,10 @@ impl CoreLoop {
             },
             delta,
             ttl_ms,
+            // Already-admitted redo — see `incr_with_absolute_expiry` above.
+            &crate::engine::kv::admit_any,
         );
-        let applied = self.log_kv_incr_result(&collection, &key, delta, result);
+        let applied = self.log_kv_incr_result(&collection, &key, delta, record_lsn, result);
         if applied > 0 {
             self.note_replay_write_lsn(
                 database_id,
@@ -175,11 +182,16 @@ impl CoreLoop {
     /// applied put; `TypeMismatch` / `Overflow` / `Encode` are
     /// correctly-converging no-ops (the live dispatch would have failed
     /// identically), logged and skipped rather than treated as errors.
+    ///
+    /// `Rejected` is not one of those: it is a committed record this build
+    /// declined to apply, so it aborts recovery rather than converging — see
+    /// its arm.
     fn log_kv_incr_result(
         &self,
         collection: &str,
         key: &[u8],
         delta: i64,
+        record_lsn: u64,
         result: Result<i64, AtomicError>,
     ) -> usize {
         match result {
@@ -216,6 +228,26 @@ impl CoreLoop {
                 );
                 0
             }
+            // Unreachable by construction: replay hands the engine
+            // `admit_any`, so there is no predicate here that could refuse an
+            // image. Reaching this arm means a redo path acquired a real
+            // write policy, and recovery would then be re-deciding writes that
+            // were already admitted when they were accepted — against
+            // whichever identity happens to be connected at restart. Every
+            // record it disagreed with would be dropped, leaving a hole in the
+            // replayed suffix that no later read can tell apart from data
+            // never written. So it takes the same exit every other unapplyable
+            // committed record takes, which files a forensic report first.
+            Err(AtomicError::Rejected(error)) => abort_replay(
+                "kv",
+                "incr_admission",
+                self.core_id,
+                record_lsn,
+                &format!(
+                    "the RLS write gate refused a committed increment on \
+                     '{collection}': {error}"
+                ),
+            ),
         }
     }
 }
@@ -317,6 +349,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p, incr]);
@@ -346,6 +379,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),
@@ -353,6 +387,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p, incr1, incr2]);
@@ -382,6 +417,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p, incr]);
@@ -459,6 +495,7 @@ mod tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_str, incr]);
@@ -492,6 +529,7 @@ mod tests {
             delta: 1,
             ttl_ms: 86_400_000,
             surrogate: Surrogate::new(7),
+            rls_write_check: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,

@@ -290,6 +290,7 @@ mod tests {
             collection: "sessions".into(),
             key: b"tok2".to_vec(),
             ttl_ms: 5_000,
+            rls_write_check: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -348,6 +349,7 @@ mod tests {
         let persist_p = PhysicalPlan::Kv(KvOp::Persist {
             collection: "sessions".into(),
             key: b"tok3".to_vec(),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p, persist_p]);

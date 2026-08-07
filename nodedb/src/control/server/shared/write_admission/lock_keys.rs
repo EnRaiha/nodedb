@@ -157,7 +157,9 @@ fn kv_point_key(op: &KvOp) -> Option<LockKey> {
             collection: Arc::from(collection.as_str()),
             key: Arc::from(key.as_slice()),
         }),
-        KvOp::Delete { collection, keys } => match keys.as_slice() {
+        KvOp::Delete {
+            collection, keys, ..
+        } => match keys.as_slice() {
             [k] => Some(LockKey::Kv {
                 collection: Arc::from(collection.as_str()),
                 key: Arc::from(k.as_slice()),
@@ -237,6 +239,7 @@ mod tests {
                 delta: 1,
                 ttl_ms: 0,
                 surrogate: Surrogate::new(1),
+                rls_write_check: Vec::new(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -253,6 +256,7 @@ mod tests {
                 key: b"k1".to_vec(),
                 delta: 1.5,
                 surrogate: Surrogate::new(1),
+                rls_write_check: Vec::new(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -270,6 +274,7 @@ mod tests {
                 expected: vec![],
                 new_value: vec![],
                 surrogate: Surrogate::new(1),
+                rls_write_check: Vec::new(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -286,6 +291,8 @@ mod tests {
                 key: b"k1".to_vec(),
                 new_value: vec![],
                 surrogate: Surrogate::new(1),
+                rls_filters: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -302,6 +309,7 @@ mod tests {
                 key: b"k1".to_vec(),
                 updates: vec![],
                 surrogate: Surrogate::new(1),
+                rls_write_check: Vec::new(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -329,6 +337,7 @@ mod tests {
             kv_point_key(&KvOp::Delete {
                 collection: "counters".to_owned(),
                 keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+                rls_write_check: Vec::new(),
             }),
             None
         );

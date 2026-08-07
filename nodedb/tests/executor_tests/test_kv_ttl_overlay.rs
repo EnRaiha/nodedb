@@ -49,6 +49,7 @@ fn stage_expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan {
             collection: collection.into(),
             key: key.to_vec(),
             ttl_ms,
+            rls_write_check: Vec::new(),
         })),
     })
 }
@@ -58,6 +59,7 @@ fn stage_persist(collection: &str, key: &[u8]) -> PhysicalPlan {
         plan: Box::new(PhysicalPlan::Kv(KvOp::Persist {
             collection: collection.into(),
             key: key.to_vec(),
+            rls_write_check: Vec::new(),
         })),
     })
 }
@@ -323,6 +325,7 @@ fn staged_incr_with_ttl_is_observed_by_in_tx_get_ttl() {
             delta: 5,
             ttl_ms: 30_000,
             surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         })),
     });
     let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, stage_incr);

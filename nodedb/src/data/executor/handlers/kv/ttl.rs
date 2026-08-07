@@ -13,16 +13,44 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 use crate::types::TenantId;
 
+/// The row a TTL mutation targets, plus the policy that decides it.
+///
+/// `EXPIRE` and `PERSIST` address a row identically and differ only in the
+/// instant they install, so they share one bundle rather than repeating the
+/// five-field address list twice. The transaction wrappers in
+/// `sub_plan_kv_ttl_sorted.rs` pass this straight through to these handlers,
+/// so a COMMIT-time replay addresses and decides the row exactly as an
+/// autocommit statement does.
+///
+/// `Copy` because it is a plain address: a wrapper hands the same one to the
+/// handler it delegates to rather than rebuilding it field by field, which is
+/// what keeps the two from drifting.
+#[derive(Clone, Copy)]
+pub(in crate::data::executor) struct KvTtlTarget<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    /// Compiled row-level-security WRITE predicate. Empty means no write
+    /// policy restricts this identity here, and the stored row is not read at
+    /// all — an ungoverned collection still touches only the TTL metadata.
+    pub rls_write_check: &'a [u8],
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_expire(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        target: KvTtlTarget<'_>,
         ttl_ms: u64,
     ) -> Response {
+        let KvTtlTarget {
+            did,
+            tid,
+            collection,
+            key,
+            ..
+        } = target;
         debug!(core = self.core_id, %collection, ttl_ms, "kv expire");
         // `kv_ttl_now_ms` prefers the Control-Plane-resolved instant carried
         // on `task` so live apply installs the exact `expire_at_ms` the
@@ -30,6 +58,14 @@ impl CoreLoop {
         // arm); recomputing the wall clock here independently would drift
         // the two apart by the dispatch latency.
         let now_ms = self.kv_ttl_now_ms(task);
+
+        // A TTL mutation leaves the body untouched, so the stored row is both
+        // the pre- and the post-image: decide it before the expiry metadata
+        // moves.
+        if let Err(e) = self.admit_kv_ttl_target(&target, now_ms) {
+            return self.response_error(task, e);
+        }
+
         if self
             .kv_engine
             .expire(did, tid, collection, key, ttl_ms, now_ms)
@@ -44,21 +80,52 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_persist(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        target: KvTtlTarget<'_>,
     ) -> Response {
+        let KvTtlTarget {
+            did,
+            tid,
+            collection,
+            key,
+            ..
+        } = target;
         debug!(core = self.core_id, %collection, "kv persist");
         // Unlike `execute_kv_expire`, PERSIST clears a key's TTL outright and
         // resolves no instant — `KvEngine::persist` takes no `now_ms` at all,
-        // so there is no clock to source from `task` here.
+        // so there is no clock to source from `task` here. The policy check
+        // still needs one to skip already-expired rows, and reads the same
+        // wall clock the engine's own expiry evaluation would.
+        if let Err(e) = self.admit_kv_ttl_target(&target, current_ms()) {
+            return self.response_error(task, e);
+        }
+
         if self.kv_engine.persist(did, tid, collection, key) {
             self.note_kv_write_lsn(task, did, tid, collection, key);
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)
         }
+    }
+
+    /// Decide the stored row a TTL mutation targets against the write policy.
+    ///
+    /// An absent key mutates nothing, so there is no image to decide and the
+    /// handler goes on to report `NotFound` on its own.
+    fn admit_kv_ttl_target(&self, target: &KvTtlTarget<'_>, now_ms: u64) -> crate::Result<()> {
+        let KvTtlTarget {
+            did,
+            tid,
+            collection,
+            key,
+            rls_write_check,
+        } = *target;
+        if rls_write_check.is_empty() {
+            return Ok(());
+        }
+        let Some(body) = self.kv_engine.get(did, tid, collection, key, now_ms) else {
+            return Ok(());
+        };
+        super::rls::admit_kv_row(rls_write_check, &body, key, tid, collection)
     }
 
     pub(in crate::data::executor) fn execute_kv_get_ttl(

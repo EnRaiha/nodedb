@@ -499,6 +499,8 @@ mod tests {
             item_key: vec![],
             dest_key: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,
+            source_rls_write_check: Vec::new(),
+            dest_rls_write_check: Vec::new(),
         });
         let names = touched_collections(&plan);
         assert!(names.contains(&"from_col".to_string()));

@@ -659,6 +659,8 @@ mod tests {
             item_key: vec![1, 2, 3],
             dest_key: vec![4, 5, 6],
             surrogate: Surrogate::new(1),
+            source_rls_write_check: Vec::new(),
+            dest_rls_write_check: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

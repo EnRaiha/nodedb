@@ -31,10 +31,13 @@ pub(crate) fn build_expire(fields: &TextFields, collection: &str) -> crate::Resu
         detail: "missing 'ttl_ms'".to_string(),
     })?;
 
+    // Every RLS slot below is left empty here and filled by the injection pass
+    // this dispatch path runs before the plan reaches the Data Plane.
     Ok(PhysicalPlan::Kv(KvOp::Expire {
         collection: collection.to_string(),
         key,
         ttl_ms,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -44,6 +47,7 @@ pub(crate) fn build_persist(fields: &TextFields, collection: &str) -> crate::Res
     Ok(PhysicalPlan::Kv(KvOp::Persist {
         collection: collection.to_string(),
         key,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -158,6 +162,7 @@ pub(crate) fn build_field_set(
         key,
         updates,
         surrogate,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -254,6 +259,7 @@ pub(crate) fn build_incr(
         delta,
         ttl_ms,
         surrogate,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -276,6 +282,7 @@ pub(crate) fn build_incr_float(
         key: key.as_bytes().to_vec(),
         delta,
         surrogate,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -305,6 +312,7 @@ pub(crate) fn build_cas(
         expected,
         new_value,
         surrogate,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -332,6 +340,8 @@ pub(crate) fn build_getset(
         key: key.as_bytes().to_vec(),
         new_value,
         surrogate,
+        rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
     }))
 }
 

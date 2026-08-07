@@ -20,6 +20,10 @@ pub(in crate::data::executor) struct KvAtomicCtx<'a> {
     pub(in crate::data::executor) collection: &'a str,
     pub(in crate::data::executor) key: &'a [u8],
     pub(in crate::data::executor) surrogate: nodedb_types::Surrogate,
+    /// Compiled row-level-security WRITE predicate from the plan. Empty means
+    /// no write policy restricts this identity on `collection`; every handler
+    /// reading this field decides the image it is about to persist against it.
+    pub(in crate::data::executor) rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -36,6 +40,7 @@ impl CoreLoop {
             collection,
             key,
             surrogate,
+            rls_write_check,
         } = ctx;
         debug!(core = self.core_id, %collection, delta, "kv incr");
 
@@ -48,6 +53,11 @@ impl CoreLoop {
         // must be the same one `wal_append_kv_op` resolved and recorded —
         // see `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
         let now_ms: u64 = self.kv_ttl_now_ms(task);
+        // The engine computes the post-image and installs it in one pass, so
+        // the write policy is handed in and decided on the computed bytes
+        // rather than on a duplicate of the increment arithmetic out here.
+        let admit =
+            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
         match self.kv_engine.incr(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -59,6 +69,7 @@ impl CoreLoop {
             },
             delta,
             ttl_ms,
+            &admit,
         ) {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
@@ -101,6 +112,9 @@ impl CoreLoop {
             Err(AtomicError::Encode { detail }) => {
                 self.response_error(task, ErrorCode::Internal { detail })
             }
+            // Nothing was written: the engine consults the gate before it
+            // installs the computed value.
+            Err(AtomicError::Rejected(error)) => self.response_error(task, *error),
         }
     }
 
@@ -116,6 +130,7 @@ impl CoreLoop {
             collection,
             key,
             surrogate,
+            rls_write_check,
         } = ctx;
         debug!(core = self.core_id, %collection, delta, "kv incr_float");
 
@@ -127,6 +142,9 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
+        // Same engine-internal compute-and-persist as `Incr` — see there.
+        let admit =
+            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
         match self.kv_engine.incr_float(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -137,6 +155,7 @@ impl CoreLoop {
                 surrogate,
             },
             delta,
+            &admit,
         ) {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
@@ -179,6 +198,9 @@ impl CoreLoop {
             Err(AtomicError::Encode { detail }) => {
                 self.response_error(task, ErrorCode::Internal { detail })
             }
+            // Nothing was written: the engine consults the gate before it
+            // installs the computed value.
+            Err(AtomicError::Rejected(error)) => self.response_error(task, *error),
         }
     }
 
@@ -195,11 +217,19 @@ impl CoreLoop {
             collection,
             key,
             surrogate,
+            rls_write_check,
         } = ctx;
         debug!(core = self.core_id, %collection, "kv cas");
 
         if self.kv_engine.is_over_budget() {
             return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
+
+        // `new_value` is caller-supplied, so the row that would exist after a
+        // successful swap is known before the engine is entered — decided here
+        // rather than after the fact.
+        if let Err(e) = super::rls::admit_kv_row(rls_write_check, new_value, key, tid, collection) {
+            return self.response_error(task, e);
         }
 
         let now_ms: u64 = self
@@ -253,10 +283,15 @@ impl CoreLoop {
         }
     }
 
+    /// `rls_filters` decides the OLD value handed back: `GETSET` is a read as
+    /// much as a write, so a row the read policy hides must come back absent
+    /// rather than being disclosed by the write that replaced it. The write
+    /// half is a separate decision on `new_value`.
     pub(in crate::data::executor) fn execute_kv_getset(
         &mut self,
         ctx: KvAtomicCtx<'_>,
         new_value: &[u8],
+        rls_filters: &[u8],
     ) -> Response {
         let KvAtomicCtx {
             task,
@@ -265,11 +300,18 @@ impl CoreLoop {
             collection,
             key,
             surrogate,
+            rls_write_check,
         } = ctx;
         debug!(core = self.core_id, %collection, "kv getset");
 
         if self.kv_engine.is_over_budget() {
             return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
+
+        // The stored row is replaced wholesale, so the post-image is known
+        // before the engine call.
+        if let Err(e) = super::rls::admit_kv_row(rls_write_check, new_value, key, tid, collection) {
+            return self.response_error(task, e);
         }
 
         let now_ms: u64 = self
@@ -302,8 +344,28 @@ impl CoreLoop {
         );
         self.note_kv_write_lsn(task, did, tid, collection, key);
 
-        let old_b64 = old
-            .as_ref()
+        // A row the read policy excludes is reported exactly as an absent row,
+        // the same convention `execute_kv_get` uses — the caller cannot tell it
+        // apart from a key that never existed, so the reply discloses nothing.
+        // A filter that fails to evaluate withholds the value too: an old value
+        // the policy could not be decided against is not one it cleared.
+        let disclosable_old = match &old {
+            Some(bytes) => match self.row_passes_rls(bytes, rls_filters) {
+                Ok(true) => old.as_deref(),
+                Ok(false) => None,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            },
+            None => None,
+        };
+
+        let old_b64 = disclosable_old
             .map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v));
         match response_codec::encode_json(&serde_json::json!({ "old_value": old_b64 })) {
             Ok(payload) => self.response_with_payload(task, payload),

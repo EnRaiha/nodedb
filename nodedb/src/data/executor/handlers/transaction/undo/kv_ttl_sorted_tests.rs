@@ -78,6 +78,7 @@ fn kv_expire_in_tx_commit_replay_sets_ttl() {
         collection: "cache".to_string(),
         key: b"k".to_vec(),
         ttl_ms: 5_000,
+        rls_write_check: Vec::new(),
     });
     let mut undo_log = Vec::new();
     let mut crdt_deltas = Vec::new();
@@ -113,6 +114,7 @@ fn kv_expire_in_tx_rollback_reverts_ttl() {
         collection: "cache".to_string(),
         key: b"k".to_vec(),
         ttl_ms: 5_000,
+        rls_write_check: Vec::new(),
     });
     let mut undo_log = Vec::new();
     let mut crdt_deltas = Vec::new();
@@ -147,6 +149,7 @@ fn kv_persist_in_tx_commit_replay_clears_ttl() {
     let plan = PhysicalPlan::Kv(KvOp::Persist {
         collection: "cache".to_string(),
         key: b"k".to_vec(),
+        rls_write_check: Vec::new(),
     });
     let mut undo_log = Vec::new();
     let mut crdt_deltas = Vec::new();
@@ -182,6 +185,7 @@ fn kv_persist_in_tx_rollback_restores_ttl() {
     let plan = PhysicalPlan::Kv(KvOp::Persist {
         collection: "cache".to_string(),
         key: b"k".to_vec(),
+        rls_write_check: Vec::new(),
     });
     let mut undo_log = Vec::new();
     let mut crdt_deltas = Vec::new();

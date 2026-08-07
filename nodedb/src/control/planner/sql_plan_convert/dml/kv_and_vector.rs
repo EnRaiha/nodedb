@@ -69,6 +69,9 @@ pub(in super::super) fn convert_kv_insert(
                 ttl_ms,
                 updates: update_values.clone(),
                 surrogate,
+                // Filled by the RLS injection pass, which runs after plan
+                // conversion.
+                rls_write_check: Vec::new(),
             },
             KvInsertIntent::Put => KvOp::Put {
                 collection: collection.into(),

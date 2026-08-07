@@ -324,7 +324,9 @@ impl CoreLoop {
             | KvOp::Expire {
                 collection, key, ..
             }
-            | KvOp::Persist { collection, key }
+            | KvOp::Persist {
+                collection, key, ..
+            }
             | KvOp::FieldSet {
                 collection, key, ..
             }
@@ -348,7 +350,9 @@ impl CoreLoop {
                     lsn,
                 );
             }
-            KvOp::Delete { collection, keys } => {
+            KvOp::Delete {
+                collection, keys, ..
+            } => {
                 for key in keys {
                     self.note_write_lsn(
                         db,

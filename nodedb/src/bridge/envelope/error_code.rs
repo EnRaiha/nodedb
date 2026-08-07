@@ -28,7 +28,14 @@ pub enum ErrorCode {
     /// Document/collection not found.
     NotFound,
     /// Authorization failure.
-    RejectedAuthz,
+    ///
+    /// `resource` says what was refused and by what — "RLS write policy on
+    /// 'orders' rejected the row", "permission denied: collection 'x'". It is
+    /// carried rather than dropped because the caller cannot act on, or even
+    /// recognise, a bare "authorization denied": a row-level-security refusal
+    /// and a missing GRANT need opposite responses, and only this string tells
+    /// them apart once the verdict has crossed the bridge.
+    RejectedAuthz { resource: String },
     /// Write conflict — client should retry.
     ConflictRetry,
     /// A CRDT apply no longer matches the domain-bound frontier it previewed.
@@ -125,7 +132,7 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::CollectionNotFound { .. } | crate::Error::DocumentNotFound { .. } => {
                 Self::NotFound
             }
-            crate::Error::RejectedAuthz { .. } => Self::RejectedAuthz,
+            crate::Error::RejectedAuthz { resource, .. } => Self::RejectedAuthz { resource },
             crate::Error::ConflictRetry { .. } => Self::ConflictRetry,
             crate::Error::FanOutExceeded { .. } => Self::FanOutExceeded,
             crate::Error::MemoryExhausted { .. } => Self::ResourcesExhausted,

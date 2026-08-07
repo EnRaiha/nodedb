@@ -127,6 +127,8 @@ pub(crate) fn build_point_delete(
         Some(CollectionType::KeyValue(_)) => Ok(PhysicalPlan::Kv(KvOp::Delete {
             collection: collection.to_string(),
             keys: vec![doc_id.into_bytes()],
+            // Filled by the RLS injection pass this dispatch path runs.
+            rls_write_check: Vec::new(),
         })),
         Some(CollectionType::Columnar(ColumnarProfile::Timeseries { .. })) => {
             Err(crate::Error::BadRequest {

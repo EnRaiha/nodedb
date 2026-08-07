@@ -117,6 +117,10 @@ pub fn wal_append_kv_op(
             ttl_ms,
             updates,
             surrogate: _,
+            // The compiled RLS predicate is a property of the requesting
+            // session, not of the row, so it stays out of the durable record —
+            // a replay re-applies an already-admitted write.
+            rls_write_check: _,
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
@@ -130,7 +134,9 @@ pub fn wal_append_kv_op(
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        KvOp::Delete { collection, keys } => {
+        KvOp::Delete {
+            collection, keys, ..
+        } => {
             let entry = encode_kv_delete(collection, keys)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -150,6 +156,7 @@ pub fn wal_append_kv_op(
             collection,
             key,
             ttl_ms,
+            ..
         } => {
             // Unlike `Put`/`BatchPut`, `Expire` has no "no TTL" sentinel for
             // `ttl_ms == 0` (see `encode_kv_expire`'s doc comment) — the
@@ -162,7 +169,9 @@ pub fn wal_append_kv_op(
             let entry = encode_kv_expire(collection, key, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        KvOp::Persist { collection, key } => {
+        KvOp::Persist {
+            collection, key, ..
+        } => {
             let entry = encode_kv_persist(collection, key)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -184,6 +193,7 @@ pub fn wal_append_kv_op(
             key,
             updates,
             surrogate,
+            ..
         } => {
             let entry = encode_kv_field_set(collection, key, updates, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -194,6 +204,7 @@ pub fn wal_append_kv_op(
             delta,
             ttl_ms,
             surrogate,
+            ..
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
@@ -212,6 +223,7 @@ pub fn wal_append_kv_op(
             key,
             delta,
             surrogate,
+            ..
         } => {
             let entry = encode_kv_incr_float(collection, key, *delta, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -222,6 +234,7 @@ pub fn wal_append_kv_op(
             expected,
             new_value,
             surrogate,
+            ..
         } => {
             let entry = encode_kv_cas(collection, key, expected, new_value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -231,6 +244,7 @@ pub fn wal_append_kv_op(
             key,
             new_value,
             surrogate,
+            ..
         } => {
             let entry = encode_kv_getset(collection, key, new_value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -273,6 +287,7 @@ pub fn wal_append_kv_op(
             amount,
             debit_surrogate,
             credit_surrogate,
+            ..
         } => {
             let entry = encode_kv_transfer(KvTransferFields {
                 collection,
@@ -291,6 +306,7 @@ pub fn wal_append_kv_op(
             item_key,
             dest_key,
             surrogate,
+            ..
         } => {
             let entry = encode_kv_transfer_item(
                 source_collection,

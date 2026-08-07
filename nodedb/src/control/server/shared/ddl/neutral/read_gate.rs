@@ -21,9 +21,14 @@
 //! A plan that carries a `filters` / `rls_filters` slot can express the policy,
 //! so [`CollectionReadGate::inject_rls`] puts it there and the query keeps
 //! working with fewer rows. [`CollectionReadGate::refuse_if_read_policy`] is
-//! for the plans that carry no such slot at all (`EstimateCount`, the atomic
-//! `KvOp`s): those cannot express a row filter, so a policy on the collection
-//! makes the answer unrepresentable rather than smaller, and they fail closed.
+//! for the plans that carry no such slot at all (`EstimateCount`): those cannot
+//! express a row filter, so a policy on the collection makes the answer
+//! unrepresentable rather than smaller, and they fail closed.
+//!
+//! A hand-built WRITE has no separate gate here at all. Its verdict — admit the
+//! image, ship the compiled predicate for the Data Plane to decide, or refuse —
+//! belongs to the injection pass alone, so a handler that builds the same plan
+//! variant a planned statement builds cannot reach a different one.
 
 use nodedb_types::DatabaseId;
 
@@ -187,39 +192,6 @@ impl<'a> CollectionReadGate<'a> {
             format!(
                 "RLS policies on '{collection}' are not supported with {what}: it has no row \
                  filter the policy could be applied through"
-            ),
-        ))
-    }
-
-    /// Fail closed when a write policy exists on `collection`.
-    ///
-    /// A hand-built write reaches the Data Plane without the planner's RLS
-    /// pass, so the write-policy verdict that pass reaches for the same shape
-    /// has to be reached here too. None of these handlers holds the row image a
-    /// write policy decides — an atomic increment, a compare-and-swap, and a
-    /// version restore all derive their post-image from stored state inside the
-    /// handler — so the verdict is refusal.
-    ///
-    /// `what` names the operation, completing "…cannot be enforced for {what}".
-    pub fn refuse_if_write_policy(&self, collection: &str, what: &str) -> Result<(), DdlError> {
-        let unrestricted = self
-            .state
-            .rls
-            .combined_write_predicate_with_auth(
-                self.tenant_id().as_u64(),
-                collection,
-                self.scope.auth(),
-            )
-            .is_some_and(|filters| filters.is_empty());
-        if unrestricted {
-            return Ok(());
-        }
-        Err(gate_err(
-            FEATURE_NOT_SUPPORTED,
-            format!(
-                "RLS write policies on '{collection}' cannot be enforced for {what}: it derives \
-                 the row it persists from stored state, so no row image is available for the \
-                 policy to be evaluated against"
             ),
         ))
     }

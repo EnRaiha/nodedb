@@ -7,6 +7,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::bridge::envelope::Status;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::session::DmlTxnCtx;
@@ -47,7 +48,7 @@ pub(crate) async fn dispatch_and_respond(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     vshard: VShardId,
-    plan: PhysicalPlan,
+    mut plan: PhysicalPlan,
     func_name: &str,
     collections: &[&str],
     txn_ctx: &DmlTxnCtx<'_>,
@@ -64,19 +65,23 @@ pub(crate) async fn dispatch_and_respond(
     // never authorized downstream. The op reports the value it replaced or
     // computed, so it is a read as much as a write and needs both grants — and
     // a cross-collection move needs them on each side, hence the slice.
-    // None of these `KvOp`s carries a filter slot for a row predicate to live
-    // in, so a read policy on the collection cannot be honored and the call
-    // fails closed rather than answering from rows the policy hides. The write
-    // half fails closed for the mirror-image reason: the value each op persists
-    // is computed from the stored one inside the handler, so a write policy
-    // never sees the image it is supposed to decide.
     let gate = CollectionReadGate::for_request(state, identity, database_id);
     for collection in collections {
         gate.authorize(collection)?;
         gate.authorize_permission(collection, Permission::Write)?;
-        gate.refuse_if_read_policy(collection, func_name)?;
-        gate.refuse_if_write_policy(collection, func_name)?;
     }
+
+    // Row-level security is resolved by the same injection pass the
+    // planner-driven path runs, against the very same op. That is the point of
+    // routing it through here rather than restating a verdict locally: these
+    // functions build the identical `KvOp`s a planned statement builds, so a
+    // local refusal here while the planner enforced — or the reverse — would
+    // give the same operation two different answers depending on which syntax
+    // reached it. The pass compiles the write policy into the op's own gate
+    // slot for the Data Plane to decide the image against, injects the read
+    // filter where the reply is a row body, and still refuses outright where
+    // the reply is a value computed from a row the policy hides.
+    gate.inject_rls(&mut plan)?;
 
     let task = PhysicalTask {
         tenant_id,
@@ -120,6 +125,19 @@ pub(crate) async fn dispatch_and_respond(
             )
             .await
             {
+                // A refused write comes back as `Ok(Response)` carrying
+                // `Status::Error` — `submit_write` reports the dispatch itself
+                // as having succeeded and puts the verdict inside the response.
+                // Its payload is empty, so forwarding it unchecked would answer
+                // `SELECT KV_INCR(...)` with one blank column and let the caller
+                // read a refusal as a completed write. Every terminal outcome
+                // these functions can produce arrives this way — a policy
+                // refusal, a type mismatch, an overflow, an insufficient
+                // balance, a missing key — so the status is what decides,
+                // never the payload's emptiness.
+                Ok(resp) if resp.status == Status::Error => {
+                    return Err(data_plane_error(resp.error_code.map(|code| *code)));
+                }
                 Ok(resp) => resp.payload.as_ref().to_vec(),
                 Err(e) => return Err(ddl_err("XX000", e.to_string())),
             }
@@ -130,20 +148,30 @@ pub(crate) async fn dispatch_and_respond(
         Ok(InTxnRoute::Buffered) => Vec::new(),
         Ok(InTxnRoute::Staged(outcome)) => outcome.payload,
         Err(StagingGateError::Dispatch(e)) => return Err(ddl_err("XX000", e.to_string())),
-        Err(StagingGateError::Rejected { code }) => {
-            let (_, sqlstate, message) = match code {
-                Some(code) => {
-                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
-                }
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
-            return Err(ddl_err(sqlstate, message));
-        }
+        Err(StagingGateError::Rejected { code }) => return Err(data_plane_error(code)),
     };
 
     let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&payload);
     let col_name = func_name.to_lowercase();
     Ok(vec![single_text_col(&col_name, payload_text)])
+}
+
+/// Translate a terminal Data-Plane verdict into the client-facing error.
+///
+/// Shared by both routes a refusal can arrive on — the staging gate's
+/// `Rejected`, and an `Ok(Response)` whose status is `Error` — so the same
+/// verdict never reaches the client as two different messages depending on
+/// whether the statement ran inside a transaction.
+///
+/// `None` means the Data Plane reported a failure without a code, which is a
+/// bug in whatever produced it; it is surfaced as an internal error rather than
+/// silently downgraded to success.
+fn data_plane_error(code: Option<crate::bridge::envelope::ErrorCode>) -> DdlError {
+    let (_, sqlstate, message) = match code {
+        Some(code) => crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code),
+        None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+    };
+    ddl_err(sqlstate, message)
 }
 
 /// Build a single-text-column row set carrying `text` under `col`.

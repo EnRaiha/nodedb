@@ -69,21 +69,35 @@ impl CoreLoop {
                 collection,
                 key,
                 ttl_ms,
+                rls_write_check,
             } => self.execute_tx_kv_expire(
                 task,
-                super::sub_plan_kv_ttl_sorted::TxExpireParams {
+                crate::data::executor::handlers::kv::ttl::KvTtlTarget {
                     did,
                     tid,
                     collection,
                     key,
-                    ttl_ms: *ttl_ms,
+                    rls_write_check,
                 },
+                *ttl_ms,
                 undo_log,
             ),
 
-            KvOp::Persist { collection, key } => {
-                self.execute_tx_kv_persist(task, did, tid, collection, key, undo_log)
-            }
+            KvOp::Persist {
+                collection,
+                key,
+                rls_write_check,
+            } => self.execute_tx_kv_persist(
+                task,
+                crate::data::executor::handlers::kv::ttl::KvTtlTarget {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    rls_write_check,
+                },
+                undo_log,
+            ),
 
             // ── Sorted-index DDL — capture prior def, execute, push undo ─────
             KvOp::RegisterSortedIndex {

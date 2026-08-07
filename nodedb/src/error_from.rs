@@ -365,7 +365,12 @@ impl From<Error> for NodeDbError {
                     Ec::RejectedConstraint { constraint, detail } => {
                         NodeDbError::constraint_violation(constraint, detail)
                     }
-                    Ec::RejectedAuthz => NodeDbError::authorization_denied(""),
+                    // `resource` says what refused the request and why — an RLS
+                    // policy on a named collection, a missing grant. It lands in
+                    // `ErrorDetails::AuthorizationDenied { resource }`, so a
+                    // client can match on it instead of parsing prose; the empty
+                    // string this used to pass made every denial identical.
+                    Ec::RejectedAuthz { resource } => NodeDbError::authorization_denied(resource),
                     Ec::DeadlineExceeded => NodeDbError::deadline_exceeded(),
                     Ec::ConflictRetry => NodeDbError::write_conflict("", ""),
                     other => NodeDbError::internal(format!("{other:?}")),

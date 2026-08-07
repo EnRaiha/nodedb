@@ -21,7 +21,7 @@ pub mod sorted_index;
 
 pub use batch_put::KvBatchPutParams;
 pub use engine::{KvEngine, RestoreCompositeIndexParams, RestoreFieldIndexParams};
-pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult};
+pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult, IncrAdmission, admit_any};
 pub use engine_atomic_compute as atomic_compute;
 pub use engine_index::RegisterIndexParams;
 pub use engine_rename::RenameCollectionParams;

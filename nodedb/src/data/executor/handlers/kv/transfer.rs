@@ -28,6 +28,9 @@ pub(in crate::data::executor) struct TransferParams<'a> {
     pub debit_surrogate: nodedb_types::Surrogate,
     /// Cross-engine surrogate of the credit (dest) row.
     pub credit_surrogate: nodedb_types::Surrogate,
+    /// Compiled row-level-security WRITE predicate for the collection both
+    /// rows live in. Empty means no write policy applies.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Parameters for an atomic non-fungible item transfer.
@@ -40,6 +43,14 @@ pub(in crate::data::executor) struct TransferItemParams<'a> {
     pub dest_key: &'a [u8],
     /// Cross-engine surrogate of the moved row at its destination.
     pub surrogate: nodedb_types::Surrogate,
+    /// Compiled row-level-security WRITE predicate of the SOURCE collection,
+    /// decided against the row being removed from it.
+    pub source_rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate of the DESTINATION
+    /// collection, decided against the same bytes being inserted there. The
+    /// two collections carry independent policies, so the two checks stay
+    /// separate.
+    pub dest_rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -61,6 +72,7 @@ impl CoreLoop {
             amount,
             debit_surrogate,
             credit_surrogate,
+            rls_write_check,
         } = params;
         debug!(core = self.core_id, %collection, %field, amount, "kv transfer");
 
@@ -113,6 +125,20 @@ impl CoreLoop {
         let new_dest = computed.new_dest;
         let source_balance_after = computed.source_balance_after;
         let dest_balance_after = computed.dest_balance_after;
+
+        // Both post-images are decided before either is persisted: a transfer
+        // is one write, so a policy that rejects the credit must not leave the
+        // debit applied.
+        if let Err(e) =
+            super::rls::admit_kv_row(rls_write_check, &new_source, source_key, tid, collection)
+        {
+            return self.response_error(task, e);
+        }
+        if let Err(e) =
+            super::rls::admit_kv_row(rls_write_check, &new_dest, dest_key, tid, collection)
+        {
+            return self.response_error(task, e);
+        }
 
         // Step 4: Write both atomically (deterministic order for consistency).
         // Write lower key first to match the documented lock ordering.
@@ -221,6 +247,8 @@ impl CoreLoop {
             item_key,
             dest_key,
             surrogate,
+            source_rls_write_check,
+            dest_rls_write_check,
         } = params;
         debug!(core = self.core_id, %source_collection, %dest_collection, "kv transfer item");
 
@@ -237,6 +265,29 @@ impl CoreLoop {
         else {
             return self.response_error(task, ErrorCode::NotFound);
         };
+
+        // The same bytes are two different images to two different policies:
+        // the row leaving the source, and the row arriving at the destination.
+        // Both are decided before either half runs, so a move a policy rejects
+        // cannot delete from the source and then fail to insert at the dest.
+        if let Err(e) = super::rls::admit_kv_row(
+            source_rls_write_check,
+            &item_data,
+            item_key,
+            tid,
+            source_collection,
+        ) {
+            return self.response_error(task, e);
+        }
+        if let Err(e) = super::rls::admit_kv_row(
+            dest_rls_write_check,
+            &item_data,
+            dest_key,
+            tid,
+            dest_collection,
+        ) {
+            return self.response_error(task, e);
+        }
 
         // Step 2: Delete from source, insert at dest — atomic (single core).
         self.kv_engine

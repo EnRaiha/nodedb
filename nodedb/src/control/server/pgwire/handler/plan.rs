@@ -271,6 +271,7 @@ mod tests {
         let delete = PhysicalPlan::Kv(KvOp::Delete {
             collection: "items".into(),
             keys: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert!(!is_calvin_foldable(&delete));
         assert!(calvin_tag_for_plan(&delete).is_err());

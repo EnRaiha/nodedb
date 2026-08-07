@@ -715,6 +715,8 @@ mod tests {
             item_key: b"sword".to_vec(),
             dest_key: b"sword".to_vec(),
             surrogate: Surrogate::new(9),
+            source_rls_write_check: Vec::new(),
+            dest_rls_write_check: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

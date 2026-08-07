@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! KV engine operations dispatched to the Data Plane.
+//! The KV operation enum — the wire shape and nothing else.
 
 use nodedb_types::Surrogate;
 
@@ -88,15 +88,32 @@ pub enum KvOp {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
-        updates: Vec<(String, super::document::UpdateValue)>,
+        updates: Vec<(String, crate::physical_plan::document::UpdateValue)>,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate, evaluated in the Data
+        /// Plane against the body actually persisted — the incoming row on the
+        /// insert branch, the merge of it with the stored row on the conflict
+        /// branch, neither of which exists at plan time. Empty means no write
+        /// policy restricts this identity here.
+        ///
+        /// Distinct from the read-side `rls_filters` slot other variants
+        /// carry: one bounds what may be shown back, this one bounds what may
+        /// be written at all.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Delete by primary key(s). Returns count of keys actually deleted.
     Delete {
         collection: String,
         keys: Vec<Vec<u8>>,
+        /// Compiled row-level-security WRITE predicate, evaluated in the Data
+        /// Plane against the stored row being removed. Empty means no write
+        /// policy restricts this identity here; only a non-empty check makes
+        /// the handler read the pre-image at all.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Cursor-based scan with optional filter predicate.
@@ -130,10 +147,25 @@ pub enum KvOp {
         key: Vec<u8>,
         /// TTL in milliseconds from now.
         ttl_ms: u64,
+        /// Compiled row-level-security WRITE predicate. The body is unchanged
+        /// by a TTL mutation, so the stored row is both the pre- and the
+        /// post-image and the Data Plane decides it before touching the
+        /// expiry metadata. Empty means no write policy restricts this
+        /// identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Remove TTL from an existing key (make it persistent).
-    Persist { collection: String, key: Vec<u8> },
+    Persist {
+        collection: String,
+        key: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate — see `Expire`, which
+        /// this mirrors: the row body does not change, so the stored row is
+        /// the image the policy decides.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
+    },
 
     /// Get remaining TTL for a key without fetching the value.
     ///
@@ -219,6 +251,12 @@ pub enum KvOp {
         /// surrogate its original insert assigned. `Surrogate::ZERO` only in
         /// test fixtures / when no assigner is wired.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate, evaluated against the
+        /// merged body — which exists only after the stored row has been read
+        /// and the field updates applied. Empty means no write policy
+        /// restricts this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Truncate: delete ALL entries in a KV collection.
@@ -243,6 +281,13 @@ pub enum KvOp {
         /// surrogate its original insert assigned. `Surrogate::ZERO` only in
         /// test fixtures / when no assigner is wired.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate. The incremented value
+        /// is computed inside the engine, so the engine consults this check
+        /// with the computed image before making it durable rather than the
+        /// handler guessing the result. Empty means no write policy restricts
+        /// this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Atomic float increment on a numeric value. Returns new value.
@@ -255,6 +300,10 @@ pub enum KvOp {
         delta: f64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate — see `Incr`, whose
+        /// engine-internal compute-and-persist this mirrors.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Compare-and-swap: set value to `new_value` only if current equals `expected`.
@@ -268,6 +317,11 @@ pub enum KvOp {
         new_value: Vec<u8>,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate, evaluated against
+        /// `new_value` before the swap is attempted. Empty means no write
+        /// policy restricts this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Atomic get-and-set: set new value, return old value.
@@ -279,6 +333,17 @@ pub enum KvOp {
         new_value: Vec<u8>,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// Row-level-security READ filters applied to the OLD value this op
+        /// hands back. The reply is a row body, so a row the read policy hides
+        /// must come back absent rather than being disclosed by the write that
+        /// replaced it.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate, evaluated against
+        /// `new_value` before the swap. Never an alias of `rls_filters`: one
+        /// decides what may be shown, the other what may be written.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     // ── Atomic Transfer Operations ───────────────────────────────────
@@ -303,6 +368,13 @@ pub enum KvOp {
         /// write-back so the credited row keeps its surrogate. Distinct from
         /// `debit_surrogate` so the two rows never collapse onto one identity.
         credit_surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate for the collection both
+        /// rows live in. Both post-images — the debited source and the credited
+        /// dest — are decided against it before either is persisted, so a
+        /// transfer cannot half-apply. Empty means no write policy restricts
+        /// this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
@@ -319,6 +391,17 @@ pub enum KvOp {
         /// dest write-back so the inserted row carries its surrogate.
         /// `Surrogate::ZERO` only in test fixtures / when no assigner is wired.
         surrogate: Surrogate,
+        /// Compiled row-level-security WRITE predicate of the SOURCE
+        /// collection, decided against the row being removed from it.
+        #[serde(default)]
+        source_rls_write_check: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate of the DESTINATION
+        /// collection, decided against the same bytes as the row being
+        /// inserted there. Kept separate from the source check because the two
+        /// collections carry independent policies — one identity may be
+        /// allowed to give a row up but not to receive it.
+        #[serde(default)]
+        dest_rls_write_check: Vec<u8>,
     },
 
     // ── Sorted Index (Leaderboard) Operations ──────────────────────────
@@ -381,47 +464,4 @@ pub enum KvOp {
         cursor: Vec<u8>,
         count: usize,
     },
-}
-
-impl KvOp {
-    /// The user collection this op targets, if any. Sorted-index ops keyed only
-    /// by an index name (and no direct collection) return `None`; `TransferItem`
-    /// reports its source collection.
-    pub fn collection(&self) -> Option<&str> {
-        match self {
-            KvOp::Get { collection, .. }
-            | KvOp::Put { collection, .. }
-            | KvOp::Insert { collection, .. }
-            | KvOp::InsertIfAbsent { collection, .. }
-            | KvOp::InsertOnConflictUpdate { collection, .. }
-            | KvOp::Delete { collection, .. }
-            | KvOp::Scan { collection, .. }
-            | KvOp::Expire { collection, .. }
-            | KvOp::Persist { collection, .. }
-            | KvOp::GetTtl { collection, .. }
-            | KvOp::BatchGet { collection, .. }
-            | KvOp::BatchPut { collection, .. }
-            | KvOp::RegisterIndex { collection, .. }
-            | KvOp::DropIndex { collection, .. }
-            | KvOp::FieldGet { collection, .. }
-            | KvOp::FieldSet { collection, .. }
-            | KvOp::Truncate { collection, .. }
-            | KvOp::Incr { collection, .. }
-            | KvOp::IncrFloat { collection, .. }
-            | KvOp::Cas { collection, .. }
-            | KvOp::GetSet { collection, .. }
-            | KvOp::Transfer { collection, .. }
-            | KvOp::RegisterSortedIndex { collection, .. }
-            | KvOp::MaterializeScan { collection, .. } => Some(collection.as_str()),
-            KvOp::TransferItem {
-                source_collection, ..
-            } => Some(source_collection.as_str()),
-            KvOp::DropSortedIndex { .. }
-            | KvOp::SortedIndexRank { .. }
-            | KvOp::SortedIndexTopK { .. }
-            | KvOp::SortedIndexRange { .. }
-            | KvOp::SortedIndexCount { .. }
-            | KvOp::SortedIndexScore { .. } => None,
-        }
-    }
 }
