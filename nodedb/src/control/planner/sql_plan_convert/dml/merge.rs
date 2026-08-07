@@ -80,6 +80,12 @@ pub(in super::super) fn convert_merge(
             target_join_col: target_join_col.into(),
             source_join_col: source_join_col.into(),
             clauses: clause_ops,
+            // The projected column list lives only in the raw SQL: it is parsed
+            // and stripped by the RETURNING pre-processor, which attaches the
+            // resulting `ReturningSpec` to this op after conversion. The logical
+            // plan carries a bare bool with no column names, so it cannot build
+            // a spec here without inventing a projection. Same shape as the
+            // sibling UPDATE / DELETE / UPDATE-FROM conversions.
             returning: None,
             // Autocommit MERGE is intercepted at the dispatch entry points and
             // driven by the Control-Plane orchestrator (`control::merge_orchestrator`),

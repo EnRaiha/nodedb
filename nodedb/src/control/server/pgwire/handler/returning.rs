@@ -22,7 +22,7 @@ const RETURNING_KEYWORD: &str = "RETURNING";
 /// Returns `(cleaned_sql, returning_spec)`. The cleaned SQL has the
 /// `RETURNING ...` suffix removed so DataFusion can parse it.
 ///
-/// Only strips RETURNING from UPDATE and DELETE statements (INSERT
+/// Only strips RETURNING from UPDATE, DELETE and MERGE statements (INSERT
 /// RETURNING is handled separately in `collection_insert.rs`).
 ///
 /// Arithmetic expressions (e.g. `RETURNING stock * 2`) are rejected with
@@ -32,6 +32,7 @@ pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec
 
     if !starts_with_ascii_case_insensitive(trimmed, "UPDATE")
         && !starts_with_ascii_case_insensitive(trimmed, "DELETE")
+        && !starts_with_ascii_case_insensitive(trimmed, "MERGE")
     {
         return Ok((sql.to_string(), None));
     }
@@ -215,6 +216,57 @@ mod tests {
                 alias: None
             }])
         );
+    }
+
+    #[test]
+    fn strips_star_returning_from_merge() {
+        let (sql, spec) = strip_returning(
+            "MERGE INTO products t USING staging s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET stock = s.stock RETURNING *",
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "MERGE INTO products t USING staging s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET stock = s.stock"
+        );
+        assert_eq!(spec.unwrap().columns, ReturningColumns::Star);
+    }
+
+    #[test]
+    fn strips_named_returning_from_merge() {
+        let (sql, spec) = strip_returning(
+            "MERGE INTO products t USING staging s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id) RETURNING id, stock",
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "MERGE INTO products t USING staging s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        );
+        assert_eq!(
+            spec.unwrap().columns,
+            ReturningColumns::Named(vec![
+                ReturningItem {
+                    name: "id".into(),
+                    alias: None
+                },
+                ReturningItem {
+                    name: "stock".into(),
+                    alias: None
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_without_returning_is_unchanged() {
+        let original = "MERGE INTO products t USING staging s ON t.id = s.id \
+                        WHEN MATCHED THEN DELETE";
+        let (sql, spec) = strip_returning(original).unwrap();
+        assert!(spec.is_none());
+        assert_eq!(sql, original);
     }
 
     #[test]

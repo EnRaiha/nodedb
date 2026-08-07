@@ -385,8 +385,8 @@ pub(super) fn consistency_for_tasks(tasks: &[PhysicalTask]) -> crate::types::Rea
 /// Inject a RETURNING spec into a DML physical plan variant.
 ///
 /// Only `PointUpdate`, `BulkUpdate`, `PointDelete`, `BulkDelete`,
-/// `UpdateFromJoin`, and the CRDT `DocUpsert` / `DocDelete` ops are affected.
-/// All other plan variants are left unchanged.
+/// `UpdateFromJoin`, `Merge`, and the CRDT `DocUpsert` / `DocDelete` ops are
+/// affected. All other plan variants are left unchanged.
 pub(super) fn inject_returning_spec(
     plan: &mut crate::bridge::envelope::PhysicalPlan,
     spec: nodedb_physical::physical_plan::ReturningSpec,
@@ -408,6 +408,9 @@ pub(super) fn inject_returning_spec(
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::UpdateFromJoin { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::Merge { returning, .. }) => {
             *returning = Some(spec);
         }
         PhysicalPlan::Crdt(CrdtOp::DocUpsert { returning, .. }) => {

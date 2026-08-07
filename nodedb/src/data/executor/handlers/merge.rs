@@ -57,6 +57,10 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// `None` selects the legacy local-storage read (co-resident / in-txn
     /// buffered replay).
     pub source_rows: Option<&'a [(String, Vec<u8>)]>,
+    /// Projection for a `MERGE ... RETURNING`. Honoured only by the orchestrated
+    /// apply pass — the only pass that walks every arm's row bodies. `None`
+    /// selects the affected-count payload.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
 }
 
 impl CoreLoop {
@@ -105,6 +109,10 @@ impl CoreLoop {
             resolve_only: _,
             resolved_inserts: _,
             source_rows,
+            // The legacy per-row path is reached only by in-transaction replay,
+            // which never carries a RETURNING projection (the COMMIT expander
+            // rewrites the statement into concrete point ops before dispatch).
+            returning: _,
         } = params;
 
         debug!(

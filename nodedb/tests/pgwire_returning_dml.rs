@@ -208,6 +208,177 @@ async fn bulk_delete_returning() {
 }
 
 // ---------------------------------------------------------------------------
+// MERGE RETURNING
+// ---------------------------------------------------------------------------
+
+/// Target holds 'a' and 'b'; source holds 'a' (matched) and 'c' (unmatched),
+/// so one statement can exercise the matched and not-matched arms separately.
+async fn seed_merge(server: &TestServer) {
+    for name in ["merge_tgt", "merge_src"] {
+        server
+            .exec(&format!(
+                "CREATE COLLECTION {name} (\
+                     id TEXT PRIMARY KEY, name TEXT, score INT) \
+                 WITH (engine='document_strict')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+    for (id, name, score) in [("a", "alpha", 10i64), ("b", "beta", 20)] {
+        server
+            .exec(&format!(
+                "INSERT INTO merge_tgt (id, name, score) VALUES ('{id}', '{name}', {score})"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, name, score) in [("a", "ALPHA_UPD", 99i64), ("c", "gamma", 30)] {
+        server
+            .exec(&format!(
+                "INSERT INTO merge_src (id, name, score) VALUES ('{id}', '{name}', {score})"
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+/// The NOT-MATCHED INSERT arm must return the post-image of each inserted row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_insert_arm_returning() {
+    let server = TestServer::start().await;
+    seed_merge(&server).await;
+
+    let rows = server
+        .query_rows(
+            "MERGE INTO merge_tgt t USING merge_src s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, name, score) VALUES (s.id, s.name, s.score) \
+             RETURNING id, score",
+        )
+        .await
+        .expect("MERGE INSERT arm RETURNING should succeed");
+
+    assert_eq!(rows.len(), 1, "only 'c' is unmatched: {rows:?}");
+    assert_eq!(rows[0][0], "c");
+    assert_eq!(
+        rows[0][1], "30",
+        "insert arm must return the new row's value"
+    );
+}
+
+/// The MATCHED UPDATE arm must return the POST-image, not the pre-update row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_update_arm_returning() {
+    let server = TestServer::start().await;
+    seed_merge(&server).await;
+
+    let rows = server
+        .query_rows(
+            "MERGE INTO merge_tgt t USING merge_src s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name, score = s.score \
+             RETURNING id, name, score",
+        )
+        .await
+        .expect("MERGE UPDATE arm RETURNING should succeed");
+
+    assert_eq!(rows.len(), 1, "only 'a' is matched: {rows:?}");
+    assert_eq!(rows[0][0], "a");
+    assert_eq!(rows[0][1], "ALPHA_UPD");
+    assert_eq!(rows[0][2], "99", "update arm must return the post-image");
+}
+
+/// The DELETE arm has no post-image, so it must return the PRE-image of the
+/// removed row — the row as it stood when the merge classified it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_delete_arm_returns_pre_image() {
+    let server = TestServer::start().await;
+    seed_merge(&server).await;
+
+    let rows = server
+        .query_rows(
+            "MERGE INTO merge_tgt t USING merge_src s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE RETURNING id, name, score",
+        )
+        .await
+        .expect("MERGE DELETE arm RETURNING should succeed");
+
+    assert_eq!(rows.len(), 1, "only 'a' is matched: {rows:?}");
+    assert_eq!(rows[0][0], "a");
+    assert_eq!(rows[0][1], "alpha", "pre-image name");
+    assert_eq!(rows[0][2], "10", "pre-image score");
+
+    // The row really is gone — the pre-image is not a sign the delete no-oped.
+    let remaining = server
+        .query_rows("SELECT id FROM merge_tgt ORDER BY id")
+        .await
+        .unwrap();
+    let ids: Vec<&str> = remaining.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(ids, ["b"], "'a' must have been deleted: {remaining:?}");
+}
+
+/// Both arms in one statement: `RETURNING *` must surface every row the merge
+/// wrote, updated and inserted alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_both_arms_returning_star() {
+    let server = TestServer::start().await;
+    seed_merge(&server).await;
+
+    let rows = server
+        .query_rows(
+            "MERGE INTO merge_tgt t USING merge_src s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name, score = s.score \
+             WHEN NOT MATCHED THEN INSERT (id, name, score) VALUES (s.id, s.name, s.score) \
+             RETURNING *",
+        )
+        .await
+        .expect("MERGE RETURNING * should succeed");
+
+    assert_eq!(rows.len(), 2, "one updated + one inserted row: {rows:?}");
+    let joined: Vec<String> = rows.iter().map(|r| r.join(",")).collect();
+    assert!(
+        joined.iter().any(|r| r.contains("ALPHA_UPD")),
+        "updated row missing: {joined:?}"
+    );
+    assert!(
+        joined.iter().any(|r| r.contains("gamma")),
+        "inserted row missing: {joined:?}"
+    );
+}
+
+/// Without a RETURNING clause the statement still reports its affected count —
+/// adding RETURNING support must not change the plain MERGE's response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_without_returning_reports_affected_count() {
+    let server = TestServer::start().await;
+    seed_merge(&server).await;
+
+    let messages = server
+        .client
+        .simple_query(
+            "MERGE INTO merge_tgt t USING merge_src s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET score = s.score \
+             WHEN NOT MATCHED THEN INSERT (id, name, score) VALUES (s.id, s.name, s.score)",
+        )
+        .await
+        .expect("plain MERGE should succeed");
+
+    let mut rows = 0usize;
+    let mut affected = None;
+    for message in &messages {
+        match message {
+            tokio_postgres::SimpleQueryMessage::Row(_) => rows += 1,
+            tokio_postgres::SimpleQueryMessage::CommandComplete(n) => affected = Some(*n),
+            _ => {}
+        }
+    }
+    assert_eq!(rows, 0, "a plain MERGE returns no rows");
+    assert_eq!(
+        affected,
+        Some(2),
+        "one updated + one inserted row must be counted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Extended-query (prepared statement) RETURNING *
 // ---------------------------------------------------------------------------
 

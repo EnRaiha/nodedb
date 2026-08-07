@@ -148,6 +148,17 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         }) => PlanKind::ReturningRows,
         PhysicalPlan::Document(DocumentOp::UpdateFromJoin { .. }) => DmlResult("UPDATE"),
 
+        // A MERGE carrying a projection returns real target rows, so it must be
+        // decoded and redacted like every other RETURNING write. Without this
+        // arm it fell through to `Execution`, whose passthrough forwards the
+        // Data-Plane payload to the client with no redaction applied at all.
+        PhysicalPlan::Document(DocumentOp::Merge {
+            returning: Some(_), ..
+        }) => PlanKind::ReturningRows,
+        // Postgres tags a plain MERGE `MERGE <total-rows-affected>`, matching
+        // the in-transaction staged path's tag.
+        PhysicalPlan::Document(DocumentOp::Merge { .. }) => DmlResult("MERGE"),
+
         PhysicalPlan::Document(DocumentOp::Truncate { .. }) => DmlResult("TRUNCATE"),
 
         // KV delete / truncate count the keys they removed. Classifying them as
@@ -201,12 +212,26 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Vector(VectorOp::MultiVectorDelete { .. })
         | PhysicalPlan::Vector(VectorOp::DirectUpsert { .. }) => PlanKind::Execution,
 
+        // Document ops with no row payload to shape: index DDL, collection
+        // registration, cardinality estimates, and the clone materializer's
+        // cursor scan (whose payload is an internal typed tuple the
+        // materializer decodes itself, never a client row). Enumerated
+        // explicitly, not via a `Document(_)` wildcard: a wildcard here made
+        // `Merge` default to unredacted passthrough for as long as it carried
+        // no rows, and the next row-bearing op added would inherit exactly the
+        // same silent leak.
+        PhysicalPlan::Document(DocumentOp::Register { .. })
+        | PhysicalPlan::Document(DocumentOp::IndexLookup { .. })
+        | PhysicalPlan::Document(DocumentOp::DropIndex { .. })
+        | PhysicalPlan::Document(DocumentOp::BackfillIndex { .. })
+        | PhysicalPlan::Document(DocumentOp::EstimateCount { .. })
+        | PhysicalPlan::Document(DocumentOp::MaterializeScan { .. })
+
         // Default: opaque execution result. The specific arms above take
         // precedence; these inner wildcards catch every unmatched op of each
         // engine (including the remaining `Crdt` ops not covered above) plus
         // the engines with no arms at all here (Meta, ClusterArray).
         // Exhaustive so a new PhysicalPlan variant forces a decision.
-        PhysicalPlan::Document(_)
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Columnar(_)
@@ -307,5 +332,46 @@ mod tests {
         });
 
         assert!(matches!(describe_plan(&plan), PlanKind::Execution));
+    }
+
+    fn merge_plan(
+        returning: Option<nodedb_physical::physical_plan::ReturningSpec>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::Merge {
+            target_collection: "target".to_string(),
+            source_collection: "source".to_string(),
+            source_alias: "s".to_string(),
+            target_join_col: "id".to_string(),
+            source_join_col: "id".to_string(),
+            clauses: Vec::new(),
+            returning,
+            resolve_only: false,
+            resolved_inserts: None,
+            source_rows: None,
+        })
+    }
+
+    /// A `MERGE ... RETURNING` payload is a `RowsPayload` of real target rows.
+    /// Classifying it as `Execution` would pass those rows straight to the
+    /// client with no decode and no redaction — the leak this arm closes.
+    #[test]
+    fn merge_with_returning_is_returning_rows() {
+        use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
+
+        let plan = merge_plan(Some(ReturningSpec {
+            columns: ReturningColumns::Star,
+        }));
+
+        assert!(matches!(describe_plan(&plan), PlanKind::ReturningRows));
+    }
+
+    /// A plain MERGE reports its affected count under the Postgres `MERGE` tag,
+    /// not an opaque `OK`.
+    #[test]
+    fn merge_without_returning_is_a_dml_result() {
+        assert!(matches!(
+            describe_plan(&merge_plan(None)),
+            PlanKind::DmlResult("MERGE")
+        ));
     }
 }

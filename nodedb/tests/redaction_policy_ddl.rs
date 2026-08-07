@@ -185,6 +185,85 @@ async fn show_redaction_policies_lists_created_policies() {
     );
 }
 
+/// `MERGE ... RETURNING` surfaces real target rows, so its response must go
+/// through the same masking pass a SELECT does.
+///
+/// It used to be classified as an opaque execution result and forwarded to the
+/// client undecoded, which was harmless only while a MERGE returned nothing but
+/// an affected count. Both halves of that are load-bearing: the plan must be
+/// recognised as row-returning, AND it must report its target collection, or
+/// the masking pass finds no policy to key on and runs inert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_returning_rows_are_redacted() {
+    let server = TestServer::start().await;
+
+    for name in ["redact_merge_tgt", "redact_merge_src"] {
+        server
+            .exec(&format!(
+                "CREATE COLLECTION {name} (\
+                     id TEXT PRIMARY KEY, email TEXT, name TEXT) \
+                 WITH (engine='document_strict')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+    server
+        .exec(
+            "INSERT INTO redact_merge_tgt (id, email, name) \
+             VALUES ('u1', 'alice@example.com', 'Alice')",
+        )
+        .await
+        .unwrap();
+    for (id, email, name) in [
+        ("u1", "alice.new@example.com", "Alice"),
+        ("u2", "bob@example.com", "Bob"),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO redact_merge_src (id, email, name) \
+                 VALUES ('{id}', '{email}', '{name}')"
+            ))
+            .await
+            .unwrap();
+    }
+    server
+        .exec(&format!(
+            "CREATE REDACTION POLICY mask_merge ON redact_merge_tgt FOR ROLE {ROLE} \
+             (email MASK '***@***.com')"
+        ))
+        .await
+        .unwrap();
+
+    // One matched UPDATE (u1) and one NOT-MATCHED INSERT (u2).
+    let rows = server
+        .query_rows(
+            "MERGE INTO redact_merge_tgt t USING redact_merge_src s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET email = s.email \
+             WHEN NOT MATCHED THEN INSERT (id, email, name) VALUES (s.id, s.email, s.name) \
+             RETURNING id, email, name",
+        )
+        .await
+        .expect("MERGE RETURNING should succeed");
+
+    assert_eq!(rows.len(), 2, "one updated + one inserted row: {rows:?}");
+    for row in &rows {
+        assert_eq!(row[1], "***@***.com", "email must be masked: {row:?}");
+    }
+    let joined = rows
+        .iter()
+        .map(|r| r.join(","))
+        .collect::<Vec<_>>()
+        .join(";");
+    assert!(
+        !joined.contains("@example.com"),
+        "no raw address may survive masking: {joined}"
+    );
+    assert!(
+        joined.contains("Alice") && joined.contains("Bob"),
+        "unruled columns stay clear: {joined}"
+    );
+}
+
 /// An array is refused: its cells are delivered through a fan-out that carries
 /// no subscriber identity, so a policy naming an array attribute would be
 /// accepted and then silently never applied.

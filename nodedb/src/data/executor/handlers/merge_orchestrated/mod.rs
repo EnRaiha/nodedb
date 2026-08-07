@@ -30,5 +30,6 @@
 //!    (whose cascade opens its own transactions) after the put commit.
 
 mod apply;
+mod apply_support;
 pub(super) mod plan;
 mod resolve;

@@ -62,6 +62,20 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
             target_collection: collection,
             ..
         })
+        // The joined source is read, but every row these two write — and every
+        // row their RETURNING clause surfaces — belongs to the TARGET, so the
+        // target is the collection whose policies and write version apply.
+        // Reporting `None` here left their RETURNING rows with no source
+        // collection to key a redaction policy on, so the masking pass ran
+        // inert and shipped the rows in the clear.
+        | PhysicalPlan::Document(DocumentOp::Merge {
+            target_collection: collection,
+            ..
+        })
+        | PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+            target_collection: collection,
+            ..
+        })
         | PhysicalPlan::Document(DocumentOp::Truncate { collection, .. })
         | PhysicalPlan::Document(DocumentOp::EstimateCount { collection, .. })
         | PhysicalPlan::Columnar(ColumnarOp::Scan { collection, .. })

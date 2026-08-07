@@ -45,8 +45,8 @@ use nodedb_types::{DatabaseId, TenantId};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
+use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec};
 
 use super::resolve_arms::decode_resolve;
 use crate::control::target_identity::{
@@ -70,6 +70,9 @@ pub struct MergeArgs<'a> {
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
     pub clauses: &'a [MergeClauseOp],
+    /// Projection for a `MERGE ... RETURNING`, attached by the RETURNING
+    /// pre-processor. `None` selects the affected-count response.
+    pub returning: Option<&'a ReturningSpec>,
 }
 
 /// Consume an authorized autocommit `MERGE` at the orchestration boundary.
@@ -88,7 +91,7 @@ pub async fn run_authorized_merge(
         resolve_only: false,
         resolved_inserts: None,
         source_rows: _,
-        returning: _,
+        returning,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -106,6 +109,7 @@ pub async fn run_authorized_merge(
             target_join_col: &target_join_col,
             source_join_col: &source_join_col,
             clauses: &clauses,
+            returning: returning.as_ref(),
         },
     )
     .await
@@ -113,7 +117,7 @@ pub async fn run_authorized_merge(
 
 /// Drive an autocommit `MERGE` from the Control Plane.
 ///
-/// Returns a `{"affected": N}` response mirroring the shape the Data Plane
+/// Returns the `{"affected": N}` (or RETURNING-rows) response the Data-Plane
 /// merge handler produces, so the dispatch loops render the same command tag.
 pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Result<Response> {
     let catalog = state.credentials.catalog();
@@ -238,7 +242,15 @@ fn merge_plan(
         target_join_col: args.target_join_col.to_string(),
         source_join_col: args.source_join_col.to_string(),
         clauses: args.clauses.to_vec(),
-        returning: None,
+        // Only the APPLY pass can project rows. The RESOLVE pass is a read-only
+        // classification whose payload is the `(updates, deletes, inserts)`
+        // tuple `decode_resolve` expects; emitting RETURNING rows there would
+        // replace that payload and strand the surrogate assignment.
+        returning: if resolve_only {
+            None
+        } else {
+            args.returning.cloned()
+        },
         resolve_only,
         resolved_inserts,
         source_rows,

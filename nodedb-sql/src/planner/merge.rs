@@ -62,7 +62,11 @@ pub fn plan_merge(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Vec
         source_join_col,
         source_alias,
         clauses,
-        returning: false,
+        // sqlparser folds MSSQL's `OUTPUT ... [INTO tbl]` and Postgres'
+        // `RETURNING ...` into one `output` field. Only the RETURNING form
+        // sends rows back to the client; `OUTPUT ... INTO` redirects them into
+        // another table and must not be reported as a row-returning statement.
+        returning: matches!(&merge.output, Some(ast::OutputClause::Returning { .. })),
     })
 }
 

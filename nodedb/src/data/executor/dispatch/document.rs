@@ -387,7 +387,7 @@ impl CoreLoop {
                 target_join_col,
                 source_join_col,
                 clauses,
-                returning: _,
+                returning,
                 resolve_only,
                 resolved_inserts,
                 source_rows,
@@ -404,6 +404,7 @@ impl CoreLoop {
                     resolve_only: *resolve_only,
                     resolved_inserts: resolved_inserts.as_deref(),
                     source_rows: source_rows.as_deref(),
+                    returning: returning.as_ref(),
                 },
             ),
 

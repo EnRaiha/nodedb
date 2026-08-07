@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
-use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPutParams};
+use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
@@ -16,32 +16,8 @@ use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
 
 use super::super::merge::MergeParams;
-
-/// One committed Phase-A put captured for post-commit event emission:
-/// `(row_key, new stored body borrowed from the plan, prior stored value)`.
-/// The body borrows from the merge plan (owned for the whole apply) rather than
-/// being cloned.
-type MergePutEvent<'a> = (String, &'a [u8], Option<Vec<u8>>);
-
-/// Record the in-memory index mutations a successful [`CoreLoop::apply_point_put`]
-/// performed as undo entries. The HNSW vector index and the spatial R-tree live
-/// OUTSIDE the shared redb transaction, so dropping that transaction on abort
-/// does not reverse them — they must be undone explicitly. Drains the outcome's
-/// insert deltas (leaving `prior_value` for the caller's event emission).
-fn record_put_index_undo(undo_log: &mut Vec<UndoEntry>, outcome: &mut PointPutOutcome) {
-    for d in std::mem::take(&mut outcome.vector_inserts) {
-        undo_log.push(UndoEntry::InsertVector {
-            index_key: d.index_key,
-            vector_id: d.vector_id,
-            collection: d.collection,
-            field: d.field,
-            doc_id: d.doc_id,
-        });
-    }
-    for (key, entry_id) in std::mem::take(&mut outcome.spatial_inserts) {
-        undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
-    }
-}
+use super::super::returning_rows;
+use super::apply_support::{MergePutEvent, record_put_index_undo, returning_doc};
 
 /// Everything [`CoreLoop::abort_merge_apply`] needs to unwind a partially
 /// applied MERGE and surface the terminating error.
@@ -174,6 +150,12 @@ impl CoreLoop {
         // In-memory (HNSW + R-tree) index deltas applied this pass, reversed on
         // any abort path — the redb txn drop only reverses store-backed state.
         let mut undo_log: Vec<UndoEntry> = Vec::new();
+        // RETURNING rows for THIS apply attempt: post-images for the UPDATE and
+        // INSERT arms, pre-images for the DELETE arms. Built fresh here rather
+        // than carried in, because an attempt that ends in `OllpRetryRequired`
+        // is fully re-resolved and re-applied by the orchestrator — rows from a
+        // failed attempt describe a snapshot that never committed.
+        let mut returned_docs: Vec<serde_json::Value> = Vec::new();
 
         for upd in &plan.updates {
             match upd.surrogate {
@@ -226,6 +208,11 @@ impl CoreLoop {
                                     value: upd.body.clone(),
                                 });
                             }
+                            if params.returning.is_some()
+                                && let Some(doc) = returning_doc(&upd.body, &row_key)
+                            {
+                                returned_docs.push(doc);
+                            }
                             put_events.push((row_key, upd.body.as_slice(), outcome.prior_value));
                             affected += 1;
                         }
@@ -264,6 +251,11 @@ impl CoreLoop {
                             undo_log,
                             err: e.into(),
                         });
+                    }
+                    if params.returning.is_some()
+                        && let Some(doc) = returning_doc(&upd.body, &upd.doc_id)
+                    {
+                        returned_docs.push(doc);
                     }
                     affected += 1;
                 }
@@ -313,6 +305,11 @@ impl CoreLoop {
                             is_delete: false,
                             value: ins.body.clone(),
                         });
+                    }
+                    if params.returning.is_some()
+                        && let Some(doc) = returning_doc(&ins.body, &row_key)
+                    {
+                        returned_docs.push(doc);
                     }
                     put_events.push((row_key, ins.body.as_slice(), None));
                     affected += 1;
@@ -377,6 +374,17 @@ impl CoreLoop {
                         Ok(outcome) => {
                             if outcome.prior_value.is_some() {
                                 affected += 1;
+                                // A DELETE arm returns the PRE-image — the row
+                                // as it was classified, since nothing survives
+                                // the delete to project. Taken from the plan's
+                                // captured body rather than `prior_value`, which
+                                // is the raw stored form (Binary Tuple on a
+                                // strict target) and would need re-decoding.
+                                if params.returning.is_some()
+                                    && let Some(doc) = returning_doc(&del.body, &del.doc_id)
+                                {
+                                    returned_docs.push(doc);
+                                }
                                 if has_vectors {
                                     write_set.push(WriteSetEntry {
                                         surrogate: surrogate.as_u32(),
@@ -405,20 +413,45 @@ impl CoreLoop {
                     {
                         return self.response_error(task, e);
                     }
+                    // Legacy non-surrogate row: the raw delete reports no prior
+                    // value, so the plan's captured pre-image is the only image
+                    // of the removed row — without it a RETURNING delete of such
+                    // a row would silently drop it from the result set.
+                    if params.returning.is_some()
+                        && let Some(doc) = returning_doc(&del.body, &del.doc_id)
+                    {
+                        returned_docs.push(doc);
+                    }
                     affected += 1;
                 }
             }
         }
 
-        let result = serde_json::json!({ "affected": affected });
-        let mut response = match encode_json(&result) {
-            Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+        let mut response = if let Some(spec) = params.returning {
+            match returning_rows::build_rows_payload(spec, &returned_docs) {
+                Ok(payload) => self.response_with_payload(task, payload),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RETURNING encode: {e}"),
+                        },
+                    );
+                }
+            }
+        } else {
+            let result = serde_json::json!({ "affected": affected });
+            match encode_json(&result) {
+                Ok(payload) => self.response_with_payload(task, payload),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            }
         };
         if !write_set.is_empty() {
             response.write_set = write_set;
