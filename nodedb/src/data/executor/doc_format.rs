@@ -103,6 +103,34 @@ pub(super) fn json_to_msgpack(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Convert a vector-primary metadata sidecar body to a standard MessagePack map.
+///
+/// A sidecar is `zerompk::to_msgpack_vec(&HashMap<String, nodedb_types::Value>)`
+/// — the TAGGED form, where each value is a `[tag, payload]` array
+/// (`Value::String("r1")` → `[4,"r1"]`) — stored verbatim by the vector upsert
+/// handler. Handing those bytes to a document decoder yields tag arrays where
+/// the client expects values, because the outer container is an ordinary
+/// MessagePack map and passes every "is this already msgpack?" guard.
+///
+/// This is why the choice is never made by inspecting bytes: it is made by the
+/// caller, from the collection's registered kind, and lands here.
+///
+/// Bytes that do not decode as a tagged map are returned unchanged rather than
+/// re-guessed — a sidecar that cannot be read as one is not something a second
+/// format guess can rescue.
+pub(super) fn vector_sidecar_to_msgpack(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return bytes.to_vec();
+    }
+    match zerompk::from_msgpack::<std::collections::HashMap<String, nodedb_types::Value>>(bytes) {
+        Ok(map) => {
+            let json: serde_json::Value = nodedb_types::Value::Object(map).into();
+            encode_to_msgpack(&json)
+        }
+        Err(_) => bytes.to_vec(),
+    }
+}
+
 fn is_standard_msgpack_map(bytes: &[u8]) -> bool {
     let first = bytes[0];
     ((0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF)
@@ -220,6 +248,41 @@ mod tests {
             "expected standard msgpack map"
         );
         assert!(nodedb_query::msgpack_scan::extract_field(&canonical, 0, "user_id").is_some());
+    }
+
+    /// The sidecar normalizer must turn tagged values into real values.
+    ///
+    /// Passing the same bytes through `json_to_msgpack` returns them untouched
+    /// (its guard only reads the outer map header), which is exactly how
+    /// `[4,"alice"]` reached clients as a payload column value.
+    #[test]
+    fn a_tagged_sidecar_decodes_to_values_not_tag_arrays() {
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("id".to_string(), nodedb_types::Value::String("r1".into()));
+        obj.insert(
+            "owner".to_string(),
+            nodedb_types::Value::String("alice".into()),
+        );
+        let tagged = zerompk::to_msgpack_vec(&obj).unwrap();
+
+        assert_eq!(
+            json_to_msgpack(&tagged),
+            tagged,
+            "the document normalizer must NOT be the thing that fixes this"
+        );
+
+        let normalized = vector_sidecar_to_msgpack(&tagged);
+        let doc = decode_document(&normalized).expect("sidecar must decode as msgpack");
+        assert_eq!(doc.get("owner").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(doc.get("id").and_then(|v| v.as_str()), Some("r1"));
+    }
+
+    #[test]
+    fn a_non_sidecar_body_is_returned_unchanged() {
+        let value = serde_json::json!({"a": 1});
+        let msgpack = nodedb_types::json_to_msgpack(&value).unwrap();
+        assert_eq!(vector_sidecar_to_msgpack(&msgpack), msgpack);
+        assert!(vector_sidecar_to_msgpack(b"").is_empty());
     }
 
     #[test]

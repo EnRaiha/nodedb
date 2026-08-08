@@ -36,7 +36,7 @@ impl CoreLoop {
             },
             &|_| true,
         )?;
-        let strict_schema = self.strict_schema_for(
+        let format = self.sparse_body_format(
             crate::types::DatabaseId::new(did),
             crate::types::TenantId::new(tid),
             collection,
@@ -44,7 +44,7 @@ impl CoreLoop {
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            normalized.push(sparse_row_to_doc(&id, &raw, strict_schema.as_ref()));
+            normalized.push(sparse_row_to_doc(&id, &raw, &format));
         }
         Ok(normalized)
     }

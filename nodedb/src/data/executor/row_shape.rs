@@ -12,7 +12,8 @@
 //! second copy of one of these rules.
 
 use nodedb_query::msgpack_scan;
-use nodedb_types::columnar::StrictSchema;
+
+use super::sparse_body_format::SparseBodyFormat;
 
 /// Convert a single KV engine entry to a `(key, msgpack)` document.
 ///
@@ -27,25 +28,40 @@ pub(in crate::data::executor) fn kv_row_to_doc(key: &[u8], value: &[u8]) -> (Str
     (key_str, mp)
 }
 
+/// Normalize one sparse-store row's bytes to a standard msgpack map.
+///
+/// The single decision point for how a sparse body is decoded. Both readers of
+/// a sidecar row — the `SELECT` scan (via [`sparse_row_to_doc`]) and the vector
+/// search body attach — come through here, so neither can drift into its own
+/// private notion of the encoding.
+pub(in crate::data::executor) fn sparse_body_to_msgpack(
+    raw: &[u8],
+    format: &SparseBodyFormat,
+) -> Vec<u8> {
+    match format {
+        SparseBodyFormat::Strict(schema) => {
+            super::strict_format::binary_tuple_to_msgpack(raw, schema)
+                .unwrap_or_else(|| super::doc_format::json_to_msgpack(raw))
+        }
+        SparseBodyFormat::Document => super::doc_format::json_to_msgpack(raw),
+        SparseBodyFormat::VectorSidecar => super::doc_format::vector_sidecar_to_msgpack(raw),
+    }
+}
+
 /// Convert a single sparse/document row to a `(id, msgpack)` document.
 ///
-/// When `strict_schema` is `Some`, the raw bytes are a Binary Tuple and are
-/// decoded via the strict schema (falling back to JSON transcoding if the
-/// tuple cannot be decoded). When `None`, the raw bytes are schemaless and
-/// are normalised from (possibly legacy JSON) to standard msgpack. In both
-/// cases the `id` field is injected identically. Shared by the materializing
-/// scan and the streaming scan so both paths produce byte-identical output.
+/// Normalizes the body per [`sparse_body_to_msgpack`], then injects the `id`
+/// field. Injection is a no-op when the body already carries an `id` — a
+/// vector-primary sidecar stores the user's declared primary key, and its
+/// sparse key is the internal surrogate-hex, which must not displace it.
+/// Shared by the materializing scan and the streaming scan so both paths
+/// produce byte-identical output.
 pub(in crate::data::executor) fn sparse_row_to_doc(
     id: &str,
     raw: &[u8],
-    strict_schema: Option<&StrictSchema>,
+    format: &SparseBodyFormat,
 ) -> (String, Vec<u8>) {
-    let mp = if let Some(schema) = strict_schema {
-        super::strict_format::binary_tuple_to_msgpack(raw, schema)
-            .unwrap_or_else(|| super::doc_format::json_to_msgpack(raw))
-    } else {
-        super::doc_format::json_to_msgpack(raw)
-    };
+    let mp = sparse_body_to_msgpack(raw, format);
     let mp = msgpack_scan::inject_str_field(&mp, "id", id);
     (id.to_string(), mp)
 }

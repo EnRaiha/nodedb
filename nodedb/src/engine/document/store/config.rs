@@ -31,6 +31,16 @@ pub struct CollectionConfig {
     /// come from the DDL rather than from whatever the first ingested batch
     /// happened to look like.
     pub timeseries: Option<Box<nodedb_physical::physical_plan::TimeseriesSchema>>,
+    /// Vector-primary access-path config. `Some` only for a
+    /// `WITH (primary='vector')` collection, whose sparse rows are `zerompk`
+    /// TAGGED metadata sidecars (`Value::String("r1")` → `[4,"r1"]`) rather
+    /// than ordinary document bodies.
+    ///
+    /// The read path decodes by this marker and never by inspecting the
+    /// stored bytes: a tagged map and a plain document map are both valid
+    /// MessagePack maps with the same header byte, so byte sniffing silently
+    /// returns tag arrays to the client.
+    pub vector_primary: Option<Box<nodedb_types::VectorPrimaryConfig>>,
 }
 
 impl CollectionConfig {
@@ -44,6 +54,7 @@ impl CollectionConfig {
             bitemporal: false,
             conflict_policy: None,
             timeseries: None,
+            vector_primary: None,
         }
     }
 

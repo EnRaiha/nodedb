@@ -364,6 +364,7 @@ impl CoreLoop {
                 bitemporal,
                 conflict_policy,
                 timeseries,
+                vector_primary,
             } => self.execute_register_document_collection(
                 task,
                 super::super::handlers::document::write::RegisterDocumentCollectionParams {
@@ -376,6 +377,7 @@ impl CoreLoop {
                     bitemporal: *bitemporal,
                     conflict_policy: conflict_policy.as_deref(),
                     timeseries: timeseries.as_deref(),
+                    vector_primary: vector_primary.as_deref(),
                 },
             ),
 

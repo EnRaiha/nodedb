@@ -40,6 +40,7 @@ fn register_with_generated(
             bitemporal: false,
             conflict_policy: None,
             timeseries: None,
+            vector_primary: None,
         }),
     );
 }

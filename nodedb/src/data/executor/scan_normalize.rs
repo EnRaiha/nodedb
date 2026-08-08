@@ -176,26 +176,19 @@ impl CoreLoop {
             return Ok(());
         }
 
-        // 3. Sparse/document engine (schemaless + strict) — TRULY streams
-        //    row-at-a-time via `scan_documents_for_each`. The strict schema is
-        //    resolved once up front, exactly as in `scan_sparse`.
-        let config_key = (
+        // 3. Sparse/document engine (schemaless + strict + vector-primary
+        //    sidecar) — TRULY streams row-at-a-time via
+        //    `scan_documents_for_each`. The body encoding is resolved once up
+        //    front through the same helper `scan_sparse` uses, so the streaming
+        //    and materializing scans cannot disagree about a row's shape.
+        let format = self.sparse_body_format(
             crate::types::DatabaseId::new(did),
             crate::types::TenantId::new(tid),
-            collection.to_string(),
+            collection,
         );
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
         self.sparse
             .scan_documents_for_each(did, tid, collection, usize::MAX, |id, raw| {
-                let (id_s, mp) = sparse_row_to_doc(id, raw, strict_schema.as_ref());
+                let (id_s, mp) = sparse_row_to_doc(id, raw, &format);
                 f(&id_s, &mp)
             })?;
         Ok(())
@@ -392,7 +385,7 @@ impl CoreLoop {
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let docs = self.sparse.scan_documents(did, tid, collection, limit)?;
-        let strict_schema = self.strict_schema_for(
+        let format = self.sparse_body_format(
             crate::types::DatabaseId::new(did),
             crate::types::TenantId::new(tid),
             collection,
@@ -400,7 +393,7 @@ impl CoreLoop {
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            normalized.push(sparse_row_to_doc(&id, &raw, strict_schema.as_ref()));
+            normalized.push(sparse_row_to_doc(&id, &raw, &format));
         }
         Ok(normalized)
     }
@@ -411,7 +404,7 @@ impl CoreLoop {
 // caller in this directory reaches them through `scan_normalize::` and the
 // split must not be visible to them.
 pub(in crate::data::executor) use super::row_shape::{
-    decoded_col_to_value, kv_row_to_doc, sparse_row_to_doc,
+    decoded_col_to_value, kv_row_to_doc, sparse_body_to_msgpack, sparse_row_to_doc,
 };
 
 #[cfg(test)]

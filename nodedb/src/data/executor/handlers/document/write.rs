@@ -360,6 +360,11 @@ pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
     /// Declared columns + designated `TIME_KEY` when this is a timeseries
     /// collection; `None` for every other engine.
     pub timeseries: Option<&'a nodedb_physical::physical_plan::TimeseriesSchema>,
+    /// Vector-primary access-path config when this is a
+    /// `WITH (primary='vector')` collection; `None` for every other engine.
+    /// The read path decodes this collection's sparse rows as `zerompk`
+    /// TAGGED sidecars solely on the strength of this marker.
+    pub vector_primary: Option<&'a nodedb_types::VectorPrimaryConfig>,
 }
 
 impl CoreLoop {
@@ -383,6 +388,7 @@ impl CoreLoop {
             bitemporal,
             conflict_policy,
             timeseries,
+            vector_primary,
         } = params;
         let mode_label = match storage_mode {
             nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
@@ -400,17 +406,24 @@ impl CoreLoop {
             "register document collection"
         );
 
-        let mut config = crate::engine::document::store::CollectionConfig::new(collection);
-        config.crdt_enabled = crdt_enabled;
-        config.storage_mode = storage_mode.clone();
-        config.enforcement = enforcement.clone();
-        config.bitemporal = bitemporal;
-        config.conflict_policy = conflict_policy.map(str::to_string);
-        config.timeseries = timeseries.map(|ts| Box::new(ts.clone()));
-        config.index_paths = indexes
-            .iter()
-            .map(crate::engine::document::store::IndexPath::from_registered)
-            .collect();
+        // Struct literal with every field named — never `..Default::default()`.
+        // A `CollectionConfig` field left unassigned here would make the
+        // attribute silently absent on every registered collection instead of
+        // failing to compile.
+        let config = crate::engine::document::store::CollectionConfig {
+            name: collection.to_string(),
+            index_paths: indexes
+                .iter()
+                .map(crate::engine::document::store::IndexPath::from_registered)
+                .collect(),
+            crdt_enabled,
+            storage_mode: storage_mode.clone(),
+            enforcement: enforcement.clone(),
+            bitemporal,
+            conflict_policy: conflict_policy.map(str::to_string),
+            timeseries: timeseries.map(|ts| Box::new(ts.clone())),
+            vector_primary: vector_primary.map(|vp| Box::new(vp.clone())),
+        };
 
         let config_key = (
             task.request.database_id,

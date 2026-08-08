@@ -31,6 +31,8 @@ use nodedb_types::columnar::schema::{
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
+use crate::data::executor::scan_normalize::{sparse_body_to_msgpack, sparse_row_to_doc};
+use crate::data::executor::sparse_body_format::SparseBodyFormat;
 use crate::data::executor::task::ExecutionTask;
 use crate::data::executor::{doc_format, strict_format};
 
@@ -218,6 +220,17 @@ impl CoreLoop {
         );
         let database_id = task.request.database_id.as_u64();
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
+        // Resolved from the collection's registered kind, never from the bytes:
+        // a tagged sidecar and a plain document body are both valid MessagePack
+        // maps with the same header, so sniffing necessarily mis-reads one.
+        let is_vector_sidecar = matches!(
+            self.sparse_body_format(
+                crate::types::DatabaseId::new(database_id),
+                crate::types::TenantId::new(tid),
+                collection,
+            ),
+            SparseBodyFormat::VectorSidecar
+        );
 
         // `scan_documents_filtered`/`versioned_scan_as_of`/`scan_collection`
         // take an infallible `Fn(&[u8]) -> bool` predicate (a storage-engine
@@ -229,6 +242,17 @@ impl CoreLoop {
             if filter_predicates.is_empty() {
                 return true;
             }
+            // Filters read fields out of a standard msgpack map, so a sidecar
+            // must be normalized BEFORE evaluation. Pushing a predicate at the
+            // stored tagged bytes matches nothing, which reads as "no rows"
+            // rather than as an error.
+            let normalized;
+            let value = if is_vector_sidecar {
+                normalized = sparse_body_to_msgpack(value, &SparseBodyFormat::VectorSidecar);
+                normalized.as_slice()
+            } else {
+                value
+            };
             match matches_with_resolved_schema(strict_schema, filter_predicates, value) {
                 Ok(b) => b,
                 Err(e) => {
@@ -327,6 +351,21 @@ impl CoreLoop {
         if let Some(e) = predicate_err.take() {
             return Err(crate::Error::from(e));
         }
+
+        // A vector-primary collection's sparse rows are `zerompk` TAGGED
+        // metadata sidecars, not document bodies. Normalize them here, at the
+        // one point where this handler's raw sparse bytes become "rows", so
+        // every downstream transform — sort, window functions, computed
+        // columns, projection, DISTINCT — sees the same standard-msgpack shape
+        // it sees for every other collection. Without it the tagged values pass
+        // through untouched and reach the client as `[4,"alice"]`.
+        let rows = if is_vector_sidecar {
+            rows.into_iter()
+                .map(|(id, body)| sparse_row_to_doc(&id, &body, &SparseBodyFormat::VectorSidecar))
+                .collect()
+        } else {
+            rows
+        };
 
         Ok(FetchedRows {
             rows,

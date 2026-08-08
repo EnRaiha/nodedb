@@ -270,18 +270,26 @@ pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
         generated_columns: build_generated_column_specs(coll),
     };
 
-    let mut config = crate::engine::document::store::CollectionConfig::new(&name);
-    config.crdt_enabled = coll.crdt;
-    config.storage_mode = storage_mode;
-    config.enforcement = enforcement;
-    config.bitemporal = coll.bitemporal;
-    config.conflict_policy = coll.conflict_policy.clone();
-    config.timeseries = build_timeseries_schema(coll);
-    config.index_paths = indexes
-        .iter()
-        .map(crate::engine::document::store::IndexPath::from_registered)
-        .collect();
-    config
+    // Written as a struct literal with every field named — and deliberately
+    // NOT `..Default::default()`. A field added to `CollectionConfig` that is
+    // never derived from the catalog is invisible at runtime: the collection
+    // simply behaves as though the attribute was never declared. Naming every
+    // field turns that into a compile error here, in the one function both the
+    // live-DDL path and the boot seed go through.
+    crate::engine::document::store::CollectionConfig {
+        name,
+        index_paths: indexes
+            .iter()
+            .map(crate::engine::document::store::IndexPath::from_registered)
+            .collect(),
+        crdt_enabled: coll.crdt,
+        storage_mode,
+        enforcement,
+        bitemporal: coll.bitemporal,
+        conflict_policy: coll.conflict_policy.clone(),
+        timeseries: build_timeseries_schema(coll),
+        vector_primary: coll.vector_primary.clone().map(Box::new),
+    }
 }
 
 async fn dispatch_register_from_stored_inner(
@@ -303,6 +311,7 @@ async fn dispatch_register_from_stored_inner(
             bitemporal: config.bitemporal,
             conflict_policy: config.conflict_policy.clone(),
             timeseries: config.timeseries.clone(),
+            vector_primary: config.vector_primary.clone(),
         },
     );
 
@@ -314,4 +323,79 @@ async fn dispatch_register_from_stored_inner(
         TraceId::ZERO,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::{PrimaryEngine, VectorPrimaryConfig};
+
+    /// A catalog with no other collections — enough for the builder, which
+    /// only consults it to discover materialized-sum bindings.
+    struct EmptyCatalog;
+
+    impl CollectionSource for EmptyCatalog {
+        fn list_database_ids(&self) -> crate::Result<Vec<DatabaseId>> {
+            Ok(Vec::new())
+        }
+        fn collections_in(&self, _database_id: DatabaseId) -> crate::Result<Vec<StoredCollection>> {
+            Ok(Vec::new())
+        }
+        fn collections_for_tenant(
+            &self,
+            _database_id: DatabaseId,
+            _tenant_id: u64,
+        ) -> crate::Result<Vec<StoredCollection>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn vector_primary_collection() -> StoredCollection {
+        let mut coll = StoredCollection::new(1, "vec_primary", "owner");
+        coll.primary = PrimaryEngine::Vector;
+        coll.vector_primary = Some(VectorPrimaryConfig {
+            vector_field: "vec".to_string(),
+            dim: 3,
+            ..VectorPrimaryConfig::default()
+        });
+        coll
+    }
+
+    /// The vector-primary marker must reach `CollectionConfig`.
+    ///
+    /// This is the ONE builder both the live-DDL register broadcast and the
+    /// boot-time `doc_configs` seed go through, so a marker that survives here
+    /// survives a restart too. A marker that existed only after a live CREATE
+    /// would make a vector-primary collection readable until the first restart
+    /// and unreadable after it — the same defect one layer down.
+    #[test]
+    fn a_vector_primary_collection_carries_its_marker_into_the_doc_config() {
+        let coll = vector_primary_collection();
+        let config = build_doc_config_from_stored(
+            &EmptyCatalog,
+            crate::types::TenantId::new(coll.tenant_id),
+            &coll,
+            &[],
+        );
+        let vp = config
+            .vector_primary
+            .as_ref()
+            .expect("a primary='vector' collection must register its vector-primary config");
+        assert_eq!(vp.vector_field, "vec");
+        assert_eq!(vp.dim, 3);
+    }
+
+    /// Every other engine must leave the marker unset, or every collection's
+    /// rows would be decoded as tagged sidecars.
+    #[test]
+    fn a_plain_document_collection_carries_no_vector_primary_marker() {
+        let coll = StoredCollection::new(1, "plain_docs", "owner");
+        let config = build_doc_config_from_stored(
+            &EmptyCatalog,
+            crate::types::TenantId::new(coll.tenant_id),
+            &coll,
+            &[],
+        );
+        assert!(config.vector_primary.is_none());
+    }
 }

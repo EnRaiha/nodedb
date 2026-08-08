@@ -22,6 +22,7 @@ mod row_shape;
 mod scan_normalize;
 mod scan_versioned;
 mod snapshot;
+mod sparse_body_format;
 mod sparse_vector_checkpoint;
 mod spatial_checkpoint;
 mod spatial_key;

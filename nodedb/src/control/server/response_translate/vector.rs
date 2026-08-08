@@ -145,6 +145,15 @@ pub fn translate_vector_search_payload(
     // SQL projections like `SELECT id, label, vector_distance(...)` see the
     // payload columns. The base hit fields stay top-level; payload fields are
     // serialized as JSON-style siblings.
+    //
+    // `body` is BARE (standard) msgpack: the Data Plane normalizes every
+    // attached body through the shared sparse-body normalizer, which resolves a
+    // vector-primary collection's `zerompk` TAGGED sidecar to the same shape a
+    // classic document body already has. That is the one contract — the gather
+    // path's `flatten_vector_hits_to_relational_rows` reads it identically.
+    // Decoding with the tagged `Value` codec here instead would read exactly
+    // one of the two collection kinds and silently drop the columns of the
+    // other.
     use std::collections::BTreeMap;
     let flattened: Vec<BTreeMap<String, serde_json::Value>> = hits
         .iter()
@@ -155,14 +164,10 @@ pub fn translate_vector_search_payload(
             // over the internal surrogate integer. Body fields are only present
             // when the Data Plane performed the slow-path fetch.
             if let Some(ref body) = h.body
-                && let Ok(map) = zerompk::from_msgpack::<
-                    std::collections::HashMap<String, nodedb_types::Value>,
-                >(body)
+                && let Ok(serde_json::Value::Object(map)) = nodedb_types::json_from_msgpack(body)
             {
                 for (k, v) in map {
-                    if let Ok(j) = serde_json::to_value(&v) {
-                        obj.insert(k, j);
-                    }
+                    obj.insert(k, v);
                 }
             }
             // Fall back to catalog-resolved doc_id or raw surrogate when

@@ -448,6 +448,10 @@ pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Re
         bitemporal: false,
         conflict_policy: None,
         timeseries: None,
+        // The native protocol's register frame carries only index paths; a
+        // vector-primary collection is created through SQL DDL, which goes
+        // through the catalog-sourced builder instead.
+        vector_primary: None,
     }))
 }
 

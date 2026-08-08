@@ -177,7 +177,7 @@ impl CoreLoop {
         // mirrors `scan_collection`'s own presence-based (columnar → sparse)
         // routing and is correct regardless of which engine backs the row.
         let database_id = db_id.as_u64();
-        let strict_schema = self.strict_schema_for(db_id, tid_id, collection);
+        let body_format = self.sparse_body_format(db_id, tid_id, collection);
 
         // Lazily-built columnar id → document map, populated on the first
         // candidate that is absent from the sparse store (i.e. a columnar-family
@@ -228,7 +228,7 @@ impl CoreLoop {
                     let (_, doc_mp) = crate::data::executor::scan_normalize::sparse_row_to_doc(
                         &doc_id,
                         &raw,
-                        strict_schema.as_ref(),
+                        &body_format,
                     );
                     match super::super::doc_format::decode_document_value(&doc_mp) {
                         Some(d) => d,

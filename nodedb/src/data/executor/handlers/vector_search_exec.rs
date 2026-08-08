@@ -34,6 +34,13 @@ impl CoreLoop {
     /// the slow-path SELECT (the Control Plane response translator flattens
     /// the body's fields into the hit JSON so payload columns surface to
     /// the client). When `attach == false` the hit is returned unchanged.
+    ///
+    /// The bytes are normalized to a standard msgpack map through the shared
+    /// sparse-body normalizer, resolved from the collection's registered kind.
+    /// A vector-primary collection's rows are `zerompk` TAGGED sidecars and a
+    /// classic collection's are ordinary document bodies; the two are
+    /// indistinguishable byte-wise, and both the RLS filter evaluator and the
+    /// Control-Plane flatten read the attached body as one shape.
     #[inline]
     pub(in crate::data::executor) fn attach_body(
         &self,
@@ -48,7 +55,14 @@ impl CoreLoop {
         }
         let hex = format!("{:08x}", hit.id);
         if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, &hex) {
-            hit.body = Some(bytes);
+            let format = self.sparse_body_format(
+                crate::types::DatabaseId::new(database_id),
+                crate::types::TenantId::new(tid),
+                collection,
+            );
+            hit.body = Some(
+                crate::data::executor::scan_normalize::sparse_body_to_msgpack(&bytes, &format),
+            );
         }
         hit
     }

@@ -592,6 +592,7 @@ mod tests {
                 bitemporal: false,
                 conflict_policy: None,
                 timeseries: None,
+                vector_primary: None,
             }),
             PhysicalPlan::Document(DocumentOp::IndexLookup {
                 collection: "c".into(),

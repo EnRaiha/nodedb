@@ -41,6 +41,20 @@ impl CoreLoop {
         }
 
         for (tenant_id, collection) in targets {
+            // These bodies are read RAW on purpose: they must NOT go through
+            // the shared sparse-body normalizer that the read paths use.
+            //
+            // `entries` comes from the `CREATE VECTOR INDEX` param seed, so
+            // every target here is a classic collection with a vector index
+            // over a document field, and `apply_point_put_vector_indexes`
+            // extracts that field out of the document body itself. A
+            // vector-primary collection has no vector field in its sidecar at
+            // all — the vector lives only in the HNSW graph — and its
+            // durability is served by `replay_direct_upsert` in
+            // `wal_replay_vector_extended` instead. Routing this scan through
+            // the sidecar normalizer would therefore rebuild nothing extra and
+            // would corrupt the classic rebuild it does serve.
+            //
             // Collect first (the scan borrows `&self.sparse`); re-index after
             // the borrow ends so `&mut self` is free for the HNSW insert.
             let mut docs: Vec<(nodedb_types::Surrogate, Vec<u8>)> = Vec::new();

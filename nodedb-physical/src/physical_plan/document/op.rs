@@ -252,6 +252,15 @@ pub enum DocumentOp {
         /// collection's memtable schema from this instead of inferring one
         /// from the first ingested batch.
         timeseries: Option<Box<TimeseriesSchema>>,
+        /// Vector-primary access-path config. `Some` for every
+        /// `WITH (primary='vector')` collection, `None` for every other.
+        ///
+        /// The Data Plane read path needs it to know that this collection's
+        /// sparse rows are `zerompk` TAGGED metadata sidecars rather than
+        /// ordinary document bodies. Both encodings are legal MessagePack
+        /// maps, so no inspection of the stored bytes can tell them apart —
+        /// the collection's declared kind is the only sound discriminator.
+        vector_primary: Option<Box<nodedb_types::VectorPrimaryConfig>>,
     },
 
     /// Lookup documents by secondary index value.

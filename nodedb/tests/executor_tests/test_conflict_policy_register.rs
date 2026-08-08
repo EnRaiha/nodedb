@@ -48,6 +48,7 @@ fn register(ctx: &mut TestCtx, collection: &str, conflict_policy: Option<String>
             bitemporal: false,
             conflict_policy,
             timeseries: None,
+            vector_primary: None,
         }),
     );
     assert_eq!(resp.status, Status::Ok, "register document collection");
