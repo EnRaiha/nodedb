@@ -172,6 +172,8 @@ fn fts_derived_bitmap_filters_vector_search() {
                 value: serde_json::to_vec(&doc_json).unwrap(),
                 surrogate: *surrogate,
                 pk_bytes: hex_id.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -323,6 +325,8 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
                 value: serde_json::to_vec(&doc_json).unwrap(),
                 surrogate: *surrogate,
                 pk_bytes: hex_id.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

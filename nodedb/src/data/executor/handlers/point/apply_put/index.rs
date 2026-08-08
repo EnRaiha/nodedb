@@ -166,6 +166,7 @@ impl CoreLoop {
 mod tests {
     use crate::bridge::envelope::{Priority, Request, Status};
     use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::handlers::point::put::PointPutExec;
     use crate::data::executor::task::ExecutionTask;
     use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
     use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
@@ -186,6 +187,8 @@ mod tests {
                 value: value.to_vec(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,
@@ -218,7 +221,18 @@ mod tests {
 
         let doc = br#"{"loc":"{\"type\":\"Point\",\"coordinates\":[1.0,2.0]}"}"#;
         let task = point_put_task("docs", "d1", doc);
-        let resp = core.execute_point_put(&task, 1, "docs", "d1", Surrogate::ZERO, doc);
+        let resp = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: 1,
+                collection: "docs",
+                document_id: "d1",
+                surrogate: Surrogate::ZERO,
+                value: doc,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
         assert_eq!(resp.status, Status::Ok);
 
         let key = (
@@ -250,7 +264,18 @@ mod tests {
 
         let doc = br#"{"loc":{"type":"Point","coordinates":[1.0,2.0]}}"#;
         let task = point_put_task("docs_obj", "d1", doc);
-        let resp = core.execute_point_put(&task, 1, "docs_obj", "d1", Surrogate::ZERO, doc);
+        let resp = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: 1,
+                collection: "docs_obj",
+                document_id: "d1",
+                surrogate: Surrogate::ZERO,
+                value: doc,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
         assert_eq!(resp.status, Status::Ok);
 
         let key = (

@@ -45,6 +45,8 @@ fn insert_product(
             value: value_bytes,
             surrogate,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

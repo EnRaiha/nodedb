@@ -86,6 +86,8 @@ fn put(ctx: &mut TestCtx, collection: &str, doc_id: &str, value: Vec<u8>, surrog
             value,
             surrogate: nodedb_types::Surrogate::new(surrogate),
             pk_bytes: doc_id.as_bytes().to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     assert_eq!(resp.status, Status::Ok, "PointPut {doc_id}");

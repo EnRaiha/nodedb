@@ -473,6 +473,7 @@ impl CoreLoop {
 
         Ok(PointPutOutcome {
             prior_value: prior,
+            stored_value: stored,
             bitemporal_sys_from_ms: if bitemporal { Some(sys_from_ms) } else { None },
             bitemporal_index_tuples,
             secondary_index_added,
@@ -492,6 +493,7 @@ mod tests {
     use crate::data::executor::core_loop::CoreLoop;
     use crate::data::executor::core_loop::tests::make_core_with_dir;
     use crate::data::executor::handlers::point::apply_put::PointPutParams;
+    use crate::data::executor::handlers::point::put::PointPutExec;
     use crate::data::executor::task::ExecutionTask;
     use crate::engine::document::store::surrogate_to_doc_id;
     use crate::engine::sparse::fts_redb::tables::DOC_LENGTHS;
@@ -540,6 +542,8 @@ mod tests {
                 value: BODY.to_vec(),
                 surrogate: SURROGATE,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,
@@ -574,7 +578,18 @@ mod tests {
         let row_key = surrogate_to_doc_id(SURROGATE);
 
         let task = point_put_task(&row_key);
-        let resp = core.execute_point_put(&task, TID, COLL, &row_key, SURROGATE, BODY);
+        let resp = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: TID,
+                collection: COLL,
+                document_id: &row_key,
+                surrogate: SURROGATE,
+                value: BODY,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
 
         assert_eq!(resp.status, Status::Ok);
         assert!(stored_row(&core, &row_key).is_some(), "row must be stored");
@@ -598,7 +613,18 @@ mod tests {
         poison_inverted_index(&core);
 
         let task = point_put_task(&row_key);
-        let resp = core.execute_point_put(&task, TID, COLL, &row_key, SURROGATE, BODY);
+        let resp = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: TID,
+                collection: COLL,
+                document_id: &row_key,
+                surrogate: SURROGATE,
+                value: BODY,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
 
         assert_eq!(
             resp.status,

@@ -121,6 +121,8 @@ fn doc_insert(coll: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
         value: doc_value(),
         if_absent: false,
         surrogate: Surrogate::new(surrogate),
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 

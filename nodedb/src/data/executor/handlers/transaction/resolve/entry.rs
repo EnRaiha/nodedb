@@ -1036,6 +1036,8 @@ mod tests {
                 collection: "notes".to_string(),
                 documents: vec![("d1".to_string(), Vec::new())],
                 surrogates: vec![Surrogate::ZERO],
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ];
 
@@ -1377,6 +1379,8 @@ mod tests {
             value: Vec::new(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

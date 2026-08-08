@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! RETURNING clause pre-processing for DML statements.
+//! RETURNING clause handling for DML statements: strip it from the text,
+//! decide whether the resulting plan can carry it, and attach it.
 //!
-//! DataFusion does not support RETURNING on DML (INSERT/UPDATE/DELETE).
-//! This module detects and strips the RETURNING clause from raw SQL before
-//! DataFusion planning, parsing the projected column list so the response
-//! handler can format the Data Plane's returned documents as a pgwire
-//! QueryResponse with one column per projected field.
+//! The planner does not parse RETURNING on DML, so the clause is removed from
+//! the raw SQL before planning and its projected column list is parsed here.
+//! The spec is then injected into the plan variant that will produce the rows.
+//!
+//! Protocol-neutral: both the pgwire planner and the neutral DDL router's
+//! `UPSERT` path go through this module, so a statement's clause is stripped,
+//! judged, and attached identically on either transport.
 
 // Re-export bridge types so callers only import from this module.
-pub(super) use nodedb_physical::physical_plan::{ReturningColumns, ReturningItem, ReturningSpec};
+pub use nodedb_physical::physical_plan::{ReturningColumns, ReturningItem, ReturningSpec};
 
 use crate::Error;
+use crate::bridge::envelope::PhysicalPlan;
+use nodedb_physical::physical_plan::{
+    ColumnarOp, CrdtOp, DocumentOp, KvOp, QueryOp, TimeseriesOp, VectorOp,
+};
 use nodedb_sql::parser::preprocess::lex::{find_ascii_keyword, keyword_position_outside_literals};
 use nodedb_types::starts_with_ascii_case_insensitive;
 
@@ -22,17 +29,22 @@ const RETURNING_KEYWORD: &str = "RETURNING";
 /// Returns `(cleaned_sql, returning_spec)`. The cleaned SQL has the
 /// `RETURNING ...` suffix removed so DataFusion can parse it.
 ///
-/// RETURNING is honored on UPDATE, DELETE and MERGE. On INSERT it is
-/// **refused** — see [`refuse_unsupported_insert_returning`].
+/// RETURNING is honored on INSERT, UPSERT, UPDATE, DELETE and MERGE. Which
+/// engine can actually carry the clause is not decidable from the statement
+/// text — it depends on the target collection's engine — so that judgement is
+/// made once the plan exists, by [`refuse_unplannable_insert_returning`].
 ///
 /// Arithmetic expressions (e.g. `RETURNING stock * 2`) are rejected with
 /// a typed error — only bare column names and `*` are supported.
-pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Error> {
+pub fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Error> {
     let trimmed = sql.trim_start();
 
-    refuse_unsupported_insert_returning(trimmed, sql)?;
-
-    if !starts_with_ascii_case_insensitive(trimmed, "UPDATE")
+    // Gated on the DML verbs rather than on "everything that is not a SELECT",
+    // so an unrelated statement whose text merely contains the word is never
+    // truncated at it.
+    if !starts_with_ascii_case_insensitive(trimmed, "INSERT")
+        && !starts_with_ascii_case_insensitive(trimmed, "UPSERT")
+        && !starts_with_ascii_case_insensitive(trimmed, "UPDATE")
         && !starts_with_ascii_case_insensitive(trimmed, "DELETE")
         && !starts_with_ascii_case_insensitive(trimmed, "MERGE")
     {
@@ -49,41 +61,150 @@ pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec
     }
 }
 
-/// Refuse `INSERT ... RETURNING`, which nothing in the system can honor.
+/// Refuse an `INSERT ... RETURNING` the planner produced a plan for that has
+/// nowhere to carry the clause.
 ///
-/// No insert operation carries a `returning` slot on any engine —
-/// `DocumentOp::PointInsert` / `PointPut` / `BatchInsert`, and the key-value,
-/// columnar, and vector inserts alike — while `PointUpdate`, `PointDelete`,
-/// `Merge`, and `UpdateFrom` all do. So the clause has nowhere to be planned
-/// into: it was parsed, discarded, and the caller received a command tag for a
-/// statement that asked for rows, with nothing anywhere saying the request had
-/// been dropped.
+/// The document engines carry it: `PointInsert`, `PointPut`, `BatchInsert`, and
+/// `Upsert` each own a `returning` slot paired with the `rls_filters` read gate,
+/// so the statement returns the STORED post-image bounded by the read policy.
+/// The remaining insert shapes own no such slot, so the clause would be parsed,
+/// discarded, and answered with a command tag for a statement that asked for
+/// rows — with nothing anywhere saying the request had been dropped.
 ///
-/// Refusing is the honest answer until an insert can actually return its row.
-/// Returning the caller's own submitted values instead would be worse than
-/// silence: every other RETURNING in the product returns the STORED row and is
-/// gated by the read policy (see the `rls_filters` slot beside each `returning`
-/// field), and an echo of the request would match neither.
+/// Refusing is the honest answer until each of those inserts can return its own
+/// row. Returning the caller's submitted values instead would be worse than
+/// silence: every RETURNING in the product returns the STORED row and is gated
+/// by the read policy, and an echo of the request would match neither.
 ///
-/// Scoped to statements that begin with INSERT rather than to "everything that
-/// is not UPDATE/DELETE/MERGE", so no unrelated statement that happens to
-/// contain the word is caught by it. `UPSERT` is deliberately not included:
-/// the protocol-neutral DDL router claims every UPSERT before this function is
-/// reached, and it answers the clause from its own parse rather than from the
-/// planner.
-fn refuse_unsupported_insert_returning(trimmed: &str, sql: &str) -> Result<(), Error> {
-    if !starts_with_ascii_case_insensitive(trimmed, "INSERT") {
-        return Ok(());
-    }
-    if keyword_position_outside_literals(sql, RETURNING_KEYWORD).is_none() {
-        return Ok(());
-    }
+/// Runs against the plan rather than the statement text because the engine — the
+/// thing that decides whether the clause can be carried — is a property of the
+/// target collection, not of the SQL.
+pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Error> {
+    let unsupported = match plan {
+        PhysicalPlan::Kv(
+            KvOp::Insert { .. }
+            | KvOp::InsertIfAbsent { .. }
+            | KvOp::InsertOnConflictUpdate { .. }
+            | KvOp::Put { .. },
+        ) => "key-value",
+        PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => "columnar and spatial",
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => "timeseries",
+        PhysicalPlan::Vector(VectorOp::Insert { .. } | VectorOp::DirectUpsert { .. }) => "vector",
+        // `INSERT ... SELECT` never reaches the Data Plane as this op: it is
+        // expanded on the Control Plane into fresh-surrogate insert tasks whose
+        // rows the expander, not the plan, decides — so there is no slot on
+        // this plan for the clause to ride in.
+        PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => "INSERT ... SELECT",
+        // Exchange wraps an unresolved child; judge the child.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => {
+            return refuse_unplannable_insert_returning(&op.child);
+        }
+        // Everything else either carries the clause already or is not an
+        // insert. Enumerated per engine rather than via a catch-all so a new
+        // `PhysicalPlan` variant forces a decision instead of silently
+        // inheriting "supported" and dropping the clause.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => return Ok(()),
+    };
     Err(Error::BadRequest {
-        detail: "RETURNING is not supported on INSERT; it is supported on UPDATE, DELETE, and \
-                 MERGE. Follow the insert with a SELECT on the inserted key to read the stored \
-                 row."
-            .to_string(),
+        detail: format!(
+            "RETURNING is not supported on INSERT into {unsupported} collections; it is \
+             supported on document collections (schemaless and strict), and on UPDATE, DELETE, \
+             and MERGE. Follow the insert with a SELECT on the inserted key to read the stored \
+             row."
+        ),
     })
+}
+
+/// The error a row-returning write must fail with when an open transaction
+/// buffers or stages it instead of executing it.
+///
+/// Both in-transaction routes are structurally unable to answer the clause, and
+/// for different reasons — which is why this refuses rather than returning an
+/// empty row set:
+///
+/// - A **buffered** write performs no engine work at all until COMMIT, so at
+///   statement time there is no stored row to project. Nothing could be
+///   returned however the response were shaped.
+/// - A **staged** write does touch the transaction overlay, but every staging
+///   handler answers with an affected-count payload; the one payload-bearing
+///   staged outcome is reserved for the atomic key-value ops that compute a
+///   value. No staged write carries a row image back.
+///
+/// COMMIT then answers with a single tag for the whole transaction, so the rows
+/// cannot be surfaced later either. Reporting success with no rows is the exact
+/// silence this clause exists to remove, so the statement is refused and says
+/// which limitation it hit. Verb-agnostic on purpose: it fires for any plan the
+/// shaper classifies as row-returning, so INSERT, UPSERT, UPDATE, DELETE and
+/// MERGE all behave identically inside a transaction.
+pub fn in_transaction_returning_unsupported() -> Error {
+    Error::BadRequest {
+        detail: "RETURNING is not supported inside an explicit transaction: the write is staged \
+                 or buffered until COMMIT, so it has no stored row to project at this point. Run \
+                 the statement in autocommit, or follow the write with a SELECT after COMMIT."
+            .to_string(),
+    }
+}
+
+/// Inject a RETURNING spec into a DML physical plan variant.
+///
+/// Only `PointInsert`, `PointPut`, `BatchInsert`, `Upsert`, `PointUpdate`,
+/// `BulkUpdate`, `PointDelete`, `BulkDelete`, `UpdateFromJoin`, `Merge`, and
+/// the CRDT `DocUpsert` / `DocDelete` ops are affected. Every other variant is
+/// left unchanged — an insert shape among them has already been refused by
+/// [`refuse_unplannable_insert_returning`], which runs first.
+pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
+    match plan {
+        PhysicalPlan::Document(DocumentOp::PointInsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::PointPut { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::BatchInsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::Upsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::PointUpdate { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::BulkUpdate { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::PointDelete { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::BulkDelete { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::UpdateFromJoin { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::Merge { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Crdt(CrdtOp::DocUpsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Crdt(CrdtOp::DocDelete { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        _ => {}
+    }
 }
 
 /// Parse the column list that appears after the RETURNING keyword.
@@ -201,27 +322,71 @@ fn is_valid_column_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// No insert op carries a `returning` slot, so the clause used to be parsed
-    /// away and the caller got a command tag for a statement that asked for
-    /// rows. It is refused now, and the refusal says which statements do
-    /// support it.
+    /// The document engines carry the clause, so it is stripped and parsed like
+    /// any other verb's — the statement text alone cannot decide the engine, so
+    /// nothing is refused here.
     #[test]
-    fn insert_returning_is_refused_rather_than_dropped() {
-        for sql in [
-            "INSERT INTO items (id, name) VALUES ('a', 'alpha') RETURNING *",
-            "insert into items (id) values ('a') returning id",
-            "  INSERT INTO items (id) VALUES ('a') RETURNING id AS k",
-        ] {
-            let error = strip_returning(sql).expect_err("INSERT RETURNING must be refused");
-            let detail = error.to_string();
-            assert!(
-                detail.contains("RETURNING") && detail.contains("UPDATE"),
-                "the refusal must name the clause and where it IS supported; got {detail}"
-            );
-        }
+    fn insert_returning_is_stripped_and_parsed() {
+        let (sql, spec) =
+            strip_returning("INSERT INTO items (id, name) VALUES ('a', 'alpha') RETURNING *")
+                .expect("INSERT RETURNING must plan");
+        assert_eq!(sql, "INSERT INTO items (id, name) VALUES ('a', 'alpha')");
+        assert_eq!(spec.expect("spec").columns, ReturningColumns::Star);
+
+        let (sql, spec) = strip_returning("insert into items (id) values ('a') returning id AS k")
+            .expect("INSERT RETURNING must plan");
+        assert_eq!(sql, "insert into items (id) values ('a')");
+        assert_eq!(
+            spec.expect("spec").columns,
+            ReturningColumns::Named(vec![ReturningItem {
+                name: "id".into(),
+                alias: Some("k".into()),
+            }])
+        );
     }
 
-    /// An INSERT with no such clause is untouched — the refusal must not turn
+    /// An insert shape with no `returning` slot is refused at the plan, naming
+    /// the engine and where the clause IS honored. Silently dropping it left
+    /// the caller with a command tag for a statement that asked for rows.
+    #[test]
+    fn an_insert_plan_with_no_returning_slot_is_refused() {
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: "metrics".into(),
+            payload: Vec::new(),
+            format: "msgpack".into(),
+            intent: nodedb_physical::physical_plan::ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: Vec::new(),
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: Vec::new(),
+        });
+        let detail = refuse_unplannable_insert_returning(&plan)
+            .expect_err("a columnar insert cannot carry the clause")
+            .to_string();
+        assert!(
+            detail.contains("columnar") && detail.contains("document"),
+            "the refusal must name the engine and where it IS supported; got {detail}"
+        );
+    }
+
+    /// A document insert carries the clause, so the same gate admits it.
+    #[test]
+    fn a_document_insert_plan_is_admitted() {
+        let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
+            collection: "items".into(),
+            document_id: "a".into(),
+            value: Vec::new(),
+            if_absent: false,
+            surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(refuse_unplannable_insert_returning(&plan).is_ok());
+    }
+
+    /// An INSERT with no such clause is untouched — planning must not turn
     /// ordinary inserts into errors.
     #[test]
     fn a_plain_insert_is_untouched() {
@@ -240,10 +405,10 @@ mod tests {
         assert!(spec.is_none());
     }
 
-    /// The refusal is scoped to INSERT: a statement that merely contains the
-    /// word elsewhere is not caught by it.
+    /// Only DML verbs are scanned for the clause: a SELECT whose column name
+    /// merely embeds the word is left alone.
     #[test]
-    fn a_non_insert_statement_is_not_caught_by_the_refusal() {
+    fn a_non_dml_statement_is_not_scanned_for_the_clause() {
         let sql = "SELECT returning_count FROM items";
         let (out, spec) = strip_returning(sql).expect("a select must pass through");
         assert_eq!(out, sql);

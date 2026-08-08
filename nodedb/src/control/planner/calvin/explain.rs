@@ -89,6 +89,8 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::new(1),
                 value: vec![],
                 if_absent: false,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

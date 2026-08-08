@@ -162,6 +162,8 @@ pub fn doc_put(collection: &str, doc_id: &str, val: &[u8]) -> PhysicalPlan {
         value: val.to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 
@@ -185,6 +187,8 @@ pub fn doc_conflict(collection: &str, doc_id: &str) -> PhysicalPlan {
         value: b"conflict".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         if_absent: false,
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 

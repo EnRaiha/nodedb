@@ -107,6 +107,8 @@ fn insert_materializes_generated_column() {
             .unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -147,6 +149,8 @@ fn insert_materializes_concat() {
             .unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -189,6 +193,8 @@ fn update_recomputes_generated_column() {
             .unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -247,6 +253,8 @@ fn update_generated_column_directly_rejected() {
             value: serde_json::to_vec(&serde_json::json!({"price": 100.0})).unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -316,6 +324,8 @@ fn chained_generated_columns() {
             .unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

@@ -156,6 +156,8 @@ mod tests {
                 value: vec![],
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

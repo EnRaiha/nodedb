@@ -24,6 +24,8 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -43,6 +45,8 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -62,6 +66,8 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

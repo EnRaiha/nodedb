@@ -353,6 +353,8 @@ mod tests {
                 on_conflict_updates: vec![],
                 surrogate: Surrogate::new(7),
                 rls_write_check: vec![],
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             Some(LockKey::Surrogate {
                 collection: Arc::from("docs"),

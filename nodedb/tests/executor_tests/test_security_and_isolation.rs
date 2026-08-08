@@ -35,6 +35,8 @@ fn security_tenant_isolation() {
             value: b"{\"data\":\"tenant1_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -171,6 +173,8 @@ fn linearizability_read_after_write() {
                 value: value.into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
 
@@ -210,6 +214,8 @@ fn linearizability_delete_visibility() {
             value: b"{\"x\":1}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -273,6 +279,8 @@ fn wal_replay_deterministic() {
                     value: value.clone(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
             );
         }
@@ -354,6 +362,8 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 value: format!("{{\"val\":{i}}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

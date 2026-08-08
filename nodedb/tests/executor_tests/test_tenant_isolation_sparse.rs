@@ -26,6 +26,8 @@ fn sparse_point_get_isolated() {
             value: b"{\"name\":\"alice\",\"secret\":\"tenant_a_data\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -88,6 +90,8 @@ fn sparse_range_scan_isolated() {
                 value: format!("{{\"val\":{i}}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

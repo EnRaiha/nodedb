@@ -226,6 +226,10 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         value: source_row_bytes.clone(),
         surrogate: target_surrogate,
         pk_bytes: source_doc_id.as_bytes().to_vec(),
+        // A copy-up is internal plumbing behind the caller's own statement; it
+        // projects nothing and needs no read gate of its own.
+        returning: None,
+        rls_filters: Vec::new(),
     });
 
     let vshard_id = VShardId::from_collection_in_database(target_db_id, &target_coll_qualified);

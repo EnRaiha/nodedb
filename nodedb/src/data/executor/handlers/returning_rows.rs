@@ -11,9 +11,72 @@
 //! documents, so the policy can be evaluated against columns the `RETURNING`
 //! list never mentions.
 
-use super::rls_eval;
+use super::{returning_doc, rls_eval};
+use crate::bridge::envelope::{ErrorCode, Response};
+use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec::RowsPayload;
+use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
+use nodedb_types::columnar::StrictSchema;
+
+/// Rows a write path hands back to a `RETURNING` projection: the user-facing
+/// document id paired with the exact bytes stored for it.
+pub(in crate::data::executor) type StoredRow<'a> = (&'a str, &'a [u8]);
+
+impl CoreLoop {
+    /// Build this task's `RETURNING` response from the rows it just stored.
+    ///
+    /// The single exit every insert-family handler uses, so the read gate and
+    /// the storage-mode-aware decode can never be applied on one write path and
+    /// skipped on another. An empty `rows` slice is the correct answer for a
+    /// write that stored nothing (an `ON CONFLICT DO NOTHING` that hit a
+    /// conflict): the statement still returns a row set, it is just empty.
+    pub(in crate::data::executor) fn stored_returning_response(
+        &self,
+        task: &ExecutionTask,
+        spec: &ReturningSpec,
+        rls_filters: &[u8],
+        strict_schema: Option<&StrictSchema>,
+        rows: &[StoredRow<'_>],
+    ) -> Response {
+        match build_stored_rows_payload(spec, rls_filters, strict_schema, rows) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
+    }
+}
+
+/// Project the STORED post-images of freshly written rows into a `RowsPayload`.
+///
+/// The write paths (point insert / put / batch insert / upsert) hold the exact
+/// bytes they handed to storage, so `RETURNING` reports what landed — generated
+/// columns evaluated, `_rowid` injected, an `ON CONFLICT` merge applied — rather
+/// than echoing the caller's submitted body, which would report the request
+/// instead of the row and would bypass the read gate entirely.
+///
+/// `strict_schema` must be `Some` exactly when the collection stores Binary
+/// Tuples; a body that fails to decode degrades to a bare `{id}` row so the
+/// statement still reports the row it wrote.
+fn build_stored_rows_payload(
+    spec: &ReturningSpec,
+    rls_filters: &[u8],
+    strict_schema: Option<&StrictSchema>,
+    rows: &[StoredRow<'_>],
+) -> crate::Result<Vec<u8>> {
+    let docs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(doc_id, body)| {
+            returning_doc::from_stored(body, doc_id, strict_schema)
+                .unwrap_or_else(|| serde_json::json!({ "id": doc_id }))
+        })
+        .collect();
+    build_rows_payload(spec, rls_filters, &docs)
+}
 
 /// Project a slice of documents per `spec` and encode as a `RowsPayload` msgpack blob.
 ///

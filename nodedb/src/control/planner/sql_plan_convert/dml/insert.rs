@@ -276,6 +276,11 @@ pub(in super::super) fn convert_insert(
                         value: value_bytes,
                         if_absent,
                         surrogate,
+                        // Both filled in after conversion: the RETURNING spec
+                        // by the protocol layer's injection pass, the read
+                        // filter by the RLS injection pass.
+                        returning: None,
+                        rls_filters: Vec::new(),
                     })
                 };
                 tasks.push(PhysicalTask {
@@ -423,6 +428,9 @@ pub(in super::super) fn convert_upsert(
                         // Filled in by the RLS injection pass, which runs after
                         // conversion.
                         rls_write_check: Vec::new(),
+                        rls_filters: Vec::new(),
+                        // Filled in by the protocol layer's RETURNING injection.
+                        returning: None,
                     })
                 };
                 tasks.push(PhysicalTask {

@@ -156,6 +156,10 @@ pub(super) async fn materialize_document_collection(
                 value: value_bytes,
                 if_absent: true,
                 surrogate: target_surrogate,
+                // A materializer copy answers no client, so it projects
+                // nothing and needs no read gate.
+                returning: None,
+                rls_filters: Vec::new(),
             });
 
             let resp =

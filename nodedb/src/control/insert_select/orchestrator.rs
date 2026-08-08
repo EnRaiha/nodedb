@@ -146,6 +146,11 @@ pub(crate) async fn run_insert_select(
                 collection: target_collection.to_string(),
                 documents,
                 surrogates,
+                // `INSERT ... SELECT` is paged across many of these writes, so
+                // no single page owns the statement's answer; the clause is
+                // refused at planning rather than half-answered here.
+                returning: None,
+                rls_filters: Vec::new(),
             });
             let resp = dispatch_local(state, tenant_id, database_id, target_collection, plan, None)
                 .await?;

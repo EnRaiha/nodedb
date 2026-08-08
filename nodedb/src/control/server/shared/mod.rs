@@ -8,6 +8,7 @@ pub mod plan_admission;
 pub mod plan_util;
 pub mod planning_overrides;
 pub mod retry;
+pub mod returning;
 pub mod session;
 pub mod sql;
 pub mod write_admission;

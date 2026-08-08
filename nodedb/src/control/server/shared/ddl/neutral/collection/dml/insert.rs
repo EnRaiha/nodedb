@@ -17,7 +17,7 @@ use crate::control::state::SharedState;
 
 use super::parse::{
     authorize_write_target, dispatch_plan, extract_vector_fields, fields_to_insert_sql,
-    parse_write_statement, plan_and_dispatch, returning_response,
+    parse_write_statement, plan_and_dispatch,
 };
 use super::triggers::{fire_before_triggers, fire_instead_triggers, fire_sync_after_triggers};
 
@@ -173,8 +173,15 @@ pub async fn insert_document(
 
     // Build SQL from fields and route through nodedb-sql → sql_plan_convert.
     // This ensures all engine-type routing goes through the shared EngineRules.
-    let insert_sql = fields_to_insert_sql(&parsed.coll_name, &fields);
-    if let Err(e) = plan_and_dispatch(
+    // The statement is REBUILT from `fields`, so the author's `RETURNING` list
+    // has to be re-attached here or the planner would never see it and the
+    // clause would be silently dropped.
+    let mut insert_sql = fields_to_insert_sql(&parsed.coll_name, &fields);
+    if let Some(ref columns) = parsed.returning_clause {
+        insert_sql.push_str(" RETURNING ");
+        insert_sql.push_str(columns);
+    }
+    let returned_rows = match plan_and_dispatch(
         state,
         identity,
         tenant_id,
@@ -184,8 +191,9 @@ pub async fn insert_document(
     )
     .await
     {
-        return Some(Err(e));
-    }
+        Ok(rows) => rows,
+        Err(e) => return Some(Err(e)),
+    };
 
     // Track field names in catalog for schemaless collections.
     let catalog = state.credentials.catalog();
@@ -298,8 +306,8 @@ pub async fn insert_document(
         }
     }
 
-    if parsed.has_returning {
-        return Some(returning_response(&parsed.doc_id, &fields));
+    if !returned_rows.is_empty() {
+        return Some(Ok(returned_rows));
     }
 
     Some(Ok(vec![DdlResult::Status {

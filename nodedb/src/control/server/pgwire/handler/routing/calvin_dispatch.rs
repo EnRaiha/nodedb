@@ -15,6 +15,7 @@ use crate::control::planner::calvin::{
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::{SessionId, TransactionState};
 use crate::types::{DatabaseId, TenantId};
@@ -22,18 +23,18 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
-use super::planning::{CalvinResponseCtx, calvin_execution_response};
+use super::calvin_response::{CalvinResponseCtx, CalvinTaskOutcome, calvin_execution_response};
 
 /// Meter one Calvin task's shaped response, once its response has already
 /// been synthesised successfully by `calvin_execution_response` — Calvin
 /// applies the whole batch atomically, so by the time responses are being
 /// shaped every task in `tasks` has already committed.
 ///
-/// `rows: None` — `calvin_execution_response` shapes a `pgwire` `Response`
-/// (a `Query` row stream or an `Execution` tag), not a decoded row count;
-/// decoding the stream solely to count rows here would consume it before the
-/// caller can stream it to the client. `meter_dispatch` charges one unit for
-/// `None`, correct for the write that just committed.
+/// `rows: None` — `calvin_execution_response` yields either an `Execution` tag
+/// or the task's `ShapedRows`, which the caller folds into the statement's
+/// single result set; counting rows here would mean reaching into that fold
+/// before it is complete. `meter_dispatch` charges one unit for `None`, correct
+/// for the write that just committed.
 fn meter_calvin_task(
     state: &crate::control::state::SharedState,
     identity: &AuthenticatedIdentity,
@@ -150,19 +151,36 @@ impl NodeDbPgHandler {
             })?;
 
             let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
+            // A statement is ONE result set. Calvin deposits ONE applied
+            // response for the whole transaction (a second RETURNING-bearing
+            // participant is recorded as a conflict and fails the statement
+            // upstream), and every task below is shaped from that same payload
+            // — so the rows are taken once rather than accumulated, which would
+            // repeat the identical payload per task. This is the shape the
+            // native Calvin path already uses.
+            let mut returning_rows: Option<ShapedRows> = None;
             for task in &tasks {
-                calvin_responses.push(calvin_execution_response(
+                match calvin_execution_response(
                     task,
                     apply_resp.as_ref(),
                     CalvinResponseCtx {
                         state: &self.state,
                         tenant_id,
                         database_id,
-                        formats: result_formats,
                         auth,
                     },
-                )?);
+                )? {
+                    CalvinTaskOutcome::Rows(shaped) => {
+                        returning_rows.get_or_insert(shaped);
+                    }
+                    CalvinTaskOutcome::Tag(response) => calvin_responses.push(response),
+                }
                 meter_calvin_task(&self.state, identity, database_id, task);
+            }
+            if let Some(shaped) = returning_rows {
+                let (response, _notice) =
+                    super::super::shape_encode::shaped_query_response(shaped, result_formats);
+                calvin_responses.push(response);
             }
             return Ok(calvin_responses);
         }
@@ -217,19 +235,31 @@ impl NodeDbPgHandler {
         })?;
 
         let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
+        // One result set per statement, taken once from the batch's single
+        // applied response — see the static path above.
+        let mut returning_rows: Option<ShapedRows> = None;
         for task in &tasks {
-            calvin_responses.push(calvin_execution_response(
+            match calvin_execution_response(
                 task,
                 outcome.apply_result.as_ref(),
                 CalvinResponseCtx {
                     state: &self.state,
                     tenant_id,
                     database_id,
-                    formats: result_formats,
                     auth,
                 },
-            )?);
+            )? {
+                CalvinTaskOutcome::Rows(shaped) => {
+                    returning_rows.get_or_insert(shaped);
+                }
+                CalvinTaskOutcome::Tag(response) => calvin_responses.push(response),
+            }
             meter_calvin_task(&self.state, identity, database_id, task);
+        }
+        if let Some(shaped) = returning_rows {
+            let (response, _notice) =
+                super::super::shape_encode::shaped_query_response(shaped, result_formats);
+            calvin_responses.push(response);
         }
         Ok(calvin_responses)
     }

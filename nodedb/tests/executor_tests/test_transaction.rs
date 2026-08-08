@@ -28,6 +28,8 @@ fn transaction_batch_commits_atomically() {
                     value: b"{\"name\":\"alice\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "docs".into(),
@@ -35,6 +37,8 @@ fn transaction_batch_commits_atomically() {
                     value: b"{\"name\":\"bob\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
             ],
         }),
@@ -90,6 +94,8 @@ fn transaction_batch_response_uses_outer_request_id() {
                     value: b"{\"name\":\"alice\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 })],
             }),
         ),
@@ -117,6 +123,8 @@ fn transaction_batch_rollback_on_failure() {
             value: b"original".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -168,6 +176,8 @@ fn transaction_batch_rollback_on_failure() {
                     value: b"{\"name\":\"modified\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 // Dimension mismatch: index is dim=3 but vector has 2 elements.
                 PhysicalPlan::Vector(VectorOp::Insert {

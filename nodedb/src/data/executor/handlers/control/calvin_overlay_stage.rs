@@ -61,6 +61,7 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
+                ..
             }) => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
                 let resp = self.stage_point_insert(&ctx, value, *if_absent);
@@ -107,6 +108,7 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogate,
                 rls_write_check,
+                ..
             }) => {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
                 let resp =

@@ -40,6 +40,8 @@ fn fulltext_cross_tenant_index_does_not_contaminate_search() {
                 value: val.as_bytes().to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -81,6 +83,8 @@ fn fulltext_cross_tenant_index_does_not_contaminate_search() {
                 value: val.into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

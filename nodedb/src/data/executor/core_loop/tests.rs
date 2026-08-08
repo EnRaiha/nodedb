@@ -3,6 +3,7 @@
 use super::*;
 use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Priority, Request, Status};
+use crate::data::executor::handlers::point::put::PointPutExec;
 use crate::types::*;
 use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
 use nodedb_physical::physical_plan::{DocumentOp, MetaOp};
@@ -141,11 +142,15 @@ fn point_put_records_write_version_and_advances_watermark() {
     let task = wal_task(10);
     let resp = core.execute_point_put(
         &task,
-        1,
-        "orders",
-        "o1",
-        Surrogate::new(7),
-        &doc_value("a", "1"),
+        PointPutExec {
+            tid: 1,
+            collection: "orders",
+            document_id: "o1",
+            surrogate: Surrogate::new(7),
+            value: &doc_value("a", "1"),
+            returning: None,
+            rls_filters: &[],
+        },
     );
     assert_eq!(resp.status, Status::Ok);
 
@@ -163,11 +168,15 @@ fn point_put_records_write_version_and_advances_watermark() {
     let task = wal_task(20);
     core.execute_point_put(
         &task,
-        1,
-        "orders",
-        "o1",
-        Surrogate::new(7),
-        &doc_value("a", "2"),
+        PointPutExec {
+            tid: 1,
+            collection: "orders",
+            document_id: "o1",
+            surrogate: Surrogate::new(7),
+            value: &doc_value("a", "2"),
+            returning: None,
+            rls_filters: &[],
+        },
     );
     assert_eq!(
         core.write_index.key_write_lsn(&surrogate_key("orders", 7)),
@@ -183,11 +192,15 @@ fn point_put_records_write_version_and_advances_watermark() {
     let task = wal_task(15);
     core.execute_point_put(
         &task,
-        1,
-        "orders",
-        "o1",
-        Surrogate::new(7),
-        &doc_value("a", "3"),
+        PointPutExec {
+            tid: 1,
+            collection: "orders",
+            document_id: "o1",
+            surrogate: Surrogate::new(7),
+            value: &doc_value("a", "3"),
+            returning: None,
+            rls_filters: &[],
+        },
     );
     assert_eq!(
         core.write_index.key_write_lsn(&surrogate_key("orders", 7)),
@@ -199,11 +212,15 @@ fn point_put_records_write_version_and_advances_watermark() {
     let task = wal_task(30);
     core.execute_point_put(
         &task,
-        1,
-        "items",
-        "i1",
-        Surrogate::new(9),
-        &doc_value("a", "4"),
+        PointPutExec {
+            tid: 1,
+            collection: "items",
+            document_id: "i1",
+            surrogate: Surrogate::new(9),
+            value: &doc_value("a", "4"),
+            returning: None,
+            rls_filters: &[],
+        },
     );
     assert_eq!(
         core.write_index.collection_write_lsn(&coll_key("items")),
@@ -291,6 +308,8 @@ fn transaction_batch_records_sub_plan_versions() {
         value: doc_value("a", "1"),
         surrogate: Surrogate::new(11),
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })];
     let resp = core.execute_transaction_batch(&task, 1, &plans, &[], None);
     assert_eq!(resp.status, Status::Ok);
@@ -321,11 +340,15 @@ fn no_wal_lsn_records_nothing() {
     })));
     core.execute_point_put(
         &task,
-        1,
-        "orders",
-        "o1",
-        Surrogate::new(7),
-        &doc_value("a", "1"),
+        PointPutExec {
+            tid: 1,
+            collection: "orders",
+            document_id: "o1",
+            surrogate: Surrogate::new(7),
+            value: &doc_value("a", "1"),
+            returning: None,
+            rls_filters: &[],
+        },
     );
     assert_eq!(
         core.write_index.key_write_lsn(&surrogate_key("orders", 7)),
@@ -482,6 +505,8 @@ fn point_put_stores_schemaless_docs_as_canonical_msgpack_maps() {
                 value: tagged,
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             })),
         })
         .unwrap();
@@ -523,6 +548,8 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
                     value: bytes,
                     surrogate: Surrogate::new(*sur_val),
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 })),
             })
             .unwrap();
@@ -764,6 +791,8 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         value: doc_value("a", "1"),
         surrogate: Surrogate::new(7),
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })];
     let write_resp = core.execute_transaction_batch(&write_task, 1, &write_plans, &[], None);
     assert_eq!(write_resp.status, Status::Ok);
@@ -786,6 +815,8 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         value: doc_value("a", "2"),
         surrogate: Surrogate::new(8),
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })];
     let stale_reads = vec![point_entry("orders", 7, 5)];
     let second_resp =

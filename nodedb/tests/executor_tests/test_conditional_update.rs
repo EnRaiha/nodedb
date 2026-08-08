@@ -60,6 +60,8 @@ fn insert_product(
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
             pk_bytes: id.as_bytes().to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

@@ -199,6 +199,8 @@ mod tests {
                 surrogate: Surrogate::new(surrogate),
                 value: Vec::new(),
                 if_absent: false,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

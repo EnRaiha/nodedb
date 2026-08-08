@@ -36,6 +36,8 @@ fn async_trigger_not_in_raft_log() {
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
 
     // to_replicated_entry converts the plan to a Raft log entry.
@@ -252,6 +254,8 @@ fn procedure_dml_is_normal_write() {
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     // This is a normal write → replicates via Raft.
     assert!(

@@ -311,3 +311,101 @@ async fn redaction_still_masks_the_rows_that_survive_filtering() {
         "the surviving row must be returned with its ruled column masked"
     );
 }
+
+/// `INSERT ... RETURNING` is a read of the rows it wrote: the read policy must
+/// filter what comes back while every row still lands.
+///
+/// The write is unaffected — no write policy exists on this collection, so the
+/// principal may insert a row it will not be shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_hides_rows_the_read_policy_excludes() {
+    let server = TestServer::start().await;
+    let user = "ret_rls_insert_user";
+    server
+        .exec(
+            "CREATE COLLECTION ret_rls_insert (\
+                 id TEXT PRIMARY KEY, owner TEXT, note TEXT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create ret_rls_insert");
+    create_user(&server, user).await;
+    server
+        .exec(
+            "CREATE RLS POLICY ret_rls_insert_owner ON ret_rls_insert FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create read policy on ret_rls_insert");
+
+    let rows = rows_as(
+        &server,
+        user,
+        &format!(
+            "INSERT INTO ret_rls_insert (id, owner, note) \
+             VALUES ('i_hidden', 'alice', 'a'), ('i_visible', '{user}', 'b') \
+             RETURNING id, note"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec!["i_visible|b".to_string()],
+        "only the row the read policy admits may be returned"
+    );
+
+    // Both rows were written — read them back as the superuser, who holds no
+    // restricting policy.
+    let stored = server
+        .query_rows("SELECT id FROM ret_rls_insert ORDER BY id")
+        .await
+        .expect("read back as superuser");
+    assert_eq!(
+        stored,
+        vec![vec!["i_hidden".to_string()], vec!["i_visible".to_string()]],
+        "the insert must write every row, hidden or not: {stored:?}"
+    );
+}
+
+/// A read policy predicating on a column the `RETURNING` list omits still
+/// filters an insert's output — the filter runs on the stored row, before
+/// projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_filters_on_a_column_outside_the_projection() {
+    let server = TestServer::start().await;
+    let user = "ret_rls_insert_proj_user";
+    server
+        .exec(
+            "CREATE COLLECTION ret_rls_insert_proj (\
+                 id TEXT PRIMARY KEY, owner TEXT, note TEXT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create ret_rls_insert_proj");
+    create_user(&server, user).await;
+    server
+        .exec(
+            "CREATE RLS POLICY ret_rls_insert_proj_owner ON ret_rls_insert_proj FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create read policy on ret_rls_insert_proj");
+
+    let rows = rows_as(
+        &server,
+        user,
+        &format!(
+            "INSERT INTO ret_rls_insert_proj (id, owner, note) \
+             VALUES ('p_hidden', 'alice', 'hidden'), ('p_visible', '{user}', 'shown') \
+             RETURNING note"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec!["shown".to_string()],
+        "the policy must be evaluated against the stored row, not the projection"
+    );
+}

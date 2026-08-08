@@ -11,16 +11,35 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
+use nodedb_physical::physical_plan::ReturningSpec;
+
+/// Parameters for [`CoreLoop::execute_document_batch_insert`].
+pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub documents: &'a [(String, Vec<u8>)],
+    pub surrogates: &'a [nodedb_types::Surrogate],
+    /// When `Some`, return one row per inserted document — the STORED
+    /// post-image of each, in `documents` order.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
+}
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_document_batch_insert(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        documents: &[(String, Vec<u8>)],
-        surrogates: &[nodedb_types::Surrogate],
+        params: DocumentBatchInsertParams<'_>,
     ) -> Response {
+        let DocumentBatchInsertParams {
+            tid,
+            collection,
+            documents,
+            surrogates,
+            returning,
+            rls_filters,
+        } = params;
         debug!(core = self.core_id, %collection, count = documents.len(), "document batch insert");
 
         // When per-row surrogates are parallel to the documents, run the batch
@@ -34,7 +53,15 @@ impl CoreLoop {
         // parallel surrogates (no cross-engine identity available).
         if !documents.is_empty() && surrogates.len() == documents.len() {
             return self.execute_document_batch_insert_indexed(
-                task, tid, collection, documents, surrogates,
+                task,
+                DocumentBatchInsertParams {
+                    tid,
+                    collection,
+                    documents,
+                    surrogates,
+                    returning,
+                    rls_filters,
+                },
             );
         }
 
@@ -125,6 +152,13 @@ impl CoreLoop {
                 if let Some(ref m) = self.metrics {
                     m.record_document_insert();
                 }
+                if let Some(spec) = returning {
+                    // This path stores `converted` verbatim (no strict re-encode
+                    // is reachable here — it runs only for callers with no
+                    // surrogates, which are schemaless), so the canonicalized
+                    // bodies ARE the stored post-images.
+                    return self.stored_returning_response(task, spec, rls_filters, None, &refs);
+                }
                 match super::super::super::response_codec::encode_count("inserted", documents.len())
                 {
                     Ok(bytes) => self.response_with_payload(task, bytes),
@@ -157,11 +191,16 @@ impl CoreLoop {
     fn execute_document_batch_insert_indexed(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        documents: &[(String, Vec<u8>)],
-        surrogates: &[nodedb_types::Surrogate],
+        params: DocumentBatchInsertParams<'_>,
     ) -> Response {
+        let DocumentBatchInsertParams {
+            tid,
+            collection,
+            documents,
+            surrogates,
+            returning,
+            rls_filters,
+        } = params;
         let database_id = task.request.database_id.as_u64();
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
@@ -192,6 +231,9 @@ impl CoreLoop {
         // substrate only after `txn.commit()` succeeds below — a row that
         // never commits touched no durable index state.
         let mut row_index_tuples: Vec<Vec<(String, String)>> = Vec::with_capacity(documents.len());
+        // The exact bytes each row landed as, parallel to `documents`, kept only
+        // when a `RETURNING` projection will read them.
+        let mut stored_bodies: Vec<Vec<u8>> = Vec::new();
         for (i, (_document_id, value)) in documents.iter().enumerate() {
             let surrogate = surrogates[i];
             let row_key = surrogate_to_doc_id(surrogate);
@@ -213,6 +255,9 @@ impl CoreLoop {
                 Ok(o) => o,
                 Err(e) => return self.response_error(task, e),
             };
+            if returning.is_some() {
+                stored_bodies.push(outcome.stored_value);
+            }
             if has_vectors {
                 write_set.push(WriteSetEntry {
                     surrogate: surrogate.as_u32(),
@@ -263,7 +308,22 @@ impl CoreLoop {
             self.emit_put_event(task, tid, collection, row_key, &documents[i].1, None);
         }
 
-        let mut response =
+        let mut response = if let Some(spec) = returning {
+            // One row per inserted document, in `documents` order — the order
+            // the rows were applied in, which is the order PostgreSQL returns
+            // them in for a multi-row INSERT.
+            let strict_schema = self.strict_schema_for(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+            );
+            let rows: Vec<(&str, &[u8])> = documents
+                .iter()
+                .zip(stored_bodies.iter())
+                .map(|((document_id, _), stored)| (document_id.as_str(), stored.as_slice()))
+                .collect();
+            self.stored_returning_response(task, spec, rls_filters, strict_schema.as_ref(), &rows)
+        } else {
             match super::super::super::response_codec::encode_count("inserted", documents.len()) {
                 Ok(bytes) => self.response_with_payload(task, bytes),
                 Err(e) => {
@@ -274,7 +334,8 @@ impl CoreLoop {
                         },
                     );
                 }
-            };
+            }
+        };
         if !write_set.is_empty() {
             response.write_set = write_set;
         }

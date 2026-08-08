@@ -106,6 +106,8 @@ fn point_put_and_get() {
             value: b"hello world".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -142,6 +144,8 @@ fn point_delete_removes() {
             value: b"data".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -210,6 +214,8 @@ fn range_scan_returns_results() {
             value: b"{\"name\":\"alice\",\"age\":25}".to_vec(),
             surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"u1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     send_ok(
@@ -222,6 +228,8 @@ fn range_scan_returns_results() {
             value: b"{\"name\":\"bob\",\"age\":30}".to_vec(),
             surrogate: nodedb_types::Surrogate::new(2),
             pk_bytes: b"u2".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -277,6 +285,8 @@ fn batch_insert_docs(
             collection: collection.into(),
             documents,
             surrogates,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

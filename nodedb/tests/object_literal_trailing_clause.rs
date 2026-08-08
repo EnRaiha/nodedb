@@ -4,8 +4,8 @@
 //!
 //! `INSERT INTO c { … }` and `UPSERT INTO c { … }` are rewritten to standard
 //! SQL by reconstructing the statement from the parsed fields. Nothing written
-//! after the literal survives that reconstruction, so a trailing `RETURNING` or
-//! `ON CONFLICT` has nowhere to go.
+//! after the literal survives that reconstruction, so a trailing `ON CONFLICT`
+//! — or trailing text that is not a clause at all — has nowhere to go.
 //!
 //! Such a statement used to succeed with the clause quietly removed — a write
 //! that applied, an empty result set, and no indication that half of what the
@@ -13,14 +13,19 @@
 //! naming the clause, and that the write does not apply: a refusal that still
 //! wrote the row would be the same failure wearing an error message.
 //!
-//! The limit itself is deliberate. Carrying the clause is not a matter of
-//! appending text: the downstream `(cols) VALUES (…)` scanner locates the value
-//! list by searching backwards for `)`, which `RETURNING upper(x)` or
-//! `ON CONFLICT (id)` would capture, and the INSERT handler rebuilds its SQL
-//! from the parsed fields a second time. Supporting trailing clauses means
-//! rebuilding that pipeline; until then the honest answer is to say so. The
-//! `(cols) VALUES (…)` form takes these clauses today and is what the error
-//! points authors at.
+//! The limit itself is deliberate. Carrying a clause is not a matter of
+//! appending text: the INSERT handler rebuilds its SQL from the parsed fields a
+//! second time, and the downstream `(cols) VALUES (…)` scanner locates the value
+//! list by searching backwards for `)`, which `ON CONFLICT (id)` would capture.
+//! Supporting trailing clauses means rebuilding that pipeline; until then the
+//! honest answer is to say so.
+//!
+//! `RETURNING` is the exception, and deliberately so: it is split off the text
+//! before the rewrite and re-attached to the rebuilt statement, so it survives
+//! the reconstruction rather than being leftover input. Every write form
+//! therefore answers it with the stored rows — pinned below, because "the clause
+//! is carried" and "the clause is quietly dropped" both look like success from
+//! the outside and only the returned rows tell them apart.
 
 mod common;
 
@@ -51,8 +56,8 @@ async fn assert_refused_and_unwritten(
     );
 }
 
-/// Every trailing clause the brace form cannot carry, on every form that
-/// reaches the rewrite: single object, array batch, and the UPSERT keyword.
+/// A trailing clause the rewrite cannot carry is refused on every form that
+/// reaches it: single object, array batch, and the UPSERT keyword.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clause_after_the_object_literal_is_refused_and_nothing_is_written() {
     let server = TestServer::start().await;
@@ -63,24 +68,75 @@ async fn a_clause_after_the_object_literal_is_refused_and_nothing_is_written() {
 
     for (expected, sql) in [
         (
-            "RETURNING",
-            "INSERT INTO objlit_trail { id: 't1', owner: 'alice' } RETURNING *",
-        ),
-        (
-            "RETURNING",
-            "UPSERT INTO objlit_trail { id: 't2', owner: 'alice' } RETURNING *",
-        ),
-        (
             "ON CONFLICT",
             "INSERT INTO objlit_trail { id: 't3', owner: 'alice' } ON CONFLICT (id) DO NOTHING",
         ),
         (
-            "RETURNING",
-            "INSERT INTO objlit_trail [{ id: 't4', owner: 'alice' }] RETURNING *",
+            "ON CONFLICT",
+            "UPSERT INTO objlit_trail { id: 't5', owner: 'alice' } ON CONFLICT (id) DO NOTHING",
+        ),
+        (
+            "ON CONFLICT",
+            "INSERT INTO objlit_trail [{ id: 't6', owner: 'alice' }] ON CONFLICT (id) DO NOTHING",
         ),
     ] {
         assert_refused_and_unwritten(&server, "objlit_trail", sql, expected).await;
     }
+}
+
+/// `RETURNING` after an object literal is CARRIED, not dropped: every form
+/// answers with the stored row.
+///
+/// The rows are the assertion, not the absence of an error. A statement that
+/// applied its write and quietly discarded the clause also "succeeds" — it just
+/// hands back nothing — and that silent drop is the original defect this whole
+/// file exists to prevent. Asserting the row content is the only thing that
+/// tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn returning_after_an_object_literal_is_carried_and_answers_with_rows() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION objlit_ret_ok")
+        .await
+        .expect("create collection");
+
+    for (id, sql) in [
+        (
+            "r1",
+            "INSERT INTO objlit_ret_ok { id: 'r1', owner: 'alice' } RETURNING id",
+        ),
+        (
+            "r2",
+            "UPSERT INTO objlit_ret_ok { id: 'r2', owner: 'alice' } RETURNING id",
+        ),
+        (
+            "r3",
+            "INSERT INTO objlit_ret_ok [{ id: 'r3', owner: 'alice' }] RETURNING id",
+        ),
+    ] {
+        let rows = server
+            .query_rows(sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must return its row: {e}"));
+        assert_eq!(
+            rows,
+            vec![vec![id.to_string()]],
+            "`{sql}` must answer with the stored row, not an empty success"
+        );
+    }
+
+    assert_eq!(
+        server
+            .query_rows("SELECT id FROM objlit_ret_ok ORDER BY id")
+            .await
+            .expect("read back objlit_ret_ok"),
+        vec![
+            vec!["r1".to_string()],
+            vec!["r2".to_string()],
+            vec!["r3".to_string()]
+        ],
+        "every returning write must also have applied"
+    );
 }
 
 /// Trailing text that is not even a clause is refused the same way, rather than

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! SQL planning: converts SQL text into physical task lists.
+//! SQL planning: converts SQL text into physical task lists, and selects the
+//! read consistency a planned task set requires.
+//!
+//! Calvin batch response shaping lives in `calvin_response.rs`.
 
 use std::sync::Arc;
 
-use pgwire::api::results::Tag;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::shared::returning;
 use crate::control::server::shared::session::SessionId;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_task::PhysicalTask;
@@ -194,8 +197,8 @@ impl NodeDbPgHandler {
             crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
 
         // Strip RETURNING clause before DataFusion planning.
-        let (clean_sql, returning_spec) = super::super::returning::strip_returning(&clean_sql)
-            .map_err(StatementSetupError::from)?;
+        let (clean_sql, returning_spec) =
+            returning::strip_returning(&clean_sql).map_err(StatementSetupError::from)?;
         let has_returning = returning_spec.is_some();
 
         // Forward every per-session planning GUC (vector-dim quota, force-shuffle
@@ -335,14 +338,19 @@ impl NodeDbPgHandler {
         };
 
         // Inject RETURNING spec into DML plans.
+        //
+        // An insert shape with no `returning` slot is refused here rather than
+        // silently dropped: the engine is a property of the target collection,
+        // so only the plan can tell whether the clause has anywhere to go.
         let tasks = if let Some(ref spec) = returning_spec {
-            tasks
-                .into_iter()
-                .map(|mut task| {
-                    inject_returning_spec(&mut task.plan, spec.clone());
-                    task
-                })
-                .collect()
+            let mut injected = Vec::with_capacity(tasks.len());
+            for mut task in tasks {
+                returning::refuse_unplannable_insert_returning(&task.plan)
+                    .map_err(StatementSetupError::from)?;
+                returning::inject_returning_spec(&mut task.plan, spec.clone());
+                injected.push(task);
+            }
+            injected
         } else {
             tasks
         };
@@ -380,138 +388,4 @@ pub(super) fn consistency_for_tasks(tasks: &[PhysicalTask]) -> crate::types::Rea
     } else {
         crate::types::ReadConsistency::BoundedStaleness(std::time::Duration::from_secs(5))
     }
-}
-
-/// Inject a RETURNING spec into a DML physical plan variant.
-///
-/// Only `PointUpdate`, `BulkUpdate`, `PointDelete`, `BulkDelete`,
-/// `UpdateFromJoin`, `Merge`, and the CRDT `DocUpsert` / `DocDelete` ops are
-/// affected. All other plan variants are left unchanged.
-pub(super) fn inject_returning_spec(
-    plan: &mut crate::bridge::envelope::PhysicalPlan,
-    spec: nodedb_physical::physical_plan::ReturningSpec,
-) {
-    use crate::bridge::envelope::PhysicalPlan;
-    use nodedb_physical::physical_plan::{CrdtOp, DocumentOp};
-
-    match plan {
-        PhysicalPlan::Document(DocumentOp::PointUpdate { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Document(DocumentOp::BulkUpdate { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Document(DocumentOp::PointDelete { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Document(DocumentOp::BulkDelete { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Document(DocumentOp::UpdateFromJoin { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Document(DocumentOp::Merge { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Crdt(CrdtOp::DocUpsert { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        PhysicalPlan::Crdt(CrdtOp::DocDelete { returning, .. }) => {
-            *returning = Some(spec);
-        }
-        _ => {}
-    }
-}
-
-/// Build the pgwire response for one task of a completed Calvin batch.
-///
-/// A task whose plan carries a RETURNING clause emits its deleted/updated rows
-/// as a `Response::Query` decoded from `apply_resp`'s Data-Plane payload — the
-/// site that previously dropped those rows, surfacing a bare command tag
-/// instead. Every other task (and a RETURNING task with no carried payload)
-/// keeps the synthesised `Response::Execution` command tag.
-pub(super) struct CalvinResponseCtx<'a> {
-    pub(super) state: &'a crate::control::state::SharedState,
-    pub(super) tenant_id: TenantId,
-    pub(super) database_id: crate::types::DatabaseId,
-    pub(super) formats: &'a [pgwire::api::results::FieldFormat],
-    /// The requester's resolved context; its roles drive column-level
-    /// redaction of any RETURNING rows this batch surfaces.
-    pub(super) auth: &'a crate::control::security::auth_context::AuthContext,
-}
-
-pub(super) fn calvin_execution_response(
-    task: &PhysicalTask,
-    apply_resp: Option<&crate::bridge::envelope::Response>,
-    ctx: CalvinResponseCtx<'_>,
-) -> pgwire::error::PgWireResult<pgwire::api::results::Response> {
-    use super::super::plan::{calvin_tag_for_plan, is_calvin_foldable};
-    use crate::control::server::response_shape::compose::{
-        ShapeOutcome, shape_response_materialized,
-    };
-    use crate::control::server::response_shape::redaction::QueryRedaction;
-    use crate::control::server::response_shape::request::MaterializedShapeRequest;
-    use crate::control::server::response_shape::types::{PlanKind, describe_plan};
-
-    let CalvinResponseCtx {
-        state,
-        tenant_id,
-        database_id,
-        formats,
-        auth,
-    } = ctx;
-
-    // RETURNING path: shape the applied payload into DATA-ROWs, exactly as the
-    // non-Calvin dispatch loop does for a RETURNING write.
-    let redaction = QueryRedaction::for_plan(tenant_id, auth, &task.plan);
-    if let (PlanKind::ReturningRows, Some(resp)) = (describe_plan(&task.plan), apply_resp)
-        && let Ok(ShapeOutcome::Rows(shaped)) =
-            shape_response_materialized(MaterializedShapeRequest {
-                payload: resp.payload.as_bytes(),
-                plan: &task.plan,
-                plan_kind: PlanKind::ReturningRows,
-                projection: None,
-                state,
-                database_id,
-                tenant_id,
-                redaction: Some(redaction.ctx(&state.redaction)),
-            })
-    {
-        let (response, _notice) =
-            super::super::shape_encode::shaped_query_response(shaped, formats);
-        return Ok(response);
-    }
-
-    // Plain (non-RETURNING) write: surface its ACTUAL affected count from the
-    // payload — exactly as the non-Calvin write path does.
-    //
-    // Every primary-write participant deposits its applied `Response` before
-    // proposing the completion ack (cross-node it rides back on the routed
-    // submit's RPC reply), so a count-bearing plan ALWAYS has one here. If it
-    // does not, the deposit path regressed: fail loudly rather than synthesise a
-    // count, which is what made a delete of an absent row report a removed row.
-    if let PlanKind::DmlResult(tag) = describe_plan(&task.plan) {
-        let resp = apply_resp.ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!(
-                    "internal: Calvin {tag} completed with no applied response to read its \
-                     affected-row count from"
-                ),
-            )))
-        })?;
-        return Ok(super::super::plan::payload_to_response(
-            resp.payload.as_bytes(),
-            describe_plan(&task.plan),
-        )?
-        .response);
-    }
-
-    let tag = if is_calvin_foldable(&task.plan) {
-        calvin_tag_for_plan(&task.plan)?
-    } else {
-        Tag::new("OK")
-    };
-    Ok(pgwire::api::results::Response::Execution(tag))
 }

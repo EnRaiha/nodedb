@@ -148,6 +148,8 @@ fn document_schemaless_non_bitemporal_byte_identical() {
                 value: doc.into_bytes(),
                 surrogate: nodedb_types::Surrogate::new(i),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             })
         })
         .collect();
@@ -298,6 +300,8 @@ fn document_bitemporal_byte_identical() {
                 value: doc.into_bytes(),
                 surrogate: nodedb_types::Surrogate::new(i),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             })
         })
         .collect();

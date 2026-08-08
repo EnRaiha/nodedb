@@ -21,6 +21,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             surrogate,
             pk_bytes: _,
+            // The replicated record carries the row, not the projection: a
+            // follower re-applies the write, it does not answer the client.
+            returning: _,
+            rls_filters: _,
         } => document::point_put(collection, document_id, value, surrogate.as_u32()),
         DocumentOp::PointInsert {
             collection,
@@ -28,6 +32,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             if_absent,
             surrogate,
+            returning: _,
+            rls_filters: _,
         } => document::point_insert(
             collection,
             document_id,
@@ -57,6 +63,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // The leader already decided this row against the write policy; the
             // replicated record carries the row, not the policy.
             rls_write_check: _,
+            returning: _,
+            rls_filters: _,
         } => document::upsert(
             collection,
             document_id,
@@ -99,6 +107,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             collection,
             documents,
             surrogates,
+            returning: _,
+            rls_filters: _,
         } => document::batch_insert(collection, documents, surrogates),
 
         // Known replication gaps: genuine writes not yet wired to a

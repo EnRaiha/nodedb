@@ -31,6 +31,8 @@ fn multi_core_broadcast_inner_join() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -169,6 +171,8 @@ fn multi_core_broadcast_left_join() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -281,6 +285,8 @@ fn multi_core_broadcast_merge_simulation() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -296,6 +302,8 @@ fn multi_core_broadcast_merge_simulation() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new(1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

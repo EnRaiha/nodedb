@@ -113,6 +113,10 @@ pub(crate) fn build_point_put(
                 value,
                 surrogate,
                 pk_bytes,
+                // The native protocol has no RETURNING clause, so this
+                // write projects nothing and needs no read gate.
+                returning: None,
+                rls_filters: Vec::new(),
             }))
         }
     }
@@ -221,6 +225,9 @@ pub(crate) fn build_batch_insert(
         collection: collection.to_string(),
         documents,
         surrogates,
+        // See `build_point_put`.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -303,6 +310,9 @@ pub(crate) fn build_upsert(
         on_conflict_updates: Vec::new(),
         surrogate,
         rls_write_check: Vec::new(),
+        // See `build_point_put`.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

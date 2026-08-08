@@ -237,6 +237,10 @@ fn emit_arms(
                 value: body,
                 if_absent: false,
                 surrogate,
+                // The MERGE itself owns the statement's projection; the ops it
+                // expands into are internal writes that answer no client.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ));
     }
@@ -254,6 +258,9 @@ fn emit_arms(
                 value: body,
                 surrogate,
                 pk_bytes,
+                // See the insert arm above.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ));
     }

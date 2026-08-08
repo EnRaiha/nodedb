@@ -6,11 +6,17 @@ use crate::control::planner::context::PlanSecurityContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::pgwire::types::error_to_sqlstate;
+use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
+use crate::control::server::response_shape::types::{PlanKind, ShapedRows};
 use crate::control::server::shared::authorization::{
     AuthorizationError, AuthorizedTask, AuthorizedTaskSet, authorize_collection, authorize_task_set,
 };
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::returning;
 use crate::control::server::shared::session::{
     DmlTxnCtx, InTxnRoute, StagingGateError, route_in_tx_write,
 };
@@ -74,6 +80,12 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn authorize_wr
 }
 
 /// Plan SQL through nodedb-sql, authorize the final task set, and dispatch it.
+///
+/// Returns the rows a `RETURNING` clause on `sql` produced, empty when the
+/// statement carries none. The rows are decoded from the Data Plane's own
+/// response — the STORED post-image — and are redacted before they leave, so
+/// this path answers `RETURNING` exactly as the pgwire planner does rather than
+/// echoing back the values the caller submitted.
 pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_and_dispatch(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -81,7 +93,14 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     database_id: crate::types::DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
-) -> Result<(), DdlError> {
+) -> Result<Vec<DdlResult>, DdlError> {
+    // The clause is stripped from the rebuilt statement before planning and
+    // re-attached to each plan below — the planner itself does not parse it.
+    let (sql, returning_spec) = returning::strip_returning(sql).map_err(|error| {
+        let (_, sqlstate, message) = error_to_sqlstate(&error);
+        ddl_err(sqlstate, message)
+    })?;
+    let sql = sql.as_str();
     // This is a client statement — the object-literal `INSERT INTO c { … }` and
     // `UPSERT` forms land here after being rewritten to standard SQL — so it
     // plans under the requester's own scope, the same one it is authorized and
@@ -109,12 +128,23 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
             .await
             .map_err(|error| {
-                let (_, sqlstate, message) =
-                    crate::control::server::pgwire::types::error_to_sqlstate(&error);
+                let (_, sqlstate, message) = error_to_sqlstate(&error);
                 ddl_err(sqlstate, message)
             })?;
         (tasks, versions)
     };
+
+    // Attach the projection to every planned write, refusing any insert shape
+    // that has nowhere to carry it rather than dropping the clause in silence.
+    if let Some(ref spec) = returning_spec {
+        for task in &mut tasks {
+            returning::refuse_unplannable_insert_returning(&task.plan).map_err(|error| {
+                let (_, sqlstate, message) = error_to_sqlstate(&error);
+                ddl_err(sqlstate, message)
+            })?;
+            returning::inject_returning_spec(&mut task.plan, spec.clone());
+        }
+    }
 
     // Extraction marks catalog state and allocates surrogates. Reject an
     // unauthorized original DML task set before either side effect can occur.
@@ -139,8 +169,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // through expansion's successors, transaction staging, and dispatch below.
     let plan_lease_scope =
         Arc::new(state.acquire_plan_lease_scope(&versions).map_err(|error| {
-            let (_, sqlstate, message) =
-                crate::control::server::pgwire::types::error_to_sqlstate(&error);
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
             ddl_err(sqlstate, message)
         })?);
 
@@ -164,9 +193,19 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         )
         .await
         .map_err(|error| ddl_err("XX000", error.to_string()))?;
-        return Ok(());
+        // A cross-shard Calvin dispatch returns no per-task payload here, so
+        // there is no stored row to project. Refused rather than answered with
+        // an empty row set, which would read as "the write matched nothing".
+        if returning_spec.is_some() {
+            return Err(ddl_err(
+                "0A000",
+                "RETURNING is not supported on a write that spans multiple shards",
+            ));
+        }
+        return Ok(Vec::new());
     }
 
+    let mut returned_rows: Option<ShapedRows> = None;
     let statement_buffer_start = txn_ctx.sessions.buffered_task_count(txn_ctx.session_id);
     for (task, initial_authorized) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
         let routed = route_in_tx_write(
@@ -205,6 +244,15 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             Ok(InTxnRoute::Read(task)) => *task,
             Ok(InTxnRoute::Buffered) | Ok(InTxnRoute::Staged(_)) => {
                 drop(initial_authorized);
+                // A buffered/staged write produces its rows at COMMIT, not
+                // here, so the clause cannot be answered on this path. Refused
+                // through the shared rule so this transport's message is the
+                // one the pgwire and native loops give for the same limitation.
+                if returning_spec.is_some() {
+                    let (_, sqlstate, message) =
+                        error_to_sqlstate(&returning::in_transaction_returning_unsupported());
+                    return Err(ddl_err(sqlstate, message));
+                }
                 continue;
             }
             Err(StagingGateError::Dispatch(error)) => {
@@ -243,8 +291,35 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             };
             return Err(ddl_err(sqlstate, detail));
         }
+
+        // Shape the STORED rows the write returned, redacted for the caller —
+        // the same choke point the pgwire dispatch loop uses, so a redaction
+        // policy masks identically on both transports.
+        if returning_spec.is_some() {
+            let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+            let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &task.plan);
+            let outcome = shape_response_materialized(MaterializedShapeRequest {
+                payload: response.payload.as_bytes(),
+                plan: &task.plan,
+                plan_kind: PlanKind::ReturningRows,
+                projection: None,
+                state,
+                database_id,
+                tenant_id,
+                redaction: Some(redaction.ctx(&state.redaction)),
+            })
+            .map_err(|error| ddl_err("XX000", error.message().to_string()))?;
+            // Folded rather than pushed: a statement is ONE result set, however
+            // many tasks it planned to.
+            if let ShapeOutcome::Rows(shaped) = outcome {
+                match returned_rows {
+                    Some(ref mut accumulated) => accumulated.append(shaped),
+                    None => returned_rows = Some(shaped),
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(returned_rows.map(DdlResult::Rows).into_iter().collect())
 }
 
 fn authorize_final_task_set(

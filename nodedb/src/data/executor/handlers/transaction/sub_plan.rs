@@ -182,6 +182,7 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
+                ..
             } => self.tx_point_put(
                 TxPointPut {
                     task: dummy_task,

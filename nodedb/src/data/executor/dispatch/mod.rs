@@ -8,6 +8,7 @@ pub mod bitmap;
 pub mod columnar;
 pub mod crdt;
 pub mod document;
+mod document_admit;
 pub mod graph;
 pub mod kv;
 pub mod meta;

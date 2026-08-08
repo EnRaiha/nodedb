@@ -9,7 +9,12 @@ pub(in crate::control::server::shared::ddl::neutral::collection) struct ParsedIn
     pub coll_name: String,
     pub doc_id: String,
     pub fields: HashMap<String, nodedb_types::Value>,
-    pub has_returning: bool,
+    /// The raw column list written after `RETURNING`, when the statement has
+    /// one. Carried (rather than reduced to a flag) because the statement is
+    /// REBUILT from `fields` before planning: a flag would say the clause
+    /// existed while the rebuilt SQL dropped it, which is how the clause used
+    /// to be answered from this parse instead of from the stored row.
+    pub returning_clause: Option<String>,
     /// Collection type looked up from the catalog. Drives the write plan.
     pub collection_type: Option<nodedb_types::CollectionType>,
 }

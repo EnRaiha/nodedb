@@ -18,18 +18,16 @@
 //! - A non-Document engine through the same entry point, so the coverage is the
 //!   transport's — not one engine's. Key-value is used because its object
 //!   literal is already the documented form for that engine.
-//! - What the path actually RETURNS, established rather than assumed: nothing.
-//!   An INSERT answers with a command status, and `RETURNING` is unsupported on
-//!   INSERT product-wide — no insert operation carries a `returning` slot on any
-//!   engine — so both this form and `(cols) VALUES (…)` refuse the clause rather
-//!   than dropping it. A read policy therefore has no row set to narrow on a
-//!   write through this entry point; the write gate is the whole of the control
-//!   that applies. An ordinary `SELECT` against the same collection is still
-//!   filtered, which is asserted alongside so the empty result is pinned as the
-//!   statement's shape rather than as rows a policy silently removed. The
-//!   refusals themselves live in `pgwire_returning_dml.rs` and
-//!   `object_literal_trailing_clause.rs`; what is pinned here is that a
-//!   conforming row is refused on the CLAUSE, not reported as a policy denial.
+//! - What the path actually RETURNS, established rather than assumed: a write
+//!   with no `RETURNING` answers with a command status and no rows, so a read
+//!   policy has no row set to narrow and the write gate is the whole of the
+//!   control that applies. An ordinary `SELECT` against the same collection is
+//!   still filtered, which is asserted alongside so the empty result is pinned
+//!   as the statement's shape rather than as rows a policy silently removed.
+//! - A write that DOES ask for rows is answered on its row, not on its clause:
+//!   a conforming row comes back, a violating one is refused as a policy denial
+//!   and writes nothing. `RETURNING` must not become a way around the write
+//!   gate, and a conforming row must never be reported as a policy denial.
 //! - A collection with no policy is unaffected on every one of those forms.
 
 mod common;
@@ -325,18 +323,17 @@ async fn object_literal_returns_no_rows_so_a_read_policy_has_nothing_to_narrow()
     );
 }
 
-/// No INSERT form returns rows, and asking for them is refused as a RETURNING
-/// limitation — never mistaken for a policy denial.
+/// A write that asks for rows is answered on its own merits: a conforming row
+/// comes back, a violating one is refused BY THE POLICY.
 ///
-/// `RETURNING` is unsupported on INSERT across the whole product: no insert
-/// operation carries a `returning` slot on any engine, so both the object
-/// literal and the `(cols) VALUES (…)` form refuse it. The distinction pinned
-/// here is WHICH refusal the caller gets. A conforming write that asked for
-/// rows must fail on the clause, not on the policy — reporting a policy denial
-/// for a statement the policy admits would send an operator hunting through
-/// their RLS rules for a parser limitation.
+/// The distinction pinned here is WHICH outcome the caller gets, and that the
+/// two are never confused. A conforming write must not be refused at all — an
+/// operator told "policy denied" for a row the policy admits goes hunting
+/// through their RLS rules for something that is not there. A violating write
+/// must be refused as a policy denial and must not write, whatever clause it
+/// carries: `RETURNING` must not become a way around the write gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn asking_an_insert_for_rows_is_refused_on_the_clause_not_the_policy() {
+async fn a_returning_insert_is_answered_on_its_row_not_on_its_clause() {
     let server = TestServer::start().await;
     let user = "objlit_echo_user";
     server
@@ -346,36 +343,45 @@ async fn asking_an_insert_for_rows_is_refused_on_the_clause_not_the_policy() {
     create_user(&server, user).await;
     write_policy(&server, "objlit_echo_owner", "objlit_echo").await;
 
-    // The row CONFORMS to the write policy, so the only thing wrong with the
-    // statement is the clause.
-    for sql in [
-        format!("INSERT INTO objlit_echo (id, owner) VALUES ('mine', '{user}') RETURNING *"),
-        format!("INSERT INTO objlit_echo {{ id: 'mine2', owner: '{user}' }} RETURNING *"),
+    // Conforming rows: the only thing that could refuse these is the policy,
+    // and it admits them — so each answers with its own stored row.
+    for (id, sql) in [
+        (
+            "mine",
+            format!("INSERT INTO objlit_echo (id, owner) VALUES ('mine', '{user}') RETURNING id"),
+        ),
+        (
+            "mine2",
+            format!("INSERT INTO objlit_echo {{ id: 'mine2', owner: '{user}' }} RETURNING id"),
+        ),
     ] {
-        match run_as(&server, user, &sql).await {
-            Ok(rows) => panic!("`{sql}` must be refused, but it succeeded: {rows:?}"),
-            Err(message) => {
-                assert!(
-                    message.contains("RETURNING"),
-                    "the refusal must name the clause; sql = {sql}, got: {message}"
-                );
-                assert!(
-                    !message.contains("RLS"),
-                    "a conforming row must not be reported as a policy denial; sql = {sql}, \
-                     got: {message}"
-                );
-            }
-        }
+        let rows = run_as(&server, user, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` conforms to the policy and must apply: {e}"));
+        assert_eq!(
+            rows,
+            vec![id.to_string()],
+            "`{sql}` must answer with the row it stored"
+        );
     }
 
-    // …and neither refused statement wrote anything.
-    assert!(
+    // Violating rows: refused by the POLICY, not by anything about the clause.
+    for sql in [
+        "INSERT INTO objlit_echo (id, owner) VALUES ('theirs', 'alice') RETURNING id".to_string(),
+        "INSERT INTO objlit_echo { id: 'theirs2', owner: 'alice' } RETURNING id".to_string(),
+    ] {
+        assert_rls_denied(run_as(&server, user, &sql).await, &sql);
+    }
+
+    // Only the conforming rows exist: asking for rows back never loosened the
+    // write gate.
+    assert_eq!(
         server
-            .query_rows("SELECT id FROM objlit_echo")
+            .query_rows("SELECT id FROM objlit_echo ORDER BY id")
             .await
-            .expect("read back objlit_echo")
-            .is_empty(),
-        "a refused statement must not have written its row"
+            .expect("read back objlit_echo"),
+        vec![vec!["mine".to_string()], vec!["mine2".to_string()]],
+        "a policy-denied statement must not have written its row"
     );
 }
 

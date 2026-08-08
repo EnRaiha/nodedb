@@ -530,6 +530,8 @@ mod tests {
                 value: Vec::new(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointInsert {
                 collection: "c".into(),
@@ -537,6 +539,8 @@ mod tests {
                 value: Vec::new(),
                 if_absent: false,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: "c".into(),
@@ -632,6 +636,8 @@ mod tests {
                 on_conflict_updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: non-OLLP (both None) — the buffered case.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
@@ -718,6 +724,8 @@ mod tests {
                 collection: "c".into(),
                 documents: Vec::new(),
                 surrogates: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ];
         for p in &plans {

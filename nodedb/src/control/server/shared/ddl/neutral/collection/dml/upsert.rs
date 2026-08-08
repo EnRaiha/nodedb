@@ -181,8 +181,17 @@ pub async fn upsert_document(
     };
 
     // Build SQL and route through nodedb-sql → EngineRules → sql_plan_convert.
-    let upsert_sql = fields_to_upsert_sql(&parsed.coll_name, &fields);
-    if let Err(e) = plan_and_dispatch(
+    //
+    // The statement is REBUILT from `fields`, so the author's `RETURNING` list
+    // has to be re-attached here or the planner would never see it and the
+    // clause would be silently dropped — which is what used to happen, with the
+    // caller's own submitted values echoed back in its place.
+    let mut upsert_sql = fields_to_upsert_sql(&parsed.coll_name, &fields);
+    if let Some(ref columns) = parsed.returning_clause {
+        upsert_sql.push_str(" RETURNING ");
+        upsert_sql.push_str(columns);
+    }
+    let returned_rows = match plan_and_dispatch(
         state,
         identity,
         tenant_id,
@@ -192,8 +201,9 @@ pub async fn upsert_document(
     )
     .await
     {
-        return Some(Err(e));
-    }
+        Ok(rows) => rows,
+        Err(e) => return Some(Err(e)),
+    };
 
     // Fire the AFTER trigger family that matches the actual mutation:
     // AFTER UPDATE when a prior row existed, AFTER INSERT otherwise.
@@ -225,6 +235,10 @@ pub async fn upsert_document(
     .await
     {
         return Some(err);
+    }
+
+    if !returned_rows.is_empty() {
+        return Some(Ok(returned_rows));
     }
 
     Some(Ok(vec![DdlResult::Status {

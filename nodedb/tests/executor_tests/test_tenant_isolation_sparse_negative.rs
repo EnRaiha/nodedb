@@ -27,6 +27,8 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
             value: b"{\"name\":\"alice\",\"secret\":\"tenant_a_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -42,6 +44,8 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
             value: b"{\"name\":\"bob\",\"secret\":\"tenant_b_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -90,6 +94,8 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             value: b"{\"data\":\"confidential\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

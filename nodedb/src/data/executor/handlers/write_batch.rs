@@ -10,6 +10,22 @@ use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPu
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::DocumentOp;
 
+/// Whether a task is a `PointPut` this coalescing path may absorb.
+///
+/// A put carrying a `RETURNING` projection is excluded: this path answers every
+/// batched task with a bare OK, which carries no row payload, so absorbing one
+/// would drop the rows the statement asked for. It falls through to `poll_one`
+/// and the single-put handler, which projects the stored post-image.
+fn is_batchable_put(task: &ExecutionTask) -> bool {
+    matches!(
+        task.plan(),
+        PhysicalPlan::Document(DocumentOp::PointPut {
+            returning: None,
+            ..
+        })
+    )
+}
+
 impl CoreLoop {
     /// Batch-coalesce consecutive PointPut tasks from the front of the task queue.
     ///
@@ -21,13 +37,11 @@ impl CoreLoop {
     /// is not a batchable PointPut, in which case the caller should fall
     /// back to `poll_one`).
     pub fn poll_write_batch(&mut self) -> usize {
-        // Check if the front of the queue is a non-expired PointPut.
-        let front_is_put = self.task_queue.front().is_some_and(|t| {
-            matches!(
-                t.plan(),
-                PhysicalPlan::Document(DocumentOp::PointPut { .. })
-            ) && !t.is_expired()
-        });
+        // Check if the front of the queue is a non-expired batchable PointPut.
+        let front_is_put = self
+            .task_queue
+            .front()
+            .is_some_and(|t| is_batchable_put(t) && !t.is_expired());
         if !front_is_put {
             return 0;
         }
@@ -35,12 +49,10 @@ impl CoreLoop {
         // Collect consecutive non-expired PointPuts (max 64).
         let mut batch: Vec<ExecutionTask> = Vec::with_capacity(64);
         while batch.len() < 64 {
-            let is_put = self.task_queue.front().is_some_and(|t| {
-                matches!(
-                    t.plan(),
-                    PhysicalPlan::Document(DocumentOp::PointPut { .. })
-                ) && !t.is_expired()
-            });
+            let is_put = self
+                .task_queue
+                .front()
+                .is_some_and(|t| is_batchable_put(t) && !t.is_expired());
             if !is_put {
                 break;
             }
@@ -81,10 +93,9 @@ impl CoreLoop {
         for task in &batch {
             let PhysicalPlan::Document(DocumentOp::PointPut {
                 collection,
-                document_id: _,
                 value,
                 surrogate,
-                pk_bytes: _,
+                ..
             }) = task.plan()
             else {
                 unreachable!("batch only contains PointPut");

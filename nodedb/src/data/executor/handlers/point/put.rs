@@ -10,18 +10,38 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
+use nodedb_physical::physical_plan::ReturningSpec;
 use nodedb_types::Surrogate;
+
+/// Dispatch-side arguments for [`CoreLoop::execute_point_put`].
+pub(in crate::data::executor) struct PointPutExec<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub value: &'a [u8],
+    /// When `Some`, project the STORED post-image per spec instead of
+    /// reporting a bare affected count.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
+}
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_point_put(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        value: &[u8],
+        params: PointPutExec<'_>,
     ) -> Response {
+        let PointPutExec {
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+            returning,
+            rls_filters,
+        } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         debug!(core = self.core_id, %collection, %document_id, "point put");
@@ -105,6 +125,21 @@ impl CoreLoop {
             value,
             prior.prior_value.as_deref(),
         );
+
+        if let Some(spec) = returning {
+            let strict_schema = self.strict_schema_for(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+            );
+            return self.stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                strict_schema.as_ref(),
+                &[(document_id, prior.stored_value.as_slice())],
+            );
+        }
 
         // An upsert always writes the row, whether or not one was there before.
         self.response_affected(task, 1)

@@ -248,6 +248,8 @@ fn surrogate_round_trip_all_engines() {
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
                 pk_bytes: hex.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -381,6 +383,8 @@ fn surrogate_round_trip_all_engines() {
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
                 pk_bytes: hex.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -400,6 +404,8 @@ fn surrogate_round_trip_all_engines() {
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
                 pk_bytes: hex.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

@@ -31,6 +31,10 @@ pub(super) fn point_put(
         value: value.to_vec(),
         surrogate,
         pk_bytes,
+        // A replay re-applies the row; it answers no client, so it projects
+        // nothing and needs no read gate — see `point_delete`.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -60,6 +64,9 @@ pub(super) fn point_insert(
         value: value.to_vec(),
         if_absent,
         surrogate,
+        // Replay projects nothing back — see `point_delete`.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -129,6 +136,8 @@ pub(super) fn doc_upsert(
         surrogate,
         // Empty on replay — see `point_delete`.
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -165,6 +174,9 @@ pub(super) fn batch_insert(
         collection: collection.to_owned(),
         documents: documents.to_vec(),
         surrogates: resolved,
+        // Replay projects nothing back — see `point_delete`.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

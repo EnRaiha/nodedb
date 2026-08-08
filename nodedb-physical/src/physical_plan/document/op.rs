@@ -59,6 +59,19 @@ pub enum DocumentOp {
         /// Raw primary-key bytes, used by follower-side WAL decode to
         /// re-derive the surrogate via the catalog rev table.
         pk_bytes: Vec<u8>,
+        /// When `Some`, return the STORED post-image of the written row
+        /// projected per spec — generated columns evaluated, `_rowid`
+        /// injected, strict tuple re-decoded. Never the submitted body: an
+        /// echo of the request would report what was asked for rather than
+        /// what landed.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. The write policy
+        /// governs the write; this bounds what may be shown back, so a
+        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        /// See `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Point insert: write one document, fail on duplicate primary key.
@@ -80,6 +93,15 @@ pub enum DocumentOp {
         /// `Surrogate::ZERO` is reserved as a sentinel and only appears
         /// in test fixtures.
         surrogate: Surrogate,
+        /// When `Some`, return the STORED post-image of the inserted row
+        /// projected per spec — see `PointPut::returning`. A conflict skipped
+        /// by `if_absent` inserts nothing and therefore returns no row.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits — see
+        /// `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Point delete: remove a document.
@@ -174,6 +196,15 @@ pub enum DocumentOp {
         /// same length as `documents`, the handler uses these for FTS indexing.
         /// `Surrogate::ZERO` entries are silently skipped by the FTS path.
         surrogates: Vec<nodedb_types::Surrogate>,
+        /// When `Some`, return one row per inserted document — the STORED
+        /// post-image of each, in `documents` order — projected per spec.
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits — see
+        /// `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Range scan on a sparse/metadata index.
@@ -322,6 +353,16 @@ pub enum DocumentOp {
         /// result) when it is present. See `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// When `Some`, return the STORED post-image projected per spec: the
+        /// merged row on the conflict branch, the inserted row otherwise.
+        /// Never the submitted body — on a conflict the caller's values are
+        /// only part of what the row ends up holding.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits — see
+        /// `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Update target rows matched by a join with a source collection.

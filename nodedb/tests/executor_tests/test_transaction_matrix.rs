@@ -322,6 +322,8 @@ fn rollback_matrix_doc_doc_second_fails() {
         value: b"should_not_persist".to_vec(),
         surrogate: nodedb_types::Surrogate::new(99),
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let resp = send_raw(
         &mut core,

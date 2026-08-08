@@ -21,13 +21,17 @@ use crate::parser::object_literal::{
 /// rewrite rather than an oversight: [`fields_to_values_sql`] reconstructs the
 /// statement from the parsed fields alone, so anything the author wrote after
 /// the literal has nowhere to go. Carrying it is not a matter of appending the
-/// text either — the downstream hand-rolled `(cols) VALUES (…)` scanner locates
-/// the value list with a reverse search for `)`, which a `RETURNING upper(x)` or
-/// an `ON CONFLICT (id)` would capture, and the INSERT handler rebuilds its own
-/// SQL from the parsed fields a second time, dropping the clause again. Making
-/// the form carry clauses is a change to that whole pipeline; until then the
-/// honest answer is to refuse the statement and say which clause is the
-/// problem.
+/// text either — the INSERT handler downstream rebuilds its own SQL from the
+/// parsed fields a second time, dropping the clause again, and the hand-rolled
+/// `(cols) VALUES (…)` scanner locates the value list with a reverse search for
+/// `)`, which an `ON CONFLICT (id)` would capture. Making the form carry clauses
+/// is a change to that whole pipeline; until then the honest answer is to refuse
+/// the statement and point at the `(cols) VALUES (…)` form, which does carry
+/// them.
+///
+/// `RETURNING` is the one clause this never sees: every caller splits it off the
+/// text before rewriting and re-attaches it to the rebuilt statement, so it
+/// survives the reconstruction and is not leftover input to reject.
 pub(super) fn try_rewrite_object_literal(sql: &str) -> Result<Option<String>, SqlError> {
     let after_into = sql["INSERT INTO ".len()..].trim_start();
     let Some(coll_end) = after_into.find(|c: char| c.is_whitespace()) else {

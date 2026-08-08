@@ -76,6 +76,10 @@ pub(super) fn wal_append_document_op(
             value,
             surrogate,
             pk_bytes: _,
+            // The WAL record carries the row; the projection is answered
+            // from the Data Plane's response, not from the journal.
+            returning: _,
+            rls_filters: _,
         } => {
             let entry =
                 encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
@@ -87,6 +91,8 @@ pub(super) fn wal_append_document_op(
             value,
             if_absent: _,
             surrogate,
+            returning: _,
+            rls_filters: _,
         } => {
             let entry =
                 encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
@@ -172,6 +178,8 @@ mod tests {
             value: vec![1, 2, 3],
             surrogate: Surrogate::new(5),
             pk_bytes: vec![],
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(

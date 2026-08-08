@@ -37,6 +37,8 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -139,6 +141,8 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -234,6 +238,8 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -264,6 +270,8 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

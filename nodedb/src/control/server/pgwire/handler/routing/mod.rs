@@ -9,6 +9,7 @@
 //! physical plan via `ExecuteRequest` instead of a raw SQL string.
 
 mod calvin_dispatch;
+mod calvin_response;
 mod catalog;
 mod check_enforcement;
 mod clone_dispatch;

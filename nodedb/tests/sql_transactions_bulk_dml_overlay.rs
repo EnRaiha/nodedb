@@ -363,59 +363,72 @@ async fn strict_bulk_delete_sees_row_staged_earlier_in_txn_case() {
     strict_bulk_delete_sees_row_staged_earlier_in_txn("bu_st_ov_del").await;
 }
 
-/// A predicate `UPDATE ... RETURNING` inside a transaction stages its matched
-/// rows exactly like the non-RETURNING form: the statement now reports the real
-/// `UPDATE n` tag, an upgrade from the former buffer + `OK` deferral. The
-/// RETURNING rows themselves are NOT projected back inside a transaction — a
-/// pre-existing limitation this staging change does not address, tracked
-/// separately — so the response carries only the command tag, no data rows.
-async fn bulk_update_returning_in_txn_reports_count_not_ok(engine: &str, coll: &str) {
+/// A predicate `UPDATE ... RETURNING` inside a transaction is REFUSED, naming
+/// the limitation.
+///
+/// It used to succeed with the real `UPDATE n` tag and zero data rows — a
+/// caller that asked for rows got silence, which is precisely the failure this
+/// clause exists to remove. The write is staged into the per-transaction
+/// overlay, and staging answers with a count rather than a row image, while
+/// COMMIT answers with one tag for the whole transaction; so there is no point
+/// at which the rows could be surfaced. Refusing says so instead of pretending
+/// the statement matched nothing.
+///
+/// The refusal is verb-agnostic — it fires for any row-returning plan — so the
+/// non-RETURNING form of the same statement is asserted alongside to pin that
+/// staging itself is untouched.
+async fn bulk_update_returning_in_txn_is_refused(engine: &str, coll: &str) {
     let server = TestServer::start().await;
     setup(&server, coll, engine).await;
 
     server.exec("BEGIN").await.unwrap();
 
-    let msgs = server
+    let error = server
         .client
         .simple_query(&format!(
             "UPDATE {coll} SET n = 7 WHERE n = 1 RETURNING id, n"
         ))
         .await
-        .expect("in-tx RETURNING bulk update should succeed at the statement");
+        .expect_err("in-tx UPDATE ... RETURNING must be refused, not answered with no rows");
+    let message = error
+        .as_db_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| error.to_string());
+    assert!(
+        message.contains("RETURNING") && message.contains("transaction"),
+        "{engine}: the refusal must name the clause and the limitation, got: {message}"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+
+    // The same statement without the clause still stages and still reports its
+    // real matched-row count: the refusal is about the projection, not about
+    // predicate DML in a transaction.
+    server.exec("BEGIN").await.unwrap();
+    let msgs = server
+        .client
+        .simple_query(&format!("UPDATE {coll} SET n = 7 WHERE n = 1"))
+        .await
+        .expect("in-tx bulk update should succeed at the statement");
     assert_eq!(
         command_count(&msgs),
         Some(2),
-        "{engine}: in-tx UPDATE ... RETURNING must report the real matched-row count, not OK"
-    );
-    // Rows are not projected back inside a transaction (pre-existing behavior,
-    // unchanged by this staging upgrade): only the command tag is returned.
-    let row_count = msgs
-        .iter()
-        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
-        .count();
-    assert_eq!(
-        row_count, 0,
-        "{engine}: in-tx RETURNING rows are not projected back to the client"
+        "{engine}: in-tx UPDATE must report the real matched-row count, not OK"
     );
 
-    // The staged change is still visible to the transaction's own scan.
     let seen = scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 7")).await;
     assert_eq!(
         seen,
         vec![7, 7],
-        "{engine}: in-tx scan must observe the staged RETURNING update"
+        "{engine}: in-tx scan must observe the staged update"
     );
 
     server.client.simple_query("COMMIT").await.unwrap();
     let after = scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 7")).await;
-    assert_eq!(
-        after,
-        vec![7, 7],
-        "{engine}: committed RETURNING update must persist"
-    );
+    assert_eq!(after, vec![7, 7], "{engine}: committed update must persist");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bulk_update_returning_in_txn_reports_count_not_ok_case() {
-    bulk_update_returning_in_txn_reports_count_not_ok("document_schemaless", "bu_ret_ov_upd").await;
+async fn bulk_update_returning_in_txn_is_refused_case() {
+    bulk_update_returning_in_txn_is_refused("document_schemaless", "bu_ret_ov_upd").await;
 }

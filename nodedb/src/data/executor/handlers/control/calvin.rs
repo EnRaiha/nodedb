@@ -561,6 +561,8 @@ mod tests {
             value: doc_value("a", "1"),
             if_absent: false,
             surrogate: Surrogate::new(surrogate),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

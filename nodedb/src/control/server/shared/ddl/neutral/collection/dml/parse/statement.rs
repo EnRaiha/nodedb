@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
+use nodedb_sql::parser::preprocess::lex::{
+    find_ascii_case_insensitive, keyword_position_outside_literals,
+};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::DdlError;
@@ -12,10 +14,19 @@ use crate::types::DatabaseId;
 
 use super::types::{ParsedInsert, ddl_err};
 
+const RETURNING_KEYWORD: &str = "RETURNING";
+
 /// Parse an INSERT/UPSERT SQL statement into structured fields.
 ///
 /// `keyword` is the SQL prefix to match (e.g., "INSERT INTO " or "UPSERT INTO ").
 /// Returns `None` if the collection has a typed schema (let the SQL path handle it).
+///
+/// A trailing `RETURNING` list is split off the text up front and carried on
+/// [`ParsedInsert::returning_clause`] for the caller to re-attach. Every form
+/// below REBUILDS the statement from the parsed fields, so a clause left in the
+/// text is discarded by that rebuild — and the object-literal rewriter refuses
+/// input it cannot account for, so leaving it there would refuse a clause the
+/// pipeline can in fact carry.
 pub(in crate::control::server::shared::ddl::neutral::collection) fn parse_write_statement(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -23,6 +34,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn parse_write_
     sql: &str,
     keyword: &str,
 ) -> Option<Result<ParsedInsert, DdlError>> {
+    let (sql, returning_clause) = split_returning(sql);
     let kw_pos = find_ascii_case_insensitive(sql, keyword)?;
     let after_into = sql[kw_pos + keyword.len()..].trim_start();
     let coll_name_str = after_into.split_whitespace().next()?;
@@ -60,7 +72,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn parse_write_
         match nodedb_sql::parser::preprocess::preprocess(sql) {
             // The preprocessed SQL is always INSERT INTO regardless of original keyword.
             Ok(Some(preprocessed)) => {
-                return parse_values_form(&preprocessed.sql, "INSERT INTO ", &coll_name, coll_type);
+                return with_returning(
+                    parse_values_form(&preprocessed.sql, "INSERT INTO ", &coll_name, coll_type),
+                    returning_clause,
+                );
             }
             Ok(None) => {
                 return Some(Err(ddl_err(
@@ -72,10 +87,46 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn parse_write_
         }
     }
 
-    parse_values_form(sql, keyword, &coll_name, coll_type)
+    with_returning(
+        parse_values_form(sql, keyword, &coll_name, coll_type),
+        returning_clause,
+    )
+}
+
+/// Split a trailing `RETURNING <columns>` off the statement text.
+///
+/// Returns the statement without the clause plus the projected column list.
+/// The keyword is located outside string literals so a value containing the
+/// word is data, not a clause.
+fn split_returning(sql: &str) -> (&str, Option<String>) {
+    match keyword_position_outside_literals(sql, RETURNING_KEYWORD) {
+        Some(pos) => (
+            &sql[..pos],
+            Some(sql[pos + RETURNING_KEYWORD.len()..].trim().to_string()),
+        ),
+        None => (sql, None),
+    }
+}
+
+/// Stamp the split-off projection onto a successfully parsed statement.
+fn with_returning(
+    parsed: Option<Result<ParsedInsert, DdlError>>,
+    returning_clause: Option<String>,
+) -> Option<Result<ParsedInsert, DdlError>> {
+    parsed.map(|result| {
+        result.map(|mut parsed| {
+            parsed.returning_clause = returning_clause;
+            parsed
+        })
+    })
 }
 
 /// Parse the `(cols) VALUES (vals)` form.
+///
+/// Any trailing `RETURNING` is already gone — [`parse_write_statement`] splits
+/// it off before either form is examined. That matters here: the value list is
+/// located by a REVERSE search for `)`, which a `RETURNING upper(x)` would
+/// otherwise capture, swallowing the real values.
 fn parse_values_form(
     sql: &str,
     keyword: &str,
@@ -149,7 +200,8 @@ fn parse_values_form(
         coll_name: coll_name.to_string(),
         doc_id,
         fields,
-        has_returning: find_ascii_case_insensitive(sql, "RETURNING").is_some(),
+        // Stamped by `parse_write_statement`, which owns the split.
+        returning_clause: None,
         collection_type: coll_type,
     }))
 }

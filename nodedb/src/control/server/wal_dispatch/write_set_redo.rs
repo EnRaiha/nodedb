@@ -233,6 +233,8 @@ mod tests {
             collection: "docs".to_string(),
             documents: Vec::new(),
             surrogates: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }

@@ -30,6 +30,8 @@ fn single_core_cross_type_hash_join() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -131,6 +133,8 @@ fn single_core_left_join_with_nulls() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -215,6 +219,8 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: id.as_bytes().to_vec(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -301,6 +307,8 @@ fn single_core_self_join_star_keeps_both_sides() {
                 value: doc,
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -387,6 +395,8 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
                 value: tagged,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
                 pk_bytes: id.as_bytes().to_vec(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

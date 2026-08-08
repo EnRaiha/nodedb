@@ -125,6 +125,10 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
                 value: body,
                 surrogate,
                 pk_bytes,
+                // The `UPDATE ... FROM` op owns the statement's projection; the
+                // puts it expands into answer no client.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,

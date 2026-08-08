@@ -51,6 +51,12 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
 pub(in crate::data::executor) struct PointPutOutcome {
     /// Prior stored bytes when this put replaced an existing row, else `None`.
     pub prior_value: Option<Vec<u8>>,
+    /// The exact bytes this put handed to storage — a Binary Tuple on a strict
+    /// collection, MessagePack otherwise, with generated columns evaluated and
+    /// `_rowid` injected. A `RETURNING` projection reads THIS, never the
+    /// caller's submitted body, so it reports the row that landed rather than
+    /// the row that was asked for.
+    pub stored_value: Vec<u8>,
     /// System-time key the bitemporal version row (and its versioned index
     /// entries) were appended at. `Some(t)` on the bitemporal branch, `None`
     /// on the plain overwrite branch.

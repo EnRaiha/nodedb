@@ -165,6 +165,8 @@ fn schemaless_put_scan_roundtrip() {
             value: doc1,
             surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"d1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -179,6 +181,8 @@ fn schemaless_put_scan_roundtrip() {
             value: doc2,
             surrogate: nodedb_types::Surrogate::new(2),
             pk_bytes: b"d3".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

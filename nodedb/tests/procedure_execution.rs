@@ -158,6 +158,8 @@ fn dummy_task(id: &str) -> nodedb_physical::physical_task::PhysicalTask {
             value: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

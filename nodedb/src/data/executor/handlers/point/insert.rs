@@ -15,6 +15,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
+use nodedb_physical::physical_plan::ReturningSpec;
 use nodedb_types::Surrogate;
 
 /// Parameters for [`CoreLoop::execute_point_insert`].
@@ -28,6 +29,11 @@ pub(in crate::data::executor) struct PointInsertParams<'a> {
     /// `INSERT ... ON CONFLICT DO NOTHING` flag: silently skip on a duplicate
     /// primary key instead of raising a `unique` constraint violation.
     pub if_absent: bool,
+    /// When `Some`, project the STORED post-image per spec instead of
+    /// reporting a bare affected count.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -43,6 +49,8 @@ impl CoreLoop {
             surrogate,
             value,
             if_absent,
+            returning,
+            rls_filters,
         } = p;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -79,6 +87,15 @@ impl CoreLoop {
                     // exists, so nothing is inserted and the statement affects
                     // 0 rows. Reporting no count here let the renderer assume
                     // the default 1 and claim an insert that never happened.
+                    //
+                    // A `RETURNING` on the same statement must likewise ship an
+                    // empty row set rather than the count shape: nothing was
+                    // written, so there is no post-image to project, and a
+                    // count payload would be decoded as a row set of the wrong
+                    // shape by the RETURNING renderer.
+                    if let Some(spec) = returning {
+                        return self.stored_returning_response(task, spec, rls_filters, None, &[]);
+                    }
                     return self.response_affected(task, 0);
                 }
                 return self.response_error(
@@ -101,7 +118,7 @@ impl CoreLoop {
         // is `None` because the probe above already rejected the conflict case.
         // The outcome's index tuples are consumed below to record touched
         // secondary-index values.
-        let outcome = match self.apply_point_put(
+        let mut outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id: task.request.database_id.as_u64(),
@@ -134,6 +151,12 @@ impl CoreLoop {
 
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
 
+        // The exact bytes storage now holds, taken before the index tuples are
+        // consumed below. A `RETURNING` projection reads these rather than
+        // `value`, so it reports the generated columns and injected `_rowid`
+        // the encode pipeline added on the way to disk.
+        let stored_value = std::mem::take(&mut outcome.stored_value);
+
         // Record the touched secondary-index values into the per-index
         // write-value substrate (added ∪ removed ∪ bitemporal tuples).
         if let Some(lsn) = task.wal_lsn() {
@@ -158,6 +181,21 @@ impl CoreLoop {
         // cross-shard edges by the document's vShard).
 
         self.emit_put_event(task, tid, collection, row_key, value, None);
+
+        if let Some(spec) = returning {
+            let strict_schema = self.strict_schema_for(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+            );
+            return self.stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                strict_schema.as_ref(),
+                &[(document_id, stored_value.as_slice())],
+            );
+        }
 
         // The row was inserted: exactly one row affected.
         self.response_affected(task, 1)

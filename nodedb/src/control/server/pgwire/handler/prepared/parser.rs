@@ -193,7 +193,7 @@ impl NodeDbQueryParser {
         emitter: &ArcAuditEmitter,
     ) -> PgWireResult<bool> {
         let (sql_without_returning, _) =
-            match crate::control::server::pgwire::handler::returning::strip_returning(sql) {
+            match crate::control::server::shared::returning::strip_returning(sql) {
                 Ok(parts) => parts,
                 Err(_) => return Ok(false),
             };
@@ -282,7 +282,7 @@ impl NodeDbQueryParser {
         // Strip RETURNING from DML before passing to DataFusion. Retain the
         // parsed spec so we can build result fields for Describe.
         let (sql_stripped, returning_spec) =
-            match crate::control::server::pgwire::handler::returning::strip_returning(sql) {
+            match crate::control::server::shared::returning::strip_returning(sql) {
                 Ok(pair) => pair,
                 Err(_) => return (param_types, Vec::new()),
             };

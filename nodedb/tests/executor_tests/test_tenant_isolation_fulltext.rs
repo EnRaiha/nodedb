@@ -40,6 +40,8 @@ fn fulltext_search_isolated() {
                 value: val.as_bytes().to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

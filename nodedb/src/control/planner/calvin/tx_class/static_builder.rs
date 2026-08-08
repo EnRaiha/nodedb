@@ -299,6 +299,8 @@ mod tests {
                 surrogate: Surrogate::new(surrogate),
                 value: vec![],
                 if_absent: false,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

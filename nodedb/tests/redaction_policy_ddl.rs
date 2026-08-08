@@ -409,3 +409,49 @@ async fn policy_created_mid_session_refuses_a_previously_cached_aggregate() {
         .await
         .expect("the aggregate runs again once the policy is gone");
 }
+
+/// `INSERT ... RETURNING` surfaces real stored rows, so its response must go
+/// through the same masking pass a SELECT does.
+///
+/// Both halves are load-bearing, exactly as for MERGE: the plan must classify
+/// as row-returning, AND it must report its collection, or the masking pass
+/// finds no policy to key on and ships the rows in the clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_rows_are_redacted() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION redact_insert (id TEXT PRIMARY KEY, email TEXT, name TEXT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create redact_insert");
+    server
+        .exec(&format!(
+            "CREATE REDACTION POLICY mask_insert ON redact_insert FOR ROLE {ROLE} \
+             (email MASK '***@***.com')"
+        ))
+        .await
+        .expect("create redaction policy");
+
+    let rows = server
+        .query_rows(
+            "INSERT INTO redact_insert (id, email, name) \
+             VALUES ('u1', 'alice@example.com', 'Alice') \
+             RETURNING id, email, name",
+        )
+        .await
+        .expect("INSERT RETURNING should succeed");
+
+    assert_eq!(rows.len(), 1, "one inserted row: {rows:?}");
+    assert_eq!(rows[0][1], "***@***.com", "email must be masked: {rows:?}");
+    assert_eq!(rows[0][2], "Alice", "an unruled column must survive intact");
+
+    // The masking is a display rule, not a write rule: storage holds the real
+    // address.
+    let stored = server
+        .query_named_rows("SELECT email FROM redact_insert")
+        .await
+        .expect("read back");
+    assert_eq!(stored.len(), 1, "one stored row: {stored:?}");
+}

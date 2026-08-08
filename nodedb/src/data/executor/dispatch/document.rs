@@ -8,29 +8,15 @@ use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_types::SystemTimeScope;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::document::read::fetch::DocScanMode;
 use crate::data::executor::task::ExecutionTask;
+
+use super::document_admit::{doc_scan_mode, is_document_write};
 
 impl CoreLoop {
     pub(super) fn dispatch_document(&mut self, task: &ExecutionTask, op: &DocumentOp) -> Response {
         let tid = task.request.tenant_id.as_u64();
         // Pressure guard for write operations.
-        let is_write = matches!(
-            op,
-            DocumentOp::PointPut { .. }
-                | DocumentOp::PointInsert { .. }
-                | DocumentOp::PointUpdate { .. }
-                | DocumentOp::PointDelete { .. }
-                | DocumentOp::BatchInsert { .. }
-                | DocumentOp::BulkUpdate { .. }
-                | DocumentOp::BulkDelete { .. }
-                | DocumentOp::UpdateFromJoin { .. }
-                | DocumentOp::Upsert { .. }
-                | DocumentOp::InsertSelect { .. }
-                | DocumentOp::BackfillIndex { .. }
-                | DocumentOp::Merge { .. }
-        );
-        if is_write {
+        if is_document_write(op) {
             if let Some(r) =
                 self.check_engine_pressure(task, nodedb_mem::EngineId::DocumentSchemaless)
             {
@@ -85,7 +71,20 @@ impl CoreLoop {
                 value,
                 surrogate,
                 pk_bytes: _,
-            } => self.execute_point_put(task, tid, collection, document_id, *surrogate, value),
+                returning,
+                rls_filters,
+            } => self.execute_point_put(
+                task,
+                crate::data::executor::handlers::point::put::PointPutExec {
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    value,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
+            ),
 
             DocumentOp::PointInsert {
                 collection,
@@ -93,6 +92,8 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
+                returning,
+                rls_filters,
             } => self.execute_point_insert(
                 crate::data::executor::handlers::point::insert::PointInsertParams {
                     task,
@@ -102,6 +103,8 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     value,
                     if_absent: *if_absent,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 
@@ -163,21 +166,7 @@ impl CoreLoop {
                 valid_at_ms,
                 prefilter,
             } => {
-                // The temporal slice differs ONLY in the fetch stage; sort,
-                // computed columns, window functions and DISTINCT are applied by
-                // the same downstream pipeline for every mode.
-                let mode = if system_time.is_all_versions() {
-                    DocScanMode::AllVersions {
-                        valid_at_ms: *valid_at_ms,
-                    }
-                } else if system_time.is_temporal() || valid_at_ms.is_some() {
-                    DocScanMode::AsOf {
-                        system_as_of_ms: system_time.as_of_ms(),
-                        valid_at_ms: *valid_at_ms,
-                    }
-                } else {
-                    DocScanMode::Current
-                };
+                let mode = doc_scan_mode(system_time, *valid_at_ms);
                 self.execute_document_scan(
                     task,
                     crate::data::executor::handlers::document::read::scan::DocumentScanParams {
@@ -201,7 +190,19 @@ impl CoreLoop {
                 collection,
                 documents,
                 surrogates,
-            } => self.execute_document_batch_insert(task, tid, collection, documents, surrogates),
+                returning,
+                rls_filters,
+            } => self.execute_document_batch_insert(
+                task,
+                crate::data::executor::handlers::document::write::DocumentBatchInsertParams {
+                    tid,
+                    collection,
+                    documents,
+                    surrogates,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
+            ),
 
             DocumentOp::RangeScan {
                 collection,
@@ -310,6 +311,8 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogate,
                 rls_write_check,
+                returning,
+                rls_filters,
             } => self.execute_upsert(
                 task,
                 crate::data::executor::handlers::upsert::UpsertParams {
@@ -320,6 +323,8 @@ impl CoreLoop {
                     value,
                     on_conflict_updates,
                     rls_write_check,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 

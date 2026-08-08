@@ -45,6 +45,8 @@ fn doc_put_conflict_seed(coll: &str) -> PhysicalPlan {
         value: b"seed".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 
@@ -55,6 +57,8 @@ fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
         value: b"conflict".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         if_absent: false,
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 

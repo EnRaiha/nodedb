@@ -194,6 +194,8 @@ fn three_way_fts_vector_doc_bitmap() {
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
                 pk_bytes: hex.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -215,6 +217,8 @@ fn three_way_fts_vector_doc_bitmap() {
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
                 pk_bytes: hex.into_bytes(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

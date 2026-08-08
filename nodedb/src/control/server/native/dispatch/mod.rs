@@ -17,6 +17,7 @@ mod session_ops;
 mod single_task;
 mod sql;
 mod sql_admin;
+mod sql_dispatch_task;
 mod sql_gateway;
 mod sql_loop;
 mod streaming;

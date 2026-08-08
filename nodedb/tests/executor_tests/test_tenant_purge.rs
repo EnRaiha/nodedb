@@ -31,6 +31,8 @@ fn purge_removes_all_tenant_data() {
                 value: format!("{{\"name\":\"user_{i}\"}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -97,6 +99,8 @@ fn purge_removes_all_tenant_data() {
             value: b"{\"name\":\"tenant_b_user\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -266,6 +270,8 @@ fn purge_is_idempotent() {
             value: b"{\"x\":1}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

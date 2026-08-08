@@ -15,6 +15,7 @@ use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
@@ -22,7 +23,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate, sqlstate_error};
 use super::super::core::NodeDbPgHandler;
-use super::super::plan::{describe_plan, payload_to_response};
+use super::super::plan::{PlanKind, describe_plan, payload_to_response};
 use super::super::shape_encode;
 use super::result_shaping::ResultShaping;
 use super::set_ops;
@@ -62,6 +63,12 @@ impl NodeDbPgHandler {
             .then(|| QueryRedaction::for_plans(tenant_id, auth_ctx, tasks.iter().map(|t| &t.plan)));
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
         let mut dedup_set_op = PostSetOp::None;
+        // A statement's RETURNING rows are ONE result set, however many tasks
+        // the statement planned to. A multi-row `INSERT ... RETURNING` plans one
+        // task per row, so the rows are folded here and emitted once after the
+        // loop rather than as a RowDescription/DataRow sequence per task, which
+        // an extended-query client reads as several results for one statement.
+        let mut returning_rows: Option<ShapedRows> = None;
         let mut responses = Vec::with_capacity(tasks.len());
         // Checked once rather than per task — metering is disabled by
         // default, so this keeps the per-task extraction below (which clones
@@ -115,6 +122,12 @@ impl NodeDbPgHandler {
                 continue;
             }
 
+            // Whether this task would answer with rows, read BEFORE the
+            // routing gate consumes the task: a buffered or staged write
+            // reports only a command tag, and a statement that asked for rows
+            // must be told so rather than handed that tag.
+            let returns_rows = matches!(describe_plan(&task.plan), PlanKind::ReturningRows);
+
             // In-transaction write-routing gate: protocol-neutral decision of
             // read / buffer-for-COMMIT / stage-now-and-buffer, shared with
             // every other dispatch loop (native, DSL/UPSERT). Moved to
@@ -128,6 +141,17 @@ impl NodeDbPgHandler {
                     task = *routed_task;
                 }
                 super::execute_dml_hooks::TxnRouteOutcome::Handled(resp) => {
+                    if returns_rows {
+                        let (severity, code, message) = error_to_sqlstate(
+                            &crate::control::server::shared::returning::
+                                in_transaction_returning_unsupported(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        ))));
+                    }
                     responses.push(resp);
                     continue;
                 }
@@ -349,12 +373,21 @@ impl NodeDbPgHandler {
                 {
                     ShapeOutcome::Rows(shaped) => {
                         task_rows = Some(shaped.rows.len() as u64);
-                        let (response, notice) =
-                            shape_encode::shaped_query_response(shaped, result_formats);
-                        if let Some(n) = notice {
-                            self.sessions.push_notice(session_id, n);
+                        if matches!(plan_kind, PlanKind::ReturningRows) {
+                            // Folded, not emitted: the whole statement answers
+                            // with one result set after the loop.
+                            match returning_rows {
+                                Some(ref mut accumulated) => accumulated.append(shaped),
+                                None => returning_rows = Some(shaped),
+                            }
+                        } else {
+                            let (response, notice) =
+                                shape_encode::shaped_query_response(shaped, result_formats);
+                            if let Some(n) = notice {
+                                self.sessions.push_notice(session_id, n);
+                            }
+                            responses.push(response);
                         }
-                        responses.push(response);
                     }
                     ShapeOutcome::Passthrough => {
                         let shaped = payload_to_response(&resp.payload, plan_kind)?;
@@ -375,6 +408,15 @@ impl NodeDbPgHandler {
                     .build();
                 meter_dispatch(&self.state, &scope, info, task_rows);
             }
+        }
+
+        // The statement's RETURNING rows, as one result set.
+        if let Some(shaped) = returning_rows {
+            let (response, notice) = shape_encode::shaped_query_response(shaped, result_formats);
+            if let Some(n) = notice {
+                self.sessions.push_notice(session_id, n);
+            }
+            responses.push(response);
         }
 
         // Set operations: merge sub-query payloads.

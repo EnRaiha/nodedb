@@ -76,6 +76,8 @@ fn insert_active(ctx: &mut TestCtx, id: &str) {
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
             pk_bytes: id.as_bytes().to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }
@@ -102,6 +104,8 @@ fn insert_active_edge(ctx: &mut TestCtx, id: &str, from: &str, to: &str, etype: 
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
             pk_bytes: id.as_bytes().to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

@@ -26,6 +26,8 @@ fn transaction_edge_put_committed() {
             value: b"{\"name\":\"alice\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     send_ok(
@@ -38,6 +40,8 @@ fn transaction_edge_put_committed() {
             value: b"{\"name\":\"bob\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -55,6 +59,8 @@ fn transaction_edge_put_committed() {
                     value: b"{\"name\":\"carol\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
                     collection: "col".into(),
@@ -102,6 +108,8 @@ fn transaction_edge_put_rolled_back_on_failure() {
             value: b"{\"name\":\"alice\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     send_ok(
@@ -114,6 +122,8 @@ fn transaction_edge_put_rolled_back_on_failure() {
             value: b"{\"name\":\"bob\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -222,6 +232,8 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             value: b"original_n1".to_vec(),
             surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"n1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     send_ok(
@@ -234,6 +246,8 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             value: b"original_n2".to_vec(),
             surrogate: nodedb_types::Surrogate::new(2),
             pk_bytes: b"n2".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -284,6 +298,8 @@ fn transaction_mixed_doc_edge_vector_rollback() {
                     value: b"modified_n1".to_vec(),
                     surrogate: nodedb_types::Surrogate::new(1),
                     pk_bytes: b"n1".to_vec(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
                     collection: "col".into(),

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Upsert handler: insert if absent, merge fields if present.
+//! The upsert handler itself: probe, merge or insert, persist, respond.
 //!
 //! Works for schemaless and strict collections. All internal transport
 //! uses nodedb_types::Value + zerompk (msgpack). No JSON roundtrips.
@@ -11,6 +11,7 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::rls_write_gate;
+use crate::data::executor::handlers::upsert::merge::{apply_on_conflict_updates, merge_values};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
@@ -27,6 +28,12 @@ pub(in crate::data::executor) struct UpsertParams<'a> {
     /// body this call actually stores — the merged row on the conflict branch,
     /// the incoming body on the insert branch. Empty = no write policy.
     pub rls_write_check: &'a [u8],
+    /// When `Some`, project the STORED post-image per spec: the merged row on
+    /// the conflict branch, the inserted row otherwise. Never the submitted
+    /// body — on a conflict the caller's values are only part of the result.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -51,6 +58,8 @@ impl CoreLoop {
             value,
             on_conflict_updates,
             rls_write_check,
+            returning,
+            rls_filters,
         } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -102,8 +111,10 @@ impl CoreLoop {
                 // Decode existing document to nodedb_types::Value.
                 let existing_val = if let Some(ref schema) = strict_schema {
                     // Strict: binary tuple → Value via schema.
-                    match super::super::strict_format::binary_tuple_to_value(&current_bytes, schema)
-                    {
+                    match crate::data::executor::strict_format::binary_tuple_to_value(
+                        &current_bytes,
+                        schema,
+                    ) {
                         Some(v) => v,
                         None => {
                             // Fallback: try msgpack (migration case).
@@ -169,7 +180,7 @@ impl CoreLoop {
                 // Encode merged value for storage.
                 let stored_bytes = if let Some(ref schema) = strict_schema {
                     let result = if bitemporal && schema.bitemporal {
-                        super::super::strict_format::value_to_binary_tuple_bitemporal(
+                        crate::data::executor::strict_format::value_to_binary_tuple_bitemporal(
                             &merged,
                             schema,
                             sys_from_ms,
@@ -177,7 +188,7 @@ impl CoreLoop {
                             i64::MAX,
                         )
                     } else {
-                        super::super::strict_format::value_to_binary_tuple(&merged, schema)
+                        crate::data::executor::strict_format::value_to_binary_tuple(&merged, schema)
                     };
                     match result {
                         Ok(bt) => bt,
@@ -268,7 +279,7 @@ impl CoreLoop {
                         // the merged body so KNN search reflects the overwrite in
                         // the same process. No-op when `has_vectors` is false.
                         if let Err(e) = self.update_reindex_vector_indexes(
-                            super::point::update_reindex_vector::UpdateVectorReindex {
+                            crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex {
                                 database_id,
                                 tid,
                                 collection,
@@ -289,7 +300,20 @@ impl CoreLoop {
                         // pre-upsert body and resurrects the old embedding.
                         // `stored_bytes` is moved in as its last use.
                         // An upsert always writes the row: one row affected.
-                        let mut response = self.response_affected(task, 1);
+                        let mut response = match returning {
+                            // The MERGED body, not the caller's: on a conflict
+                            // the submitted values are only part of what the
+                            // row now holds, so echoing them would report a
+                            // row that does not exist.
+                            Some(spec) => self.stored_returning_response(
+                                task,
+                                spec,
+                                rls_filters,
+                                strict_schema.as_ref(),
+                                &[(document_id, stored_bytes.as_slice())],
+                            ),
+                            None => self.response_affected(task, 1),
+                        };
                         if has_vectors {
                             response.write_set = vec![WriteSetEntry {
                                 surrogate: surrogate.as_u32(),
@@ -389,7 +413,16 @@ impl CoreLoop {
                 // index with the new embedding. `value` is a borrowed param here,
                 // so the post-image is copied. No-op when `has_vectors` is false.
                 // An upsert always writes the row: one row affected.
-                let mut response = self.response_affected(task, 1);
+                let mut response = match returning {
+                    Some(spec) => self.stored_returning_response(
+                        task,
+                        spec,
+                        rls_filters,
+                        strict_schema.as_ref(),
+                        &[(document_id, prior.stored_value.as_slice())],
+                    ),
+                    None => self.response_affected(task, 1),
+                };
                 if has_vectors {
                     response.write_set = vec![WriteSetEntry {
                         surrogate: surrogate.as_u32(),
@@ -406,68 +439,5 @@ impl CoreLoop {
                 },
             ),
         }
-    }
-}
-
-/// Apply `ON CONFLICT DO UPDATE SET` assignments against the existing row.
-///
-/// Each assignment's RHS is evaluated via `SqlExpr::eval` — identical to
-/// the UPDATE handler's path — so arithmetic (`n = n + 1`), functions
-/// (`name = UPPER(name)`), `CASE`, and concatenation all work. Literal
-/// assignments bypass the evaluator and decode their msgpack directly.
-pub(in crate::data::executor) fn apply_on_conflict_updates(
-    existing: nodedb_types::Value,
-    excluded: &nodedb_types::Value,
-    updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
-) -> crate::Result<nodedb_types::Value> {
-    let mut obj = match existing {
-        nodedb_types::Value::Object(map) => map,
-        // If the existing row isn't an object (shouldn't happen for
-        // document engines) fall back to the assignments as a blank slate.
-        _ => std::collections::HashMap::new(),
-    };
-    // Snapshot the row before any assignment applies, so all assignments
-    // see the pre-update state — matches PostgreSQL semantics. `excluded`
-    // is the row proposed for INSERT that triggered the conflict — it
-    // resolves `EXCLUDED.col` references inside the RHS expressions.
-    let snapshot = nodedb_types::Value::Object(obj.clone());
-    for (field, update_val) in updates {
-        let new_val: nodedb_types::Value = match update_val {
-            nodedb_physical::physical_plan::UpdateValue::Literal(bytes) => {
-                match nodedb_types::value_from_msgpack(bytes) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            }
-            // `ON CONFLICT DO UPDATE SET` is write-path-shaped: a
-            // division/modulo-by-zero fails the statement instead of
-            // silently writing NULL.
-            nodedb_physical::physical_plan::UpdateValue::Expr(expr) => {
-                expr.eval_with_excluded(&snapshot, excluded)?
-            }
-        };
-        obj.insert(field.clone(), new_val);
-    }
-    Ok(nodedb_types::Value::Object(obj))
-}
-
-/// Merge two `nodedb_types::Value` objects: overlay `new` fields onto `existing`.
-///
-/// Shared with the in-transaction staging path (`stage_write/stage_upsert.rs`)
-/// so a staged `UPSERT INTO` with no `ON CONFLICT DO UPDATE` clause merges
-/// identically to the autocommit handler above.
-pub(in crate::data::executor) fn merge_values(
-    existing: nodedb_types::Value,
-    new: nodedb_types::Value,
-) -> nodedb_types::Value {
-    match (existing, new) {
-        (nodedb_types::Value::Object(mut existing_map), nodedb_types::Value::Object(new_map)) => {
-            for (k, v) in new_map {
-                existing_map.insert(k, v);
-            }
-            nodedb_types::Value::Object(existing_map)
-        }
-        // If shapes don't match, new value wins entirely.
-        (_, new) => new,
     }
 }

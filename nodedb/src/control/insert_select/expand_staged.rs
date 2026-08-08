@@ -113,6 +113,10 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
                 value,
                 if_absent: false,
                 surrogate,
+                // Expanded internal writes answer no client — see the
+                // orchestrator's paged batch insert.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,

@@ -128,29 +128,46 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
              carries no row filter",
         ),
 
-        // Admit: the plan carries the whole post-image, so the write policy is
-        // evaluated against the exact row that will exist afterwards. The
-        // planner emits these bodies as MessagePack for every storage mode —
-        // the Data Plane re-encodes a strict collection's tuple on the way to
-        // disk — so the predicate reads the same field names a `SELECT` would.
-        // The read policy has nothing to restrict here: neither op returns a
-        // row.
+        // Admit the write image, then inject the read filter: the plan carries
+        // the whole post-image, so the write policy is evaluated against the
+        // exact row that will exist afterwards. The planner emits these bodies
+        // as MessagePack for every storage mode — the Data Plane re-encodes a
+        // strict collection's tuple on the way to disk — so the predicate reads
+        // the same field names a `SELECT` would.
+        //
+        // The read filter is not redundant with that admission. It gates a
+        // different thing: a `RETURNING` clause on these writes ships rows back,
+        // and that output is a read, so a row a read-only policy hides must not
+        // become visible just because the statement wrote it. The two policies
+        // are independent — a collection can carry a `FOR SELECT` policy and no
+        // write policy at all, in which case the write is unrestricted and the
+        // returned row set still shrinks.
         DocumentOp::PointPut {
-            collection, value, ..
+            collection,
+            value,
+            rls_filters,
+            ..
         }
         | DocumentOp::PointInsert {
-            collection, value, ..
-        } => ctx.admit_write_image(collection, value),
+            collection,
+            value,
+            rls_filters,
+            ..
+        } => {
+            ctx.admit_write_image(collection, value)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
 
         DocumentOp::BatchInsert {
             collection,
             documents,
+            rls_filters,
             ..
         } => {
             for (_, value) in documents.iter() {
                 ctx.admit_write_image(collection, value)?;
             }
-            Ok(())
+            ctx.set_post_filters(collection, rls_filters)
         }
 
         // Ship the write predicate: the insert body is in the plan, but the
@@ -159,12 +176,17 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         // of those images exists until the handler has read the stored row.
         // Admitting on the insert body alone would clear a write whose actual
         // post-image the policy never saw, so the handler tests whichever body
-        // it is about to store. No read policy applies — the op returns no row.
+        // it is about to store. The read filter rides along for the same reason
+        // it does on the plain inserts above: `RETURNING` output is a read.
         DocumentOp::Upsert {
             collection,
             rls_write_check,
+            rls_filters,
             ..
-        } => ctx.set_write_check(collection, rls_write_check),
+        } => {
+            ctx.set_write_check(collection, rls_write_check)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
 
         // Refuse: the rows come from a scan resolved after this pass, so the
         // plan carries no image to evaluate.
@@ -223,6 +245,8 @@ mod tests {
             value: body(owner_id),
             if_absent: false,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -283,6 +307,8 @@ mod tests {
             collection: "orders".into(),
             documents: vec![("d1".into(), body("42")), ("d2".into(), body("99"))],
             surrogates: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),
@@ -376,9 +402,28 @@ mod tests {
             on_conflict_updates: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(!write_check(&plan).is_empty());
+    }
+
+    /// A `RETURNING` on an insert ships rows back, so a read-only policy must
+    /// land in the insert's post-filter slot. Leaving it empty would return
+    /// rows the same principal's `SELECT` hides.
+    #[test]
+    fn insert_receives_the_read_policy_filter() {
+        let store = store_with_read_policy("orders");
+        let mut plan = point_insert("orders", "42");
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Document(DocumentOp::PointInsert { rls_filters, .. }) => assert!(
+                !rls_filters.is_empty(),
+                "the read policy must gate RETURNING output"
+            ),
+            other => panic!("plan shape changed: {other:?}"),
+        }
     }
 
     /// An unresolvable `$auth.*` in a write predicate denies the statement

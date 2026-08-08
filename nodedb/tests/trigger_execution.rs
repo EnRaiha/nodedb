@@ -133,6 +133,8 @@ fn classify_point_put_as_insert() {
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "orders");
@@ -658,6 +660,8 @@ fn classify_point_put_deserializes_json_value() {
         value,
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     let fields = info.new_fields.unwrap();
@@ -683,6 +687,8 @@ fn classify_point_put_deserializes_msgpack_value() {
         value,
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     let fields = info.new_fields.unwrap();

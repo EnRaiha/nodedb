@@ -284,6 +284,8 @@ fn to_replicated_entry_writes_only() {
         value: vec![],
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     assert!(to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan).is_some());
 
@@ -514,6 +516,8 @@ fn doc_batch_insert_roundtrip() {
         collection: "docs".into(),
         documents: documents.clone(),
         surrogates: surrogates.clone(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
@@ -529,6 +533,7 @@ fn doc_batch_insert_roundtrip() {
             collection,
             documents: decoded_docs,
             surrogates: decoded_surrogates,
+            ..
         }) => {
             assert_eq!(collection, "docs");
             assert_eq!(
@@ -1263,6 +1268,8 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
         value: vec![1, 2, 3],
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
 
     let entry = to_replicated_entry(tenant, database, vshard, &plan)
@@ -1747,6 +1754,8 @@ fn representative_handled_writes_still_replicate() {
         value: vec![1, 2, 3],
         surrogate: Surrogate::ZERO,
         pk_bytes: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     assert!(
         to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &point_put).is_some(),
