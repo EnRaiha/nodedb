@@ -44,7 +44,7 @@ impl CoreLoop {
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            normalized.push(sparse_row_to_doc(&id, &raw, &format));
+            normalized.push(sparse_row_to_doc(&id, &raw, format.as_format_ref()));
         }
         Ok(normalized)
     }

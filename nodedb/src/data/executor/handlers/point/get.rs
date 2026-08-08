@@ -6,6 +6,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
@@ -50,21 +51,17 @@ impl CoreLoop {
         );
 
         let database_id = task.request.database_id.as_u64();
-        // Check if this is a strict collection — affects decode format.
-        let config_key = (
+        // How this collection's sparse rows are encoded, resolved from its
+        // registered kind. Three encodings share the sparse store — schemaless
+        // document bodies, strict Binary Tuples, and vector-primary `zerompk`
+        // TAGGED sidecars — and a tagged map and a plain document map are both
+        // valid MessagePack maps with the same header, so no inspection of the
+        // bytes can separate them.
+        let body_format = self.sparse_body_format(
             task.request.database_id,
             crate::types::TenantId::new(tid),
-            collection.to_string(),
+            collection,
         );
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
 
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
         let is_temporal_read = system_as_of_ms.is_some() || valid_at_ms.is_some();
@@ -133,29 +130,30 @@ impl CoreLoop {
             }
         };
 
-        // RLS post-fetch: evaluate filters against msgpack bytes.
-        if !rls_filters.is_empty() {
-            if let Some(ref schema) = strict_schema {
-                // Strict: decode Binary Tuple to msgpack for RLS evaluation.
-                if let Some(mp) =
-                    super::super::super::strict_format::binary_tuple_to_msgpack(&data, schema)
-                    && !super::super::rls_eval::rls_check_msgpack_bytes(rls_filters, &mp)
-                {
-                    return self.response_with_payload(task, Vec::new());
-                }
-            } else if !super::super::rls_eval::rls_check_msgpack_bytes(rls_filters, &data) {
+        // Normalize once, then gate on the normalized image and return that
+        // same image. Evaluating RLS against the stored bytes drops a strict
+        // or vector-primary row on a format mismatch rather than on policy —
+        // the predicate finds no field it recognizes in a Binary Tuple or in a
+        // tagged sidecar — and returning the stored bytes hands the client
+        // `[4,"alice"]` where it asked for `alice`.
+        //
+        // The normalizer borrows when the stored body needed no transcode, so
+        // the common schemaless read costs nothing here; only a body that was
+        // actually rewritten yields an owned buffer, and only then is `data`
+        // superseded.
+        let transcoded = {
+            let normalized = sparse_body_to_msgpack(&data, body_format.as_format_ref());
+            if !rls_filters.is_empty()
+                && !super::super::rls_eval::rls_check_msgpack_bytes(rls_filters, &normalized)
+            {
                 return self.response_with_payload(task, Vec::new());
             }
-        }
+            match normalized {
+                std::borrow::Cow::Owned(v) => Some(v),
+                std::borrow::Cow::Borrowed(_) => None,
+            }
+        };
 
-        // For strict collections, return msgpack (decoded from Binary Tuple).
-        if let Some(ref schema) = strict_schema
-            && let Some(mp) =
-                super::super::super::strict_format::binary_tuple_to_msgpack(&data, schema)
-        {
-            return self.response_with_payload(task, mp);
-        }
-
-        self.response_with_payload(task, data)
+        self.response_with_payload(task, transcoded.unwrap_or(data))
     }
 }

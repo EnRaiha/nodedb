@@ -60,8 +60,14 @@ impl CoreLoop {
                 crate::types::TenantId::new(tid),
                 collection,
             );
+            // Owned: the hit outlives `bytes`, which is the storage read's
+            // local buffer.
             hit.body = Some(
-                crate::data::executor::scan_normalize::sparse_body_to_msgpack(&bytes, &format),
+                crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                    &bytes,
+                    format.as_format_ref(),
+                )
+                .into_owned(),
             );
         }
         hit

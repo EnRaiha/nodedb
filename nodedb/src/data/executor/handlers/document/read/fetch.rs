@@ -32,9 +32,9 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::scan_normalize::{sparse_body_to_msgpack, sparse_row_to_doc};
-use crate::data::executor::sparse_body_format::SparseBodyFormat;
+use crate::data::executor::sparse_body_format::{SparseBodyFormat, SparseBodyFormatRef};
+use crate::data::executor::strict_format;
 use crate::data::executor::task::ExecutionTask;
-use crate::data::executor::{doc_format, strict_format};
 
 /// Which temporal slice of a document collection a scan fetches.
 pub(in crate::data::executor) enum DocScanMode {
@@ -138,7 +138,19 @@ impl CoreLoop {
                 }
                 let rows = raw
                     .into_iter()
-                    .map(|(doc_id, body)| (doc_id, normalize_body(&body, strict_schema)))
+                    .map(|(doc_id, body)| {
+                        // A temporal read's bodies are strict Binary Tuples or
+                        // schemaless (possibly legacy-JSON) document bodies —
+                        // never sidecars, which the vector-primary branch
+                        // handles on its own — so the schema is the whole
+                        // question, and the shared converter answers it.
+                        let mp = sparse_body_to_msgpack(
+                            &body,
+                            SparseBodyFormatRef::from_schema(strict_schema),
+                        )
+                        .into_owned();
+                        (doc_id, mp)
+                    })
                     .collect();
                 Ok(FetchedRows {
                     rows,
@@ -248,8 +260,8 @@ impl CoreLoop {
             // rather than as an error.
             let normalized;
             let value = if is_vector_sidecar {
-                normalized = sparse_body_to_msgpack(value, &SparseBodyFormat::VectorSidecar);
-                normalized.as_slice()
+                normalized = sparse_body_to_msgpack(value, SparseBodyFormatRef::VectorSidecar);
+                &*normalized
             } else {
                 value
             };
@@ -361,7 +373,7 @@ impl CoreLoop {
         // through untouched and reach the client as `[4,"alice"]`.
         let rows = if is_vector_sidecar {
             rows.into_iter()
-                .map(|(id, body)| sparse_row_to_doc(&id, &body, &SparseBodyFormat::VectorSidecar))
+                .map(|(id, body)| sparse_row_to_doc(&id, &body, SparseBodyFormatRef::VectorSidecar))
                 .collect()
         } else {
             rows
@@ -371,17 +383,6 @@ impl CoreLoop {
             rows,
             effective_schema: strict_schema.cloned(),
         })
-    }
-}
-
-/// Normalize a stored versioned body to standard MessagePack: strict Binary
-/// Tuples via the schema, schemaless (possibly legacy-JSON) bodies via
-/// [`doc_format::json_to_msgpack`] (which passes through already-msgpack maps).
-fn normalize_body(body: &[u8], strict_schema: Option<&StrictSchema>) -> Vec<u8> {
-    match strict_schema {
-        Some(schema) => strict_format::binary_tuple_to_msgpack(body, schema)
-            .unwrap_or_else(|| doc_format::json_to_msgpack(body)),
-        None => doc_format::json_to_msgpack(body),
     }
 }
 

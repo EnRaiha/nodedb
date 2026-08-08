@@ -92,7 +92,6 @@ impl CoreLoop {
             );
         }
 
-        let strict_schema = self.strict_schema_for(task.request.database_id, tenant_id, collection);
         let rows = self.hydrate_text_hits(
             merged,
             HydrateTextHitsParams {
@@ -101,7 +100,6 @@ impl CoreLoop {
                 collection,
                 top_k,
                 rls_filters: &[],
-                strict_schema: strict_schema.as_ref(),
                 txn_id: task.request.txn_id,
             },
         );
@@ -185,17 +183,12 @@ impl CoreLoop {
             );
         }
 
-        // Retrieve the strict schema (if any) so binary-tuple rows decode correctly.
-        let config_key = (task.request.database_id, tenant_id, collection.to_string());
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
+        // The body encoding of this collection's sparse rows, resolved from
+        // its registered kind. This scan returns EVERY row (a row with no FTS
+        // hit gets a null score), so it reaches vector-primary sidecars even
+        // when the inverted index holds nothing for the collection — and a
+        // sidecar decoded as a document body renders `[4,"alice"]`.
+        let format = self.sparse_body_format(task.request.database_id, tenant_id, collection);
 
         // Scan all documents and inject the score field.
         let scan_result = self.sparse.scan_documents(
@@ -241,7 +234,7 @@ impl CoreLoop {
 
         let mut rows: Vec<DocumentRow> = Vec::with_capacity(docs.len());
         for (hex_key, bytes) in &docs {
-            let mut value = decode_scanned_document(bytes, strict_schema.as_ref());
+            let mut value = decode_scanned_document(bytes, format.as_format_ref());
             // Inject score into the document object.
             if let serde_json::Value::Object(ref mut map) = value {
                 let score = crate::engine::document::store::doc_id_to_surrogate(hex_key)

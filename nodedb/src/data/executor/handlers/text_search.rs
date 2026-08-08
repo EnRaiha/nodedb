@@ -10,9 +10,10 @@ use nodedb_fts::posting::QueryMode;
 use crate::bridge::envelope::{ErrorCode, Response};
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
+use crate::data::executor::handlers::document::read::decode::decode_scanned_row;
 use crate::data::executor::handlers::transaction::overlay::FtsMergeParams;
 use crate::data::executor::response_codec::DocumentRow;
+use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TxnId};
 
@@ -31,13 +32,18 @@ pub(in crate::data::executor) struct TextSearchParams<'a> {
 ///
 /// Shared by `text_search.rs`, `text_search_scan.rs`, and any future handler
 /// that needs to resolve FTS surrogates back to document rows.
+///
+/// There is deliberately no encoding field: the body encoding is resolved
+/// inside [`CoreLoop::hydrate_text_hits`] from `database_id` / `tid` /
+/// `collection`, the same way every other sparse reader resolves it, so a
+/// caller cannot hand this helper the wrong one (or omit it and get the
+/// schemaless default for a strict or vector-primary collection).
 pub(in crate::data::executor) struct HydrateTextHitsParams<'a> {
     pub database_id: u64,
     pub tid: u64,
     pub collection: &'a str,
     pub top_k: usize,
     pub rls_filters: &'a [u8],
-    pub strict_schema: Option<&'a nodedb_types::columnar::StrictSchema>,
     /// The issuing transaction, when this read runs inside `BEGIN..COMMIT`.
     /// A matched surrogate's body is resolved from this transaction's
     /// staging overlay first (a doc inserted/updated in THIS transaction is
@@ -122,7 +128,6 @@ impl CoreLoop {
             );
         }
 
-        let strict_schema = self.strict_schema_for(task.request.database_id, tenant_id, collection);
         let rows = self.hydrate_text_hits(
             merged,
             HydrateTextHitsParams {
@@ -131,7 +136,6 @@ impl CoreLoop {
                 collection,
                 top_k,
                 rls_filters,
-                strict_schema: strict_schema.as_ref(),
                 txn_id: task.request.txn_id,
             },
         );
@@ -182,7 +186,6 @@ impl CoreLoop {
             collection,
             top_k,
             rls_filters,
-            strict_schema,
             txn_id,
         } = params;
         // Read-your-own-writes for the projection step: a matched surrogate
@@ -196,6 +199,12 @@ impl CoreLoop {
             TenantId::new(tid),
             collection.to_string(),
         );
+        // Resolved once, from the collection's registered kind — never from
+        // the bytes. A vector-primary sidecar and a schemaless document body
+        // are both valid MessagePack maps with the same header, so sniffing
+        // necessarily mis-reads one of them.
+        let format =
+            self.sparse_body_format(DatabaseId::new(database_id), TenantId::new(tid), collection);
         let mut rows: Vec<DocumentRow> = Vec::new();
         for (surrogate, score, fuzzy) in hits {
             if rows.len() >= top_k {
@@ -223,12 +232,27 @@ impl CoreLoop {
             // (the common case in sync interop tests and CDC pipelines) still
             // receive a result. RLS filters are skipped when there is no body.
             let mut value = if let Some(ref bytes) = bytes_opt {
-                if !rls_filters.is_empty()
-                    && !super::rls_eval::rls_check_msgpack_bytes(rls_filters, bytes)
-                {
-                    continue;
-                }
-                decode_scanned_document(bytes, strict_schema)
+                // RLS is evaluated against the NORMALIZED msgpack image — the
+                // same bytes the projection below reads — so the gate and the
+                // output agree. A strict Binary Tuple is not a msgpack map at
+                // all and a vector-primary sidecar is a TAGGED one, so a
+                // predicate pushed at the stored bytes finds no field it
+                // recognizes and drops the row on a format mismatch rather
+                // than on policy.
+                //
+                // The image built for the gate is then handed to the decoder
+                // rather than dropped, so a sidecar row is transcoded once for
+                // both steps.
+                let normalized = if rls_filters.is_empty() {
+                    None
+                } else {
+                    let normalized = sparse_body_to_msgpack(bytes, format.as_format_ref());
+                    if !super::rls_eval::rls_check_msgpack_bytes(rls_filters, &normalized) {
+                        continue;
+                    }
+                    Some(normalized)
+                };
+                decode_scanned_row(bytes, normalized.as_deref(), format.as_format_ref())
             } else {
                 serde_json::Value::Object(serde_json::Map::new())
             };

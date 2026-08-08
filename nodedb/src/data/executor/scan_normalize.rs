@@ -188,7 +188,7 @@ impl CoreLoop {
         );
         self.sparse
             .scan_documents_for_each(did, tid, collection, usize::MAX, |id, raw| {
-                let (id_s, mp) = sparse_row_to_doc(id, raw, &format);
+                let (id_s, mp) = sparse_row_to_doc(id, raw, format.as_format_ref());
                 f(&id_s, &mp)
             })?;
         Ok(())
@@ -393,7 +393,7 @@ impl CoreLoop {
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            normalized.push(sparse_row_to_doc(&id, &raw, &format));
+            normalized.push(sparse_row_to_doc(&id, &raw, format.as_format_ref()));
         }
         Ok(normalized)
     }

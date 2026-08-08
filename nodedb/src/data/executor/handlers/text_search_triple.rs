@@ -19,6 +19,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::graph_expansion::{GraphExpansionParams, GraphSeeds};
 use crate::data::executor::handlers::graph_rag::graph_nodes_to_ranked_results;
+use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
 
@@ -214,6 +215,16 @@ impl CoreLoop {
         );
 
         // 5. Materialise results with per-engine rank diagnostics (reusing HybridSearchHit).
+        //
+        // The RLS predicate runs against the NORMALIZED msgpack image, never
+        // the stored bytes: a strict Binary Tuple is not a msgpack map at all
+        // and a vector-primary sidecar is a TAGGED one, so a predicate pushed
+        // at the stored bytes finds no field it recognizes and the row is
+        // dropped on a format mismatch rather than on policy. The encoding is
+        // resolved from the collection's registered kind — a tagged map and a
+        // plain document map share the same map header, so the bytes cannot
+        // answer it.
+        let body_format = self.sparse_body_format(task.request.database_id, tenant_id, collection);
         let results: Vec<_> = fused
             .iter()
             .filter(|f| {
@@ -227,7 +238,9 @@ impl CoreLoop {
                     &f.document_id,
                 ) {
                     Ok(Some(bytes)) => {
-                        super::rls_eval::rls_check_msgpack_bytes(rls_filters, &bytes)
+                        let normalized =
+                            sparse_body_to_msgpack(&bytes, body_format.as_format_ref());
+                        super::rls_eval::rls_check_msgpack_bytes(rls_filters, &normalized)
                     }
                     _ => false,
                 }

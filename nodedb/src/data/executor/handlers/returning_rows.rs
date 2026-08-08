@@ -17,7 +17,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::response_codec::RowsPayload;
 use crate::data::executor::scan_normalize::{kv_row_to_doc, sparse_row_to_doc};
-use crate::data::executor::sparse_body_format::SparseBodyFormat;
+use crate::data::executor::sparse_body_format::SparseBodyFormatRef;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
 use nodedb_types::columnar::StrictSchema;
@@ -169,7 +169,7 @@ impl CoreLoop {
     /// just stored.
     ///
     /// The row image comes from [`sparse_row_to_doc`] against
-    /// [`SparseBodyFormat::VectorSidecar`] — the SAME converter the `SELECT`
+    /// [`SparseBodyFormatRef::VectorSidecar`] — the SAME converter the `SELECT`
     /// scan resolves for this collection — so the returned row is byte-for-byte
     /// what a later read renders. The sidecar is `zerompk` TAGGED bytes, which
     /// an ordinary document decode ACCEPTS and misreads: a stored `"alice"`
@@ -192,7 +192,7 @@ impl CoreLoop {
         row_key: &str,
         sidecar: &[u8],
     ) -> Response {
-        let (_id, mp) = sparse_row_to_doc(row_key, sidecar, &SparseBodyFormat::VectorSidecar);
+        let (_id, mp) = sparse_row_to_doc(row_key, sidecar, SparseBodyFormatRef::VectorSidecar);
         let docs: Vec<serde_json::Value> = doc_format::decode_document(&mp)
             .map(|doc| vec![doc])
             .unwrap_or_default();

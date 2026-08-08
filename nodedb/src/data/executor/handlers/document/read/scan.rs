@@ -4,16 +4,16 @@
 
 use tracing::{debug, warn};
 
-use super::decode::{decode_scanned_document, decode_scanned_document_msgpack};
+use super::decode::decode_scanned_document;
 use super::fetch::{DocFetchParams, DocScanMode};
 use super::projection::{apply_projection, apply_projection_msgpack};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::handlers::document::sort;
 use crate::data::executor::response_codec::DocumentRow;
-use crate::data::executor::strict_format;
+use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
+use crate::data::executor::sparse_body_format::SparseBodyFormatRef;
 use crate::data::executor::task::ExecutionTask;
 
 /// Parameters for [`CoreLoop::execute_document_scan`].
@@ -138,6 +138,15 @@ impl CoreLoop {
             Ok(fetched) => {
                 let mut filtered = fetched.rows;
                 let effective_schema = fetched.effective_schema;
+                // The encoding the rows arrive in from the fetch stage. It is
+                // NOT the collection's stored encoding: the fetch stage has
+                // already normalized a vector-primary collection's tagged
+                // sidecars (and every temporal read's bodies) to standard
+                // msgpack, and reports a schema only when the bodies it hands
+                // back are still Binary Tuples. Re-resolving the collection's
+                // stored kind here would decode already-normalized bodies a
+                // second time.
+                let body_format = SparseBodyFormatRef::from_schema(effective_schema.as_ref());
 
                 if let Some(ref m) = self.metrics {
                     m.record_document_read();
@@ -211,21 +220,20 @@ impl CoreLoop {
                 }
 
                 // Strict collections may store binary tuples. Sort and projection
-                // operate on msgpack, so normalize binary tuples here.
+                // operate on msgpack, so normalize binary tuples here — through
+                // the shared converter, which leaves an already-msgpack body
+                // borrowed and so costs nothing on the schemaless path.
                 let filtered = if !sort_keys.is_empty() || !projection.is_empty() {
-                    if let Some(ref schema) = effective_schema {
-                        filtered
-                            .into_iter()
-                            .map(|(id, bytes)| {
-                                match strict_format::binary_tuple_to_msgpack(&bytes, schema) {
-                                    Some(mp) => (id, mp),
-                                    None => (id, bytes),
-                                }
-                            })
-                            .collect()
-                    } else {
-                        filtered
-                    }
+                    filtered
+                        .into_iter()
+                        .map(|(id, bytes)| {
+                            let transcoded = match sparse_body_to_msgpack(&bytes, body_format) {
+                                std::borrow::Cow::Owned(mp) => Some(mp),
+                                std::borrow::Cow::Borrowed(_) => None,
+                            };
+                            (id, transcoded.unwrap_or(bytes))
+                        })
+                        .collect()
                 } else {
                     filtered
                 };
@@ -255,9 +263,7 @@ impl CoreLoop {
 
                 let stream_chunk_size = self.query_tuning.stream_chunk_size;
 
-                if let Some(ref schema) = effective_schema
-                    && window_specs.is_empty()
-                {
+                if effective_schema.is_some() && window_specs.is_empty() {
                     // SQL DISTINCT semantics require deduplication on the
                     // *projected* row, not the raw document bytes — two rows
                     // with the same `category` but different ids/payload are
@@ -266,7 +272,7 @@ impl CoreLoop {
                     let projected_rows: Vec<_> = match sorted
                         .into_iter()
                         .map(|(doc_id, val)| {
-                            let mp = decode_scanned_document_msgpack(&val, Some(schema));
+                            let mp = sparse_body_to_msgpack(&val, body_format);
                             let projected =
                                 apply_projection_msgpack(&mp, &computed_cols, projection)?;
                             Ok((doc_id, projected))
@@ -293,7 +299,7 @@ impl CoreLoop {
                     let mut decoded_rows: Vec<(String, serde_json::Value)> = sorted
                         .into_iter()
                         .map(|(id, val)| {
-                            let doc = decode_scanned_document(&val, effective_schema.as_ref());
+                            let doc = decode_scanned_document(&val, body_format);
                             (id, doc)
                         })
                         .collect();
@@ -342,7 +348,7 @@ impl CoreLoop {
                         let projected_rows: Vec<_> = match sorted
                             .into_iter()
                             .map(|(doc_id, value)| {
-                                let mp = doc_format::json_to_msgpack(&value);
+                                let mp = sparse_body_to_msgpack(&value, body_format);
                                 let projected =
                                     apply_projection_msgpack(&mp, &computed_cols, projection)?;
                                 Ok((doc_id, projected))

@@ -77,30 +77,44 @@ pub(super) fn encode_to_msgpack(value: &serde_json::Value) -> Vec<u8> {
     })
 }
 
-/// Convert JSON bytes to MessagePack bytes.
-///
-/// If the input is already MessagePack, returns it unchanged.
+/// Convert JSON bytes to MessagePack bytes, borrowing when nothing changes.
 ///
 /// Handles three input formats:
-/// - Standard msgpack map (0x80–0x8F / 0xDE / 0xDF): returned as-is.
-/// - JSON bytes: parsed and re-encoded as standard msgpack map.
-/// - Unknown bytes: returned as-is.
-pub(super) fn json_to_msgpack(bytes: &[u8]) -> Vec<u8> {
+/// - Standard msgpack map (0x80–0x8F / 0xDE / 0xDF): borrowed as-is.
+/// - JSON bytes: parsed and re-encoded as standard msgpack map (owned).
+/// - Unknown bytes: borrowed as-is.
+///
+/// The common case on a scan is the first one, where the stored body is
+/// already the wanted encoding — borrowing there is what keeps a whole-scan
+/// normalization pass from being a per-row `memcpy` of every document body.
+pub(super) fn json_to_msgpack_cow(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+
     if bytes.is_empty() {
-        return bytes.to_vec();
+        return Cow::Borrowed(bytes);
     }
 
-    // Already a standard MessagePack map? Return as-is.
+    // Already a standard MessagePack map? Pass through untouched.
     let first = bytes[0];
     if (0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF {
-        return bytes.to_vec();
+        return Cow::Borrowed(bytes);
     }
 
     // Try parsing as JSON and converting to MessagePack.
     match sonic_rs::from_slice::<serde_json::Value>(bytes) {
-        Ok(value) => encode_to_msgpack(&value),
-        Err(_) => bytes.to_vec(),
+        Ok(value) => Cow::Owned(encode_to_msgpack(&value)),
+        Err(_) => Cow::Borrowed(bytes),
     }
+}
+
+/// Owning form of [`json_to_msgpack_cow`], for callers that must keep the
+/// result past the input's lifetime or hand it on as a `Vec`.
+///
+/// The rules live in the `_cow` form and only there; this is a one-line
+/// adapter so the two forms cannot disagree about what a given body decodes
+/// to.
+pub(super) fn json_to_msgpack(bytes: &[u8]) -> Vec<u8> {
+    json_to_msgpack_cow(bytes).into_owned()
 }
 
 /// Convert a vector-primary metadata sidecar body to a standard MessagePack map.
@@ -117,17 +131,20 @@ pub(super) fn json_to_msgpack(bytes: &[u8]) -> Vec<u8> {
 ///
 /// Bytes that do not decode as a tagged map are returned unchanged rather than
 /// re-guessed — a sidecar that cannot be read as one is not something a second
-/// format guess can rescue.
-pub(super) fn vector_sidecar_to_msgpack(bytes: &[u8]) -> Vec<u8> {
+/// format guess can rescue. Those pass-through cases borrow; only the real
+/// transcode allocates.
+pub(super) fn vector_sidecar_to_msgpack_cow(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+
     if bytes.is_empty() {
-        return bytes.to_vec();
+        return Cow::Borrowed(bytes);
     }
     match zerompk::from_msgpack::<std::collections::HashMap<String, nodedb_types::Value>>(bytes) {
         Ok(map) => {
             let json: serde_json::Value = nodedb_types::Value::Object(map).into();
-            encode_to_msgpack(&json)
+            Cow::Owned(encode_to_msgpack(&json))
         }
-        Err(_) => bytes.to_vec(),
+        Err(_) => Cow::Borrowed(bytes),
     }
 }
 
@@ -271,7 +288,7 @@ mod tests {
             "the document normalizer must NOT be the thing that fixes this"
         );
 
-        let normalized = vector_sidecar_to_msgpack(&tagged);
+        let normalized = vector_sidecar_to_msgpack_cow(&tagged);
         let doc = decode_document(&normalized).expect("sidecar must decode as msgpack");
         assert_eq!(doc.get("owner").and_then(|v| v.as_str()), Some("alice"));
         assert_eq!(doc.get("id").and_then(|v| v.as_str()), Some("r1"));
@@ -281,8 +298,8 @@ mod tests {
     fn a_non_sidecar_body_is_returned_unchanged() {
         let value = serde_json::json!({"a": 1});
         let msgpack = nodedb_types::json_to_msgpack(&value).unwrap();
-        assert_eq!(vector_sidecar_to_msgpack(&msgpack), msgpack);
-        assert!(vector_sidecar_to_msgpack(b"").is_empty());
+        assert_eq!(vector_sidecar_to_msgpack_cow(&msgpack), msgpack);
+        assert!(vector_sidecar_to_msgpack_cow(b"").is_empty());
     }
 
     #[test]

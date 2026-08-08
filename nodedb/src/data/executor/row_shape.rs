@@ -13,7 +13,7 @@
 
 use nodedb_query::msgpack_scan;
 
-use super::sparse_body_format::SparseBodyFormat;
+use super::sparse_body_format::SparseBodyFormatRef;
 
 /// Convert a single KV engine entry to a `(key, msgpack)` document.
 ///
@@ -30,21 +30,33 @@ pub(in crate::data::executor) fn kv_row_to_doc(key: &[u8], value: &[u8]) -> (Str
 
 /// Normalize one sparse-store row's bytes to a standard msgpack map.
 ///
-/// The single decision point for how a sparse body is decoded. Both readers of
-/// a sidecar row — the `SELECT` scan (via [`sparse_row_to_doc`]) and the vector
-/// search body attach — come through here, so neither can drift into its own
-/// private notion of the encoding.
-pub(in crate::data::executor) fn sparse_body_to_msgpack(
-    raw: &[u8],
-    format: &SparseBodyFormat,
-) -> Vec<u8> {
+/// THE single decision point for how a sparse body is decoded — every reader of
+/// a sparse row comes through here, from the `SELECT` scan (via
+/// [`sparse_row_to_doc`]) to the vector search body attach to the audit/`AS OF`
+/// read, so none of them can drift into its own private notion of the encoding.
+/// A caller that finds itself writing `match format { Document => …, Strict =>
+/// … }` is re-creating this function badly; pass the format down instead.
+///
+/// The result BORROWS `raw` whenever no transcode was needed — which is the
+/// ordinary case for a schemaless document body, already stored as a standard
+/// msgpack map. That is precisely why a caller must NOT special-case
+/// `SparseBodyFormatRef::Document` to "skip the copy": there is no copy to skip,
+/// and a hand-written carve-out only re-creates the format decision this
+/// function exists to own. Call it unconditionally and use the result as
+/// `&[u8]`; take `.into_owned()` only where an owned `Vec` is genuinely
+/// required.
+pub(in crate::data::executor) fn sparse_body_to_msgpack<'a>(
+    raw: &'a [u8],
+    format: SparseBodyFormatRef<'_>,
+) -> std::borrow::Cow<'a, [u8]> {
     match format {
-        SparseBodyFormat::Strict(schema) => {
+        SparseBodyFormatRef::Strict(schema) => {
             super::strict_format::binary_tuple_to_msgpack(raw, schema)
-                .unwrap_or_else(|| super::doc_format::json_to_msgpack(raw))
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or_else(|| super::doc_format::json_to_msgpack_cow(raw))
         }
-        SparseBodyFormat::Document => super::doc_format::json_to_msgpack(raw),
-        SparseBodyFormat::VectorSidecar => super::doc_format::vector_sidecar_to_msgpack(raw),
+        SparseBodyFormatRef::Document => super::doc_format::json_to_msgpack_cow(raw),
+        SparseBodyFormatRef::VectorSidecar => super::doc_format::vector_sidecar_to_msgpack_cow(raw),
     }
 }
 
@@ -59,7 +71,7 @@ pub(in crate::data::executor) fn sparse_body_to_msgpack(
 pub(in crate::data::executor) fn sparse_row_to_doc(
     id: &str,
     raw: &[u8],
-    format: &SparseBodyFormat,
+    format: SparseBodyFormatRef<'_>,
 ) -> (String, Vec<u8>) {
     let mp = sparse_body_to_msgpack(raw, format);
     let mp = msgpack_scan::inject_str_field(&mp, "id", id);

@@ -228,7 +228,7 @@ impl CoreLoop {
                     let (_, doc_mp) = crate::data::executor::scan_normalize::sparse_row_to_doc(
                         &doc_id,
                         &raw,
-                        &body_format,
+                        body_format.as_format_ref(),
                     );
                     match super::super::doc_format::decode_document_value(&doc_mp) {
                         Some(d) => d,
