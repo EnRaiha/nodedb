@@ -2501,6 +2501,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
+            rls_write_check: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -2562,6 +2563,7 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -2618,6 +2620,7 @@ mod tests {
             wal_lsn: None,
             surrogates: vec![Surrogate::new(701)],
             provenance: None,
+            rls_write_check: Vec::new(),
         });
 
         let redo = decode_redo(&src.execute_resolve_txn(&task, TID, txn, &[plan]));
@@ -2678,6 +2681,7 @@ mod tests {
             collection: "cevents".to_string(),
             filters: Vec::new(),
             updates: vec![("a".to_string(), vec![1, 2, 3])],
+            rls_write_check: Vec::new(),
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(44), &[update]);
         assert_eq!(resp.status, Status::Ok);
@@ -2694,6 +2698,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "cevents".to_string(),
             filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(45), &[delete]);
         assert_eq!(resp.status, Status::Ok);
@@ -2840,6 +2845,7 @@ mod tests {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
+                rls_write_check: Vec::new(),
             }),
         ];
 

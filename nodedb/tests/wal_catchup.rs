@@ -200,6 +200,7 @@ async fn wal_redispatch_makes_data_queryable() {
                     wal_lsn: Some(record.header.lsn),
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 collection,
             )
@@ -289,6 +290,7 @@ async fn catchup_fills_gaps_from_spsc_drops() {
                     wal_lsn: Some(record.header.lsn),
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 collection,
             )
@@ -438,6 +440,7 @@ async fn production_scenario_catchup_drains_wal_after_ingest() {
                         wal_lsn: None,
                         surrogates: Vec::new(),
                         provenance: None,
+                        rls_write_check: Vec::new(),
                     }),
                     collection,
                 )

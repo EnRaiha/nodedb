@@ -15,7 +15,7 @@ pub mod schema;
 pub mod spatial;
 
 pub(in crate::data::executor) use insert::ColumnarInsertParams;
-pub(in crate::data::executor) use schema::ndb_field_to_value;
+pub(in crate::data::executor) use schema::{ndb_field_to_value, row_values_to_object};
 // `ensure_columnar_engine_schema` is an inherent `CoreLoop` method (defined
 // in `schema.rs`), called via `self.` — no re-export needed.
 // `flush_columnar_memtable_if_needed`, `index_columnar_geometry_columns`, and

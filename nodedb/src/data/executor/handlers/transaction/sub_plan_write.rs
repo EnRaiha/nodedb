@@ -228,10 +228,17 @@ impl CoreLoop {
         collection: &str,
         filters: &[u8],
         updates: &[(String, Vec<u8>)],
+        rls_write_check: &[u8],
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
-        let resp =
-            self.execute_columnar_update(dummy_task, collection, filters, updates, Some(undo_log));
+        let resp = self.execute_columnar_update(
+            dummy_task,
+            collection,
+            filters,
+            updates,
+            rls_write_check,
+            Some(undo_log),
+        );
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "columnar update failed".into(),
@@ -246,9 +253,16 @@ impl CoreLoop {
         dummy_task: &ExecutionTask,
         collection: &str,
         filters: &[u8],
+        rls_write_check: &[u8],
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
-        let resp = self.execute_columnar_delete(dummy_task, collection, filters, Some(undo_log));
+        let resp = self.execute_columnar_delete(
+            dummy_task,
+            collection,
+            filters,
+            rls_write_check,
+            Some(undo_log),
+        );
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "columnar delete failed".into(),

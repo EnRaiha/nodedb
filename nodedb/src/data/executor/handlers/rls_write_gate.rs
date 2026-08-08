@@ -21,8 +21,12 @@
 //! bounds which rows a `RETURNING` clause may show, this one bounds which rows
 //! may be written at all.
 
-use nodedb_types::columnar::StrictSchema;
+use nodedb_types::columnar::{ColumnarSchema, StrictSchema};
 
+use crate::bridge::scan_filter::ScanFilter;
+
+use super::columnar_read::filter::value_matches_filters;
+use super::columnar_write::row_values_to_object;
 use super::returning_doc;
 use super::rls_eval;
 
@@ -80,10 +84,61 @@ pub(in crate::data::executor) fn admit_stored_row(
     }
 }
 
+/// Decide one row image held as a [`nodedb_types::Value`] object.
+///
+/// The columnar family never materializes a row as a JSON document: its rows
+/// are typed `Value`s, in schema order, and its own WHERE evaluation already
+/// tests them through [`value_matches_filters`]. Routing the write gate through
+/// that same evaluator is what keeps one compiled predicate from meaning one
+/// thing on the read side and another on the write side — a JSON round-trip
+/// here would retype every value on the way through.
+///
+/// Fails closed: an undecodable filter payload or an evaluation error denies.
+pub(in crate::data::executor) fn admit_value_row(
+    rls_write_check: &[u8],
+    image: &nodedb_types::Value,
+    tid: u64,
+    collection: &str,
+) -> crate::Result<()> {
+    if rls_write_check.is_empty() {
+        return Ok(());
+    }
+    let admitted = match zerompk::from_msgpack::<Vec<ScanFilter>>(rls_write_check) {
+        Ok(filters) => value_matches_filters(image, &filters).unwrap_or(false),
+        Err(_) => false,
+    };
+    if admitted {
+        return Ok(());
+    }
+    Err(crate::Error::RejectedAuthz {
+        tenant_id: crate::types::TenantId::new(tid),
+        resource: format!("RLS write policy on '{collection}' rejected the row"),
+    })
+}
+
+/// Decide one schema-ordered columnar row — the values about to be written, or
+/// the values about to be removed — against the compiled write policy.
+pub(in crate::data::executor) fn admit_columnar_row(
+    rls_write_check: &[u8],
+    row: &[nodedb_types::value::Value],
+    schema: &ColumnarSchema,
+    tid: u64,
+    collection: &str,
+) -> crate::Result<()> {
+    if rls_write_check.is_empty() {
+        return Ok(());
+    }
+    admit_value_row(
+        rls_write_check,
+        &row_values_to_object(schema, row),
+        tid,
+        collection,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::scan_filter::ScanFilter;
     use serde_json::json;
 
     fn owner_policy(value: &str) -> Vec<u8> {

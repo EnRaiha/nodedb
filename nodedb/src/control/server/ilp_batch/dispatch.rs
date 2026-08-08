@@ -164,7 +164,23 @@ async fn flush_ilp_batch_inner(
 ) -> crate::Result<u64> {
     let tenant_id = identity.tenant_id;
     let total_rows = preflighted_row_count(&groups)?;
-    let tasks = build_ilp_calvin_tasks(tenant_id, database_id, &groups)?;
+    let mut tasks = build_ilp_calvin_tasks(tenant_id, database_id, &groups)?;
+
+    // This transport builds its physical tasks itself instead of going through
+    // the SQL planner, so it has to run the planner's row-level-security pass
+    // over them explicitly — without this the line-protocol listener would be a
+    // way to write rows a write policy forbids, with the same identity and the
+    // same collection that `INSERT` refuses. The resolved scope is the same one
+    // the metering pass below uses, so the policy is evaluated for exactly the
+    // principal this batch is billed and audited as.
+    //
+    // It runs BEFORE `authorize_task_set` and before dispatch: the pass mutates
+    // the tasks (it compiles the write predicate onto each `Ingest`), and an
+    // authorized task set is what gets dispatched, so injecting afterwards
+    // would dispatch the un-injected copies.
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    crate::control::planner::rls_injection::inject_rls(&mut tasks, &state.rls, scope.auth())?;
+
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
     let authorized =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)
@@ -195,7 +211,6 @@ async fn flush_ilp_batch_inner(
     // (`build_ilp_calvin_tasks` iterates `groups` in order), so zipping
     // them pairs each task with the row count it actually carried.
     if state.metering_config.enabled {
-        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
         for (task, group) in tasks.iter().zip(groups.iter()) {
             let info = PlanMeteringInfo::extract(&task.plan);
             let rows = u64::try_from(group.raw_lines.len()).ok();
@@ -264,6 +279,11 @@ fn build_ilp_calvin_tasks(
                     wal_lsn: None,
                     surrogates,
                     provenance: None,
+                    // Filled by `inject_rls` in `flush_ilp_batch_inner`, which
+                    // runs over these tasks before they are authorized or
+                    // dispatched. Left empty here so this builder stays a pure
+                    // function of the preflighted batch.
+                    rls_write_check: Vec::new(),
                 }),
                 post_set_op: PostSetOp::None,
                 txn_id: None,
@@ -351,6 +371,67 @@ mod tests {
         );
     }
 
+    /// The line-protocol listener builds its physical tasks itself instead of
+    /// going through the SQL planner, so it has to run the row-level-security
+    /// injection pass explicitly. Before that call existed, this transport
+    /// reached the Data Plane without the pass running at all — a write policy
+    /// that refuses an `INSERT` into a collection did nothing to an ILP batch
+    /// into the same collection under the same identity.
+    ///
+    /// The policy here names an `$auth` field the identity does not carry, so
+    /// the pass fails closed and refuses before dispatch — an outcome only the
+    /// injection pass can produce, which is what makes this a regression test
+    /// for the pass being called rather than for anything downstream.
+    #[tokio::test]
+    async fn ilp_ingest_runs_the_row_level_security_injection_pass() {
+        use crate::control::security::predicate::{CompareOp, PredicateValue, RlsPredicate};
+        use crate::control::security::rls::{PolicyType, RlsPolicy};
+
+        let directory = tempfile::tempdir().expect("create ILP RLS test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("ilp-rls.wal"))
+                .expect("open ILP RLS test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = Arc::new(SharedState::new(dispatcher, wal).expect("construct ILP RLS state"));
+        let database_id = DatabaseId::new(7);
+        grant_write(&state.permissions, "cpu");
+        state
+            .rls
+            .create_policy(RlsPolicy {
+                name: "cpu_owner".into(),
+                collection: "cpu".into(),
+                tenant_id: 9,
+                policy_type: PolicyType::Write,
+                compiled_predicate: Some(RlsPredicate::Compare {
+                    field: "owner".into(),
+                    op: CompareOp::Eq,
+                    value: PredicateValue::AuthRef("nonexistent_field".into()),
+                }),
+                mode: Default::default(),
+                on_deny: Default::default(),
+                enabled: true,
+                created_by: "admin".into(),
+                created_at: 0,
+            })
+            .expect("create ILP write policy");
+
+        let error = flush_authenticated_ilp_batch(
+            &state,
+            &identity(database_id),
+            database_id,
+            "127.0.0.1:9009",
+            "cpu,owner=mallory value=1i\n",
+        )
+        .await
+        .expect_err("an unresolvable policy must refuse the batch before dispatch");
+
+        assert!(
+            matches!(error, crate::Error::RejectedAuthz { .. }),
+            "the refusal must come from the RLS pass, got {error:?}"
+        );
+    }
+
     #[test]
     fn schema_projection_slot_admits_exactly_one_merge_at_a_time() {
         // The bound that keeps ingest from queueing blocking-pool threads
@@ -410,6 +491,7 @@ mod tests {
             format,
             wal_lsn,
             surrogates,
+            rls_write_check,
             ..
         }) = &tasks[0].plan
         else {
@@ -418,6 +500,10 @@ mod tests {
         assert_eq!(collection, "cpu");
         assert_eq!(format, "ilp-msgpack");
         assert_eq!(*wal_lsn, None);
+        assert!(
+            rls_write_check.is_empty(),
+            "the builder must leave the predicate to the injection pass"
+        );
         assert_eq!(surrogates, &vec![Surrogate::new(1), Surrogate::new(2)]);
         assert_eq!(
             zerompk::from_msgpack::<Vec<String>>(payload).expect("payload"),

@@ -113,6 +113,10 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             wal_lsn,
             surrogates: Vec::new(),
             provenance: Some(prov),
+            // Edge-to-origin sync replays rows already decided by the policy
+            // where they were written; the writing device's session is not
+            // present here to resolve `$auth.*` against.
+            rls_write_check: Vec::new(),
         });
 
         let authorized = super::raft_dispatch::authorize_sync_task(

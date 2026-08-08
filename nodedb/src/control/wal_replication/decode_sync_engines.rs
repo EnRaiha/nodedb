@@ -52,6 +52,7 @@ pub fn columnar_ingest(
         schema_bytes: schema_bytes.to_vec(),
         provenance,
         wal_lsn: None,
+        rls_write_check: Vec::new(),
     }))
 }
 
@@ -70,6 +71,7 @@ pub fn timeseries_ingest(
         wal_lsn: None,
         surrogates: surrogates.iter().copied().map(Surrogate::new).collect(),
         provenance,
+        rls_write_check: Vec::new(),
     }))
 }
 

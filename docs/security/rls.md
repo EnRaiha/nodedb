@@ -50,13 +50,33 @@ bytes about to be written, including any generated columns recomputed by the
 statement. A predicate may therefore reference a column the statement never
 mentions.
 
+Columnar, timeseries, and spatial collections are decided the same way. A plain
+`INSERT` carries every row it will persist, so the policy decides those rows
+before the statement is dispatched and a rejected batch applies nothing — not
+even the conforming rows sharing it. An `UPDATE`, a `DELETE`, and an
+`ON CONFLICT DO UPDATE` build their image inside the engine, so the compiled
+predicate travels with the plan and is evaluated against the row about to be
+written or removed. Timeseries ingest is decided per parsed row, and that check
+covers every ingest path — SQL, JSON, MessagePack, and the line-protocol
+listener alike.
+
+### When the decision happens inside a transaction
+
+A write issued inside a `BEGIN..COMMIT` block runs at statement time: the row
+image is produced, staged, and made readable to that transaction's own queries
+before COMMIT replays the write durably. The policy decides the row at both
+points. The statement-time decision is what a client sees — a refused write
+fails at the statement, with no affected-row count and nothing visible to the
+transaction — and the COMMIT-time decision guards the durable apply. This holds
+for the document, key-value, columnar, timeseries, and spatial engines alike.
+
 Some write shapes carry no such row body at all: a key-value atomic computes
 from the stored value, `TRUNCATE` removes every row without reading one, and
-vector, FTS, graph, columnar, timeseries, and spatial writes carry an embedding,
-extracted text, edge endpoints, or column vectors instead of the row the
-predicate names. A write policy on the collection **refuses** those statements
-rather than letting them persist rows the predicate was never evaluated against.
-The refusal names the collection and says which image was unavailable.
+vector, FTS, and graph writes carry an embedding, extracted text, or edge
+endpoints instead of the row the predicate names. A write policy on the
+collection **refuses** those statements rather than letting them persist rows
+the predicate was never evaluated against. The refusal names the collection and
+says which image was unavailable.
 
 Externally submitted CRDT deltas are the exception: they are admitted against
 the storage engine's authoritative post-merge image, so the predicate decides

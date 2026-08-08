@@ -135,6 +135,7 @@ impl CoreLoop {
                 wal_lsn: Some(record_lsn),
                 surrogates: Vec::new(),
                 provenance: provenance.clone(),
+                rls_write_check: Vec::new(),
             }),
             Some(crate::types::Lsn::new(record_lsn)),
         );
@@ -147,6 +148,11 @@ impl CoreLoop {
             wal_lsn: Some(record_lsn),
             provenance: provenance.as_ref(),
             mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
+            // Replay re-applies a record the policy already decided when it was
+            // written, and the identity that wrote it is not present at boot to
+            // resolve `$auth.*` against. A refused write never reaches replay:
+            // its record is cancelled before the refusal is acknowledged.
+            rls_write_check: &[],
         });
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(
@@ -196,6 +202,7 @@ impl CoreLoop {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: Some(record_lsn),
+                rls_write_check: Vec::new(),
             }),
             Some(crate::types::Lsn::new(record_lsn)),
         );
@@ -214,6 +221,7 @@ impl CoreLoop {
                 surrogates: &surrogates,
                 schema_bytes: &[],
                 provenance: provenance.as_ref(),
+                rls_write_check: &[],
             },
         );
         if response.status != crate::bridge::envelope::Status::Ok {

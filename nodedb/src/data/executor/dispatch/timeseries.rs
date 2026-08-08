@@ -54,6 +54,7 @@ impl CoreLoop {
                 wal_lsn,
                 surrogates: _,
                 provenance,
+                rls_write_check,
             } => self.execute_timeseries_ingest(TimeseriesIngestExec {
                 task,
                 tid: task.request.tenant_id,
@@ -73,6 +74,7 @@ impl CoreLoop {
                 wal_lsn: task.wal_lsn().map(|lsn| lsn.as_u64()).or(*wal_lsn),
                 provenance: provenance.as_ref(),
                 mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
+                rls_write_check,
             }),
         }
     }
@@ -134,6 +136,7 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         });
         ExecutionTask::new(Request {
             request_id: RequestId::new(1),

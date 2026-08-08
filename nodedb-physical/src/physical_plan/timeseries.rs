@@ -96,5 +96,14 @@ pub enum TimeseriesOp {
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
+        /// Compiled row-level-security WRITE predicate (`Vec<ScanFilter>` as
+        /// MessagePack), evaluated in the Data Plane against every parsed row
+        /// before it reaches the memtable. Every ingest format normalizes into
+        /// ILP inside the handler, so one gate there covers all of them —
+        /// including the raw ILP listener, which builds its tasks outside the
+        /// SQL planner. Empty means no write policy restricts this identity
+        /// here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 }

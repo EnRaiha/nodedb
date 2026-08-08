@@ -33,6 +33,10 @@ pub(super) fn wal_append_columnar_op(
             schema_bytes: _,
             provenance,
             wal_lsn: _,
+            // The compiled RLS predicate is a per-request authorization input,
+            // not part of the row image being made durable, so it is not
+            // written to the log and replay does not re-evaluate it.
+            rls_write_check: _,
         } => {
             // Encode a map-shaped `ColumnarWalRecord` carrying the per-row
             // cross-engine surrogates so replay restores the exact same
@@ -52,6 +56,7 @@ pub(super) fn wal_append_columnar_op(
             collection,
             filters,
             updates,
+            rls_write_check: _,
         } => {
             // Predicate UPDATE has no row post-image at append time (the
             // matching set is only known once the Data Plane scans current
@@ -66,6 +71,7 @@ pub(super) fn wal_append_columnar_op(
         ColumnarOp::Delete {
             collection,
             filters,
+            rls_write_check: _,
         } => {
             // Mirrors the `Update` arm above; delete is idempotent (mark +
             // remove from PK index), so unlike update it tolerates a
@@ -111,6 +117,7 @@ mod tests {
             schema_bytes: vec![],
             provenance: None,
             wal_lsn: None,
+            rls_write_check: vec![],
         });
 
         let outcome = super::super::wal_append_if_write(

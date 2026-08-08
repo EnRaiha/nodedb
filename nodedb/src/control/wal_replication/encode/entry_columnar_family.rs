@@ -34,14 +34,21 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> Option<ReplicatedWrite> {
             schema_bytes,
             encode_provenance(provenance),
         ),
+        // The compiled RLS predicate is deliberately not replicated: it was
+        // already applied by the leader that accepted this write, and it
+        // resolves against the writing identity's session, which no follower
+        // has. A follower re-evaluating it would deny writes the leader
+        // committed.
         ColumnarOp::Delete {
             collection,
             filters,
+            rls_write_check: _,
         } => columnar::bulk_delete(collection, filters),
         ColumnarOp::Update {
             collection,
             filters,
             updates,
+            rls_write_check: _,
         } => columnar::bulk_update(collection, filters, updates),
 
         // Not a write — reads / scans.

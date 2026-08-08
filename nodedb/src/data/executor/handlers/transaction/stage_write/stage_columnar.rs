@@ -20,11 +20,19 @@
 //! staging-only representation; it plays no part in the durable segment
 //! format written at COMMIT by `execute_columnar_insert`.
 //!
+//! Row-level security: the write policy decides the batch here, at the
+//! statement, not only at COMMIT — otherwise a refused row would be reported as
+//! affected and be readable by this transaction until COMMIT failed. A plain
+//! insert's rows were already decided at plan time (the plan carries them), so
+//! this gate bites for the ON CONFLICT shape, whose merged image is resolved
+//! here the same way the durable path resolves it.
+//!
 //! Field coercion mirrors `execute_columnar_insert` exactly (same
 //! `ndb_field_to_value` / bitemporal column population) via the shared
 //! `columnar_write::schema` helpers, so a staged row's values match what the
 //! durable COMMIT replay will eventually store.
 
+use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::Surrogate;
 use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::value::Value;
@@ -47,6 +55,16 @@ pub(in crate::data::executor) struct StageColumnarInsertParams<'a> {
     pub payload: &'a [u8],
     pub surrogates: &'a [Surrogate],
     pub schema_bytes: &'a [u8],
+    /// `ON CONFLICT (pk) DO UPDATE SET` assignments carried by the plan.
+    /// Needed here only to resolve the row image the write policy decides —
+    /// the merged row, not the submitted one. The staged body itself is
+    /// unaffected.
+    pub on_conflict_updates: &'a [(String, UpdateValue)],
+    /// Compiled row-level-security WRITE predicate carried by the plan. Empty
+    /// for a plain insert, whose rows the Control Plane already decided at plan
+    /// time; non-empty for the ON CONFLICT shape, whose merged image only
+    /// exists once the stored row has been read.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -66,6 +84,8 @@ impl CoreLoop {
             payload,
             surrogates,
             schema_bytes,
+            on_conflict_updates,
+            rls_write_check,
         } = params;
 
         let ndb_rows: Vec<Value> = match nodedb_types::value_from_msgpack(payload) {
@@ -135,7 +155,11 @@ impl CoreLoop {
         } else {
             0
         };
-        let mut staged = 0usize;
+        // Coerce every row and let the write policy decide all of them BEFORE
+        // the first `stage_put_capped`. A rejection must leave the overlay
+        // exactly as it was, and must not have reported an affected count for a
+        // row the transaction will never be allowed to keep.
+        let mut resolved: Vec<(Surrogate, Vec<Value>)> = Vec::with_capacity(ndb_rows.len());
 
         for (row_idx, row) in ndb_rows.iter().enumerate() {
             let obj = match row {
@@ -183,6 +207,42 @@ impl CoreLoop {
                 }
             };
 
+            resolved.push((surrogate, values));
+        }
+
+        // The image the policy decides is the row that will exist afterwards:
+        // the incoming row for a plain insert, the merged row for the ON
+        // CONFLICT branch.
+        let images: Vec<Vec<Value>> = if rls_write_check.is_empty() {
+            Vec::new()
+        } else {
+            let mut images = Vec::with_capacity(resolved.len());
+            for (_, values) in &resolved {
+                match self.staged_columnar_write_image(
+                    &engine_key,
+                    &schema,
+                    values.clone(),
+                    on_conflict_updates,
+                ) {
+                    Ok(image) => images.push(image),
+                    Err(error) => return self.response_error(task, error),
+                }
+            }
+            images
+        };
+        if let Err(response) = self.stage_admit_columnar_rows(
+            task,
+            rls_write_check,
+            images.iter().map(Vec::as_slice),
+            &schema,
+            tid,
+            collection,
+        ) {
+            return response;
+        }
+
+        let mut staged = 0usize;
+        for (surrogate, values) in resolved {
             let body = match nodedb_types::value_to_msgpack(&Value::Array(values)) {
                 Ok(b) => b,
                 Err(e) => {

@@ -78,6 +78,17 @@ pub async fn remote_write(
     let mut total_accepted = 0u64;
     let mut total_rejected = 0u64;
 
+    // This endpoint builds its physical tasks itself instead of going through
+    // the SQL planner, so it has to run the planner's row-level-security pass
+    // over each one explicitly — otherwise remote write would be a way to
+    // ingest rows a write policy forbids, with the same identity and the same
+    // collection an `INSERT` refuses.
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        &identity.0,
+        state.shared.auth_stores(),
+        DatabaseId::DEFAULT,
+    );
+
     for ts in &write_req.timeseries {
         let lines = ts.to_ilp_lines();
         if lines.is_empty() {
@@ -100,9 +111,10 @@ pub async fn remote_write(
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         });
 
-        let task = PhysicalTask {
+        let mut task = PhysicalTask {
             tenant_id,
             vshard_id: vshard,
             database_id: DatabaseId::DEFAULT,
@@ -110,6 +122,18 @@ pub async fn remote_write(
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
+        // Runs before authorization, because the pass compiles the write
+        // predicate onto the task and it is the authorized copy that is
+        // dispatched.
+        if let Err(error) = crate::control::planner::rls_injection::inject_rls(
+            std::slice::from_mut(&mut task),
+            &state.shared.rls,
+            scope.auth(),
+        ) {
+            tracing::warn!(error = ?error, collection = %collection, "remote write denied by row policy");
+            total_rejected += ts.samples.len() as u64;
+            continue;
+        }
         let emitter =
             crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.shared.audit));
         let authorized = match crate::control::server::shared::authorization::authorize_task_set(

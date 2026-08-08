@@ -15,16 +15,20 @@ pub(super) fn bulk_dml(
     is_update: bool,
     updates: &[(String, Vec<u8>)],
 ) -> PhysicalPlan {
+    // No RLS predicate: the leader already decided these rows against the
+    // writing identity, which the follower does not have.
     if is_update {
         PhysicalPlan::Columnar(ColumnarOp::Update {
             collection: collection.to_owned(),
             filters: filters.to_vec(),
             updates: updates.to_vec(),
+            rls_write_check: Vec::new(),
         })
     } else {
         PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: collection.to_owned(),
             filters: filters.to_vec(),
+            rls_write_check: Vec::new(),
         })
     }
 }

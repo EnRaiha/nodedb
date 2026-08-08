@@ -470,6 +470,8 @@ mod txn_created_columnar_engine_tests {
             payload: &pl,
             surrogates: &surrogates,
             schema_bytes: &sb,
+            on_conflict_updates: &[],
+            rls_write_check: &[],
         });
         assert_eq!(
             resp.status,
@@ -596,6 +598,8 @@ mod txn_created_columnar_engine_tests {
             payload: &pl,
             surrogates: &surrogates,
             schema_bytes: &sb,
+            on_conflict_updates: &[],
+            rls_write_check: &[],
         });
         assert_eq!(resp.status, Status::Ok);
         assert!(

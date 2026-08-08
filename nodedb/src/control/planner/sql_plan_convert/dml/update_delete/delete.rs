@@ -66,6 +66,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             plan: PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: collection.into(),
                 filters: effective_filter,
+                rls_write_check: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

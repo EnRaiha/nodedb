@@ -318,6 +318,7 @@ fn rollback_matrix_columnar_then_doc_fail() {
                     schema_bytes: Vec::new(),
                     provenance: None,
                     wal_lsn: None,
+                    rls_write_check: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],
@@ -382,6 +383,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -405,6 +407,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
                     schema_bytes: Vec::new(),
                     provenance: None,
                     wal_lsn: None,
+                    rls_write_check: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],
@@ -488,6 +491,7 @@ fn rollback_matrix_timeseries_then_doc_fail() {
                     wal_lsn: None,
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],
@@ -575,6 +579,7 @@ fn rollback_matrix_timeseries_count_after_rollback() {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         }),
     );
 
@@ -596,6 +601,7 @@ fn rollback_matrix_timeseries_count_after_rollback() {
                     wal_lsn: None,
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],

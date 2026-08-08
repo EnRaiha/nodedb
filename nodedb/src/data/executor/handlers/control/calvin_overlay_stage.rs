@@ -154,6 +154,7 @@ impl CoreLoop {
                 payload,
                 format,
                 surrogates,
+                rls_write_check,
                 ..
             }) => {
                 let response = self.stage_timeseries_insert(StageTimeseriesInsertParams {
@@ -164,6 +165,7 @@ impl CoreLoop {
                     payload,
                     format,
                     surrogates,
+                    rls_write_check,
                 });
                 Self::stage_result(&response)
             }

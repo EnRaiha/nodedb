@@ -112,6 +112,50 @@ impl RlsCtx<'_> {
         )
     }
 
+    /// Admit every row of a MessagePack row batch the plan carries in full.
+    ///
+    /// The columnar family ships a statement's rows as one MessagePack array of
+    /// per-row objects rather than as separate op fields, so the batch is split
+    /// here and each row decided on its own. The first violation fails the whole
+    /// statement before any dispatch, which is what keeps a partially applied
+    /// batch impossible: nothing has been written yet when the refusal happens.
+    ///
+    /// A payload that is neither an array of rows nor a single row object is
+    /// refused rather than admitted — an image the policy could not be
+    /// evaluated against is not an image the policy admitted.
+    pub(super) fn admit_write_batch(&self, collection: &str, payload: &[u8]) -> crate::Result<()> {
+        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        if check.is_empty() {
+            return Ok(());
+        }
+        let rows = match nodedb_types::value_from_msgpack(payload) {
+            Ok(nodedb_types::Value::Array(rows)) => rows,
+            Ok(row @ nodedb_types::Value::Object(_)) => vec![row],
+            _ => {
+                return Err(crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(self.tenant_id),
+                    resource: format!(
+                        "RLS write policy on '{collection}': the row batch did not decode, so the \
+                         policy could not be evaluated against it"
+                    ),
+                });
+            }
+        };
+        for row in &rows {
+            let image =
+                nodedb_types::value_to_msgpack(row).map_err(|error| crate::Error::PlanError {
+                    detail: format!("RLS write admission could not re-encode a row: {error}"),
+                })?;
+            crate::control::security::rls::admit_compiled_write_image(
+                &check,
+                &image,
+                self.tenant_id,
+                collection,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Compile the collection's write policy into a plan's write-gate slot.
     ///
     /// For a write whose row image is produced where it is persisted: an

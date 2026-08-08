@@ -297,6 +297,7 @@ pub fn build_timeseries_ingest_plan(
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
+        rls_write_check: Vec::new(),
     }))
 }
 

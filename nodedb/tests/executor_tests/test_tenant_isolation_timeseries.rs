@@ -29,6 +29,7 @@ fn timeseries_scan_isolated() {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         }),
     );
 

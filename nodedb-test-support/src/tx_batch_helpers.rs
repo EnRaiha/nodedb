@@ -242,6 +242,7 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
+        rls_write_check: Vec::new(),
     })
 }
 
@@ -275,6 +276,7 @@ pub fn timeseries_ingest(collection: &str, ilp: &str) -> PhysicalPlan {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
+        rls_write_check: Vec::new(),
     })
 }
 

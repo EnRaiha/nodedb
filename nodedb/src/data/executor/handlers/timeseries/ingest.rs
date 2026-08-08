@@ -6,6 +6,11 @@
 //! normalize into ILP text in the sibling `ingest_formats` module and then call
 //! `execute_ilp_ingest`, so the record-boundary admission gate below covers
 //! them all. The checks the gate runs live in the sibling `admission` module.
+//!
+//! That funnel is also why the row-level-security write gate sits here rather
+//! than at each format's entry point: a transport that builds its own ingest
+//! task — the raw line-protocol listener does exactly that — still reaches this
+//! one place, so the policy cannot be routed around by adding a caller.
 
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
@@ -18,6 +23,7 @@ use crate::engine::timeseries::ilp_ingest;
 
 use super::admission;
 use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
+use super::rls_gate;
 
 impl CoreLoop {
     /// Schema for a collection's very first memtable.
@@ -126,6 +132,7 @@ impl CoreLoop {
             wal_lsn,
             now_ms,
             mode,
+            rls_write_check,
         } = params;
         let key = (task.request.database_id, tid, collection.to_string());
         let input = match std::str::from_utf8(payload) {
@@ -170,6 +177,25 @@ impl CoreLoop {
                     reason: "ILP measurements must match the routed collection".into(),
                 },
             );
+        }
+
+        // The write policy decides the whole batch before anything else in this
+        // handler runs: ahead of the memtable being created, the schema being
+        // evolved, and the first row being appended. A refusal therefore leaves
+        // no trace at all, rather than a schema published or a prefix of the
+        // batch made durable.
+        let time_key = self
+            .declared_ts_time_key(task.request.database_id, tid, collection)
+            .map(str::to_string);
+        if let Err(error) = rls_gate::admit_ilp_lines(
+            rls_write_check,
+            &lines,
+            time_key.as_deref(),
+            now_ms,
+            tid.as_u64(),
+            collection,
+        ) {
+            return self.response_error(task, error);
         }
 
         if mode == TimeseriesApplyMode::CommitDeferred

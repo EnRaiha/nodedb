@@ -375,6 +375,7 @@ mod tests {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: "crdt".into(),
@@ -422,6 +423,7 @@ mod tests {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: "crdt".into(),
@@ -544,6 +546,7 @@ mod tests {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: "crdt".into(),

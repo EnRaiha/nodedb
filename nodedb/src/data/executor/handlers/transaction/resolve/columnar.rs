@@ -70,6 +70,7 @@ pub(super) fn serialize_columnar_op(
             schema_bytes: _,
             provenance,
             wal_lsn: _,
+            rls_write_check: _,
         } => {
             let sub_payload = encode_columnar_batch_payload(
                 collection,
@@ -99,6 +100,7 @@ pub(super) fn serialize_columnar_op(
             collection,
             filters,
             updates,
+            rls_write_check: _,
         } => {
             let sub_payload = encode_columnar_dml_payload(collection, true, filters, updates)?;
             ops.push(RedoSubRecord {
@@ -110,6 +112,7 @@ pub(super) fn serialize_columnar_op(
         ColumnarOp::Delete {
             collection,
             filters,
+            rls_write_check: _,
         } => {
             let sub_payload = encode_columnar_dml_payload(collection, false, filters, &[])?;
             ops.push(RedoSubRecord {
@@ -137,6 +140,7 @@ pub(super) fn serialize_timeseries_op(
             wal_lsn: _,
             surrogates: _,
             provenance,
+            rls_write_check: _,
         } => {
             let sub_payload = encode_timeseries_batch_payload_with_format(
                 collection,

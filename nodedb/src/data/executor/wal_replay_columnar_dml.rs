@@ -98,16 +98,23 @@ impl CoreLoop {
         // silently degrade to a no-op against an empty collection name the day a
         // handler starts reading the plan; on a once-per-record startup path the
         // clone costs nothing worth that risk.
+        // Replay carries no row-level-security predicate: the policy already
+        // decided these rows when the record was written, and the identity that
+        // wrote it is not present at boot to resolve `$auth.*` against. A
+        // refused write never reaches replay at all — its record is cancelled
+        // by a `WriteAborted` marker before the refusal is acknowledged.
         let plan = if record.is_update {
             PhysicalPlan::Columnar(ColumnarOp::Update {
                 collection: record.collection.clone(),
                 filters: record.filters.clone(),
                 updates: record.updates.clone(),
+                rls_write_check: Vec::new(),
             })
         } else {
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: record.collection.clone(),
                 filters: record.filters.clone(),
+                rls_write_check: Vec::new(),
             })
         };
         let task = Self::replay_task(
@@ -127,10 +134,11 @@ impl CoreLoop {
                 &record.collection,
                 &record.filters,
                 &record.updates,
+                &[],
                 None,
             )
         } else {
-            self.execute_columnar_delete(&task, &record.collection, &record.filters, None)
+            self.execute_columnar_delete(&task, &record.collection, &record.filters, &[], None)
         };
 
         if response.status != Status::Ok {
@@ -213,6 +221,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
+            rls_write_check: Vec::new(),
         })
     }
 
@@ -302,6 +311,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: COLLECTION.into(),
             filters: eq_filter_bytes("id", Value::Integer(2)),
+            rls_write_check: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -333,6 +343,7 @@ mod tests {
                 // encoding `zerompk::to_msgpack_vec(&Value)` would emit.
                 nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
             )],
+            rls_write_check: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -355,6 +366,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: COLLECTION.into(),
             filters: eq_filter_bytes("id", Value::Integer(2)),
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[insert, delete]);
@@ -386,6 +398,7 @@ mod tests {
                 "v".to_string(),
                 nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
             )],
+            rls_write_check: Vec::new(),
         });
 
         let records = append_via_autocommit(&[insert, update]);

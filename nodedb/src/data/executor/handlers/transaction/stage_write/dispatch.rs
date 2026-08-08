@@ -46,6 +46,8 @@ impl CoreLoop {
                 payload,
                 surrogates,
                 schema_bytes,
+                on_conflict_updates,
+                rls_write_check,
                 ..
             }) => {
                 return self.stage_columnar_insert(StageColumnarInsertParams {
@@ -56,6 +58,8 @@ impl CoreLoop {
                     payload,
                     surrogates,
                     schema_bytes,
+                    on_conflict_updates,
+                    rls_write_check,
                 });
             }
             // Predicate DELETE / UPDATE on a columnar collection staged at
@@ -66,6 +70,7 @@ impl CoreLoop {
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection,
                 filters,
+                rls_write_check,
             }) => {
                 return self.stage_columnar_delete(StageColumnarDeleteParams {
                     task,
@@ -73,12 +78,14 @@ impl CoreLoop {
                     txn_id,
                     collection,
                     filter_bytes: filters,
+                    rls_write_check,
                 });
             }
             PhysicalPlan::Columnar(ColumnarOp::Update {
                 collection,
                 filters,
                 updates,
+                rls_write_check,
             }) => {
                 return self.stage_columnar_update(StageColumnarUpdateParams {
                     task,
@@ -87,6 +94,7 @@ impl CoreLoop {
                     collection,
                     filter_bytes: filters,
                     updates,
+                    rls_write_check,
                 });
             }
             PhysicalPlan::Columnar(
@@ -149,6 +157,7 @@ impl CoreLoop {
                 payload,
                 format,
                 surrogates,
+                rls_write_check,
                 ..
             }) => {
                 return self.stage_timeseries_insert(StageTimeseriesInsertParams {
@@ -159,6 +168,7 @@ impl CoreLoop {
                     payload,
                     format,
                     surrogates,
+                    rls_write_check,
                 });
             }
             PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. }) => {

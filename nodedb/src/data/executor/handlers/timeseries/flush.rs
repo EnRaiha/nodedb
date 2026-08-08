@@ -141,6 +141,16 @@ impl CoreLoop {
         registry.insert_partition(pe);
 
         // Fire continuous aggregate hook.
+        //
+        // The derived rows this writes are deliberately NOT put through the
+        // row-level-security write gate. An aggregate refresh is system work: it
+        // is triggered by a flush rather than by a statement, so there is no
+        // `PhysicalPlan` to carry a compiled predicate and no requesting
+        // identity to resolve `$auth.*` against — the same reason those
+        // references cannot resolve anywhere else on an internal path. Gating it
+        // on a predicate that cannot be resolved would fail closed and silently
+        // stop every continuous aggregate on a governed collection. The rows it
+        // derives were already decided by the policy when they were ingested.
         let refreshed =
             self.continuous_agg_mgr
                 .on_flush(database_id.as_u64(), collection, &drain, now_ms);

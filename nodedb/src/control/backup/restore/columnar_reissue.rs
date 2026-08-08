@@ -156,6 +156,7 @@ pub fn build_columnar_insert_plan(
         schema_bytes: decoded.schema_bytes,
         provenance: None,
         wal_lsn: None,
+        rls_write_check: Vec::new(),
     }))
 }
 

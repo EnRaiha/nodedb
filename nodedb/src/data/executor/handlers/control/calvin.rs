@@ -572,6 +572,7 @@ mod tests {
             wal_lsn: None,
             surrogates: tokens.into_iter().map(Surrogate::new).collect(),
             provenance: None,
+            rls_write_check: Vec::new(),
         })
     }
 
@@ -814,6 +815,7 @@ mod tests {
             wal_lsn: None,
             surrogates: vec![Surrogate::new(1)],
             provenance: None,
+            rls_write_check: Vec::new(),
         });
         let failed = core.execute_calvin_execute_static(
             &task,

@@ -1338,15 +1338,18 @@ mod tests {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::Update {
                 collection: "c".into(),
                 filters: Vec::new(),
                 updates: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: "c".into(),
                 filters: Vec::new(),
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::MaterializeScan {
                 collection: "c".into(),
@@ -1377,6 +1380,7 @@ mod tests {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Spatial(SpatialOp::Insert {
                 collection: "c".into(),

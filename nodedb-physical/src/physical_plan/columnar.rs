@@ -137,6 +137,13 @@ pub enum ColumnarOp {
         /// to disk. `None` for live ingest (always accepted).
         #[serde(default)]
         wal_lsn: Option<u64>,
+        /// Compiled row-level-security WRITE predicate (`Vec<ScanFilter>` as
+        /// MessagePack). Carried only for the ON CONFLICT DO UPDATE shape,
+        /// whose merged post-image exists only inside the handler; a plain
+        /// insert's rows are decided at plan time instead. Empty means no
+        /// write policy restricts this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Update rows matching filter predicates.
@@ -149,6 +156,11 @@ pub enum ColumnarOp {
         filters: Vec<u8>,
         /// Field assignments: `(column_name, json_value_bytes)`.
         updates: Vec<(String, Vec<u8>)>,
+        /// Compiled row-level-security WRITE predicate, evaluated against each
+        /// row's post-image once the assignments have been applied. Empty means
+        /// no write policy restricts this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Delete rows matching filter predicates.
@@ -158,6 +170,11 @@ pub enum ColumnarOp {
         collection: String,
         /// Serialized `Vec<ScanFilter>` (MessagePack).
         filters: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate, evaluated against the
+        /// pre-image of every row this removes. Empty means no write policy
+        /// restricts this identity here.
+        #[serde(default)]
+        rls_write_check: Vec<u8>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.

@@ -496,6 +496,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
+            rls_write_check: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(
@@ -513,6 +514,7 @@ mod tests {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "metrics".into(),
             filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

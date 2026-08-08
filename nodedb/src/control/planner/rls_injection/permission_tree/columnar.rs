@@ -46,6 +46,7 @@ pub(super) fn apply_columnar(ctx: &PermCtx<'_>, op: &mut ColumnarOp) -> crate::R
         ColumnarOp::Delete {
             collection,
             filters,
+            ..
         } => {
             ctx.authorize(collection, PermTreeLevel::Delete)?;
             ctx.filter_into(collection, PermTreeLevel::Delete, filters)

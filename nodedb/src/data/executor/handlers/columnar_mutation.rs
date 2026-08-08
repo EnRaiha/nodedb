@@ -32,6 +32,7 @@ impl CoreLoop {
         collection: &str,
         filter_bytes: &[u8],
         updates: &[(String, Vec<u8>)],
+        rls_write_check: &[u8],
         undo_log: Option<&mut Vec<UndoEntry>>,
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar update");
@@ -93,7 +94,17 @@ impl CoreLoop {
         let mut displaced: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)> = Vec::new();
         let mut restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)> = Vec::new();
 
-        let mut affected = 0u64;
+        // Resolve every matching row's post-image, and let the write policy
+        // decide all of them, BEFORE any row is mutated. The post-image is what
+        // the policy governs and it exists only once the assignments have been
+        // applied, so the check cannot happen earlier — and it must happen for
+        // the whole statement before the first `engine.update`, or a rejection
+        // partway through would leave the rows ahead of it already changed with
+        // no way for the caller to see or undo that.
+        let mut pending: Vec<(
+            &Vec<nodedb_types::value::Value>,
+            Vec<nodedb_types::value::Value>,
+        )> = Vec::new();
         for row in &rows {
             // Skip rows that don't match WHERE filters.
             if !filter_predicates.is_empty() {
@@ -133,6 +144,21 @@ impl CoreLoop {
                 }
             }
 
+            if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
+                rls_write_check,
+                &new_row,
+                &schema,
+                task.request.tenant_id.as_u64(),
+                collection,
+            ) {
+                return self.response_error(task, error);
+            }
+
+            pending.push((row, new_row));
+        }
+
+        let mut affected = 0u64;
+        for (row, new_row) in &pending {
             // Extract old PK value.
             let old_pk = &row[pk_cols[0]];
 
@@ -143,7 +169,7 @@ impl CoreLoop {
             let capture = if track {
                 let old_pk_bytes = encode_pk(old_pk);
                 let old_location = engine.pk_index().get(&old_pk_bytes).copied();
-                let new_pk_bytes = engine.encode_pk_from_row(&new_row).ok();
+                let new_pk_bytes = engine.encode_pk_from_row(new_row).ok();
                 let displaced_entry = match &new_pk_bytes {
                     Some(nb) if *nb != old_pk_bytes => engine
                         .pk_index()
@@ -159,7 +185,7 @@ impl CoreLoop {
             };
 
             // Execute update via MutationEngine (delete + insert).
-            match engine.update(old_pk, &new_row) {
+            match engine.update(old_pk, new_row) {
                 Ok(_result) => {
                     affected += 1;
                     if let Some((old_pk_bytes, old_location, new_pk_bytes, displaced_entry)) =
@@ -239,6 +265,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         collection: &str,
         filter_bytes: &[u8],
+        rls_write_check: &[u8],
         undo_log: Option<&mut Vec<UndoEntry>>,
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar delete");
@@ -297,6 +324,19 @@ impl CoreLoop {
                         return self.response_error(task, ErrorCode::DivisionByZero);
                     }
                 }
+            }
+            // The image a delete is governed by is the row it removes, and that
+            // row is only known here. Every matched row is decided before the
+            // first `engine.delete`, so a rejection removes nothing at all
+            // rather than leaving the rows ahead of it already tombstoned.
+            if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
+                rls_write_check,
+                row,
+                &schema,
+                task.request.tenant_id.as_u64(),
+                collection,
+            ) {
+                return self.response_error(task, error);
             }
             pk_values.push(row[pk_cols[0]].clone());
         }

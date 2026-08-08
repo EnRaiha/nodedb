@@ -17,6 +17,12 @@
 //! no undo-log entry is required, exactly like the columnar statement-time
 //! staging path.
 //!
+//! Row-level security: the write policy decides every row here, at the
+//! statement, before any overlay entry is written. The structured `msgpack`
+//! payload was already decided at plan time (the plan carries its rows), so
+//! this gate bites for the canonical line-protocol payload, whose rows exist
+//! only once the parser has produced them.
+//!
 //! Row identity: a timeseries row is identified internally by its `series_id`
 //! (a hash of measurement + tags), which is not a cross-engine surrogate. For
 //! staging, each row is keyed by the per-row `Surrogate` the planner minted
@@ -58,6 +64,24 @@ pub(in crate::data::executor) struct StageTimeseriesInsertParams<'a> {
     pub payload: &'a [u8],
     pub surrogates: &'a [Surrogate],
     pub format: &'a str,
+    /// Compiled row-level-security WRITE predicate carried by the plan. Empty
+    /// for the structured `msgpack` payload, whose rows the Control Plane
+    /// already decided at plan time; non-empty for the canonical line-protocol
+    /// payload, whose rows only exist once the parser has produced them.
+    pub rls_write_check: &'a [u8],
+}
+
+/// Borrowed inputs for the canonical line-protocol staging path. Bundled
+/// because the raw parameter list exceeds the project's too-many-arguments
+/// bound.
+struct CanonicalIlpStage<'a> {
+    task: &'a ExecutionTask,
+    tid: u64,
+    txn_id: TxnId,
+    collection: &'a str,
+    payload: &'a [u8],
+    surrogates: &'a [Surrogate],
+    rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -77,11 +101,19 @@ impl CoreLoop {
             payload,
             surrogates,
             format,
+            rls_write_check,
         } = params;
 
         if format == "ilp-msgpack" {
-            return self
-                .stage_canonical_ilp_rows(task, tid, txn_id, collection, payload, surrogates);
+            return self.stage_canonical_ilp_rows(CanonicalIlpStage {
+                task,
+                tid,
+                txn_id,
+                collection,
+                payload,
+                surrogates,
+                rls_write_check,
+            });
         }
 
         let rows: Vec<Value> = match nodedb_types::value_from_msgpack(payload) {
@@ -114,7 +146,9 @@ impl CoreLoop {
             );
         }
 
-        let mut staged = 0usize;
+        // Decide every row before the first staged put, so a refusal leaves the
+        // overlay untouched and reports no affected count.
+        let mut resolved: Vec<(Surrogate, &Value)> = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter().enumerate() {
             if !matches!(row, Value::Object(_)) {
                 continue;
@@ -131,7 +165,20 @@ impl CoreLoop {
                     );
                 }
             };
+            resolved.push((surrogate, row));
+        }
+        if let Err(response) = self.stage_admit_value_rows(
+            task,
+            rls_write_check,
+            resolved.iter().map(|(_, row)| *row),
+            tid,
+            collection,
+        ) {
+            return response;
+        }
 
+        let mut staged = 0usize;
+        for (surrogate, row) in resolved {
             let body = match nodedb_types::value_to_msgpack(row) {
                 Ok(b) => b,
                 Err(e) => {
@@ -155,15 +202,16 @@ impl CoreLoop {
         self.stage_count_response(task, staged)
     }
 
-    fn stage_canonical_ilp_rows(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        payload: &[u8],
-        surrogates: &[Surrogate],
-    ) -> Response {
+    fn stage_canonical_ilp_rows(&mut self, args: CanonicalIlpStage<'_>) -> Response {
+        let CanonicalIlpStage {
+            task,
+            tid,
+            txn_id,
+            collection,
+            payload,
+            surrogates,
+            rls_write_check,
+        } = args;
         let lines: Vec<String> = match zerompk::from_msgpack::<Vec<String>>(payload) {
             Ok(lines) if !lines.is_empty() => lines,
             Ok(_) => {
@@ -259,8 +307,11 @@ impl CoreLoop {
             collection,
         );
 
-        // Encode every already-admitted row before mutating an overlay.
-        let mut encoded_rows = Vec::with_capacity(lines.len());
+        // Build every row image first, decide the whole batch against the write
+        // policy, and only then encode and stage — the same all-before-mutate
+        // discipline the cap-failure rollback below exists for, so a refused
+        // batch is never partially visible to this transaction's own reads.
+        let mut images = Vec::with_capacity(lines.len());
         for row in parsed.lines() {
             let mut object = HashMap::new();
             for (name, value) in &row.tags {
@@ -290,7 +341,18 @@ impl CoreLoop {
             if let Some(timestamp) = row.timestamp_ns {
                 object.insert(time_column.clone(), Value::Integer(timestamp / 1_000_000));
             }
-            let body = match nodedb_types::value_to_msgpack(&Value::Object(object)) {
+            images.push(Value::Object(object));
+        }
+
+        if let Err(response) =
+            self.stage_admit_value_rows(task, rls_write_check, images.iter(), tid, collection)
+        {
+            return response;
+        }
+
+        let mut encoded_rows = Vec::with_capacity(images.len());
+        for image in &images {
+            let body = match nodedb_types::value_to_msgpack(image) {
                 Ok(body) => body,
                 Err(error) => {
                     return self.response_error(
@@ -400,6 +462,7 @@ mod tests {
                     wal_lsn: None,
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                 priority: Priority::Normal,
@@ -430,14 +493,15 @@ mod tests {
                 .expect("canonical ILP payload");
         let txn_id = TxnId::new(80);
 
-        let response = core.stage_canonical_ilp_rows(
-            &task,
-            1,
+        let response = core.stage_canonical_ilp_rows(super::CanonicalIlpStage {
+            task: &task,
+            tid: 1,
             txn_id,
-            "metrics",
-            &payload,
-            &[Surrogate::new(700)],
-        );
+            collection: "metrics",
+            payload: &payload,
+            surrogates: &[Surrogate::new(700)],
+            rls_write_check: &[],
+        });
         assert_ne!(response.status, crate::bridge::envelope::Status::Error);
         let body = core
             .txn_overlays
@@ -471,14 +535,15 @@ mod tests {
         ])
         .expect("canonical ILP payload");
 
-        let response = core.stage_canonical_ilp_rows(
-            &task,
-            1,
+        let response = core.stage_canonical_ilp_rows(super::CanonicalIlpStage {
+            task: &task,
+            tid: 1,
             txn_id,
-            "metrics",
-            &payload,
-            &[Surrogate::new(701), Surrogate::new(702)],
-        );
+            collection: "metrics",
+            payload: &payload,
+            surrogates: &[Surrogate::new(701), Surrogate::new(702)],
+            rls_write_check: &[],
+        });
 
         assert_eq!(response.status, crate::bridge::envelope::Status::Error);
         assert!(!core.txn_overlays.contains_key(&txn_id));
@@ -498,6 +563,7 @@ mod tests {
             wal_lsn: None,
             provenance: None,
             mode: TimeseriesApplyMode::Immediate,
+            rls_write_check: &[],
         });
         assert_ne!(response.status, crate::bridge::envelope::Status::Error);
 

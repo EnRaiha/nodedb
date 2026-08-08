@@ -80,6 +80,7 @@ fn purge_removes_all_tenant_data() {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
+            rls_write_check: Vec::new(),
         }),
     );
 

@@ -228,6 +228,7 @@ fn columnar_insert_byte_identical() {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
+                rls_write_check: Vec::new(),
             })
         })
         .collect();
@@ -384,6 +385,7 @@ fn timeseries_bitemporal_byte_identical() {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
+                rls_write_check: Vec::new(),
             })
         })
         .collect();

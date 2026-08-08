@@ -184,6 +184,7 @@ mod tests {
                     wal_lsn: Some(wal_lsn),
                     surrogates: Vec::new(),
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 }),
                 Some(wal_lsn),
             );

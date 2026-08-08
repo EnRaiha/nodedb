@@ -156,6 +156,7 @@ pub(super) async fn materialize_columnar_collection(
                     wal_lsn: None,
                     surrogates: vec![target_surrogate],
                     provenance: None,
+                    rls_write_check: Vec::new(),
                 })
             } else {
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
@@ -168,6 +169,7 @@ pub(super) async fn materialize_columnar_collection(
                     schema_bytes: Vec::new(),
                     provenance: None,
                     wal_lsn: None,
+                    rls_write_check: Vec::new(),
                 })
             };
 

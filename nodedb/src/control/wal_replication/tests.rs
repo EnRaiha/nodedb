@@ -791,6 +791,7 @@ fn columnar_ingest_provenance_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: Some(prov.clone()),
         wal_lsn: None,
+        rls_write_check: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("ColumnarIngest should produce a ReplicatedEntry");
@@ -848,6 +849,7 @@ fn timeseries_ingest_provenance_roundtrip() {
         wal_lsn: None,
         surrogates: vec![nodedb_types::Surrogate::new(99)],
         provenance: Some(prov.clone()),
+        rls_write_check: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("TimeseriesIngest should produce a ReplicatedEntry");

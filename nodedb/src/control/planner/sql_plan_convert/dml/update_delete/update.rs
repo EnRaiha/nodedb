@@ -138,6 +138,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 collection: collection.into(),
                 filters: effective_filter,
                 updates: columnar_updates,
+                rls_write_check: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

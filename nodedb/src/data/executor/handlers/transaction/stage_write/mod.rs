@@ -28,6 +28,7 @@ mod stage_kv_delete;
 mod stage_kv_transfer;
 mod stage_kv_ttl;
 mod stage_point_document;
+mod stage_rls;
 mod stage_spatial;
 mod stage_timeseries;
 mod stage_upsert;

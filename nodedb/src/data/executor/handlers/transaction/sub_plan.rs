@@ -403,6 +403,7 @@ impl CoreLoop {
                 schema_bytes,
                 provenance: _,
                 wal_lsn: _,
+                rls_write_check,
             } => self.execute_tx_columnar_insert(
                 dummy_task,
                 super::sub_plan_kv::TxColumnarInsertParams {
@@ -413,6 +414,7 @@ impl CoreLoop {
                     on_conflict_updates,
                     surrogates,
                     schema_bytes,
+                    rls_write_check,
                 },
                 undo_log,
             ),
@@ -421,12 +423,27 @@ impl CoreLoop {
                 collection,
                 filters,
                 updates,
-            } => self.exec_tx_columnar_update(dummy_task, collection, filters, updates, undo_log),
+                rls_write_check,
+            } => self.exec_tx_columnar_update(
+                dummy_task,
+                collection,
+                filters,
+                updates,
+                rls_write_check,
+                undo_log,
+            ),
 
             ColumnarOp::Delete {
                 collection,
                 filters,
-            } => self.exec_tx_columnar_delete(dummy_task, collection, filters, undo_log),
+                rls_write_check,
+            } => self.exec_tx_columnar_delete(
+                dummy_task,
+                collection,
+                filters,
+                rls_write_check,
+                undo_log,
+            ),
 
             _ => self.exec_tx_passthrough(tid, plan),
         }
@@ -448,6 +465,7 @@ impl CoreLoop {
                 payload,
                 format,
                 wal_lsn,
+                rls_write_check,
                 ..
             } => self.execute_tx_timeseries_ingest(
                 dummy_task,
@@ -456,6 +474,7 @@ impl CoreLoop {
                     collection,
                     payload,
                     format,
+                    rls_write_check,
                     // The enclosing transaction record, when present, is
                     // the durable identity of this ingest. A plan-local LSN is
                     // only a compatibility fallback for direct unit callers.

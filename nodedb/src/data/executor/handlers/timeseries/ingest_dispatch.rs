@@ -27,6 +27,9 @@ pub(in crate::data::executor) struct TimeseriesIngestExec<'a> {
     pub wal_lsn: Option<u64>,
     pub provenance: Option<&'a SyncProvenance>,
     pub mode: TimeseriesApplyMode,
+    /// Compiled row-level-security WRITE predicate carried by the plan; empty
+    /// when no policy restricts this identity on the collection.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Borrowed inputs shared by every timeseries payload decoder.
@@ -38,6 +41,10 @@ pub(in crate::data::executor) struct TimeseriesIngestParams<'a> {
     pub wal_lsn: Option<u64>,
     pub now_ms: i64,
     pub mode: TimeseriesApplyMode,
+    /// Compiled row-level-security WRITE predicate, decided against every
+    /// parsed row in `execute_ilp_ingest` — the one point every payload format
+    /// funnels through.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -56,6 +63,7 @@ impl CoreLoop {
             wal_lsn,
             provenance,
             mode,
+            rls_write_check,
         } = args;
         if let Some(prov) = provenance {
             let admit = self.sync_admit(prov);
@@ -161,6 +169,7 @@ impl CoreLoop {
                 wal_lsn,
                 now_ms,
                 mode,
+                rls_write_check,
             }),
             "ilp-msgpack" => self.execute_ilp_msgpack_ingest(TimeseriesIngestParams {
                 task,
@@ -170,6 +179,7 @@ impl CoreLoop {
                 wal_lsn,
                 now_ms,
                 mode,
+                rls_write_check,
             }),
             "json" => self.execute_json_ingest(TimeseriesIngestParams {
                 task,
@@ -179,6 +189,7 @@ impl CoreLoop {
                 wal_lsn,
                 now_ms,
                 mode,
+                rls_write_check,
             }),
             "msgpack" => self.execute_msgpack_ingest(TimeseriesIngestParams {
                 task,
@@ -188,6 +199,7 @@ impl CoreLoop {
                 wal_lsn,
                 now_ms,
                 mode,
+                rls_write_check,
             }),
             _ => {
                 return self.response_error(

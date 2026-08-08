@@ -50,6 +50,7 @@ impl CoreLoop {
                 schema_bytes,
                 provenance,
                 wal_lsn: _,
+                rls_write_check,
             } => {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
@@ -65,6 +66,7 @@ impl CoreLoop {
                         surrogates,
                         schema_bytes,
                         provenance: provenance.as_ref(),
+                        rls_write_check,
                     },
                 )
             }
@@ -73,21 +75,30 @@ impl CoreLoop {
                 collection,
                 filters,
                 updates,
+                rls_write_check,
             } => {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_update(task, collection, filters, updates, None)
+                self.execute_columnar_update(
+                    task,
+                    collection,
+                    filters,
+                    updates,
+                    rls_write_check,
+                    None,
+                )
             }
 
             ColumnarOp::Delete {
                 collection,
                 filters,
+                rls_write_check,
             } => {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_delete(task, collection, filters, None)
+                self.execute_columnar_delete(task, collection, filters, rls_write_check, None)
             }
 
             ColumnarOp::MaterializeScan {

@@ -93,6 +93,7 @@ impl CoreLoop {
             wal_lsn,
             now_ms,
             mode,
+            rls_write_check,
         } = params;
         let measurement = collection
             .split_once(':')
@@ -221,6 +222,7 @@ impl CoreLoop {
             wal_lsn,
             now_ms,
             mode,
+            rls_write_check,
         })
     }
 
@@ -235,6 +237,7 @@ impl CoreLoop {
             wal_lsn,
             now_ms,
             mode,
+            rls_write_check,
         } = params;
         let rows: sonic_rs::Array = match sonic_rs::from_slice(payload) {
             Ok(r) => r,
@@ -351,6 +354,7 @@ impl CoreLoop {
             wal_lsn,
             now_ms,
             mode,
+            rls_write_check,
         })
     }
 }

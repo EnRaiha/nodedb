@@ -69,8 +69,12 @@ impl CoreLoop {
 /// Build a `nodedb_types::Value::Object` from a schema-ordered row. Used
 /// by the ON CONFLICT DO UPDATE path to present `existing` and `EXCLUDED`
 /// rows to `apply_on_conflict_updates` in the same shape the document
-/// upsert path uses.
-pub(super) fn row_values_to_object(schema: &ColumnarSchema, row: &[Value]) -> nodedb_types::Value {
+/// upsert path uses, and by the row-level-security write gate to present the
+/// row a statement is about to persist or remove to a policy predicate.
+pub(in crate::data::executor) fn row_values_to_object(
+    schema: &ColumnarSchema,
+    row: &[Value],
+) -> nodedb_types::Value {
     let mut map = std::collections::HashMap::with_capacity(schema.columns.len());
     for (col, val) in schema.columns.iter().zip(row.iter()) {
         map.insert(col.name.clone(), val.clone());

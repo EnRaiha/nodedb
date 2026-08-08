@@ -29,13 +29,24 @@ pub(in crate::data::executor) fn row_matches_filters(
             map.insert(col_def.name.clone(), row[i].clone());
         }
     }
-    let doc = nodedb_types::Value::Object(map);
+    value_matches_filters(&nodedb_types::Value::Object(map), filters)
+}
 
+/// Check whether an already-assembled row object satisfies all predicates.
+///
+/// The single evaluator both the columnar WHERE path above and the write gate
+/// share, so a row-level-security predicate can never mean one thing when it
+/// decides which rows a query returns and another when it decides which rows a
+/// statement may write.
+pub(in crate::data::executor) fn value_matches_filters(
+    doc: &nodedb_types::Value,
+    filters: &[ScanFilter],
+) -> Result<bool, EvalError> {
     for filter in filters {
         if filter.op == FilterOp::MatchAll {
             continue;
         }
-        if !filter.matches_value(&doc)? {
+        if !filter.matches_value(doc)? {
             return Ok(false);
         }
     }

@@ -530,12 +530,14 @@ mod tests {
             collection: "metrics".to_owned(),
             filters: Vec::new(),
             updates: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(vshards_of(&update), vec![want]);
 
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "metrics".to_owned(),
             filters: Vec::new(),
+            rls_write_check: Vec::new(),
         });
         assert_eq!(vshards_of(&delete), vec![want]);
     }

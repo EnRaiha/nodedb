@@ -151,10 +151,12 @@ fn is_write_plan_classifies_columnar_update_and_delete() {
         collection: "metrics".to_owned(),
         filters: vec![],
         updates: vec![],
+        rls_write_check: Vec::new(),
     });
     let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
         collection: "metrics".to_owned(),
         filters: vec![],
+        rls_write_check: Vec::new(),
     });
     assert!(
         is_write_plan(&update),

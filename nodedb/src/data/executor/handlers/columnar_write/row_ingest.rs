@@ -26,6 +26,11 @@ pub(in crate::data::executor) struct RowIngestParams<'a> {
     pub on_conflict_updates: &'a [(String, UpdateValue)],
     pub surrogates: &'a [Surrogate],
     pub ndb_rows: &'a [nodedb_types::Value],
+    /// Compiled row-level-security WRITE predicate carried by the plan. Non-empty
+    /// only for the ON CONFLICT DO UPDATE shape, whose merged post-image the
+    /// Control Plane could not see; a plain insert's rows were already decided
+    /// at plan time. Empty admits every row.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -50,6 +55,7 @@ impl CoreLoop {
             on_conflict_updates,
             surrogates,
             ndb_rows,
+            rls_write_check,
         } = params;
         let mut accepted = 0u64;
 
@@ -185,6 +191,21 @@ impl CoreLoop {
                 }
                 _ => values,
             };
+
+            // The row that will actually exist afterwards is decided here, not
+            // at plan time: for an ON CONFLICT DO UPDATE the merged body only
+            // exists once the stored row has been read. A rejection fails the
+            // whole statement rather than skipping the row, which would report
+            // a write that never happened.
+            if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
+                rls_write_check,
+                &final_values,
+                schema,
+                task.request.tenant_id.as_u64(),
+                engine_key.2.as_str(),
+            ) {
+                return Err(self.response_error(task, error));
+            }
 
             let engine = match self.columnar_engines.get_mut(engine_key) {
                 Some(e) => e,

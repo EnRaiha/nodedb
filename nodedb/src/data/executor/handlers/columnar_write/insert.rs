@@ -26,6 +26,9 @@ pub(in crate::data::executor) struct ColumnarInsertParams<'a> {
     pub surrogates: &'a [Surrogate],
     pub schema_bytes: &'a [u8],
     pub provenance: Option<&'a SyncProvenance>,
+    /// Compiled row-level-security WRITE predicate carried by the plan; empty
+    /// when no policy restricts this identity on the collection.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -56,6 +59,7 @@ impl CoreLoop {
             surrogates,
             schema_bytes,
             provenance,
+            rls_write_check,
         } = params;
         // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
         if let Some(prov) = provenance {
@@ -137,6 +141,7 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogates,
                 ndb_rows: &ndb_rows,
+                rls_write_check,
             },
         ) {
             Ok(accepted) => accepted,

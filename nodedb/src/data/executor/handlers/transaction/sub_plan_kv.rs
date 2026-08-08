@@ -32,6 +32,10 @@ pub(super) struct TxColumnarInsertParams<'a> {
     pub on_conflict_updates: &'a [(String, UpdateValue)],
     pub surrogates: &'a [nodedb_types::Surrogate],
     pub schema_bytes: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the buffered
+    /// plan. COMMIT replay is the sole durable apply for an in-transaction
+    /// columnar write, so the predicate has to survive the buffering.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Parameters for [`CoreLoop::execute_tx_timeseries_ingest`].
@@ -41,6 +45,9 @@ pub(super) struct TxTimeseriesIngestParams<'a> {
     pub payload: &'a [u8],
     pub format: &'a str,
     pub wal_lsn: Option<u64>,
+    /// Compiled row-level-security WRITE predicate carried by the buffered
+    /// plan; see [`TxColumnarInsertParams::rls_write_check`].
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -64,6 +71,7 @@ impl CoreLoop {
             on_conflict_updates,
             surrogates,
             schema_bytes,
+            rls_write_check,
         } = params;
         let collection_key = (
             task.request.database_id,
@@ -91,6 +99,7 @@ impl CoreLoop {
                 surrogates,
                 schema_bytes,
                 provenance: None,
+                rls_write_check,
             },
         );
         if resp.status == Status::Error {
@@ -194,6 +203,7 @@ impl CoreLoop {
             payload,
             format,
             wal_lsn,
+            rls_write_check,
         } = params;
         let collection_key = (task.request.database_id, tid, collection.to_string());
 
@@ -232,6 +242,7 @@ impl CoreLoop {
             wal_lsn,
             provenance: None,
             mode: TimeseriesApplyMode::CommitDeferred,
+            rls_write_check,
         });
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {

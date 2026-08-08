@@ -12,6 +12,7 @@ pub mod ingest_formats;
 mod msgpack_decode;
 pub mod paths;
 pub mod raw_scan;
+mod rls_gate;
 mod scan;
 mod sort;
 mod time_range;

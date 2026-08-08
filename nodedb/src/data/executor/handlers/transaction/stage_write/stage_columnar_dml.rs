@@ -29,6 +29,12 @@
 //! UPDATE moved into the predicate) is affected too, not only committed base
 //! rows.
 //!
+//! Row-level security: the write policy decides the whole matching set here —
+//! a delete against the row it removes, an update against the post-image the
+//! assignments produce — before any overlay entry is written. Deferring that to
+//! COMMIT would report `{"affected": N}` for a statement the transaction can
+//! never keep, and expose the refused image to its own reads meanwhile.
+//!
 //! COMMIT durable replay is unchanged: the buffered `ColumnarOp::Delete` /
 //! `ColumnarOp::Update` plan is still replayed through
 //! `execute_columnar_delete` / `execute_columnar_update` inside the COMMIT
@@ -59,6 +65,9 @@ pub(in crate::data::executor) struct StageColumnarDeleteParams<'a> {
     pub txn_id: TxnId,
     pub collection: &'a str,
     pub filter_bytes: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the plan,
+    /// decided against the pre-image of every row this would remove.
+    pub rls_write_check: &'a [u8],
 }
 
 /// Routing identity + payload for one staged columnar predicate `UPDATE`.
@@ -71,6 +80,9 @@ pub(in crate::data::executor) struct StageColumnarUpdateParams<'a> {
     /// Field assignments: `(column_name, msgpack_value_bytes)`, the same shape
     /// `execute_columnar_update` applies on the durable path.
     pub updates: &'a [(String, Vec<u8>)],
+    /// Compiled row-level-security WRITE predicate carried by the plan,
+    /// decided against each row's post-image once the assignments are applied.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -88,6 +100,7 @@ impl CoreLoop {
             txn_id,
             collection,
             filter_bytes,
+            rls_write_check,
         } = params;
 
         let coll_key = (
@@ -101,6 +114,26 @@ impl CoreLoop {
                 Ok(rows) => rows,
                 Err(resp) => return resp,
             };
+
+        // The image a delete is governed by is the row it removes. Decided for
+        // the whole matching set before the first tombstone, so a refusal
+        // leaves the overlay untouched.
+        if !rls_write_check.is_empty() {
+            let schema = match self.columnar_engine_schema(task, tid, collection) {
+                Ok(s) => s,
+                Err(resp) => return resp,
+            };
+            if let Err(response) = self.stage_admit_columnar_rows(
+                task,
+                rls_write_check,
+                affected_rows.iter().map(|(_, row)| row.as_slice()),
+                &schema,
+                tid,
+                collection,
+            ) {
+                return response;
+            }
+        }
 
         let affected = affected_rows.len();
         for (surrogate, _row) in affected_rows {
@@ -128,6 +161,7 @@ impl CoreLoop {
             collection,
             filter_bytes,
             updates,
+            rls_write_check,
         } = params;
 
         let coll_key = (
@@ -150,14 +184,33 @@ impl CoreLoop {
                 Err(resp) => return resp,
             };
 
+        // Resolve every post-image and let the policy decide all of them before
+        // the first staged put: the post-image is what the policy governs, and
+        // it only exists once the assignments are applied. A refusal partway
+        // through would leave the rows ahead of it staged and visible to this
+        // transaction's own reads.
         let affected = affected_rows.len();
+        let mut new_rows: Vec<(u32, Vec<Value>)> = Vec::with_capacity(affected);
         for (surrogate, row) in affected_rows {
-            let new_row = match apply_columnar_updates(&schema, row, updates) {
-                Ok(r) => r,
+            match apply_columnar_updates(&schema, row, updates) {
+                Ok(r) => new_rows.push((surrogate, r)),
                 Err(detail) => {
                     return self.response_error(task, ErrorCode::Internal { detail });
                 }
-            };
+            }
+        }
+        if let Err(response) = self.stage_admit_columnar_rows(
+            task,
+            rls_write_check,
+            new_rows.iter().map(|(_, row)| row.as_slice()),
+            &schema,
+            tid,
+            collection,
+        ) {
+            return response;
+        }
+
+        for (surrogate, new_row) in new_rows {
             let body = match nodedb_types::value_to_msgpack(&Value::Array(new_row)) {
                 Ok(b) => b,
                 Err(e) => {

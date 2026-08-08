@@ -47,6 +47,7 @@ fn insert_grouped_columnar(
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
+            rls_write_check: Vec::new(),
         }),
     );
 }
