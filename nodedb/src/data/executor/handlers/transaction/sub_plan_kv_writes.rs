@@ -37,6 +37,7 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                ..
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
@@ -50,6 +51,8 @@ impl CoreLoop {
                         value,
                         ttl_ms: *ttl_ms,
                         surrogate: *surrogate,
+                        returning: None,
+                        rls_filters: &[],
                     },
                 );
                 if resp.status == Status::Error {
@@ -71,6 +74,7 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                ..
             } => {
                 let resp = self.execute_kv_insert(
                     task,
@@ -82,6 +86,8 @@ impl CoreLoop {
                         value,
                         ttl_ms: *ttl_ms,
                         surrogate: *surrogate,
+                        returning: None,
+                        rls_filters: &[],
                     },
                 );
                 if resp.status == Status::Error {
@@ -104,6 +110,7 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                ..
             } => {
                 let now_ms = current_ms();
                 let was_absent = self
@@ -120,6 +127,8 @@ impl CoreLoop {
                         value,
                         ttl_ms: *ttl_ms,
                         surrogate: *surrogate,
+                        returning: None,
+                        rls_filters: &[],
                     },
                 );
                 if resp.status == Status::Error {
@@ -193,6 +202,7 @@ impl CoreLoop {
                 entries,
                 ttl_ms,
                 surrogates,
+                ..
             } => {
                 let now_ms = current_ms();
                 let prior_entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
@@ -211,6 +221,8 @@ impl CoreLoop {
                         entries,
                         ttl_ms: *ttl_ms,
                         surrogates,
+                        returning: None,
+                        rls_filters: &[],
                     },
                 );
                 if resp.status == Status::Error {

@@ -247,6 +247,8 @@ fn kv_put_records_kvkey_version() {
             value: b"v1".as_slice(),
             ttl_ms: 0,
             surrogate: Surrogate::new(3),
+            returning: None,
+            rls_filters: &[],
         },
     );
     assert_eq!(resp.status, Status::Ok);

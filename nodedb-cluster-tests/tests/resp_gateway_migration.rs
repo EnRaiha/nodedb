@@ -68,6 +68,8 @@ async fn resp_gateway_migration_single_node_set_get() {
         value: mp_string("myvalue"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     let put_result = gateway.execute(&ctx, put_authorized).await;
@@ -132,6 +134,8 @@ async fn resp_gateway_migration_cross_node_get() {
         value: mp_string("cross-value"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan);
     leader_gw

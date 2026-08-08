@@ -409,3 +409,61 @@ async fn insert_returning_filters_on_a_column_outside_the_projection() {
         "the policy must be evaluated against the stored row, not the projection"
     );
 }
+
+/// The key-value engine goes through the same read gate: `INSERT ... RETURNING`
+/// on a KV collection shows only the rows the read policy admits, while every
+/// row still lands.
+///
+/// KV is asserted separately from the document engines because its row shape is
+/// built by a different helper (`{key, value…}` rather than `{id, …}`), and the
+/// filter has to be evaluated against that shape — a gate that silently matched
+/// nothing on a KV row would return everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_returning_hides_rows_the_read_policy_excludes() {
+    let server = TestServer::start().await;
+    let user = "ret_rls_kv_user";
+    server
+        .exec(
+            "CREATE COLLECTION ret_rls_kv (key TEXT PRIMARY KEY, owner TEXT, note TEXT) \
+             WITH (engine='kv')",
+        )
+        .await
+        .expect("create ret_rls_kv");
+    create_user(&server, user).await;
+    server
+        .exec(
+            "CREATE RLS POLICY ret_rls_kv_owner ON ret_rls_kv FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create read policy on ret_rls_kv");
+
+    let rows = rows_as(
+        &server,
+        user,
+        &format!(
+            "INSERT INTO ret_rls_kv (key, owner, note) \
+             VALUES ('k_hidden', 'alice', 'a'), ('k_visible', '{user}', 'b') \
+             RETURNING key, note"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec!["k_visible|b".to_string()],
+        "only the row the read policy admits may be returned"
+    );
+
+    // Both rows were written — read them back as the superuser, who holds no
+    // restricting policy.
+    let stored = server
+        .query_rows("SELECT key FROM ret_rls_kv ORDER BY key")
+        .await
+        .expect("read back as superuser");
+    assert_eq!(
+        stored,
+        vec![vec!["k_hidden".to_string()], vec!["k_visible".to_string()]],
+        "the insert must write every row, hidden or not: {stored:?}"
+    );
+}

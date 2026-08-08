@@ -31,6 +31,8 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
             entries,
             ttl_ms: 0,
             surrogates,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

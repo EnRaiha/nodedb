@@ -50,6 +50,8 @@ fn multi_core_broadcast_inner_join() {
                 value,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -189,6 +191,8 @@ fn multi_core_broadcast_left_join() {
                 value,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -321,6 +325,8 @@ fn multi_core_broadcast_merge_simulation() {
                 value,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -336,6 +342,8 @@ fn multi_core_broadcast_merge_simulation() {
                 value,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

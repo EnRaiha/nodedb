@@ -85,6 +85,8 @@ fn staged_expire_is_observed_by_in_tx_get_ttl_then_reverts_on_rollback() {
             value: b"v".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -159,6 +161,8 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
             value: b"v".to_vec(),
             ttl_ms: 60_000,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -241,6 +245,8 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
             value: b"v".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

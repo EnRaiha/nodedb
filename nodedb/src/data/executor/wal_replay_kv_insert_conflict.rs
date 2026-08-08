@@ -412,6 +412,8 @@ mod tests {
             value: seed.clone(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let updates = vec![(
             "mana".to_string(),
@@ -427,6 +429,8 @@ mod tests {
             updates: updates.clone(),
             surrogate: Surrogate::new(1),
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let records = append_via_autocommit(&[put_p1, upsert]);
@@ -469,6 +473,8 @@ mod tests {
             updates,
             surrogate: Surrogate::new(3),
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let records = append_via_autocommit(&[upsert]);
@@ -495,6 +501,8 @@ mod tests {
             value: seed.clone(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let excluded = obj_bytes(&[("hp", 1)]);

@@ -135,6 +135,7 @@ impl CoreLoop {
                 ttl_ms,
                 surrogate,
                 rls_write_check,
+                ..
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
                 self.stage_kv_insert_on_conflict_update(

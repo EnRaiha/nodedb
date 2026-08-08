@@ -25,6 +25,8 @@ pub(super) fn put(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -60,6 +62,8 @@ pub(super) fn insert(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -82,6 +86,8 @@ pub(super) fn insert_if_absent(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -107,6 +113,8 @@ pub(super) fn insert_on_conflict_update(
         updates: updates.to_vec(),
         surrogate,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -133,6 +141,8 @@ pub(super) fn batch_put(
         entries: entries.to_vec(),
         ttl_ms,
         surrogates: resolved,
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

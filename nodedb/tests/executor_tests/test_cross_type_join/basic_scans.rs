@@ -33,6 +33,8 @@ fn kv_put_scan_roundtrip() {
             value: value1,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -47,6 +49,8 @@ fn kv_put_scan_roundtrip() {
             value: value2,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -114,6 +118,8 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
             value,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

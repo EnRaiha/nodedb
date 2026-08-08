@@ -21,12 +21,13 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             value,
             ttl_ms,
             surrogate,
+            ..
         } => kv::put(collection, key, value, *ttl_ms, surrogate.as_u32()),
-        // The compiled RLS predicate every write below carries is a property of
-        // the requesting session, not of the row: it is deliberately absent
-        // from the durable record, so a replay re-applies the write that was
-        // already admitted rather than re-deciding it against whoever happens
-        // to be connected at recovery time.
+        // The compiled RLS predicates and the RETURNING projection every write
+        // below carries are properties of the requesting session, not of the
+        // row: they are deliberately absent from the durable record, so a
+        // replay re-applies the write that was already admitted rather than
+        // re-deciding it — and answers no client, so it projects nothing.
         KvOp::Delete {
             collection, keys, ..
         } => kv::delete(collection, keys),
@@ -36,6 +37,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             value,
             ttl_ms,
             surrogate,
+            ..
         } => kv::insert(collection, key, value, *ttl_ms, surrogate.as_u32()),
         KvOp::InsertIfAbsent {
             collection,
@@ -43,6 +45,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             value,
             ttl_ms,
             surrogate,
+            ..
         } => kv::insert_if_absent(collection, key, value, *ttl_ms, surrogate.as_u32()),
         KvOp::InsertOnConflictUpdate {
             collection,
@@ -65,6 +68,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             entries,
             ttl_ms,
             surrogates,
+            ..
         } => kv::batch_put(collection, entries, *ttl_ms, surrogates),
         KvOp::Expire {
             collection,

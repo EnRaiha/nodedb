@@ -1151,6 +1151,8 @@ mod tests {
                 value: Vec::new(),
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Insert {
                 collection: "c".into(),
@@ -1158,6 +1160,8 @@ mod tests {
                 value: Vec::new(),
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertIfAbsent {
                 collection: "c".into(),
@@ -1165,6 +1169,8 @@ mod tests {
                 value: Vec::new(),
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
                 collection: "c".into(),
@@ -1174,6 +1180,8 @@ mod tests {
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Delete {
                 collection: "c".into(),
@@ -1214,6 +1222,8 @@ mod tests {
                 entries: Vec::new(),
                 ttl_ms: 0,
                 surrogates: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::FieldGet {
                 collection: "c".into(),

@@ -136,6 +136,8 @@ pub(in crate::control::server::resp) async fn handle_set(
         value,
         ttl_ms,
         surrogate,
+        returning: None,
+        rls_filters: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

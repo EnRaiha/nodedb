@@ -178,6 +178,8 @@ mod tests {
                 .expect("encode seed doc"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
             collection: "players".into(),
@@ -250,6 +252,8 @@ mod tests {
             value: json_field_bytes(serde_json::json!(42)),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
             collection: "players".into(),

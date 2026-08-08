@@ -437,18 +437,44 @@ async fn upsert_returning_shows_the_stored_row_not_the_submitted_one() {
 /// `INSERT ... RETURNING` into an engine with no `returning` slot is refused,
 /// naming the engine. Dropping the clause silently answered a statement that
 /// asked for rows with a bare command tag.
+///
+/// The engines still without the slot are asserted here as a group, so the
+/// refusal message stays accurate as each one gains support: an engine that
+/// starts working must be moved out of this list rather than left behind
+/// claiming a limitation that no longer exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn insert_returning_into_a_key_value_collection_is_refused() {
+async fn insert_returning_into_an_unsupported_engine_is_refused_by_name() {
     let server = TestServer::start().await;
     server
-        .exec("CREATE COLLECTION ins_ret_kv (id TEXT PRIMARY KEY, n INT) WITH (engine='kv')")
+        .exec("CREATE COLLECTION ins_ret_col COLUMNS (id TEXT, v FLOAT) WITH (engine='columnar')")
         .await
-        .expect("create collection");
+        .expect("create columnar collection");
 
     server
         .expect_error(
-            "INSERT INTO ins_ret_kv (id, n) VALUES ('k1', 1) RETURNING *",
-            "key-value",
+            "INSERT INTO ins_ret_col (id, v) VALUES ('c1', 1.5) RETURNING *",
+            "columnar",
         )
         .await;
+}
+
+/// The key-value engine DOES carry the clause now, so the same statement that
+/// used to be refused returns its stored row. Pinned here beside the refusal so
+/// the two cannot drift into claiming the same thing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_into_a_key_value_collection_returns_its_row() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION ins_ret_kv (key TEXT PRIMARY KEY, n INT) WITH (engine='kv')")
+        .await
+        .expect("create collection");
+
+    assert_eq!(
+        rows(
+            &server,
+            "INSERT INTO ins_ret_kv (key, n) VALUES ('k1', 1) RETURNING key, n"
+        )
+        .await,
+        vec!["k1|1".to_string()],
+    );
 }

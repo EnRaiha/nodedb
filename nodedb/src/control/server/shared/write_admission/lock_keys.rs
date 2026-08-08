@@ -326,6 +326,8 @@ mod tests {
                 entries: vec![(b"k1".to_vec(), vec![]), (b"k2".to_vec(), vec![])],
                 ttl_ms: 0,
                 surrogates: vec![],
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             None
         );

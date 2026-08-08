@@ -73,6 +73,8 @@ async fn pgwire_gateway_smoke_cache_hit() {
         value: mp_string("pgwire-smoke-val"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
@@ -138,6 +140,8 @@ async fn http_gateway_smoke_cache_hit() {
         value: mp_string("http-smoke-val"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
@@ -197,6 +201,8 @@ async fn resp_gateway_smoke_cache_hit() {
         value: mp_string("resp-smoke-val"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
@@ -259,6 +265,8 @@ async fn ilp_gateway_smoke_cache_hit() {
         value: mp_string("ilp-smoke-val"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
@@ -318,6 +326,8 @@ async fn native_gateway_smoke_cache_hit() {
         value: mp_string("native-smoke-val"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway

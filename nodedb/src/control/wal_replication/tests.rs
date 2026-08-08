@@ -1768,6 +1768,8 @@ fn representative_handled_writes_still_replicate() {
         value: vec![2],
         ttl_ms: 0,
         surrogate: Surrogate::new(7),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     assert!(
         to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &kv_put).is_some(),

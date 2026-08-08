@@ -73,6 +73,8 @@ async fn gateway_execute_kv_put_get_single_node() {
         value: mp_string("smoke-value"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     let put_result = gateway.execute(&ctx, put_authorized).await;

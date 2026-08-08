@@ -85,6 +85,8 @@ fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
         value: b"v".to_vec(),
         ttl_ms: 0,
         surrogate: Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 

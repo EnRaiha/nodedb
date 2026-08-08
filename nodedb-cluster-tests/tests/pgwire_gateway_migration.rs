@@ -182,6 +182,8 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
             value: mp_string("cache-val"),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
         gateway

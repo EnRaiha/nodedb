@@ -453,6 +453,8 @@ mod tests {
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
             surrogates: vec![nodedb_types::Surrogate::ZERO],
+            returning: None,
+            rls_filters: Vec::new(),
         })));
     }
 
@@ -508,6 +510,8 @@ mod tests {
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
             surrogates: vec![nodedb_types::Surrogate::ZERO],
+            returning: None,
+            rls_filters: Vec::new(),
         };
         assert_eq!(staged_kv_tag_kind(&op, &payload), StagedTagKind::Insert);
     }

@@ -79,6 +79,8 @@ pub(crate) fn build_point_put(
                 value,
                 ttl_ms: 0,
                 surrogate,
+                returning: None,
+                rls_filters: Vec::new(),
             }))
         }
         Some(CollectionType::Columnar(ColumnarProfile::Timeseries { .. })) => {

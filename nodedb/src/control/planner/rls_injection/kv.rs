@@ -73,35 +73,58 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              and the plan names only the index",
         ),
 
-        // Admit: the plan carries the whole post-image, so the write policy is
-        // evaluated against the exact row that will exist afterwards. A
-        // multi-column SQL write encodes its columns as a MessagePack map, so
-        // the predicate reads the same field names a `SELECT` would; a
-        // single-column `value` write stores one opaque scalar, which carries
-        // no field for the predicate to name and is therefore rejected by the
-        // same evaluation rather than by a carve-out. Neither op returns a row,
-        // so the read policy has nothing to restrict here.
+        // Admit the write image, then inject the read filter. The plan carries
+        // the whole post-image, so the write policy is evaluated against the
+        // exact row that will exist afterwards. A multi-column SQL write
+        // encodes its columns as a MessagePack map, so the predicate reads the
+        // same field names a `SELECT` would; a single-column `value` write
+        // stores one opaque scalar, which carries no field for the predicate to
+        // name and is therefore rejected by the same evaluation rather than by
+        // a carve-out.
+        //
+        // The read filter is not redundant with that admission. It gates a
+        // different thing: a `RETURNING` clause on these writes ships rows
+        // back, and that output is a read, so a row a read-only policy hides
+        // must not become visible just because the statement wrote it. The two
+        // policies are independent — a collection can carry a `FOR SELECT`
+        // policy and no write policy at all, in which case the write is
+        // unrestricted and the returned row set still shrinks.
         KvOp::Put {
-            collection, value, ..
+            collection,
+            value,
+            rls_filters,
+            ..
         }
         | KvOp::Insert {
-            collection, value, ..
+            collection,
+            value,
+            rls_filters,
+            ..
         }
         | KvOp::InsertIfAbsent {
-            collection, value, ..
-        } => ctx.admit_write_image(collection, value),
+            collection,
+            value,
+            rls_filters,
+            ..
+        } => {
+            ctx.admit_write_image(collection, value)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
 
         // Admit every entry: one violating row fails the whole statement, since
-        // a silently dropped row would report a write that never happened.
+        // a silently dropped row would report a write that never happened. The
+        // read filter rides along for the same reason it does on the point
+        // writes above — `RETURNING` output is a read.
         KvOp::BatchPut {
             collection,
             entries,
+            rls_filters,
             ..
         } => {
             for (_, value) in entries.iter() {
                 ctx.admit_write_image(collection, value)?;
             }
-            Ok(())
+            ctx.set_post_filters(collection, rls_filters)
         }
 
         // Ship the write predicate: the image these persist is produced where
@@ -114,9 +137,15 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
         KvOp::InsertOnConflictUpdate {
             collection,
             rls_write_check,
+            rls_filters,
             ..
+        } => {
+            ctx.set_write_check(collection, rls_write_check)?;
+            // `RETURNING` output is a read — see the point-write arms above.
+            ctx.set_post_filters(collection, rls_filters)
         }
-        | KvOp::Delete {
+
+        KvOp::Delete {
             collection,
             rls_write_check,
             ..
@@ -250,6 +279,8 @@ mod tests {
             value: body(owner_id),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -312,11 +343,30 @@ mod tests {
             value: b"v1".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),
             Err(crate::Error::RejectedAuthz { .. })
         ));
+    }
+
+    /// A `RETURNING` on a KV write ships rows back, so a read-only policy must
+    /// land in the write's post-filter slot. Leaving it empty would return rows
+    /// the same principal's `SELECT` hides.
+    #[test]
+    fn a_kv_write_receives_the_read_policy_filter() {
+        let store = store_with_read_policy("sessions");
+        let mut plan = kv_put_row("sessions", "42");
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Kv(KvOp::Put { rls_filters, .. }) => assert!(
+                !rls_filters.is_empty(),
+                "the read policy must gate RETURNING output"
+            ),
+            other => panic!("plan shape changed: {other:?}"),
+        }
     }
 
     /// A batch fails whole when any one of its rows violates the policy.
@@ -328,6 +378,8 @@ mod tests {
             entries: vec![(b"k1".to_vec(), body("42")), (b"k2".to_vec(), body("99"))],
             ttl_ms: 0,
             surrogates: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),

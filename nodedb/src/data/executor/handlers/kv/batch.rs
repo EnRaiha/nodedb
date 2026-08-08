@@ -23,6 +23,10 @@ pub(in crate::data::executor) struct KvBatchPutArgs<'a> {
     pub entries: &'a [(Vec<u8>, Vec<u8>)],
     pub ttl_ms: u64,
     pub surrogates: &'a [nodedb_types::Surrogate],
+    /// When `Some`, return one row per written entry, in `entries` order.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -100,6 +104,8 @@ impl CoreLoop {
             entries,
             ttl_ms,
             surrogates,
+            returning,
+            rls_filters,
         } = args;
         debug!(core = self.core_id, %collection, count = entries.len(), "kv batch put");
         // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
@@ -119,6 +125,18 @@ impl CoreLoop {
             for (key, _) in entries {
                 self.note_kv_write_lsn(task, did, tid, collection, key);
             }
+        }
+        if let Some(spec) = returning {
+            // One row per entry, in `entries` order — the order the statement
+            // listed them, which is the order PostgreSQL returns them in. The
+            // batch writes each value verbatim, so the entry bytes ARE the
+            // stored post-images.
+            let rows: Vec<crate::data::executor::handlers::returning_rows::KvStoredRow<'_>> =
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                    .collect();
+            return self.kv_stored_returning_response(task, spec, rls_filters, &rows);
         }
         match response_codec::encode_count("inserted", new_count) {
             Ok(payload) => self.response_with_payload(task, payload),

@@ -109,6 +109,8 @@ pub(in crate::control::server::resp) async fn handle_mset(
         entries,
         ttl_ms: 0,
         surrogates,
+        returning: None,
+        rls_filters: Vec::new(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

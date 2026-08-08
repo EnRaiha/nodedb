@@ -64,9 +64,11 @@ pub fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Err
 /// Refuse an `INSERT ... RETURNING` the planner produced a plan for that has
 /// nowhere to carry the clause.
 ///
-/// The document engines carry it: `PointInsert`, `PointPut`, `BatchInsert`, and
-/// `Upsert` each own a `returning` slot paired with the `rls_filters` read gate,
-/// so the statement returns the STORED post-image bounded by the read policy.
+/// The document and key-value engines carry it: `PointInsert`, `PointPut`,
+/// `BatchInsert`, `Upsert`, and the KV `Insert` / `InsertIfAbsent` /
+/// `InsertOnConflictUpdate` / `Put` / `BatchPut` each own a `returning` slot
+/// paired with the `rls_filters` read gate, so the statement returns the STORED
+/// post-image bounded by the read policy.
 /// The remaining insert shapes own no such slot, so the clause would be parsed,
 /// discarded, and answered with a command tag for a statement that asked for
 /// rows — with nothing anywhere saying the request had been dropped.
@@ -81,12 +83,6 @@ pub fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Err
 /// target collection, not of the SQL.
 pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Error> {
     let unsupported = match plan {
-        PhysicalPlan::Kv(
-            KvOp::Insert { .. }
-            | KvOp::InsertIfAbsent { .. }
-            | KvOp::InsertOnConflictUpdate { .. }
-            | KvOp::Put { .. },
-        ) => "key-value",
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => "columnar and spatial",
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => "timeseries",
         PhysicalPlan::Vector(VectorOp::Insert { .. } | VectorOp::DirectUpsert { .. }) => "vector",
@@ -121,9 +117,9 @@ pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Er
     Err(Error::BadRequest {
         detail: format!(
             "RETURNING is not supported on INSERT into {unsupported} collections; it is \
-             supported on document collections (schemaless and strict), and on UPDATE, DELETE, \
-             and MERGE. Follow the insert with a SELECT on the inserted key to read the stored \
-             row."
+             supported on document collections (schemaless and strict) and key-value \
+             collections, and on UPDATE, DELETE, and MERGE. Follow the insert with a SELECT on \
+             the inserted key to read the stored row."
         ),
     })
 }
@@ -161,13 +157,29 @@ pub fn in_transaction_returning_unsupported() -> Error {
 /// Inject a RETURNING spec into a DML physical plan variant.
 ///
 /// Only `PointInsert`, `PointPut`, `BatchInsert`, `Upsert`, `PointUpdate`,
-/// `BulkUpdate`, `PointDelete`, `BulkDelete`, `UpdateFromJoin`, `Merge`, and
-/// the CRDT `DocUpsert` / `DocDelete` ops are affected. Every other variant is
+/// `BulkUpdate`, `PointDelete`, `BulkDelete`, `UpdateFromJoin`, `Merge`, the KV
+/// `Insert` / `InsertIfAbsent` / `InsertOnConflictUpdate` / `Put` / `BatchPut`
+/// ops, and the CRDT `DocUpsert` / `DocDelete` ops are affected. Every other variant is
 /// left unchanged — an insert shape among them has already been refused by
 /// [`refuse_unplannable_insert_returning`], which runs first.
 pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointInsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Kv(KvOp::Insert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Kv(KvOp::InsertIfAbsent { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Kv(KvOp::Put { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Kv(KvOp::BatchPut { returning, .. }) => {
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::PointPut { returning, .. }) => {

@@ -83,6 +83,7 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             surrogate,
+            ..
         }
         | KvOp::Insert {
             collection,
@@ -90,6 +91,7 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             surrogate,
+            ..
         }
         | KvOp::InsertIfAbsent {
             collection,
@@ -97,6 +99,7 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             surrogate,
+            ..
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
@@ -121,6 +124,11 @@ pub fn wal_append_kv_op(
             // session, not of the row, so it stays out of the durable record —
             // a replay re-applies an already-admitted write.
             rls_write_check: _,
+            // The projection is answered from the Data Plane's response, not
+            // from the journal: a replay re-applies the row, it does not answer
+            // a client. Both slots stay out of the durable record.
+            returning: _,
+            rls_filters: _,
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
@@ -145,6 +153,7 @@ pub fn wal_append_kv_op(
             entries,
             ttl_ms,
             surrogates,
+            ..
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;

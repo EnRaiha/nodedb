@@ -124,22 +124,12 @@ impl CoreLoop {
         // Build results as raw msgpack — no serde_json::Value intermediary.
         let mut result_entries: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
         for (k, v) in &entries {
-            let key_str = String::from_utf8_lossy(k);
-            // Two storage shapes coexist by design (see dml.rs::convert_kv_insert):
-            // - msgpack map (typed columns) — inject `key` in place.
-            // - raw bytes (single-`value` form / RESP SET) — wrap as
-            //   `{value: <bytes>}` first so the downstream injection
-            //   produces the same `{key, value}` shape every scan path
-            //   expects.
-            let entry_mp = if nodedb_query::msgpack_scan::map_header(v, 0).is_some() {
-                nodedb_query::msgpack_scan::inject_str_field(v, "key", &key_str)
-            } else {
-                let mut wrapped = Vec::with_capacity(v.len() + 8);
-                nodedb_query::msgpack_scan::write_map_header(&mut wrapped, 1);
-                nodedb_query::msgpack_scan::write_str(&mut wrapped, "value");
-                nodedb_query::msgpack_scan::write_str(&mut wrapped, &String::from_utf8_lossy(v));
-                nodedb_query::msgpack_scan::inject_str_field(&wrapped, "key", &key_str)
-            };
+            // The two storage shapes (msgpack map vs raw bytes) are resolved by
+            // the one shared shaper, so this scan, the streaming/materializing
+            // scans, and a write's `RETURNING` projection cannot disagree about
+            // what a KV row looks like. This loop used to carry its own copy of
+            // that logic, and the copies diverged on the raw-bytes case.
+            let (_key_str, entry_mp) = crate::data::executor::scan_normalize::kv_row_to_doc(k, v);
 
             // Apply filter predicates post-scan (already works on raw msgpack).
             if !filter_predicates.is_empty() {

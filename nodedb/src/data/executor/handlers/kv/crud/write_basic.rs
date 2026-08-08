@@ -24,6 +24,8 @@ impl CoreLoop {
             value,
             ttl_ms,
             surrogate,
+            returning,
+            rls_filters,
         } = params;
         debug!(core = self.core_id, %collection, "kv put");
 
@@ -65,6 +67,12 @@ impl CoreLoop {
         self.emit_write_event(task, collection, op, &key_str, Some(value), old_slice);
 
         self.note_kv_write_lsn(task, did, tid, collection, key);
+        if let Some(spec) = returning {
+            // `value` IS the stored body on this path: the put writes the
+            // caller's bytes verbatim, so projecting them is projecting the
+            // stored post-image, not an echo of the request.
+            return self.kv_stored_returning_response(task, spec, rls_filters, &[(key, value)]);
+        }
         self.response_ok(task)
     }
 
@@ -89,6 +97,8 @@ impl CoreLoop {
             value,
             ttl_ms,
             surrogate,
+            returning,
+            rls_filters,
         } = params;
         debug!(core = self.core_id, %collection, "kv insert");
 
@@ -147,6 +157,9 @@ impl CoreLoop {
         );
 
         self.note_kv_write_lsn(task, did, tid, collection, key);
+        if let Some(spec) = returning {
+            return self.kv_stored_returning_response(task, spec, rls_filters, &[(key, value)]);
+        }
         self.response_ok(task)
     }
 
@@ -165,6 +178,8 @@ impl CoreLoop {
             value,
             ttl_ms,
             surrogate,
+            returning,
+            rls_filters,
         } = params;
         debug!(core = self.core_id, %collection, "kv insert-if-absent");
 
@@ -187,6 +202,14 @@ impl CoreLoop {
             // Key already present: `ON CONFLICT DO NOTHING` inserts nothing, so
             // it reports 0 rows — matches the strict/schemaless `if_absent`
             // path, which reports 0 for the same reason.
+            //
+            // A `RETURNING` on the same statement ships an EMPTY row set rather
+            // than the count shape: nothing was written, so there is no
+            // post-image to project, and a count payload would be decoded as a
+            // row set of the wrong shape by the RETURNING renderer.
+            if let Some(spec) = returning {
+                return self.kv_stored_returning_response(task, spec, rls_filters, &[]);
+            }
             return self.response_affected(task, 0);
         }
 
@@ -215,6 +238,9 @@ impl CoreLoop {
         );
 
         self.note_kv_write_lsn(task, did, tid, collection, key);
+        if let Some(spec) = returning {
+            return self.kv_stored_returning_response(task, spec, rls_filters, &[(key, value)]);
+        }
         self.response_affected(task, 1)
     }
 

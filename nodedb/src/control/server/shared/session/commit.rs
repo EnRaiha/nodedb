@@ -543,6 +543,8 @@ mod tests {
             value: Vec::new(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }))
     }
 

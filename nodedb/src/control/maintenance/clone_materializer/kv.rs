@@ -103,6 +103,8 @@ pub(super) async fn materialize_kv_collection(
                 value,
                 ttl_ms: 0,
                 surrogate,
+                returning: None,
+                rls_filters: Vec::new(),
             });
             let resp =
                 dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;

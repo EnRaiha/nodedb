@@ -201,6 +201,8 @@ mod tests {
                 .expect("encode seed doc"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

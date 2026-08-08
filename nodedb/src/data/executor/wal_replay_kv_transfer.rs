@@ -407,6 +407,8 @@ mod tests {
             value: kv_doc("balance", 100.0),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let put_bob = PhysicalPlan::Kv(KvOp::Put {
             collection: "accounts".into(),
@@ -414,6 +416,8 @@ mod tests {
             value: kv_doc("balance", 10.0),
             ttl_ms: 0,
             surrogate: Surrogate::new(2),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let transfer = PhysicalPlan::Kv(KvOp::Transfer {
             collection: "accounts".into(),
@@ -479,6 +483,8 @@ mod tests {
             value: kv_doc("power", 5.0),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let transfer_item = PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection: "inventory".into(),

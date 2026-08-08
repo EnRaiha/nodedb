@@ -171,6 +171,8 @@ fn kv_no_ttl_byte_identical() {
                 value: format!("val-{i}").into_bytes(),
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::new(i),
+                returning: None,
+                rls_filters: Vec::new(),
             })
         })
         .collect();
@@ -332,6 +334,8 @@ fn kv_with_ttl_byte_identical() {
                 value: format!("ttl-val-{i}").into_bytes(),
                 ttl_ms: 60_000,
                 surrogate: nodedb_types::Surrogate::new(i),
+                returning: None,
+                rls_filters: Vec::new(),
             })
         })
         .collect();

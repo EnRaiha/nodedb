@@ -274,6 +274,8 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
             value: b"v".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

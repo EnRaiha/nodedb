@@ -216,6 +216,8 @@ mod tests {
             value: nodedb_types::json_to_msgpack(&doc).expect("encode seed doc"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

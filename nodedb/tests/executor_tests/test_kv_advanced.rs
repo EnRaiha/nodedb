@@ -27,6 +27,8 @@ fn kv_protocol_command_sequence() {
             value: b"value1".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -55,6 +57,8 @@ fn kv_protocol_command_sequence() {
             value: b"value2".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -128,6 +132,8 @@ fn kv_protocol_command_sequence() {
             ],
             ttl_ms: 0,
             surrogates: vec![nodedb_types::Surrogate::ZERO; 3],
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -186,6 +192,8 @@ fn kv_and_vector_coexist() {
                 value: format!("data:{i}").into_bytes(),
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -263,6 +271,8 @@ fn ttl_expiry_produces_expired_key_info() {
             value: b"data".to_vec(),
             ttl_ms: 1000, // 1 second.
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -299,6 +309,8 @@ fn ttl_expiry_produces_expired_key_info() {
             value: b"forever".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -347,6 +359,8 @@ fn kv_field_get_and_set() {
             value: doc,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -419,6 +433,8 @@ fn kv_truncate_clears_all() {
                 value: b"v".to_vec(),
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -492,6 +508,8 @@ fn kv_index_write_amp_ratio_matches() {
                 value: doc,
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -539,6 +557,8 @@ fn kv_mass_expiry_respects_reap_budget() {
                 value: b"v".to_vec(),
                 ttl_ms: 100, // All expire in 100ms.
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -554,6 +574,8 @@ fn kv_mass_expiry_respects_reap_budget() {
             value: b"alive".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

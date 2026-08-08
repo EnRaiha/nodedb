@@ -71,6 +71,8 @@ async fn native_gateway_migration_single_node_select() {
         value: mp_string("native-value"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
@@ -133,6 +135,8 @@ async fn native_gateway_migration_cross_node_select() {
         value: mp_string("cross-native-value"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan);
     leader_gw

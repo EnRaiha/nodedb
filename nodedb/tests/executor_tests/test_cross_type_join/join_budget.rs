@@ -50,6 +50,8 @@ fn batch_kv(ctx: &mut TestCtx, collection: &str, count: usize) -> String {
             entries,
             ttl_ms: 0,
             surrogates,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     format!("k{}", count - 1)
@@ -82,6 +84,8 @@ fn hash_join_completeness_past_50k_cap() {
             value: b"match".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -142,6 +146,8 @@ fn sort_merge_join_completeness_past_50k_cap() {
             value: b"smatch".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -189,6 +195,8 @@ fn nested_loop_join_completeness_past_50k_cap() {
             value: b"nlmatch".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

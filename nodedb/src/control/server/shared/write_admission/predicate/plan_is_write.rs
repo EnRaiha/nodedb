@@ -69,6 +69,8 @@ mod tests {
             value: b"v".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(plan_is_write(&plan));
     }

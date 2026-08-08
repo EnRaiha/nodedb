@@ -30,6 +30,8 @@ impl CoreLoop {
             updates,
             surrogate,
             rls_write_check,
+            returning,
+            rls_filters,
         } = params;
         debug!(core = self.core_id, %collection, "kv insert-on-conflict-update");
 
@@ -140,6 +142,19 @@ impl CoreLoop {
             old_slice,
         );
 
+        if let Some(spec) = returning {
+            // The MERGED body, not the caller's: on a conflict the submitted
+            // values are only part of what the row now holds, so echoing them
+            // would report a row that does not exist. `stored_bytes` is the
+            // exact body the put above persisted — the same bytes the write
+            // gate was decided against.
+            return self.kv_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &[(key, stored_bytes.as_slice())],
+            );
+        }
         self.response_ok(task)
     }
 }

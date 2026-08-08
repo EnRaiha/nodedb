@@ -342,6 +342,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),
@@ -372,6 +374,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let incr1 = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),
@@ -410,6 +414,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 60_000,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),
@@ -445,6 +451,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&0i64).expect("encode"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let entry = encode_kv_incr("counters", b"daily", 1, 5_000, 1, Some(6_000))
             .expect("encode kv_incr with absolute expiry");
@@ -488,6 +496,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&"hello").expect("encode"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),

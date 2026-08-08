@@ -78,6 +78,8 @@ pub(super) async fn handle_zadd(
             value,
             ttl_ms: 0,
             surrogate,
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         match dispatch_kv_write(state, session, plan).await {

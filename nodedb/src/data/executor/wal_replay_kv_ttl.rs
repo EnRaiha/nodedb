@@ -167,6 +167,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 5_000,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -216,6 +218,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -278,6 +282,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 5_000,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         // 1_000 is vastly less than the real wall clock, so a live-apply path
         // that ignores `resolved_now_ms` and reads the wall clock instead
@@ -294,6 +300,8 @@ mod tests {
                 value: b"payload",
                 ttl_ms: 5_000,
                 surrogate: Surrogate::new(1),
+                returning: None,
+                rls_filters: &[],
             },
         );
         assert_eq!(resp.status, crate::bridge::envelope::Status::Ok);
@@ -319,6 +327,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 5_000,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let task = task_with_resolved_now_ms(plan, Some(1_000));
 
@@ -332,6 +342,8 @@ mod tests {
                 value: b"payload",
                 ttl_ms: 5_000,
                 surrogate: Surrogate::new(1),
+                returning: None,
+                rls_filters: &[],
             },
         );
         assert_eq!(resp.status, crate::bridge::envelope::Status::Ok);

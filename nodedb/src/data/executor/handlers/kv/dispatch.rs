@@ -39,6 +39,8 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                returning,
+                rls_filters,
             } => self.execute_kv_put(
                 task,
                 super::crud::KvWriteParams {
@@ -49,6 +51,8 @@ impl CoreLoop {
                     value,
                     ttl_ms: *ttl_ms,
                     surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
             KvOp::Insert {
@@ -57,6 +61,8 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                returning,
+                rls_filters,
             } => self.execute_kv_insert(
                 task,
                 super::crud::KvWriteParams {
@@ -67,6 +73,8 @@ impl CoreLoop {
                     value,
                     ttl_ms: *ttl_ms,
                     surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
             KvOp::InsertIfAbsent {
@@ -75,6 +83,8 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
+                returning,
+                rls_filters,
             } => self.execute_kv_insert_if_absent(
                 task,
                 super::crud::KvWriteParams {
@@ -85,6 +95,8 @@ impl CoreLoop {
                     value,
                     ttl_ms: *ttl_ms,
                     surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
             KvOp::InsertOnConflictUpdate {
@@ -95,6 +107,8 @@ impl CoreLoop {
                 updates,
                 surrogate,
                 rls_write_check,
+                returning,
+                rls_filters,
             } => self.execute_kv_insert_on_conflict_update(
                 task,
                 super::crud::KvInsertOnConflictUpdateParams {
@@ -107,6 +121,8 @@ impl CoreLoop {
                     updates,
                     surrogate: *surrogate,
                     rls_write_check,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
             KvOp::Delete {
@@ -176,6 +192,8 @@ impl CoreLoop {
                 entries,
                 ttl_ms,
                 surrogates,
+                returning,
+                rls_filters,
             } => self.execute_kv_batch_put(
                 task,
                 super::batch::KvBatchPutArgs {
@@ -185,6 +203,8 @@ impl CoreLoop {
                     entries,
                     ttl_ms: *ttl_ms,
                     surrogates,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
             KvOp::RegisterIndex {

@@ -14,7 +14,6 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::kv::KvScanParams;
 use nodedb_query::msgpack_scan;
-use nodedb_types::columnar::StrictSchema;
 
 impl CoreLoop {
     /// [`Self::scan_collection`] with row-level-security filters applied.
@@ -407,122 +406,13 @@ impl CoreLoop {
     }
 }
 
-/// Convert a single KV engine entry to a `(key, msgpack)` document.
-///
-/// Lossy-decodes the key to a UTF-8 string and injects it as the `key`
-/// field directly into the msgpack map at the binary level (no JSON
-/// roundtrip). Shared by the materializing scan and the streaming scan so
-/// both paths produce byte-identical output.
-fn kv_row_to_doc(key: &[u8], value: &[u8]) -> (String, Vec<u8>) {
-    let key_str = String::from_utf8_lossy(key).to_string();
-    let mp = msgpack_scan::inject_str_field(value, "key", &key_str);
-    (key_str, mp)
-}
-
-/// Convert a single sparse/document row to a `(id, msgpack)` document.
-///
-/// When `strict_schema` is `Some`, the raw bytes are a Binary Tuple and are
-/// decoded via the strict schema (falling back to JSON transcoding if the
-/// tuple cannot be decoded). When `None`, the raw bytes are schemaless and
-/// are normalised from (possibly legacy JSON) to standard msgpack. In both
-/// cases the `id` field is injected identically. Shared by the materializing
-/// scan and the streaming scan so both paths produce byte-identical output.
-pub(in crate::data::executor) fn sparse_row_to_doc(
-    id: &str,
-    raw: &[u8],
-    strict_schema: Option<&StrictSchema>,
-) -> (String, Vec<u8>) {
-    let mp = if let Some(schema) = strict_schema {
-        super::strict_format::binary_tuple_to_msgpack(raw, schema)
-            .unwrap_or_else(|| super::doc_format::json_to_msgpack(raw))
-    } else {
-        super::doc_format::json_to_msgpack(raw)
-    };
-    let mp = msgpack_scan::inject_str_field(&mp, "id", id);
-    (id.to_string(), mp)
-}
-
-/// Convert a single row from a `DecodedColumn` to a `nodedb_types::value::Value`.
-///
-/// Returns `Value::Null` if the row index is out of range or the validity bit is false.
-pub(in crate::data::executor) fn decoded_col_to_value(
-    col: &nodedb_columnar::reader::DecodedColumn,
-    row_idx: usize,
-) -> nodedb_types::value::Value {
-    use nodedb_columnar::reader::DecodedColumn;
-    use nodedb_types::value::Value;
-
-    match col {
-        DecodedColumn::Int64 { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                Value::Integer(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Float64 { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                Value::Float(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Timestamp { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                // Represent as integer microseconds (same as Value::Integer for timestamps).
-                Value::Integer(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Bool { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                Value::Bool(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Binary {
-            data,
-            offsets,
-            valid,
-        } => {
-            if row_idx < valid.len() && valid[row_idx] && row_idx + 1 < offsets.len() {
-                let start = offsets[row_idx] as usize;
-                let end = offsets[row_idx + 1] as usize;
-                if start <= end && end <= data.len() {
-                    let bytes = &data[start..end];
-                    // Best-effort UTF-8 interpretation; fall back to bytes.
-                    match std::str::from_utf8(bytes) {
-                        Ok(s) => Value::String(s.to_string()),
-                        Err(_) => Value::Bytes(bytes.to_vec()),
-                    }
-                } else {
-                    Value::Null
-                }
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::DictEncoded {
-            ids,
-            dictionary,
-            valid,
-        } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                let id = ids[row_idx] as usize;
-                if id < dictionary.len() {
-                    Value::String(dictionary[id].clone())
-                } else {
-                    Value::Null
-                }
-            } else {
-                Value::Null
-            }
-        }
-        _ => Value::Null,
-    }
-}
+// The per-row shape converters live in `row_shape`, beside each other and
+// away from the scan orchestration above. Re-exported here because every
+// caller in this directory reaches them through `scan_normalize::` and the
+// split must not be visible to them.
+pub(in crate::data::executor) use super::row_shape::{
+    decoded_col_to_value, kv_row_to_doc, sparse_row_to_doc,
+};
 
 #[cfg(test)]
 mod tests {

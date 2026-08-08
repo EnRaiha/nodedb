@@ -18,6 +18,11 @@ pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
     /// ends up persisting — the incoming row or its merge with the stored one
     /// — is decided against it. Empty means no write policy applies.
     pub rls_write_check: &'a [u8],
+    /// When `Some`, project the STORED post-image per spec instead of
+    /// reporting a bare status/count.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
 }
 
 /// Parameters for a KV point `GET`.
@@ -39,4 +44,9 @@ pub(in crate::data::executor) struct KvWriteParams<'a> {
     pub value: &'a [u8],
     pub ttl_ms: u64,
     pub surrogate: Surrogate,
+    /// When `Some`, project the STORED post-image per spec instead of
+    /// reporting a bare status/count.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled read policy bounding which of those rows may be shown back.
+    pub rls_filters: &'a [u8],
 }

@@ -71,6 +71,8 @@ async fn http_gateway_migration_single_node_query() {
         value: mp_string("hello-http"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     let put_result = gateway.execute(&ctx, put_authorized).await;
@@ -142,6 +144,8 @@ async fn http_gateway_migration_cross_node_query() {
         value: mp_string("cross-value"),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let put_authorized = common::authorize_gateway_plan(&follower.shared, &ctx, put_plan);
     let put_result = gateway.execute(&ctx, put_authorized).await;

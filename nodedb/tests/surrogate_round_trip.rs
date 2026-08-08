@@ -289,6 +289,8 @@ fn surrogate_round_trip_all_engines() {
                 value: vec![],
                 ttl_ms: 0,
                 surrogate: Surrogate::new(s),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }

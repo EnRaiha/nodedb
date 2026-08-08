@@ -208,6 +208,8 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
         value: b"v1".to_vec(),
         ttl_ms: 5_000,
         surrogate: nodedb_types::Surrogate::new(1),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("Kv(Put) should produce a ReplicatedEntry");
@@ -227,6 +229,8 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
         value: b"v2".to_vec(),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::new(2),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry_no_ttl = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_no_ttl)
         .expect("Kv(Put) should produce a ReplicatedEntry");

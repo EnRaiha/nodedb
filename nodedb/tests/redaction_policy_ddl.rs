@@ -455,3 +455,42 @@ async fn insert_returning_rows_are_redacted() {
         .expect("read back");
     assert_eq!(stored.len(), 1, "one stored row: {stored:?}");
 }
+
+/// A KV `INSERT ... RETURNING` surfaces real stored rows, so its response goes
+/// through the same masking pass a SELECT does.
+///
+/// Both halves are load-bearing here as everywhere: the plan must classify as
+/// row-returning, AND it must report its collection — for KV that comes from
+/// `KvOp::collection()`, so a variant missing from that list would leave the
+/// masking pass with no policy to key on and ship the rows in the clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_returning_rows_are_redacted() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION redact_kv (key TEXT PRIMARY KEY, email TEXT, name TEXT) \
+             WITH (engine='kv')",
+        )
+        .await
+        .expect("create redact_kv");
+    server
+        .exec(&format!(
+            "CREATE REDACTION POLICY mask_kv ON redact_kv FOR ROLE {ROLE} \
+             (email MASK '***@***.com')"
+        ))
+        .await
+        .expect("create redaction policy");
+
+    let rows = server
+        .query_rows(
+            "INSERT INTO redact_kv (key, email, name) \
+             VALUES ('u1', 'alice@example.com', 'Alice') \
+             RETURNING key, email, name",
+        )
+        .await
+        .expect("KV INSERT RETURNING should succeed");
+
+    assert_eq!(rows.len(), 1, "one inserted row: {rows:?}");
+    assert_eq!(rows[0][1], "***@***.com", "email must be masked: {rows:?}");
+    assert_eq!(rows[0][2], "Alice", "an unruled column must survive intact");
+}

@@ -28,6 +28,8 @@ fn kv_cross_tenant_put_does_not_overwrite() {
             value: b"tenant_a_value".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -44,6 +46,8 @@ fn kv_cross_tenant_put_does_not_overwrite() {
             value: b"tenant_b_value".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -89,6 +93,8 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
             value: b"secret_token".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

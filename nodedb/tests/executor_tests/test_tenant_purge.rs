@@ -66,6 +66,8 @@ fn purge_removes_all_tenant_data() {
             value: b"session_data".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

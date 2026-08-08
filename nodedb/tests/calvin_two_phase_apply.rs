@@ -93,6 +93,8 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
         value: value.to_vec(),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 
@@ -531,6 +533,8 @@ fn absent_kv_key_phantom_insert_causes_abort() {
                 value: b"v".to_vec(),
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             })],
         }),
         phantom_vshard,

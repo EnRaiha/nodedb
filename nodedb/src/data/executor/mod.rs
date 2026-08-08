@@ -18,6 +18,7 @@ pub(super) mod msgpack_utils;
 pub(crate) mod replay_abort;
 pub(crate) mod replay_floors;
 pub mod response_codec;
+mod row_shape;
 mod scan_normalize;
 mod scan_versioned;
 mod snapshot;

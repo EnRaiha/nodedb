@@ -118,6 +118,8 @@ pub(crate) fn build_batch_put(
         entries,
         ttl_ms,
         surrogates,
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

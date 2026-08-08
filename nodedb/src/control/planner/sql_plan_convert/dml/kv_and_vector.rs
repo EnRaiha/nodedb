@@ -54,6 +54,11 @@ pub(in super::super) fn convert_kv_insert(
                 value,
                 ttl_ms,
                 surrogate,
+                // Both filled in after conversion: the RETURNING spec by
+                // the protocol layer's injection pass, the read filter by the
+                // RLS injection pass.
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::InsertIfAbsent => KvOp::InsertIfAbsent {
                 collection: collection.into(),
@@ -61,6 +66,11 @@ pub(in super::super) fn convert_kv_insert(
                 value,
                 ttl_ms,
                 surrogate,
+                // Both filled in after conversion: the RETURNING spec by
+                // the protocol layer's injection pass, the read filter by the
+                // RLS injection pass.
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::Put if !update_values.is_empty() => KvOp::InsertOnConflictUpdate {
                 collection: collection.into(),
@@ -72,6 +82,11 @@ pub(in super::super) fn convert_kv_insert(
                 // Filled by the RLS injection pass, which runs after plan
                 // conversion.
                 rls_write_check: Vec::new(),
+                // Both filled in after conversion: the RETURNING spec by
+                // the protocol layer's injection pass, the read filter by the
+                // RLS injection pass.
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::Put => KvOp::Put {
                 collection: collection.into(),
@@ -79,6 +94,11 @@ pub(in super::super) fn convert_kv_insert(
                 value,
                 ttl_ms,
                 surrogate,
+                // Both filled in after conversion: the RETURNING spec by
+                // the protocol layer's injection pass, the read filter by the
+                // RLS injection pass.
+                returning: None,
+                rls_filters: Vec::new(),
             },
         };
         tasks.push(PhysicalTask {

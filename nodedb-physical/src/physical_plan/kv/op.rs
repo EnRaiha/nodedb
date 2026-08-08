@@ -4,6 +4,8 @@
 
 use nodedb_types::Surrogate;
 
+use crate::physical_plan::document::ReturningSpec;
+
 /// KV engine physical operations.
 ///
 /// All operations target a hash-indexed collection with O(1) point lookups.
@@ -51,6 +53,17 @@ pub enum KvOp {
         /// `SurrogateAssigner` from `(collection, key)`.
         /// `Surrogate::ZERO` only appears in test fixtures.
         surrogate: Surrogate,
+        /// When `Some`, return the STORED post-image of the written row
+        /// projected per spec — the row as `SELECT` would show it, `key`
+        /// included. Never the caller's submitted body: an echo of the
+        /// request would report what was asked for rather than what landed.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. The write policy
+        /// governs the write; this bounds what may be shown back, so a
+        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// SQL `INSERT` semantics: write only if the key does not already exist.
@@ -64,6 +77,17 @@ pub enum KvOp {
         ttl_ms: u64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// When `Some`, return the STORED post-image of the written row
+        /// projected per spec — the row as `SELECT` would show it, `key`
+        /// included. Never the caller's submitted body: an echo of the
+        /// request would report what was asked for rather than what landed.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. The write policy
+        /// governs the write; this bounds what may be shown back, so a
+        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// SQL `INSERT ... ON CONFLICT DO NOTHING` semantics: write if the key
@@ -75,6 +99,17 @@ pub enum KvOp {
         ttl_ms: u64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
+        /// When `Some`, return the STORED post-image of the written row
+        /// projected per spec — the row as `SELECT` would show it, `key`
+        /// included. Never the caller's submitted body: an echo of the
+        /// request would report what was asked for rather than what landed.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. The write policy
+        /// governs the write; this bounds what may be shown back, so a
+        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// SQL `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` semantics:
@@ -97,11 +132,22 @@ pub enum KvOp {
         /// branch, neither of which exists at plan time. Empty means no write
         /// policy restricts this identity here.
         ///
-        /// Distinct from the read-side `rls_filters` slot other variants
-        /// carry: one bounds what may be shown back, this one bounds what may
-        /// be written at all.
+        /// Distinct from the read-side `rls_filters` slot beside it: that one
+        /// bounds what may be shown back, this one bounds what may be written
+        /// at all. Never conflate them — a write gate used as row redaction
+        /// admits rows it should hide, and the reverse silently drops writes.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// When `Some`, return the STORED post-image projected per spec: the
+        /// merged row on the conflict branch, the inserted row otherwise.
+        /// Never the submitted body — on a conflict the caller's values are
+        /// only part of what the row ends up holding.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits — see
+        /// `Put::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Delete by primary key(s). Returns count of keys actually deleted.
@@ -200,6 +246,14 @@ pub enum KvOp {
         /// use. `Surrogate::ZERO` only appears in test fixtures.
         #[serde(default)]
         surrogates: Vec<Surrogate>,
+        /// When `Some`, return one row per written entry — the STORED
+        /// post-image of each, in `entries` order — projected per spec.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits — see
+        /// `Put::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Register a secondary index on a value field (DDL).

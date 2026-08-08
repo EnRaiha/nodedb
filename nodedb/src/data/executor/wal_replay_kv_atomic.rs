@@ -353,6 +353,8 @@ mod tests {
             value: b"idle".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let cas = PhysicalPlan::Kv(KvOp::Cas {
             collection: "state".into(),
@@ -383,6 +385,8 @@ mod tests {
             value: b"fighting".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         // Live dispatch would have failed this compare (expected "idle" but
         // the seeded value is "fighting"); the WAL record still exists
@@ -470,6 +474,8 @@ mod tests {
             value: zerompk::to_msgpack_vec(&"hello").expect("encode"),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: "scores".into(),
@@ -500,6 +506,8 @@ mod tests {
             value: b"old-token".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let getset = PhysicalPlan::Kv(KvOp::GetSet {
             collection: "session".into(),

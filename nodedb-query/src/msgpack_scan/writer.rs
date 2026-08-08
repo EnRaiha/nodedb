@@ -167,7 +167,11 @@ pub fn write_kv_null(buf: &mut Vec<u8>, key: &str) {
 /// the existing value is preserved and the input is returned unchanged —
 /// the caller's body is authoritative for its own primary key. If the map
 /// does not contain the field, it is prepended. If `value` is not a map,
-/// wraps as `{field_name: field_value, "value": raw}`.
+/// wraps as `{field_name: field_value, "value": raw}`, with `raw` encoded as
+/// a msgpack STRING: appending non-msgpack bytes verbatim produces a body a
+/// decoder reads as one scalar and silently truncates (`"v1"` becomes the
+/// integer 118), which is worse than an error because it reports success.
+/// Callers holding a genuine map never reach this branch.
 pub fn inject_str_field(value: &[u8], field_name: &str, field_value: &str) -> Vec<u8> {
     if let Some((count, body_start)) = crate::msgpack_scan::reader::map_header(value, 0) {
         if crate::msgpack_scan::extract_field(value, 0, field_name).is_some() {
@@ -183,7 +187,7 @@ pub fn inject_str_field(value: &[u8], field_name: &str, field_value: &str) -> Ve
         write_map_header(&mut buf, 2);
         write_kv_str(&mut buf, field_name, field_value);
         write_str(&mut buf, "value");
-        buf.extend_from_slice(value);
+        write_str(&mut buf, &String::from_utf8_lossy(value));
         buf
     }
 }

@@ -258,6 +258,8 @@ mod tests {
             value: Vec::new(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(is_calvin_foldable(&plan));
         assert!(calvin_tag_for_plan(&plan).is_ok());

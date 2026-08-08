@@ -14,7 +14,9 @@
 use super::{returning_doc, rls_eval};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::doc_format;
 use crate::data::executor::response_codec::RowsPayload;
+use crate::data::executor::scan_normalize::kv_row_to_doc;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
 use nodedb_types::columnar::StrictSchema;
@@ -40,6 +42,49 @@ impl CoreLoop {
         rows: &[StoredRow<'_>],
     ) -> Response {
         match build_stored_rows_payload(spec, rls_filters, strict_schema, rows) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
+    }
+}
+
+/// A KV row a write path hands back to a `RETURNING` projection: the raw key
+/// bytes paired with the exact value bytes stored under them.
+pub(in crate::data::executor) type KvStoredRow<'a> = (&'a [u8], &'a [u8]);
+
+impl CoreLoop {
+    /// Build a KV write's `RETURNING` response from the rows it just stored.
+    ///
+    /// The row shape comes from [`kv_row_to_doc`], the same helper the KV scan
+    /// paths use, so a row a write hands back is byte-identical to the row a
+    /// `SELECT` on that key would produce — including the `key` field, and
+    /// including the `{key, value}` wrapper an opaque single-scalar value gets
+    /// (such a value has no field map to inject into, and inventing a second
+    /// shape here would make `RETURNING *` disagree with `SELECT *`).
+    ///
+    /// A body that fails to decode degrades to a bare `{key}` row, so the
+    /// statement still reports the row it wrote.
+    pub(in crate::data::executor) fn kv_stored_returning_response(
+        &self,
+        task: &ExecutionTask,
+        spec: &ReturningSpec,
+        rls_filters: &[u8],
+        rows: &[KvStoredRow<'_>],
+    ) -> Response {
+        let docs: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(key, value)| {
+                let (key_str, body) = kv_row_to_doc(key, value);
+                doc_format::decode_document(&body)
+                    .unwrap_or_else(|| serde_json::json!({ "key": key_str }))
+            })
+            .collect();
+        match build_rows_payload(spec, rls_filters, &docs) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

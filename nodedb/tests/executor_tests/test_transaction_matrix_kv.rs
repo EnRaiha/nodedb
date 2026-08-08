@@ -26,6 +26,8 @@ fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
         value: value.to_vec(),
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
+        returning: None,
+        rls_filters: Vec::new(),
     })
 }
 
@@ -216,6 +218,8 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
                     ],
                     ttl_ms: 0,
                     surrogates: vec![nodedb_types::Surrogate::ZERO; 2],
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 doc_insert_conflict("docs"),
             ],

@@ -113,18 +113,29 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         // MultiRow before dispatch.)
         PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => describe_plan(input),
 
-        // DML operations that return affected row count.
-        //
-        // `PointInsert` and `KvOp::InsertIfAbsent` are here because
-        // `ON CONFLICT DO NOTHING` makes them no-op-capable: the count is 0 when
-        // the key was already present, so it has to be read from the write's
-        // response instead of assumed from the plan.
         // An insert carrying a projection returns real stored rows, so it must
         // be decoded and redacted like every other RETURNING write. Without
         // these arms it falls through to the count shape below, whose
         // passthrough forwards the Data-Plane payload with no redaction applied
         // at all — the same silent leak `Merge` had.
-        PhysicalPlan::Document(DocumentOp::PointPut {
+        PhysicalPlan::Kv(
+            KvOp::Insert {
+                returning: Some(_), ..
+            }
+            | KvOp::InsertIfAbsent {
+                returning: Some(_), ..
+            }
+            | KvOp::InsertOnConflictUpdate {
+                returning: Some(_), ..
+            }
+            | KvOp::Put {
+                returning: Some(_), ..
+            }
+            | KvOp::BatchPut {
+                returning: Some(_), ..
+            },
+        )
+        | PhysicalPlan::Document(DocumentOp::PointPut {
             returning: Some(_), ..
         })
         | PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -134,6 +145,12 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
+        // DML operations that return affected row count.
+        //
+        // `PointInsert` and `KvOp::InsertIfAbsent` are here because
+        // `ON CONFLICT DO NOTHING` makes them no-op-capable: the count is 0 when
+        // the key was already present, so it has to be read from the write's
+        // response instead of assumed from the plan.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
         | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { .. })
@@ -568,6 +585,73 @@ mod tests {
                 on_conflict_updates: Vec::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 rls_write_check: Vec::new(),
+                returning: spec(),
+                rls_filters: Vec::new(),
+            }),
+        ];
+        for plan in &plans {
+            assert!(
+                matches!(describe_plan(plan), PlanKind::ReturningRows),
+                "{plan:?} must shape as rows"
+            );
+        }
+    }
+
+    /// Every KV insert-family op that can carry a projection must classify as
+    /// row-returning too — the same passthrough leak, one engine over.
+    #[test]
+    fn kv_inserts_with_returning_are_returning_rows() {
+        use nodedb_physical::physical_plan::{KvOp, ReturningColumns, ReturningSpec};
+
+        let spec = || {
+            Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            })
+        };
+        let plans = [
+            PhysicalPlan::Kv(KvOp::Insert {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                value: Vec::new(),
+                ttl_ms: 0,
+                surrogate: nodedb_types::Surrogate::ZERO,
+                returning: spec(),
+                rls_filters: Vec::new(),
+            }),
+            PhysicalPlan::Kv(KvOp::InsertIfAbsent {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                value: Vec::new(),
+                ttl_ms: 0,
+                surrogate: nodedb_types::Surrogate::ZERO,
+                returning: spec(),
+                rls_filters: Vec::new(),
+            }),
+            PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                value: Vec::new(),
+                ttl_ms: 0,
+                updates: Vec::new(),
+                surrogate: nodedb_types::Surrogate::ZERO,
+                rls_write_check: Vec::new(),
+                returning: spec(),
+                rls_filters: Vec::new(),
+            }),
+            PhysicalPlan::Kv(KvOp::Put {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                value: Vec::new(),
+                ttl_ms: 0,
+                surrogate: nodedb_types::Surrogate::ZERO,
+                returning: spec(),
+                rls_filters: Vec::new(),
+            }),
+            PhysicalPlan::Kv(KvOp::BatchPut {
+                collection: "c".into(),
+                entries: Vec::new(),
+                ttl_ms: 0,
+                surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
             }),

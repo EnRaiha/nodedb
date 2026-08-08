@@ -26,6 +26,8 @@ fn kv_put_get_delete() {
             value: b"value1".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -86,6 +88,8 @@ fn kv_overwrite_returns_ok() {
             value: b"v1".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -100,6 +104,8 @@ fn kv_overwrite_returns_ok() {
             value: b"v2".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -137,6 +143,8 @@ fn kv_batch_put_and_get() {
             entries,
             ttl_ms: 0,
             surrogates,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     let json = payload_value(&payload);
@@ -175,6 +183,8 @@ fn kv_scan_returns_entries() {
                 value: format!("val{i}").into_bytes(),
                 ttl_ms: 0,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
     }
@@ -215,6 +225,8 @@ fn kv_scan_with_match_pattern() {
                     value: b"data".to_vec(),
                     ttl_ms: 0,
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
             );
         }
@@ -260,6 +272,8 @@ fn kv_expire_and_persist() {
             value: b"v".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -333,6 +347,8 @@ fn kv_register_index_and_lookup() {
             value: doc1,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
     send_ok(
@@ -345,6 +361,8 @@ fn kv_register_index_and_lookup() {
             value: doc2,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -393,6 +411,8 @@ fn kv_drop_index() {
             value: doc,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -427,6 +447,8 @@ fn kv_tenant_isolation() {
             value: b"tenant1".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }))
     };
     tx.try_push(nodedb::bridge::dispatch::BridgeRequest { inner: req })
@@ -444,6 +466,8 @@ fn kv_tenant_isolation() {
             value: b"tenant2".to_vec(),
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
+            returning: None,
+            rls_filters: Vec::new(),
         }))
     };
     tx.try_push(nodedb::bridge::dispatch::BridgeRequest { inner: req })

@@ -173,6 +173,8 @@ pub async fn weighted_pick(
                     value: audit_value,
                     ttl_ms: 0,
                     surrogate: audit_surrogate,
+                    returning: None,
+                    rls_filters: Vec::new(),
                 });
                 // Audit write failure doesn't block the pick result, but log the error.
                 if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(

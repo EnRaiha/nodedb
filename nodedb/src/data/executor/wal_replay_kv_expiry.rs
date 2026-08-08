@@ -227,6 +227,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let entry = crate::control::server::wal_dispatch_kv::encode::encode_kv_expire(
             "sessions", b"tok1", 5_000, 6_000,
@@ -276,6 +278,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         wal_append_if_write(
             &wal,
@@ -345,6 +349,8 @@ mod tests {
             value: b"payload".to_vec(),
             ttl_ms: 60_000,
             surrogate: Surrogate::new(1),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let persist_p = PhysicalPlan::Kv(KvOp::Persist {
             collection: "sessions".into(),
