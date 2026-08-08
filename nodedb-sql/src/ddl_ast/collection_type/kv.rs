@@ -27,7 +27,7 @@ pub(crate) fn build_kv_collection_type(
     // We strip those to get the bare type, then apply primary_key flag.
     let mut col_defs: Vec<ColumnDef> = Vec::with_capacity(columns.len());
     for (name, type_str) in columns {
-        let (bare_type, is_pk, not_null, _) = parse_column_type_str_full(type_str);
+        let (bare_type, is_pk, not_null, default_expr) = parse_column_type_str_full(type_str);
         let column_type = ColumnType::from_str(&bare_type).map_err(
             |e: nodedb_types::columnar::ColumnTypeParseError| SqlError::Parse {
                 detail: format!("column '{}': {}", name, e),
@@ -41,6 +41,13 @@ pub(crate) fn build_kv_collection_type(
         };
         if is_pk {
             col = col.with_primary_key();
+        }
+        // Without this the DDL parses, the column is created, and the DEFAULT is
+        // dropped on the floor: `ColumnInfo::default` reaches the planner as
+        // `None` forever, so an omitted column can never be materialized. The
+        // strict-document schema builder keeps it for exactly this reason.
+        if let Some(expr) = default_expr {
+            col = col.with_default(expr);
         }
         col_defs.push(col);
     }

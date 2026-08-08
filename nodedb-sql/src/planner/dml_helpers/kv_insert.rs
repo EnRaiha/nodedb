@@ -46,8 +46,6 @@ pub(crate) fn build_kv_insert_plan(
         });
     }
     let key_col_name = pk_col.unwrap_or("key");
-    let key_idx = columns.iter().position(|c| c == key_col_name);
-    let ttl_idx = columns.iter().position(|c| c == "ttl");
     // When using a named primary-key column (e.g. `k STRING PRIMARY KEY`), we
     // store the key bytes in the KV key slot AND also keep the column in the
     // value map.  This allows scan filters on the primary-key column (e.g.
@@ -55,18 +53,13 @@ pub(crate) fn build_kv_insert_plan(
     // without teaching the KV scan handler to inspect the raw key bytes.
     // The only column we exclude from the value map is the built-in `"key"`
     // sentinel (used by raw key/value KV collections) and `"ttl"`.
-    let exclude_from_value: std::collections::HashSet<usize> = {
-        let mut s = std::collections::HashSet::new();
+    // Keyed by NAME rather than by position in the statement's column list:
+    // a column materialized from its DEFAULT is appended to the row and has no
+    // position in that list, so an index-keyed rule would silently stop
+    // excluding it. The two rules must agree however the cell arrived.
+    let excluded_from_value = |name: &str| {
         // Exclude the raw "key" sentinel column (not a named PK column).
-        if key_col_name == "key"
-            && let Some(idx) = key_idx
-        {
-            s.insert(idx);
-        }
-        if let Some(idx) = ttl_idx {
-            s.insert(idx);
-        }
-        s
+        (key_col_name == "key" && name == "key") || name == "ttl"
     };
     // Resolve every row's literals once, then coerce each cell to its declared
     // column type. Unlike the strict, columnar, and timeseries engines, KV has
@@ -84,6 +77,7 @@ pub(crate) fn build_kv_insert_plan(
             let Some(expr) = row_exprs.get(i) else { break };
             row.push((col.clone(), expr_to_sql_value(expr)?));
         }
+        materialize_declared_defaults(declared_columns, &mut row)?;
         // The key column is exempt — see `coerce_rows_to_declared_types`.
         coerce_row_to_declared_types(declared_columns, &mut row, Some(key_col_name))?;
         coerced_rows.push(row);
@@ -109,11 +103,14 @@ pub(crate) fn build_kv_insert_plan(
     let mut entries = Vec::with_capacity(coerced_rows.len());
     let mut ttl_secs: u64 = 0;
     for row in &coerced_rows {
-        let key_val = match key_idx.and_then(|idx| row.get(idx)) {
+        // By name, for the same reason the exclusion rule above is: a
+        // DEFAULT-materialized key column is appended to the row and has no
+        // position in the statement's column list.
+        let key_val = match row.iter().find(|(name, _)| name == key_col_name) {
             Some((_, value)) => value.clone(),
             None => SqlValue::String(String::new()),
         };
-        if let Some((_, value)) = ttl_idx.and_then(|idx| row.get(idx)) {
+        if let Some((_, value)) = row.iter().find(|(name, _)| name == "ttl") {
             match value {
                 SqlValue::Int(n) => ttl_secs = (*n).max(0) as u64,
                 SqlValue::Float(f) => ttl_secs = f.max(0.0) as u64,
@@ -122,9 +119,8 @@ pub(crate) fn build_kv_insert_plan(
         }
         let value_cols: Vec<(String, SqlValue)> = row
             .iter()
-            .enumerate()
-            .filter(|(i, _)| !exclude_from_value.contains(i))
-            .map(|(_, cell)| cell.clone())
+            .filter(|(name, _)| !excluded_from_value(name))
+            .cloned()
             .collect();
         entries.push((key_val, value_cols));
     }
@@ -135,6 +131,84 @@ pub(crate) fn build_kv_insert_plan(
         intent,
         on_conflict_updates,
     }])
+}
+
+/// Fill in every declared column the statement omitted that carries a DEFAULT.
+///
+/// The key-value engine stores the bytes it is handed and has no typed write
+/// path, so a DEFAULT that is not materialized HERE is materialized nowhere:
+/// the catalog would keep the declaration and every read return nothing for it.
+/// Documents and columnar rows expand theirs through the same
+/// `evaluate_default_expr`, so one expression yields one value on every engine.
+///
+/// Two rules the ordering encodes:
+///
+/// - A column the statement SUPPLIED is never touched, and that includes an
+///   explicit `NULL`. `NULL` is a value the author chose; overwriting it with
+///   the default would make it impossible to store one.
+/// - Materialized values are appended BEFORE the caller's declared-type
+///   coercion and range checks, so a default is validated exactly like a
+///   supplied literal. Filling them in afterwards would make `DEFAULT 999999`
+///   on a `SMALLINT` column a way to store a value the same literal is
+///   rejected for.
+fn materialize_declared_defaults(
+    declared_columns: &[ColumnInfo],
+    row: &mut Vec<(String, SqlValue)>,
+) -> Result<()> {
+    for column in declared_columns {
+        let Some(default_expr) = column.default.as_deref() else {
+            continue;
+        };
+        if row.iter().any(|(name, _)| name == &column.name) {
+            continue;
+        }
+        let evaluated =
+            crate::planner::defaults::evaluate_default_expr(default_expr).map_err(|e| {
+                SqlError::Parse {
+                    detail: format!("default for column '{}' is invalid: {e}", column.name),
+                }
+            })?;
+        let Some(evaluated) = evaluated else { continue };
+        let value = nodedb_value_to_sql_value(&column.name, evaluated)?;
+        row.push((column.name.clone(), value));
+    }
+    Ok(())
+}
+
+/// Convert an evaluated default back into the planner's literal type.
+///
+/// The inverse of `sql_value_to_ndb` in `planner::defaults`, which is the only
+/// producer of these values — so every shape the evaluator can emit has an
+/// exact counterpart here. Anything else is rejected rather than rendered
+/// through `Debug`: a `DEFAULT` that silently stored `Uuid("…")` as its own
+/// debug text would be the same class of defect as dropping it entirely, but
+/// harder to notice because the column would look populated.
+fn nodedb_value_to_sql_value(column: &str, value: nodedb_types::Value) -> Result<SqlValue> {
+    Ok(match value {
+        nodedb_types::Value::Null => SqlValue::Null,
+        nodedb_types::Value::Bool(b) => SqlValue::Bool(b),
+        nodedb_types::Value::Integer(i) => SqlValue::Int(i),
+        nodedb_types::Value::Float(f) => SqlValue::Float(f),
+        nodedb_types::Value::Decimal(d) => SqlValue::Decimal(d),
+        nodedb_types::Value::String(s) => SqlValue::String(s),
+        nodedb_types::Value::Bytes(b) => SqlValue::Bytes(b),
+        nodedb_types::Value::NaiveDateTime(dt) => SqlValue::Timestamp(dt),
+        nodedb_types::Value::DateTime(dt) => SqlValue::Timestamptz(dt),
+        nodedb_types::Value::Array(items) => SqlValue::Array(
+            items
+                .into_iter()
+                .map(|item| nodedb_value_to_sql_value(column, item))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        other => {
+            return Err(SqlError::Unsupported {
+                detail: format!(
+                    "default for column '{column}' evaluates to a value with no SQL literal \
+                     form: {other:?}"
+                ),
+            });
+        }
+    })
 }
 
 #[cfg(test)]

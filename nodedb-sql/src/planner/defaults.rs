@@ -1,16 +1,22 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Column DEFAULT expression evaluation at insert time.
 //!
 //! Supports ID generation functions (UUIDv4/v7, ULID, CUID2, NANOID), `NOW()`,
-//! and literal values. More complex defaults (arbitrary expressions) go
-//! through the shared SqlExpr evaluator path.
+//! and literal values. More complex defaults (arbitrary expressions) fall
+//! through to the plan-time const-folder.
+//!
+//! Lives in the SQL crate rather than beside one engine's converter because
+//! every engine that materializes a DEFAULT has to produce the SAME value for
+//! the same expression — a `DEFAULT now()` that means one thing on a document
+//! collection and another on a key-value one would be a difference nobody
+//! declared. The key-value planner also needs it BEFORE its declared-type
+//! coercion and range checks run, so a materialized default is validated
+//! exactly like a supplied one.
 
 use nodedb_types::NodeDbError;
 
-pub(crate) fn evaluate_default_expr(
-    expr: &str,
-) -> Result<Option<nodedb_types::Value>, NodeDbError> {
+pub fn evaluate_default_expr(expr: &str) -> Result<Option<nodedb_types::Value>, NodeDbError> {
     let upper = expr.trim().to_uppercase();
     match upper.as_str() {
         "UUID_V7" | "UUIDV7" | "GEN_UUID_V7()" | "UUID_V7()" => Ok(Some(
@@ -92,13 +98,13 @@ fn parse_parametric_or_literal(
 
 /// Attempt to parse the DEFAULT expression as SQL, then const-fold it.
 fn try_const_fold_default(expr: &str) -> Option<nodedb_types::Value> {
-    let sql_expr = nodedb_sql::parse_expr_string(expr).ok()?;
-    let folded = nodedb_sql::planner::const_fold::fold_constant_default(&sql_expr)?;
+    let sql_expr = crate::parse_expr_string(expr).ok()?;
+    let folded = crate::planner::const_fold::fold_constant_default(&sql_expr)?;
     Some(sql_value_to_ndb(folded))
 }
 
-fn sql_value_to_ndb(v: nodedb_sql::types::SqlValue) -> nodedb_types::Value {
-    use nodedb_sql::types::SqlValue;
+fn sql_value_to_ndb(v: crate::types::SqlValue) -> nodedb_types::Value {
+    use crate::types::SqlValue;
     match v {
         SqlValue::Null => nodedb_types::Value::Null,
         SqlValue::Bool(b) => nodedb_types::Value::Bool(b),

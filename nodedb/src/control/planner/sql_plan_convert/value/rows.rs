@@ -5,7 +5,7 @@
 use nodedb_sql::types::SqlValue;
 
 use super::convert::sql_value_to_nodedb_value;
-use super::defaults::evaluate_default_expr;
+use nodedb_sql::planner::defaults::evaluate_default_expr;
 
 pub(crate) fn rows_to_msgpack_array(
     rows: &[&Vec<(String, SqlValue)>],
