@@ -138,7 +138,15 @@ pub(super) fn convert_collection_type(
             let mut columns = Vec::new();
             if !profile.is_timeseries() {
                 let (pk_type, pk_default, pk_raw) = match declared_pk {
-                    Some((_, type_str)) => (parse_type_str(type_str), None, Some(type_str.clone())),
+                    // A declared `id` keeps whatever DEFAULT the DDL gave it.
+                    // Dropping it here would accept the declaration and then
+                    // ignore it on every insert — the column would read back
+                    // empty with nothing to point at as the cause.
+                    Some((_, type_str)) => (
+                        parse_type_str(type_str),
+                        declared_default(type_str),
+                        Some(type_str.clone()),
+                    ),
                     None => (SqlDataType::String, Some("UUID_V7".into()), None),
                 };
                 let pk_int_width = pk_raw.as_deref().and_then(IntWidth::from_declared_type);
@@ -163,7 +171,7 @@ pub(super) fn convert_collection_type(
                     data_type: parse_type_str(type_str),
                     nullable: true,
                     is_primary_key: false,
-                    default: None,
+                    default: declared_default(type_str),
                     raw_type: Some(type_str.clone()),
                     int_width: IntWidth::from_declared_type(type_str),
                     float_width: FloatWidth::from_declared_type(type_str),
@@ -177,6 +185,19 @@ pub(super) fn convert_collection_type(
             (engine, columns, pk)
         }
     }
+}
+
+/// Extract the `DEFAULT <expr>` clause a columnar-family column declared.
+///
+/// The columnar catalog stores each column as the raw DDL type string with its
+/// modifiers still attached, so the default has to be recovered from that text.
+/// It goes through the SAME parser the strict-document and key-value schema
+/// builders use, so `DEFAULT concat('a', 'b')` delimits identically on every
+/// engine rather than each one guessing where the expression ends.
+fn declared_default(type_str: &str) -> Option<String> {
+    let (_, _, _, default_expr) =
+        nodedb_sql::ddl_ast::collection_type::parse_column_type_str_full(type_str);
+    default_expr
 }
 
 /// Resolve the declared width of every catalog field `resolve` recognizes,
