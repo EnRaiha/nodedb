@@ -90,6 +90,10 @@ pub(super) fn edge_delete(
         dst_id: dst_id.to_owned(),
         src_surrogate,
         dst_surrogate,
+        // A replicated write was already admitted by the write policy on the
+        // leader that accepted it; re-deciding it on the follower would make
+        // replication depend on per-node policy state.
+        rls_write_check: Vec::new(),
     }))
 }
 

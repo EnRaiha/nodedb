@@ -295,8 +295,13 @@ pub enum VectorOp {
         surrogate: Surrogate,
         /// FP32 vector values.
         vector: Vec<f32>,
-        /// Pre-encoded MessagePack of only the payload-indexed fields.
-        /// Empty when the collection has no payload indexes configured.
+        /// Pre-encoded MessagePack of every non-vector column the statement
+        /// supplied. Empty when the row carried none.
+        ///
+        /// Only the fields named in `payload_indexes` become bitmap-indexed
+        /// downstream; the rest travel here so the whole row image is available
+        /// to whatever has to decide it — a row-level-security write policy
+        /// among them.
         payload: Vec<u8>,
         /// Collection-level quantization. Applied via `set_quantization` on
         /// first insert so subsequent seals trigger codec-dispatch rebuilds

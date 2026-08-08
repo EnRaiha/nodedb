@@ -112,6 +112,104 @@ impl RlsCtx<'_> {
         )
     }
 
+    /// Admit a write whose post-image the plan carries as a JSON object.
+    ///
+    /// A graph edge stores the `PROPERTIES` clause as JSON text rather than
+    /// MessagePack, so the image is transcoded here and then decided by the
+    /// same [`admit_compiled_write_image`] every other engine goes through —
+    /// one compiled predicate cannot mean one thing for a document row and
+    /// another for an edge's property object.
+    ///
+    /// Bytes that are not a JSON object — including the empty clause an edge
+    /// written without `PROPERTIES` carries — hold no field the predicate can
+    /// test, so they are denied rather than admitted by omission. That is the
+    /// same fail-closed direction as a row missing the governed column.
+    ///
+    /// [`admit_compiled_write_image`]: crate::control::security::rls::admit_compiled_write_image
+    pub(super) fn admit_write_json_image(
+        &self,
+        collection: &str,
+        image: &[u8],
+    ) -> crate::Result<()> {
+        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        if check.is_empty() {
+            return Ok(());
+        }
+        let decoded = sonic_rs::from_slice::<serde_json::Value>(image).ok();
+        let Some(object @ serde_json::Value::Object(_)) = decoded else {
+            return Err(crate::Error::RejectedAuthz {
+                tenant_id: crate::types::TenantId::new(self.tenant_id),
+                resource: format!(
+                    "RLS write policy on '{collection}': the write carries no decodable property \
+                     object, so the policy could not be evaluated against it"
+                ),
+            });
+        };
+        crate::control::security::rls::admit_compiled_write_image(
+            &check,
+            &nodedb_types::json_to_msgpack_or_empty(&object),
+            self.tenant_id,
+            collection,
+        )
+    }
+
+    /// Admit a write whose post-image the plan carries as a zerompk-encoded
+    /// `HashMap<String, Value>`.
+    ///
+    /// [`nodedb_types::Value`]'s zerompk representation is TAGGED: a string
+    /// field is written as the two-element array `[4, "…"]`, not as a bare
+    /// MessagePack string. Handing those bytes to the row evaluator directly
+    /// would compare every predicate against a tag array and reject rows the
+    /// policy permits — a gate that denies everything, which is as wrong as one
+    /// that admits everything. So the map is decoded and rewritten as the
+    /// standard MessagePack body every other engine's image already is, and one
+    /// compiled predicate decides them all identically.
+    ///
+    /// Field names are lower-cased because that is what the collection will
+    /// store: a policy on `owner` must not depend on whether the statement
+    /// spelled the column `owner` or `Owner`.
+    ///
+    /// Bytes that do not decode as that map carry no field the predicate can
+    /// test, so they deny rather than being admitted by omission.
+    pub(super) fn admit_write_value_map_image(
+        &self,
+        collection: &str,
+        payload: &[u8],
+    ) -> crate::Result<()> {
+        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        if check.is_empty() {
+            return Ok(());
+        }
+        let decoded = zerompk::from_msgpack::<std::collections::HashMap<String, nodedb_types::Value>>(
+            payload,
+        );
+        let Ok(fields) = decoded else {
+            return Err(crate::Error::RejectedAuthz {
+                tenant_id: crate::types::TenantId::new(self.tenant_id),
+                resource: format!(
+                    "RLS write policy on '{collection}': the write carries no decodable field \
+                     image, so the policy could not be evaluated against it"
+                ),
+            });
+        };
+        let image = nodedb_types::Value::Object(
+            fields
+                .into_iter()
+                .map(|(field, value)| (field.to_ascii_lowercase(), value))
+                .collect(),
+        );
+        let bytes =
+            nodedb_types::value_to_msgpack(&image).map_err(|error| crate::Error::PlanError {
+                detail: format!("RLS write admission could not re-encode the row image: {error}"),
+            })?;
+        crate::control::security::rls::admit_compiled_write_image(
+            &check,
+            &bytes,
+            self.tenant_id,
+            collection,
+        )
+    }
+
     /// Admit every row of a MessagePack row batch the plan carries in full.
     ///
     /// The columnar family ships a statement's rows as one MessagePack array of

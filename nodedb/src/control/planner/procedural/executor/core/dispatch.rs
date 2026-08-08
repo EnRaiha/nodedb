@@ -76,10 +76,26 @@ impl<'a> StatementExecutor<'a> {
         let ctx = crate::control::planner::context::QueryContext::for_state(self.state);
         let ctx = &ctx;
         let bound_sql = &bound_sql;
+        // A stored-procedure body is server-defined code, not a client
+        // statement, and runs SECURITY DEFINER exactly as a trigger body does —
+        // so it plans as the system rather than under the invoker's scope. The
+        // context is built once and borrowed by the retry closure, which may run
+        // it several times.
+        let security = crate::control::planner::context::SystemPlanSecurity::new(
+            self.tenant_id,
+            "_system_procedure",
+        );
+        let security = &security;
         let (tasks, lease_scope) =
             crate::control::server::shared::retry::retry_on_schema_change(move || async move {
-                let (tasks, _output_schema, versions) = ctx
-                    .plan_sql_and_versions(bound_sql, self.tenant_id, self.database_id)
+                let (tasks, _output_schema, versions, _) = ctx
+                    .plan_sql_with_rls_and_versions(
+                        bound_sql,
+                        self.tenant_id,
+                        self.database_id,
+                        &security.context(self.state),
+                        false,
+                    )
                     .await?;
                 let lease_scope = self.state.acquire_plan_lease_scope(&versions)?;
                 Ok::<_, crate::Error>((tasks, lease_scope))

@@ -52,11 +52,39 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
              evaluated against",
         ),
 
-        // Refuse: an index write carries an embedding and a surrogate, not the
-        // row body a policy predicate names, so there is nothing here for the
-        // write policy to be evaluated against. The vector entry is a claim
-        // about a row, and admitting it unchecked would let an identity the
-        // policy restricts make a hidden row reachable by search.
+        // Admit: a vector-primary collection stores the row here and nowhere
+        // else — no companion document write would gate it — and this op
+        // carries `payload`, the MessagePack image of every non-vector column
+        // the statement supplied, so the policy decides that image directly.
+        //
+        // The image holds what the STATEMENT wrote, not the collection's
+        // declared columns: an INSERT that omits the governed column leaves the
+        // predicate nothing to test, and the write fails closed. That is the
+        // safe direction, and the same one a document insert missing the
+        // governed column takes — but worth stating here, because only the
+        // fields listed in `payload_indexes` are queryable afterwards, which
+        // makes it easy to treat every other column as if it did not travel
+        // with the write. It does, and the policy decides it.
+        //
+        // `payload` is a zerompk `HashMap<String, Value>`, whose values are
+        // TAGGED, so it goes through the transcoding admission rather than the
+        // raw-image one — see [`RlsCtx::admit_write_value_map_image`].
+        VectorOp::DirectUpsert {
+            collection,
+            payload,
+            ..
+        } => ctx.admit_write_value_map_image(collection, payload),
+
+        // Refuse: these carry an embedding, a surrogate, or an opaque document
+        // id — never the row body a policy predicate names — so no image is
+        // available for the write policy to be evaluated against. A vector
+        // entry is a claim about a row, and admitting it unchecked would let an
+        // identity the policy restricts make a hidden row reachable by search.
+        //
+        // `Insert` is also reachable from the document insert path, where the
+        // full row is decided by the document write gate before this op is
+        // dispatched; refusing here bounds the case where such a plan arrives
+        // on its own, with no row body to decide.
         VectorOp::Insert { collection, .. }
         | VectorOp::BatchInsert { collection, .. }
         | VectorOp::Delete { collection, .. }
@@ -64,8 +92,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
         | VectorOp::SparseInsert { collection, .. }
         | VectorOp::SparseDelete { collection, .. }
         | VectorOp::MultiVectorInsert { collection, .. }
-        | VectorOp::MultiVectorDelete { collection, .. }
-        | VectorOp::DirectUpsert { collection, .. } => ctx.refuse_if_write_policy(
+        | VectorOp::MultiVectorDelete { collection, .. } => ctx.refuse_if_write_policy(
             collection,
             "a vector write carries an embedding and a surrogate rather than the row body the \
              policy names, so no row image is available for it to be evaluated against",
@@ -152,6 +179,75 @@ mod tests {
             })),
         );
         assert_refused(inject(&mut plan, &store), "users");
+    }
+
+    fn direct_upsert(collection: &str, payload: &[(&str, &str)]) -> PhysicalPlan {
+        let map: std::collections::HashMap<String, nodedb_types::Value> = payload
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), nodedb_types::Value::String((*v).into())))
+            .collect();
+        let payload = if map.is_empty() {
+            Vec::new()
+        } else {
+            zerompk::to_msgpack_vec(&map).expect("encode payload")
+        };
+        PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            collection: collection.into(),
+            field: "emb".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            vector: vec![0.1, 0.2],
+            payload,
+            quantization: Default::default(),
+            storage_dtype: Default::default(),
+            payload_indexes: Vec::new(),
+        })
+    }
+
+    /// A vector-primary row lives only in this op, so its payload image is
+    /// decided here and a conforming one is admitted.
+    ///
+    /// The payload is built exactly as the planner builds it — a zerompk
+    /// `HashMap<String, Value>`, whose values are tag-prefixed arrays — so this
+    /// also pins that the image is transcoded before evaluation. Handing those
+    /// bytes to the row evaluator raw rejects every row, conforming or not.
+    #[test]
+    fn conforming_direct_upsert_is_admitted() {
+        let store = store_with_write_policy("docs");
+        let mut plan = direct_upsert("docs", &[("owner_id", "42")]);
+        assert!(inject(&mut plan, &store).is_ok());
+    }
+
+    /// …and a violating payload fails the statement.
+    #[test]
+    fn violating_direct_upsert_is_rejected() {
+        let store = store_with_write_policy("docs");
+        let mut plan = direct_upsert("docs", &[("owner_id", "99")]);
+        assert!(matches!(
+            inject(&mut plan, &store),
+            Err(crate::Error::RejectedAuthz { .. })
+        ));
+    }
+
+    /// `payload` carries what the statement wrote, so a row that omits the
+    /// governed column gives the predicate nothing to test and fails closed.
+    /// Pinned so the behavior is stated rather than discovered.
+    #[test]
+    fn direct_upsert_denies_when_the_statement_omits_the_governed_column() {
+        let store = store_with_write_policy("docs");
+        let mut plan = direct_upsert("docs", &[("region", "eu")]);
+        assert!(matches!(
+            inject(&mut plan, &store),
+            Err(crate::Error::RejectedAuthz { .. })
+        ));
+    }
+
+    /// With no write policy the same upsert runs untouched.
+    #[test]
+    fn direct_upsert_without_a_policy_is_untouched() {
+        let mut plan = direct_upsert("docs", &[("region", "eu")]);
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
     }
 
     /// A sparse search has no filter slot, so a policy refuses it.

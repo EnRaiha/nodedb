@@ -998,6 +998,7 @@ mod tests {
                 dst_id: "b".into(),
                 src_surrogate: Surrogate::ZERO,
                 dst_surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
             }),
             PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
                 edges: Vec::<BatchEdge>::new(),

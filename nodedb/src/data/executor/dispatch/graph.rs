@@ -72,8 +72,19 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                rls_write_check,
                 ..
-            } => self.execute_edge_delete(task, tid, collection, src_id, label, dst_id),
+            } => self.execute_edge_delete(
+                task,
+                crate::data::executor::handlers::graph::EdgeDeleteParams {
+                    tid,
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                    rls_write_check,
+                },
+            ),
 
             GraphOp::EdgeDeleteBatch { edges } => self.execute_edge_delete_batch(task, tid, edges),
 

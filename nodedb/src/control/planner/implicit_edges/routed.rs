@@ -86,6 +86,11 @@ pub(super) async fn push_edge_delete(
             dst_id: dst.to_string(),
             src_surrogate,
             dst_surrogate,
+            // A mirrored edge is reconciliation of the document write that owns
+            // it, and that write is decided by the policy on the same
+            // collection before this task is derived. Gating the mirror as well
+            // would refuse a document write the policy already admitted.
+            rls_write_check: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

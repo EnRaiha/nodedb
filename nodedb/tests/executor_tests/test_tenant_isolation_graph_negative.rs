@@ -150,6 +150,7 @@ fn graph_cross_tenant_edge_delete_does_not_affect_owner() {
             dst_id: "beta".into(),
             src_surrogate: nodedb_types::Surrogate::ZERO,
             dst_surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         }),
     );
     // Ok (edge not present in B's namespace) or Error — both are acceptable.

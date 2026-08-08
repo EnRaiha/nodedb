@@ -1938,6 +1938,7 @@ mod tests {
             dst_id: "b".to_string(),
             src_surrogate: Surrogate::ZERO,
             dst_surrogate: Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);

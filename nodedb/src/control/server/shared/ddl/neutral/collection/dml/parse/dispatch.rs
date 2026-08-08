@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use crate::control::planner::context::PlanSecurityContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::{
     AuthorizationError, AuthorizedTask, AuthorizedTaskSet, authorize_collection, authorize_task_set,
 };
@@ -80,11 +82,39 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<(), DdlError> {
-    let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let (mut tasks, _output_schema, versions) = query_ctx
-        .plan_sql_and_versions(sql, tenant_id, database_id)
-        .await
-        .map_err(|error| ddl_err("XX000", error.to_string()))?;
+    // This is a client statement — the object-literal `INSERT INTO c { … }` and
+    // `UPSERT` forms land here after being rewritten to standard SQL — so it
+    // plans under the requester's own scope, the same one it is authorized and
+    // metered as below. Planning it as the system would apply no row policy to
+    // it: read filters would not be injected, and the write gates would decide
+    // nothing, on a transport a client can reach directly.
+    //
+    // Injection happens HERE, before the task set is consumed: implicit-edge
+    // extraction, authorization, staging, and dispatch all read `tasks` after
+    // this point, and injecting later would hand them un-injected copies.
+    let (mut tasks, versions) = {
+        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+        let permission_cache = state.permission_cache.read().await;
+        let sec = PlanSecurityContext {
+            identity,
+            auth: scope.auth(),
+            rls_store: &state.rls,
+            redaction_store: &state.redaction,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            permission_cache: Some(&*permission_cache),
+        };
+        let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
+        let (tasks, _output_schema, versions, _) = query_ctx
+            .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
+            .await
+            .map_err(|error| {
+                let (_, sqlstate, message) =
+                    crate::control::server::pgwire::types::error_to_sqlstate(&error);
+                ddl_err(sqlstate, message)
+            })?;
+        (tasks, versions)
+    };
 
     // Extraction marks catalog state and allocates surrogates. Reject an
     // unauthorized original DML task set before either side effect can occur.

@@ -173,16 +173,25 @@ impl CoreLoop {
                         dst_id: dst_id.clone(),
                         src_surrogate: nodedb_types::Surrogate::ZERO,
                         dst_surrogate: nodedb_types::Surrogate::ZERO,
+                        // Replay re-applies a delete that was already admitted
+                        // by the write policy when it was first accepted;
+                        // re-deciding it here against today's policies would
+                        // make recovery depend on catalog state the record
+                        // never carried.
+                        rls_write_check: Vec::new(),
                     }),
                 );
                 self.active_graph_system_from = system_from;
                 let response = self.execute_edge_delete(
                     &task,
-                    tenant_id,
-                    &collection,
-                    &src_id,
-                    &label,
-                    &dst_id,
+                    crate::data::executor::handlers::graph::EdgeDeleteParams {
+                        tid: tenant_id,
+                        collection: &collection,
+                        src_id: &src_id,
+                        label: &label,
+                        dst_id: &dst_id,
+                        rls_write_check: &[],
+                    },
                 );
                 self.active_graph_system_from = None;
                 if response.status == crate::bridge::envelope::Status::Ok {

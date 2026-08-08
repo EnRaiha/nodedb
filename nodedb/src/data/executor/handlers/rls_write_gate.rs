@@ -84,6 +84,44 @@ pub(in crate::data::executor) fn admit_stored_row(
     }
 }
 
+/// Decide one graph edge's STORED property object — the image of the edge
+/// about to be tombstoned — against the compiled write policy.
+///
+/// An edge stores the `PROPERTIES` clause as the JSON object text the DSL
+/// produced, not MessagePack, so the decode goes through JSON and the result is
+/// decided by [`admit_row`]: the same evaluator the document path uses, so one
+/// compiled predicate cannot mean one thing for a document row and another for
+/// an edge's properties.
+///
+/// `properties` is `None` when no live edge version exists, and a body that is
+/// not a JSON object — including an edge written with no `PROPERTIES` clause —
+/// carries no field the predicate can test. Both deny: an image the policy
+/// could not be evaluated against is not an image the policy admitted.
+pub(in crate::data::executor) fn admit_edge_properties(
+    rls_write_check: &[u8],
+    properties: Option<&[u8]>,
+    tid: u64,
+    collection: &str,
+) -> crate::Result<()> {
+    if rls_write_check.is_empty() {
+        return Ok(());
+    }
+    let decoded =
+        properties.and_then(|bytes| sonic_rs::from_slice::<serde_json::Value>(bytes).ok());
+    match decoded {
+        Some(image @ serde_json::Value::Object(_)) => {
+            admit_row(rls_write_check, &image, tid, collection)
+        }
+        _ => Err(crate::Error::RejectedAuthz {
+            tenant_id: crate::types::TenantId::new(tid),
+            resource: format!(
+                "RLS write policy on '{collection}': the edge carries no decodable property \
+                 object, so the policy could not be evaluated against it"
+            ),
+        }),
+    }
+}
+
 /// Decide one row image held as a [`nodedb_types::Value`] object.
 ///
 /// The columnar family never materializes a row as a JSON document: its rows
@@ -188,6 +226,48 @@ mod tests {
     #[test]
     fn a_row_without_the_governed_column_is_rejected() {
         assert!(admit_row(&owner_policy("alice"), &json!({"note": "x"}), 1, "orders").is_err());
+    }
+
+    #[test]
+    fn an_empty_check_admits_an_edge_with_no_properties() {
+        assert!(admit_edge_properties(&[], None, 1, "knows").is_ok());
+    }
+
+    #[test]
+    fn a_conforming_edge_property_object_is_admitted() {
+        assert!(
+            admit_edge_properties(
+                &owner_policy("alice"),
+                Some(br#"{"owner":"alice"}"#),
+                1,
+                "knows"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_violating_edge_property_object_is_rejected() {
+        assert!(
+            admit_edge_properties(
+                &owner_policy("alice"),
+                Some(br#"{"owner":"bob"}"#),
+                1,
+                "knows"
+            )
+            .is_err()
+        );
+    }
+
+    /// An edge with no live version, an empty `PROPERTIES` clause, or a body
+    /// that is not a JSON object gives the predicate nothing to test, so each
+    /// denies rather than being admitted by omission.
+    #[test]
+    fn an_edge_without_a_decodable_property_object_is_rejected() {
+        let policy = owner_policy("alice");
+        assert!(admit_edge_properties(&policy, None, 1, "knows").is_err());
+        assert!(admit_edge_properties(&policy, Some(b""), 1, "knows").is_err());
+        assert!(admit_edge_properties(&policy, Some(b"[1,2]"), 1, "knows").is_err());
     }
 
     /// A filter payload that does not deserialize denies rather than passing

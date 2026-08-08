@@ -20,6 +20,14 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// surrogates resolved via the routed surrogate exchange, so the downstream
 /// classify/Calvin/single-shard logic dual-homes cross-shard edges and
 /// single-homes same-shard edges identically to explicit edges.
+///
+/// A mirrored edge carries NO row-level-security write gate, and must not: it
+/// is derived from a `DocumentOp` write on the same collection, that write was
+/// already decided against the collection's write policy before this runs, and
+/// a denial there fails the statement before any mirror is derived. Deciding
+/// the mirror as well would refuse every governed document insert on the
+/// strength of its own edge, whose property object holds a weight and none of
+/// the columns a policy names.
 pub async fn append_implicit_edge_tasks(
     state: &SharedState,
     tasks: &mut Vec<PhysicalTask>,

@@ -174,6 +174,7 @@ fn edge_delete_updates_csr() {
             dst_id: "y".into(),
             src_surrogate: nodedb_types::Surrogate::ZERO,
             dst_surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
         }),
     );
 

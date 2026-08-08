@@ -40,6 +40,10 @@ pub(super) struct TxEdgeDeleteParams<'a> {
     pub src_id: &'a str,
     pub label: &'a str,
     pub dst_id: &'a str,
+    /// Compiled RLS write-policy filters the staged plan carried. Decided
+    /// against the edge's pre-image inside the batch, so a rejected delete
+    /// fails the whole transaction instead of applying unchecked.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -196,6 +200,7 @@ impl CoreLoop {
             src_id,
             label,
             dst_id,
+            rls_write_check,
         } = params;
 
         // Compensation is recorded inside `execute_edge_delete_with_undo` only
@@ -210,6 +215,7 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                rls_write_check,
             },
             Some(undo_log),
         );

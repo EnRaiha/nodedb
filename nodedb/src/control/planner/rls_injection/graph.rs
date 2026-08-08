@@ -23,15 +23,15 @@ use super::context::RlsCtx;
 const TRAVERSAL_REASON: &str =
     "a traversal returns graph topology, which the row filter cannot be evaluated against";
 
-const EDGE_WRITE_REASON: &str = "an edge write carries endpoints and a label rather than the row body the policy names, so no \
-     row image is available for it to be evaluated against";
+const EDGE_BATCH_REASON: &str = "a batched edge write is applied with empty properties, so it carries no row image for the \
+     policy to be evaluated against";
 
 const ALGORITHM_REASON: &str = "an algorithm returns per-node scalars computed over every edge, which the row filter cannot \
      be evaluated against";
 
 /// Exhaustive over [`GraphOp`] so a new graph operation forces a decision
 /// between injecting, refusing, and no-op.
-pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &GraphOp) -> crate::Result<()> {
+pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<()> {
     match op {
         // Refuse: a traversal returns node ids and edge labels, not row bodies
         // — the rows are fetched later through `DocumentOp::PointGet`, which
@@ -110,22 +110,44 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &GraphOp) -> crate::Result<()> 
             ),
         },
 
-        // Refuse: an edge write carries endpoints and a label, not the row body
-        // a policy predicate names, so there is no image the write policy can
-        // be evaluated against. Topology is exactly what a read policy on this
-        // collection already refuses to disclose, and writing it is the same
-        // claim in reverse.
-        GraphOp::EdgePut { collection, .. } | GraphOp::EdgeDelete { collection, .. } => {
-            ctx.refuse_if_write_policy(collection, EDGE_WRITE_REASON)
-        }
+        // Admit: `GRAPH INSERT EDGE` carries its `PROPERTIES` clause on the
+        // plan as the JSON object the edge is about to store, so the policy
+        // decides the row that will exist after the write — the same plan-time
+        // admission a document insert with a full image gets. An edge written
+        // with no `PROPERTIES` carries no field the predicate can test and is
+        // denied rather than admitted by omission.
+        //
+        // The mirrored edge a `_from`/`_to` document write produces is NOT
+        // decided here, and must not be: it is appended to the task set AFTER
+        // this pass runs, it targets the same collection as the `DocumentOp`
+        // write that produced it, and that write was already admitted against
+        // this same policy. Deciding it a second time would deny every governed
+        // document insert on the strength of its own mirror, whose property
+        // object holds an edge weight and none of the governed columns.
+        GraphOp::EdgePut {
+            collection,
+            properties,
+            ..
+        } => ctx.admit_write_json_image(collection, properties),
 
-        // Refuse: the batch forms name no collection — each edge carries its
-        // own — so the narrow question cannot be asked, and node labels are
-        // keyed on a node id that no plan field binds to a collection. Both
-        // fall back to the tenant-wide question, the same fallback every
-        // collection-less shape in this pass uses.
+        // Compile: a delete carries no image. The property object the policy
+        // decides is the stored one, readable only where the tombstone is
+        // written, so the predicate travels with the plan and the Data Plane
+        // evaluates it against the pre-image it reads back — the same shape a
+        // document DELETE uses.
+        GraphOp::EdgeDelete {
+            collection,
+            rls_write_check,
+            ..
+        } => ctx.set_write_check(collection, rls_write_check),
+
+        // Refuse: the batch forms carry no property image at all — every edge
+        // in a batch is applied with empty properties — so there is nothing for
+        // the policy to be evaluated against. Each `BatchEdge` does name its
+        // collection, but a known collection with no row image still leaves the
+        // policy undecidable, so this falls back to the tenant-wide question.
         GraphOp::EdgePutBatch { .. } | GraphOp::EdgeDeleteBatch { .. } => {
-            ctx.refuse_if_any_write_policy(EDGE_WRITE_REASON)
+            ctx.refuse_if_any_write_policy(EDGE_BATCH_REASON)
         }
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => ctx
             .refuse_if_any_write_policy(
@@ -170,6 +192,7 @@ mod tests {
 
     use super::super::plan::test_support::{
         assert_refused, inject, inject_without_policy, store_with_read_policy,
+        store_with_write_policy,
     };
     use crate::bridge::envelope::PhysicalPlan;
     use crate::engine::graph::pattern::ast::MatchQuery;
@@ -249,23 +272,99 @@ mod tests {
         }
     }
 
-    /// An edge write carries endpoints and a label rather than the row body a
-    /// write policy names, so it is refused rather than persisted unchecked.
-    #[test]
-    fn edge_put_is_refused_under_a_write_policy() {
-        use super::super::plan::test_support::{assert_write_refused, store_with_write_policy};
-
-        let store = store_with_write_policy("users");
-        let mut plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "users".into(),
+    fn edge_put(collection: &str, properties: &str) -> PhysicalPlan {
+        PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: collection.into(),
             src_id: "a".into(),
             label: "knows".into(),
             dst_id: "b".into(),
-            properties: Vec::new(),
+            properties: properties.as_bytes().to_vec(),
             src_surrogate: nodedb_types::Surrogate::ZERO,
             dst_surrogate: nodedb_types::Surrogate::ZERO,
-        });
-        assert_write_refused(inject(&mut plan, &store), "users");
+        })
+    }
+
+    fn edge_delete(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Graph(GraphOp::EdgeDelete {
+            collection: collection.into(),
+            src_id: "a".into(),
+            label: "knows".into(),
+            dst_id: "b".into(),
+            src_surrogate: nodedb_types::Surrogate::ZERO,
+            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            rls_write_check: Vec::new(),
+        })
+    }
+
+    /// The `PROPERTIES` clause is the edge's row image, so a conforming one is
+    /// admitted at plan time.
+    #[test]
+    fn conforming_edge_put_is_admitted() {
+        let store = store_with_write_policy("users");
+        let mut plan = edge_put("users", r#"{"owner_id":"42"}"#);
+        assert!(inject(&mut plan, &store).is_ok());
+    }
+
+    /// …and one whose properties violate the policy fails the statement rather
+    /// than being persisted unchecked.
+    #[test]
+    fn violating_edge_put_is_rejected() {
+        let store = store_with_write_policy("users");
+        let mut plan = edge_put("users", r#"{"owner_id":"99"}"#);
+        assert!(matches!(
+            inject(&mut plan, &store),
+            Err(crate::Error::RejectedAuthz { .. })
+        ));
+    }
+
+    /// An edge with no `PROPERTIES` carries no field the predicate can test, so
+    /// it is denied rather than admitted by omission.
+    #[test]
+    fn edge_put_without_properties_is_denied_under_a_write_policy() {
+        let store = store_with_write_policy("users");
+        let mut plan = edge_put("users", "");
+        assert!(matches!(
+            inject(&mut plan, &store),
+            Err(crate::Error::RejectedAuthz { .. })
+        ));
+    }
+
+    /// With no write policy the same edge insert runs untouched, whatever its
+    /// properties are.
+    #[test]
+    fn edge_put_without_a_policy_is_untouched() {
+        let mut plan = edge_put("users", "");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
+    }
+
+    /// A delete's image is the stored property object, so the compiled
+    /// predicate ships to the Data Plane instead of the plan being refused.
+    #[test]
+    fn edge_delete_carries_the_write_check() {
+        let store = store_with_write_policy("users");
+        let mut plan = edge_delete("users");
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Graph(GraphOp::EdgeDelete {
+                rls_write_check, ..
+            }) => assert!(
+                !rls_write_check.is_empty(),
+                "a governed edge delete must ship the compiled predicate"
+            ),
+            other => panic!("expected an EdgeDelete plan, got {other:?}"),
+        }
+    }
+
+    /// …and an ungoverned collection ships an empty check, which admits
+    /// everything and costs the Data Plane no pre-image read.
+    #[test]
+    fn edge_delete_without_a_policy_is_untouched() {
+        let mut plan = edge_delete("users");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
     }
 
     /// A graph algorithm runs over every edge of the collection.

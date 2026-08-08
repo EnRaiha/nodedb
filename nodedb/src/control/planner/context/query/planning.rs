@@ -23,44 +23,18 @@ pub struct PlanSqlWithRlsParams<'a> {
 }
 
 impl QueryContext {
-    /// Parse SQL and convert to NodeDB physical plan(s).
-    ///
-    /// Uses nodedb-sql for parsing and planning, then converts to PhysicalTasks.
-    /// `database_id` scopes catalog lookups to a specific database namespace.
-    /// Pass `DatabaseId::DEFAULT` when no explicit database scope is needed
-    /// (e.g. internal queries from event triggers or scheduled jobs).
-    pub async fn plan_sql(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-    ) -> crate::Result<(
-        Vec<nodedb_physical::physical_task::PhysicalTask>,
-        OutputSchema,
-    )> {
-        self.plan_with_nodedb_sql(sql, tenant_id, database_id)
-            .map(|(t, schema, _, _)| (t, schema))
-    }
-
-    /// Plan SQL and return the descriptor versions observed during planning.
-    ///
-    /// Internal dispatchers without an RLS security context use this variant so
-    /// they can acquire descriptor leases before sending work to the Data Plane.
-    pub async fn plan_sql_and_versions(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-    ) -> crate::Result<(
-        Vec<nodedb_physical::physical_task::PhysicalTask>,
-        OutputSchema,
-        crate::control::planner::descriptor_set::DescriptorVersionSet,
-    )> {
-        self.plan_with_nodedb_sql(sql, tenant_id, database_id)
-            .map(|(tasks, schema, versions, _)| (tasks, schema, versions))
-    }
-
     /// Core planning via nodedb-sql: parse → plan → optimize → convert.
+    ///
+    /// PRIVATE, and it stays private. Its result is a task set with no policy
+    /// resolved against it — no row filters injected, no write image admitted,
+    /// no unredactable read refused. Every transport that reached this
+    /// directly became a hole through which row-level security did not apply,
+    /// so the only caller is
+    /// [`Self::plan_sql_with_rls_and_versions_for_purpose`], which runs the
+    /// injection pass over what comes back. Work that genuinely has no
+    /// requester passes a
+    /// [`SystemPlanSecurity`](crate::control::planner::context::SystemPlanSecurity)
+    /// context and still goes through that one door.
     ///
     /// Returns the compiled physical tasks and the
     /// [`crate::control::planner::descriptor_set::DescriptorVersionSet`] recording
@@ -68,20 +42,6 @@ impl QueryContext {
     /// used as the plan-cache key AND as the input to
     /// `SharedState::acquire_plan_lease_scope` so cache hits
     /// and fresh plans share the same lease-acquisition path.
-    pub(super) fn plan_with_nodedb_sql(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-    ) -> crate::Result<(
-        Vec<nodedb_physical::physical_task::PhysicalTask>,
-        OutputSchema,
-        crate::control::planner::descriptor_set::DescriptorVersionSet,
-        nodedb_sql::types::PlanCacheEligibility,
-    )> {
-        self.plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, PlanningPurpose::Execute)
-    }
-
     fn plan_with_nodedb_sql_for_purpose(
         &self,
         sql: &str,
@@ -402,7 +362,7 @@ impl QueryContext {
             }
         };
         // Fresh adapter per plan call: same rationale as
-        // `plan_with_nodedb_sql`. Its recorded version set is returned to the
+        // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(

@@ -56,6 +56,15 @@ pub enum GraphOp {
         dst_id: String,
         src_surrogate: Surrogate,
         dst_surrogate: Surrogate,
+        /// Compiled row-level-security WRITE filters, or empty when no write
+        /// policy restricts this identity on `collection`.
+        ///
+        /// The image a write policy decides for an edge is the edge's stored
+        /// property object, which the plan does not carry — it exists only
+        /// where the tombstone is written. So the predicate travels with the
+        /// plan and the Data Plane evaluates it against the pre-image it reads
+        /// back, exactly as a document DELETE does.
+        rls_write_check: Vec<u8>,
     },
 
     /// Batched edge delete: used to revert a partial `EdgePutBatch` on

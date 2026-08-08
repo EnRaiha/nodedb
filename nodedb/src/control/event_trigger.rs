@@ -252,12 +252,25 @@ async fn execute_then_action(
     };
 
     let query_ctx = QueryContext::for_state(&shared);
+    // A trigger action is database-defined code with no external requester, so
+    // it plans as the system — the same SECURITY DEFINER model the trigger
+    // dispatcher already uses for the identity it executes under.
+    let security = crate::control::planner::context::SystemPlanSecurity::new(
+        event.tenant_id,
+        "_system_event_trigger",
+    );
 
     match query_ctx
-        .plan_sql_and_versions(&sql, event.tenant_id, event.database_id)
+        .plan_sql_with_rls_and_versions(
+            &sql,
+            event.tenant_id,
+            event.database_id,
+            &security.context(&shared),
+            false,
+        )
         .await
     {
-        Ok((tasks, _output_schema, versions)) => {
+        Ok((tasks, _output_schema, versions, _)) => {
             // Keep the Arc and lease scope alive through every trigger action
             // dispatch. Admission is fail-closed while a descriptor drains.
             let _lease_scope = match Arc::clone(&shared).acquire_plan_lease_scope(&versions) {

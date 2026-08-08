@@ -41,6 +41,9 @@ pub(in crate::data::executor) struct EdgeDeleteParams<'a> {
     pub src_id: &'a str,
     pub label: &'a str,
     pub dst_id: &'a str,
+    /// Compiled RLS write-policy filters the plan carried, or empty when no
+    /// write policy restricts this identity on `collection`.
+    pub rls_write_check: &'a [u8],
 }
 
 impl CoreLoop {
@@ -381,23 +384,9 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_edge_delete(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        src_id: &str,
-        label: &str,
-        dst_id: &str,
+        params: EdgeDeleteParams<'_>,
     ) -> Response {
-        self.execute_edge_delete_with_undo(
-            task,
-            EdgeDeleteParams {
-                tid,
-                collection,
-                src_id,
-                label,
-                dst_id,
-            },
-            None,
-        )
+        self.execute_edge_delete_with_undo(task, params, None)
     }
 
     /// Edge delete with optional transactional compensation.
@@ -406,6 +395,10 @@ impl CoreLoop {
     /// existed *and* the tombstone was durably written — never speculatively
     /// before the write. A phantom entry would otherwise re-insert an edge that
     /// was never deleted when the surrounding transaction rolls back.
+    ///
+    /// The RLS write policy is decided against that same pre-image and BEFORE
+    /// the tombstone: the row a policy governs is the edge that exists now, and
+    /// a delete the policy rejects must leave the edge in place.
     pub(in crate::data::executor) fn execute_edge_delete_with_undo(
         &mut self,
         task: &ExecutionTask,
@@ -418,12 +411,16 @@ impl CoreLoop {
             src_id,
             label,
             dst_id,
+            rls_write_check,
         } = params;
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge delete");
         let database_id = task.request.database_id.as_u64();
 
-        // Capture the pre-image only when a compensation record is requested.
-        let old_properties = if undo.is_some() {
+        // Capture the pre-image when a compensation record is requested, or
+        // when a write policy has to be decided against it. An ungoverned
+        // delete with no undo log reads nothing, so the common path pays no
+        // extra lookup.
+        let old_properties = if undo.is_some() || !rls_write_check.is_empty() {
             self.edge_store
                 .get_edge(
                     database_id,
@@ -438,6 +435,15 @@ impl CoreLoop {
         } else {
             None
         };
+
+        if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_edge_properties(
+            rls_write_check,
+            old_properties.as_deref(),
+            tid,
+            collection,
+        ) {
+            return self.response_error(task, error);
+        }
 
         let ord = self
             .active_graph_system_from
@@ -640,6 +646,114 @@ mod tests {
         assert_eq!(event.new_value.as_deref(), Some(b"w=1".as_slice()));
     }
 
+    /// Compiled filters equivalent to a `FOR WRITE` policy on `owner`.
+    fn owner_write_check(owner: &str) -> Vec<u8> {
+        let filter = crate::bridge::scan_filter::ScanFilter {
+            field: "owner".into(),
+            op: "eq".into(),
+            value: nodedb_types::Value::String(owner.into()),
+            clauses: Vec::new(),
+            expr: None,
+        };
+        zerompk::to_msgpack_vec(&vec![filter]).expect("encode policy filter")
+    }
+
+    /// The delete is decided against the edge's STORED property object before
+    /// the tombstone is written, so a rejected delete leaves the edge in place.
+    #[test]
+    fn edge_delete_rejected_by_the_write_policy_leaves_the_edge() {
+        let mut h = make_core();
+        let put_task = make_task_with_lsn(90);
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: br#"{"owner":"alice"}"#,
+                        src_surrogate: nodedb_types::Surrogate::new(1),
+                        dst_surrogate: nodedb_types::Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+
+        let check = owner_write_check("mallory");
+        let del_task = make_task_with_lsn(91);
+        let resp = h.core.execute_edge_delete(
+            &del_task,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &check,
+            },
+        );
+        assert_eq!(resp.status, Status::Error);
+        assert!(
+            h.core
+                .edge_store
+                .get_edge(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TenantId::new(1),
+                    "knows",
+                    "a",
+                    "KNOWS",
+                    "b",
+                )
+                .expect("read edge back")
+                .is_some(),
+            "a refused delete must leave the edge present"
+        );
+    }
+
+    /// …and a policy the stored properties satisfy lets the delete through.
+    #[test]
+    fn edge_delete_admitted_by_the_write_policy_applies() {
+        let mut h = make_core();
+        let put_task = make_task_with_lsn(92);
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: br#"{"owner":"alice"}"#,
+                        src_surrogate: nodedb_types::Surrogate::new(1),
+                        dst_surrogate: nodedb_types::Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+
+        let check = owner_write_check("alice");
+        let del_task = make_task_with_lsn(93);
+        let resp = h.core.execute_edge_delete(
+            &del_task,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &check,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+    }
+
     #[test]
     fn edge_delete_emits_cdc_delete_on_its_collection() {
         let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 64);
@@ -670,9 +784,17 @@ mod tests {
         let _ = consumers[0].try_recv(); // drain the put event
 
         let del_task = make_task_with_lsn(81);
-        let resp = h
-            .core
-            .execute_edge_delete(&del_task, 1, "knows", "a", "KNOWS", "b");
+        let resp = h.core.execute_edge_delete(
+            &del_task,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &[],
+            },
+        );
         assert_eq!(resp.status, Status::Ok);
 
         let event = consumers[0]

@@ -378,6 +378,14 @@ pub async fn coordinate_cross_shard_hop(
         let mut any_error = false;
         let mut work = Vec::with_capacity(batch.node_ids.len());
 
+        // The fan-out leg of a traversal the originating query already resolved
+        // policy for — this synthesizes internal SQL per remote shard and has no
+        // requester of its own, so it plans as the system.
+        let security = crate::control::planner::context::SystemPlanSecurity::new(
+            crate::types::TenantId::new(tenant_id_u64),
+            "_system_scatter_gather",
+        );
+
         // Plan and admit every traversal before spawning. The resulting work
         // owns its descriptor lease scope, so the spawned closure does not
         // need to retain or reconstruct SharedState.
@@ -396,11 +404,13 @@ pub async fn coordinate_cross_shard_hop(
                 txn_id: None,
             };
             let plan_ctx = crate::control::planner::context::QueryContext::for_state(shared);
-            let (tasks, _output_schema, versions) = match plan_ctx
-                .plan_sql_and_versions(
+            let (tasks, _output_schema, versions, _) = match plan_ctx
+                .plan_sql_with_rls_and_versions(
                     &sql,
                     crate::types::TenantId::new(tenant_id_u64),
                     database_id,
+                    &security.context(shared),
+                    false,
                 )
                 .await
             {

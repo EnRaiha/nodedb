@@ -55,6 +55,9 @@ pub(super) fn wal_append_graph_op(
             })?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
+        // The compiled write predicate is a planning-time artifact of the
+        // session that produced the plan, not part of the durable edge, so it
+        // is deliberately not part of the WAL entry.
         GraphOp::EdgeDelete {
             collection,
             src_id,
@@ -62,6 +65,7 @@ pub(super) fn wal_append_graph_op(
             dst_id,
             src_surrogate: _,
             dst_surrogate: _,
+            rls_write_check: _,
         } => {
             let entry =
                 zerompk::to_msgpack_vec(&(collection, src_id, label, dst_id)).map_err(|e| {

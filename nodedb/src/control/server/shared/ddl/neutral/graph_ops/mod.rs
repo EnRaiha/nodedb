@@ -12,6 +12,8 @@
 pub mod algo;
 pub mod dispatch;
 pub mod edge;
+mod edge_parse;
+mod edge_rls;
 mod edge_stage;
 pub mod rag_fusion;
 pub mod response;

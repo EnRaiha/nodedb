@@ -20,38 +20,8 @@ use nodedb_physical::physical_plan::GraphOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
-
-/// Maximum byte length for an edge label string. Keeps a single `TYPE`
-/// clause from bloating the CSR label table and the msgpack wire payload.
-const MAX_EDGE_LABEL_BYTES: usize = 256;
-
-/// Validate a user-supplied edge label. Rejects empty, overlong, and
-/// labels containing ASCII control characters (0x00..=0x1F, 0x7F).
-///
-/// Runs at every DSL ingress so the CSR interner never sees degenerate
-/// input — a complement to the `u32` widening of the label id space.
-fn validate_edge_label(label: &str) -> Result<(), DdlError> {
-    if label.is_empty() {
-        return Err(ddl_err("42601", "edge TYPE label must not be empty"));
-    }
-    if label.len() > MAX_EDGE_LABEL_BYTES {
-        return Err(ddl_err(
-            "42601",
-            format!(
-                "edge TYPE label is {} bytes; maximum is {MAX_EDGE_LABEL_BYTES}",
-                label.len()
-            ),
-        ));
-    }
-    if label.chars().any(|c| c.is_control() || c == '\u{007F}') {
-        return Err(ddl_err(
-            "42601",
-            "edge TYPE label must not contain control characters",
-        ));
-    }
-    Ok(())
-}
+use super::edge_parse::{properties_to_json, validate_edge_label};
+use super::support::{data_plane_verdict, ddl_err};
 
 /// `GRAPH INSERT EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>' [PROPERTIES '<json>' | { ... }]`
 ///
@@ -129,15 +99,24 @@ pub async fn insert_edge(
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    let edge_put = GraphOp::EdgePut {
-        collection,
-        src_id: src,
-        label,
-        dst_id: dst,
-        properties: properties_json.into_bytes(),
-        src_surrogate,
-        dst_surrogate,
-    };
+    // The write policy decides the edge's `PROPERTIES` image before anything is
+    // staged or dispatched: this handler builds its plan by hand and dispatches
+    // it as trusted internal work, so nothing downstream will resolve a policy
+    // for it.
+    let edge_put = super::edge_rls::resolve_edge_write_rls(
+        state,
+        identity,
+        database_id,
+        GraphOp::EdgePut {
+            collection,
+            src_id: src,
+            label,
+            dst_id: dst,
+            properties: properties_json.into_bytes(),
+            src_surrogate,
+            dst_surrogate,
+        },
+    )?;
 
     // Calvin cross-shard atomicity is only operational in cluster mode with a
     // wired sequencer. In single-node (no cluster transport) every vShard is
@@ -184,17 +163,19 @@ pub async fn insert_edge(
         // are single-node), so a single-home Raft write to `vsrc` covers both
         // forward and reverse traversal — EDGES + REVERSE_EDGES land together.
         let plan = PhysicalPlan::Graph(edge_put);
-        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
-            state,
-            tenant_id,
-            database_id,
-            vsrc,
-            plan,
-            TraceId::ZERO,
-            crate::event::EventSource::User,
-        )
-        .await
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        let response =
+            crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+                state,
+                tenant_id,
+                database_id,
+                vsrc,
+                plan,
+                TraceId::ZERO,
+                crate::event::EventSource::User,
+            )
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        data_plane_verdict(&response)?;
     } else {
         // Cross-shard edge: dual-home it ATOMICALLY via Calvin. `build_static_tx_class`
         // enumerates {vsrc, vdst} as the participating vShards (the dh-1 substrate),
@@ -212,9 +193,12 @@ pub async fn insert_edge(
         };
         let tx_class = build_static_tx_class(&[task], tenant_id, &[])
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
-        submit_calvin_routed(state, tx_class)
+        let response = submit_calvin_routed(state, tx_class)
             .await
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        if let Some(response) = response {
+            data_plane_verdict(&response)?;
+        }
     }
 
     Ok(vec![DdlResult::Status {
@@ -307,14 +291,24 @@ pub async fn delete_edge(
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    let edge_delete = GraphOp::EdgeDelete {
-        collection,
-        src_id: src,
-        label,
-        dst_id: dst,
-        src_surrogate,
-        dst_surrogate,
-    };
+    // A delete carries no image, so the policy is compiled into the plan's
+    // write-gate slot here and decided in the Data Plane against the edge's
+    // stored properties — this handler dispatches trusted internal work that
+    // nothing downstream resolves a policy for.
+    let edge_delete = super::edge_rls::resolve_edge_write_rls(
+        state,
+        identity,
+        database_id,
+        GraphOp::EdgeDelete {
+            collection,
+            src_id: src,
+            label,
+            dst_id: dst,
+            src_surrogate,
+            dst_surrogate,
+            rls_write_check: Vec::new(),
+        },
+    )?;
 
     // Calvin cross-shard atomicity is only operational in cluster mode with a
     // wired sequencer. In single-node every vShard is local, so the F1a
@@ -355,17 +349,19 @@ pub async fn delete_edge(
         // are single-node), so a single-home write to `vsrc` tombstones both the
         // forward and reverse rows together.
         let plan = PhysicalPlan::Graph(edge_delete);
-        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
-            state,
-            tenant_id,
-            database_id,
-            vsrc,
-            plan,
-            TraceId::ZERO,
-            crate::event::EventSource::User,
-        )
-        .await
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        let response =
+            crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+                state,
+                tenant_id,
+                database_id,
+                vsrc,
+                plan,
+                TraceId::ZERO,
+                crate::event::EventSource::User,
+            )
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        data_plane_verdict(&response)?;
     } else {
         // Cross-shard edge: dual-home the delete ATOMICALLY via Calvin, mirroring
         // the insert path. `build_static_tx_class` enumerates {vsrc, vdst} as the
@@ -383,9 +379,12 @@ pub async fn delete_edge(
         };
         let tx_class = build_static_tx_class(&[task], tenant_id, &[])
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
-        submit_calvin_routed(state, tx_class)
+        let response = submit_calvin_routed(state, tx_class)
             .await
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        if let Some(response) = response {
+            data_plane_verdict(&response)?;
+        }
     }
 
     Ok(vec![DdlResult::Status {
@@ -446,44 +445,23 @@ pub async fn set_node_labels(
     )
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
-        state,
-        tenant_id,
-        DatabaseId::DEFAULT,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-        crate::event::EventSource::User,
-    )
-    .await
-    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let response =
+        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+            state,
+            tenant_id,
+            DatabaseId::DEFAULT,
+            vshard_id,
+            plan,
+            TraceId::ZERO,
+            crate::event::EventSource::User,
+        )
+        .await
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    data_plane_verdict(&response)?;
 
     let tag = if remove { "UNLABEL" } else { "LABEL" };
     Ok(vec![DdlResult::Status {
         command: tag.to_string(),
         rows_affected: None,
     }])
-}
-
-/// Convert a parsed `PROPERTIES` clause to the JSON string stored
-/// in `GraphOp::EdgePut`. Object-literal forms go through the
-/// existing `nodedb_sql::parser::object_literal::parse_object_literal`
-/// so the type coercions (numbers, bools, nested objects) match
-/// every other object-literal ingress (INSERT { ... }, UPSERT).
-fn properties_to_json(properties: GraphProperties) -> Result<String, DdlError> {
-    match properties {
-        GraphProperties::None => Ok(String::new()),
-        GraphProperties::Quoted(s) => Ok(s),
-        GraphProperties::Object(obj_str) => {
-            match nodedb_sql::parser::object_literal::parse_object_literal(&obj_str) {
-                Some(Ok(fields)) => sonic_rs::to_string(&nodedb_types::Value::Object(fields))
-                    .map_err(|e| ddl_err("XX000", format!("PROPERTIES serialize error: {e}"))),
-                Some(Err(msg)) => Err(ddl_err(
-                    "42601",
-                    format!("PROPERTIES object literal error: {msg}"),
-                )),
-                None => Ok(String::new()),
-            }
-        }
-    }
 }

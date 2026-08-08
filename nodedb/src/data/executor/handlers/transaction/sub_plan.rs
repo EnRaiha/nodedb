@@ -297,6 +297,7 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                rls_write_check,
                 ..
             } => self.exec_tx_edge_delete(
                 dummy_task,
@@ -306,6 +307,7 @@ impl CoreLoop {
                     src_id,
                     label,
                     dst_id,
+                    rls_write_check,
                 },
                 undo_log,
             ),
@@ -342,6 +344,10 @@ impl CoreLoop {
                             src_id: &edge.src_id,
                             label: &edge.label,
                             dst_id: &edge.dst_id,
+                            // A batched edge carries no property image, so the
+                            // planner refuses the batch outright while a write
+                            // policy applies — nothing reaches here to decide.
+                            rls_write_check: &[],
                         },
                         undo_log,
                     )?;
