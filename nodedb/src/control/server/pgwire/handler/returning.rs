@@ -22,13 +22,15 @@ const RETURNING_KEYWORD: &str = "RETURNING";
 /// Returns `(cleaned_sql, returning_spec)`. The cleaned SQL has the
 /// `RETURNING ...` suffix removed so DataFusion can parse it.
 ///
-/// Only strips RETURNING from UPDATE, DELETE and MERGE statements (INSERT
-/// RETURNING is handled separately in `collection_insert.rs`).
+/// RETURNING is honored on UPDATE, DELETE and MERGE. On INSERT it is
+/// **refused** — see [`refuse_unsupported_insert_returning`].
 ///
 /// Arithmetic expressions (e.g. `RETURNING stock * 2`) are rejected with
 /// a typed error — only bare column names and `*` are supported.
 pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Error> {
     let trimmed = sql.trim_start();
+
+    refuse_unsupported_insert_returning(trimmed, sql)?;
 
     if !starts_with_ascii_case_insensitive(trimmed, "UPDATE")
         && !starts_with_ascii_case_insensitive(trimmed, "DELETE")
@@ -45,6 +47,43 @@ pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec
     } else {
         Ok((sql.to_string(), None))
     }
+}
+
+/// Refuse `INSERT ... RETURNING`, which nothing in the system can honor.
+///
+/// No insert operation carries a `returning` slot on any engine —
+/// `DocumentOp::PointInsert` / `PointPut` / `BatchInsert`, and the key-value,
+/// columnar, and vector inserts alike — while `PointUpdate`, `PointDelete`,
+/// `Merge`, and `UpdateFrom` all do. So the clause has nowhere to be planned
+/// into: it was parsed, discarded, and the caller received a command tag for a
+/// statement that asked for rows, with nothing anywhere saying the request had
+/// been dropped.
+///
+/// Refusing is the honest answer until an insert can actually return its row.
+/// Returning the caller's own submitted values instead would be worse than
+/// silence: every other RETURNING in the product returns the STORED row and is
+/// gated by the read policy (see the `rls_filters` slot beside each `returning`
+/// field), and an echo of the request would match neither.
+///
+/// Scoped to statements that begin with INSERT rather than to "everything that
+/// is not UPDATE/DELETE/MERGE", so no unrelated statement that happens to
+/// contain the word is caught by it. `UPSERT` is deliberately not included:
+/// the protocol-neutral DDL router claims every UPSERT before this function is
+/// reached, and it answers the clause from its own parse rather than from the
+/// planner.
+fn refuse_unsupported_insert_returning(trimmed: &str, sql: &str) -> Result<(), Error> {
+    if !starts_with_ascii_case_insensitive(trimmed, "INSERT") {
+        return Ok(());
+    }
+    if keyword_position_outside_literals(sql, RETURNING_KEYWORD).is_none() {
+        return Ok(());
+    }
+    Err(Error::BadRequest {
+        detail: "RETURNING is not supported on INSERT; it is supported on UPDATE, DELETE, and \
+                 MERGE. Follow the insert with a SELECT on the inserted key to read the stored \
+                 row."
+            .to_string(),
+    })
 }
 
 /// Parse the column list that appears after the RETURNING keyword.
@@ -161,6 +200,55 @@ fn is_valid_column_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No insert op carries a `returning` slot, so the clause used to be parsed
+    /// away and the caller got a command tag for a statement that asked for
+    /// rows. It is refused now, and the refusal says which statements do
+    /// support it.
+    #[test]
+    fn insert_returning_is_refused_rather_than_dropped() {
+        for sql in [
+            "INSERT INTO items (id, name) VALUES ('a', 'alpha') RETURNING *",
+            "insert into items (id) values ('a') returning id",
+            "  INSERT INTO items (id) VALUES ('a') RETURNING id AS k",
+        ] {
+            let error = strip_returning(sql).expect_err("INSERT RETURNING must be refused");
+            let detail = error.to_string();
+            assert!(
+                detail.contains("RETURNING") && detail.contains("UPDATE"),
+                "the refusal must name the clause and where it IS supported; got {detail}"
+            );
+        }
+    }
+
+    /// An INSERT with no such clause is untouched — the refusal must not turn
+    /// ordinary inserts into errors.
+    #[test]
+    fn a_plain_insert_is_untouched() {
+        let sql = "INSERT INTO items (id, name) VALUES ('a', 'alpha')";
+        let (out, spec) = strip_returning(sql).expect("a plain insert must plan");
+        assert_eq!(out, sql);
+        assert!(spec.is_none());
+    }
+
+    /// The word inside a string literal is data, not a clause.
+    #[test]
+    fn returning_inside_a_string_literal_is_not_a_clause() {
+        let sql = "INSERT INTO items (id, note) VALUES ('a', 'RETURNING soon')";
+        let (out, spec) = strip_returning(sql).expect("a quoted keyword is not a clause");
+        assert_eq!(out, sql);
+        assert!(spec.is_none());
+    }
+
+    /// The refusal is scoped to INSERT: a statement that merely contains the
+    /// word elsewhere is not caught by it.
+    #[test]
+    fn a_non_insert_statement_is_not_caught_by_the_refusal() {
+        let sql = "SELECT returning_count FROM items";
+        let (out, spec) = strip_returning(sql).expect("a select must pass through");
+        assert_eq!(out, sql);
+        assert!(spec.is_none());
+    }
 
     #[test]
     fn strips_star_returning_from_update() {

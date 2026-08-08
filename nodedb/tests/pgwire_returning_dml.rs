@@ -451,3 +451,69 @@ async fn returning_arithmetic_expression_rejected() {
         )
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// INSERT RETURNING — unsupported, and says so
+// ---------------------------------------------------------------------------
+
+/// RETURNING is supported on UPDATE, DELETE, and MERGE — every test above —
+/// and NOT on INSERT: no insert operation carries a `returning` slot on any
+/// engine, so there is nothing for the clause to be planned into.
+///
+/// It used to be parsed and discarded, which meant the write applied, the
+/// client got a command tag, and a statement that asked for rows came back with
+/// none and no error. This pins the refusal, and that the refusal names where
+/// RETURNING does work so the message is actionable.
+#[tokio::test]
+async fn insert_returning_is_refused_rather_than_silently_dropped() {
+    let server = TestServer::start().await;
+    seed_docs(&server).await;
+
+    for sql in [
+        "INSERT INTO items (id, name, score) VALUES ('d', 'delta', 40) RETURNING *",
+        "INSERT INTO items (id, name, score) VALUES ('e', 'epsilon', 50) RETURNING id",
+    ] {
+        server
+            .expect_error(sql, "RETURNING is not supported on INSERT")
+            .await;
+    }
+
+    // Nothing was written by either refused statement, and the collection still
+    // holds exactly the three seeded rows.
+    let rows = server
+        .query_rows("SELECT id FROM items ORDER BY id")
+        .await
+        .expect("read back items");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["a".to_string()],
+            vec!["b".to_string()],
+            vec!["c".to_string()],
+        ],
+        "a refused INSERT must not have written its row: {rows:?}"
+    );
+}
+
+/// The refusal must not catch ordinary inserts, including one whose data
+/// happens to contain the word.
+#[tokio::test]
+async fn a_plain_insert_still_applies() {
+    let server = TestServer::start().await;
+    seed_docs(&server).await;
+
+    server
+        .exec("INSERT INTO items (id, name, score) VALUES ('d', 'RETURNING soon', 40)")
+        .await
+        .expect("an insert with no RETURNING clause must apply");
+
+    let rows = server
+        .query_rows("SELECT id FROM items ORDER BY id")
+        .await
+        .expect("read back items");
+    assert_eq!(
+        rows.len(),
+        4,
+        "the plain insert must have applied: {rows:?}"
+    );
+}
