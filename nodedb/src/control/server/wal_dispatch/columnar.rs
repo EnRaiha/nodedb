@@ -37,6 +37,11 @@ pub(super) fn wal_append_columnar_op(
             // not part of the row image being made durable, so it is not
             // written to the log and replay does not re-evaluate it.
             rls_write_check: _,
+            // Likewise per-request, and about the response rather than the row:
+            // a projection and its read gate shape what one caller is shown,
+            // which is not something replay reconstructs.
+            returning: _,
+            rls_filters: _,
         } => {
             // Encode a map-shaped `ColumnarWalRecord` carrying the per-row
             // cross-engine surrogates so replay restores the exact same
@@ -118,6 +123,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: vec![],
+            returning: None,
+            rls_filters: vec![],
         });
 
         let outcome = super::super::wal_append_if_write(

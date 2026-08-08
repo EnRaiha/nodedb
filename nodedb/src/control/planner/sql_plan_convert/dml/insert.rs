@@ -326,6 +326,13 @@ pub(in super::super) fn convert_insert(
                 provenance: None,
                 wal_lsn: None,
                 rls_write_check: Vec::new(),
+                // Both slots are filled by later passes over the built plan —
+                // `inject_returning_spec` from the statement's RETURNING list,
+                // and the row-level-security injector from the collection's read
+                // policy. Filling either here would duplicate a decision that
+                // has one owner.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -474,6 +481,10 @@ pub(in super::super) fn convert_upsert(
                 provenance: None,
                 wal_lsn: None,
                 rls_write_check: Vec::new(),
+                // Filled by the later `inject_returning_spec` / row-level-security
+                // passes — see the plain-insert site above.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

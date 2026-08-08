@@ -222,6 +222,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

@@ -12,7 +12,7 @@ use crate::data::executor::response_codec;
 use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
-use nodedb_physical::physical_plan::document::UpdateValue;
+use nodedb_physical::physical_plan::document::{ReturningSpec, UpdateValue};
 
 use super::row_ingest::RowIngestParams;
 
@@ -29,6 +29,12 @@ pub(in crate::data::executor) struct ColumnarInsertParams<'a> {
     /// Compiled row-level-security WRITE predicate carried by the plan; empty
     /// when no policy restricts this identity on the collection.
     pub rls_write_check: &'a [u8],
+    /// Projection for a `RETURNING` clause, when the statement carried one.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled row-level-security READ predicate gating the rows `returning`
+    /// emits. A separate gate from `rls_write_check`: that one decides whether
+    /// the write happens, this one decides what may be shown back.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -60,6 +66,8 @@ impl CoreLoop {
             schema_bytes,
             provenance,
             rls_write_check,
+            returning,
+            rls_filters,
         } = params;
         // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
         if let Some(prov) = provenance {
@@ -131,7 +139,7 @@ impl CoreLoop {
             schema_bytes,
         );
 
-        let accepted = match self.insert_columnar_rows(
+        let outcome = match self.insert_columnar_rows(
             task,
             RowIngestParams {
                 engine_key: &engine_key,
@@ -142,11 +150,13 @@ impl CoreLoop {
                 surrogates,
                 ndb_rows: &ndb_rows,
                 rls_write_check,
+                collect_stored_rows: returning.is_some(),
             },
         ) {
-            Ok(accepted) => accepted,
+            Ok(outcome) => outcome,
             Err(response) => return response,
         };
+        let accepted = outcome.accepted;
 
         if let Err(response) = self.flush_columnar_memtable_if_needed(task, &engine_key, collection)
         {
@@ -187,6 +197,20 @@ impl CoreLoop {
             self.sync_commit(prov);
             let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
             return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
+        }
+
+        // Answered after the flush and the geometry indexing above, so the rows
+        // reported are rows a concurrent `SELECT` can already find — a response
+        // sent before them would be true of the memtable and not yet of the
+        // collection.
+        if let Some(spec) = returning {
+            return self.columnar_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &schema,
+                &outcome.stored_rows,
+            );
         }
 
         let result = serde_json::json!({

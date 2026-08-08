@@ -31,6 +31,23 @@ pub(in crate::data::executor) struct RowIngestParams<'a> {
     /// Control Plane could not see; a plain insert's rows were already decided
     /// at plan time. Empty admits every row.
     pub rls_write_check: &'a [u8],
+    /// Whether the caller needs the stored post-image of every row that was
+    /// actually written. Only a `RETURNING` clause sets this; the row images
+    /// are cloned, so a plain insert must not pay for them.
+    pub collect_stored_rows: bool,
+}
+
+/// What an ingest run produced: how many rows landed, and — when the caller
+/// asked — the exact schema-ordered values that landed for each.
+///
+/// The two are reported together because they answer the same question and
+/// must never disagree: a row that was skipped is neither counted nor
+/// returned.
+pub(in crate::data::executor) struct RowIngestOutcome {
+    pub accepted: u64,
+    /// Schema-ordered stored values, one entry per accepted row, in insert
+    /// order. Empty unless `collect_stored_rows` was set.
+    pub stored_rows: Vec<Vec<Value>>,
 }
 
 impl CoreLoop {
@@ -40,13 +57,14 @@ impl CoreLoop {
     /// `InsertIfAbsent`, merge-via-`apply_on_conflict_updates` for `Put`
     /// with non-empty `on_conflict_updates`).
     ///
-    /// Returns the accepted row count, or `Err(Response)` on the first
-    /// unrecoverable error (short-circuits the remaining rows).
+    /// Returns the accepted row count (and, on request, the stored post-images),
+    /// or `Err(Response)` on the first unrecoverable error (short-circuits the
+    /// remaining rows).
     pub(in crate::data::executor) fn insert_columnar_rows(
         &mut self,
         task: &ExecutionTask,
         params: RowIngestParams<'_>,
-    ) -> Result<u64, Response> {
+    ) -> Result<RowIngestOutcome, Response> {
         let RowIngestParams {
             engine_key,
             schema,
@@ -56,8 +74,10 @@ impl CoreLoop {
             surrogates,
             ndb_rows,
             rls_write_check,
+            collect_stored_rows,
         } = params;
         let mut accepted = 0u64;
+        let mut stored_rows: Vec<Vec<Value>> = Vec::new();
 
         for (row_idx, row) in ndb_rows.iter().enumerate() {
             let obj = match row {
@@ -228,7 +248,18 @@ impl CoreLoop {
             };
 
             match result {
-                Ok(_) => accepted += 1,
+                // An `insert_if_absent` that hit an existing key returns an
+                // EMPTY `wal_records` — that is the engine's documented no-op
+                // signal, and the only way to tell a skip from a write. Counting
+                // it reported an `INSERT 1` for a row that was never stored, and
+                // returning it would hand back a row that does not exist.
+                Ok(mutation) if mutation.wal_records.is_empty() => {}
+                Ok(_) => {
+                    accepted += 1;
+                    if collect_stored_rows {
+                        stored_rows.push(final_values);
+                    }
+                }
                 Err(e) => {
                     return Err(self.response_error(
                         task,
@@ -240,6 +271,9 @@ impl CoreLoop {
             }
         }
 
-        Ok(accepted)
+        Ok(RowIngestOutcome {
+            accepted,
+            stored_rows,
+        })
     }
 }

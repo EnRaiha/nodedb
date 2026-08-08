@@ -60,6 +60,10 @@ pub(crate) fn build_insert(
         provenance: None,
         wal_lsn: None,
         rls_write_check: Vec::new(),
+        // The native insert API takes rows, not a projection; a caller wanting
+        // rows back issues SQL, where `inject_returning_spec` fills this slot.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

@@ -21,15 +21,12 @@ pub(in crate::data::executor) fn row_matches_filters(
     schema: &nodedb_types::columnar::ColumnarSchema,
     filters: &[ScanFilter],
 ) -> Result<bool, EvalError> {
-    // Build a Value::Object so that ScanFilter::matches_value can navigate
-    // field paths and expression predicates (e.g. pg_json_get_text).
-    let mut map = std::collections::HashMap::with_capacity(schema.columns.len());
-    for (i, col_def) in schema.columns.iter().enumerate() {
-        if i < row.len() {
-            map.insert(col_def.name.clone(), row[i].clone());
-        }
-    }
-    value_matches_filters(&nodedb_types::Value::Object(map), filters)
+    // Build the row image through the ONE builder every columnar path uses —
+    // the write gate, the `ON CONFLICT` merge, and a `RETURNING` projection all
+    // call it too. A private copy here is how the same schema-ordered row came
+    // to mean two different objects on the read and write sides.
+    let doc = crate::data::executor::handlers::columnar_write::row_values_to_object(schema, row);
+    value_matches_filters(&doc, filters)
 }
 
 /// Check whether an already-assembled row object satisfies all predicates.

@@ -327,6 +327,8 @@ fn rollback_matrix_columnar_then_doc_fail() {
                     provenance: None,
                     wal_lsn: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],
@@ -392,6 +394,8 @@ fn rollback_matrix_columnar_count_after_rollback() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -416,6 +420,8 @@ fn rollback_matrix_columnar_count_after_rollback() {
                     provenance: None,
                     wal_lsn: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],

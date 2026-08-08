@@ -363,6 +363,8 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

@@ -38,18 +38,28 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
         // incoming body alone would clear a write whose actual post-image the
         // policy never saw, so the compiled predicate travels with the plan and
         // the handler decides the merged row just before persisting it.
+        //
+        // The read filter is not redundant with either of those. It gates a
+        // different thing: a `RETURNING` clause on this insert ships rows back,
+        // and that output is a read, so a row a read-only policy hides must not
+        // become visible just because the statement wrote it. The two policies
+        // are independent — a collection can carry a `FOR SELECT` policy and no
+        // write policy at all, in which case the write is unrestricted and the
+        // returned row set still shrinks.
         ColumnarOp::Insert {
             collection,
             payload,
             on_conflict_updates,
             rls_write_check,
+            rls_filters,
             ..
         } => {
             if on_conflict_updates.is_empty() {
-                ctx.admit_write_batch(collection, payload)
+                ctx.admit_write_batch(collection, payload)?;
             } else {
-                ctx.set_write_check(collection, rls_write_check)
+                ctx.set_write_check(collection, rls_write_check)?;
             }
+            ctx.set_post_filters(collection, rls_filters)
         }
 
         // Ship the write predicate: an update's post-image exists only after
@@ -104,6 +114,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -180,6 +192,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),
@@ -204,6 +218,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(

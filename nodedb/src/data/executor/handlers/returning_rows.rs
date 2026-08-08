@@ -96,6 +96,44 @@ impl CoreLoop {
     }
 }
 
+impl CoreLoop {
+    /// Build a columnar write's `RETURNING` response from the rows it stored.
+    ///
+    /// A columnar row is `Vec<Value>` in schema order, not a stored msgpack
+    /// body, so the row image is assembled by `row_values_to_object` — the same
+    /// builder the columnar WHERE evaluator and the row-level-security write
+    /// gate use. Assembling it a second way here is how `RETURNING` output would
+    /// drift from what a `SELECT` on the same key reports.
+    ///
+    /// `rows` must already exclude anything the engine skipped (an
+    /// `ON CONFLICT DO NOTHING` that hit a conflict), so an empty slice is the
+    /// correct answer for a write that stored nothing.
+    pub(in crate::data::executor) fn columnar_stored_returning_response(
+        &self,
+        task: &ExecutionTask,
+        spec: &ReturningSpec,
+        rls_filters: &[u8],
+        schema: &nodedb_types::columnar::ColumnarSchema,
+        rows: &[Vec<nodedb_types::Value>],
+    ) -> Response {
+        let docs: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                serde_json::Value::from(super::columnar_write::row_values_to_object(schema, row))
+            })
+            .collect();
+        match build_rows_payload(spec, rls_filters, &docs) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
+    }
+}
+
 /// Project the STORED post-images of freshly written rows into a `RowsPayload`.
 ///
 /// The write paths (point insert / put / batch insert / upsert) hold the exact

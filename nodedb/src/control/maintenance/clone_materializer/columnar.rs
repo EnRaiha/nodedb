@@ -170,6 +170,10 @@ pub(super) async fn materialize_columnar_collection(
                     provenance: None,
                     wal_lsn: None,
                     rls_write_check: Vec::new(),
+                    // Internal row copy — nothing is projected back and no
+                    // caller identity's reads are being gated.
+                    returning: None,
+                    rls_filters: Vec::new(),
                 })
             };
 

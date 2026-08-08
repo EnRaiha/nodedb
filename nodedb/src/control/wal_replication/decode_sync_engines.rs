@@ -53,6 +53,10 @@ pub fn columnar_ingest(
         provenance,
         wal_lsn: None,
         rls_write_check: Vec::new(),
+        // A replicated entry reconstructs stored rows; the response shape a
+        // projection would produce belongs to the originating request only.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

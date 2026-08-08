@@ -100,6 +100,11 @@ impl CoreLoop {
                 schema_bytes,
                 provenance: None,
                 rls_write_check,
+                // A row-returning write inside a transaction is refused on the
+                // Control Plane before it reaches any sub-plan, so this path
+                // never carries a projection or the read gate that bounds one.
+                returning: None,
+                rls_filters: &[],
             },
         );
         if resp.status == Status::Error {

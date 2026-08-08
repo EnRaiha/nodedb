@@ -11,6 +11,7 @@
 
 mod common;
 
+use common::insert_returning_engines;
 use common::pgwire_harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
@@ -438,23 +439,27 @@ async fn upsert_returning_shows_the_stored_row_not_the_submitted_one() {
 /// naming the engine. Dropping the clause silently answered a statement that
 /// asked for rows with a bare command tag.
 ///
-/// The engines still without the slot are asserted here as a group, so the
-/// refusal message stays accurate as each one gains support: an engine that
-/// starts working must be moved out of this list rather than left behind
-/// claiming a limitation that no longer exists.
+/// The engines still without the slot are asserted as a GROUP, from the one
+/// shared list, so the refusal message stays accurate as each one gains
+/// support. Naming a specific engine here is what went stale twice: the
+/// assertion kept passing in isolation and only failed once the whole suite
+/// ran. Adding an engine now means moving one row in that list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn insert_returning_into_an_unsupported_engine_is_refused_by_name() {
     let server = TestServer::start().await;
-    server
-        .exec("CREATE COLLECTION ins_ret_col COLUMNS (id TEXT, v FLOAT) WITH (engine='columnar')")
-        .await
-        .expect("create columnar collection");
+    insert_returning_engines::assert_refused_engines_still_refuse(&server, "ins_ret_refused").await;
+}
 
-    server
-        .expect_error(
-            "INSERT INTO ins_ret_col (id, v) VALUES ('c1', 1.5) RETURNING *",
-            "columnar",
-        )
+/// The other half of that split: every engine the list calls supported must
+/// actually hand back its stored row.
+///
+/// Pinned beside the refusal so the two cannot drift into claiming the same
+/// thing — an engine dropped from the refusal list without gaining the clause
+/// fails here rather than passing both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_into_every_supported_engine_returns_its_row() {
+    let server = TestServer::start().await;
+    insert_returning_engines::assert_supported_engines_return_their_row(&server, "ins_ret_ok")
         .await;
 }
 

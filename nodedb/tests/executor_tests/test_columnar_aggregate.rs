@@ -33,6 +33,8 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -102,6 +104,8 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -185,6 +189,8 @@ fn columnar_insert_triggers_memtable_flush() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -235,6 +241,8 @@ fn aggregate_group_by_does_not_require_full_materialization() {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -316,6 +324,8 @@ fn insert_columnar_rows(ctx: &mut crate::helpers::TestCtx, collection: &str, cou
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

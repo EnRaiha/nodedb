@@ -51,6 +51,8 @@ impl CoreLoop {
                 provenance,
                 wal_lsn: _,
                 rls_write_check,
+                returning,
+                rls_filters,
             } => {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
@@ -67,6 +69,8 @@ impl CoreLoop {
                         schema_bytes,
                         provenance: provenance.as_ref(),
                         rls_write_check,
+                        returning: returning.as_ref(),
+                        rls_filters,
                     },
                 )
             }

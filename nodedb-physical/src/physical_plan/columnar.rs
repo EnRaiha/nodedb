@@ -11,6 +11,8 @@
 
 use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
+use crate::physical_plan::document::ReturningSpec;
+
 /// Intent carried on `ColumnarOp::Insert` — see enum docs.
 #[derive(
     Clone,
@@ -144,6 +146,22 @@ pub enum ColumnarOp {
         /// write policy restricts this identity here.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// When `Some`, return the STORED post-image of each written row
+        /// projected per spec — the row assembled from the values that reached
+        /// the engine, in schema order, so it matches what a `SELECT` on the
+        /// same key produces. Never the caller's submitted body: an `ON
+        /// CONFLICT DO UPDATE` merges against the stored row, so an echo of the
+        /// request would report a row that does not exist.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. Distinct from
+        /// `rls_write_check` above, which decides whether the write happens at
+        /// all: this one bounds what may be shown back, so a `RETURNING` row set
+        /// never exceeds a `SELECT` by the same principal. A collection can
+        /// carry a read policy and no write policy, in which case the write is
+        /// unrestricted and only the visible row set shrinks.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Update rows matching filter predicates.

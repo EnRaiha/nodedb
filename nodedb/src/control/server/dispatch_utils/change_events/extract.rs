@@ -499,6 +499,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

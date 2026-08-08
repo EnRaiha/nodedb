@@ -2509,6 +2509,8 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -2853,6 +2855,8 @@ mod tests {
                 provenance: None,
                 wal_lsn: None,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ];
 

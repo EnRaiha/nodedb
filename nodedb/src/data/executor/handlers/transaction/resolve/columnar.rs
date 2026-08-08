@@ -71,6 +71,10 @@ pub(super) fn serialize_columnar_op(
             provenance,
             wal_lsn: _,
             rls_write_check: _,
+            // The redo record carries the row image, not the response shape a
+            // projection and its read gate would have produced for one caller.
+            returning: _,
+            rls_filters: _,
         } => {
             let sub_payload = encode_columnar_batch_payload(
                 collection,

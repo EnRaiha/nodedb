@@ -411,6 +411,11 @@ impl CoreLoop {
                 provenance: _,
                 wal_lsn: _,
                 rls_write_check,
+                // A row-returning write is refused before it can be staged into
+                // a transaction, so neither the projection nor the read gate
+                // that bounds it can be set on a plan reaching this path.
+                returning: _,
+                rls_filters: _,
             } => self.execute_tx_columnar_insert(
                 dummy_task,
                 super::sub_plan_kv::TxColumnarInsertParams {

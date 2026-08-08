@@ -797,6 +797,8 @@ fn columnar_ingest_provenance_roundtrip() {
         provenance: Some(prov.clone()),
         wal_lsn: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("ColumnarIngest should produce a ReplicatedEntry");

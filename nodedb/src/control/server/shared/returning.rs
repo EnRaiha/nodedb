@@ -83,7 +83,6 @@ pub fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Err
 /// target collection, not of the SQL.
 pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Error> {
     let unsupported = match plan {
-        PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => "columnar and spatial",
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => "timeseries",
         PhysicalPlan::Vector(VectorOp::Insert { .. } | VectorOp::DirectUpsert { .. }) => "vector",
         // `INSERT ... SELECT` never reaches the Data Plane as this op: it is
@@ -117,9 +116,9 @@ pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Er
     Err(Error::BadRequest {
         detail: format!(
             "RETURNING is not supported on INSERT into {unsupported} collections; it is \
-             supported on document collections (schemaless and strict) and key-value \
-             collections, and on UPDATE, DELETE, and MERGE. Follow the insert with a SELECT on \
-             the inserted key to read the stored row."
+             supported on document collections (schemaless and strict), key-value \
+             collections, and columnar and spatial collections, and on UPDATE, DELETE, and \
+             MERGE. Follow the insert with a SELECT on the inserted key to read the stored row."
         ),
     })
 }
@@ -180,6 +179,9 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             *returning = Some(spec);
         }
         PhysicalPlan::Kv(KvOp::BatchPut { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Columnar(ColumnarOp::Insert { returning, .. }) => {
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::PointPut { returning, .. }) => {
@@ -362,6 +364,30 @@ mod tests {
     /// the caller with a command tag for a statement that asked for rows.
     #[test]
     fn an_insert_plan_with_no_returning_slot_is_refused() {
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "metrics".into(),
+            payload: Vec::new(),
+            format: "ilp".into(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+            rls_write_check: Vec::new(),
+        });
+        let detail = refuse_unplannable_insert_returning(&plan)
+            .expect_err("a timeseries ingest cannot carry the clause")
+            .to_string();
+        assert!(
+            detail.contains("timeseries") && detail.contains("document"),
+            "the refusal must name the engine and where it IS supported; got {detail}"
+        );
+    }
+
+    /// A columnar insert now carries the clause, so the same gate admits it.
+    /// This is the assertion that would fail if the columnar arm were ever
+    /// restored to the refusal while the op kept its `returning` slot — the
+    /// combination that silently drops the clause.
+    #[test]
+    fn a_columnar_insert_plan_is_admitted() {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
             collection: "metrics".into(),
             payload: Vec::new(),
@@ -373,14 +399,10 @@ mod tests {
             provenance: None,
             wal_lsn: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
-        let detail = refuse_unplannable_insert_returning(&plan)
-            .expect_err("a columnar insert cannot carry the clause")
-            .to_string();
-        assert!(
-            detail.contains("columnar") && detail.contains("document"),
-            "the refusal must name the engine and where it IS supported; got {detail}"
-        );
+        assert!(refuse_unplannable_insert_returning(&plan).is_ok());
     }
 
     /// A document insert carries the clause, so the same gate admits it.

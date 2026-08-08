@@ -5,6 +5,7 @@
 pub mod array_sync;
 pub mod cluster_harness;
 pub mod core_loop_runner;
+pub mod insert_returning_engines;
 pub mod jwks_fixture;
 pub mod native_harness;
 pub mod occ_shuffle;

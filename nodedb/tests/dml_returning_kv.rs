@@ -10,6 +10,7 @@
 
 mod common;
 
+use common::insert_returning_engines;
 use common::pgwire_harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
@@ -304,19 +305,39 @@ async fn kv_on_conflict_do_nothing_returning_ships_no_row() {
     );
 }
 
-/// The engines that cannot yet carry the clause still refuse it, by name.
+/// The engines that cannot yet carry the clause still refuse it, by name —
+/// taken from the one shared list rather than naming an engine here, because a
+/// hard-coded engine name in this file is exactly what went stale when columnar
+/// gained support.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn insert_returning_into_a_columnar_collection_is_still_refused() {
+async fn insert_returning_into_an_unsupported_engine_is_still_refused() {
+    let server = TestServer::start().await;
+    insert_returning_engines::assert_refused_engines_still_refuse(&server, "kv_ret_refused").await;
+}
+
+/// The columnar engine DOES carry the clause now, so the statement this file
+/// once used as its refusal example returns its stored row instead.
+///
+/// Kept deliberately beside the refusal above, in the same shape the key-value
+/// pair has in the document file: the two claims are about the same statement
+/// on different engines, and reading them together is what stops one from
+/// quietly contradicting the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_returning_into_a_columnar_collection_returns_its_row() {
     let server = TestServer::start().await;
     server
-        .exec("CREATE COLLECTION kv_ret_col COLUMNS (id TEXT, v FLOAT) WITH (engine='columnar')")
+        .exec(
+            "CREATE COLLECTION kv_ret_col (id TEXT PRIMARY KEY, v FLOAT) WITH (engine='columnar')",
+        )
         .await
         .expect("create columnar collection");
 
-    server
-        .expect_error(
-            "INSERT INTO kv_ret_col (id, v) VALUES ('c1', 1.5) RETURNING *",
-            "columnar",
+    assert_eq!(
+        rows(
+            &server,
+            "INSERT INTO kv_ret_col (id, v) VALUES ('c1', 1.5) RETURNING id, v"
         )
-        .await;
+        .await,
+        vec!["c1|1.5".to_string()],
+    );
 }

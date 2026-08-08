@@ -157,6 +157,10 @@ pub fn build_columnar_insert_plan(
         provenance: None,
         wal_lsn: None,
         rls_write_check: Vec::new(),
+        // A restore re-issues stored rows; no client is waiting on a
+        // projection, and there is no identity whose reads need gating.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

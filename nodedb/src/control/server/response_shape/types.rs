@@ -143,6 +143,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         })
         | PhysicalPlan::Document(DocumentOp::BatchInsert {
             returning: Some(_), ..
+        })
+        | PhysicalPlan::Columnar(ColumnarOp::Insert {
+            returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
         // DML operations that return affected row count.

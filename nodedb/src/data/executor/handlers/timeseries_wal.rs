@@ -203,6 +203,8 @@ impl CoreLoop {
                 provenance: None,
                 wal_lsn: Some(record_lsn),
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             Some(crate::types::Lsn::new(record_lsn)),
         );
@@ -222,6 +224,10 @@ impl CoreLoop {
                 schema_bytes: &[],
                 provenance: provenance.as_ref(),
                 rls_write_check: &[],
+                // WAL replay reconstructs stored state; there is no client
+                // waiting on a projection, and no identity to gate reads for.
+                returning: None,
+                rls_filters: &[],
             },
         );
         if response.status != crate::bridge::envelope::Status::Ok {
