@@ -248,6 +248,13 @@ impl CoreLoop {
             provenance: None,
             mode: TimeseriesApplyMode::CommitDeferred,
             rls_write_check,
+            // A row-returning write inside a transaction is refused on the
+            // Control Plane before it can be staged, so no plan reaching this
+            // sub-plan path carries a projection or the read gate that bounds
+            // one. Blanking them here is a statement of that invariant, not a
+            // convenience.
+            returning: None,
+            rls_filters: &[],
         });
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {

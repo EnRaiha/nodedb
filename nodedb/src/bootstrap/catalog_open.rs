@@ -27,30 +27,55 @@ pub(crate) enum CatalogForRead {
     Repaired(SystemCatalog),
 }
 
+/// Why a catalog that EXISTS could not be opened.
+///
+/// Separate from "there is no catalog", which is [`CatalogForRead::open`]
+/// returning `Ok(None)`. Collapsing the two is what made a redb lock conflict
+/// indistinguishable from a fresh data directory: both yielded `None`, every
+/// boot loader read that as "nothing to load", and cores came up with an empty
+/// schema registry that looked exactly like a first start.
+#[derive(Debug)]
+pub(crate) struct CatalogOpenFailure {
+    pub detail: String,
+}
+
+impl std::fmt::Display for CatalogOpenFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
 impl CatalogForRead {
-    /// Open `path` for reading. Returns `None` when there is no catalog yet or
-    /// it could not be opened at all — callers treat that as "nothing to load".
-    pub(crate) fn open(path: &Path) -> Option<Self> {
+    /// Open `path` for reading.
+    ///
+    /// - `Ok(None)` — no catalog exists yet. A legitimate fresh start; a caller
+    ///   may safely treat it as "nothing to load".
+    /// - `Err(_)` — a catalog exists and could not be read: locked by another
+    ///   handle in this process, corrupt, or unreadable. NOT a fresh start, and
+    ///   a caller that degrades to empty here degrades silently on a real fault.
+    ///
+    /// The distinction is the point. redb is single-writer, so a second open
+    /// while another handle is alive fails — and a boot loader that cannot tell
+    /// that from an absent catalog seeds nothing and reports success.
+    pub(crate) fn open(path: &Path) -> Result<Option<Self>, CatalogOpenFailure> {
         match ReadOnlySystemCatalog::open(path) {
-            Ok(Some(catalog)) => Some(Self::ReadOnly(catalog)),
-            Ok(None) => None,
+            Ok(Some(catalog)) => Ok(Some(Self::ReadOnly(catalog))),
+            Ok(None) => Ok(None),
             Err(ReadOnlyOpenError::RepairRequired) => {
                 warn!(
                     path = %path.display(),
                     "catalog was not shut down cleanly; opening read-write to repair it"
                 );
                 match SystemCatalog::open(path) {
-                    Ok(catalog) => Some(Self::Repaired(catalog)),
-                    Err(error) => {
-                        warn!(error = %error, "failed to open catalog for repair");
-                        None
-                    }
+                    Ok(catalog) => Ok(Some(Self::Repaired(catalog))),
+                    Err(error) => Err(CatalogOpenFailure {
+                        detail: format!("failed to open catalog for repair: {error}"),
+                    }),
                 }
             }
-            Err(error) => {
-                warn!(error = %error, "failed to open catalog read-only");
-                None
-            }
+            Err(error) => Err(CatalogOpenFailure {
+                detail: format!("failed to open catalog read-only: {error}"),
+            }),
         }
     }
 

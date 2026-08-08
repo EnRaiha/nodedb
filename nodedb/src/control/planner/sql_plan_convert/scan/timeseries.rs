@@ -127,6 +127,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
             surrogates,
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

@@ -9,6 +9,7 @@ pub mod flush;
 pub mod ingest;
 mod ingest_dispatch;
 pub mod ingest_formats;
+mod ingest_schema;
 mod msgpack_decode;
 pub mod paths;
 pub mod raw_scan;

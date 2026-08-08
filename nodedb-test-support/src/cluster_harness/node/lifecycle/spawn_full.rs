@@ -248,6 +248,13 @@ impl TestClusterNode {
                     replay,
                     graph_tuning: graph_tuning.clone(),
                     query_tuning: query_tuning.clone(),
+                    // Seeded from the SAME durable catalog production reads, so a
+                    // harness restart reconstructs cores the way a real one does.
+                    // An empty catalog yields an empty seed, which is exactly what
+                    // production gets booting a fresh data dir.
+                    doc_config_seed: nodedb::bootstrap::data_plane::load_doc_config_registry_from(
+                        shared.credentials.catalog(),
+                    ),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

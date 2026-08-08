@@ -197,6 +197,8 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
             // Catch-up re-applies a record the policy already decided when it
             // was written, and the writing identity is gone by now.
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         // Dispatch to Data Plane — do NOT re-append to WAL (already there).

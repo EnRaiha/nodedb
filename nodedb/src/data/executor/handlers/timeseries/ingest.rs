@@ -26,25 +26,6 @@ use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
 use super::rls_gate;
 
 impl CoreLoop {
-    /// Schema for a collection's very first memtable.
-    ///
-    /// A collection created through DDL declares its columns and its
-    /// `TIME_KEY`; that declaration is the schema, so the time key keeps its
-    /// name and position and every declared column exists from the first row
-    /// on. Only a collection with no declaration — raw ILP protocol ingest
-    /// into a measurement that was never created — falls back to inferring a
-    /// shape from the batch itself.
-    fn initial_ts_schema(
-        &self,
-        task: &crate::data::executor::task::ExecutionTask,
-        tid: crate::types::TenantId,
-        collection: &str,
-        lines: &[ilp::IlpLine<'_>],
-    ) -> crate::engine::timeseries::columnar_memtable::ColumnarSchema {
-        self.declared_ts_memtable_schema(task.request.database_id, tid, collection)
-            .unwrap_or_else(|| ilp_ingest::infer_schema(lines))
-    }
-
     /// Check every condition that could reject a commit-deferred ILP ingest
     /// before it is allowed to cast a Calvin commit vote. The simulation is
     /// deliberately isolated from live state: schema evolution and dictionary
@@ -133,6 +114,8 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
+            returning,
+            rls_filters,
         } = params;
         let key = (task.request.database_id, tid, collection.to_string());
         let input = match std::str::from_utf8(payload) {
@@ -293,8 +276,17 @@ impl CoreLoop {
         };
         let lvc = self.ts_last_value_caches.get_mut(&key);
         let catalog = self.ts_series_catalogs.entry(key.clone()).or_default();
-        let (accepted, rejected) =
-            ilp_ingest::ingest_batch_with_lvc(mt, &lines, catalog, now_ms, lvc, stamps);
+        let outcome = ilp_ingest::ingest_batch_with_lvc(ilp_ingest::IngestBatchArgs {
+            memtable: mt,
+            lines: &lines,
+            catalog,
+            default_timestamp_ms: now_ms,
+            lvc,
+            bitemporal: stamps,
+            collect_row_indices: returning.is_some(),
+        });
+        let accepted = outcome.accepted;
+        let rejected = outcome.rejected;
 
         if rejected > 0 {
             tracing::warn!(
@@ -304,6 +296,47 @@ impl CoreLoop {
                 "ILP batch rows rejected as invalid rows"
             );
         }
+
+        // A rejected row is a FAILURE, not a requested skip, and the two answer
+        // shapes report it differently: the count response below carries
+        // `rejected`, so a client can see rows were dropped, but a `RETURNING`
+        // response is a row set with nowhere to put that number — a short row
+        // set is indistinguishable from a complete one. Rather than tell the
+        // client less than the truth, a projecting ingest fails outright and
+        // names the count and the first reason. The non-projecting path keeps
+        // its counts unchanged because it already reports them honestly.
+        if returning.is_some() && rejected > 0 {
+            let reason = outcome
+                .first_rejection
+                .unwrap_or_else(|| "no reason recorded".to_string());
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "timeseries ingest with RETURNING rejected {rejected} of {} rows and \
+                         cannot report them alongside a row set; first rejection: {reason}",
+                        accepted + rejected
+                    ),
+                },
+            );
+        }
+
+        // Read the stored rows back through the ORDINARY scan projection, at
+        // the indices they landed at, before any flush below can drain the
+        // memtable out from under those indices. Reusing `emit_memtable_row`
+        // is what makes `RETURNING` agree with `SELECT` by construction: a
+        // missing float field is stored as NaN and both paths render it as SQL
+        // NULL, which a hand-written projection over the ingest values would
+        // have printed as "NaN".
+        let returned_rows: Vec<rmpv::Value> = match returning {
+            Some(_) => match self.columnar_memtables.get(&key) {
+                Some(mt) => {
+                    super::raw_scan::emit_memtable_rows_at(mt, &outcome.accepted_row_indices)
+                }
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
 
         if accepted > 0
             && let Some(lsn) = wal_lsn
@@ -342,6 +375,19 @@ impl CoreLoop {
             self.checkpoint_coordinator
                 .mark_dirty("timeseries", accepted);
             self.recharge_ts_memtable_budget(tid, task.request.database_id, collection);
+        }
+
+        // Answered only once every flush above has succeeded, so a statement
+        // that fails after the rows landed reports the failure rather than a
+        // row set. The rows themselves were captured before those flushes,
+        // because a flush drains the memtable and invalidates the indices.
+        if let Some(spec) = returning {
+            return self.timeseries_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &returned_rows,
+            );
         }
 
         let include_schema = is_new_memtable || schema_changed;

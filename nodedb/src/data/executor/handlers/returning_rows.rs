@@ -134,6 +134,70 @@ impl CoreLoop {
     }
 }
 
+impl CoreLoop {
+    /// Build a timeseries ingest's `RETURNING` response from the points it stored.
+    ///
+    /// `rows` are already the output of the ordinary memtable scan projection —
+    /// see `raw_scan::emit_memtable_rows_at` — so a stored point renders here
+    /// exactly as `SELECT` renders it, `NaN`-as-NULL included. This function
+    /// only re-keys that row into the shape `build_rows_payload` reads; it makes
+    /// no per-cell decisions of its own, which is the entire reason the read-back
+    /// happens upstream rather than here.
+    pub(in crate::data::executor) fn timeseries_stored_returning_response(
+        &self,
+        task: &ExecutionTask,
+        spec: &ReturningSpec,
+        rls_filters: &[u8],
+        rows: &[rmpv::Value],
+    ) -> Response {
+        let docs: Vec<serde_json::Value> = rows.iter().map(rmpv_row_to_json).collect();
+        match build_rows_payload(spec, rls_filters, &docs) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
+    }
+}
+
+/// Re-key one scan-projected timeseries row into JSON for `build_rows_payload`.
+///
+/// A straight transcode: msgpack nil stays SQL NULL, and no value is
+/// reinterpreted. Anything cleverer here would be a second shaper.
+fn rmpv_row_to_json(row: &rmpv::Value) -> serde_json::Value {
+    let rmpv::Value::Map(fields) = row else {
+        return serde_json::Value::Null;
+    };
+    let mut obj = serde_json::Map::with_capacity(fields.len());
+    for (key, value) in fields {
+        let Some(name) = key.as_str() else { continue };
+        let cell = match value {
+            rmpv::Value::Nil => serde_json::Value::Null,
+            rmpv::Value::Boolean(b) => serde_json::Value::Bool(*b),
+            rmpv::Value::Integer(n) => n
+                .as_i64()
+                .map(|i| serde_json::Value::Number(i.into()))
+                .unwrap_or(serde_json::Value::Null),
+            rmpv::Value::F64(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            rmpv::Value::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            rmpv::Value::String(s) => s
+                .as_str()
+                .map(|text| serde_json::Value::String(text.to_string()))
+                .unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::Null,
+        };
+        obj.insert(name.to_string(), cell);
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Project the STORED post-images of freshly written rows into a `RowsPayload`.
 ///
 /// The write paths (point insert / put / batch insert / upsert) hold the exact

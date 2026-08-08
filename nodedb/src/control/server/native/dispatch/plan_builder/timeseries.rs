@@ -62,5 +62,7 @@ pub(crate) fn build_ingest(fields: &TextFields, collection: &str) -> crate::Resu
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }

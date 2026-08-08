@@ -76,6 +76,8 @@ pub fn timeseries_ingest(
         surrogates: surrogates.iter().copied().map(Surrogate::new).collect(),
         provenance,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

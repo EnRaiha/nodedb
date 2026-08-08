@@ -1402,6 +1402,8 @@ mod tests {
                 surrogates: Vec::new(),
                 provenance: None,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Spatial(SpatialOp::Insert {
                 collection: "c".into(),

@@ -146,6 +146,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         })
         | PhysicalPlan::Columnar(ColumnarOp::Insert {
             returning: Some(_), ..
+        })
+        | PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
         // DML operations that return affected row count.

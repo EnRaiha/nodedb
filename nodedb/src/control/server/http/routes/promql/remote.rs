@@ -112,6 +112,12 @@ pub async fn remote_write(
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            // Prometheus remote-write answers with an HTTP status, never rows,
+            // for the same reason the line-protocol listener does. `inject_rls`
+            // still runs over this task, so the read filter it fills in is
+            // simply never consulted.
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let mut task = PhysicalTask {

@@ -136,6 +136,8 @@ impl CoreLoop {
                 surrogates: Vec::new(),
                 provenance: provenance.clone(),
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             Some(crate::types::Lsn::new(record_lsn)),
         );
@@ -153,6 +155,12 @@ impl CoreLoop {
             // resolve `$auth.*` against. A refused write never reaches replay:
             // its record is cancelled before the refusal is acknowledged.
             rls_write_check: &[],
+            // Replay rebuilds stored state at boot; there is no client waiting
+            // on a row set, and no identity whose reads would need gating. The
+            // projection belongs to the originating request, which was answered
+            // before the process restarted.
+            returning: None,
+            rls_filters: &[],
         });
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(

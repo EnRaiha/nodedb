@@ -283,6 +283,8 @@ mod tests {
             surrogates: vec![],
             provenance: None,
             rls_write_check: vec![],
+            returning: None,
+            rls_filters: vec![],
         });
 
         // No credentials => no WAL bypass; the ingest must produce a record.

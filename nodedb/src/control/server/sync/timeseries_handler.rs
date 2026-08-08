@@ -117,6 +117,8 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             // where they were written; the writing device's session is not
             // present here to resolve `$auth.*` against.
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let authorized = super::raft_dispatch::authorize_sync_task(

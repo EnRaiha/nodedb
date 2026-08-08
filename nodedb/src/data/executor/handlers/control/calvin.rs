@@ -575,6 +575,8 @@ mod tests {
             surrogates: tokens.into_iter().map(Surrogate::new).collect(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -818,6 +820,8 @@ mod tests {
             surrogates: vec![Surrogate::new(1)],
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let failed = core.execute_calvin_execute_static(
             &task,

@@ -506,6 +506,8 @@ fn rollback_matrix_timeseries_then_doc_fail() {
                     surrogates: Vec::new(),
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],
@@ -594,6 +596,8 @@ fn rollback_matrix_timeseries_count_after_rollback() {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -616,6 +620,8 @@ fn rollback_matrix_timeseries_count_after_rollback() {
                     surrogates: Vec::new(),
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 doc_insert_conflict("conflict_coll"),
             ],

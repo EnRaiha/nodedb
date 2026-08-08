@@ -55,6 +55,8 @@ impl CoreLoop {
                 surrogates: _,
                 provenance,
                 rls_write_check,
+                returning,
+                rls_filters,
             } => self.execute_timeseries_ingest(TimeseriesIngestExec {
                 task,
                 tid: task.request.tenant_id,
@@ -75,6 +77,8 @@ impl CoreLoop {
                 provenance: provenance.as_ref(),
                 mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
                 rls_write_check,
+                returning: returning.as_ref(),
+                rls_filters,
             }),
         }
     }
@@ -137,6 +141,8 @@ mod tests {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         ExecutionTask::new(Request {
             request_id: RequestId::new(1),

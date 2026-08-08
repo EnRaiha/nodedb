@@ -108,8 +108,19 @@ fn load_tombstones(
     let catalog_path = config.catalog_path();
     let mut set = nodedb_wal::extract_tombstones(wal_records)
         .map_err(|error| anyhow::anyhow!("extract WAL tombstones: {error}"))?;
-    let Some(catalog) = crate::bootstrap::catalog_open::CatalogForRead::open(&catalog_path) else {
-        return Ok(set);
+    let catalog = match crate::bootstrap::catalog_open::CatalogForRead::open(&catalog_path) {
+        Ok(Some(catalog)) => catalog,
+        // No catalog yet: a genuine fresh start, so the WAL's own tombstones
+        // are the whole truth.
+        Ok(None) => return Ok(set),
+        // A catalog exists and could not be read. Dropping the PERSISTED
+        // tombstones here would resurrect deleted rows on replay, so this is a
+        // hard failure rather than a quiet degradation.
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "catalog exists but could not be opened to load persisted WAL tombstones: {error}"
+            ));
+        }
     };
     let persisted = catalog
         .load_wal_tombstones()

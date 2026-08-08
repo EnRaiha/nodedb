@@ -487,6 +487,8 @@ mod tests {
                     surrogates: Vec::new(),
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                 priority: Priority::Normal,
@@ -588,6 +590,8 @@ mod tests {
             provenance: None,
             mode: TimeseriesApplyMode::Immediate,
             rls_write_check: &[],
+            returning: None,
+            rls_filters: &[],
         });
         assert_ne!(response.status, crate::bridge::envelope::Status::Error);
 

@@ -2573,6 +2573,8 @@ mod tests {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -2630,6 +2632,8 @@ mod tests {
             surrogates: vec![Surrogate::new(701)],
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
 
         let redo = decode_redo(&src.execute_resolve_txn(&task, TID, txn, &[plan]));

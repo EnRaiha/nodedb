@@ -1162,6 +1162,8 @@ mod tests {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let info = PlanMeteringInfo::extract(&plan);
         assert_eq!(info.collection.as_deref(), Some("cpu"));

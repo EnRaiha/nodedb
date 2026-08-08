@@ -145,6 +145,11 @@ pub(super) fn serialize_timeseries_op(
             surrogates: _,
             provenance,
             rls_write_check: _,
+            // The redo record carries the ingested payload, not the response
+            // shape a projection and its read gate would have produced for one
+            // caller. Replay reconstructs stored state; nobody is waiting on it.
+            returning: _,
+            rls_filters: _,
         } => {
             let sub_payload = encode_timeseries_batch_payload_with_format(
                 collection,

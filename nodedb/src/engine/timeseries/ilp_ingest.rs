@@ -24,6 +24,38 @@ pub struct BitempStamps {
     pub system_ms: i64,
 }
 
+/// What an ILP batch ingest produced.
+///
+/// The row indices are reported alongside the counts, not derived from them,
+/// because only this loop knows which lines actually landed: a rejected line
+/// advances `rejected` and appends nothing, so position in the input is not
+/// position in the memtable.
+pub struct IngestBatchOutcome {
+    pub accepted: usize,
+    pub rejected: usize,
+    /// Why the FIRST rejected row was rejected. Kept so a caller that cannot
+    /// tolerate a partial batch can say what went wrong rather than only how
+    /// many rows vanished.
+    pub first_rejection: Option<String>,
+    /// Memtable row index of each accepted row, in insert order. Empty unless
+    /// the caller asked for it — a large batch would otherwise pay a `usize`
+    /// per row for something almost every ingest discards.
+    pub accepted_row_indices: Vec<usize>,
+}
+
+/// Inputs to [`ingest_batch_with_lvc`].
+pub struct IngestBatchArgs<'a, 'l> {
+    pub memtable: &'a mut ColumnarMemtable,
+    pub lines: &'a [IlpLine<'l>],
+    pub catalog: &'a mut SeriesCatalog,
+    pub default_timestamp_ms: i64,
+    pub lvc: Option<&'a mut super::last_value_cache::LastValueCache>,
+    pub bitemporal: Option<BitempStamps>,
+    /// Record where each accepted row landed, so the caller can read those
+    /// exact rows back through the ordinary scan projection.
+    pub collect_row_indices: bool,
+}
+
 /// Ingest a batch of parsed ILP lines into a columnar memtable.
 ///
 /// The memtable's schema must already be set. Tag/field values are mapped
@@ -36,7 +68,16 @@ pub fn ingest_batch(
     catalog: &mut SeriesCatalog,
     default_timestamp_ms: i64,
 ) -> (usize, usize) {
-    ingest_batch_with_lvc(memtable, lines, catalog, default_timestamp_ms, None, None)
+    let outcome = ingest_batch_with_lvc(IngestBatchArgs {
+        memtable,
+        lines,
+        catalog,
+        default_timestamp_ms,
+        lvc: None,
+        bitemporal: None,
+        collect_row_indices: false,
+    });
+    (outcome.accepted, outcome.rejected)
 }
 
 /// Ingest a batch of ILP lines with optional last-value cache update.
@@ -45,17 +86,21 @@ pub fn ingest_batch(
 /// `system_ms` for the `_ts_system` reserved column. `_ts_valid_from` /
 /// `_ts_valid_until` are pulled from the line's field set when present,
 /// defaulting to the open interval `[i64::MIN, i64::MAX)`.
-pub fn ingest_batch_with_lvc(
-    memtable: &mut ColumnarMemtable,
-    lines: &[IlpLine<'_>],
-    catalog: &mut SeriesCatalog,
-    default_timestamp_ms: i64,
-    mut lvc: Option<&mut super::last_value_cache::LastValueCache>,
-    bitemporal: Option<BitempStamps>,
-) -> (usize, usize) {
+pub fn ingest_batch_with_lvc(args: IngestBatchArgs<'_, '_>) -> IngestBatchOutcome {
+    let IngestBatchArgs {
+        memtable,
+        lines,
+        catalog,
+        default_timestamp_ms,
+        mut lvc,
+        bitemporal,
+        collect_row_indices,
+    } = args;
     let schema = memtable.schema().clone();
     let mut accepted = 0;
     let mut rejected = 0;
+    let mut first_rejection: Option<String> = None;
+    let mut accepted_row_indices: Vec<usize> = Vec::new();
 
     for line in lines {
         // Build SeriesKey from measurement + tags.
@@ -136,10 +181,23 @@ pub fn ingest_batch_with_lvc(
             }
         }
 
+        // `ingest_row` appends at the tail of every column and rolls the
+        // partial row back on error, so the row this call lands at is exactly
+        // the row count observed before it. Read before the call, because the
+        // count has already moved by the time it returns.
+        let landing_index = memtable.row_count() as usize;
         match memtable.ingest_row(series_id, &values) {
-            Ok(IngestResult::Rejected) => rejected += 1,
+            Ok(IngestResult::Rejected) => {
+                rejected += 1;
+                first_rejection.get_or_insert_with(|| {
+                    "memtable rejected the row: memory budget exhausted".to_string()
+                });
+            }
             Ok(_) => {
                 accepted += 1;
+                if collect_row_indices {
+                    accepted_row_indices.push(landing_index);
+                }
                 // Update last-value cache with the first float64 field value.
                 if let Some(ref mut cache) = lvc {
                     let value = values
@@ -152,11 +210,23 @@ pub fn ingest_batch_with_lvc(
                     cache.update(series_id, ts_ms, value);
                 }
             }
-            Err(_) => rejected += 1,
+            Err(error) => {
+                rejected += 1;
+                // The engine's own message names the column and the rule it
+                // broke ("type mismatch at column N", "tag cardinality limit
+                // exceeded for column 'x'"). Keeping it is what lets a caller
+                // report why a row was dropped instead of only that one was.
+                first_rejection.get_or_insert_with(|| error.to_string());
+            }
         }
     }
 
-    (accepted, rejected)
+    IngestBatchOutcome {
+        accepted,
+        rejected,
+        first_rejection,
+        accepted_row_indices,
+    }
 }
 
 /// Read a non-designated timestamp column's value from the line's field set.
@@ -313,9 +383,21 @@ mod tests {
         let mut mt = ColumnarMemtable::new(schema, default_config());
         let mut catalog = SeriesCatalog::new();
         let stamps = Some(BitempStamps { system_ms: 5_000 });
-        let (accepted, rejected) =
-            ingest_batch_with_lvc(&mut mt, &lines, &mut catalog, 0, None, stamps);
-        assert_eq!((accepted, rejected), (1, 0));
+        let outcome = ingest_batch_with_lvc(IngestBatchArgs {
+            memtable: &mut mt,
+            lines: &lines,
+            catalog: &mut catalog,
+            default_timestamp_ms: 0,
+            lvc: None,
+            bitemporal: stamps,
+            collect_row_indices: true,
+        });
+        assert_eq!((outcome.accepted, outcome.rejected), (1, 0));
+        assert_eq!(
+            outcome.accepted_row_indices,
+            vec![0],
+            "the single accepted row must be reported at memtable row 0"
+        );
 
         // Inspect the memtable row to verify the three reserved slots
         // carry the expected stamps.
@@ -468,5 +550,58 @@ mod tests {
         } else {
             panic!("expected Symbol column data for qname");
         }
+    }
+
+    /// A rejected row reports WHY, not just that it happened.
+    ///
+    /// The reason is what lets a caller that cannot tolerate a partial batch —
+    /// a projecting ingest, whose row set has nowhere to carry a `rejected`
+    /// count — fail with something actionable instead of silently returning
+    /// fewer rows than were submitted.
+    #[test]
+    fn a_rejected_row_records_its_reason_and_is_not_counted_as_accepted() {
+        // One tag value, and a dictionary that admits none of them: the
+        // cardinality ceiling is the reachable rejection that does not depend
+        // on a malformed line.
+        let input = "cpu,host=a value=1.0 1000000000\n";
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
+        let schema = infer_schema(&lines);
+        let mut mt = ColumnarMemtable::new(
+            schema,
+            ColumnarMemtableConfig {
+                max_memory_bytes: 10 * 1024 * 1024,
+                hard_memory_limit: 20 * 1024 * 1024,
+                max_tag_cardinality: 0,
+            },
+        );
+        let mut catalog = SeriesCatalog::new();
+
+        let outcome = ingest_batch_with_lvc(IngestBatchArgs {
+            memtable: &mut mt,
+            lines: &lines,
+            catalog: &mut catalog,
+            default_timestamp_ms: 0,
+            lvc: None,
+            bitemporal: None,
+            collect_row_indices: true,
+        });
+
+        assert_eq!(
+            (outcome.accepted, outcome.rejected),
+            (0, 1),
+            "the row must be rejected, not quietly accepted"
+        );
+        assert!(
+            outcome.accepted_row_indices.is_empty(),
+            "a rejected row must not be reported as stored: {:?}",
+            outcome.accepted_row_indices
+        );
+        let reason = outcome
+            .first_rejection
+            .expect("a rejection must carry its reason");
+        assert!(
+            reason.contains("cardinality"),
+            "the reason must name the rule that was broken; got {reason}"
+        );
     }
 }

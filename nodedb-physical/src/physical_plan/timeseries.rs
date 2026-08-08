@@ -4,6 +4,8 @@
 
 use nodedb_types::{Surrogate, SystemTimeScope};
 
+use crate::physical_plan::document::ReturningSpec;
+
 /// An unconstrained `(min_ts_ms, max_ts_ms)` envelope.
 ///
 /// The Control Plane always plans a timeseries scan unbounded: narrowing it
@@ -105,5 +107,23 @@ pub enum TimeseriesOp {
         /// here.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// When `Some`, return the STORED post-image of each ingested point —
+        /// the row as it exists after time-key normalization, tag/field
+        /// splitting and schema resolution, read back through the ordinary scan
+        /// projection so it matches what `SELECT` shows. Never the submitted
+        /// line: every format is rewritten into ILP before a point is built, so
+        /// echoing the request would report values the collection does not hold.
+        ///
+        /// A batch that rejects any row FAILS when this is set, rather than
+        /// answering with a short row set: the count response has a `rejected`
+        /// field to report the loss and a row set has nowhere to put it.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits. Distinct from
+        /// `rls_write_check` above, which decides whether the write happens at
+        /// all: this bounds what may be shown back, so a `RETURNING` row set
+        /// never exceeds a `SELECT` by the same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 }

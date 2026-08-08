@@ -857,6 +857,8 @@ fn timeseries_ingest_provenance_roundtrip() {
         surrogates: vec![nodedb_types::Surrogate::new(99)],
         provenance: Some(prov.clone()),
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("TimeseriesIngest should produce a ReplicatedEntry");

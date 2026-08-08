@@ -137,6 +137,8 @@ mod tests {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 
@@ -263,6 +265,8 @@ mod tests {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert!(
             inject(&mut plan, &store).is_ok(),
@@ -350,11 +354,24 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
         // belongs at the one point every format funnels through, after
         // normalization — where it also still fails the whole batch before any
         // row reaches the memtable.
+        // The read filter is independent of that write predicate. A `RETURNING`
+        // clause on an ingest ships rows back, and that output is a read, so a
+        // row a read-only policy hides must not become visible just because the
+        // statement wrote it. A collection can carry a `FOR SELECT` policy and
+        // no write policy at all, in which case the ingest is unrestricted and
+        // only the returned row set shrinks. The raw ILP listener and the
+        // Prometheus remote-write endpoint reach this arm too — both run
+        // `inject_rls` over their tasks — and both carry no projection, so the
+        // filter they receive is simply never consulted.
         TimeseriesOp::Ingest {
             collection,
             rls_write_check,
+            rls_filters,
             ..
-        } => ctx.set_write_check(collection, rls_write_check),
+        } => {
+            ctx.set_write_check(collection, rls_write_check)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
     }
 }
 

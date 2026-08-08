@@ -94,6 +94,8 @@ pub(crate) fn build_point_put(
                 surrogates: Vec::new(),
                 provenance: None,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }))
         }
         Some(CollectionType::Columnar(_)) => Err(crate::Error::BadRequest {

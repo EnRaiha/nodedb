@@ -174,6 +174,8 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: "metrics".into(),
@@ -183,6 +185,8 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     ];
 
@@ -256,6 +260,8 @@ fn transactional_timeseries_flush_uses_the_enclosing_wal_lsn() {
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     })];
 
     let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);

@@ -49,23 +49,14 @@ pub struct SupportedEngine {
 ///
 /// Move a row from here to [`SUPPORTED`] in the same change that gives its op
 /// a `returning` slot — never separately.
-pub const REFUSED: &[RefusedEngine] = &[
-    RefusedEngine {
-        engine: "timeseries",
-        named_in_refusal: "timeseries",
-        ddl: "CREATE COLLECTION {c} (ts TIMESTAMP TIME_KEY, v FLOAT) \
-              WITH (engine='timeseries')",
-        insert_returning: "INSERT INTO {c} (ts, v) VALUES (1000, 1.5) RETURNING *",
-    },
-    RefusedEngine {
-        engine: "vector-primary",
-        named_in_refusal: "vector",
-        ddl: "CREATE COLLECTION {c} (id STRING PRIMARY KEY, vec VECTOR(3)) \
+pub const REFUSED: &[RefusedEngine] = &[RefusedEngine {
+    engine: "vector-primary",
+    named_in_refusal: "vector",
+    ddl: "CREATE COLLECTION {c} (id STRING PRIMARY KEY, vec VECTOR(3)) \
               WITH (engine='vector', primary='vector', vector_field='vec', dim=3)",
-        insert_returning: "INSERT INTO {c} (id, vec) VALUES ('v1', ARRAY[1.0, 0.0, 0.0]) \
+    insert_returning: "INSERT INTO {c} (id, vec) VALUES ('v1', ARRAY[1.0, 0.0, 0.0]) \
                            RETURNING *",
-    },
-];
+}];
 
 /// Engines that carry `INSERT ... RETURNING` today.
 pub const SUPPORTED: &[SupportedEngine] = &[
@@ -107,6 +98,14 @@ pub const SUPPORTED: &[SupportedEngine] = &[
                            RETURNING id, name",
         probe_column: "id",
         expected: "p1",
+    },
+    SupportedEngine {
+        engine: "timeseries",
+        ddl: "CREATE COLLECTION {c} (ts TIMESTAMP TIME_KEY, v FLOAT) \
+              WITH (engine='timeseries')",
+        insert_returning: "INSERT INTO {c} (ts, v) VALUES (1000, 1.5) RETURNING ts, v",
+        probe_column: "v",
+        expected: "1.5",
     },
 ];
 

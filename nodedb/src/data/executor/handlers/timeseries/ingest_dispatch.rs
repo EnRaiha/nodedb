@@ -2,6 +2,7 @@
 
 //! Timeseries ingest dispatch and side-effect mode types.
 
+use nodedb_physical::physical_plan::document::ReturningSpec;
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
@@ -30,6 +31,14 @@ pub(in crate::data::executor) struct TimeseriesIngestExec<'a> {
     /// Compiled row-level-security WRITE predicate carried by the plan; empty
     /// when no policy restricts this identity on the collection.
     pub rls_write_check: &'a [u8],
+    /// Projection for a `RETURNING` clause, when the statement carried one.
+    /// The ILP listener and Prometheus remote-write build this op directly with
+    /// no SQL statement behind them, so they leave it `None`.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Compiled row-level-security READ predicate gating the rows `returning`
+    /// emits — a separate gate from `rls_write_check`, which decides whether
+    /// the write happens at all.
+    pub rls_filters: &'a [u8],
 }
 
 /// Borrowed inputs shared by every timeseries payload decoder.
@@ -45,6 +54,13 @@ pub(in crate::data::executor) struct TimeseriesIngestParams<'a> {
     /// parsed row in `execute_ilp_ingest` — the one point every payload format
     /// funnels through.
     pub rls_write_check: &'a [u8],
+    /// Carried through the format decoders unchanged so the projection is
+    /// resolved in `execute_ilp_ingest`, on the far side of every format's
+    /// normalization into ILP. Projecting in a decoder instead would report the
+    /// submitted values rather than the stored point.
+    pub returning: Option<&'a ReturningSpec>,
+    /// Read gate for the rows `returning` emits. See `TimeseriesIngestExec`.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -81,6 +97,8 @@ impl CoreLoop {
             provenance,
             mode,
             rls_write_check,
+            returning,
+            rls_filters,
         } = args;
         if let Some(prov) = provenance {
             let admit = self.sync_admit(prov);
@@ -139,6 +157,15 @@ impl CoreLoop {
                 let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
                 return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
             }
+            // This record was already ingested and flushed, so nothing was
+            // written now and there is no row to hand back. A projecting
+            // statement still owes the client a ROW SET, not the count payload
+            // below — the response shaper decodes the two differently, and
+            // handing it the wrong one would surface as a decode failure rather
+            // than as the empty result this actually is.
+            if let Some(spec) = returning {
+                return self.timeseries_stored_returning_response(task, spec, rls_filters, &[]);
+            }
             let result = serde_json::json!({
                 "accepted": 0,
                 "rejected": 0,
@@ -182,6 +209,8 @@ impl CoreLoop {
                 now_ms,
                 mode,
                 rls_write_check,
+                returning,
+                rls_filters,
             }),
             "ilp-msgpack" => self.execute_ilp_msgpack_ingest(TimeseriesIngestParams {
                 task,
@@ -192,6 +221,8 @@ impl CoreLoop {
                 now_ms,
                 mode,
                 rls_write_check,
+                returning,
+                rls_filters,
             }),
             "json" => self.execute_json_ingest(TimeseriesIngestParams {
                 task,
@@ -202,6 +233,8 @@ impl CoreLoop {
                 now_ms,
                 mode,
                 rls_write_check,
+                returning,
+                rls_filters,
             }),
             "msgpack" => self.execute_msgpack_ingest(TimeseriesIngestParams {
                 task,
@@ -212,6 +245,8 @@ impl CoreLoop {
                 now_ms,
                 mode,
                 rls_write_check,
+                returning,
+                rls_filters,
             }),
             _ => {
                 return self.response_error(

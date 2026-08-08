@@ -33,6 +33,8 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -92,6 +94,8 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 

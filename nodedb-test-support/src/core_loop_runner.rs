@@ -89,6 +89,16 @@ pub struct CoreLoopSpawn {
     /// unless a test overrides e.g. `columnar_flush_threshold` to drive flush
     /// on a small dataset.
     pub query_tuning: nodedb_types::config::tuning::QueryTuning,
+    /// Catalog-sourced `doc_configs` seed, applied BEFORE WAL replay exactly as
+    /// production's `seed_catalog_state` does.
+    ///
+    /// Without it a replayed collection has no declared schema to resolve, so
+    /// every engine that consults `doc_configs` during replay falls back to
+    /// inference: strict documents re-persist as raw MessagePack, and a
+    /// timeseries collection's declared `TIME_KEY` is renamed to the inferred
+    /// `timestamp`. That made every restart test here quietly weaker than it
+    /// looked — none of them exercised the seeded path production always takes.
+    pub doc_config_seed: Vec<nodedb::data::executor::core_loop::DocConfigSeedEntry>,
     /// Stop signal for the tick loop. Sender lives in the harness shutdown path.
     pub stop_rx: std::sync::mpsc::Receiver<()>,
 }
@@ -110,6 +120,7 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
         replay,
         graph_tuning,
         query_tuning,
+        doc_config_seed,
         stop_rx,
     } = spawn;
 
@@ -136,6 +147,10 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 if let Some(g) = governor {
                     core.set_governor(g);
                 }
+                // Before replay, never after: replay is what consults
+                // `doc_configs`, and production seeds it in the same order
+                // (`seed_catalog_state` -> `replay_wal_and_rebuild_indexes`).
+                core.seed_doc_configs(&doc_config_seed);
                 if let Some(WalReplay {
                     records,
                     tombstones,

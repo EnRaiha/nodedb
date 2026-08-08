@@ -62,6 +62,29 @@ impl ColumnarSegmentWriter {
         let mut column_stats = HashMap::new();
         let mut resolved_codecs = Vec::with_capacity(view.schema.columns.len());
 
+        // Column FILES are named from the memtable's schema, and the partition
+        // records that same schema as its own — so a partition inherits whatever
+        // column names the memtable was built with, permanently. Nothing here
+        // re-derives them from the collection's declaration at read time.
+        //
+        // That is only sound because a memtable is always built from the
+        // DECLARED schema: `initial_ts_schema` resolves it from `doc_configs`,
+        // which the boot path seeds from the durable catalog BEFORE WAL replay
+        // (`seed_catalog_state` -> `replay_wal_and_rebuild_indexes`). For a
+        // declared collection to reach the inference fallback and flush a
+        // partition under inferred names — `timestamp.col` instead of the
+        // declared TIME_KEY — the seed would have to arrive empty, which needs
+        // one of: the catalog unreadable at boot (now an error rather than a
+        // silent empty seed, see `CatalogForRead::open`), a core spawned
+        // without `doc_config_seed`, or the collection missing from the
+        // catalog. All three are boot-integrity failures, not steady state.
+        //
+        // If that ever regresses, the damage is durable and silent: those
+        // partitions keep projecting under the inferred name after the
+        // regression is fixed, because each partition is read against its own
+        // stored schema. The repair would be a rename at partition load keyed
+        // on `schema.timestamp_idx` — the time column's identity is positional,
+        // so the mapping is unambiguous and needs no rewrite.
         for (i, (col_name, col_type)) in view.schema.columns.iter().enumerate() {
             let col_data = &view.columns[i];
             let requested_codec = view.schema.codec(i);

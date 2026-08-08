@@ -157,6 +157,8 @@ pub(super) async fn materialize_columnar_collection(
                     surrogates: vec![target_surrogate],
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 })
             } else {
                 PhysicalPlan::Columnar(ColumnarOp::Insert {

@@ -284,6 +284,11 @@ fn build_ilp_calvin_tasks(
                     // dispatched. Left empty here so this builder stays a pure
                     // function of the preflighted batch.
                     rls_write_check: Vec::new(),
+                    // The line-protocol listener answers with an ingest ack, not
+                    // a row set — there is no SQL statement behind it to carry a
+                    // projection, and so no rows whose visibility needs gating.
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 post_set_op: PostSetOp::None,
                 txn_id: None,

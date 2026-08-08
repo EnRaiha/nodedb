@@ -21,7 +21,10 @@ use crate::types::{DatabaseId, TenantId};
 
 use super::state::CoreLoop;
 
-pub(crate) type DocConfigSeedEntry = (
+/// Public so the integration-test harness can build the same seed production
+/// builds; it spawns cores through its own path and would otherwise have no way
+/// to reconstruct them faithfully.
+pub type DocConfigSeedEntry = (
     (DatabaseId, TenantId, String),
     crate::engine::document::store::CollectionConfig,
 );

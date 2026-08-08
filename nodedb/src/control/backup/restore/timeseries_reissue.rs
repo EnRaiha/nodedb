@@ -298,6 +298,8 @@ pub fn build_timeseries_ingest_plan(
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }
 

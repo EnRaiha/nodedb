@@ -201,6 +201,8 @@ async fn wal_redispatch_makes_data_queryable() {
                     surrogates: Vec::new(),
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 collection,
             )
@@ -291,6 +293,8 @@ async fn catchup_fills_gaps_from_spsc_drops() {
                     surrogates: Vec::new(),
                     provenance: None,
                     rls_write_check: Vec::new(),
+                    returning: None,
+                    rls_filters: Vec::new(),
                 }),
                 collection,
             )
@@ -441,6 +445,8 @@ async fn production_scenario_catchup_drains_wal_after_ingest() {
                         surrogates: Vec::new(),
                         provenance: None,
                         rls_write_check: Vec::new(),
+                        returning: None,
+                        rls_filters: Vec::new(),
                     }),
                     collection,
                 )

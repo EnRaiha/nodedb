@@ -169,6 +169,12 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
+            // Carried through, never blanked: this function only rewrites the
+            // payload into line protocol and delegates. Dropping the slot here
+            // would leave the clause working on the ILP path and silently doing
+            // nothing on this one — a difference no caller could see.
+            returning,
+            rls_filters,
         } = params;
         let measurement = collection
             .split_once(':')
@@ -241,6 +247,12 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
+            // Forwarded so the projection is resolved in `execute_ilp_ingest`,
+            // on the far side of this conversion — the stored point exists only
+            // after the rewrite above, so projecting any earlier would report
+            // the submitted values instead.
+            returning,
+            rls_filters,
         })
     }
 
@@ -256,6 +268,12 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
+            // Carried through, never blanked: this function only rewrites the
+            // payload into line protocol and delegates. Dropping the slot here
+            // would leave the clause working on the ILP path and silently doing
+            // nothing on this one — a difference no caller could see.
+            returning,
+            rls_filters,
         } = params;
         let rows: sonic_rs::Array = match sonic_rs::from_slice(payload) {
             Ok(r) => r,
@@ -373,6 +391,12 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
+            // Forwarded so the projection is resolved in `execute_ilp_ingest`,
+            // on the far side of this conversion — the stored point exists only
+            // after the rewrite above, so projecting any earlier would report
+            // the submitted values instead.
+            returning,
+            rls_filters,
         })
     }
 }

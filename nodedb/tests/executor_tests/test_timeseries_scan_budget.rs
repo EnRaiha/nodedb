@@ -43,6 +43,8 @@ fn ingest(ctx: &mut TestCtx, collection: &str, payload: &str) {
             surrogates: Vec::new(),
             provenance: None,
             rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     );
 }

@@ -25,6 +25,39 @@ pub(super) fn rmpv_system_time(row: &rmpv::Value) -> i64 {
     i64::MIN
 }
 
+/// Emit the memtable rows at `row_indices`, in the order given.
+///
+/// The read-back a write's `RETURNING` projection uses. It deliberately goes
+/// through [`emit_memtable_row`] — the same function `SELECT` uses — so the two
+/// cannot disagree about how a stored cell renders. The rules that would
+/// otherwise have to be restated are real: a float field the line omitted is
+/// stored as `NaN` and must come back as SQL NULL, and so must a symbol whose
+/// dictionary entry is missing. A projection written over the ingest-side
+/// `ColumnValue`s would have had to repeat both, and repeating them is how two
+/// shapers drift.
+///
+/// An index past the memtable's row count is skipped rather than panicking:
+/// the caller reads indices recorded before a flush, and a flush in between
+/// would invalidate them. Callers must project before flushing.
+pub(in crate::data::executor) fn emit_memtable_rows_at(
+    mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
+    row_indices: &[usize],
+) -> Vec<rmpv::Value> {
+    let schema = mt.schema().clone();
+    let columns: Vec<_> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, (name, ty))| (i, name, ty, mt.column(i)))
+        .collect();
+    let row_count = mt.row_count() as usize;
+    row_indices
+        .iter()
+        .filter(|&&idx| idx < row_count)
+        .map(|&idx| emit_memtable_row(mt, &columns, idx))
+        .collect()
+}
+
 /// Emit a single row from the memtable as rmpv::Value::Map.
 pub(super) fn emit_memtable_row(
     mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
@@ -52,7 +85,17 @@ pub(super) fn emit_partition_row(
 ) -> rmpv::Value {
     let mut fields: Vec<(rmpv::Value, rmpv::Value)> = Vec::with_capacity(schema.len());
     for (col_i, (col_name, col_type)) in schema.iter().enumerate() {
+        // A column whose file could not be read is emitted as NULL, never
+        // skipped. Skipping it changed the row's COLUMN SET rather than one
+        // cell's value, so `SELECT *` on the same row returned different
+        // columns before and after a flush — the memtable path below always
+        // emits every column. A missing value is NULL; it is not a missing
+        // column.
         let Some(data) = &col_data[col_i] else {
+            fields.push((
+                rmpv::Value::String(col_name.as_str().into()),
+                rmpv::Value::Nil,
+            ));
             continue;
         };
         let val = match col_type {
