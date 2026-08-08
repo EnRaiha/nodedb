@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parser for `{ key: value }` object literal syntax.
+//! The recursive-descent scanner behind the object-literal entry points:
+//! whitespace, identifiers, strings, numbers, nested objects, and arrays.
 
 use std::collections::HashMap;
 
@@ -8,71 +9,7 @@ use nodedb_types::Value;
 
 use crate::error::SqlError;
 
-/// Parse a `{ key: value, ... }` object literal into a field map.
-///
-/// Returns `None` if the input doesn't start with `{` (not an object literal).
-/// Returns `Some(Err(msg))` on parse errors (malformed object literal).
-/// Returns `Some(Ok(fields))` on success.
-pub fn parse_object_literal(s: &str) -> Option<Result<HashMap<String, Value>, SqlError>> {
-    let trimmed = s.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut pos = 0;
-    Some(parse_object(&chars, &mut pos))
-}
-
-/// Parse `[{ ... }, { ... }]` — an array of object literals for batch insert.
-///
-/// Returns `None` if the input doesn't start with `[` (not an array literal).
-/// Returns `Some(Err(msg))` on parse errors.
-/// Returns `Some(Ok(vec))` on success — each element must be an object.
-pub fn parse_object_literal_array(
-    s: &str,
-) -> Option<Result<Vec<HashMap<String, Value>>, SqlError>> {
-    let trimmed = s.trim();
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut pos = 0;
-
-    // Consume '['
-    pos += 1;
-    let mut objects = Vec::new();
-    loop {
-        skip_ws(&chars, &mut pos);
-        if pos >= chars.len() {
-            return Some(Err(SqlError::Parse {
-                detail: "unterminated array of objects".to_string(),
-            }));
-        }
-        if chars[pos] == ']' {
-            break;
-        }
-        if chars[pos] == ',' {
-            pos += 1;
-            continue;
-        }
-        if chars[pos] != '{' {
-            return Some(Err(SqlError::Parse {
-                detail: format!("expected '{{' at position {pos}, found '{}'", chars[pos]),
-            }));
-        }
-        match parse_object(&chars, &mut pos) {
-            Ok(obj) => objects.push(obj),
-            Err(e) => return Some(Err(e)),
-        }
-        skip_ws(&chars, &mut pos);
-        if pos < chars.len() && chars[pos] == ',' {
-            pos += 1;
-        }
-    }
-    Some(Ok(objects))
-}
-
-fn skip_ws(chars: &[char], pos: &mut usize) {
+pub(super) fn skip_ws(chars: &[char], pos: &mut usize) {
     while *pos < chars.len() && chars[*pos].is_ascii_whitespace() {
         *pos += 1;
     }
@@ -234,7 +171,10 @@ fn parse_array(chars: &[char], pos: &mut usize) -> Result<Vec<Value>, SqlError> 
     Ok(items)
 }
 
-fn parse_object(chars: &[char], pos: &mut usize) -> Result<HashMap<String, Value>, SqlError> {
+pub(super) fn parse_object(
+    chars: &[char],
+    pos: &mut usize,
+) -> Result<HashMap<String, Value>, SqlError> {
     // Expect '{'
     if *pos >= chars.len() || chars[*pos] != '{' {
         return Err(SqlError::Parse {
@@ -356,9 +296,73 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Value, SqlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::object_literal::{
+        parse_object_literal, parse_object_literal_array, parse_object_literal_array_complete,
+        parse_object_literal_complete,
+    };
 
     fn parse(s: &str) -> HashMap<String, Value> {
         parse_object_literal(s).unwrap().unwrap()
+    }
+
+    /// The prefix parser tolerates trailing input BY DESIGN — the
+    /// function-argument rewriter depends on it — so the tolerance is pinned
+    /// here rather than left as an accident of the implementation.
+    #[test]
+    fn the_prefix_parser_stops_at_the_matching_brace() {
+        let fields = parse("{ a: 1 } and then some");
+        assert_eq!(fields.len(), 1);
+    }
+
+    /// …and the strict form reports what the prefix parser would have thrown
+    /// away, naming it so the author can see which part was rejected.
+    #[test]
+    fn the_strict_parser_reports_trailing_input() {
+        let error = parse_object_literal_complete("{ a: 1 } RETURNING *")
+            .expect("input starts with a brace")
+            .expect_err("trailing input must not be accepted");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("RETURNING *"),
+            "the error must name the leftover, got: {detail}"
+        );
+    }
+
+    /// A statement terminator is not content, so it does not trip the check.
+    #[test]
+    fn the_strict_parser_accepts_a_trailing_semicolon() {
+        assert!(
+            parse_object_literal_complete("{ a: 1 };")
+                .expect("input starts with a brace")
+                .is_ok()
+        );
+    }
+
+    /// A `}` inside a quoted value belongs to the value, so it must not be
+    /// mistaken for the end of the literal.
+    #[test]
+    fn the_strict_parser_ignores_a_brace_inside_a_string() {
+        let fields = parse_object_literal_complete("{ note: '} not the end' }")
+            .expect("input starts with a brace")
+            .expect("a brace inside a string is part of the value");
+        assert_eq!(fields.len(), 1);
+    }
+
+    /// The array form gets the same contract, measured against the real
+    /// closing bracket rather than the last one in the input.
+    #[test]
+    fn the_strict_array_parser_reports_trailing_input() {
+        assert!(
+            parse_object_literal_array_complete("[{ a: 1 }] RETURNING *")
+                .expect("input starts with a bracket")
+                .is_err()
+        );
+        assert!(
+            parse_object_literal_array_complete("[{ note: 'x]y' }]")
+                .expect("input starts with a bracket")
+                .is_ok(),
+            "a bracket inside a string must not be read as the array's end"
+        );
     }
 
     #[test]

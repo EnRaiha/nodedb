@@ -4,15 +4,35 @@
 //! standard `INSERT INTO coll (cols) VALUES (row), ...`.
 
 use super::literal::value_to_sql_literal;
-use crate::parser::object_literal::{parse_object_literal, parse_object_literal_array};
+use crate::error::SqlError;
+use crate::parser::object_literal::{
+    parse_object_literal_array_complete, parse_object_literal_complete,
+};
 
 /// Try to rewrite `INSERT INTO coll { ... }` or `INSERT INTO coll [{ ... }, { ... }]`
 /// into standard `INSERT INTO coll (cols) VALUES (row1), (row2)`.
 ///
-/// Returns `None` if the statement doesn't use object literal syntax.
-pub(super) fn try_rewrite_object_literal(sql: &str) -> Option<String> {
+/// `Ok(None)` means the statement does not use object-literal syntax and the
+/// caller should carry on with the original text. `Err` means it does and is
+/// malformed — including the case where the author wrote a clause after the
+/// literal.
+///
+/// The literal form carries no trailing clause, and that is a property of this
+/// rewrite rather than an oversight: [`fields_to_values_sql`] reconstructs the
+/// statement from the parsed fields alone, so anything the author wrote after
+/// the literal has nowhere to go. Carrying it is not a matter of appending the
+/// text either — the downstream hand-rolled `(cols) VALUES (…)` scanner locates
+/// the value list with a reverse search for `)`, which a `RETURNING upper(x)` or
+/// an `ON CONFLICT (id)` would capture, and the INSERT handler rebuilds its own
+/// SQL from the parsed fields a second time, dropping the clause again. Making
+/// the form carry clauses is a change to that whole pipeline; until then the
+/// honest answer is to refuse the statement and say which clause is the
+/// problem.
+pub(super) fn try_rewrite_object_literal(sql: &str) -> Result<Option<String>, SqlError> {
     let after_into = sql["INSERT INTO ".len()..].trim_start();
-    let coll_end = after_into.find(|c: char| c.is_whitespace())?;
+    let Some(coll_end) = after_into.find(|c: char| c.is_whitespace()) else {
+        return Ok(None);
+    };
     let coll_name = &after_into[..coll_end];
     let rest = after_into[coll_end..].trim_start();
 
@@ -24,23 +44,29 @@ pub(super) fn try_rewrite_object_literal(sql: &str) -> Option<String> {
     }
 
     if !obj_str.starts_with('{') {
-        return None;
+        return Ok(None);
     }
 
-    let fields = parse_object_literal(obj_str)?.ok()?;
+    let Some(parsed) = parse_object_literal_complete(obj_str) else {
+        return Ok(None);
+    };
+    let fields = parsed?;
     if fields.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(fields_to_values_sql(coll_name, &[fields]))
+    Ok(Some(fields_to_values_sql(coll_name, &[fields])))
 }
 
 /// Rewrite `[{ ... }, { ... }]` → multi-row VALUES.
-fn rewrite_array_form(coll_name: &str, obj_str: &str) -> Option<String> {
-    let objects = parse_object_literal_array(obj_str)?.ok()?;
+fn rewrite_array_form(coll_name: &str, obj_str: &str) -> Result<Option<String>, SqlError> {
+    let Some(parsed) = parse_object_literal_array_complete(obj_str) else {
+        return Ok(None);
+    };
+    let objects = parsed?;
     if objects.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(fields_to_values_sql(coll_name, &objects))
+    Ok(Some(fields_to_values_sql(coll_name, &objects)))
 }
 
 /// Build `INSERT INTO coll (col_union) VALUES (row1), (row2), ...`

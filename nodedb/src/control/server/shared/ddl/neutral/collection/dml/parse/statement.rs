@@ -52,15 +52,24 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn parse_write_
     // If { }, rewrite to VALUES SQL via nodedb-sql's preprocess, then parse that.
     let after_coll_name = after_into[coll_name_str.len()..].trim_start();
     if after_coll_name.starts_with('{') || after_coll_name.starts_with('[') {
-        if let Ok(Some(preprocessed)) = nodedb_sql::parser::preprocess::preprocess(sql) {
-            let rewritten = preprocessed.sql;
+        // The rewriter's own diagnostic is carried through verbatim. It is the
+        // only place that knows WHY the literal was rejected — a malformed
+        // field, or a trailing clause the brace form cannot carry — and
+        // replacing it with a generic message would tell the author that
+        // something failed without telling them what to change.
+        match nodedb_sql::parser::preprocess::preprocess(sql) {
             // The preprocessed SQL is always INSERT INTO regardless of original keyword.
-            return parse_values_form(&rewritten, "INSERT INTO ", &coll_name, coll_type);
+            Ok(Some(preprocessed)) => {
+                return parse_values_form(&preprocessed.sql, "INSERT INTO ", &coll_name, coll_type);
+            }
+            Ok(None) => {
+                return Some(Err(ddl_err(
+                    "42601",
+                    "failed to parse object literal in INSERT/UPSERT statement",
+                )));
+            }
+            Err(error) => return Some(Err(ddl_err("42601", error.to_string()))),
         }
-        return Some(Err(ddl_err(
-            "42601",
-            "failed to parse object literal in INSERT/UPSERT statement",
-        )));
     }
 
     parse_values_form(sql, keyword, &coll_name, coll_type)

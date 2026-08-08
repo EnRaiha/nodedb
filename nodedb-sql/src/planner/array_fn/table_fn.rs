@@ -12,7 +12,7 @@ use super::helpers::{
     require_array_name, value_to_coord_literal,
 };
 use crate::error::{Result, SqlError};
-use crate::parser::object_literal::parse_object_literal;
+use crate::parser::object_literal::parse_object_literal_complete;
 use crate::temporal::TemporalScope;
 use crate::types::{SqlCatalog, SqlPlan};
 use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst, NamedDimRange};
@@ -90,9 +90,10 @@ fn plan_slice(
     // bare `{...}` in expression position, so we decode the string
     // contents here.
     let slice_str = expect_string_literal(&args[1], "ARRAY_SLICE slice predicate")?;
-    let parsed = parse_object_literal(&slice_str).ok_or_else(|| SqlError::Unsupported {
-        detail: format!("ARRAY_SLICE: slice predicate must be an object literal: {slice_str}"),
-    })?;
+    let parsed =
+        parse_object_literal_complete(&slice_str).ok_or_else(|| SqlError::Unsupported {
+            detail: format!("ARRAY_SLICE: slice predicate must be an object literal: {slice_str}"),
+        })?;
     let map = parsed.map_err(|detail| SqlError::Unsupported {
         detail: format!("ARRAY_SLICE: slice parse: {detail}"),
     })?;

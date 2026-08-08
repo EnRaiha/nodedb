@@ -77,7 +77,10 @@ pub fn preprocess(sql: &str) -> Result<Option<PreprocessedSql>, SqlError> {
 
     if is_upsert {
         let rewritten = format!("INSERT INTO {}", &temporal_sql["UPSERT INTO ".len()..]);
-        if let Some(result) = try_rewrite_object_literal(&rewritten) {
+        // `?`: a malformed object literal — or a clause the literal form cannot
+        // carry — fails the statement here rather than falling through to be
+        // reparsed as something else, which is how it used to disappear.
+        if let Some(result) = try_rewrite_object_literal(&rewritten)? {
             return Ok(Some(PreprocessedSql {
                 sql: result,
                 is_upsert: true,
@@ -92,7 +95,7 @@ pub fn preprocess(sql: &str) -> Result<Option<PreprocessedSql>, SqlError> {
     }
 
     if first_word == "INSERT"
-        && let Some(result) = try_rewrite_object_literal(&temporal_sql)
+        && let Some(result) = try_rewrite_object_literal(&temporal_sql)?
     {
         return Ok(Some(PreprocessedSql {
             sql: result,
@@ -181,6 +184,35 @@ mod tests {
         assert!(result.is_upsert);
         assert!(result.sql.starts_with("INSERT INTO users ("));
         assert!(result.sql.contains("'bob'"));
+    }
+
+    /// The brace form reconstructs the statement from its fields, so a clause
+    /// written after the literal cannot be carried. It is refused, by name —
+    /// the failure this guards is the earlier behavior, where the clause was
+    /// dropped and the statement succeeded as though it had never been written.
+    #[test]
+    fn a_clause_after_the_object_literal_is_refused_not_dropped() {
+        for sql in [
+            "INSERT INTO users { name: 'alice' } RETURNING *",
+            "UPSERT INTO users { name: 'alice' } RETURNING *",
+            "INSERT INTO users { name: 'alice' } ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO users [{ name: 'alice' }] RETURNING *",
+        ] {
+            let error = super::preprocess(sql)
+                .expect_err("a clause the brace form cannot carry must fail the statement");
+            let detail = error.to_string();
+            assert!(
+                detail.contains("RETURNING") || detail.contains("ON CONFLICT"),
+                "the refusal must name the clause it could not carry; sql = {sql}, got {detail}"
+            );
+        }
+    }
+
+    /// …while the clean forms, and a statement terminator, still rewrite.
+    #[test]
+    fn a_trailing_semicolon_is_not_a_clause() {
+        assert!(pp("INSERT INTO users { name: 'alice' };").is_some());
+        assert!(pp("INSERT INTO users [{ name: 'alice' }];").is_some());
     }
 
     #[test]
