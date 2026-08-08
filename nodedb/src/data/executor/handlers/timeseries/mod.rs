@@ -18,4 +18,5 @@ mod sort;
 mod time_range;
 
 pub(in crate::data::executor) use ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestExec};
+pub(in crate::data::executor) use rls_gate::{admit_ilp_lines, admit_msgpack_rows};
 pub(in crate::data::executor) use scan::TimeseriesScanParams;

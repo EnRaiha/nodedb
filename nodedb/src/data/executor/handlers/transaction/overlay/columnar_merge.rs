@@ -57,7 +57,7 @@ pub(in crate::data::executor) struct ColumnarOverlayMergeParams<'a> {
 /// its schema-ordered `Vec<Value>`. Returns `None` for a body that fails to
 /// decode or is not an array — defensively treated as "does not match" by
 /// callers rather than surfacing a panic.
-fn decode_staged_row(body: &[u8]) -> Option<Vec<Value>> {
+pub(in crate::data::executor) fn decode_staged_row(body: &[u8]) -> Option<Vec<Value>> {
     match nodedb_types::value_from_msgpack(body) {
         Ok(Value::Array(values)) => Some(values),
         _ => None,

@@ -7,9 +7,6 @@ use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TimeseriesOp};
 
 use super::context::RlsCtx;
 
-/// The payload format whose rows the plan carries as decodable per-row images.
-const MSGPACK_ROWS: &str = "msgpack";
-
 /// Exhaustive over [`ColumnarOp`].
 pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::Result<()> {
     match op {
@@ -234,10 +231,13 @@ mod tests {
         assert!(!write_check(&delete).is_empty());
     }
 
-    /// A timeseries ingest whose payload is a MessagePack row batch is decided
-    /// at plan time, exactly like a plain columnar insert.
+    /// A structured MessagePack batch is NOT decided here even though the plan
+    /// carries its rows: the ingest handler retypes those values before storing
+    /// them, so a plan-time decision would judge an image the collection never
+    /// holds. The predicate ships instead, and the one gate after normalization
+    /// decides the stored rows.
     #[test]
-    fn timeseries_msgpack_ingest_is_rejected_on_a_violating_row() {
+    fn timeseries_msgpack_ingest_carries_the_write_predicate_rather_than_deciding_here() {
         let store = store_with_write_policy("metrics");
         let mut plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: "metrics".into(),
@@ -248,14 +248,17 @@ mod tests {
             provenance: None,
             rls_write_check: Vec::new(),
         });
-        assert!(matches!(
-            inject(&mut plan, &store),
-            Err(crate::Error::RejectedAuthz { .. })
-        ));
+        assert!(
+            inject(&mut plan, &store).is_ok(),
+            "the violating row must be left for the Data-Plane gate, not refused here"
+        );
+        assert!(
+            !write_check(&plan).is_empty(),
+            "the predicate must reach the gate that sees the stored image"
+        );
     }
 
-    /// Line-protocol payloads are parsed where they are ingested, so the
-    /// predicate rides along to the handler's per-line gate.
+    /// Every payload shape carries the predicate to the handler's per-row gate.
     #[test]
     fn timeseries_ilp_ingest_carries_the_write_predicate() {
         let store = store_with_write_policy("metrics");
@@ -317,30 +320,25 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // A structured row batch is carried in the plan in full, so it is
-        // decided here and the statement fails before dispatch.
+        // Ship the write predicate, for every payload shape without exception.
         //
-        // Every other payload shape — line protocol from the raw ILP listener,
-        // its canonical MessagePack form, JSON rows — is only turned into rows
-        // by the parser inside the ingest handler, so the compiled predicate
-        // travels with the plan and the handler decides each parsed row before
-        // any of them reaches the memtable. Only one of the two runs for a
-        // given payload: evaluating the same batch twice, once before and once
-        // after the line-protocol conversion retypes its fields, could reject a
-        // row the policy admitted a moment earlier.
+        // A timeseries row does not exist until the handler has normalized the
+        // payload into line protocol and parsed it — and that normalization
+        // changes values: a numeric-looking string is stored as a number, and
+        // the time column is rewritten into milliseconds under the collection's
+        // declared `TIME_KEY`. A structured MessagePack batch is carried in the
+        // plan in full, so it could be decided here, but only against the
+        // values as SUBMITTED. That is a different image from the one that will
+        // be stored, and a policy naming one of those columns would then be
+        // decided against a value the collection never holds. So the decision
+        // belongs at the one point every format funnels through, after
+        // normalization — where it also still fails the whole batch before any
+        // row reaches the memtable.
         TimeseriesOp::Ingest {
             collection,
-            payload,
-            format,
             rls_write_check,
             ..
-        } => {
-            if format.as_str() == MSGPACK_ROWS {
-                ctx.admit_write_batch(collection, payload)
-            } else {
-                ctx.set_write_check(collection, rls_write_check)
-            }
-        }
+        } => ctx.set_write_check(collection, rls_write_check),
     }
 }
 

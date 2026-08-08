@@ -48,6 +48,23 @@ pub(in crate::data::executor) struct TimeseriesIngestParams<'a> {
 }
 
 impl CoreLoop {
+    /// The wall-clock instant a timeseries ingest reads, in epoch milliseconds.
+    ///
+    /// It is the default timestamp for a row that carries none, so anything
+    /// reasoning about the row an ingest will store — the statement-time
+    /// row-level-security gate in particular — has to read the same clock this
+    /// one does, or the two disagree about the time column. `epoch_system_ms`
+    /// is the Calvin-supplied deterministic override; only its absence falls
+    /// back to the host clock.
+    pub(in crate::data::executor) fn ingest_now_ms(&self) -> i64 {
+        self.epoch_system_ms.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        })
+    }
+
     /// Execute a timeseries ingest, applying the sync gate and dispatching the
     /// payload to the format-specific implementation.
     pub(in crate::data::executor) fn execute_timeseries_ingest(
@@ -153,12 +170,7 @@ impl CoreLoop {
             };
         }
 
-        let now_ms: i64 = self.epoch_system_ms.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0)
-        });
+        let now_ms = self.ingest_now_ms();
 
         let ingest_response = match format {
             "ilp" => self.execute_ilp_ingest(TimeseriesIngestParams {

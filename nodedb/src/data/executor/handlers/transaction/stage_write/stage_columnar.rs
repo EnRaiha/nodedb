@@ -20,12 +20,22 @@
 //! staging-only representation; it plays no part in the durable segment
 //! format written at COMMIT by `execute_columnar_insert`.
 //!
+//! ON CONFLICT DO UPDATE: the staged body is the MERGED row, not the submitted
+//! one. The overlay exists to show what this transaction has written, and after
+//! a conflict merge that is the stored row with the assignments applied —
+//! exactly what `execute_columnar_insert` persists at COMMIT. Staging the
+//! submitted body instead made the overlay and the eventual durable state
+//! disagree, so a same-transaction `SELECT` showed a row the COMMIT would never
+//! produce. The merge is resolved against this transaction's own overlay first
+//! and the engine second, so an earlier statement's staged row is the one it
+//! merges against.
+//!
 //! Row-level security: the write policy decides the batch here, at the
 //! statement, not only at COMMIT — otherwise a refused row would be reported as
 //! affected and be readable by this transaction until COMMIT failed. A plain
 //! insert's rows were already decided at plan time (the plan carries them), so
-//! this gate bites for the ON CONFLICT shape, whose merged image is resolved
-//! here the same way the durable path resolves it.
+//! this gate bites for the ON CONFLICT shape. It decides the same merged image
+//! that is staged, so the gate and the overlay can never disagree.
 //!
 //! Field coercion mirrors `execute_columnar_insert` exactly (same
 //! `ndb_field_to_value` / bitemporal column population) via the shared
@@ -155,10 +165,18 @@ impl CoreLoop {
         } else {
             0
         };
-        // Coerce every row and let the write policy decide all of them BEFORE
-        // the first `stage_put_capped`. A rejection must leave the overlay
-        // exactly as it was, and must not have reported an affected count for a
-        // row the transaction will never be allowed to keep.
+        // Coerce every row, resolve the image it will actually persist, and let
+        // the write policy decide all of them BEFORE the first
+        // `stage_put_capped`. A rejection must leave the overlay exactly as it
+        // was, and must not have reported an affected count for a row the
+        // transaction will never be allowed to keep.
+        //
+        // Resolving before staging means an ON CONFLICT row merges against the
+        // state as of the start of THIS statement, so two rows of one `VALUES`
+        // list that share a primary key both merge against the same prior row.
+        // A prior STATEMENT's staged row is seen, because it is already in the
+        // overlay. Splitting it the other way would make a refusal partially
+        // durable in the overlay, which is the worse of the two.
         let mut resolved: Vec<(Surrogate, Vec<Value>)> = Vec::with_capacity(ndb_rows.len());
 
         for (row_idx, row) in ndb_rows.iter().enumerate() {
@@ -207,33 +225,30 @@ impl CoreLoop {
                 }
             };
 
-            resolved.push((surrogate, values));
+            // The row that will exist afterwards: the incoming row for a plain
+            // insert, the merged row for the ON CONFLICT branch. This is the
+            // body staged as well as the image decided — the overlay is
+            // supposed to show what this transaction has written, and after a
+            // merge that is the merged row, which is also what COMMIT persists.
+            let image = match self.staged_columnar_write_image(
+                txn_id,
+                &engine_key,
+                &schema,
+                surrogate,
+                values,
+                on_conflict_updates,
+            ) {
+                Ok(image) => image,
+                Err(error) => return self.response_error(task, error),
+            };
+
+            resolved.push((surrogate, image));
         }
 
-        // The image the policy decides is the row that will exist afterwards:
-        // the incoming row for a plain insert, the merged row for the ON
-        // CONFLICT branch.
-        let images: Vec<Vec<Value>> = if rls_write_check.is_empty() {
-            Vec::new()
-        } else {
-            let mut images = Vec::with_capacity(resolved.len());
-            for (_, values) in &resolved {
-                match self.staged_columnar_write_image(
-                    &engine_key,
-                    &schema,
-                    values.clone(),
-                    on_conflict_updates,
-                ) {
-                    Ok(image) => images.push(image),
-                    Err(error) => return self.response_error(task, error),
-                }
-            }
-            images
-        };
         if let Err(response) = self.stage_admit_columnar_rows(
             task,
             rls_write_check,
-            images.iter().map(Vec::as_slice),
+            resolved.iter().map(|(_, row)| row.as_slice()),
             &schema,
             tid,
             collection,

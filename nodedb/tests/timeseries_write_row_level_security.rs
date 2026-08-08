@@ -193,3 +193,58 @@ async fn a_collection_with_no_write_policy_is_unaffected() {
         "an ungoverned collection must ingest exactly as before"
     );
 }
+
+/// A policy predicating on a column whose TYPE the ingest rewrites must be
+/// decided against the stored value, not the submitted one.
+///
+/// The SQL parser routes a decimal literal through `SqlValue::Decimal`, which
+/// the MessagePack writer encodes as a string; the ingest recovers the numeric
+/// type on the way to the memtable, so the collection stores `1.5` as a float.
+/// A decision taken on the submitted image compares a float predicate against
+/// the string `"1.5"`, which cannot match — so this conforming row was refused
+/// before the decision moved to the one point that sees the normalized row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_whose_type_normalization_rewrites_is_admitted_on_its_stored_value() {
+    let server = TestServer::start().await;
+    let user = "ts_rls_norm_user";
+    seed(&server, "ts_rls_norm", user).await;
+    server
+        .exec(
+            "CREATE RLS POLICY ts_rls_norm_reading ON ts_rls_norm FOR WRITE \
+             USING (value = 1.5)",
+        )
+        .await
+        .expect("create write policy on a normalized column");
+
+    run_as(
+        &server,
+        user,
+        "INSERT INTO ts_rls_norm (ts, owner, value) \
+         VALUES (1700000000000, 'alice', 1.5)",
+    )
+    .await
+    .expect("the stored value satisfies the policy, so the ingest must be admitted");
+
+    assert_eq!(
+        stored_owners(&server, "ts_rls_norm").await.len(),
+        1,
+        "the conforming ingest must land"
+    );
+
+    // …and the same policy still refuses a row whose stored value differs.
+    assert_rls_denied(
+        run_as(
+            &server,
+            user,
+            "INSERT INTO ts_rls_norm (ts, owner, value) \
+             VALUES (1700000001000, 'alice', 2.5)",
+        )
+        .await,
+        "an ingest whose stored value violates the policy",
+    );
+    assert_eq!(
+        stored_owners(&server, "ts_rls_norm").await.len(),
+        1,
+        "the refused ingest must store nothing"
+    );
+}

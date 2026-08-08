@@ -226,3 +226,74 @@ async fn columnar_in_tx_insert_into_brand_new_collection_is_visible_in_tx() {
         .unwrap();
     assert_eq!(committed, vec!["100"]);
 }
+
+/// An `INSERT ... ON CONFLICT DO UPDATE` stages the MERGED row, not the row the
+/// statement submitted.
+///
+/// The overlay's job is to show what this transaction has written, and after a
+/// conflict merge that is the stored row with the assignments applied — which
+/// is also exactly what `execute_columnar_insert` persists at COMMIT. Staging
+/// the submitted body instead made the two disagree: the in-transaction
+/// `SELECT` showed `note = 'new'` (submitted) while COMMIT produced
+/// `note = 'orig'` (untouched by the `SET` list). `note` is the discriminator
+/// here for that reason — `v` looks the same either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn columnar_in_tx_on_conflict_update_stages_the_merged_row() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION upsert_tx (id TEXT PRIMARY KEY, v INT, note TEXT) \
+             WITH (engine='columnar')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("CREATE UNIQUE INDEX upsert_tx_pk ON upsert_tx (id)")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO upsert_tx (id, v, note) VALUES ('a', 1, 'orig')")
+        .await
+        .unwrap();
+
+    server.exec("BEGIN").await.unwrap();
+
+    let msgs = server
+        .client
+        .simple_query(
+            "INSERT INTO upsert_tx (id, v, note) VALUES ('a', 7, 'new') \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        )
+        .await
+        .expect("staged upsert must succeed at the statement");
+    assert_eq!(command_count(&msgs), Some(1));
+
+    let staged = server
+        .client
+        .simple_query("SELECT v, note FROM upsert_tx WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_of(&staged, "v"),
+        vec!["7"],
+        "the merged row takes `v` from EXCLUDED"
+    );
+    assert_eq!(
+        rows_of(&staged, "note"),
+        vec!["orig"],
+        "the merged row keeps the column the SET list did not touch — staging the \
+         submitted body would show 'new' here and disagree with what COMMIT writes"
+    );
+
+    server.client.simple_query("COMMIT").await.unwrap();
+
+    let committed = server
+        .query_rows("SELECT v, note FROM upsert_tx WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert_eq!(
+        committed,
+        vec![vec!["7".to_string(), "orig".to_string()]],
+        "COMMIT must leave exactly the values the transaction was shown"
+    );
+}

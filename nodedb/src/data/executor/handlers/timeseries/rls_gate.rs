@@ -16,8 +16,9 @@ use std::collections::HashMap;
 
 use nodedb_types::Value;
 
+use super::{ingest_formats, msgpack_decode};
 use crate::data::executor::handlers::rls_write_gate::admit_value_row;
-use crate::engine::timeseries::ilp::{FieldValue, IlpLine};
+use crate::engine::timeseries::ilp::{self, FieldValue, IlpLine};
 
 /// Nanoseconds per millisecond — line protocol timestamps are nanoseconds, the
 /// stored time column is milliseconds.
@@ -30,7 +31,7 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 /// that was never created), where no column name can be bound to the line's
 /// timestamp. Empty `rls_write_check` admits everything, the same convention
 /// every other write gate uses.
-pub(super) fn admit_ilp_lines(
+pub(in crate::data::executor) fn admit_ilp_lines(
     rls_write_check: &[u8],
     lines: &[IlpLine<'_>],
     time_key: Option<&str>,
@@ -46,6 +47,51 @@ pub(super) fn admit_ilp_lines(
         admit_value_row(rls_write_check, &image, tid, collection)?;
     }
     Ok(())
+}
+
+/// Decide a structured MessagePack row batch against the compiled write policy.
+///
+/// The rows are normalized into line protocol first, exactly as the ingest
+/// handler normalizes them, so the policy sees the values that will be STORED
+/// rather than the values that were submitted: a numeric-looking string is
+/// stored as a number, and the time column is stored in milliseconds under the
+/// collection's declared `TIME_KEY`. Deciding the submitted values instead
+/// would refuse a conforming row whenever a predicate names a column whose
+/// type normalization rewrites.
+///
+/// A payload that does not decode, or that produces no line protocol at all, is
+/// refused rather than admitted — an image the policy could not be evaluated
+/// against is not an image the policy admitted.
+pub(in crate::data::executor) fn admit_msgpack_rows(
+    rls_write_check: &[u8],
+    payload: &[u8],
+    measurement: &str,
+    time_key: Option<&str>,
+    default_timestamp_ms: i64,
+    tid: u64,
+    collection: &str,
+) -> crate::Result<()> {
+    if rls_write_check.is_empty() {
+        return Ok(());
+    }
+    let undecodable = || crate::Error::RejectedAuthz {
+        tenant_id: crate::types::TenantId::new(tid),
+        resource: format!(
+            "RLS write policy on '{collection}': the row batch did not decode, so the policy \
+             could not be evaluated against it"
+        ),
+    };
+    let rows = msgpack_decode::decode_msgpack_rows(payload).map_err(|_| undecodable())?;
+    let batch = ingest_formats::msgpack_rows_to_ilp(&rows, measurement, time_key);
+    let parsed = ilp::parse_batch(&batch).map_err(|_| undecodable())?;
+    admit_ilp_lines(
+        rls_write_check,
+        parsed.lines(),
+        time_key,
+        default_timestamp_ms,
+        tid,
+        collection,
+    )
 }
 
 /// Build the row image a line will be stored as: its tags, its fields, and its
@@ -94,7 +140,6 @@ fn field_value(value: &FieldValue<'_>) -> Value {
 mod tests {
     use super::*;
     use crate::bridge::scan_filter::ScanFilter;
-    use crate::engine::timeseries::ilp;
 
     fn owner_policy(owner: &str) -> Vec<u8> {
         let filter = ScanFilter {
@@ -175,6 +220,67 @@ mod tests {
     fn a_corrupt_check_denies() {
         let batch = "cpu,owner=alice value=1i\n";
         assert!(admit_ilp_lines(&[0xFF, 0xFE], &lines(batch), Some("ts"), 0, 1, "cpu").is_err());
+    }
+
+    /// A structured MessagePack batch is decided against the values the ingest
+    /// will STORE, not the values submitted. The SQL parser hands a decimal
+    /// literal over as a string, and normalization turns it back into a number
+    /// before storage — so a policy predicating on that column must be
+    /// evaluated after the conversion. Decided on the submitted string, this
+    /// conforming row is refused.
+    #[test]
+    fn a_msgpack_row_is_decided_on_its_normalized_values() {
+        let filter = ScanFilter {
+            field: "reading".into(),
+            op: "eq".into(),
+            value: Value::Float(1.5),
+            clauses: Vec::new(),
+            expr: None,
+        };
+        let policy = zerompk::to_msgpack_vec(&vec![filter]).expect("encode policy filter");
+
+        // What the planner emits for `VALUES (…, 1.5)`: the decimal arrives as
+        // a string, and only the ILP conversion recovers its numeric type.
+        let payload = nodedb_types::json_to_msgpack_or_empty(&serde_json::json!([{
+            "reading": "1.5",
+        }]));
+
+        assert!(
+            admit_msgpack_rows(&policy, &payload, "cpu", Some("ts"), 0, 1, "cpu").is_ok(),
+            "a row whose stored value satisfies the policy must be admitted"
+        );
+    }
+
+    /// …and a row whose stored value does not satisfy it is still refused.
+    #[test]
+    fn a_violating_msgpack_row_is_still_refused_after_normalization() {
+        let policy = owner_policy("alice");
+        let payload = nodedb_types::json_to_msgpack_or_empty(&serde_json::json!([{
+            "owner": "mallory",
+            "value": 1,
+        }]));
+        assert!(
+            admit_msgpack_rows(&policy, &payload, "cpu", Some("ts"), 0, 1, "cpu").is_err(),
+            "normalization must not turn a violating row into an admitted one"
+        );
+    }
+
+    /// A payload that does not decode is refused rather than admitted by
+    /// omission.
+    #[test]
+    fn an_undecodable_msgpack_payload_is_refused() {
+        assert!(
+            admit_msgpack_rows(
+                &owner_policy("alice"),
+                &[0xC1],
+                "cpu",
+                Some("ts"),
+                0,
+                1,
+                "cpu"
+            )
+            .is_err()
+        );
     }
 
     /// The line's own timestamp is bound to the declared time column, in the

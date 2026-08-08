@@ -58,6 +58,81 @@ fn is_time_column(column: &str, declared: Option<&str>) -> bool {
     }
 }
 
+/// Normalize decoded MessagePack rows into line protocol.
+///
+/// This is where a structured ingest's values become the values that are
+/// STORED: the declared time column moves into the line's timestamp (and thence
+/// into the schema's millisecond time column), and a numeric-looking string
+/// becomes a number. Anything that needs to reason about the row a MessagePack
+/// ingest will actually persist — the row-level-security gate in particular —
+/// has to go through here rather than reading the submitted values, or it is
+/// reasoning about an image the collection never holds.
+pub(super) fn msgpack_rows_to_ilp(
+    rows: &[Vec<(String, MsgpackValue)>],
+    measurement: &str,
+    time_key: Option<&str>,
+) -> String {
+    let mut ilp_buf = String::new();
+    for row in rows {
+        let mut fields = Vec::new();
+        let mut timestamp_ns: Option<i64> = None;
+
+        for (key, val) in row {
+            if is_time_column(key, time_key) {
+                match val {
+                    MsgpackValue::Str(s) => {
+                        timestamp_ns = parse_ts_string_to_nanos(s);
+                    }
+                    MsgpackValue::Int(n) => {
+                        timestamp_ns = Some(*n * 1_000_000);
+                    }
+                    MsgpackValue::Float(f) => {
+                        timestamp_ns = Some(*f as i64 * 1_000_000);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match val {
+                MsgpackValue::Float(f) => fields.push(format!("{key}={f}")),
+                MsgpackValue::Int(n) => fields.push(format!("{key}={n}i")),
+                MsgpackValue::Str(s) => {
+                    // SQL parser routes numeric literals with `.`/`e`/`E` through
+                    // `SqlValue::Decimal`, which the standard msgpack writer encodes
+                    // as a string. Recover the numeric type here so timeseries
+                    // schema inference picks `Float64` / `Int64` instead of `Symbol`.
+                    if let Ok(i) = s.parse::<i64>() {
+                        fields.push(format!("{key}={i}i"));
+                    } else if let Ok(f) = s.parse::<f64>()
+                        && f.is_finite()
+                    {
+                        fields.push(format!("{key}={f}"));
+                    } else {
+                        fields.push(format!("{key}=\"{}\"", s.replace('\"', "\\\"")));
+                    }
+                }
+                MsgpackValue::Bool(b) => fields.push(format!("{key}={b}")),
+                _ => {}
+            }
+        }
+
+        if fields.is_empty() {
+            continue;
+        }
+
+        ilp_buf.push_str(measurement);
+        ilp_buf.push(' ');
+        ilp_buf.push_str(&fields.join(","));
+        if let Some(ts) = timestamp_ns {
+            ilp_buf.push(' ');
+            ilp_buf.push_str(&ts.to_string());
+        }
+        ilp_buf.push('\n');
+    }
+    ilp_buf
+}
+
 impl CoreLoop {
     /// Decode the canonical Calvin ILP representation without reformatting any
     /// identifiers, unsigned values, escaped tags, or nanosecond timestamps.
@@ -146,64 +221,7 @@ impl CoreLoop {
             .declared_ts_time_key(task.request.database_id, tid, collection)
             .map(str::to_string);
 
-        let mut ilp_buf = String::new();
-        for row in &rows {
-            let mut fields = Vec::new();
-            let mut timestamp_ns: Option<i64> = None;
-
-            for (key, val) in row {
-                if is_time_column(key, time_key.as_deref()) {
-                    match val {
-                        MsgpackValue::Str(s) => {
-                            timestamp_ns = parse_ts_string_to_nanos(s);
-                        }
-                        MsgpackValue::Int(n) => {
-                            timestamp_ns = Some(*n * 1_000_000);
-                        }
-                        MsgpackValue::Float(f) => {
-                            timestamp_ns = Some(*f as i64 * 1_000_000);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                match val {
-                    MsgpackValue::Float(f) => fields.push(format!("{key}={f}")),
-                    MsgpackValue::Int(n) => fields.push(format!("{key}={n}i")),
-                    MsgpackValue::Str(s) => {
-                        // SQL parser routes numeric literals with `.`/`e`/`E` through
-                        // `SqlValue::Decimal`, which the standard msgpack writer encodes
-                        // as a string. Recover the numeric type here so timeseries
-                        // schema inference picks `Float64` / `Int64` instead of `Symbol`.
-                        if let Ok(i) = s.parse::<i64>() {
-                            fields.push(format!("{key}={i}i"));
-                        } else if let Ok(f) = s.parse::<f64>()
-                            && f.is_finite()
-                        {
-                            fields.push(format!("{key}={f}"));
-                        } else {
-                            fields.push(format!("{key}=\"{}\"", s.replace('\"', "\\\"")));
-                        }
-                    }
-                    MsgpackValue::Bool(b) => fields.push(format!("{key}={b}")),
-                    _ => {}
-                }
-            }
-
-            if fields.is_empty() {
-                continue;
-            }
-
-            ilp_buf.push_str(measurement);
-            ilp_buf.push(' ');
-            ilp_buf.push_str(&fields.join(","));
-            if let Some(ts) = timestamp_ns {
-                ilp_buf.push(' ');
-                ilp_buf.push_str(&ts.to_string());
-            }
-            ilp_buf.push('\n');
-        }
+        let ilp_buf = msgpack_rows_to_ilp(&rows, measurement, time_key.as_deref());
 
         if ilp_buf.is_empty() {
             return self.response_error(

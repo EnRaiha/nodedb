@@ -18,10 +18,11 @@
 //! staging path.
 //!
 //! Row-level security: the write policy decides every row here, at the
-//! statement, before any overlay entry is written. The structured `msgpack`
-//! payload was already decided at plan time (the plan carries its rows), so
-//! this gate bites for the canonical line-protocol payload, whose rows exist
-//! only once the parser has produced them.
+//! statement, before any overlay entry is written. Both payload shapes are
+//! decided through the same helpers the Data-Plane ingest gate uses, on the
+//! NORMALIZED row — the values that will be stored, not the values that were
+//! submitted — so the statement-time decision and the COMMIT-time one are made
+//! on a byte-identical image and can never disagree.
 //!
 //! Row identity: a timeseries row is identified internally by its `series_id`
 //! (a hash of measurement + tags), which is not a cross-engine surrogate. For
@@ -64,10 +65,8 @@ pub(in crate::data::executor) struct StageTimeseriesInsertParams<'a> {
     pub payload: &'a [u8],
     pub surrogates: &'a [Surrogate],
     pub format: &'a str,
-    /// Compiled row-level-security WRITE predicate carried by the plan. Empty
-    /// for the structured `msgpack` payload, whose rows the Control Plane
-    /// already decided at plan time; non-empty for the canonical line-protocol
-    /// payload, whose rows only exist once the parser has produced them.
+    /// Compiled row-level-security WRITE predicate carried by the plan,
+    /// decided here against the normalized row every payload shape produces.
     pub rls_write_check: &'a [u8],
 }
 
@@ -146,9 +145,36 @@ impl CoreLoop {
             );
         }
 
-        // Decide every row before the first staged put, so a refusal leaves the
-        // overlay untouched and reports no affected count.
-        let mut resolved: Vec<(Surrogate, &Value)> = Vec::with_capacity(rows.len());
+        // Decide the whole batch before the first staged put, so a refusal
+        // leaves the overlay untouched and reports no affected count.
+        //
+        // The decision runs on the payload rather than on the decoded rows
+        // above, because the policy governs the row that will be STORED and the
+        // ingest normalizes these values on the way there — a numeric-looking
+        // string becomes a number, the time column becomes milliseconds under
+        // the declared `TIME_KEY`. `admit_msgpack_rows` performs that exact
+        // normalization, so this gate and the one COMMIT replay runs decide a
+        // byte-identical image and cannot disagree.
+        if let Err(error) = crate::data::executor::handlers::timeseries::admit_msgpack_rows(
+            rls_write_check,
+            payload,
+            collection
+                .split_once(':')
+                .map(|(_, name)| name)
+                .unwrap_or(collection),
+            self.declared_ts_time_key(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+            ),
+            self.ingest_now_ms(),
+            tid,
+            collection,
+        ) {
+            return self.response_error(task, error);
+        }
+
+        let mut staged = 0usize;
         for (row_idx, row) in rows.iter().enumerate() {
             if !matches!(row, Value::Object(_)) {
                 continue;
@@ -165,20 +191,7 @@ impl CoreLoop {
                     );
                 }
             };
-            resolved.push((surrogate, row));
-        }
-        if let Err(response) = self.stage_admit_value_rows(
-            task,
-            rls_write_check,
-            resolved.iter().map(|(_, row)| *row),
-            tid,
-            collection,
-        ) {
-            return response;
-        }
 
-        let mut staged = 0usize;
-        for (surrogate, row) in resolved {
             let body = match nodedb_types::value_to_msgpack(row) {
                 Ok(b) => b,
                 Err(e) => {
@@ -289,6 +302,26 @@ impl CoreLoop {
                 },
             );
         }
+        // The write policy decides the parsed lines, through the very same
+        // helper the Data-Plane ingest gate uses, so the statement-time
+        // decision and the COMMIT-time one are made on a byte-identical image.
+        // It runs before prevalidation and before any overlay mutation, so a
+        // refusal leaves nothing behind.
+        if let Err(error) = crate::data::executor::handlers::timeseries::admit_ilp_lines(
+            rls_write_check,
+            parsed.lines(),
+            self.declared_ts_time_key(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+            ),
+            self.ingest_now_ms(),
+            tid,
+            collection,
+        ) {
+            return self.response_error(task, error);
+        }
+
         if let Err(error) = self.prevalidate_deferred_ilp_ingest(
             task,
             crate::types::TenantId::new(tid),
@@ -307,10 +340,7 @@ impl CoreLoop {
             collection,
         );
 
-        // Build every row image first, decide the whole batch against the write
-        // policy, and only then encode and stage — the same all-before-mutate
-        // discipline the cap-failure rollback below exists for, so a refused
-        // batch is never partially visible to this transaction's own reads.
+        // Encode every row before mutating an overlay.
         let mut images = Vec::with_capacity(lines.len());
         for row in parsed.lines() {
             let mut object = HashMap::new();
@@ -342,12 +372,6 @@ impl CoreLoop {
                 object.insert(time_column.clone(), Value::Integer(timestamp / 1_000_000));
             }
             images.push(Value::Object(object));
-        }
-
-        if let Err(response) =
-            self.stage_admit_value_rows(task, rls_write_check, images.iter(), tid, collection)
-        {
-            return response;
         }
 
         let mut encoded_rows = Vec::with_capacity(images.len());
