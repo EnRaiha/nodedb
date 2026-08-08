@@ -5,6 +5,7 @@
 use nodedb_types::{Surrogate, SurrogateBitmap, vector_distance::DistanceMetric};
 
 use crate::physical_plan::PhysicalPlan;
+use crate::physical_plan::document::ReturningSpec;
 
 /// Vector engine physical operations.
 #[derive(
@@ -314,5 +315,25 @@ pub enum VectorOp {
         /// Payload field bitmap indexes (name + kind). Registered via
         /// `payload.add_index` on the first insert into a new collection.
         payload_indexes: Vec<(String, nodedb_types::PayloadIndexKind)>,
+        /// When `Some`, return the STORED post-image of the upserted row — the
+        /// metadata sidecar as it exists after the handler wrote it, decoded
+        /// through the same normalizer the `SELECT` scan uses, so the returned
+        /// row renders identically to a later read. Never the submitted values:
+        /// the sidecar is `zerompk` TAGGED bytes and echoing the request would
+        /// report a shape no read of the collection ever produces.
+        ///
+        /// This is the only insert op a vector-primary collection plans to —
+        /// the vector goes to HNSW, every other column to the sidecar, and
+        /// there is no companion document write to carry the clause instead.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the row `returning` emits. A vector-primary
+        /// write's policy admission happens Control-Plane-side against the
+        /// `payload` image (`RlsCtx::admit_write_value_map_image`), which
+        /// decides whether the write happens at all; this bounds what may be
+        /// shown back, so a `RETURNING` row never exceeds a `SELECT` by the
+        /// same principal.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 }

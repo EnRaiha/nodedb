@@ -258,6 +258,8 @@ impl CoreLoop {
                 quantization,
                 storage_dtype,
                 payload_indexes,
+                returning,
+                rls_filters,
             } => self.execute_vector_direct_upsert(
                 super::super::handlers::vector_upsert::VectorDirectUpsertParams {
                     task,
@@ -270,6 +272,8 @@ impl CoreLoop {
                     quantization: *quantization,
                     storage_dtype: *storage_dtype,
                     payload_indexes,
+                    returning: returning.as_ref(),
+                    rls_filters,
                 },
             ),
 

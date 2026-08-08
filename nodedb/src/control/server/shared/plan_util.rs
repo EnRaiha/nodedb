@@ -25,6 +25,11 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
+        // A vector-primary collection stores its row HERE and nowhere else, so
+        // this op is the only source a RETURNING projection over it can name.
+        // Reporting `None` left those rows with no collection to key a
+        // redaction policy on, and the masking pass ran inert.
+        | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::Delete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. })
         | PhysicalPlan::Document(DocumentOp::PointPut { collection, .. })

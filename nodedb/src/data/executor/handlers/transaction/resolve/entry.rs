@@ -1075,6 +1075,8 @@ mod tests {
                 quantization: nodedb_types::VectorQuantization::None,
                 storage_dtype: nodedb_types::VectorStorageDtype::F32,
                 payload_indexes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
                 collection: "mc".to_string(),
@@ -1153,6 +1155,8 @@ mod tests {
             quantization: nodedb_types::VectorQuantization::None,
             storage_dtype: nodedb_types::VectorStorageDtype::F32,
             payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, TxnId::new(51), std::slice::from_ref(&plan));
         let redo = decode_redo(&resp);

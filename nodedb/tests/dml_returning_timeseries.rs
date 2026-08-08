@@ -115,7 +115,7 @@ async fn timeseries_ingest_returning_named_columns() {
         "the alias must name the column: {returned:?}"
     );
     assert!(
-        returned[0].get("v").is_none(),
+        !returned[0].contains_key("v"),
         "an aliased column must not also appear under its source name: {returned:?}"
     );
 }

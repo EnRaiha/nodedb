@@ -866,6 +866,8 @@ mod tests {
                 quantization: Default::default(),
                 storage_dtype: Default::default(),
                 payload_indexes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         ];
         for p in &plans {

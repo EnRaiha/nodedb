@@ -16,7 +16,8 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::response_codec::RowsPayload;
-use crate::data::executor::scan_normalize::kv_row_to_doc;
+use crate::data::executor::scan_normalize::{kv_row_to_doc, sparse_row_to_doc};
+use crate::data::executor::sparse_body_format::SparseBodyFormat;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
 use nodedb_types::columnar::StrictSchema;
@@ -151,6 +152,50 @@ impl CoreLoop {
         rows: &[rmpv::Value],
     ) -> Response {
         let docs: Vec<serde_json::Value> = rows.iter().map(rmpv_row_to_json).collect();
+        match build_rows_payload(spec, rls_filters, &docs) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
+    }
+}
+
+impl CoreLoop {
+    /// Build a vector-primary upsert's `RETURNING` response from the sidecar it
+    /// just stored.
+    ///
+    /// The row image comes from [`sparse_row_to_doc`] against
+    /// [`SparseBodyFormat::VectorSidecar`] — the SAME converter the `SELECT`
+    /// scan resolves for this collection — so the returned row is byte-for-byte
+    /// what a later read renders. The sidecar is `zerompk` TAGGED bytes, which
+    /// an ordinary document decode ACCEPTS and misreads: a stored `"alice"`
+    /// comes back as the tag array `[4,"alice"]`. Deciding the encoding here a
+    /// second time is exactly how that defect would return.
+    ///
+    /// The format is passed as the literal `VectorSidecar` rather than resolved
+    /// via `sparse_body_format` because this op only ever runs against a
+    /// vector-primary collection — the same reasoning the vector-primary body
+    /// fetch already uses.
+    ///
+    /// `id` is injected only when the body carries none — a vector-primary
+    /// sidecar stores the user's declared primary key, and the sparse key is
+    /// the internal surrogate hex, which must not displace it.
+    pub(in crate::data::executor) fn vector_stored_returning_response(
+        &self,
+        task: &ExecutionTask,
+        spec: &ReturningSpec,
+        rls_filters: &[u8],
+        row_key: &str,
+        sidecar: &[u8],
+    ) -> Response {
+        let (_id, mp) = sparse_row_to_doc(row_key, sidecar, &SparseBodyFormat::VectorSidecar);
+        let docs: Vec<serde_json::Value> = doc_format::decode_document(&mp)
+            .map(|doc| vec![doc])
+            .unwrap_or_default();
         match build_rows_payload(spec, rls_filters, &docs) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

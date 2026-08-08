@@ -192,6 +192,10 @@ impl CoreLoop {
                 quantization,
                 storage_dtype,
                 payload_indexes: payload_indexes.clone(),
+                // Replay re-applies a durable record; the statement that asked
+                // for rows is long gone.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
         );
         let response = self.execute_vector_direct_upsert(
@@ -206,6 +210,8 @@ impl CoreLoop {
                 quantization,
                 storage_dtype,
                 payload_indexes: &payload_indexes,
+                returning: None,
+                rls_filters: &[],
             },
         );
         if response.status != Status::Ok {
@@ -521,6 +527,8 @@ mod tests {
             quantization: nodedb_types::VectorQuantization::None,
             storage_dtype: nodedb_types::VectorStorageDtype::F32,
             payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

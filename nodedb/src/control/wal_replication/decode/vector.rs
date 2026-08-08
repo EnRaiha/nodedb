@@ -397,5 +397,9 @@ pub(super) fn direct_upsert(ctx: &DecodeCtx, f: DirectUpsertFields) -> crate::Re
         quantization: f.quantization,
         storage_dtype: f.storage_dtype,
         payload_indexes: f.payload_indexes.to_vec(),
+        // Replication applies a leader's write on a follower; there is no
+        // client session to answer with rows.
+        returning: None,
+        rls_filters: Vec::new(),
     }))
 }

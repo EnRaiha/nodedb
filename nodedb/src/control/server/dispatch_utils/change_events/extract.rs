@@ -667,6 +667,8 @@ mod tests {
             quantization: VectorQuantization::default(),
             storage_dtype: VectorStorageDtype::default(),
             payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

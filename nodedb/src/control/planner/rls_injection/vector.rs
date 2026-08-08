@@ -72,8 +72,19 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
         VectorOp::DirectUpsert {
             collection,
             payload,
+            rls_filters,
             ..
-        } => ctx.admit_write_value_map_image(collection, payload),
+        } => {
+            ctx.admit_write_value_map_image(collection, payload)?;
+            // The read filter is independent of that write admission. A
+            // `RETURNING` clause on this op ships the stored row back, and that
+            // output is a read, so a row a read-only policy hides must not
+            // become visible just because the statement wrote it. A collection
+            // can carry a `FOR SELECT` policy and no write policy at all, in
+            // which case the write is unrestricted and only the returned row
+            // set shrinks.
+            ctx.set_post_filters(collection, rls_filters)
+        }
 
         // Refuse: these carry an embedding, a surrogate, or an opaque document
         // id — never the row body a policy predicate names — so no image is
@@ -200,6 +211,8 @@ mod tests {
             quantization: Default::default(),
             storage_dtype: Default::default(),
             payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         })
     }
 

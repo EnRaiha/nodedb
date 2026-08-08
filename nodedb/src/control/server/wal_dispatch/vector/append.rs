@@ -194,6 +194,11 @@ pub(crate) fn wal_append_vector_op(
             quantization,
             storage_dtype,
             payload_indexes,
+            // A projection is a client-session concern and must not enter the
+            // durable record: replay re-applies the write, it does not answer
+            // the statement that asked for rows.
+            returning: _,
+            rls_filters: _,
         } => {
             let entry = encode_vector_direct_upsert_payload(VectorDirectUpsertPayload {
                 collection,

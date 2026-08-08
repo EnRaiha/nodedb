@@ -340,12 +340,13 @@ impl NodeDbPgHandler {
         // Inject RETURNING spec into DML plans.
         //
         // An insert shape with no `returning` slot is refused here rather than
-        // silently dropped: the engine is a property of the target collection,
-        // so only the plan can tell whether the clause has anywhere to go.
+        // silently dropped: the shape the planner produced is only visible on
+        // the plan, so only the plan can tell whether the clause has anywhere
+        // to go.
         let tasks = if let Some(ref spec) = returning_spec {
             let mut injected = Vec::with_capacity(tasks.len());
             for mut task in tasks {
-                returning::refuse_unplannable_insert_returning(&task.plan)
+                returning::refuse_unprojectable_insert_returning(&task.plan)
                     .map_err(StatementSetupError::from)?;
                 returning::inject_returning_spec(&mut task.plan, spec.clone());
                 injected.push(task);

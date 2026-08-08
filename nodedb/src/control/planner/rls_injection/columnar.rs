@@ -80,6 +80,79 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
     }
 }
 
+/// Exhaustive over [`TimeseriesOp`].
+pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crate::Result<()> {
+    match op {
+        // Inject: the policy is applied after time-range pruning, on the rows
+        // the scan actually produced.
+        TimeseriesOp::Scan {
+            collection,
+            rls_filters,
+            ..
+        } => ctx.set_post_filters(collection, rls_filters),
+
+        // Ship the write predicate, for every payload shape without exception.
+        //
+        // A timeseries row does not exist until the handler has normalized the
+        // payload into line protocol and parsed it — and that normalization
+        // changes values: a numeric-looking string is stored as a number, and
+        // the time column is rewritten into milliseconds under the collection's
+        // declared `TIME_KEY`. A structured MessagePack batch is carried in the
+        // plan in full, so it could be decided here, but only against the
+        // values as SUBMITTED. That is a different image from the one that will
+        // be stored, and a policy naming one of those columns would then be
+        // decided against a value the collection never holds. So the decision
+        // belongs at the one point every format funnels through, after
+        // normalization — where it also still fails the whole batch before any
+        // row reaches the memtable.
+        // The read filter is independent of that write predicate. A `RETURNING`
+        // clause on an ingest ships rows back, and that output is a read, so a
+        // row a read-only policy hides must not become visible just because the
+        // statement wrote it. A collection can carry a `FOR SELECT` policy and
+        // no write policy at all, in which case the ingest is unrestricted and
+        // only the returned row set shrinks. The raw ILP listener and the
+        // Prometheus remote-write endpoint reach this arm too — both run
+        // `inject_rls` over their tasks — and both carry no projection, so the
+        // filter they receive is simply never consulted.
+        TimeseriesOp::Ingest {
+            collection,
+            rls_write_check,
+            rls_filters,
+            ..
+        } => {
+            ctx.set_write_check(collection, rls_write_check)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
+    }
+}
+
+/// Exhaustive over [`SpatialOp`].
+pub(super) fn inject_spatial(ctx: &RlsCtx<'_>, op: &mut SpatialOp) -> crate::Result<()> {
+    match op {
+        // Inject: the policy is applied to the R-tree candidates before they
+        // are returned, alongside the query's own attribute filters.
+        SpatialOp::Scan {
+            collection,
+            rls_filters,
+            ..
+        } => ctx.set_post_filters(collection, rls_filters),
+
+        // Refuse: these carry a geometry and a surrogate and no column values
+        // at all, so a predicate naming columns has nothing to test. They are
+        // not user SQL — an `INSERT` / `UPDATE` / `DELETE` on a spatial-engine
+        // collection routes through `ColumnarOp::*`, which is gated. This is
+        // the edge-to-origin sync path for rows already decided by the policy
+        // where they are stored, so refusing here loses no user-facing write
+        // while keeping the pass from admitting an image it cannot see.
+        SpatialOp::Insert { collection, .. } | SpatialOp::Delete { collection, .. } => ctx
+            .refuse_if_write_policy(
+                collection,
+                "the R-tree entry carries a geometry and a surrogate rather than the column values \
+                 a policy predicate names",
+            ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_physical::physical_plan::{
@@ -326,78 +399,5 @@ mod tests {
             provenance: None,
         });
         assert_write_refused(inject(&mut plan, &store), "places");
-    }
-}
-
-/// Exhaustive over [`TimeseriesOp`].
-pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crate::Result<()> {
-    match op {
-        // Inject: the policy is applied after time-range pruning, on the rows
-        // the scan actually produced.
-        TimeseriesOp::Scan {
-            collection,
-            rls_filters,
-            ..
-        } => ctx.set_post_filters(collection, rls_filters),
-
-        // Ship the write predicate, for every payload shape without exception.
-        //
-        // A timeseries row does not exist until the handler has normalized the
-        // payload into line protocol and parsed it — and that normalization
-        // changes values: a numeric-looking string is stored as a number, and
-        // the time column is rewritten into milliseconds under the collection's
-        // declared `TIME_KEY`. A structured MessagePack batch is carried in the
-        // plan in full, so it could be decided here, but only against the
-        // values as SUBMITTED. That is a different image from the one that will
-        // be stored, and a policy naming one of those columns would then be
-        // decided against a value the collection never holds. So the decision
-        // belongs at the one point every format funnels through, after
-        // normalization — where it also still fails the whole batch before any
-        // row reaches the memtable.
-        // The read filter is independent of that write predicate. A `RETURNING`
-        // clause on an ingest ships rows back, and that output is a read, so a
-        // row a read-only policy hides must not become visible just because the
-        // statement wrote it. A collection can carry a `FOR SELECT` policy and
-        // no write policy at all, in which case the ingest is unrestricted and
-        // only the returned row set shrinks. The raw ILP listener and the
-        // Prometheus remote-write endpoint reach this arm too — both run
-        // `inject_rls` over their tasks — and both carry no projection, so the
-        // filter they receive is simply never consulted.
-        TimeseriesOp::Ingest {
-            collection,
-            rls_write_check,
-            rls_filters,
-            ..
-        } => {
-            ctx.set_write_check(collection, rls_write_check)?;
-            ctx.set_post_filters(collection, rls_filters)
-        }
-    }
-}
-
-/// Exhaustive over [`SpatialOp`].
-pub(super) fn inject_spatial(ctx: &RlsCtx<'_>, op: &mut SpatialOp) -> crate::Result<()> {
-    match op {
-        // Inject: the policy is applied to the R-tree candidates before they
-        // are returned, alongside the query's own attribute filters.
-        SpatialOp::Scan {
-            collection,
-            rls_filters,
-            ..
-        } => ctx.set_post_filters(collection, rls_filters),
-
-        // Refuse: these carry a geometry and a surrogate and no column values
-        // at all, so a predicate naming columns has nothing to test. They are
-        // not user SQL — an `INSERT` / `UPDATE` / `DELETE` on a spatial-engine
-        // collection routes through `ColumnarOp::*`, which is gated. This is
-        // the edge-to-origin sync path for rows already decided by the policy
-        // where they are stored, so refusing here loses no user-facing write
-        // while keeping the pass from admitting an image it cannot see.
-        SpatialOp::Insert { collection, .. } | SpatialOp::Delete { collection, .. } => ctx
-            .refuse_if_write_policy(
-                collection,
-                "the R-tree entry carries a geometry and a surrogate rather than the column values \
-                 a policy predicate names",
-            ),
     }
 }

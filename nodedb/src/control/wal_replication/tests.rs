@@ -1352,6 +1352,8 @@ fn vector_extended_variants_all_encode_to_some() {
             quantization: VectorQuantization::RaBitQ,
             storage_dtype: VectorStorageDtype::F16,
             payload_indexes: vec![("tenant_id".into(), PayloadIndexKind::Equality)],
+            returning: None,
+            rls_filters: Vec::new(),
         }),
     ];
     for plan in &plans {
@@ -1546,6 +1548,8 @@ fn direct_upsert_roundtrip() {
             ("category".into(), PayloadIndexKind::Equality),
             ("price".into(), PayloadIndexKind::Range),
         ],
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("DirectUpsert should produce a ReplicatedEntry");

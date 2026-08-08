@@ -175,6 +175,11 @@ pub(in super::super) fn convert_vector_primary_insert(
                 quantization: cfg.quantization,
                 storage_dtype: cfg.storage_dtype,
                 payload_indexes: cfg.payload_indexes.to_vec(),
+                // Both filled in after conversion: the RETURNING spec by the
+                // protocol layer's injection pass, the read filter by the RLS
+                // injection pass.
+                returning: None,
+                rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

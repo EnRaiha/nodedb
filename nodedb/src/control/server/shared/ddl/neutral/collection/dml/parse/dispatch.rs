@@ -138,7 +138,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // that has nowhere to carry it rather than dropping the clause in silence.
     if let Some(ref spec) = returning_spec {
         for task in &mut tasks {
-            returning::refuse_unplannable_insert_returning(&task.plan).map_err(|error| {
+            returning::refuse_unprojectable_insert_returning(&task.plan).map_err(|error| {
                 let (_, sqlstate, message) = error_to_sqlstate(&error);
                 ddl_err(sqlstate, message)
             })?;

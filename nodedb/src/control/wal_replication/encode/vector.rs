@@ -132,6 +132,11 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             quantization,
             storage_dtype,
             payload_indexes,
+            // A projection is a client-session concern and must not cross the
+            // replication wire: the follower applies the write, it does not
+            // answer the statement that asked for rows.
+            returning: _,
+            rls_filters: _,
         } => ReplicatedWrite::DirectUpsert {
             collection: collection.to_owned(),
             field: field.to_owned(),

@@ -84,7 +84,7 @@ async fn insert_returning_named_columns_on_a_strict_collection() {
     assert_eq!(returned[0].get("label").map(String::as_str), Some("alpha"));
     assert_eq!(returned[0].get("id").map(String::as_str), Some("s1"));
     assert!(
-        returned[0].get("note").is_none(),
+        !returned[0].contains_key("note"),
         "a column outside the projection must not be shipped: {returned:?}"
     );
 }
@@ -308,8 +308,8 @@ async fn multi_row_insert_returning_star_keeps_every_column_in_one_result_set() 
     }
 
     // Both rows use the same column at each position.
-    for position in 0..3 {
-        let pair = (cells[0][position].as_str(), cells[1][position].as_str());
+    for (position, (first, second)) in cells[0].iter().zip(cells[1].iter()).enumerate() {
+        let pair = (first.as_str(), second.as_str());
         assert!(
             matches!(pair, ("s1", "s2") | ("alpha", "beta") | ("x", "y")),
             "position {position} holds different columns in the two rows: {pair:?}"

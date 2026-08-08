@@ -92,7 +92,7 @@ async fn columnar_insert_returning_named_columns() {
     );
     assert_eq!(returned[0].get("id").map(String::as_str), Some("c1"));
     assert!(
-        returned[0].get("n").is_none(),
+        !returned[0].contains_key("n"),
         "an aliased column must not also appear under its source name: {returned:?}"
     );
 }

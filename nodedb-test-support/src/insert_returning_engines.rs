@@ -47,16 +47,12 @@ pub struct SupportedEngine {
 
 /// Engines that still refuse `INSERT ... RETURNING`.
 ///
-/// Move a row from here to [`SUPPORTED`] in the same change that gives its op
-/// a `returning` slot — never separately.
-pub const REFUSED: &[RefusedEngine] = &[RefusedEngine {
-    engine: "vector-primary",
-    named_in_refusal: "vector",
-    ddl: "CREATE COLLECTION {c} (id STRING PRIMARY KEY, vec VECTOR(3)) \
-              WITH (engine='vector', primary='vector', vector_field='vec', dim=3)",
-    insert_returning: "INSERT INTO {c} (id, vec) VALUES ('v1', ARRAY[1.0, 0.0, 0.0]) \
-                           RETURNING *",
-}];
+/// Empty: every engine carries the clause. Kept, with its assertion helper,
+/// because the refusal surface is not gone — `INSERT ... SELECT` and
+/// in-transaction writes still refuse, on plan-shape and staging grounds
+/// respectively — and a future engine that lands without a `returning` slot
+/// belongs here rather than in a fresh list.
+pub const REFUSED: &[RefusedEngine] = &[];
 
 /// Engines that carry `INSERT ... RETURNING` today.
 pub const SUPPORTED: &[SupportedEngine] = &[
@@ -106,6 +102,16 @@ pub const SUPPORTED: &[SupportedEngine] = &[
         insert_returning: "INSERT INTO {c} (ts, v) VALUES (1000, 1.5) RETURNING ts, v",
         probe_column: "v",
         expected: "1.5",
+    },
+    SupportedEngine {
+        engine: "vector_primary",
+        ddl: "CREATE COLLECTION {c} (id STRING PRIMARY KEY, vec VECTOR(3), owner STRING) \
+              WITH (engine='vector', primary='vector', vector_field='vec', dim=3, \
+                    payload_indexes=['owner'])",
+        insert_returning: "INSERT INTO {c} (id, vec, owner) VALUES \
+                           ('v1', ARRAY[1.0, 0.0, 0.0], 'alice') RETURNING id, owner",
+        probe_column: "id",
+        expected: "v1",
     },
 ];
 

@@ -183,6 +183,11 @@ pub(super) fn serialize_vector_op(
             quantization,
             storage_dtype,
             payload_indexes,
+            // A redo record replays a write, and a replayed write answers
+            // nobody — no client session is behind it to receive rows, so the
+            // projection and its read gate are deliberately not carried.
+            returning: _,
+            rls_filters: _,
         } => {
             let payload = encode_vector_direct_upsert_payload(VectorDirectUpsertPayload {
                 collection,

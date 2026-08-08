@@ -97,7 +97,7 @@ async fn kv_insert_returning_named_columns() {
     assert_eq!(returned[0].get("count").map(String::as_str), Some("7"));
     assert_eq!(returned[0].get("key").map(String::as_str), Some("k1"));
     assert!(
-        returned[0].get("note").is_none(),
+        !returned[0].contains_key("note"),
         "a column outside the projection must not be shipped: {returned:?}"
     );
 }

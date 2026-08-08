@@ -50,6 +50,14 @@ pub(in crate::data::executor) struct VectorDirectUpsertParams<'a> {
     pub quantization: nodedb_types::VectorQuantization,
     pub storage_dtype: nodedb_types::VectorStorageDtype,
     pub payload_indexes: &'a [(String, nodedb_types::PayloadIndexKind)],
+    /// Projection for a `RETURNING` clause, when the statement carried one.
+    /// WAL replay and replication build this op with no client session behind
+    /// them, so they leave it `None`.
+    pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
+    /// Compiled row-level-security READ predicate gating the row `returning`
+    /// emits — a separate gate from the write admission the Control Plane
+    /// already applied to `payload`.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -69,6 +77,8 @@ impl CoreLoop {
             quantization,
             storage_dtype,
             payload_indexes,
+            returning,
+            rls_filters,
         } = params;
         debug!(
             core = self.core_id,
@@ -198,35 +208,49 @@ impl CoreLoop {
         // If this panics (pure in-memory, should not happen), attempt rollback.
         coll.payload.insert_row(node_id, &payload_fields);
 
-        // Step 5: persist payload to the sparse store keyed by surrogate-hex.
-        // The SELECT slow path (`attach_body` + CP response translator
-        // flatten) reads document bodies from sparse using the same key
-        // shape, so vector-primary collections must write here even though
-        // the full document path is bypassed.
-        if !payload.is_empty() {
-            let row_key = format!("{:08x}", surrogate.as_u32());
-            if let Err(e) = self.sparse.put(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                &row_key,
-                payload,
-            ) {
-                // Roll back Steps 3 + 4 so the HNSW node and bitmap entries
-                // do not survive a failed payload persist. Without this,
-                // the orphan node would be returned by future searches
-                // with `body: null` on the slow path.
-                if let Some(coll) = self.vector_collections.get_mut(&index_key) {
-                    coll.payload.delete_row(node_id, &payload_fields);
-                    coll.delete(node_id);
+        // Persist the metadata sidecar to the sparse store keyed by
+        // surrogate-hex. Written UNCONDITIONALLY, including for a row whose
+        // statement supplied only the vector: the sparse row is what makes the
+        // row scannable at all, so skipping it made such a row invisible to
+        // `SELECT *` while every other path still counted it as stored. An
+        // empty tagged map is the honest sidecar for "no non-vector columns".
+        let row_key = format!("{:08x}", surrogate.as_u32());
+        let sidecar: std::borrow::Cow<'_, [u8]> = if payload.is_empty() {
+            match zerompk::to_msgpack_vec(&HashMap::<String, Value>::new()) {
+                Ok(bytes) => std::borrow::Cow::Owned(bytes),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("vector-primary empty sidecar encode failed: {e}"),
+                        },
+                    );
                 }
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("vector-primary payload sparse write failed: {e}"),
-                    },
-                );
             }
+        } else {
+            std::borrow::Cow::Borrowed(payload)
+        };
+        if let Err(e) = self.sparse.put(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &row_key,
+            &sidecar,
+        ) {
+            // Roll back Steps 3 + 4 so the HNSW node and bitmap entries
+            // do not survive a failed payload persist. Without this,
+            // the orphan node would be returned by future searches
+            // with `body: null` on the slow path.
+            if let Some(coll) = self.vector_collections.get_mut(&index_key) {
+                coll.payload.delete_row(node_id, &payload_fields);
+                coll.delete(node_id);
+            }
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("vector-primary payload sparse write failed: {e}"),
+                },
+            );
         }
 
         // Trigger segment seal if needed.
@@ -252,6 +276,19 @@ impl CoreLoop {
         // (predicate reads always record the collection floor) sees this
         // upsert.
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+        // Answered only once every step above has succeeded, so a statement
+        // that fails after the row landed reports the failure rather than a row
+        // set. The bytes projected are the ones just handed to the sparse store,
+        // which is what a later `SELECT` re-reads verbatim.
+        if let Some(spec) = returning {
+            return self.vector_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &row_key,
+                &sidecar,
+            );
+        }
         self.response_ok(task)
     }
 }
@@ -356,6 +393,8 @@ mod tests {
                 quantization: nodedb_types::VectorQuantization::None,
                 storage_dtype: nodedb_types::VectorStorageDtype::F32,
                 payload_indexes: &[],
+                returning: None,
+                rls_filters: &[],
             });
         assert_eq!(response.status, Status::Ok);
 

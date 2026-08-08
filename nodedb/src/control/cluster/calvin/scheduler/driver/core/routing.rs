@@ -555,6 +555,8 @@ mod tests {
             quantization: VectorQuantization::None,
             storage_dtype: VectorStorageDtype::F32,
             payload_indexes: vec![("tenant_id".to_owned(), PayloadIndexKind::Equality)],
+            returning: None,
+            rls_filters: Vec::new(),
         });
         assert_eq!(vshards_of(&direct_upsert), vec![want]);
 

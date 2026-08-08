@@ -29,10 +29,11 @@ const RETURNING_KEYWORD: &str = "RETURNING";
 /// Returns `(cleaned_sql, returning_spec)`. The cleaned SQL has the
 /// `RETURNING ...` suffix removed so DataFusion can parse it.
 ///
-/// RETURNING is honored on INSERT, UPSERT, UPDATE, DELETE and MERGE. Which
-/// engine can actually carry the clause is not decidable from the statement
-/// text — it depends on the target collection's engine — so that judgement is
-/// made once the plan exists, by [`refuse_unplannable_insert_returning`].
+/// RETURNING is honored on INSERT, UPSERT, UPDATE, DELETE and MERGE. Whether
+/// the resulting plan has a slot to carry the clause is not decidable from the
+/// statement text — it depends on the shape the planner produces — so that
+/// judgement is made once the plan exists, by
+/// [`refuse_unprojectable_insert_returning`].
 ///
 /// Arithmetic expressions (e.g. `RETURNING stock * 2`) are rejected with
 /// a typed error — only bare column names and `*` are supported.
@@ -61,29 +62,25 @@ pub fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Err
     }
 }
 
-/// Refuse an `INSERT ... RETURNING` the planner produced a plan for that has
-/// nowhere to carry the clause.
+/// Refuse an `INSERT ... RETURNING` whose plan SHAPE has nowhere to carry the
+/// clause.
 ///
-/// The document and key-value engines carry it: `PointInsert`, `PointPut`,
-/// `BatchInsert`, `Upsert`, and the KV `Insert` / `InsertIfAbsent` /
-/// `InsertOnConflictUpdate` / `Put` / `BatchPut` each own a `returning` slot
-/// paired with the `rls_filters` read gate, so the statement returns the STORED
-/// post-image bounded by the read policy.
-/// The remaining insert shapes own no such slot, so the clause would be parsed,
-/// discarded, and answered with a command tag for a statement that asked for
-/// rows — with nothing anywhere saying the request had been dropped.
+/// Every engine now carries it on its insert op — document (schemaless and
+/// strict), key-value, columnar, spatial, timeseries, and vector-primary each
+/// own a `returning` slot paired with an `rls_filters` read gate, so the
+/// statement returns the STORED post-image bounded by the read policy. What
+/// remains here is not an engine gap but a plan-shape one: `INSERT ... SELECT`
+/// never reaches the Data Plane as a single insert op, so there is no slot on
+/// it for the clause to ride in, whatever engine it targets.
 ///
-/// Refusing is the honest answer until each of those inserts can return its own
-/// row. Returning the caller's submitted values instead would be worse than
-/// silence: every RETURNING in the product returns the STORED row and is gated
-/// by the read policy, and an echo of the request would match neither.
+/// Refusing is the honest answer. Silently dropping the clause answered a
+/// statement that asked for rows with a bare command tag, and nothing anywhere
+/// said the request had been discarded.
 ///
-/// Runs against the plan rather than the statement text because the engine — the
-/// thing that decides whether the clause can be carried — is a property of the
-/// target collection, not of the SQL.
-pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Error> {
+/// Still runs against the plan rather than the statement text: the expansion
+/// that removes the slot is a planning decision, not a syntactic one.
+pub fn refuse_unprojectable_insert_returning(plan: &PhysicalPlan) -> Result<(), Error> {
     let unsupported = match plan {
-        PhysicalPlan::Vector(VectorOp::Insert { .. } | VectorOp::DirectUpsert { .. }) => "vector",
         // `INSERT ... SELECT` never reaches the Data Plane as this op: it is
         // expanded on the Control Plane into fresh-surrogate insert tasks whose
         // rows the expander, not the plan, decides — so there is no slot on
@@ -91,7 +88,7 @@ pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Er
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => "INSERT ... SELECT",
         // Exchange wraps an unresolved child; judge the child.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => {
-            return refuse_unplannable_insert_returning(&op.child);
+            return refuse_unprojectable_insert_returning(&op.child);
         }
         // Everything else either carries the clause already or is not an
         // insert. Enumerated per engine rather than via a catch-all so a new
@@ -114,11 +111,11 @@ pub fn refuse_unplannable_insert_returning(plan: &PhysicalPlan) -> Result<(), Er
     };
     Err(Error::BadRequest {
         detail: format!(
-            "RETURNING is not supported on INSERT into {unsupported} collections; it is \
-             supported on document collections (schemaless and strict), key-value \
-             collections, columnar and spatial collections, and timeseries collections, and \
-             on UPDATE, DELETE, and MERGE. Follow the insert with a SELECT on the inserted \
-             key to read the stored row."
+            "RETURNING is not supported on {unsupported}; it is supported on every engine's \
+             direct INSERT — document collections (schemaless and strict), key-value, \
+             columnar, spatial, timeseries, and vector-primary collections — and on UPDATE, \
+             DELETE, and MERGE. Follow the insert with a SELECT on the inserted key to read \
+             the stored rows."
         ),
     })
 }
@@ -158,9 +155,11 @@ pub fn in_transaction_returning_unsupported() -> Error {
 /// Only `PointInsert`, `PointPut`, `BatchInsert`, `Upsert`, `PointUpdate`,
 /// `BulkUpdate`, `PointDelete`, `BulkDelete`, `UpdateFromJoin`, `Merge`, the KV
 /// `Insert` / `InsertIfAbsent` / `InsertOnConflictUpdate` / `Put` / `BatchPut`
-/// ops, and the CRDT `DocUpsert` / `DocDelete` ops are affected. Every other variant is
-/// left unchanged — an insert shape among them has already been refused by
-/// [`refuse_unplannable_insert_returning`], which runs first.
+/// ops, the columnar `Insert`, the timeseries `Ingest`, the vector
+/// `DirectUpsert`, and the CRDT `DocUpsert` / `DocDelete` ops are affected.
+/// Every other variant is left unchanged — an insert shape among them has
+/// already been refused by [`refuse_unprojectable_insert_returning`], which
+/// runs first.
 pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointInsert { returning, .. }) => {
@@ -185,6 +184,9 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             *returning = Some(spec);
         }
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Vector(VectorOp::DirectUpsert { returning, .. }) => {
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::PointPut { returning, .. }) => {
@@ -363,26 +365,45 @@ mod tests {
     }
 
     /// An insert shape with no `returning` slot is refused at the plan, naming
-    /// the engine and where the clause IS honored. Silently dropping it left
+    /// the shape and where the clause IS honored. Silently dropping it left
     /// the caller with a command tag for a statement that asked for rows.
     #[test]
     fn an_insert_plan_with_no_returning_slot_is_refused() {
-        let plan = PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "vectors".into(),
-            vector: Vec::new(),
-            dim: 0,
-            field_name: String::new(),
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: None,
-            provenance: None,
+        let plan = PhysicalPlan::Document(DocumentOp::InsertSelect {
+            target_collection: "dst".into(),
+            source_collection: "src".into(),
+            source_filters: Vec::new(),
+            source_limit: 0,
         });
-        let detail = refuse_unplannable_insert_returning(&plan)
-            .expect_err("a vector insert cannot carry the clause")
+        let detail = refuse_unprojectable_insert_returning(&plan)
+            .expect_err("an INSERT ... SELECT cannot carry the clause")
             .to_string();
         assert!(
-            detail.contains("vector") && detail.contains("document"),
-            "the refusal must name the engine and where it IS supported; got {detail}"
+            detail.contains("INSERT ... SELECT") && detail.contains("document"),
+            "the refusal must name the plan shape and where it IS supported; got {detail}"
         );
+    }
+
+    /// A vector-primary upsert now carries the clause, so the same gate admits
+    /// it. Pinned beside the refusal above for the same reason the columnar and
+    /// timeseries cases are: an engine dropped from the refusal without gaining
+    /// the slot silently drops the clause, and only asserting both halves
+    /// catches that.
+    #[test]
+    fn a_vector_primary_upsert_plan_is_admitted() {
+        let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            collection: "vectors".into(),
+            field: "emb".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            vector: Vec::new(),
+            payload: Vec::new(),
+            quantization: nodedb_types::VectorQuantization::None,
+            storage_dtype: nodedb_types::VectorStorageDtype::F32,
+            payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(refuse_unprojectable_insert_returning(&plan).is_ok());
     }
 
     /// A timeseries ingest now carries the clause, so the same gate admits it.
@@ -402,7 +423,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
         });
-        assert!(refuse_unplannable_insert_returning(&plan).is_ok());
+        assert!(refuse_unprojectable_insert_returning(&plan).is_ok());
     }
 
     /// A columnar insert now carries the clause, so the same gate admits it.
@@ -425,7 +446,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
         });
-        assert!(refuse_unplannable_insert_returning(&plan).is_ok());
+        assert!(refuse_unprojectable_insert_returning(&plan).is_ok());
     }
 
     /// A document insert carries the clause, so the same gate admits it.
@@ -440,7 +461,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
         });
-        assert!(refuse_unplannable_insert_returning(&plan).is_ok());
+        assert!(refuse_unprojectable_insert_returning(&plan).is_ok());
     }
 
     /// An INSERT with no such clause is untouched — planning must not turn

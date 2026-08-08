@@ -228,6 +228,8 @@ fn is_write_plan_true_for_vector_direct_upsert() {
         quantization: VectorQuantization::None,
         storage_dtype: VectorStorageDtype::F32,
         payload_indexes: vec![("tenant_id".to_owned(), PayloadIndexKind::Equality)],
+        returning: None,
+        rls_filters: Vec::new(),
     });
     assert!(
         is_write_plan(&plan),
