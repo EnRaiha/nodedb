@@ -5,7 +5,7 @@
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::enforcement::{hash_chain, materialized_sum};
+use crate::data::executor::enforcement::hash_chain;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -136,6 +136,9 @@ impl CoreLoop {
                 value,
                 hash_chain_enabled,
             )
+            .map_err(|e| ErrorCode::Internal {
+                detail: format!("hash chain: {e}"),
+            })?
         } else {
             None
         };
@@ -266,10 +269,9 @@ impl CoreLoop {
         if is_insert
             && let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.materialized_sum_sources.is_empty()
-            && let Some(src_doc) = doc_format::decode_document(value)
+            && let Ok(src_doc) = doc_format::decode_document(value)
         {
-            let target_writes = materialized_sum::apply_materialized_sums(
-                &self.sparse,
+            let target_writes = self.apply_materialized_sums(
                 database_id,
                 tid,
                 &config.enforcement.materialized_sum_sources,

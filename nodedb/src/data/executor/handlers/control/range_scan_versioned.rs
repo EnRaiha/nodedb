@@ -27,11 +27,8 @@ use crate::data::executor::{doc_format, strict_format};
 /// strict bodies are Binary Tuples (need the schema), schemaless bodies are
 /// MessagePack. Mirrors `CoreLoop::decode_stored_document` but takes the
 /// already-resolved schema so the scan predicate closure never borrows `self`.
-fn decode_body(body: &[u8], schema: Option<&StrictSchema>) -> Option<serde_json::Value> {
-    match schema {
-        Some(schema) => strict_format::binary_tuple_to_json(body, schema),
-        None => doc_format::decode_document(body),
-    }
+fn decode_body(body: &[u8], schema: Option<&StrictSchema>) -> crate::Result<serde_json::Value> {
+    doc_format::decode_document_or_binary_tuple(body, schema, "versioned row body")
 }
 
 /// Range-bound test matching the secondary-index path in
@@ -109,8 +106,18 @@ impl CoreLoop {
         // Predicate: decode each current body, extract `field`, keep in-range
         // rows. `extract_index_values(_, field, false)` yields the scalar
         // string form for the path (0 or 1 value for a non-array field).
+        // The scan API's predicate is `Fn(&[u8]) -> bool`, so an undecodable
+        // body is captured through this `Cell` side-channel and checked once
+        // the scan finishes. Returning `false` and moving on would drop the row
+        // from the answer with nothing anywhere saying a row was dropped, which
+        // reads to the client as a smaller — but correct-looking — result set.
+        let decode_err: std::cell::Cell<Option<crate::Error>> = std::cell::Cell::new(None);
         let predicate = |body: &[u8]| match decode_body(body, strict_schema.as_ref()) {
-            Some(doc) => {
+            Err(e) => {
+                decode_err.set(Some(e));
+                false
+            }
+            Ok(doc) => {
                 let values =
                     crate::engine::document::store::extract_index_values(&doc, field, false);
                 if !values.iter().any(|v| value_in_bounds(v, lower, upper)) {
@@ -133,7 +140,6 @@ impl CoreLoop {
                     },
                 }
             }
-            None => false,
         };
 
         // Over-fetch so the sort produces a correct top-`limit`, matching the
@@ -178,6 +184,13 @@ impl CoreLoop {
                 collection.to_string(),
             );
             self.merge_overlay_into_scan(txn_id, &coll_key, &mut scanned, &predicate);
+        }
+
+        // Both passes above run the same predicate; check the side-channel once,
+        // after the last of them, so one unreadable row fails the scan rather
+        // than quietly shrinking its answer.
+        if let Some(e) = decode_err.take() {
+            return self.response_error(task, e);
         }
 
         // Normalize bodies to MessagePack so `sort_rows` (msgpack field

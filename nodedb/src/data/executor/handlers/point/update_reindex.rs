@@ -205,7 +205,7 @@ impl CoreLoop {
                     doc_id: p.doc_id,
                     index_paths: p.index_paths,
                 },
-            )
+            )?
         } else {
             (Vec::new(), Vec::new())
         };

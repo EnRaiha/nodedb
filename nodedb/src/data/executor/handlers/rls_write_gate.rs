@@ -73,12 +73,12 @@ pub(in crate::data::executor) fn admit_stored_row(
         return Ok(());
     }
     match returning_doc::from_stored(body, doc_id, strict_schema) {
-        Some(image) => admit_row(rls_write_check, &image, tid, collection),
-        None => Err(crate::Error::RejectedAuthz {
+        Ok(image) => admit_row(rls_write_check, &image, tid, collection),
+        Err(e) => Err(crate::Error::RejectedAuthz {
             tenant_id: crate::types::TenantId::new(tid),
             resource: format!(
                 "RLS write policy on '{collection}': row '{doc_id}' did not decode, so the policy \
-                 could not be evaluated against it"
+                 could not be evaluated against it: {e}"
             ),
         }),
     }

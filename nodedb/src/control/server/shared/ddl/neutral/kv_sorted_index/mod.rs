@@ -20,5 +20,5 @@ pub mod parse;
 pub mod query;
 
 pub use ddl::{create_sorted_index, drop_sorted_index};
-pub use dispatch::drop_in_engine;
+pub use dispatch::{SortedIndexTarget, drop_in_engine};
 pub use query::{select_range, select_rank, select_sorted_count, select_topk};

@@ -89,13 +89,12 @@ impl CoreLoop {
             let Some(config) = self.doc_configs.get(&config_key) else {
                 return Ok(());
             };
-            let Some(doc) = self.decode_stored_document(config, p.new_body) else {
-                return Ok(());
-            };
-            let Ok(mp) = nodedb_types::json_to_msgpack(&doc) else {
-                return Ok(());
-            };
-            owned_mp = mp;
+            let doc = self.decode_stored_document(config, p.new_body)?;
+            owned_mp =
+                nodedb_types::json_to_msgpack(&doc).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".to_string(),
+                    detail: format!("re-encode decoded strict body for vector re-index: {e}"),
+                })?;
             &owned_mp
         } else {
             p.new_body

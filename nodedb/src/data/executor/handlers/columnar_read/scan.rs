@@ -142,7 +142,7 @@ impl CoreLoop {
             Some(e) => e,
             None => {
                 // Empty result for missing collection.
-                return match response_codec::encode_json_vec(&[]) {
+                return match response_codec::encode_json_vec_as_msgpack(&[]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,
@@ -411,7 +411,7 @@ impl CoreLoop {
         let results: Vec<serde_json::Value> =
             matched.into_iter().take(limit).map(|(_, _, j)| j).collect();
 
-        let payload = match response_codec::encode_json_vec(&results) {
+        let payload = match response_codec::encode_json_vec_as_msgpack(&results) {
             Ok(payload) => payload,
             Err(e) => {
                 return self.response_error(

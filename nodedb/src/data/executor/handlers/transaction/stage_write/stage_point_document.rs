@@ -239,9 +239,10 @@ impl CoreLoop {
         if config.index_paths.iter().all(|p| !p.unique) {
             return Ok(());
         }
-        let Some(incoming_doc) = doc_format::decode_document(value) else {
-            return Ok(());
-        };
+        // An incoming body that will not decode cannot be checked against the
+        // UNIQUE indexes at all; skipping the check here would let it stage
+        // and commit over a value another row already owns.
+        let incoming_doc = doc_format::decode_document(value)?;
         let staged_others: Vec<Vec<u8>> = self
             .txn_overlays
             .get(&ctx.txn_id)

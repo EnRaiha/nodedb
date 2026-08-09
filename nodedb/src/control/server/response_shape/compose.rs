@@ -20,6 +20,8 @@
 //! with per-batch lazy streaming callers, which have an already-decoded batch
 //! and only need the envelope-unwrap + projection logic.
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::server::response_translate::dispatch::translate_search_response;
@@ -375,21 +377,30 @@ fn project_row(
 
 /// Derive the id-first column union across all rows: `id` first (if
 /// present), then each row's remaining keys in first-seen order.
+///
+/// The order is user-visible wire column order and is pinned by callers and
+/// tests, so it stays exactly first-seen. Membership lives in a set beside the
+/// vec rather than being answered by rescanning the vec: the vec alone makes
+/// the union quadratic in the number of distinct columns, on a path that runs
+/// once per result set.
 fn derive_columns(rows: &[Map<String, JsonValue>]) -> Vec<String> {
     let mut cols: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     if let Some(first) = rows.first() {
         if first.contains_key("id") {
             cols.push("id".to_string());
+            seen.insert("id");
         }
         for key in first.keys() {
             if key != "id" && !is_reserved_bitemporal_column(key) {
                 cols.push(key.clone());
+                seen.insert(key.as_str());
             }
         }
     }
     for row in rows.iter().skip(1) {
         for key in row.keys() {
-            if !is_reserved_bitemporal_column(key) && !cols.contains(key) {
+            if !is_reserved_bitemporal_column(key) && seen.insert(key.as_str()) {
                 cols.push(key.clone());
             }
         }
@@ -724,5 +735,57 @@ mod tests {
         let out = project_row(&row, &lookup_keys, &display_names, &keys);
         assert_eq!(out.get("id"), Some(&JsonValue::String("w1".to_string())));
         assert_eq!(out.get("title"), Some(&JsonValue::String("t".to_string())));
+    }
+
+    fn row_of(keys: &[&str]) -> Map<String, JsonValue> {
+        let mut row = Map::new();
+        for k in keys {
+            row.insert((*k).to_string(), JsonValue::String((*k).to_string()));
+        }
+        row
+    }
+
+    /// Column order is user-visible: `id` first when the first row has it,
+    /// then every other column in the order it is first seen, scanning rows in
+    /// order. Overlapping and disjoint rows must not reorder or duplicate.
+    ///
+    /// Every `row_of` list here is already in ascending key order, so the
+    /// within-row iteration order is the same whichever map backs
+    /// `serde_json::Map`; what this pins is the cross-row order.
+    #[test]
+    fn derive_columns_pins_id_first_then_first_seen_order() {
+        let rows = vec![
+            row_of(&["a", "b", "id"]),
+            row_of(&["a", "z"]),
+            row_of(&["b", "y"]),
+            row_of(&["q"]),
+        ];
+
+        assert_eq!(
+            derive_columns(&rows),
+            vec!["id", "a", "b", "z", "y", "q"],
+            "id leads; later rows append only their newly-seen columns"
+        );
+    }
+
+    #[test]
+    fn derive_columns_without_id_keeps_the_first_rows_columns_leading() {
+        let rows = vec![row_of(&["a", "b"]), row_of(&["c", "id"])];
+
+        assert_eq!(
+            derive_columns(&rows),
+            vec!["a", "b", "c", "id"],
+            "a late `id` appends where it is first seen; it is not hoisted"
+        );
+    }
+
+    #[test]
+    fn derive_columns_skips_reserved_bitemporal_columns() {
+        let rows = vec![
+            row_of(&["__system_from_ms", "id"]),
+            row_of(&["__valid_from_ms", "name"]),
+        ];
+
+        assert_eq!(derive_columns(&rows), vec!["id", "name"]);
     }
 }

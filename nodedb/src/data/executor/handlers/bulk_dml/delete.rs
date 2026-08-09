@@ -233,18 +233,30 @@ impl CoreLoop {
             // the collection is indexed (needed to recompute the removed
             // secondary-index tuples below — the delete cascade's prefix scan
             // cannot safely return them).
-            let pre_delete_doc: Option<serde_json::Value> =
-                if returning.is_some() || !index_paths.is_empty() {
-                    self.sparse
-                        .get(task.request.database_id.as_u64(), tid, collection, doc_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|bytes| {
-                            returning_doc::from_stored(&bytes, doc_id, strict_schema.as_ref())
-                        })
-                } else {
-                    None
-                };
+            // `None` means the row was already gone. A row that IS there but
+            // will not decode is a different answer: it would silently drop out
+            // of RETURNING and, worse, contribute no removed index tuples, so
+            // its old secondary-index entries would survive the delete.
+            let pre_delete_doc: Option<serde_json::Value> = if returning.is_some()
+                || !index_paths.is_empty()
+            {
+                match self
+                    .sparse
+                    .get(task.request.database_id.as_u64(), tid, collection, doc_id)
+                    .ok()
+                    .flatten()
+                {
+                    Some(bytes) => {
+                        match returning_doc::from_stored(&bytes, doc_id, strict_schema.as_ref()) {
+                            Ok(doc) => Some(doc),
+                            Err(e) => return self.response_error(task, e),
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
 
             let deleted_bytes = self
                 .sparse
@@ -453,7 +465,7 @@ impl CoreLoop {
             let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, doc_id) else {
                 continue;
             };
-            let Some(doc) = doc_format::decode_document(&bytes) else {
+            let Ok(doc) = doc_format::decode_document(&bytes) else {
                 continue;
             };
             let from = doc.get("_from").and_then(|v| v.as_str());

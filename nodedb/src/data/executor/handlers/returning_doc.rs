@@ -41,15 +41,28 @@ pub(in crate::data::executor) fn attach_row_id(doc: &mut serde_json::Value, doc_
 ///
 /// `strict_schema` is `Some` exactly when the collection stores Binary Tuples;
 /// passing `None` for a strict collection is the silent-misdecode failure this
-/// module exists to prevent. Returns `None` when the bytes do not decode under
-/// the resolved mode.
+/// module exists to prevent.
+///
+/// Fails when the bytes do not decode under the resolved mode. A `RETURNING`
+/// row that quietly disappears from the response is indistinguishable from a
+/// statement that matched fewer rows, so the client would read a wrong
+/// row count as the truth.
 pub(in crate::data::executor) fn from_stored(
     body: &[u8],
     doc_id: &str,
     strict_schema: Option<&StrictSchema>,
-) -> Option<serde_json::Value> {
+) -> crate::Result<serde_json::Value> {
     let mut doc = match strict_schema {
-        Some(schema) => strict_format::binary_tuple_to_json(body, schema)?,
+        Some(schema) => strict_format::binary_tuple_to_json(body, schema).ok_or_else(|| {
+            crate::Error::Serialization {
+                format: "binary_tuple".to_string(),
+                detail: format!(
+                    "RETURNING row {doc_id}: stored body ({} bytes) is not a Binary Tuple \
+                     readable under the collection's strict schema",
+                    body.len()
+                ),
+            }
+        })?,
         // `inject_str_field` already honours an existing `id` and wraps a
         // non-map body as `{id, value}`, which is the shape schemaless callers
         // have always emitted for a body that is not a document map.
@@ -59,5 +72,5 @@ pub(in crate::data::executor) fn from_stored(
         }
     };
     attach_row_id(&mut doc, doc_id);
-    Some(doc)
+    Ok(doc)
 }

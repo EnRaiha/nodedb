@@ -50,22 +50,28 @@ impl CoreLoop {
         // Decode one raw stored source document and extract its non-empty join
         // key. Shared by the shipped-rows path and the local-scan path so both
         // derive an identical `join_val → document` mapping from identical bytes.
-        let decode_and_key = |value_bytes: &[u8]| -> Option<(String, serde_json::Value)> {
-            let doc = match strict_schema.as_ref() {
-                Some(schema) => {
-                    super::super::strict_format::binary_tuple_to_json(value_bytes, schema)?
+        //
+        // `Ok(None)` is the domain answer "this source row has no usable join
+        // key"; a body that will not decode is not that answer. Dropping it
+        // silently would leave the row unmatched, so the UPDATE would skip
+        // every target row that should have joined to it and report a smaller
+        // affected count as the truth.
+        let decode_and_key =
+            |value_bytes: &[u8]| -> crate::Result<Option<(String, serde_json::Value)>> {
+                let doc = doc_format::decode_document_or_binary_tuple(
+                    value_bytes,
+                    strict_schema.as_ref(),
+                    "UPDATE ... FROM source row",
+                )?;
+                let key = doc
+                    .get(join_col)
+                    .map(json_value_to_string)
+                    .unwrap_or_default();
+                if key.is_empty() {
+                    return Ok(None);
                 }
-                None => doc_format::decode_document(value_bytes)?,
+                Ok(Some((key, doc)))
             };
-            let key = doc
-                .get(join_col)
-                .map(json_value_to_string)
-                .unwrap_or_default();
-            if key.is_empty() {
-                return None;
-            }
-            Some((key, doc))
-        };
 
         let mut map = std::collections::HashMap::new();
 
@@ -74,7 +80,7 @@ impl CoreLoop {
         // empty; the shipped bytes are the source's on-disk rows verbatim.
         if let Some(rows) = source_rows {
             for (_source_doc_id, value_bytes) in rows {
-                if let Some((key, doc)) = decode_and_key(value_bytes) {
+                if let Some((key, doc)) = decode_and_key(value_bytes)? {
                     map.insert(key, doc);
                 }
             }
@@ -103,7 +109,7 @@ impl CoreLoop {
 
         if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
             for entry in range.flatten() {
-                if let Some((key, doc)) = decode_and_key(entry.1.value()) {
+                if let Some((key, doc)) = decode_and_key(entry.1.value())? {
                     map.insert(key, doc);
                 }
             }

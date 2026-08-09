@@ -74,6 +74,50 @@ async fn create_index_backfills_existing_rows() {
     );
 }
 
+/// The backfill must decode existing rows with the collection's OWN storage
+/// mode, not with the schemaless MessagePack decoder.
+///
+/// A `document_strict` collection stores Binary Tuples. Reading them with the
+/// schemaless decoder fails on every row, so a backfill that skipped
+/// undecodable rows built an EMPTY index and reported `CREATE INDEX` as
+/// successful — after which every equality lookup on the indexed column
+/// silently missed rows that are plainly there. The lookup below is the only
+/// thing that can tell an index that was populated from one that merely exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_index_backfills_existing_strict_rows() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE TABLE bf_strict (id TEXT PRIMARY KEY, region TEXT, n INT)")
+        .await
+        .unwrap();
+    for (id, region, n) in [("a", "us", 1), ("b", "eu", 2), ("c", "us", 3)] {
+        server
+            .exec(&format!(
+                "INSERT INTO bf_strict (id, region, n) VALUES ('{id}', '{region}', {n})"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Rows exist first, so this CREATE INDEX must go through the backfill path
+    // rather than the incremental per-write index maintenance.
+    server
+        .exec("CREATE INDEX ON bf_strict (region)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_text("SELECT id FROM bf_strict WHERE region = 'us' ORDER BY id")
+        .await
+        .expect("indexed SELECT on a strict collection must succeed");
+    assert_eq!(
+        rows,
+        vec!["a".to_string(), "c".to_string()],
+        "the backfill must have populated the index from the Binary Tuple rows, got: {rows:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_unique_index_rejects_existing_duplicates() {
     let server = TestServer::start().await;

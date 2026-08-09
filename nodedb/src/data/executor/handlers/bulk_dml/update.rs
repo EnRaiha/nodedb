@@ -232,9 +232,12 @@ impl CoreLoop {
                             None => continue,
                         }
                     } else {
+                        // A row skipped here is one the UPDATE silently leaves
+                        // untouched while reporting a smaller affected count as
+                        // the truth.
                         match doc_format::decode_document(&current_bytes) {
-                            Some(v) => v,
-                            None => continue,
+                            Ok(v) => v,
+                            Err(e) => return self.response_error(task, e),
                         }
                     };
                     // Pre-mutation image, captured before any field is changed.

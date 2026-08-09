@@ -296,13 +296,16 @@ impl CoreLoop {
                 }
 
                 if !window_specs.is_empty() {
-                    let mut decoded_rows: Vec<(String, serde_json::Value)> = sorted
+                    let mut decoded_rows: Vec<(String, serde_json::Value)> = match sorted
                         .into_iter()
                         .map(|(id, val)| {
-                            let doc = decode_scanned_document(&val, body_format);
-                            (id, doc)
+                            decode_scanned_document(&val, body_format).map(|doc| (id, doc))
                         })
-                        .collect();
+                        .collect::<crate::Result<Vec<_>>>()
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => return self.response_error(task, e),
+                    };
                     if let Err(e) = crate::bridge::window_func::evaluate_window_functions(
                         &mut decoded_rows,
                         &window_specs,

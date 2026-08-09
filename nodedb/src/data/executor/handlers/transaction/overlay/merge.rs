@@ -250,7 +250,7 @@ impl CoreLoop {
         &self,
         params: IndexOverlayMergeParams<'_>,
         doc_ids: &mut Vec<String>,
-        decode: &dyn Fn(&[u8]) -> Option<serde_json::Value>,
+        decode: &dyn Fn(&[u8]) -> crate::Result<Option<serde_json::Value>>,
     ) -> crate::Result<()> {
         let IndexOverlayMergeParams {
             txn_id,
@@ -276,9 +276,22 @@ impl CoreLoop {
             }
         };
         let target = normalize(value.to_string());
+        // `value_matches` feeds `Vec::retain` and a plain `for` loop, both of
+        // which need a `bool`, so an undecodable staged body is captured via
+        // this `Cell` side-channel and checked once both passes finish —
+        // the same shape `predicate_err` below uses. Treating it as "does not
+        // match" and moving on would drop a staged row from the result with no
+        // indication that a row was dropped.
+        let decode_err: std::cell::Cell<Option<crate::Error>> = std::cell::Cell::new(None);
         let value_matches = |body: &[u8]| -> bool {
-            let Some(doc) = decode(body) else {
-                return false;
+            let doc = match decode(body) {
+                // No registered config: nothing indexed to compare against.
+                Ok(None) => return false,
+                Ok(Some(doc)) => doc,
+                Err(e) => {
+                    decode_err.set(Some(e));
+                    return false;
+                }
             };
             extract_index_values(&doc, path, is_array)
                 .into_iter()
@@ -350,6 +363,9 @@ impl CoreLoop {
                 Staged::Tombstone => {}
             }
         }
+        if let Some(e) = decode_err.take() {
+            return Err(e);
+        }
         if let Some(e) = predicate_err.take() {
             return Err(crate::Error::from(e));
         }
@@ -412,14 +428,20 @@ impl CoreLoop {
 
     /// Decode a stored document body (base or staged) into JSON using the
     /// collection's registered storage mode, for overlay-merge field
-    /// re-extraction. Returns `None` when the collection has no registered
-    /// config or the bytes fail to decode under that mode.
+    /// re-extraction.
+    ///
+    /// `Ok(None)` means the collection has no registered config, so there is no
+    /// storage mode to decode under and nothing indexed to re-extract. Bytes
+    /// that will not decode under a mode that IS registered are a different
+    /// answer and come back as `Err`.
     pub(in crate::data::executor) fn decode_indexed_body(
         &self,
         config_key: &(DatabaseId, TenantId, String),
         body: &[u8],
-    ) -> Option<serde_json::Value> {
-        let config = self.doc_configs.get(config_key)?;
-        self.decode_stored_document(config, body)
+    ) -> crate::Result<Option<serde_json::Value>> {
+        match self.doc_configs.get(config_key) {
+            None => Ok(None),
+            Some(config) => self.decode_stored_document(config, body).map(Some),
+        }
     }
 }

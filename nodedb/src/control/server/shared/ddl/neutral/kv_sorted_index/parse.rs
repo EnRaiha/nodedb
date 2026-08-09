@@ -128,15 +128,27 @@ pub(super) fn unquote(s: &str) -> String {
     }
 }
 
+/// A `RANGE(...)` score bound, as the raw value bytes of the index's leading
+/// sort column.
+///
+/// The bytes must match what the engine derives from a stored row for that
+/// column (`json_value_to_index_bytes` / `field_value_to_sort_bytes`), because
+/// the Data Plane frames these into a tree bound with the index's own encoder
+/// and compares them against keys built from stored values. So an integer
+/// literal encodes as a sign-flipped big-endian i64, a decimal literal as an
+/// order-preserving f64, and anything else as its UTF-8 bytes — the same three
+/// shapes a stored number / number / string produce.
 pub(super) fn parse_score_arg(s: &str) -> Option<Vec<u8>> {
     let t = unquote(s);
     if t.eq_ignore_ascii_case("NULL") || t.eq_ignore_ascii_case("NONE") || t == "*" {
         return None;
     }
-    // Try to parse as i64 and encode.
+    use crate::engine::kv::sorted_index::key::SortKeyEncoder;
     if let Ok(v) = t.parse::<i64>() {
-        return Some(crate::engine::kv::sorted_index::key::SortKeyEncoder::encode_i64(v).to_vec());
+        return Some(SortKeyEncoder::encode_i64(v).to_vec());
     }
-    // Fallback: raw bytes.
+    if let Ok(v) = t.parse::<f64>() {
+        return Some(SortKeyEncoder::encode_f64(v).to_vec());
+    }
     Some(t.into_bytes())
 }

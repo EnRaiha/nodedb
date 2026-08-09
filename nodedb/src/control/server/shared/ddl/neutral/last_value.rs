@@ -55,7 +55,14 @@ pub async fn query_last_values(
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
 
-    let entries: Vec<(u64, i64, f64)> = sonic_rs::from_slice(&payload).unwrap_or_default();
+    // `meta_query_last_values` encodes with `response_codec::encode`, which is
+    // MessagePack — `decode_payload` is its counterpart. A JSON parser on those
+    // bytes fails on the first one, and defaulting that failure away reports
+    // "this collection caches no last values" for every collection that has
+    // them.
+    let entries: Vec<(u64, i64, f64)> =
+        crate::data::executor::response_codec::decode_payload(&payload)
+            .map_err(|e| ddl_err("XX000", format!("LAST_VALUES reply: {e}")))?;
 
     let mut rows = Vec::with_capacity(entries.len());
     for (series_id, ts, value) in &entries {
@@ -120,7 +127,11 @@ pub async fn query_last_value(
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
 
-    let entry: Option<(i64, f64)> = sonic_rs::from_slice(&payload).unwrap_or_default();
+    // MessagePack, as in `query_last_values` above — an absent series is
+    // encoded as a null (decoding to `None`), which is a different fact from a
+    // payload that could not be read at all.
+    let entry: Option<(i64, f64)> = crate::data::executor::response_codec::decode_payload(&payload)
+        .map_err(|e| ddl_err("XX000", format!("LAST_VALUE reply: {e}")))?;
 
     let mut rows = Vec::new();
     if let Some((ts, value)) = entry {

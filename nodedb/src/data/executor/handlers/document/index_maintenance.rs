@@ -6,6 +6,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
 use crate::data::executor::task::ExecutionTask;
 
 /// Parameters for [`CoreLoop::execute_backfill_index`].
@@ -97,6 +98,18 @@ impl CoreLoop {
             }
         };
 
+        // The encoding of these stored bodies is resolved from the collection's
+        // registered kind, never sniffed from the bytes: a strict collection
+        // stores Binary Tuples and a vector-primary one stores tagged sidecars,
+        // and the schemaless MessagePack decoder reads neither. Decoding them
+        // all as documents is what made `CREATE INDEX` on a strict collection
+        // build an EMPTY index and report success.
+        let body_format = self.sparse_body_format(
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            collection,
+        );
+
         // Deduplicate-unique-as-we-go: track `(normalized_value → doc_id)`
         // so a dup within the existing set is flagged before we ever
         // touch the index table.
@@ -115,8 +128,12 @@ impl CoreLoop {
         };
 
         for (doc_id, bytes) in &docs {
-            let Some(doc) = super::super::super::doc_format::decode_document(bytes) else {
-                continue;
+            // A row skipped here is a row the finished index permanently omits,
+            // and the index is then reported as built — every later lookup on
+            // that row's value silently misses it.
+            let doc = match decode_scanned_document(bytes, body_format.as_format_ref()) {
+                Ok(doc) => doc,
+                Err(e) => return self.response_error(task, e),
             };
             // Partial-index predicate: skip rows that don't satisfy
             // the `WHERE` clause. `evaluate` treats NULL / non-bool as

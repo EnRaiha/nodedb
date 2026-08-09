@@ -112,9 +112,11 @@ impl CoreLoop {
                 continue;
             }
             for body in staged_others {
-                let Some(staged_doc) = self.decode_stored_document(config, body) else {
-                    continue;
-                };
+                // A staged body that will not decode cannot be checked for the
+                // unique value it might already own, so skipping it would let
+                // the incoming row take a value another staged row in the same
+                // transaction is claiming.
+                let staged_doc = self.decode_stored_document(config, body)?;
                 if let Some(ref pred) = path.predicate
                     && !pred.evaluate_json(&staged_doc)
                 {

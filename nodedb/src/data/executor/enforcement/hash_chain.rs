@@ -49,7 +49,13 @@ pub fn compute_chain_hash(previous_hash: &str, row_id: &str, row_contents: &[u8]
 ///
 /// Computes the chain hash, injects `_chain_hash` into the document JSON,
 /// and returns the re-encoded document. Updates `chain_hashes` with the new hash.
-/// Returns `None` if hash chain is not enabled for this collection config.
+///
+/// `Ok(None)` means the hash chain is not enabled for this collection config.
+///
+/// A body that will not decode is an error, never an empty document: the chain
+/// exists to make tampering detectable, and hashing a substituted empty object
+/// would write a link whose hash covers nothing the row actually contains —
+/// silently ending the tamper-evidence the feature is the whole point of.
 pub fn apply_chain_on_insert(
     chain_hashes: &mut std::collections::HashMap<
         (nodedb_types::DatabaseId, nodedb_types::TenantId, String),
@@ -61,9 +67,9 @@ pub fn apply_chain_on_insert(
     document_id: &str,
     value: &[u8],
     hash_chain_enabled: bool,
-) -> Option<Vec<u8>> {
+) -> crate::Result<Option<Vec<u8>>> {
     if !hash_chain_enabled {
-        return None;
+        return Ok(None);
     }
 
     let key = (
@@ -77,8 +83,7 @@ pub fn apply_chain_on_insert(
         .unwrap_or(GENESIS_HASH);
     let chain_hash = compute_chain_hash(prev_hash, document_id, value);
 
-    let mut doc_json = super::super::doc_format::decode_document(value)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let mut doc_json = super::super::doc_format::decode_document(value)?;
     if let Some(obj) = doc_json.as_object_mut() {
         obj.insert(
             "_chain_hash".to_string(),
@@ -87,7 +92,7 @@ pub fn apply_chain_on_insert(
     }
 
     chain_hashes.insert(key, chain_hash);
-    Some(super::super::doc_format::encode_to_msgpack(&doc_json))
+    Ok(Some(super::super::doc_format::encode_to_msgpack(&doc_json)))
 }
 
 /// Verify a segment of the hash chain.
@@ -187,5 +192,53 @@ mod tests {
         let h1 = compute_chain_hash(GENESIS_HASH, "ab", b"cd");
         let h2 = compute_chain_hash(GENESIS_HASH, "abc", b"d");
         assert_ne!(h1, h2);
+    }
+
+    fn chain_map()
+    -> std::collections::HashMap<(nodedb_types::DatabaseId, nodedb_types::TenantId, String), String>
+    {
+        std::collections::HashMap::new()
+    }
+
+    /// An unreadable body must fail the insert, never be hashed as an empty
+    /// document.
+    ///
+    /// Substituting `{}` produces a link whose hash covers nothing the row
+    /// actually contains, so `verify_chain` keeps passing over a row whose
+    /// content is not in the chain at all — the tamper-evidence this module
+    /// exists to provide, silently switched off.
+    #[test]
+    fn an_undecodable_body_fails_the_insert_instead_of_hashing_an_empty_document() {
+        let mut chain_hashes = chain_map();
+        let mut body =
+            nodedb_types::json_to_msgpack(&serde_json::json!({"amount": 10})).expect("encode");
+        assert!(
+            super::super::super::doc_format::decode_document(&body).is_ok(),
+            "baseline body must decode"
+        );
+        body.push(0xC0);
+
+        let result =
+            apply_chain_on_insert(&mut chain_hashes, 1, 1, "ledger", "doc-001", &body, true);
+        assert!(result.is_err(), "a body with trailing bytes must fail");
+        assert!(
+            chain_hashes.is_empty(),
+            "a failed insert must not advance the chain head"
+        );
+    }
+
+    #[test]
+    fn a_disabled_chain_is_not_an_error() {
+        let mut chain_hashes = chain_map();
+        let result = apply_chain_on_insert(
+            &mut chain_hashes,
+            1,
+            1,
+            "ledger",
+            "doc-001",
+            b"anything at all",
+            false,
+        );
+        assert!(matches!(result, Ok(None)));
     }
 }

@@ -9,7 +9,7 @@
 //! - Query dispatch (rank, top_k, range, count)
 //! - Rebuild from existing KV data (backfill)
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::key::SortKeyEncoder;
 use super::tree::OrderStatTree;
@@ -45,9 +45,17 @@ pub(super) struct SortedIndex {
 pub struct SortedIndexManager {
     /// All sorted indexes. Key: `"{tenant_id}:{index_name}"`.
     pub(super) indexes: HashMap<String, SortedIndex>,
-    /// Reverse map: `"{tenant_id}:{collection}"` → list of index names.
-    /// Used to find which sorted indexes to update on PUT/DELETE.
-    pub(super) collection_indexes: HashMap<u64, Vec<String>>,
+    /// Reverse map: collection table key → the index keys built over it. Used
+    /// to find which sorted indexes to update on PUT/DELETE.
+    ///
+    /// A set, not a list: an index key appearing twice would make every PUT do
+    /// its work twice and would export the same index twice into a checkpoint,
+    /// which restore then reinstates twice. Nothing here can detect that after
+    /// the fact, so the collection cannot hold the duplicate in the first
+    /// place. `BTreeSet` also fixes iteration order, which the checkpoint
+    /// export walks — a `HashSet` would reorder a collection's indexes between
+    /// generations for no reason.
+    pub(super) collection_indexes: HashMap<u64, BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for SortedIndex {
@@ -68,10 +76,29 @@ impl SortedIndexManager {
         }
     }
 
-    /// Register a new sorted index. Returns the number of entries backfilled.
+    /// Register a sorted index, rebuilding it from `existing_entries`. Returns
+    /// the number of entries backfilled.
     ///
-    /// `existing_entries` is an iterator of `(primary_key_bytes, value_bytes)` pairs
-    /// from the KV hash table, used to populate the index from existing data.
+    /// `existing_entries` is an iterator of `(primary_key_bytes, value_bytes)`
+    /// pairs from the KV hash table, used to populate the index from existing
+    /// data.
+    ///
+    /// Registering a name that already exists REPLACES it — the previous tree
+    /// and its binding are dropped first (via [`Self::drop`]) and the index is
+    /// rebuilt from the rows handed in. It is not an error, deliberately:
+    ///
+    /// * WAL replay legitimately re-applies a `kv_register_sorted_index` record
+    ///   over a registration a checkpoint already restored, and the call site
+    ///   there consumes a backfill count, not a `Result` — making this an error
+    ///   would either fail replay or need replay to special-case it.
+    /// * Rejecting a duplicate `CREATE SORTED INDEX` is the catalog's job, and
+    ///   the index registry already owns that record; a second gate here would
+    ///   be a second source of truth for the same rule.
+    ///
+    /// Dropping first is also what makes re-registering under a DIFFERENT
+    /// collection correct: without it the old collection keeps a binding to
+    /// this index, and its next PUT would splice rows from the wrong collection
+    /// into the rebuilt tree.
     pub fn register(
         &mut self,
         database_id: u64,
@@ -79,6 +106,8 @@ impl SortedIndexManager {
         def: SortedIndexDef,
         existing_entries: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> u32 {
+        self.drop(database_id, tenant_id, &def.name);
+
         let idx_key = index_key(database_id, tenant_id, &def.name);
         let tbl_key =
             super::super::engine_helpers::table_key(database_id, tenant_id, &def.collection);
@@ -97,7 +126,7 @@ impl SortedIndexManager {
         self.collection_indexes
             .entry(tbl_key)
             .or_default()
-            .push(idx_key.clone());
+            .insert(idx_key.clone());
 
         self.indexes.insert(idx_key, SortedIndex { def, tree });
         backfilled
@@ -132,8 +161,8 @@ impl SortedIndexManager {
 
         let tbl_key =
             super::super::engine_helpers::table_key(database_id, tenant_id, &idx.def.collection);
-        if let Some(list) = self.collection_indexes.get_mut(&tbl_key) {
-            list.retain(|k| k != &idx_key);
+        if let Some(bound) = self.collection_indexes.get_mut(&tbl_key) {
+            bound.remove(&idx_key);
         }
 
         true
@@ -154,7 +183,7 @@ impl SortedIndexManager {
         };
 
         // Clone keys to avoid borrow conflict with self.indexes.
-        let idx_keys: Vec<String> = idx_keys.to_vec();
+        let idx_keys: Vec<String> = idx_keys.iter().cloned().collect();
         for idx_key in &idx_keys {
             let Some(idx) = self.indexes.get_mut(idx_key) else {
                 continue;
@@ -173,7 +202,7 @@ impl SortedIndexManager {
         };
 
         // Clone keys to avoid borrow conflict with self.indexes.
-        let idx_keys: Vec<String> = idx_keys.to_vec();
+        let idx_keys: Vec<String> = idx_keys.iter().cloned().collect();
         for idx_key in &idx_keys {
             if let Some(idx) = self.indexes.get_mut(idx_key) {
                 idx.tree.remove(primary_key);
@@ -280,7 +309,12 @@ impl SortedIndexManager {
 
     /// Get entries in a score range from a sorted index.
     ///
-    /// `score_min` and `score_max` are raw encoded sort key bytes.
+    /// `score_min` and `score_max` are the raw value bytes of the index's
+    /// LEADING sort column (as [`extract_sort_key_from_value`] produces them),
+    /// not encoded tree keys: the caller names a score, and only the index's
+    /// own encoder knows the framing and direction that turn it into a bound
+    /// the tree can be compared against.
+    ///
     /// Returns `(rank, primary_key)` pairs.
     pub fn range(
         &self,
@@ -293,7 +327,11 @@ impl SortedIndexManager {
     ) -> Option<Vec<(u32, Vec<u8>)>> {
         let idx = self.get_index(database_id, tenant_id, index_name)?;
 
-        let entries = idx.tree.range(score_min, score_max);
+        let (lower, upper) = idx
+            .def
+            .encoder
+            .first_column_range_bounds(score_min, score_max);
+        let entries = idx.tree.range(lower.as_deref(), upper.as_deref());
 
         if idx.def.window.is_unwindowed() {
             // Compute rank for each entry.
@@ -571,5 +609,119 @@ mod tests {
         let sort_key = mgr.score(0, 1, "lb", b"alice");
         assert!(sort_key.is_some());
         assert!(mgr.score(0, 1, "lb", b"nonexistent").is_none());
+    }
+
+    /// Registering a name that already exists must leave the collection bound
+    /// to it EXACTLY once.
+    ///
+    /// A binding list that could hold the same index twice makes every later
+    /// PUT do its work twice and exports the index twice into a checkpoint —
+    /// and nothing downstream can tell the duplicate from two real indexes.
+    #[test]
+    fn re_registering_leaves_one_binding_and_a_working_index() {
+        let mut mgr = SortedIndexManager::new();
+        let tbl_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
+
+        mgr.register(
+            0,
+            1,
+            make_def("lb", "scores"),
+            vec![make_entry("alice", 100), make_entry("bob", 200)].into_iter(),
+        );
+        let rebuilt = mgr.register(
+            0,
+            1,
+            make_def("lb", "scores"),
+            vec![
+                make_entry("alice", 100),
+                make_entry("bob", 200),
+                make_entry("carol", 300),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(rebuilt, 3, "re-registration rebuilds from the rows given");
+        assert_eq!(
+            mgr.collection_indexes
+                .get(&tbl_key)
+                .map(|bound| bound.len()),
+            Some(1),
+            "the collection must be bound to the index exactly once"
+        );
+        assert_eq!(
+            mgr.export_for_table(tbl_key).len(),
+            1,
+            "a checkpoint must export the index once, not twice"
+        );
+
+        // The rebuilt index still answers, from the rows it was rebuilt with.
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(3));
+        assert_eq!(mgr.rank(0, 1, "lb", b"carol", 0), Some(1));
+        assert_eq!(mgr.rank(0, 1, "lb", b"alice", 0), Some(3));
+
+        // And it is still maintained on write — one insert, not two trees.
+        let bytes = SortKeyEncoder::encode_i64(400).to_vec();
+        mgr.on_put(tbl_key, b"dave", &[("score".into(), bytes)]);
+        assert_eq!(mgr.rank(0, 1, "lb", b"dave", 0), Some(1));
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(4));
+    }
+
+    /// A single `drop` must fully unregister, with no second binding hiding
+    /// behind it — which is what a duplicated entry would leave.
+    #[test]
+    fn dropping_a_re_registered_index_leaves_nothing_behind() {
+        let mut mgr = SortedIndexManager::new();
+        let tbl_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
+
+        mgr.register(0, 1, make_def("lb", "scores"), std::iter::empty());
+        mgr.register(0, 1, make_def("lb", "scores"), std::iter::empty());
+
+        assert!(mgr.drop(0, 1, "lb"));
+        assert!(!mgr.drop(0, 1, "lb"), "one drop must remove one index");
+        assert!(
+            !mgr.has_indexes(tbl_key),
+            "the collection must be left with no sorted index bound to it"
+        );
+        assert!(mgr.export_for_table(tbl_key).is_empty());
+    }
+
+    /// Re-registering the same name over a DIFFERENT collection must move the
+    /// binding, not add one. Left behind, the old collection's next PUT would
+    /// splice its own rows into an index that no longer covers it.
+    #[test]
+    fn re_registering_onto_another_collection_moves_the_binding() {
+        let mut mgr = SortedIndexManager::new();
+        let old_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
+        let new_key = super::super::super::engine_helpers::table_key(0, 1, "ladder");
+
+        mgr.register(
+            0,
+            1,
+            make_def("lb", "scores"),
+            vec![make_entry("alice", 100)].into_iter(),
+        );
+        mgr.register(
+            0,
+            1,
+            make_def("lb", "ladder"),
+            vec![make_entry("bob", 200)].into_iter(),
+        );
+
+        assert!(
+            !mgr.has_indexes(old_key),
+            "the old collection must no longer maintain this index"
+        );
+        assert!(mgr.has_indexes(new_key));
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(1));
+
+        // A write to the collection the index no longer covers must not reach it.
+        let bytes = SortKeyEncoder::encode_i64(999).to_vec();
+        mgr.on_put(old_key, b"ghost", &[("score".into(), bytes)]);
+        assert_eq!(
+            mgr.rank(0, 1, "lb", b"ghost", 0),
+            None,
+            "a row from the abandoned collection must not enter the index"
+        );
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(1));
     }
 }

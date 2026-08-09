@@ -50,7 +50,8 @@ pub(crate) fn encode_raw_document_rows(rows: &[(String, Vec<u8>)]) -> crate::Res
 ///
 /// Input: zero or more msgpack arrays back-to-back. Elements may be either:
 /// - raw scan rows from `encode_raw_document_rows` with `{id, data}` wrappers
-/// - plain msgpack rows from aggregate/join paths serialized via `encode_json_vec`
+/// - plain msgpack rows from aggregate/join paths serialized via
+///   `encode_json_vec_as_msgpack`
 ///
 /// For wrapped scan rows, the `data` field's raw bytes are extracted. For
 /// plain rows, the entire row value is returned as `msgpack_data`.

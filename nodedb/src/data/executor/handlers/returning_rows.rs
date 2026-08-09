@@ -68,8 +68,11 @@ impl CoreLoop {
     /// (such a value has no field map to inject into, and inventing a second
     /// shape here would make `RETURNING *` disagree with `SELECT *`).
     ///
-    /// A body that fails to decode degrades to a bare `{key}` row, so the
-    /// statement still reports the row it wrote.
+    /// A body that fails to decode fails the statement. `kv_row_to_doc` wraps
+    /// every shape a KV value can take, so a wrapped row that will not decode
+    /// means the stored value is not what the KV engine says it is — and a bare
+    /// `{key}` substituted for it would report a row whose value the client
+    /// never wrote, in the very response it uses to learn what landed.
     pub(in crate::data::executor) fn kv_stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -77,14 +80,17 @@ impl CoreLoop {
         rls_filters: &[u8],
         rows: &[KvStoredRow<'_>],
     ) -> Response {
-        let docs: Vec<serde_json::Value> = rows
+        let docs: Vec<serde_json::Value> = match rows
             .iter()
             .map(|(key, value)| {
-                let (key_str, body) = kv_row_to_doc(key, value);
+                let (_key_str, body) = kv_row_to_doc(key, value);
                 doc_format::decode_document(&body)
-                    .unwrap_or_else(|| serde_json::json!({ "key": key_str }))
             })
-            .collect();
+            .collect::<crate::Result<Vec<_>>>()
+        {
+            Ok(docs) => docs,
+            Err(e) => return self.response_error(task, e),
+        };
         match build_rows_payload(spec, rls_filters, &docs) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
@@ -193,9 +199,12 @@ impl CoreLoop {
         sidecar: &[u8],
     ) -> Response {
         let (_id, mp) = sparse_row_to_doc(row_key, sidecar, SparseBodyFormatRef::VectorSidecar);
-        let docs: Vec<serde_json::Value> = doc_format::decode_document(&mp)
-            .map(|doc| vec![doc])
-            .unwrap_or_default();
+        // An empty row set here would report "the write affected nothing" for a
+        // write that did land, so an unreadable sidecar fails the statement.
+        let docs: Vec<serde_json::Value> = match doc_format::decode_document(&mp) {
+            Ok(doc) => vec![doc],
+            Err(e) => return self.response_error(task, e),
+        };
         match build_rows_payload(spec, rls_filters, &docs) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
@@ -252,8 +261,9 @@ fn rmpv_row_to_json(row: &rmpv::Value) -> serde_json::Value {
 /// instead of the row and would bypass the read gate entirely.
 ///
 /// `strict_schema` must be `Some` exactly when the collection stores Binary
-/// Tuples; a body that fails to decode degrades to a bare `{id}` row so the
-/// statement still reports the row it wrote.
+/// Tuples; a body that fails to decode fails the statement rather than
+/// degrading to a bare `{id}` row, which would report a row the client never
+/// wrote and hide that the stored body is unreadable.
 fn build_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
@@ -262,11 +272,8 @@ fn build_stored_rows_payload(
 ) -> crate::Result<Vec<u8>> {
     let docs: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(doc_id, body)| {
-            returning_doc::from_stored(body, doc_id, strict_schema)
-                .unwrap_or_else(|| serde_json::json!({ "id": doc_id }))
-        })
-        .collect();
+        .map(|(doc_id, body)| returning_doc::from_stored(body, doc_id, strict_schema))
+        .collect::<crate::Result<Vec<_>>>()?;
     build_rows_payload(spec, rls_filters, &docs)
 }
 

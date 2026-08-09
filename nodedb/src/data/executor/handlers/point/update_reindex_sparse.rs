@@ -46,12 +46,18 @@ impl CoreLoop {
     /// No-op when the collection declares no sparse fields. Otherwise drops the
     /// row's prior sparse entries (so a cleared field stops matching) and
     /// upserts the new literal under the same row key.
+    ///
+    /// Fails rather than returning early when the new body will not decode: the
+    /// prior entries have already been dropped by then, so returning would leave
+    /// the row unsearchable with the update reported as successful. Mirrors
+    /// [`Self::update_reindex_vector_indexes`], which is fallible for the same
+    /// reason.
     pub(in crate::data::executor) fn update_reindex_sparse_indexes(
         &mut self,
         p: UpdateSparseReindex<'_>,
-    ) {
+    ) -> crate::Result<()> {
         if !p.has_sparse {
-            return;
+            return Ok(());
         }
 
         // Drop the row's old sparse entries before re-inserting: an UPDATE that
@@ -74,20 +80,20 @@ impl CoreLoop {
                 p.collection.to_string(),
             );
             let Some(config) = self.doc_configs.get(&config_key) else {
-                return;
+                return Ok(());
             };
-            let Some(doc) = self.decode_stored_document(config, p.new_body) else {
-                return;
-            };
-            let Ok(mp) = nodedb_types::json_to_msgpack(&doc) else {
-                return;
-            };
-            owned_mp = mp;
+            let doc = self.decode_stored_document(config, p.new_body)?;
+            owned_mp =
+                nodedb_types::json_to_msgpack(&doc).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".to_string(),
+                    detail: format!("re-encode decoded strict body for sparse re-index: {e}"),
+                })?;
             &owned_mp
         } else {
             p.new_body
         };
 
         self.apply_point_put_sparse_indexes(p.database_id, p.tid, p.collection, p.row_key, mp);
+        Ok(())
     }
 }

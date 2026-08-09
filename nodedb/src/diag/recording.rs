@@ -220,6 +220,33 @@ pub fn fts_index_update_failed(err: &crate::Error, collection: &str, surrogate: 
     .emit();
 }
 
+/// Report a document batch insert refused because its rows carry no surrogates.
+///
+/// Called from the one site that detects it: the batch-insert handler's
+/// parallel-length guard. The rejection propagates from there, so nothing is
+/// written and the caller is told the insert failed. The report exists because
+/// the rejection names only the symptom — the defect is in whatever produced a
+/// plan whose surrogate list is not parallel to its document list, and that
+/// producer is not visible from the Data Plane.
+pub fn batch_insert_without_surrogates(
+    collection: &str,
+    document_count: usize,
+    surrogate_count: usize,
+) {
+    let ctx = context::BatchInsertWithoutSurrogates {
+        collection,
+        document_count,
+        surrogate_count,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "document batch insert refused: rows carry no cross-engine identity",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a completed Data-Plane write whose response the bounded response ring
 /// refused, so the caller can only ever learn a deadline.
 ///

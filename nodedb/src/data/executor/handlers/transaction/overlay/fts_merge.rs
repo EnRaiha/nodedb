@@ -65,11 +65,15 @@ impl CoreLoop {
     /// or is excluded by a `NOT`/`-` negative term, contributes no entry
     /// (and is removed if it was already present from base — e.g. an
     /// UPDATE that made the document no longer match).
+    ///
+    /// Fails when a staged body will not decode: the merge exists so a
+    /// transaction sees its own writes, and a staged row that silently drops
+    /// out of the result is the exact opposite of that.
     pub(in crate::data::executor) fn merge_fts_overlay_into_results(
         &self,
         params: FtsMergeParams<'_>,
         base_results: &mut Vec<(Surrogate, f32, bool)>,
-    ) {
+    ) -> crate::Result<()> {
         let FtsMergeParams {
             txn_id,
             database_id,
@@ -82,7 +86,7 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
         let Some((positive_terms, negative_terms)) =
@@ -90,13 +94,13 @@ impl CoreLoop {
         else {
             // An invalid query already failed the base search with an
             // error before this merge could run — nothing to fold in.
-            return;
+            return Ok(());
         };
         if positive_terms.is_empty() {
             // No positive terms to score staged docs against — but staged
             // tombstones still hide base rows.
             remove_tombstoned(overlay, &coll_key, base_results);
-            return;
+            return Ok(());
         }
 
         let config_key = (database_id, tid, collection.to_string());
@@ -119,7 +123,7 @@ impl CoreLoop {
                 }
                 Staged::Put(body) => {
                     let score =
-                        self.score_staged_fts_doc(&ctx, body, &positive_terms, &negative_terms);
+                        self.score_staged_fts_doc(&ctx, body, &positive_terms, &negative_terms)?;
                     match (score, seen.get(&surrogate).copied()) {
                         (Some(s), Some(idx)) => {
                             base_results[idx].1 = s;
@@ -145,6 +149,7 @@ impl CoreLoop {
 
         base_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         base_results.truncate(top_k);
+        Ok(())
     }
 
     /// Phrase-search variant of the overlay merge. Unlike the bag-of-words
@@ -168,7 +173,7 @@ impl CoreLoop {
         params: FtsMergeParams<'_>,
         terms: &[String],
         base_results: &mut Vec<(Surrogate, f32, bool)>,
-    ) {
+    ) -> crate::Result<()> {
         let FtsMergeParams {
             txn_id,
             database_id,
@@ -181,7 +186,7 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
         // Canonicalize each phrase term through the collection's configured
@@ -218,7 +223,7 @@ impl CoreLoop {
                 }
                 Staged::Put(body) => {
                     let score =
-                        self.score_staged_phrase_doc(db_u64, &config_key, body, &phrase_terms);
+                        self.score_staged_phrase_doc(db_u64, &config_key, body, &phrase_terms)?;
                     match (score, seen.get(&surrogate).copied()) {
                         (Some(s), Some(idx)) => {
                             base_results[idx].1 = s;
@@ -241,6 +246,7 @@ impl CoreLoop {
 
         base_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         base_results.truncate(top_k);
+        Ok(())
     }
 
     /// Staged-doc scoring for `BM25ScoreScan`'s `HashMap<Surrogate, f32>`
@@ -249,7 +255,7 @@ impl CoreLoop {
         &self,
         params: FtsMergeParams<'_>,
         base_results: &mut HashMap<Surrogate, f32>,
-    ) {
+    ) -> crate::Result<()> {
         let FtsMergeParams {
             txn_id,
             database_id,
@@ -262,12 +268,12 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
         let Some((positive_terms, negative_terms)) =
             self.analyze_query_terms(database_id.as_u64(), tid, collection, query)
         else {
-            return;
+            return Ok(());
         };
 
         let config_key = (database_id, tid, collection.to_string());
@@ -280,7 +286,7 @@ impl CoreLoop {
                     base_results.remove(&Surrogate::new(surrogate));
                 }
                 Staged::Put(body) if !positive_terms.is_empty() => {
-                    match self.score_staged_fts_doc(&ctx, body, &positive_terms, &negative_terms) {
+                    match self.score_staged_fts_doc(&ctx, body, &positive_terms, &negative_terms)? {
                         Some(s) => {
                             base_results.insert(Surrogate::new(surrogate), s);
                         }
@@ -294,6 +300,7 @@ impl CoreLoop {
                 }
             }
         }
+        Ok(())
     }
 
     /// Fold the overlay into `BM25ScoreScan`'s scanned row set

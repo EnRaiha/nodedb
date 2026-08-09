@@ -22,7 +22,7 @@ use super::super::super::index_registry::{
 };
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::refuse_gate::RefusingReadGate;
-use super::dispatch::{dispatch_and_respond_tag, drop_in_engine, sorted_index_vshard};
+use super::dispatch::{SortedIndexTarget, drop_in_engine, register_in_engine};
 use super::gate::owning_collection;
 use super::parse::{ddl_err, parse_key_column, parse_sort_columns, parse_window_clause};
 
@@ -106,10 +106,18 @@ pub async fn create_sorted_index(
         window_end_ms: window_end,
     });
 
-    let response = dispatch_and_respond_tag(
+    // Routed by the collection, not by the index name: the backfill this plan
+    // performs reads the collection's rows out of the `KvEngine` of whichever
+    // core executes it, and every later write that must keep the tree current
+    // lands on the collection's own core. Registering anywhere else builds an
+    // empty tree that no write ever updates.
+    let response = register_in_engine(
         state,
-        tenant_id,
-        sorted_index_vshard(&index_name),
+        &SortedIndexTarget {
+            tenant_id,
+            database_id,
+            collection: &collection,
+        },
         plan,
         "CREATE SORTED INDEX",
     )
@@ -197,7 +205,16 @@ pub async fn drop_sorted_index(
         ));
     }
 
-    drop_in_engine(state, tenant_id, &index_name).await?;
+    drop_in_engine(
+        state,
+        &SortedIndexTarget {
+            tenant_id,
+            database_id,
+            collection: &collection,
+        },
+        &index_name,
+    )
+    .await?;
 
     propose_delete_index_record(state, database_id, tenant_id, &index_name, &collection)?;
     crate::control::server::shared::ddl::owner::propose_delete_owner_in_database(

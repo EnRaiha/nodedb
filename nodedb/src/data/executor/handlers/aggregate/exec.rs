@@ -289,7 +289,7 @@ impl CoreLoop {
                 }
                 agg_result.rows.truncate(limit);
 
-                return match crate::data::executor::response_codec::encode_json_vec(
+                return match crate::data::executor::response_codec::encode_json_vec_as_msgpack(
                     &agg_result.rows,
                 ) {
                     Ok(payload) => {

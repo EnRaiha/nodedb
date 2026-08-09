@@ -153,6 +153,22 @@ pub(super) fn batch_insert(
     documents: &[(String, Vec<u8>)],
     surrogates: &[u32],
 ) -> crate::Result<PhysicalPlan> {
+    // `zip` below stops at the shorter side, so a record that lost surrogates
+    // would decode into a plan whose rows have no cross-engine identity — the
+    // apply then refuses the whole batch, but only after the truncation has
+    // already been silently baked into the plan. Refuse it here, where the
+    // discrepancy is still visible as what it is: a malformed record.
+    if documents.len() != surrogates.len() {
+        return Err(crate::Error::Serialization {
+            format: "replicated_write".into(),
+            detail: format!(
+                "batch insert record for '{collection}' carries {} documents but {} \
+                 surrogates; every row must carry its own surrogate",
+                documents.len(),
+                surrogates.len(),
+            ),
+        });
+    }
     let resolved = documents
         .iter()
         .zip(surrogates.iter())

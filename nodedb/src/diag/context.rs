@@ -269,6 +269,59 @@ impl DomainContext for FtsIndexUpdateFailed<'_> {
     }
 }
 
+/// A document batch insert arrived without a surrogate for every row, so the
+/// rows it carries have no cross-engine identity to be indexed under.
+///
+/// Every index in the system — FTS, vector, spatial, and the secondary btree
+/// — is keyed by a row's global surrogate. A batch whose surrogate list is not
+/// parallel to its document list therefore cannot be indexed at all, and
+/// storing it would put rows in the collection that no index can ever return.
+/// The plan is rejected instead; the report exists because the malformation is
+/// upstream (a plan builder or a short WAL record), and the rejection alone
+/// says nothing about where it came from.
+pub(super) struct BatchInsertWithoutSurrogates<'a> {
+    /// Collection the malformed batch targeted.
+    pub collection: &'a str,
+    /// Rows the batch carried.
+    pub document_count: usize,
+    /// Surrogates it carried for them.
+    pub surrogate_count: usize,
+}
+
+impl DomainContext for BatchInsertWithoutSurrogates<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.batch_insert_without_surrogates"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The collection names the bug — one producer emitting malformed
+        // batches. The two counts are the occurrence: a client retrying the
+        // same malformed batch, or a replay walking many short records, would
+        // otherwise file a report per distinct batch size and bury the single
+        // fact that matters.
+        format!("collection={}", self.collection)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "collection": self.collection,
+            "document_count": self.document_count,
+            "surrogate_count": self.surrogate_count,
+            "why_fatal": "the batch is refused outright, so nothing is written and the \
+                          client is told the insert did not happen. It is filed anyway \
+                          because the defect is in whatever produced the plan, and that \
+                          producer is invisible from the rejection: the alternative — \
+                          storing the rows unindexed and reporting success — would leave \
+                          rows that full-text, vector, spatial, and secondary-index \
+                          lookups all silently omit",
+            "operator_action": "identify the producer: a native batch-insert builder \
+                                 assigns one surrogate per document, so a mismatch points \
+                                 either at a client path that bypassed assignment or at a \
+                                 truncated replicated write record",
+        })
+    }
+}
+
 /// What had already happened to the write whose response the Data Plane could
 /// not deliver.
 ///

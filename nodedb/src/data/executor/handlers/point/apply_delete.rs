@@ -180,9 +180,12 @@ impl CoreLoop {
                 // storage-mode-aware decoder so strict bitemporal deletes
                 // also tombstone their secondary-index entries instead of
                 // silently skipping this loop.
-                if let Some(config) = self.doc_configs.get(&config_key)
-                    && let Some(doc) = self.decode_stored_document(config, body)
-                {
+                if let Some(config) = self.doc_configs.get(&config_key) {
+                    // A body that will not decode leaves every index entry it
+                    // owns un-tombstoned, so the deleted row stays findable by
+                    // its old indexed values. That must fail the delete, not
+                    // skip the loop.
+                    let doc = self.decode_stored_document(config, body)?;
                     for path in config.index_paths.clone() {
                         for v in crate::engine::document::store::extract_index_values(
                             &doc,
@@ -245,8 +248,11 @@ impl CoreLoop {
         if !bitemporal
             && let Some(ref body) = prior
             && let Some(config) = self.doc_configs.get(&config_key)
-            && let Some(doc) = self.decode_stored_document(config, body)
         {
+            // A body that will not decode yields no rollback tuples, so a later
+            // rollback would restore the row with its secondary-index entries
+            // permanently missing. Fail the delete instead.
+            let doc = self.decode_stored_document(config, body)?;
             for path in config.index_paths.clone() {
                 if let Some(ref pred) = path.predicate
                     && !pred.evaluate_json(&doc)

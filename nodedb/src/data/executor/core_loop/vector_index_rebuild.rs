@@ -41,9 +41,6 @@ impl CoreLoop {
         }
 
         for (tenant_id, collection) in targets {
-            // These bodies are read RAW on purpose: they must NOT go through
-            // the shared sparse-body normalizer that the read paths use.
-            //
             // `entries` comes from the `CREATE VECTOR INDEX` param seed, so
             // every target here is a classic collection with a vector index
             // over a document field, and `apply_point_put_vector_indexes`
@@ -51,10 +48,28 @@ impl CoreLoop {
             // vector-primary collection has no vector field in its sidecar at
             // all — the vector lives only in the HNSW graph — and its
             // durability is served by `replay_direct_upsert` in
-            // `wal_replay_vector_extended` instead. Routing this scan through
-            // the sidecar normalizer would therefore rebuild nothing extra and
-            // would corrupt the classic rebuild it does serve.
+            // `wal_replay_vector_extended` instead. Normalizing a sidecar here
+            // would rebuild nothing extra and would corrupt the classic rebuild
+            // this serves, so that encoding is skipped rather than converted.
             //
+            // Every other encoding IS normalized, from the collection's
+            // registered kind: the forward write path hands
+            // `apply_point_put_vector_indexes` the MessagePack input, so
+            // feeding it a strict collection's stored Binary Tuple instead
+            // finds no vector field and silently leaves those embeddings out of
+            // the rebuilt index.
+            let body_format = self.sparse_body_format(
+                crate::types::DatabaseId::new(db),
+                crate::types::TenantId::new(tenant_id),
+                &collection,
+            );
+            if matches!(
+                body_format,
+                crate::data::executor::sparse_body_format::SparseBodyFormat::VectorSidecar
+            ) {
+                continue;
+            }
+
             // Collect first (the scan borrows `&self.sparse`); re-index after
             // the borrow ends so `&mut self` is free for the HNSW insert.
             let mut docs: Vec<(nodedb_types::Surrogate, Vec<u8>)> = Vec::new();
@@ -67,7 +82,12 @@ impl CoreLoop {
                     if let Some(surrogate) =
                         crate::engine::document::store::doc_id_to_surrogate(doc_id)
                     {
-                        docs.push((surrogate, value.to_vec()));
+                        let normalized =
+                            crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                                value,
+                                body_format.as_format_ref(),
+                            );
+                        docs.push((surrogate, normalized.into_owned()));
                     }
                     Ok(())
                 },

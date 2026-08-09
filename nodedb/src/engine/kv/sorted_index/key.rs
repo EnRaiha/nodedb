@@ -86,6 +86,55 @@ impl SortKeyEncoder {
         key
     }
 
+    /// Translate an inclusive `[min, max]` range over the FIRST sort column
+    /// into inclusive bounds in the encoded key space.
+    ///
+    /// A caller (`RANGE(index, lo, hi)`, `ZRANGEBYSCORE`) knows only the raw
+    /// value bytes of the leading score column, but the tree is ordered by
+    /// whole keys produced by [`Self::encode`] — length-prefixed, and
+    /// bit-complemented on a descending column. Comparing raw value bytes
+    /// against those keys matches nothing, so the bounds have to be lifted into
+    /// the same space here, where the framing rules live.
+    ///
+    /// Two consequences of that framing are handled:
+    ///
+    /// * complementing reverses order, so on a descending leading column the
+    ///   caller's `min` is the GREATER encoded bound and the two swap;
+    /// * a composite key continues past the leading column with the next
+    ///   column's 4-byte big-endian length, so the upper bound carries a
+    ///   `0xFF` tail. That tail exceeds every representable continuation —
+    ///   admitting every key whose leading column equals the bound — while
+    ///   still sorting below any key with a greater leading value.
+    pub fn first_column_range_bounds(
+        &self,
+        min: Option<&[u8]>,
+        max: Option<&[u8]>,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let descending = matches!(
+            self.columns.first().map(|col| col.direction),
+            Some(SortDirection::Desc)
+        );
+        let framed = |value: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(4 + value.len() + 4);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            if descending {
+                out.extend(value.iter().map(|byte| !byte));
+            } else {
+                out.extend_from_slice(value);
+            }
+            out
+        };
+
+        let (lower_source, upper_source) = if descending { (max, min) } else { (min, max) };
+        let lower = lower_source.map(&framed);
+        let upper = upper_source.map(|value| {
+            let mut bound = framed(value);
+            bound.extend_from_slice(&[0xFF; 4]);
+            bound
+        });
+        (lower, upper)
+    }
+
     /// Encode an i64 score as big-endian bytes suitable for sorting.
     ///
     /// Maps i64 to u64 by flipping the sign bit, so negative values sort
@@ -264,5 +313,88 @@ mod tests {
         assert_eq!(SortKeyEncoder::decode_timestamp_ms(&e1), ts1);
         assert_eq!(SortKeyEncoder::decode_timestamp_ms(&e2), ts2);
         assert!(e1 < e2);
+    }
+
+    fn encoder(direction: SortDirection) -> SortKeyEncoder {
+        SortKeyEncoder::new(vec![SortColumn {
+            name: "score".into(),
+            direction,
+        }])
+    }
+
+    /// A bound expressed in raw value bytes has to land inside the encoded key
+    /// space, or it is compared against a length prefix and matches nothing.
+    #[test]
+    fn ascending_bounds_bracket_the_keys_they_name() {
+        let enc = encoder(SortDirection::Asc);
+        let key_of = |v: i64| enc.encode(&[&SortKeyEncoder::encode_i64(v)[..]]);
+        let (lower, upper) = enc.first_column_range_bounds(
+            Some(&SortKeyEncoder::encode_i64(10)),
+            Some(&SortKeyEncoder::encode_i64(20)),
+        );
+        let (lower, upper) = (lower.expect("lower"), upper.expect("upper"));
+
+        for inside in [10, 15, 20] {
+            let key = key_of(inside);
+            assert!(key >= lower && key <= upper, "{inside} must be in range");
+        }
+        for outside in [9, 21] {
+            let key = key_of(outside);
+            assert!(key < lower || key > upper, "{outside} must be out of range");
+        }
+    }
+
+    /// Complementing a descending column reverses byte order, so the caller's
+    /// `min` becomes the GREATER encoded bound. Failing to swap them yields an
+    /// inverted, always-empty window.
+    #[test]
+    fn descending_bounds_are_swapped_into_key_order() {
+        let enc = encoder(SortDirection::Desc);
+        let key_of = |v: i64| enc.encode(&[&SortKeyEncoder::encode_i64(v)[..]]);
+        let (lower, upper) = enc.first_column_range_bounds(
+            Some(&SortKeyEncoder::encode_i64(10)),
+            Some(&SortKeyEncoder::encode_i64(20)),
+        );
+        let (lower, upper) = (lower.expect("lower"), upper.expect("upper"));
+
+        assert!(lower <= upper, "bounds must not be inverted");
+        for inside in [10, 15, 20] {
+            let key = key_of(inside);
+            assert!(key >= lower && key <= upper, "{inside} must be in range");
+        }
+        for outside in [9, 21] {
+            let key = key_of(outside);
+            assert!(key < lower || key > upper, "{outside} must be out of range");
+        }
+    }
+
+    /// The upper bound must admit every key whose LEADING column equals it,
+    /// including composite keys that carry more columns after it.
+    #[test]
+    fn upper_bound_admits_composite_keys_on_the_boundary() {
+        let enc = SortKeyEncoder::new(vec![
+            SortColumn {
+                name: "score".into(),
+                direction: SortDirection::Asc,
+            },
+            SortColumn {
+                name: "tiebreak".into(),
+                direction: SortDirection::Asc,
+            },
+        ]);
+        let key = enc.encode(&[&SortKeyEncoder::encode_i64(20)[..], b"zzz"]);
+        let (lower, upper) = enc.first_column_range_bounds(
+            Some(&SortKeyEncoder::encode_i64(10)),
+            Some(&SortKeyEncoder::encode_i64(20)),
+        );
+        let (lower, upper) = (lower.expect("lower"), upper.expect("upper"));
+
+        assert!(key >= lower && key <= upper);
+
+        let beyond = enc.encode(&[&SortKeyEncoder::encode_i64(21)[..], b""]);
+        assert!(
+            beyond > upper,
+            "the next score must stay outside the window"
+        );
     }
 }

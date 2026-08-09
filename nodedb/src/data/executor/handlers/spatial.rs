@@ -230,9 +230,12 @@ impl CoreLoop {
                         &raw,
                         body_format.as_format_ref(),
                     );
+                    // A candidate skipped here silently drops out of the
+                    // spatial result set, which reads as "no row matched the
+                    // geometry" rather than "a row could not be read".
                     match super::super::doc_format::decode_document_value(&doc_mp) {
-                        Some(d) => d,
-                        None => continue,
+                        Ok(d) => d,
+                        Err(e) => return self.response_error(task, e),
                     }
                 }
                 Ok(None) => {
@@ -259,8 +262,8 @@ impl CoreLoop {
                         continue;
                     };
                     match super::super::doc_format::decode_document_value(doc_mp) {
-                        Some(d) => d,
-                        None => continue,
+                        Ok(d) => d,
+                        Err(e) => return self.response_error(task, e),
                     }
                 }
                 Err(e) => {
@@ -385,9 +388,12 @@ impl CoreLoop {
                 }
             }
 
+            // A row skipped here silently drops out of the spatial result set,
+            // which reads as "no row matched the geometry" rather than "a row
+            // could not be read".
             let doc = match super::super::doc_format::decode_document_value(doc_bytes) {
-                Some(d) => d,
-                None => continue,
+                Ok(d) => d,
+                Err(e) => return self.response_error(task, e),
             };
 
             let doc_geom = match extract_geometry(&doc, field) {

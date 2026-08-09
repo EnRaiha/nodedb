@@ -6,7 +6,7 @@
 //! The pre-write (old) bytes of a row live in the collection's on-disk
 //! format: MessagePack for schemaless collections, Binary Tuple for strict
 //! collections. `doc_format::decode_document` only understands the former —
-//! it returns `None` for a Binary Tuple because decoding one requires the
+//! it fails on a Binary Tuple because decoding one requires the
 //! schema. This helper bridges that gap so the non-bitemporal secondary-index
 //! UPDATE diff and the DELETE rollback capture compute the real old index
 //! values for BOTH storage modes.
@@ -14,7 +14,6 @@
 use nodedb_physical::physical_plan::StorageMode;
 
 use crate::data::executor::doc_format;
-use crate::data::executor::strict_format;
 use crate::engine::document::store::CollectionConfig;
 
 use super::CoreLoop;
@@ -28,18 +27,21 @@ impl CoreLoop {
     /// - Schemaless collections → MessagePack/JSON auto-detect via
     ///   [`doc_format::decode_document`].
     ///
-    /// Returns `None` when the bytes cannot be decoded under the resolved
-    /// mode (e.g. malformed tuple). Intended for extracting old secondary
-    /// index values from the pre-write row; the NEW document is decoded
-    /// straight from the input JSON and does not need this path.
+    /// The bytes are a row that exists, so there is no "absent" answer here:
+    /// a body that will not decode under its own collection's storage mode is
+    /// on-disk state being wrong, and the error says which mode rejected it.
+    /// Intended for extracting old secondary index values from the pre-write
+    /// row; the NEW document is decoded straight from the input JSON and does
+    /// not need this path.
     pub(in crate::data::executor) fn decode_stored_document(
         &self,
         config: &CollectionConfig,
         bytes: &[u8],
-    ) -> Option<serde_json::Value> {
-        match &config.storage_mode {
-            StorageMode::Strict { schema } => strict_format::binary_tuple_to_json(bytes, schema),
-            StorageMode::Schemaless => doc_format::decode_document(bytes),
-        }
+    ) -> crate::Result<serde_json::Value> {
+        let strict_schema = match &config.storage_mode {
+            StorageMode::Strict { schema } => Some(schema),
+            StorageMode::Schemaless => None,
+        };
+        doc_format::decode_document_or_binary_tuple(bytes, strict_schema, "stored row body")
     }
 }

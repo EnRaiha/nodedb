@@ -8,7 +8,7 @@
 //! `versioned_index_tombstone_in_txn` per current indexed value. For a
 //! `document_strict` collection those stored bytes are a Binary Tuple, not
 //! MessagePack — decoding them with the schemaless-only
-//! `doc_format::decode_document` silently returns `None`, so the tombstone
+//! `doc_format::decode_document` fails, so the tombstone
 //! loop never runs and the old secondary-index entry survives the delete: a
 //! deleted strict+bitemporal document stays findable by its old indexed
 //! value. The fix routes the decode through `decode_stored_document`, which

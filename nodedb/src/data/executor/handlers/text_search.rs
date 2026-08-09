@@ -114,8 +114,8 @@ impl CoreLoop {
             .iter()
             .map(|r| (r.doc_id, r.score, r.fuzzy))
             .collect();
-        if let Some(txn_id) = task.request.txn_id {
-            self.merge_fts_overlay_into_results(
+        if let Some(txn_id) = task.request.txn_id
+            && let Err(e) = self.merge_fts_overlay_into_results(
                 FtsMergeParams {
                     txn_id,
                     database_id: task.request.database_id,
@@ -125,10 +125,12 @@ impl CoreLoop {
                     top_k: fetch_k,
                 },
                 &mut merged,
-            );
+            )
+        {
+            return self.response_error(task, e);
         }
 
-        let rows = self.hydrate_text_hits(
+        let rows = match self.hydrate_text_hits(
             merged,
             HydrateTextHitsParams {
                 database_id: task.request.database_id.as_u64(),
@@ -138,7 +140,10 @@ impl CoreLoop {
                 rls_filters,
                 txn_id: task.request.txn_id,
             },
-        );
+        ) {
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
 
         if let Some(ref m) = self.metrics {
             m.record_fts_search(0);
@@ -176,7 +181,7 @@ impl CoreLoop {
         &self,
         hits: I,
         params: HydrateTextHitsParams<'_>,
-    ) -> Vec<DocumentRow>
+    ) -> crate::Result<Vec<DocumentRow>>
     where
         I: IntoIterator<Item = (nodedb_types::Surrogate, f32, bool)>,
     {
@@ -252,7 +257,7 @@ impl CoreLoop {
                     }
                     Some(normalized)
                 };
-                decode_scanned_row(bytes, normalized.as_deref(), format.as_format_ref())
+                decode_scanned_row(bytes, normalized.as_deref(), format.as_format_ref())?
             } else {
                 serde_json::Value::Object(serde_json::Map::new())
             };
@@ -271,6 +276,6 @@ impl CoreLoop {
                 data: value,
             });
         }
-        rows
+        Ok(rows)
     }
 }

@@ -12,7 +12,7 @@ use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::dispatch::{dispatch_and_respond_json, dispatch_and_respond_rows, sorted_index_vshard};
+use super::dispatch::{SortedIndexTarget, dispatch_and_respond_json, dispatch_and_respond_rows};
 use super::gate::gate_read;
 use super::parse::{ddl_err, parse_function_args, parse_score_arg, unquote};
 
@@ -41,17 +41,20 @@ pub async fn select_rank(
     let index_name = unquote(&args[0]).to_lowercase();
     let key_value = unquote(&args[1]);
 
-    gate_read(state, identity, database_id, &index_name, RANK_WHAT)?;
+    let collection = gate_read(state, identity, database_id, &index_name, RANK_WHAT)?;
 
     let plan = PhysicalPlan::Kv(KvOp::SortedIndexRank {
-        index_name: index_name.clone(),
+        index_name,
         primary_key: key_value.into_bytes(),
     });
 
     dispatch_and_respond_json(
         state,
-        identity.tenant_id,
-        sorted_index_vshard(&index_name),
+        &SortedIndexTarget {
+            tenant_id: identity.tenant_id,
+            database_id,
+            collection: &collection,
+        },
         plan,
         "rank",
     )
@@ -81,17 +84,17 @@ pub async fn select_topk(
         )
     })?;
 
-    gate_read(state, identity, database_id, &index_name, TOPK_WHAT)?;
+    let collection = gate_read(state, identity, database_id, &index_name, TOPK_WHAT)?;
 
-    let plan = PhysicalPlan::Kv(KvOp::SortedIndexTopK {
-        index_name: index_name.clone(),
-        k,
-    });
+    let plan = PhysicalPlan::Kv(KvOp::SortedIndexTopK { index_name, k });
 
     dispatch_and_respond_rows(
         state,
-        identity.tenant_id,
-        sorted_index_vshard(&index_name),
+        &SortedIndexTarget {
+            tenant_id: identity.tenant_id,
+            database_id,
+            collection: &collection,
+        },
         plan,
     )
     .await
@@ -116,18 +119,21 @@ pub async fn select_range(
     let score_min = parse_score_arg(&args[1]);
     let score_max = parse_score_arg(&args[2]);
 
-    gate_read(state, identity, database_id, &index_name, RANGE_WHAT)?;
+    let collection = gate_read(state, identity, database_id, &index_name, RANGE_WHAT)?;
 
     let plan = PhysicalPlan::Kv(KvOp::SortedIndexRange {
-        index_name: index_name.clone(),
+        index_name,
         score_min,
         score_max,
     });
 
     dispatch_and_respond_rows(
         state,
-        identity.tenant_id,
-        sorted_index_vshard(&index_name),
+        &SortedIndexTarget {
+            tenant_id: identity.tenant_id,
+            database_id,
+            collection: &collection,
+        },
         plan,
     )
     .await
@@ -150,16 +156,17 @@ pub async fn select_sorted_count(
 
     let index_name = unquote(&args[0]).to_lowercase();
 
-    gate_read(state, identity, database_id, &index_name, COUNT_WHAT)?;
+    let collection = gate_read(state, identity, database_id, &index_name, COUNT_WHAT)?;
 
-    let plan = PhysicalPlan::Kv(KvOp::SortedIndexCount {
-        index_name: index_name.clone(),
-    });
+    let plan = PhysicalPlan::Kv(KvOp::SortedIndexCount { index_name });
 
     dispatch_and_respond_json(
         state,
-        identity.tenant_id,
-        sorted_index_vshard(&index_name),
+        &SortedIndexTarget {
+            tenant_id: identity.tenant_id,
+            database_id,
+            collection: &collection,
+        },
         plan,
         "sorted_count",
     )

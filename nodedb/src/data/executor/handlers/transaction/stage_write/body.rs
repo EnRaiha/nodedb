@@ -38,10 +38,20 @@ impl CoreLoop {
         );
 
         // Evaluate generated columns before encoding, matching the durable path.
+        //
+        // `value` is the body the staged statement carried in, never a row read
+        // back from the overlay or from base storage — the same invariant
+        // `CoreLoop::apply_point_put` states, and the reason this decode gates
+        // instead of failing: a body with no readable fields has no column for
+        // a generated expression to read or write, so it is staged as supplied.
+        // Mirroring the durable path here is the point — a staged body and its
+        // eventual COMMIT replay must agree on what was generated. Contrast
+        // `stage_apply_update` below, which decodes a body it just read out of
+        // the overlay and therefore propagates.
         let value: Vec<u8> = if let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.generated_columns.is_empty()
         {
-            if let Some(mut doc) = doc_format::decode_document(value) {
+            if let Ok(mut doc) = doc_format::decode_document(value) {
                 generated::evaluate_generated_columns(
                     &mut doc,
                     &config.enforcement.generated_columns,
@@ -142,10 +152,10 @@ impl CoreLoop {
                         engine: "binary_tuple".into(),
                         detail: "failed to decode Binary Tuple for staged update".into(),
                     })?,
-                None => doc_format::decode_document(current_bytes).ok_or_else(|| {
+                None => doc_format::decode_document(current_bytes).map_err(|e| {
                     crate::Error::Storage {
                         engine: "sparse".into(),
-                        detail: "failed to decode document for staged update".into(),
+                        detail: format!("failed to decode document for staged update: {e}"),
                     }
                 })?,
             };

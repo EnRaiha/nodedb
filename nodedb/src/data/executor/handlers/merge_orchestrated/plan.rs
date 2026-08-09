@@ -70,15 +70,15 @@ fn encode_doc_body(doc: &serde_json::Value) -> Vec<u8> {
 }
 
 /// Decode a stored target row into JSON, using the strict schema when present.
+///
+/// Fails rather than skipping the row: a target row the classifier cannot read
+/// is not "absent", and treating it as absent makes the MERGE fall through to
+/// its NOT MATCHED arm and insert a duplicate of a row that already exists.
 fn decode_target(
     bytes: &[u8],
     strict_schema: &Option<nodedb_types::columnar::StrictSchema>,
-) -> Option<serde_json::Value> {
-    if let Some(schema) = strict_schema {
-        crate::data::executor::strict_format::binary_tuple_to_json(bytes, schema)
-    } else {
-        doc_format::decode_document(bytes)
-    }
+) -> crate::Result<serde_json::Value> {
+    doc_format::decode_document_or_binary_tuple(bytes, strict_schema.as_ref(), "MERGE target row")
 }
 
 impl CoreLoop {
@@ -120,10 +120,7 @@ impl CoreLoop {
         let null_source = serde_json::Value::Null;
 
         for (doc_id, bytes) in &target_docs {
-            let target_doc = match decode_target(bytes, &strict_schema) {
-                Some(v) => v,
-                None => continue,
-            };
+            let target_doc = decode_target(bytes, &strict_schema)?;
             let join_val = target_doc
                 .get(params.target_join_col)
                 .map(json_to_str)

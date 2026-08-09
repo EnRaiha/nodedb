@@ -39,20 +39,31 @@ use crate::data::executor::{doc_format, strict_format};
 /// strict value→JSON coercions. That is exactly why `raw` stays required
 /// alongside `normalized`: the image is not a substitute for the stored bytes,
 /// only an alternative source for the encodings that are msgpack-shaped.
+///
+/// A row that will not decode under its resolved encoding is an error, not a
+/// `Null` document: a scan that renders it as `null` puts a row in the result
+/// set that no client can tell apart from one whose columns really are null,
+/// and the corruption never surfaces anywhere.
 pub(in crate::data::executor) fn decode_scanned_row(
     raw: &[u8],
     normalized: Option<&[u8]>,
     format: SparseBodyFormatRef<'_>,
-) -> serde_json::Value {
+) -> crate::Result<serde_json::Value> {
     match format {
-        SparseBodyFormatRef::Strict(schema) => strict_format::binary_tuple_to_json(raw, schema)
-            .or_else(|| doc_format::decode_document(raw)),
+        SparseBodyFormatRef::Strict(schema) => {
+            match strict_format::binary_tuple_to_json(raw, schema) {
+                Some(doc) => Ok(doc),
+                // A row written before the collection became strict is still a
+                // schemaless MessagePack body; its own decode error is the one
+                // worth reporting when that reading fails too.
+                None => doc_format::decode_document(raw),
+            }
+        }
         SparseBodyFormatRef::Document | SparseBodyFormatRef::VectorSidecar => match normalized {
             Some(image) => doc_format::decode_document(image),
             None => doc_format::decode_document(&sparse_body_to_msgpack(raw, format)),
         },
     }
-    .unwrap_or(serde_json::Value::Null)
 }
 
 /// Decode one sparse-store row to `serde_json::Value` from its stored bytes
@@ -66,7 +77,7 @@ pub(in crate::data::executor) fn decode_scanned_row(
 pub(in crate::data::executor) fn decode_scanned_document(
     value: &[u8],
     format: SparseBodyFormatRef<'_>,
-) -> serde_json::Value {
+) -> crate::Result<serde_json::Value> {
     decode_scanned_row(value, None, format)
 }
 
@@ -96,7 +107,8 @@ mod tests {
         let tuple = strict_format::value_to_binary_tuple(&Value::Object(map), &schema)
             .expect("encode strict tuple");
 
-        let decoded = decode_scanned_document(&tuple, SparseBodyFormatRef::Strict(&schema));
+        let decoded = decode_scanned_document(&tuple, SparseBodyFormatRef::Strict(&schema))
+            .expect("strict tuple must decode");
 
         assert_eq!(
             decoded,
@@ -124,7 +136,8 @@ mod tests {
         map.insert("owner".to_string(), Value::String("alice".into()));
         let tagged = zerompk::to_msgpack_vec(&map).expect("encode tagged sidecar");
 
-        let as_document = decode_scanned_document(&tagged, SparseBodyFormatRef::Document);
+        let as_document = decode_scanned_document(&tagged, SparseBodyFormatRef::Document)
+            .expect("a tagged map is still a valid msgpack map");
         assert_ne!(
             as_document.get("owner").and_then(|v| v.as_str()),
             Some("alice"),
@@ -132,7 +145,8 @@ mod tests {
              does, this test no longer proves the format parameter is load-bearing"
         );
 
-        let decoded = decode_scanned_document(&tagged, SparseBodyFormatRef::VectorSidecar);
+        let decoded = decode_scanned_document(&tagged, SparseBodyFormatRef::VectorSidecar)
+            .expect("sidecar must decode");
         assert_eq!(
             decoded.get("owner").and_then(|v| v.as_str()),
             Some("alice"),
@@ -165,8 +179,35 @@ mod tests {
         );
 
         assert_eq!(
-            decode_scanned_row(&tagged, Some(&*image), SparseBodyFormatRef::VectorSidecar),
-            decode_scanned_document(&tagged, SparseBodyFormatRef::VectorSidecar),
+            decode_scanned_row(&tagged, Some(&*image), SparseBodyFormatRef::VectorSidecar)
+                .expect("reused image must decode"),
+            decode_scanned_document(&tagged, SparseBodyFormatRef::VectorSidecar)
+                .expect("derived image must decode"),
+        );
+    }
+
+    /// An unreadable row is an error, never a `Null` document.
+    ///
+    /// A scan that renders it as `null` puts a row in the result set that no
+    /// client can distinguish from one whose columns really are null, so the
+    /// corruption never surfaces anywhere and the row count still looks right.
+    #[test]
+    fn an_undecodable_row_is_an_error_not_a_null_document() {
+        let mut body = nodedb_types::json_to_msgpack(&serde_json::json!({"id": "r1", "n": 7}))
+            .expect("encode");
+        assert!(
+            decode_scanned_document(&body, SparseBodyFormatRef::Document).is_ok(),
+            "baseline body must decode"
+        );
+
+        body.push(0xC0);
+        assert!(
+            decode_scanned_document(&body, SparseBodyFormatRef::Document).is_err(),
+            "a body with a trailing byte must not decode to Null"
+        );
+        assert!(
+            decode_scanned_row(&body, Some(&body), SparseBodyFormatRef::Document).is_err(),
+            "the reused-image path must reject it the same way"
         );
     }
 
@@ -198,7 +239,8 @@ mod tests {
         );
 
         assert_eq!(
-            decode_scanned_row(&tuple, Some(&*image), SparseBodyFormatRef::Strict(&schema)),
+            decode_scanned_row(&tuple, Some(&*image), SparseBodyFormatRef::Strict(&schema))
+                .expect("strict tuple must decode"),
             serde_json::json!({"id": "u1", "name": "Ada"}),
         );
     }

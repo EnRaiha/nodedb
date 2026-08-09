@@ -6,10 +6,14 @@
 //! response hot paths. Uses MessagePack (`zerompk`) for serialization which
 //! is 2-3x faster and 30-50% smaller than JSON.
 //!
+//! Every encoder here emits MessagePack, including the ones named for the
+//! `serde_json::Value` they take. `decode_payload` / `decode_payload_to_json`
+//! are their counterparts — see `encode`'s module docs.
+//!
 //! Split by concern:
 //!
-//! - `encode` — generic encoders + the JSON/msgpack transcoder used by
-//!   `decode_payload_to_json` at the Control Plane boundary.
+//! - `encode` — generic encoders + the `decode_payload` /
+//!   `decode_payload_to_json` counterparts used at the Control Plane boundary.
 //! - `decode` — payload→docs decoders for inline sub-plans (e.g. multi-way
 //!   joins consuming an inner-join Response).
 //! - `raw` — raw-msgpack passthrough encoders (`encode_raw_document_rows`,
@@ -29,9 +33,9 @@ mod tests;
 
 pub use arrow::encode_as_arrow_ipc;
 pub(in crate::data::executor) use decode::decode_response_to_docs;
-pub use encode::decode_payload_to_json;
+pub use encode::{decode_payload, decode_payload_to_json};
 pub(in crate::data::executor) use encode::{
-    encode, encode_count, encode_json, encode_json_vec, encode_serde, encode_value_vec,
+    encode, encode_count, encode_json, encode_json_vec_as_msgpack, encode_serde, encode_value_vec,
 };
 #[allow(unused_imports)]
 pub(crate) use hits::ArrayAggregateResponse;

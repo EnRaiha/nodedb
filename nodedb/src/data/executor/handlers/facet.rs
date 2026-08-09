@@ -146,10 +146,25 @@ impl CoreLoop {
         }
 
         // Fallback: scan matching documents, extract field from msgpack, count.
+        //
+        // The bodies are STORED rows, so the encoding comes from the
+        // collection's registered kind. Normalizing them as documents leaves a
+        // strict collection's Binary Tuple untouched — `extract_field` then
+        // finds nothing in every row and the facet reports an empty count
+        // rather than an error, so the facet silently disagrees with the scan
+        // that produced `matching_ids`.
+        let body_format = self.sparse_body_format(
+            crate::types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tid),
+            collection,
+        );
         let mut counts: HashMap<String, usize> = HashMap::new();
         for doc_id in matching_ids {
             if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, doc_id) {
-                let mp = super::super::doc_format::json_to_msgpack(&bytes);
+                let mp = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                    &bytes,
+                    body_format.as_format_ref(),
+                );
                 if let Some((start, end)) = nodedb_query::msgpack_scan::extract_field(&mp, 0, field)
                 {
                     let value_str = if let Some(s) =

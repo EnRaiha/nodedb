@@ -76,14 +76,19 @@ pub(super) fn owning_collection(
 /// `what` completes the sentence "RLS policies on '<collection>' are not
 /// supported with {what}", so it names the function and says what its result
 /// carries instead of rows.
+///
+/// Returns the owning collection the read was gated on. That collection is also
+/// what routes the read to the one core holding the index's tree
+/// (`super::dispatch::SortedIndexTarget`), so the gate and the dispatch resolve
+/// it once, together, and cannot name different collections.
 pub(super) fn gate_read(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     index_name: &str,
     what: &str,
-) -> Result<(), DdlError> {
+) -> Result<String, DdlError> {
     let collection = owning_collection(state, identity, database_id, index_name)?;
     RefusingReadGate::open(state, identity, database_id, &collection, what)?;
-    Ok(())
+    Ok(collection)
 }

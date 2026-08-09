@@ -27,156 +27,61 @@ pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
 }
 
 impl CoreLoop {
+    /// Insert a page of documents.
+    ///
+    /// Every index in the system — FTS, vector, spatial, and the secondary
+    /// btree — is keyed by a row's global surrogate, so a batch is only
+    /// insertable when it carries one surrogate per document. A batch that does
+    /// not is refused here rather than stored: writing those rows would put
+    /// documents in the collection that no index can ever return, while
+    /// reporting the insert as successful. There is no partial answer to give —
+    /// the surrogate list IS the rows' identity, and it is the part that is
+    /// missing.
     pub(in crate::data::executor) fn execute_document_batch_insert(
         &mut self,
         task: &ExecutionTask,
         params: DocumentBatchInsertParams<'_>,
     ) -> Response {
-        let DocumentBatchInsertParams {
-            tid,
-            collection,
-            documents,
-            surrogates,
-            returning,
-            rls_filters,
-        } = params;
-        debug!(core = self.core_id, %collection, count = documents.len(), "document batch insert");
+        debug!(
+            core = self.core_id,
+            collection = %params.collection,
+            count = params.documents.len(),
+            "document batch insert"
+        );
 
-        // When per-row surrogates are parallel to the documents, run the batch
-        // as ONE atomic, fully cross-engine-indexed insert: each row is applied
-        // via `apply_point_put` (document store + FTS + vector + spatial +
-        // secondary indexes) inside a single redb transaction, keyed by the
-        // row's stable surrogate. A search hit from any cross-engine index then
-        // resolves back to the row's identity, and the whole page lands or none
-        // of it does (any per-row error rolls the transaction back). The legacy
-        // raw `batch_put` path below is kept only for callers that do not supply
-        // parallel surrogates (no cross-engine identity available).
-        if !documents.is_empty() && surrogates.len() == documents.len() {
-            return self.execute_document_batch_insert_indexed(
-                task,
-                DocumentBatchInsertParams {
-                    tid,
-                    collection,
-                    documents,
-                    surrogates,
-                    returning,
-                    rls_filters,
-                },
+        if params.surrogates.len() != params.documents.len() {
+            // Recorded here, at the detection site, and never re-emitted as the
+            // rejection propagates: the malformation is upstream (a plan
+            // builder, or a replicated write record that lost rows), and the
+            // error the caller receives names only the symptom.
+            crate::diag::batch_insert_without_surrogates(
+                params.collection,
+                params.documents.len(),
+                params.surrogates.len(),
             );
-        }
-
-        let converted: Vec<(String, Vec<u8>)> = documents
-            .iter()
-            .map(|(id, val)| {
-                (
-                    id.clone(),
-                    super::super::super::doc_format::canonicalize_document_for_storage(val),
-                )
-            })
-            .collect();
-        let refs: Vec<(&str, &[u8])> = converted
-            .iter()
-            .map(|(id, val)| (id.as_str(), val.as_slice()))
-            .collect();
-        // FTS indexing requires a valid Surrogate per document. When `surrogates`
-        // is parallel to `documents` (same length), each entry can be used. When
-        // the field is absent/mismatched (legacy callers), FTS indexing is skipped
-        // — surface this loudly so missing search results are diagnosable.
-        let fts_enabled = surrogates.len() == documents.len();
-        if !fts_enabled && !documents.is_empty() {
             warn!(
                 core = self.core_id,
-                %collection,
-                doc_count = documents.len(),
-                surrogate_count = surrogates.len(),
-                "document batch insert without parallel surrogates: FTS indexing skipped"
+                collection = %params.collection,
+                doc_count = params.documents.len(),
+                surrogate_count = params.surrogates.len(),
+                "document batch insert without a surrogate per row; rejecting the batch"
             );
-        }
-        match self
-            .sparse
-            .batch_put(task.request.database_id.as_u64(), tid, collection, &refs)
-        {
-            Ok(()) => {
-                // Auto-index text fields for full-text search (same as PointPut).
-                // Also extract secondary indexes for any registered collection config.
-                let config_key = (
-                    task.request.database_id,
-                    crate::types::TenantId::new(tid),
-                    collection.to_string(),
-                );
-                let index_paths: Vec<crate::engine::document::store::IndexPath> = self
-                    .doc_configs
-                    .get(&config_key)
-                    .map(|c| c.index_paths.clone())
-                    .unwrap_or_default();
-                for (i, (doc_id, val)) in documents.iter().enumerate() {
-                    if let Some(doc) = super::super::super::doc_format::decode_document(val) {
-                        // Full-text inverted index (includes nested block content).
-                        // Only index when a valid Surrogate is available.
-                        if fts_enabled {
-                            let surrogate = surrogates[i];
-                            // Surrogate::ZERO is the "unassigned" sentinel — the
-                            // upstream allocator hasn't assigned a real id, so we
-                            // must not write it into the FTS index.
-                            if surrogate != nodedb_types::Surrogate::ZERO {
-                                let text_content =
-                                    super::text_extract::extract_indexable_text(&doc);
-                                if !text_content.is_empty() {
-                                    let _ = self.inverted.index_document(
-                                        task.request.database_id.as_u64(),
-                                        crate::types::TenantId::new(tid),
-                                        collection,
-                                        surrogate,
-                                        &text_content,
-                                    );
-                                }
-                            }
-                        }
-
-                        // Secondary index extraction (insert-only path: no prior
-                        // document, so the diff is pure adds; tuples unused).
-                        let _ = self.apply_secondary_indexes(
-                            crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
-                                database_id: task.request.database_id.as_u64(),
-                                tid,
-                                collection,
-                                old_doc: None,
-                                new_doc: &doc,
-                                doc_id,
-                                index_paths: &index_paths,
-                            },
-                        );
-                    }
-                }
-
-                if let Some(ref m) = self.metrics {
-                    m.record_document_insert();
-                }
-                if let Some(spec) = returning {
-                    // This path stores `converted` verbatim (no strict re-encode
-                    // is reachable here — it runs only for callers with no
-                    // surrogates, which are schemaless), so the canonicalized
-                    // bodies ARE the stored post-images.
-                    return self.stored_returning_response(task, spec, rls_filters, None, &refs);
-                }
-                match super::super::super::response_codec::encode_count("inserted", documents.len())
-                {
-                    Ok(bytes) => self.response_with_payload(task, bytes),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
-                }
-            }
-            Err(e) => self.response_error(
+            return self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: e.to_string(),
+                    detail: format!(
+                        "document batch insert for '{}' carries {} documents but {} \
+                         surrogates; every cross-engine index is surrogate-keyed, so these \
+                         rows cannot be indexed and are not written",
+                        params.collection,
+                        params.documents.len(),
+                        params.surrogates.len(),
+                    ),
                 },
-            ),
+            );
         }
+
+        self.execute_document_batch_insert_indexed(task, params)
     }
 
     /// Atomic, fully-indexed batch insert (surrogates parallel to documents).
@@ -461,5 +366,201 @@ impl CoreLoop {
         }
 
         self.response_ok(task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::TableDefinition;
+
+    use super::DocumentBatchInsertParams;
+    use crate::bridge::envelope::{Priority, Request, Status};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::engine::document::store::surrogate_to_doc_id;
+    use crate::engine::sparse::fts_redb::tables::DOC_LENGTHS;
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    use nodedb_types::Surrogate;
+    use std::time::{Duration, Instant};
+
+    const TID: u64 = 1;
+    const COLL: &str = "articles";
+
+    /// Raw JSON bodies with real words in them, so each row has text the
+    /// inverted index actually has to accept for the write to be searchable.
+    fn bodies() -> Vec<(String, Vec<u8>)> {
+        vec![
+            ("d1".to_string(), br#"{"title":"alpha bravo"}"#.to_vec()),
+            ("d2".to_string(), br#"{"title":"charlie delta"}"#.to_vec()),
+        ]
+    }
+
+    /// A table sharing `DOC_LENGTHS`'s redb name but with incompatible
+    /// key/value types, so every inverted-index write fails structurally.
+    const POISONED_DOC_LENGTHS: TableDefinition<u64, u64> =
+        TableDefinition::new("text.doc_lengths");
+
+    fn poison_inverted_index(core: &CoreLoop) {
+        let db = core.sparse.db().clone();
+        let txn = db.begin_write().unwrap();
+        txn.delete_table(DOC_LENGTHS).unwrap();
+        txn.open_table(POISONED_DOC_LENGTHS).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn batch_task(documents: &[(String, Vec<u8>)], surrogates: &[Surrogate]) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(TID),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection: COLL.into(),
+                documents: documents.to_vec(),
+                surrogates: surrogates.to_vec(),
+                returning: None,
+                rls_filters: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: crate::bridge::envelope::Admission::Admitted,
+        })
+    }
+
+    fn stored(core: &CoreLoop, surrogate: Surrogate) -> Option<Vec<u8>> {
+        core.sparse
+            .get(
+                DatabaseId::DEFAULT.as_u64(),
+                TID,
+                COLL,
+                &surrogate_to_doc_id(surrogate),
+            )
+            .unwrap()
+    }
+
+    fn corpus_size(core: &CoreLoop) -> u32 {
+        core.inverted
+            .corpus_stats(DatabaseId::DEFAULT.as_u64(), TenantId::new(TID), COLL)
+            .unwrap()
+            .0
+    }
+
+    /// Control: with a healthy index the batch lands AND both rows are counted
+    /// into the FTS corpus. Without this, a passing failure test could not tell
+    /// "the poison caused the rejection" from "this batch was never insertable".
+    #[test]
+    fn a_healthy_batch_commits_every_row_and_indexes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let documents = bodies();
+        let surrogates = vec![Surrogate(11), Surrogate(12)];
+
+        let task = batch_task(&documents, &surrogates);
+        let resp = core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: COLL,
+                documents: &documents,
+                surrogates: &surrogates,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
+
+        assert_eq!(resp.status, Status::Ok);
+        assert!(stored(&core, Surrogate(11)).is_some());
+        assert!(stored(&core, Surrogate(12)).is_some());
+        assert_eq!(
+            corpus_size(&core),
+            2,
+            "both committed rows must be in the FTS corpus"
+        );
+    }
+
+    /// The defect this guards: a row whose indexing failed used to be committed
+    /// anyway and counted into `inserted`, so the client was told the write
+    /// succeeded while full-text search could never return the row and nothing
+    /// — not replay, not the next write — would re-index it. The batch must now
+    /// fail as a whole, leaving no row behind and no partial corpus.
+    #[test]
+    fn a_row_that_cannot_be_indexed_fails_the_whole_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        poison_inverted_index(&core);
+        let documents = bodies();
+        let surrogates = vec![Surrogate(21), Surrogate(22)];
+
+        let task = batch_task(&documents, &surrogates);
+        let resp = core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: COLL,
+                documents: &documents,
+                surrogates: &surrogates,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
+
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "the client must be told the batch failed, not receive a success count \
+             for rows full-text search will never return"
+        );
+        assert!(
+            stored(&core, Surrogate(21)).is_none() && stored(&core, Surrogate(22)).is_none(),
+            "an indexing failure on any row must roll the whole batch back — a stored \
+             row whose index update failed is invisible to search forever"
+        );
+    }
+
+    /// A batch carrying fewer surrogates than documents has no cross-engine
+    /// identity for its rows, so every index would silently omit them. It is
+    /// refused outright rather than stored-and-reported-successful.
+    #[test]
+    fn a_batch_without_a_surrogate_per_row_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let documents = bodies();
+        let surrogates = vec![Surrogate(31)];
+
+        let task = batch_task(&documents, &surrogates);
+        let resp = core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: COLL,
+                documents: &documents,
+                surrogates: &surrogates,
+                returning: None,
+                rls_filters: &[],
+            },
+        );
+
+        assert_eq!(resp.status, Status::Error);
+        assert!(
+            stored(&core, Surrogate(31)).is_none(),
+            "a batch with no identity for every row must write no row at all"
+        );
+        assert_eq!(
+            corpus_size(&core),
+            0,
+            "and must leave nothing in the FTS corpus"
+        );
     }
 }

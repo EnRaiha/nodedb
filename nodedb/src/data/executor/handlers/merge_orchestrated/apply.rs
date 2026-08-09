@@ -2,12 +2,17 @@
 
 //! MERGE APPLY pass: verify the resolve→apply prediction, then atomically
 //! apply every arm's writes with the Control-Plane-pre-assigned surrogates.
+//!
+//! This file owns the drift verification and the single redb write transaction
+//! the UPDATE and INSERT arms share. The two things that cannot live under that
+//! transaction have their own files: unwinding a partial apply (`abort`) and
+//! the DELETE arms, whose cascade opens transactions of its own and therefore
+//! runs after the commit (`delete_arms`).
 
 use std::collections::HashMap;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::response_codec::encode_json;
@@ -17,68 +22,11 @@ use nodedb_types::Surrogate;
 
 use super::super::merge::MergeParams;
 use super::super::returning_rows;
+use super::abort::MergeAbort;
 use super::apply_support::{MergePutEvent, gate_merge_arms, record_put_index_undo, returning_doc};
-
-/// Everything [`CoreLoop::abort_merge_apply`] needs to unwind a partially
-/// applied MERGE and surface the terminating error.
-struct MergeAbort<'a> {
-    task: &'a ExecutionTask,
-    database_id: u64,
-    tid: u64,
-    collection: &'a str,
-    applied_keys: &'a [String],
-    undo_log: Vec<UndoEntry>,
-    err: ErrorCode,
-}
+use super::delete_arms::{MergeDeleteArms, MergeDeleteTally};
 
 impl CoreLoop {
-    /// Evict cached document copies for rows written into a rolled-back apply
-    /// transaction. `apply_point_put` populates the document cache BEFORE its
-    /// UNIQUE check, so a row that fails the check — and every row rolled back
-    /// when the shared txn is dropped — leaves a stale cache entry that a later
-    /// point lookup would resurrect. Eviction is always safe: the worst case is
-    /// a cache miss that falls through to the (correctly rolled-back) store.
-    /// Mirrors the transaction-undo path's cache eviction.
-    fn rollback_merge_cache(
-        &mut self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        keys: &[String],
-    ) {
-        for key in keys {
-            self.doc_cache.invalidate(database_id, tid, collection, key);
-        }
-    }
-
-    /// Abort the apply pass: reverse the in-memory vector/spatial index deltas
-    /// applied so far, evict the stale document-cache entries, and surface the
-    /// error. The shared redb write transaction (dropped uncommitted once this
-    /// returns) reverses the document store, secondary btree, FTS, and column
-    /// stats; the HNSW and R-tree live outside it and are reversed here via the
-    /// canonical undo driver. An undo failure leaves shard state unknown, so it
-    /// escalates to `RollbackFailed` rather than the original error.
-    fn abort_merge_apply(&mut self, p: MergeAbort<'_>) -> Response {
-        let MergeAbort {
-            task,
-            database_id,
-            tid,
-            collection,
-            applied_keys,
-            undo_log,
-            err,
-        } = p;
-        let final_err = match self.rollback_undo_log(database_id, tid, undo_log) {
-            Ok(()) => err,
-            Err((entry_index, detail)) => ErrorCode::RollbackFailed {
-                entry_index,
-                detail,
-            },
-        };
-        self.rollback_merge_cache(database_id, tid, collection, applied_keys);
-        self.response_error(task, final_err)
-    }
-
     /// APPLY pass: verify the resolve→apply prediction, then atomically apply.
     pub(in crate::data::executor) fn execute_merge_apply(
         &mut self,
@@ -217,10 +165,21 @@ impl CoreLoop {
                                     value: upd.body.clone(),
                                 });
                             }
-                            if params.returning.is_some()
-                                && let Some(doc) = returning_doc(&upd.body, &row_key)
-                            {
-                                returned_docs.push(doc);
+                            if params.returning.is_some() {
+                                match returning_doc(&upd.body, &row_key) {
+                                    Ok(doc) => returned_docs.push(doc),
+                                    Err(e) => {
+                                        return self.abort_merge_apply(MergeAbort {
+                                            task,
+                                            database_id,
+                                            tid,
+                                            collection: params.target_collection,
+                                            applied_keys: &applied_keys,
+                                            undo_log,
+                                            err: e.into(),
+                                        });
+                                    }
+                                }
                             }
                             put_events.push((row_key, upd.body.as_slice(), outcome.prior_value));
                             affected += 1;
@@ -261,10 +220,21 @@ impl CoreLoop {
                             err: e.into(),
                         });
                     }
-                    if params.returning.is_some()
-                        && let Some(doc) = returning_doc(&upd.body, &upd.doc_id)
-                    {
-                        returned_docs.push(doc);
+                    if params.returning.is_some() {
+                        match returning_doc(&upd.body, &upd.doc_id) {
+                            Ok(doc) => returned_docs.push(doc),
+                            Err(e) => {
+                                return self.abort_merge_apply(MergeAbort {
+                                    task,
+                                    database_id,
+                                    tid,
+                                    collection: params.target_collection,
+                                    applied_keys: &applied_keys,
+                                    undo_log,
+                                    err: e.into(),
+                                });
+                            }
+                        }
                     }
                     affected += 1;
                 }
@@ -315,10 +285,21 @@ impl CoreLoop {
                             value: ins.body.clone(),
                         });
                     }
-                    if params.returning.is_some()
-                        && let Some(doc) = returning_doc(&ins.body, &row_key)
-                    {
-                        returned_docs.push(doc);
+                    if params.returning.is_some() {
+                        match returning_doc(&ins.body, &row_key) {
+                            Ok(doc) => returned_docs.push(doc),
+                            Err(e) => {
+                                return self.abort_merge_apply(MergeAbort {
+                                    task,
+                                    database_id,
+                                    tid,
+                                    collection: params.target_collection,
+                                    applied_keys: &applied_keys,
+                                    undo_log,
+                                    err: e.into(),
+                                });
+                            }
+                        }
                     }
                     put_events.push((row_key, ins.body.as_slice(), None));
                     affected += 1;
@@ -364,76 +345,25 @@ impl CoreLoop {
             );
         }
 
-        // Phase B: DELETE arms. `apply_point_delete`'s cascade (document store,
-        // FTS, spatial, HNSW vector, secondary indexes) opens its own
-        // transactions, so it must run after the put commit rather than inside
-        // the shared txn. These arms only ever hit existing registered rows.
-        for del in &plan.deletes {
-            match del.surrogate {
-                Some(surrogate) => {
-                    match self.apply_point_delete(PointDeleteParams {
-                        database_id,
-                        tid,
-                        collection: params.target_collection,
-                        document_id: &del.doc_id,
-                        surrogate,
-                        user_roles: &task.request.user_roles,
-                        enforce: true,
-                    }) {
-                        Ok(outcome) => {
-                            if outcome.prior_value.is_some() {
-                                affected += 1;
-                                // A DELETE arm returns the PRE-image — the row
-                                // as it was classified, since nothing survives
-                                // the delete to project. Taken from the plan's
-                                // captured body rather than `prior_value`, which
-                                // is the raw stored form (Binary Tuple on a
-                                // strict target) and would need re-decoding.
-                                if params.returning.is_some()
-                                    && let Some(doc) = returning_doc(&del.body, &del.doc_id)
-                                {
-                                    returned_docs.push(doc);
-                                }
-                                if has_vectors {
-                                    write_set.push(WriteSetEntry {
-                                        surrogate: surrogate.as_u32(),
-                                        is_delete: true,
-                                        value: Vec::new(),
-                                    });
-                                }
-                            }
-                            let row_key = surrogate_to_doc_id(surrogate);
-                            self.emit_write_event(
-                                task,
-                                params.target_collection,
-                                crate::event::WriteOp::Delete,
-                                &row_key,
-                                None,
-                                outcome.prior_value.as_deref(),
-                            );
-                        }
-                        Err(e) => return self.response_error(task, e),
-                    }
-                }
-                None => {
-                    if let Err(e) =
-                        self.sparse
-                            .delete(database_id, tid, params.target_collection, &del.doc_id)
-                    {
-                        return self.response_error(task, e);
-                    }
-                    // Legacy non-surrogate row: the raw delete reports no prior
-                    // value, so the plan's captured pre-image is the only image
-                    // of the removed row — without it a RETURNING delete of such
-                    // a row would silently drop it from the result set.
-                    if params.returning.is_some()
-                        && let Some(doc) = returning_doc(&del.body, &del.doc_id)
-                    {
-                        returned_docs.push(doc);
-                    }
-                    affected += 1;
-                }
-            }
+        // Phase B: DELETE arms, applied after the put commit because their
+        // cascade opens its own transactions.
+        if let Err(response) = self.apply_merge_delete_arms(
+            MergeDeleteArms {
+                task,
+                database_id,
+                tid,
+                collection: params.target_collection,
+                deletes: &plan.deletes,
+                has_vectors,
+                returning: params.returning.is_some(),
+            },
+            MergeDeleteTally {
+                affected: &mut affected,
+                write_set: &mut write_set,
+                returned_docs: &mut returned_docs,
+            },
+        ) {
+            return response;
         }
 
         let mut response = if let Some(spec) = params.returning {

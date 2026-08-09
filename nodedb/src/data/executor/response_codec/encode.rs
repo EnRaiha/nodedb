@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Generic encoders for Data Plane response payloads, plus the
-//! `decode_payload_to_json` transcoder used at the Control Plane boundary.
+//! `decode_payload` / `decode_payload_to_json` counterparts used at the Control
+//! Plane boundary.
+//!
+//! # Every encoder here emits MessagePack
+//!
+//! Including the ones whose names mention JSON: `encode_json` and
+//! `encode_json_vec_as_msgpack` are named for the `serde_json::Value` they
+//! TAKE, never for what they produce. A Control-Plane caller that hands these
+//! bytes to a JSON parser gets a parse failure on the first byte, and a caller
+//! that then defaults the failure away (`unwrap_or_default`, `if let Ok`)
+//! reports a successful empty result for every query — which is silent data
+//! loss, not a degraded mode. Read a payload back with [`decode_payload`] (or
+//! [`decode_payload_to_json`] for the text form); nothing else is a correct
+//! counterpart.
+
+use serde::de::DeserializeOwned;
 
 /// Serialize a response payload as MessagePack bytes.
 ///
 /// Drop-in replacement for `serde_json::to_vec(&value)` in handler code.
 /// Returns MessagePack bytes that are 30-50% smaller and 2-3x faster to
-/// produce than JSON.
+/// produce than JSON. Read back with [`decode_payload`].
 pub(in crate::data::executor) fn encode<T: zerompk::ToMessagePack>(
     value: &T,
 ) -> crate::Result<Vec<u8>> {
@@ -16,7 +31,10 @@ pub(in crate::data::executor) fn encode<T: zerompk::ToMessagePack>(
     })
 }
 
-/// Encode a serde_json::Value payload as MessagePack bytes.
+/// Encode a `serde_json::Value` payload as MessagePack bytes.
+///
+/// Named for its INPUT: the output is MessagePack, like every encoder in this
+/// module. Read back with [`decode_payload`] / [`decode_payload_to_json`].
 pub(in crate::data::executor) fn encode_json(value: &serde_json::Value) -> crate::Result<Vec<u8>> {
     nodedb_types::json_to_msgpack(value).map_err(|e| crate::Error::Codec {
         detail: format!("response serialization: {e}"),
@@ -27,7 +45,7 @@ pub(in crate::data::executor) fn encode_json(value: &serde_json::Value) -> crate
 ///
 /// Serializes via serde to an intermediate `serde_json::Value`, then converts
 /// to MessagePack. Use `encode()` for types that implement `ToMessagePack`
-/// directly (faster, no intermediate).
+/// directly (faster, no intermediate). Read back with [`decode_payload`].
 pub(in crate::data::executor) fn encode_serde<T: serde::Serialize>(
     value: &T,
 ) -> crate::Result<Vec<u8>> {
@@ -37,8 +55,13 @@ pub(in crate::data::executor) fn encode_serde<T: serde::Serialize>(
     encode_json(&json_value)
 }
 
-/// Encode a Vec of serde_json::Value as MessagePack bytes.
-pub(in crate::data::executor) fn encode_json_vec(
+/// Encode a slice of `serde_json::Value` rows as MessagePack bytes.
+///
+/// The name carries `as_msgpack` because the old one (`encode_json_vec`) read
+/// as "encode to JSON" and was taken that way by four separate Control-Plane
+/// decoders, each of which parsed these bytes as JSON, failed, and defaulted
+/// the failure into an empty row set. Read back with [`decode_payload`].
+pub(in crate::data::executor) fn encode_json_vec_as_msgpack(
     values: &[serde_json::Value],
 ) -> crate::Result<Vec<u8>> {
     let wrapped: Vec<nodedb_types::JsonValue> = values
@@ -82,6 +105,30 @@ pub(in crate::data::executor) fn encode_count(key: &str, count: usize) -> crate:
     map.insert(key, count);
     zerompk::to_msgpack_vec(&map).map_err(|e| crate::Error::Codec {
         detail: format!("count response serialization: {e}"),
+    })
+}
+
+/// Deserialize a Data-Plane response payload into `T`.
+///
+/// THE counterpart to the encoders above, and the only correct way for a
+/// Control-Plane caller to read one of their payloads back. Every encoder in
+/// this module emits MessagePack — including `encode_json` and
+/// `encode_json_vec_as_msgpack`, which are named for the `serde_json::Value`
+/// they take — so a bare `sonic_rs::from_slice` / `serde_json::from_slice` on
+/// these bytes fails on the first byte, every time.
+///
+/// An empty payload yields `T::default()`: a handler with nothing to report
+/// sends no bytes, and for the row-shaped `T`s these callers use that is an
+/// empty result, not a failure. A NON-empty payload that will not deserialize
+/// is an error, never a default — that is the distinction whose absence turned
+/// four decode bugs into silently empty answers instead of loud ones.
+pub fn decode_payload<T: DeserializeOwned + Default>(payload: &[u8]) -> crate::Result<T> {
+    if payload.is_empty() {
+        return Ok(T::default());
+    }
+    let text = decode_payload_to_json(payload);
+    sonic_rs::from_str(&text).map_err(|e| crate::Error::Codec {
+        detail: format!("response payload could not be decoded: {e}"),
     })
 }
 

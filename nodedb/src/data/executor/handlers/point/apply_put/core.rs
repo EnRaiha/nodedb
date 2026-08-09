@@ -9,13 +9,11 @@ use redb::WriteTransaction;
 use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::enforcement::{
-    append_only, period_lock, state_transition, transition_check,
-};
 use crate::data::executor::handlers::generated;
 use crate::data::executor::{doc_format, strict_format};
 
-use super::types::{PointPutOutcome, PointPutParams, map_enforcement_error};
+use super::enforce::PutEnforcement;
+use super::types::{PointPutOutcome, PointPutParams};
 use super::unique::{UniqueCheck, check_unique_constraints};
 
 impl CoreLoop {
@@ -40,6 +38,35 @@ impl CoreLoop {
     /// a fully-reversible undo entry. Autocommit callers read only
     /// `prior_value` and thread it into `emit_write_event` so the Event Plane's
     /// `WriteOp` tag reflects the actual mutation.
+    ///
+    /// # `value` is an incoming body, so failing to read it as a document is an answer
+    ///
+    /// `value` always arrives WITH the write — a client PointPut / PointInsert
+    /// body, an UPSERT body, a batch-insert row, a MERGE arm's post-image, a
+    /// staged sub-plan body, a CRDT-sync delta, or a WAL redo post-image. It is
+    /// never a row this function read back out of the store in order to
+    /// reconcile something against it. Its only guaranteed property is that the
+    /// collection accepts it: a schemaless MessagePack/JSON map, a strict
+    /// collection's pre-encode MessagePack, or an opaque body that is neither —
+    /// notably a strict row's Binary Tuple during WAL redo replay, where
+    /// `doc_configs` is empty and `doc_format::decode_document` cannot read a
+    /// Binary Tuple without the schema by design.
+    ///
+    /// That is why the `if let Ok(doc) = decode_document(value)` guards below
+    /// are not swallowed errors. Each one gates a per-FIELD derivation —
+    /// generated columns, FTS text, column statistics, secondary/UNIQUE index
+    /// values, geometry detection — and a body with no readable fields yields
+    /// nothing for any of them, so skipping produces the same state as running
+    /// them. Where a decode is instead load-bearing, this path already fails:
+    /// the strict encode below rejects a body it cannot read, and the staged
+    /// UNIQUE pre-check (`stage_write::stage_point_document`) propagates rather
+    /// than admitting an unchecked row.
+    ///
+    /// This reasoning stops holding the moment `value` becomes stored state. A
+    /// stored row that will not decode is corruption, and skipping a side
+    /// effect for it leaves an index asserting entries that nothing re-derives
+    /// — which is why every decode of STORED bytes on this path (`old_value`
+    /// for the secondary-index diff, the enforcement pre-image) propagates.
     pub(in crate::data::executor) fn apply_point_put(
         &mut self,
         txn: &WriteTransaction,
@@ -66,7 +93,10 @@ impl CoreLoop {
         let value = if let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.generated_columns.is_empty()
         {
-            if let Some(mut doc) = doc_format::decode_document(value) {
+            // Incoming body, per the invariant above: a body with no readable
+            // fields has no column for a generated expression to read or write,
+            // so it is stored as supplied rather than rejected.
+            if let Ok(mut doc) = doc_format::decode_document(value) {
                 if let Err(e) = generated::evaluate_generated_columns(
                     &mut doc,
                     &config.enforcement.generated_columns,
@@ -204,67 +234,36 @@ impl CoreLoop {
         // `doc_format::decode_document` cannot decode without the schema —
         // route through the storage-mode-aware helper so strict UPDATEs also
         // compute their real old index values (and thus drop stale entries).
+        // `None` here means "there is no prior row to diff against" — an INSERT,
+        // a bitemporal collection (which reverses via versioned index tuples
+        // instead), or an unregistered collection with no index paths. A prior
+        // row that exists but will not decode is NOT that case: it would leave
+        // the row's old index entries asserted forever, so it fails the write.
         let old_doc_for_index: Option<serde_json::Value> = if bitemporal {
             None
         } else {
             match (old_value.as_ref(), self.doc_configs.get(&config_key)) {
-                (Some(b), Some(config)) => self.decode_stored_document(config, b),
+                (Some(b), Some(config)) => Some(self.decode_stored_document(config, b)?),
                 _ => None,
             }
         };
 
-        // Stateless PUT enforcement, unified across the autocommit
-        // (`apply_point_put`) and transactional (`tx_point_put`) paths.
-        // These checks have no persistent side effect, so a violation here
-        // simply aborts before the write — safe even though the caller
-        // owns a single redb write transaction. Reuses `config_key` from
-        // the generated-columns lookup above.
-        //
-        // Skipped entirely for CRDT-sync materialization (`enforce ==
-        // false`): those deltas already passed admission on their origin
-        // replica at Raft commit time.
-        if enforce && let Some(config) = self.doc_configs.get(&config_key) {
-            append_only::check_point_put(collection, &config.enforcement, &old_value)
-                .map_err(map_enforcement_error)?;
-            if let Some(ref pl) = config.enforcement.period_lock {
-                period_lock::check_period_lock(
-                    &self.sparse,
-                    database_id,
-                    tid,
-                    collection,
-                    value,
-                    pl,
-                )
-                .map_err(map_enforcement_error)?;
-            }
-            if old_value.is_some() {
-                let old_json = old_value
-                    .as_ref()
-                    .and_then(|b| doc_format::decode_document(b));
-                let new_json = doc_format::decode_document(value);
-                if let (Some(old_doc), Some(new_doc)) = (&old_json, &new_json) {
-                    if !config.enforcement.state_constraints.is_empty() {
-                        state_transition::check_state_transitions(
-                            collection,
-                            &config.enforcement.state_constraints,
-                            old_doc,
-                            new_doc,
-                            user_roles,
-                        )
-                        .map_err(map_enforcement_error)?;
-                    }
-                    if !config.enforcement.transition_checks.is_empty() {
-                        transition_check::check_transition_predicates(
-                            collection,
-                            &config.enforcement.transition_checks,
-                            old_doc,
-                            new_doc,
-                        )
-                        .map_err(map_enforcement_error)?;
-                    }
-                }
-            }
-        }
+        // Admission runs on the pre-image and the incoming body, before any
+        // store or index is touched, so a refusal leaves nothing behind.
+        // `value` is already the MessagePack form for both storage modes by
+        // this point (strict encodes to its tuple separately, into `stored`).
+        self.check_stateless_put_enforcement(
+            enforce,
+            PutEnforcement {
+                config_key: &config_key,
+                database_id,
+                tid,
+                collection,
+                value,
+                old_value: &old_value,
+                user_roles,
+            },
+        )?;
 
         // Bitemporal collections version every write: append a new version
         // at `sys_from = now()`, returning the current (pre-write) version
@@ -297,7 +296,13 @@ impl CoreLoop {
         // Text indexing and stats use the original JSON input, not the stored
         // bytes — Binary Tuple requires a schema to decode, and the input JSON
         // is already available here regardless of storage mode.
-        if let Some(doc) = doc_format::decode_document(value) {
+        //
+        // Incoming body, per the invariant above: a body that is not a readable
+        // document contributes no indexable text and no per-column statistics,
+        // so there is nothing for this block to do. Note the contrast one level
+        // in — once the document IS readable, an inverted-index write that
+        // fails is a real failure and rejects the write.
+        if let Ok(doc) = doc_format::decode_document(value) {
             // Shared extraction: the DELETE-rollback re-index path recomputes
             // the exact same text from the restored body via this helper.
             let text_content = crate::data::executor::fts_text::extract_fts_text(&doc);
@@ -376,8 +381,13 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
+        // Incoming body, per the invariant above. `extract_index_values` reads
+        // named paths out of a decoded document, so a body that is not one
+        // yields no index values — and therefore no UNIQUE candidate to
+        // conflict with and no entry to write. Skipping is the same outcome as
+        // running both, not a check quietly waived.
         if let Some(config) = self.doc_configs.get(&config_key)
-            && let Some(doc) = doc_format::decode_document(value)
+            && let Ok(doc) = doc_format::decode_document(value)
         {
             let paths = config.index_paths.clone();
             // UNIQUE enforcement is a CORE side-effect: it must run in both the
@@ -447,7 +457,7 @@ impl CoreLoop {
                         doc_id: document_id,
                         index_paths: &paths,
                     },
-                );
+                )?;
                 secondary_index_added = added;
                 secondary_index_removed = removed;
             }

@@ -77,6 +77,8 @@ async fn ilp_gateway_migration_single_node_ingest() {
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized = common::authorize_gateway_plan(&node.shared, &ctx, plan);
     let result = gw.execute(&ctx, authorized).await;
@@ -124,6 +126,8 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     let authorized1 = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, plan1);
     let result1 = leader_gw.execute(&ctx, authorized1).await;
@@ -147,6 +151,8 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         surrogates: Vec::new(),
         provenance: None,
         rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     });
     // Retry once on RetryableSchemaChanged: the descriptor may not yet be in
     // the follower catalog when the gateway snapshot was taken.
@@ -162,6 +168,8 @@ async fn ilp_gateway_migration_cross_node_ingest() {
                 surrogates: Vec::new(),
                 provenance: None,
                 rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             });
             let authorized2b =
                 common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, plan2b);

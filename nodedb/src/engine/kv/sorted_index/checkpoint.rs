@@ -63,6 +63,12 @@ impl SortedIndexManager {
     /// which differs only in where the tree comes from: `register` derives it by
     /// backfilling from the collection's rows, this one installs the exact pairs
     /// the checkpoint captured.
+    ///
+    /// Restoring over an existing registration REPLACES it, on the same terms
+    /// and for the same reasons as `register` — a checkpoint load that lands on
+    /// a manager already holding the name (a later generation over an earlier
+    /// one) reinstates the generation being loaded, and leaves exactly one
+    /// binding behind.
     pub fn restore(
         &mut self,
         database_id: u64,
@@ -70,6 +76,8 @@ impl SortedIndexManager {
         def: SortedIndexDef,
         entries: &[(Vec<u8>, Vec<u8>)],
     ) {
+        self.drop(database_id, tenant_id, &def.name);
+
         let idx_key = index_key(database_id, tenant_id, &def.name);
         let tbl_key = table_key(database_id, tenant_id, &def.collection);
 
@@ -81,7 +89,7 @@ impl SortedIndexManager {
         self.collection_indexes
             .entry(tbl_key)
             .or_default()
-            .push(idx_key.clone());
+            .insert(idx_key.clone());
         self.indexes.insert(idx_key, SortedIndex { def, tree });
     }
 }

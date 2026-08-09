@@ -57,7 +57,16 @@ impl CoreLoop {
         // If successful, computes bbox and inserts into the per-field R-tree.
         // Also writes the document to columnar_memtables so that bare table scans
         // and aggregates on spatial collections read from columnar (spatial extends columnar).
-        if let Some(doc) = doc_format::decode_document(value)
+        //
+        // `value` is `apply_point_put`'s incoming body, and the invariant on
+        // that function applies unchanged here: geometry is detected by walking
+        // a decoded document's fields, so a body that is not one carries no
+        // geometry to index and nothing to ingest. This would be wrong if
+        // `value` were ever the STORED row instead — a stored geometry that
+        // failed to decode would silently drop out of the R-tree while the row
+        // stayed queryable, which is the desync the delete-then-insert above
+        // exists to prevent.
+        if let Ok(doc) = doc_format::decode_document(value)
             && let Some(obj) = doc.as_object()
         {
             let mut has_geometry = false;

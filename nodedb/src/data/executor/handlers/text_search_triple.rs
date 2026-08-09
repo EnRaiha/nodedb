@@ -162,7 +162,7 @@ impl CoreLoop {
         // committed-only construction below runs unchanged.
         let (vector_ranked, text_ranked): (Vec<RankedResult>, Vec<RankedResult>) =
             if let Some(txn_id) = task.request.txn_id {
-                self.hybrid_ranked_with_overlay(
+                match self.hybrid_ranked_with_overlay(
                     super::hybrid_overlay::HybridOverlayParams {
                         txn_id,
                         database_id: task.request.database_id,
@@ -176,7 +176,10 @@ impl CoreLoop {
                     &vector_results,
                     vector_collection,
                     &text_results,
-                )
+                ) {
+                    Ok(ranked) => ranked,
+                    Err(e) => return self.response_error(task, e),
+                }
             } else {
                 let vector_ranked: Vec<RankedResult> = vector_results
                     .iter()

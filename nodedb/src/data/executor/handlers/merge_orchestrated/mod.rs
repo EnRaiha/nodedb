@@ -29,7 +29,9 @@
 //!    [`crate::data::executor::core_loop::CoreLoop::apply_point_delete`]
 //!    (whose cascade opens its own transactions) after the put commit.
 
+mod abort;
 mod apply;
 mod apply_support;
+mod delete_arms;
 pub(super) mod plan;
 mod resolve;

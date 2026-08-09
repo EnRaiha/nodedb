@@ -4,8 +4,13 @@
 //!
 //! Extends `KvEngine` with:
 //! - `register_sorted_index()` / `drop_sorted_index()` — DDL
-//! - `sorted_index_on_put()` / `sorted_index_on_delete()` — auto-maintenance
 //! - `sorted_index_rank()` / `sorted_index_top_k()` / etc. — query
+//!
+//! Write-time maintenance is NOT here. `KvEngine::put` / `delete` /
+//! `atomic_put` / `tick_expiry` reach `SortedIndexManager::on_put` /
+//! `on_delete` directly, alongside the secondary-index update they already do
+//! from the same field extraction — one entry point per write path, so there is
+//! no second place to edit that turns out to be called by nothing.
 
 use super::engine::KvEngine;
 use super::engine_helpers::table_key;
@@ -72,33 +77,6 @@ impl KvEngine {
         index_name: &str,
     ) -> bool {
         self.sorted_indexes.drop(database_id, tenant_id, index_name)
-    }
-
-    /// Called after a KV PUT to maintain sorted indexes on this collection.
-    ///
-    /// `field_values` are the extracted field name/value pairs from the new value.
-    pub fn sorted_index_on_put(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        primary_key: &[u8],
-        field_values: &[(String, Vec<u8>)],
-    ) {
-        let tkey = table_key(database_id, tenant_id, collection);
-        self.sorted_indexes.on_put(tkey, primary_key, field_values);
-    }
-
-    /// Called after a KV DELETE to maintain sorted indexes on this collection.
-    pub fn sorted_index_on_delete(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        primary_key: &[u8],
-    ) {
-        let tkey = table_key(database_id, tenant_id, collection);
-        self.sorted_indexes.on_delete(tkey, primary_key);
     }
 
     /// Check if any sorted indexes exist for this tenant/collection.

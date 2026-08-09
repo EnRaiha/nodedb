@@ -147,8 +147,11 @@ impl CoreLoop {
                         StorageMode::Schemaless => None,
                     });
                 returning_doc::from_stored(prior_bytes, document_id, strict_schema)
-            }
-            .unwrap_or_else(|| serde_json::json!({"id": document_id}));
+            };
+            let doc = match doc {
+                Ok(doc) => doc,
+                Err(e) => return self.response_error(task, e),
+            };
             match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(

@@ -14,56 +14,92 @@
 
 use sonic_rs;
 
+/// Build the typed error a document decode failure surfaces as.
+fn decode_err(format: &str, detail: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Serialization {
+        format: format.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// True when the first byte marks a standard MessagePack map header.
+fn looks_like_msgpack_map(first: u8) -> bool {
+    (0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF
+}
+
 /// Convert a document byte blob to `serde_json::Value`.
 ///
-/// Auto-detects the format: MessagePack, JSON, or Binary Tuple.
-/// Binary Tuple detection requires knowing the schema — if the bytes
-/// don't match MessagePack or JSON, returns `None` (the caller should
-/// use `strict_format::binary_tuple_to_json` with the schema if the
-/// collection is known to be strict).
-pub(super) fn decode_document(bytes: &[u8]) -> Option<serde_json::Value> {
+/// Auto-detects the format: MessagePack or JSON. Both readers require the
+/// input to be consumed in full, so a body with a stray suffix, a truncated
+/// body with another concatenated onto it, or two documents written into one
+/// slot are decode failures rather than a silent decode of the leading value.
+///
+/// Binary Tuple is NOT auto-detected here because decoding it requires the
+/// schema. For strict collections, callers must check
+/// `doc_configs.storage_mode` and use `strict_format::binary_tuple_to_json()`.
+pub(super) fn decode_document(bytes: &[u8]) -> crate::Result<serde_json::Value> {
     if bytes.is_empty() {
-        return None;
+        return Err(decode_err("document", "empty body"));
     }
 
     // Detect MessagePack: maps start with 0x80-0x8F (fixmap), 0xDE (map16), 0xDF (map32).
-    let first = bytes[0];
-    if (0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF {
-        // Try MessagePack first.
-        if let Ok(val) = nodedb_types::json_from_msgpack(bytes) {
-            return Some(val);
-        }
+    // Those bytes cannot begin JSON text, so there is no second format to fall
+    // back to — reporting why the msgpack read failed beats re-guessing.
+    if looks_like_msgpack_map(bytes[0]) {
+        return nodedb_types::json_from_msgpack(bytes).map_err(|e| decode_err("msgpack", e));
     }
 
-    // Fall back to JSON.
-    sonic_rs::from_slice(bytes).ok()
+    sonic_rs::from_slice(bytes).map_err(|e| decode_err("json", e))
+}
 
-    // Note: Binary Tuple bytes are NOT auto-detected here because decoding
-    // requires the schema. For strict collections, callers must check
-    // doc_configs.storage_mode and use strict_format::binary_tuple_to_json().
+/// Decode a stored row that may be either schemaless (MessagePack/JSON) or a
+/// strict collection's Binary Tuple, dispatching on whether a schema was
+/// given.
+///
+/// This is the shape every "decode a row I don't yet know the storage mode
+/// of, by schema" call site converged on independently — the versioned scan
+/// predicate, MERGE's target-row classifier, and MERGE's source/target join
+/// key extractor. `context` names the caller in the error so each site keeps
+/// its own diagnostic (e.g. `"MERGE target row"`, `"versioned row body"`)
+/// while the decode + error-construction logic lives once.
+pub(super) fn decode_document_or_binary_tuple(
+    bytes: &[u8],
+    strict_schema: Option<&nodedb_types::columnar::StrictSchema>,
+    context: &str,
+) -> crate::Result<serde_json::Value> {
+    match strict_schema {
+        Some(schema) => crate::data::executor::strict_format::binary_tuple_to_json(bytes, schema)
+            .ok_or_else(|| crate::Error::Serialization {
+                format: "binary_tuple".to_string(),
+                detail: format!(
+                    "{context} ({} bytes) is not a Binary Tuple readable under the \
+                         collection's strict schema",
+                    bytes.len()
+                ),
+            }),
+        None => decode_document(bytes),
+    }
 }
 
 /// Convert a document byte blob to `nodedb_types::Value`.
 ///
 /// Preserves all native types (Geometry, DateTime, Decimal, etc.) that
 /// would be lost when decoding to `serde_json::Value`.
-/// Auto-detects msgpack vs JSON. Binary Tuple requires schema — callers
-/// should use `strict_format::binary_tuple_to_value` for strict collections.
-pub(super) fn decode_document_value(bytes: &[u8]) -> Option<nodedb_types::Value> {
+/// Auto-detects msgpack vs JSON, with the same full-consumption requirement as
+/// [`decode_document`]. Binary Tuple requires schema — callers should use
+/// `strict_format::binary_tuple_to_value` for strict collections.
+pub(super) fn decode_document_value(bytes: &[u8]) -> crate::Result<nodedb_types::Value> {
     if bytes.is_empty() {
-        return None;
+        return Err(decode_err("document", "empty body"));
     }
 
-    let first = bytes[0];
-    if ((0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF)
-        && let Ok(val) = nodedb_types::value_from_msgpack(bytes)
-    {
-        return Some(val);
+    if looks_like_msgpack_map(bytes[0]) {
+        return nodedb_types::value_from_msgpack(bytes).map_err(|e| decode_err("msgpack", e));
     }
 
     // JSON input boundary: parse then convert.
-    let json: serde_json::Value = sonic_rs::from_slice(bytes).ok()?;
-    Some(nodedb_types::Value::from(json))
+    let json: serde_json::Value = sonic_rs::from_slice(bytes).map_err(|e| decode_err("json", e))?;
+    Ok(nodedb_types::Value::from(json))
 }
 
 /// Encode a JSON value as MessagePack bytes for storage.
@@ -304,7 +340,50 @@ mod tests {
 
     #[test]
     fn empty_bytes_handled() {
-        assert!(decode_document(b"").is_none());
+        assert!(decode_document(b"").is_err());
+        assert!(decode_document_value(b"").is_err());
         assert!(json_to_msgpack(b"").is_empty());
+    }
+
+    /// A body holds exactly one top-level value. Anything after it means the
+    /// slot does not hold the document it claims to, so decoding the leading
+    /// value and dropping the rest would report success on corrupt bytes.
+    #[test]
+    fn a_body_with_an_appended_byte_is_rejected() {
+        let value = serde_json::json!({"a": 1, "b": "two"});
+        let mut msgpack = nodedb_types::json_to_msgpack(&value).unwrap();
+        assert!(
+            decode_document(&msgpack).is_ok(),
+            "baseline body must decode"
+        );
+
+        msgpack.push(0xC0);
+        assert!(
+            decode_document(&msgpack).is_err(),
+            "trailing byte must be a decode failure, not a silent prefix decode"
+        );
+        assert!(decode_document_value(&msgpack).is_err());
+    }
+
+    #[test]
+    fn two_concatenated_bodies_are_rejected() {
+        let first = nodedb_types::json_to_msgpack(&serde_json::json!({"a": 1})).unwrap();
+        let second = nodedb_types::json_to_msgpack(&serde_json::json!({"b": 2})).unwrap();
+        let mut joined = first.clone();
+        joined.extend_from_slice(&second);
+
+        assert!(decode_document(&first).is_ok());
+        assert!(
+            decode_document(&joined).is_err(),
+            "two documents in one slot must not decode as the first"
+        );
+        assert!(decode_document_value(&joined).is_err());
+    }
+
+    #[test]
+    fn a_json_body_with_a_stray_suffix_is_rejected() {
+        assert!(decode_document(b"{\"x\":1}").is_ok());
+        assert!(decode_document(b"{\"x\":1}{\"y\":2}").is_err());
+        assert!(decode_document(b"{\"x\":1}x").is_err());
     }
 }

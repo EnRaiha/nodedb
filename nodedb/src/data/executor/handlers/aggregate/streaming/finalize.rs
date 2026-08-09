@@ -183,6 +183,6 @@ impl CoreLoop {
         sort_aggregated_rows(&mut results, sort_keys)?;
         results.truncate(limit);
 
-        crate::data::executor::response_codec::encode_json_vec(&results)
+        crate::data::executor::response_codec::encode_json_vec_as_msgpack(&results)
     }
 }

@@ -77,8 +77,8 @@ impl CoreLoop {
         // search enforces on stored postings), NOT mere term presence.
         let mut merged: Vec<(nodedb_types::Surrogate, f32, bool)> =
             results.iter().map(|r| (r.doc_id, r.score, false)).collect();
-        if let Some(txn_id) = task.request.txn_id {
-            self.merge_fts_phrase_overlay_into_results(
+        if let Some(txn_id) = task.request.txn_id
+            && let Err(e) = self.merge_fts_phrase_overlay_into_results(
                 FtsMergeParams {
                     txn_id,
                     database_id: task.request.database_id,
@@ -89,10 +89,12 @@ impl CoreLoop {
                 },
                 terms,
                 &mut merged,
-            );
+            )
+        {
+            return self.response_error(task, e);
         }
 
-        let rows = self.hydrate_text_hits(
+        let rows = match self.hydrate_text_hits(
             merged,
             HydrateTextHitsParams {
                 database_id: task.request.database_id.as_u64(),
@@ -102,7 +104,10 @@ impl CoreLoop {
                 rls_filters: &[],
                 txn_id: task.request.txn_id,
             },
-        );
+        ) {
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
         if let Some(ref m) = self.metrics {
             m.record_fts_search(0);
         }
@@ -169,8 +174,8 @@ impl CoreLoop {
         // Read-your-own-writes for FTS: fold staged document bodies into
         // the score map (staged put re-scored/added, staged tombstone
         // removed) before the collection scan renders rows below.
-        if let Some(txn_id) = task.request.txn_id {
-            self.merge_fts_overlay_into_score_map(
+        if let Some(txn_id) = task.request.txn_id
+            && let Err(e) = self.merge_fts_overlay_into_score_map(
                 FtsMergeParams {
                     txn_id,
                     database_id: task.request.database_id,
@@ -180,7 +185,9 @@ impl CoreLoop {
                     top_k: BM25_SCAN_MAX_HITS,
                 },
                 &mut score_map,
-            );
+            )
+        {
+            return self.response_error(task, e);
         }
 
         // The body encoding of this collection's sparse rows, resolved from
@@ -234,7 +241,10 @@ impl CoreLoop {
 
         let mut rows: Vec<DocumentRow> = Vec::with_capacity(docs.len());
         for (hex_key, bytes) in &docs {
-            let mut value = decode_scanned_document(bytes, format.as_format_ref());
+            let mut value = match decode_scanned_document(bytes, format.as_format_ref()) {
+                Ok(v) => v,
+                Err(e) => return self.response_error(task, e),
+            };
             // Inject score into the document object.
             if let serde_json::Value::Object(ref mut map) = value {
                 let score = crate::engine::document::store::doc_id_to_surrogate(hex_key)

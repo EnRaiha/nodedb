@@ -1028,3 +1028,226 @@ fn scan_for_each_propagates_callback_error() {
     // Stops at the first row — does not visit every row.
     assert_eq!(seen, 1);
 }
+
+// ── Sorted index: population, maintenance, and range bounds ─────────────
+
+/// A leaderboard row whose `score` is a NUMBER, which is what a SQL
+/// `INSERT ... (score INT)` stores and what the sort-key encoders assume.
+/// `mp_obj` above builds string-valued fields, which sort as UTF-8 and would
+/// hide an ordering bug behind lexicographic luck.
+fn mp_scored(player_id: &str, score: i64) -> Vec<u8> {
+    nodedb_types::json_to_msgpack(&serde_json::json!({
+        "player_id": player_id,
+        "score": score,
+    }))
+    .expect("encode leaderboard row")
+}
+
+fn put_scored(e: &mut KvEngine, collection: &str, player_id: &str, score: i64) {
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection,
+        key: player_id.as_bytes(),
+        value: &mp_scored(player_id, score),
+        ttl_ms: 0,
+        now_ms: now(),
+        surrogate: Surrogate::ZERO,
+    });
+}
+
+fn ranked_keys(entries: Option<Vec<(u32, Vec<u8>)>>) -> Vec<String> {
+    entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, key)| String::from_utf8_lossy(&key).into_owned())
+        .collect()
+}
+
+/// Registration must adopt the rows that are already there.
+///
+/// An index that starts empty and only tracks later writes disagrees with its
+/// own collection from the moment it is created, and nothing in the read path
+/// re-checks the table — `top_k` returns the tree verbatim.
+#[test]
+fn sorted_index_backfills_rows_written_before_registration() {
+    let mut e = make_engine();
+    let n = now();
+
+    put_scored(&mut e, "players", "p1", 10);
+    put_scored(&mut e, "players", "p2", 30);
+    put_scored(&mut e, "players", "p3", 20);
+
+    let backfilled = e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+    assert_eq!(backfilled, 3, "every pre-existing row must be indexed");
+    assert_eq!(e.sorted_index_count(0, 1, "lb", n), Some(3));
+    assert_eq!(
+        ranked_keys(e.sorted_index_top_k(0, 1, "lb", 10, n)),
+        vec!["p2", "p3", "p1"],
+        "backfill must order by the indexed column, highest first"
+    );
+}
+
+/// Rows written after registration must be tracked, and the index must hold
+/// exactly the collection's rows — no more, no fewer — however they arrived.
+#[test]
+fn sorted_index_holds_the_same_rows_as_the_collection() {
+    let mut e = make_engine();
+    let n = now();
+
+    put_scored(&mut e, "players", "p1", 10);
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+    put_scored(&mut e, "players", "p2", 30);
+    put_scored(&mut e, "players", "p3", 20);
+
+    let mut stored: Vec<String> = Vec::new();
+    e.scan_for_each(scan_params("players", usize::MAX, n), |key, _value| {
+        stored.push(String::from_utf8_lossy(key).into_owned());
+        Ok(())
+    })
+    .expect("scan the collection");
+    stored.sort();
+
+    let mut indexed = ranked_keys(e.sorted_index_top_k(0, 1, "lb", u32::MAX, n));
+    indexed.sort();
+
+    assert_eq!(
+        indexed, stored,
+        "the index must answer with the collection's row set, not a subset"
+    );
+}
+
+/// `INCR` / `CAS` / `GETSET` / `TRANSFER` reach the store through the atomic
+/// write body, not through `put`. Maintaining the index on only one of the two
+/// routes leaves `RANK` / `TOPK` answering from the pre-update score with
+/// nothing to signal it.
+///
+/// `incr` is the route exercised here because it is the one that genuinely
+/// rewrites the indexed column: on a typed row it re-writes the first numeric
+/// field in place, which is what `KV_INCR` and RESP `ZINCRBY` do to a
+/// leaderboard score. (`getset` and `cas` replace the first STRING field, so
+/// neither can move `score` — they are the wrong shape to test an ordering
+/// change with, not a second version of this case.)
+#[test]
+fn sorted_index_tracks_an_atomic_update() {
+    let mut e = make_engine();
+    let n = now();
+
+    put_scored(&mut e, "players", "p1", 10);
+    put_scored(&mut e, "players", "p2", 30);
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(2));
+
+    let updated = e.incr(
+        crate::engine::kv::AtomicKeyCtx {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "players",
+            key: b"p1",
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        },
+        89,
+        // `ttl_ms == 0` preserves whatever TTL the key already has, so the
+        // increment under test is the only thing this write changes.
+        0,
+        &crate::engine::kv::admit_any,
+    );
+    assert_eq!(updated.ok(), Some(99), "p1's score must become 10 + 89");
+
+    assert_eq!(
+        ranked_keys(e.sorted_index_top_k(0, 1, "lb", 10, n)),
+        vec!["p1", "p2"],
+        "the updated score must re-order the leaderboard"
+    );
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
+    assert_eq!(
+        e.sorted_index_count(0, 1, "lb", n),
+        Some(2),
+        "an update re-keys a row, it does not add one"
+    );
+}
+
+/// A DELETE must take the row out of the index too, or the deleted key keeps
+/// its rank and displaces every live key below it.
+#[test]
+fn sorted_index_tracks_a_delete() {
+    let mut e = make_engine();
+    let n = now();
+
+    put_scored(&mut e, "players", "p1", 10);
+    put_scored(&mut e, "players", "p2", 30);
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+    assert_eq!(e.delete(0, 1, "players", &[b"p2".to_vec()], n), 1);
+
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p2", n), None);
+    assert_eq!(e.sorted_index_count(0, 1, "lb", n), Some(1));
+    assert_eq!(
+        ranked_keys(e.sorted_index_top_k(0, 1, "lb", 10, n)),
+        vec!["p1"]
+    );
+}
+
+/// `RANGE(index, lo, hi)` bounds arrive as the leading column's raw value
+/// bytes; the tree is keyed by length-prefixed, direction-complemented
+/// composite keys. Comparing the two spaces directly matches nothing, so the
+/// bounds must be lifted into the key space — including the swap a descending
+/// column forces.
+#[test]
+fn sorted_index_range_selects_by_score() {
+    let mut e = make_engine();
+    let n = now();
+
+    put_scored(&mut e, "players", "p1", 10);
+    put_scored(&mut e, "players", "p2", 30);
+    put_scored(&mut e, "players", "p3", 20);
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+    let bound = |v: i64| SortKeyEncoder::encode_i64(v).to_vec();
+
+    let mid = e.sorted_index_range(crate::engine::kv::SortedIndexRangeParams {
+        database_id: 0,
+        tenant_id: 1,
+        index_name: "lb",
+        score_min: Some(&bound(15)),
+        score_max: Some(&bound(30)),
+        now_ms: n,
+    });
+    let mut keys = ranked_keys(mid);
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["p2", "p3"],
+        "an inclusive [15, 30] window must hold exactly the rows scoring 20 and 30"
+    );
+
+    let all = e.sorted_index_range(crate::engine::kv::SortedIndexRangeParams {
+        database_id: 0,
+        tenant_id: 1,
+        index_name: "lb",
+        score_min: None,
+        score_max: None,
+        now_ms: n,
+    });
+    assert_eq!(
+        ranked_keys(all).len(),
+        3,
+        "an unbounded range must return every indexed row"
+    );
+
+    let below = e.sorted_index_range(crate::engine::kv::SortedIndexRangeParams {
+        database_id: 0,
+        tenant_id: 1,
+        index_name: "lb",
+        score_min: None,
+        score_max: Some(&bound(10)),
+        now_ms: n,
+    });
+    assert_eq!(
+        ranked_keys(below),
+        vec!["p1"],
+        "an upper bound must include the row sitting exactly on it"
+    );
+}

@@ -69,7 +69,7 @@ impl CoreLoop {
         vector_results: &[SearchResult],
         vector_collection: Option<&VectorCollection>,
         text_results: &[TextSearchResult],
-    ) -> (Vec<RankedResult>, Vec<RankedResult>) {
+    ) -> crate::Result<(Vec<RankedResult>, Vec<RankedResult>)> {
         // Base committed legs, in the shape each single-source overlay merge
         // consumes: vector hits carry the surrogate-resolved id, text scores
         // carry the FTS surrogate + score + fuzzy flag.
@@ -135,7 +135,7 @@ impl CoreLoop {
                     payload_filters: &[],
                 },
                 &mut vector_hits,
-            );
+            )?;
         }
 
         // Text leg RYOW: re-score staged docs via the FTS-only overlay merge.
@@ -149,7 +149,7 @@ impl CoreLoop {
                 top_k: params.fetch_k,
             },
             &mut text_scored,
-        );
+        )?;
 
         // Rebuild the RRF-ready ranked lists from the merged legs. Both keys are
         // surrogate-hex doc-ids so the vector and text legs fuse on one key
@@ -180,6 +180,6 @@ impl CoreLoop {
                 source: "text",
             })
             .collect();
-        (vector_ranked, text_ranked)
+        Ok((vector_ranked, text_ranked))
     }
 }

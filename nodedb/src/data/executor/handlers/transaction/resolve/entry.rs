@@ -766,7 +766,8 @@ mod tests {
 
     /// Read the `name` field of a staged schemaless post-image body.
     fn staged_name(body: &[u8]) -> Option<String> {
-        crate::data::executor::doc_format::decode_document(body)?
+        crate::data::executor::doc_format::decode_document(body)
+            .ok()?
             .get("name")
             .and_then(|v| v.as_str())
             .map(str::to_string)

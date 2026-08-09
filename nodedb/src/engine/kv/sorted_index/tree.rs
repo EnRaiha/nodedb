@@ -108,7 +108,12 @@ impl OrderStatTree {
     /// "Top" means the first K entries in the tree's natural order. For a
     /// DESC-encoded score column, this returns the highest scores.
     pub fn top_k(&self, k: u32) -> Vec<(&[u8], &[u8])> {
-        let mut result = Vec::with_capacity(k as usize);
+        // Reserve for what the tree can actually yield, not for what was
+        // asked. "Everything" is spelled `u32::MAX` by callers that have no
+        // upper bound to give (`ZRANGE key 0 -1`), and reserving that many
+        // pairs up front is a multi-gigabyte allocation for a tree holding a
+        // handful of entries.
+        let mut result = Vec::with_capacity(k.min(self.count()) as usize);
         self.in_order_collect(self.root, k, &mut result);
         result
     }

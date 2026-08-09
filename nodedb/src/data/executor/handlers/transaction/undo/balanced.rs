@@ -6,7 +6,6 @@ use std::collections::HashMap;
 
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::balanced;
 
 use super::UndoEntry;
@@ -56,9 +55,18 @@ impl CoreLoop {
 
             let mut entries = Vec::with_capacity(stored_docs.len());
             for stored_bytes in stored_docs {
-                if let Some(json) = doc_format::decode_document(stored_bytes)
-                    && let Some(entry) = balanced::extract_entry(balanced_def, &json)
-                {
+                // These are STORED bodies, so the decoder comes from the
+                // collection's registered storage mode — a strict collection
+                // stores Binary Tuples, which the schemaless decoder cannot
+                // read at all. A row that contributes no entry lets an
+                // unbalanced set of inserts pass the balance check, which is
+                // the one thing this function exists to refuse.
+                let json = self
+                    .decode_stored_document(config, stored_bytes)
+                    .map_err(|e| ErrorCode::Internal {
+                        detail: format!("balanced constraint on '{collection}': {e}"),
+                    })?;
+                if let Some(entry) = balanced::extract_entry(balanced_def, &json) {
                     entries.push(entry);
                 }
             }

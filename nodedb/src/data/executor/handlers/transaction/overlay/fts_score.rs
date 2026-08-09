@@ -60,21 +60,28 @@ impl CoreLoop {
     }
 
     /// Decode a staged body, re-tokenize with the forward-indexing
-    /// tokenizer, and BM25-score it against `positive_terms`. Returns
-    /// `None` when the body cannot be decoded, extracts to empty text (the
-    /// forward indexer never indexes such documents either), matches no
-    /// positive term, or is excluded by a negative term.
+    /// tokenizer, and BM25-score it against `positive_terms`.
+    ///
+    /// `Ok(None)` is the "this document does not belong in the result" answer:
+    /// it extracts to empty text (the forward indexer never indexes such
+    /// documents either), matches no positive term, or is excluded by a
+    /// negative term. A staged body that will not decode is not that answer —
+    /// it is this transaction's own write becoming unreadable — and comes back
+    /// as `Err`.
     pub(in crate::data::executor) fn score_staged_fts_doc(
         &self,
         ctx: &StagedFtsScoreCtx<'_>,
         body: &[u8],
         positive_terms: &[String],
         negative_terms: &[String],
-    ) -> Option<f32> {
-        let doc_tokens = self.tokenize_staged_body(ctx.database_id, ctx.config_key, body)?;
+    ) -> crate::Result<Option<f32>> {
+        let Some(doc_tokens) = self.tokenize_staged_body(ctx.database_id, ctx.config_key, body)?
+        else {
+            return Ok(None);
+        };
 
         if !negative_terms.is_empty() && negative_terms.iter().any(|t| doc_tokens.contains(t)) {
-            return None;
+            return Ok(None);
         }
 
         let mut term_freq: HashMap<&str, u32> = HashMap::new();
@@ -106,29 +113,32 @@ impl CoreLoop {
         }
 
         if matched_any && score > 0.0 {
-            Some(score)
+            Ok(Some(score))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Score a staged body for a PHRASE search: include it only when the
     /// analyzed `phrase_terms` occur as a contiguous, in-order run in the
     /// staged doc's analyzed token stream. Returns `1 / (1 + earliest_start)`
-    /// (base phrase formula at rank 0) on a match, else `None`.
+    /// (base phrase formula at rank 0) on a match, `Ok(None)` when the phrase
+    /// is not present, and `Err` when the staged body will not decode.
     pub(in crate::data::executor) fn score_staged_phrase_doc(
         &self,
         database_id: u64,
         config_key: &(DatabaseId, TenantId, String),
         body: &[u8],
         phrase_terms: &[String],
-    ) -> Option<f32> {
+    ) -> crate::Result<Option<f32>> {
         if phrase_terms.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let doc_tokens = self.tokenize_staged_body(database_id, config_key, body)?;
-        let start = earliest_contiguous_match(&doc_tokens, phrase_terms)?;
-        Some(1.0 / (1.0 + start as f32))
+        let Some(doc_tokens) = self.tokenize_staged_body(database_id, config_key, body)? else {
+            return Ok(None);
+        };
+        Ok(earliest_contiguous_match(&doc_tokens, phrase_terms)
+            .map(|start| 1.0 / (1.0 + start as f32)))
     }
 
     /// Decode a staged body via the collection's storage mode and analyze it
@@ -136,21 +146,25 @@ impl CoreLoop {
     /// [`InvertedIndex::analyze_for_collection`](crate::engine::sparse::inverted::InvertedIndex::analyze_for_collection),
     /// the exact same lookup the forward indexing path
     /// (`index_document_in_txn`) uses, so a staged doc is tokenized
-    /// identically to how it will be tokenized once committed. Returns
-    /// `None` for an undecodable body, one whose extracted text is empty
-    /// (which the forward indexer also never indexes), or one whose
-    /// analyzer resolution fails (logged, since that indicates a backend
-    /// metadata read error rather than an expected empty-text case).
+    /// identically to how it will be tokenized once committed.
+    ///
+    /// `Ok(None)` means the document has nothing to tokenize: the collection is
+    /// unregistered, the extracted text is empty (which the forward indexer
+    /// also never indexes), or the analyzer produced no tokens. An undecodable
+    /// body is `Err`. Analyzer resolution failure stays a logged skip — it is a
+    /// backend metadata read error, not a statement about this document.
     fn tokenize_staged_body(
         &self,
         database_id: u64,
         config_key: &(DatabaseId, TenantId, String),
         body: &[u8],
-    ) -> Option<Vec<String>> {
-        let doc = self.decode_indexed_body(config_key, body)?;
+    ) -> crate::Result<Option<Vec<String>>> {
+        let Some(doc) = self.decode_indexed_body(config_key, body)? else {
+            return Ok(None);
+        };
         let text = extract_fts_text(&doc);
         if text.is_empty() {
-            return None;
+            return Ok(None);
         }
         let (_, tid, collection) = config_key;
         let tokens =
@@ -165,13 +179,13 @@ impl CoreLoop {
                         %collection,
                         "staged FTS scoring: analyzer resolution failed; skipping doc"
                     );
-                    return None;
+                    return Ok(None);
                 }
             };
         if tokens.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(tokens)
+            Ok(Some(tokens))
         }
     }
 }

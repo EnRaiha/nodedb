@@ -106,10 +106,10 @@ impl CoreLoop {
                     None => continue,
                 }
             } else {
-                match doc_format::decode_document(&current_bytes) {
-                    Some(v) => v,
-                    None => continue,
-                }
+                // A target row skipped here is one the UPDATE silently leaves
+                // untouched while reporting a smaller affected count as the
+                // truth.
+                doc_format::decode_document(&current_bytes)?
             };
 
             // Extract the join key from the target document.

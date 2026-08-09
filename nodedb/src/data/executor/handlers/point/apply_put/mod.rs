@@ -4,6 +4,7 @@
 //! (spatial/vector/sparse), and UNIQUE-constraint check.
 
 pub(in crate::data::executor::handlers::point) mod core;
+pub(in crate::data::executor::handlers::point) mod enforce;
 pub(in crate::data::executor::handlers::point) mod index;
 pub(in crate::data::executor::handlers::point) mod sparse;
 pub(in crate::data::executor::handlers::point) mod types;

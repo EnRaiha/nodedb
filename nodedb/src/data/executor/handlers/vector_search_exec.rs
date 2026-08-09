@@ -291,7 +291,7 @@ impl CoreLoop {
             // result before truncation, so a vector inserted earlier in the
             // same transaction is ranked in by true distance before COMMIT.
             if let Some(txn_id) = task.request.txn_id {
-                self.merge_vector_overlay_into_search(
+                if let Err(e) = self.merge_vector_overlay_into_search(
                     super::transaction::overlay::VectorMergeParams {
                         txn_id,
                         database_id: task.request.database_id,
@@ -305,7 +305,9 @@ impl CoreLoop {
                         payload_filters,
                     },
                     &mut hits,
-                );
+                ) {
+                    return self.response_error(task, e);
+                }
             } else {
                 hits.truncate(top_k);
             }
@@ -348,7 +350,7 @@ impl CoreLoop {
         // truncation, so a vector inserted earlier in the same transaction
         // is ranked in by true distance before COMMIT.
         if let Some(txn_id) = task.request.txn_id {
-            self.merge_vector_overlay_into_search(
+            if let Err(e) = self.merge_vector_overlay_into_search(
                 super::transaction::overlay::VectorMergeParams {
                     txn_id,
                     database_id: task.request.database_id,
@@ -362,7 +364,9 @@ impl CoreLoop {
                     payload_filters,
                 },
                 &mut hits,
-            );
+            ) {
+                return self.response_error(task, e);
+            }
         } else {
             hits.truncate(truncate_to);
         }

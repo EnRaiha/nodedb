@@ -292,19 +292,28 @@ impl KvEngine {
             self.expiry.cancel(&composite, meta.expire_at_ms);
         }
 
+        let has_secondary_indexes = self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty());
+        // Sorted indexes are maintained here too. Every atomic KV write —
+        // `UPDATE ... SET`, `INCR`, `CAS`, `GETSET`, `TRANSFER`, and upsert's
+        // conflict branch — reaches the store through this one body, so an
+        // index refreshed only by `KvEngine::put` would keep answering `TOPK`
+        // and `RANK` from the pre-update score of every row any of them
+        // touched, with nothing to signal the divergence.
+        let has_sorted_indexes = self.sorted_indexes.has_indexes(tkey);
+
         // Extract old field values BEFORE overwriting — needed so on_put can
-        // remove stale index entries when a field changes.
-        let old_fields =
-            if !is_new_key && self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty()) {
-                self.tables
-                    .get(&tkey)
-                    .and_then(|t| t.get(key, now_ms))
-                    .map(|old_val| {
-                        super::engine_helpers::extract_all_field_values_from_msgpack(old_val)
-                    })
-            } else {
-                None
-            };
+        // remove stale index entries when a field changes. The sorted index
+        // re-keys a primary key in place and needs no before-image.
+        let old_fields = if !is_new_key && has_secondary_indexes {
+            self.tables
+                .get(&tkey)
+                .and_then(|t| t.get(key, now_ms))
+                .map(|old_val| {
+                    super::engine_helpers::extract_all_field_values_from_msgpack(old_val)
+                })
+        } else {
+            None
+        };
 
         // Write the value. Callers of `atomic_put` always invoke `ensure_table`
         // for this `tkey` earlier in the same method, so the entry is
@@ -330,22 +339,29 @@ impl KvEngine {
             self.expiry.insert(composite, expire_at);
         }
 
-        // Secondary index maintenance.
-        if self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty()) {
-            let old_refs: Option<Vec<(&str, &[u8])>> = old_fields.as_ref().map(|fields| {
-                fields
+        // Index maintenance — the same pair `KvEngine::put` performs, over the
+        // one field extraction both kinds read.
+        if has_secondary_indexes || has_sorted_indexes {
+            let new_fields = super::engine_helpers::extract_all_field_values_from_msgpack(value);
+
+            if has_secondary_indexes {
+                let old_refs: Option<Vec<(&str, &[u8])>> = old_fields.as_ref().map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_slice()))
+                        .collect()
+                });
+                let new_refs: Vec<(&str, &[u8])> = new_fields
                     .iter()
                     .map(|(k, v)| (k.as_str(), v.as_slice()))
-                    .collect()
-            });
+                    .collect();
+                if let Some(idx_set) = self.indexes.get_mut(&tkey) {
+                    idx_set.on_put(key, &new_refs, old_refs.as_deref());
+                }
+            }
 
-            let new_fields = super::engine_helpers::extract_all_field_values_from_msgpack(value);
-            let new_refs: Vec<(&str, &[u8])> = new_fields
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_slice()))
-                .collect();
-            if let Some(idx_set) = self.indexes.get_mut(&tkey) {
-                idx_set.on_put(key, &new_refs, old_refs.as_deref());
+            if has_sorted_indexes {
+                self.sorted_indexes.on_put(tkey, key, &new_fields);
             }
         }
     }

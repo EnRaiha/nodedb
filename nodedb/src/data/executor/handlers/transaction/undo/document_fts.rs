@@ -47,9 +47,12 @@ impl CoreLoop {
             // could not decode either, so there is nothing to restore.
             return Ok(());
         };
-        let Some(doc) = self.decode_stored_document(config, old_value) else {
-            return Ok(());
-        };
+        // A rollback that cannot read the body it is restoring cannot rebuild
+        // the row's FTS postings, so the restored row would be permanently
+        // unsearchable. That is a failed rollback, not a no-op.
+        let doc = self
+            .decode_stored_document(config, old_value)
+            .map_err(|e| (entry_index, e.to_string()))?;
         let text = extract_fts_text(&doc);
         if text.is_empty() {
             return Ok(());

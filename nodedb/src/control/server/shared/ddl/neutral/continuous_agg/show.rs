@@ -61,22 +61,37 @@ pub async fn show_continuous_aggregates(
         .unwrap_or_default();
 
     // Best-effort runtime stats from the local manager.
-    let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_system(
-        state,
-        sync_dispatch::SystemTask::new(
-            sync_dispatch::SystemReason::CatalogMaintenance,
-            tenant_id,
-            database_id,
-            "__system",
-            PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
-        ),
-        Duration::from_secs(5),
-    )
-    .await
-    {
-        Ok(payload) => sonic_rs::from_slice(&payload).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    //
+    // "Best effort" covers the dispatch not answering — a node still replaying
+    // registers has no stats to give, and the catalog rows below carry the
+    // listing regardless. It does NOT cover a payload that arrived and could
+    // not be read: `MetaOp::ListContinuousAggregates` encodes with
+    // `response_codec::encode_serde`, which is MessagePack, and the JSON parser
+    // that used to sit here failed on every one of those payloads and defaulted
+    // the failure away — so every aggregate reported watermark 0, zero rows
+    // aggregated, zero materialized buckets, and the catalog's stale flag
+    // instead of the live one, on every node, always.
+    let runtime_infos: Vec<AggregateInfo> =
+        match sync_dispatch::dispatch_system(
+            state,
+            sync_dispatch::SystemTask::new(
+                sync_dispatch::SystemReason::CatalogMaintenance,
+                tenant_id,
+                database_id,
+                "__system",
+                PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
+            ),
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(payload) => crate::data::executor::response_codec::decode_payload(&payload)
+                .map_err(|e| DdlError {
+                    sqlstate: "XX000".to_string(),
+                    message: format!("continuous aggregate runtime stats: {e}"),
+                })?,
+            Err(_) => Vec::new(),
+        };
 
     let columns = vec![
         "name".to_string(),

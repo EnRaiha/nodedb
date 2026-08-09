@@ -8,8 +8,7 @@ use crate::engine::sparse::doc_cache::DocCache;
 /// (added, removed) secondary-index (field, value) tuples.
 type SecondaryIndexDiff = (Vec<(String, String)>, Vec<(String, String)>);
 
-/// Shared parameters for [`CoreLoop::apply_secondary_indexes`] and
-/// [`CoreLoop::apply_secondary_indexes_in_txn`].
+/// Shared parameters for [`CoreLoop::apply_secondary_indexes_in_txn`].
 pub(in crate::data::executor) struct SecondaryIndexInputs<'a> {
     pub database_id: u64,
     pub tid: u64,
@@ -102,95 +101,34 @@ impl CoreLoop {
         self.ts_tuning = tuning;
     }
 
-    /// Apply the secondary-index SET diff for a document (opens its own txn).
+    /// Apply the secondary-index SET diff within an already-open write txn.
     ///
-    /// Used by `execute_document_batch_insert` after `batch_put` has already
-    /// committed its document transaction. Callers that already hold a
-    /// write transaction (PointPut) MUST call
-    /// [`apply_secondary_indexes_in_txn`](Self::apply_secondary_indexes_in_txn)
-    /// instead — a nested `begin_write` deadlocks redb's single-writer lock.
+    /// Routes writes through [`SparseEngine::index_put_in_txn`] /
+    /// [`SparseEngine::index_remove_in_txn`] so the document + index entries
+    /// commit atomically with the caller's `WriteTransaction`. There is no
+    /// own-transaction variant: every caller already holds the row's write
+    /// txn, and a nested `begin_write` deadlocks redb's single-writer lock.
     ///
     /// `old_doc` is the pre-write document (`None` for a fresh insert). The set
     /// of indexed values is diffed against the new document: values only in the
     /// new set are inserted, values only in the old set are removed — so an
     /// UPDATE that changes a field value drops the stale entry. Returns
     /// `(added, removed)` as `(field, value)` tuples.
-    pub(in crate::data::executor) fn apply_secondary_indexes(
-        &mut self,
-        inputs: SecondaryIndexInputs<'_>,
-    ) -> SecondaryIndexDiff {
-        let SecondaryIndexInputs {
-            database_id,
-            tid,
-            collection,
-            old_doc,
-            new_doc,
-            doc_id,
-            index_paths,
-        } = inputs;
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        for index_path in index_paths {
-            let new_vals = index_values_for(new_doc, index_path);
-            let old_vals = old_doc
-                .map(|d| index_values_for(d, index_path))
-                .unwrap_or_default();
-            for v in new_vals.difference(&old_vals) {
-                if let Err(e) =
-                    self.sparse
-                        .index_put(database_id, tid, collection, &index_path.path, v, doc_id)
-                {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        doc_id = %doc_id,
-                        path = %index_path.path,
-                        error = %e,
-                        "secondary index insert failed"
-                    );
-                    continue;
-                }
-                added.push((index_path.path.clone(), v.clone()));
-            }
-            for v in old_vals.difference(&new_vals) {
-                if let Err(e) = self.sparse.index_remove(
-                    database_id,
-                    tid,
-                    collection,
-                    &index_path.path,
-                    v,
-                    doc_id,
-                ) {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        doc_id = %doc_id,
-                        path = %index_path.path,
-                        error = %e,
-                        "secondary index stale-entry removal failed"
-                    );
-                    continue;
-                }
-                removed.push((index_path.path.clone(), v.clone()));
-            }
-        }
-        (added, removed)
-    }
-
-    /// Apply the secondary-index SET diff within an already-open write txn.
     ///
-    /// Routes writes through [`SparseEngine::index_put_in_txn`] /
-    /// [`SparseEngine::index_remove_in_txn`] so the document + index entries
-    /// commit atomically with the caller's `WriteTransaction`. Required from
-    /// `apply_point_put`, which opens the outer txn in `execute_point_put`.
-    ///
-    /// See [`apply_secondary_indexes`](Self::apply_secondary_indexes) for the
-    /// `old_doc` diff semantics and the `(added, removed)` return.
+    /// An index write that fails propagates rather than being stepped over.
+    /// The entries land in the CALLER'S transaction alongside the row body, so
+    /// every caller returns before `txn.commit()` and redb rolls both halves
+    /// back — the row does not exist, rather than existing with an index that
+    /// cannot find it. Stepping over the failure would be permanent, not
+    /// transient: nothing re-derives the missing entry, the next write to the
+    /// document diffs against the values this one believed it wrote, and a
+    /// lookup on the indexed field can no longer distinguish "no such row"
+    /// from "the row is there and the index forgot it".
     pub(in crate::data::executor) fn apply_secondary_indexes_in_txn(
         &mut self,
         txn: &redb::WriteTransaction,
         inputs: SecondaryIndexInputs<'_>,
-    ) -> SecondaryIndexDiff {
+    ) -> crate::Result<SecondaryIndexDiff> {
         let SecondaryIndexInputs {
             database_id,
             tid,
@@ -208,7 +146,7 @@ impl CoreLoop {
                 .map(|d| index_values_for(d, index_path))
                 .unwrap_or_default();
             for v in new_vals.difference(&old_vals) {
-                if let Err(e) = self.sparse.index_put_in_txn(
+                self.sparse.index_put_in_txn(
                     txn,
                     crate::engine::sparse::btree_index::IndexEntryTxn {
                         database_id,
@@ -218,21 +156,11 @@ impl CoreLoop {
                         value: v,
                         document_id: doc_id,
                     },
-                ) {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        doc_id = %doc_id,
-                        path = %index_path.path,
-                        error = %e,
-                        "secondary index insert failed (in-txn)"
-                    );
-                    continue;
-                }
+                )?;
                 added.push((index_path.path.clone(), v.clone()));
             }
             for v in old_vals.difference(&new_vals) {
-                if let Err(e) = self.sparse.index_remove_in_txn(
+                self.sparse.index_remove_in_txn(
                     txn,
                     crate::engine::sparse::btree_index::IndexEntryTxn {
                         database_id,
@@ -242,21 +170,11 @@ impl CoreLoop {
                         value: v,
                         document_id: doc_id,
                     },
-                ) {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        doc_id = %doc_id,
-                        path = %index_path.path,
-                        error = %e,
-                        "secondary index stale-entry removal failed (in-txn)"
-                    );
-                    continue;
-                }
+                )?;
                 removed.push((index_path.path.clone(), v.clone()));
             }
         }
-        (added, removed)
+        Ok((added, removed))
     }
 
     /// Pause writes to a vShard (during Phase 3 migration cutover).
@@ -361,7 +279,7 @@ fn maybe_lowercase(v: &str, case_insensitive: bool) -> String {
 /// Extract the set of stored index values a document contributes for one index
 /// path. Applies the path's predicate (empty set when it fails) and the same
 /// case-insensitive folding the forward write path uses, so the SET diff in
-/// `apply_secondary_indexes*` compares like-for-like.
+/// `apply_secondary_indexes_in_txn` compares like-for-like.
 fn index_values_for(
     doc: &serde_json::Value,
     index_path: &crate::engine::document::store::IndexPath,

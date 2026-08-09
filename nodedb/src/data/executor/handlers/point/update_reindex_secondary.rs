@@ -57,7 +57,7 @@ impl CoreLoop {
             new_body: p.new_body,
             is_strict: p.is_strict,
             has_sparse,
-        });
+        })?;
         Ok(())
     }
 }

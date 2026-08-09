@@ -91,21 +91,15 @@ impl CoreLoop {
             }
         };
 
-        // Check if the collection uses strict (Binary Tuple) encoding.
-        let config_key = (
+        // The stored bodies' encoding comes from the collection's registered
+        // kind, resolved once here: a two-way Strict/Document decision made
+        // inline would leave a vector-primary sidecar read as a document, whose
+        // tagged values yield `[4,"alice"]` where the CTE expects `alice`.
+        let body_format = self.sparse_body_format(
             task.request.database_id,
             crate::types::TenantId::new(tid),
-            collection.to_string(),
+            collection,
         );
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
 
         // Scan all documents once (used for both base and recursive steps).
         let all_docs = match self.sparse.scan_documents(
@@ -125,13 +119,15 @@ impl CoreLoop {
             }
         };
 
-        // Convert raw bytes to msgpack. For strict docs, this requires the schema.
+        // Convert raw stored bytes to the msgpack form the CTE steps compare on.
         let to_msgpack = |value: &[u8]| -> Option<Vec<u8>> {
-            if let Some(ref schema) = strict_schema {
-                super::super::strict_format::binary_tuple_to_msgpack(value, schema)
-            } else {
-                Some(super::super::doc_format::json_to_msgpack(value))
-            }
+            Some(
+                crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                    value,
+                    body_format.as_format_ref(),
+                )
+                .into_owned(),
+            )
         };
 
         // Step 1: Seed working table with base query results.
@@ -143,7 +139,6 @@ impl CoreLoop {
             %collection,
             all_docs = all_docs.len(),
             base_preds = base_preds.len(),
-            strict = strict_schema.is_some(),
             ?join_link,
             "recursive CTE: starting seed"
         );

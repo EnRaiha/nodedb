@@ -87,6 +87,6 @@ pub(super) fn gate_merge_arms(
 /// bodies are MessagePack for BOTH storage modes (`collect_merge_plan` decodes
 /// a strict target's Binary Tuple and re-encodes the resolved row before the
 /// apply pass ever sees it), so the strict decoder would have nothing to read.
-pub(super) fn returning_doc(body: &[u8], doc_id: &str) -> Option<serde_json::Value> {
+pub(super) fn returning_doc(body: &[u8], doc_id: &str) -> crate::Result<serde_json::Value> {
     super::super::returning_doc::from_stored(body, doc_id, None)
 }

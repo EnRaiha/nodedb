@@ -81,7 +81,7 @@ impl CoreLoop {
             };
             json_results.push(entry);
         }
-        match response_codec::encode_json_vec(&json_results) {
+        match response_codec::encode_json_vec_as_msgpack(&json_results) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

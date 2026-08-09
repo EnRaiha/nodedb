@@ -123,8 +123,10 @@ impl CoreLoop {
                 // No strict schema: a CRDT row's stored body is whatever
                 // `encode_crdt_row` materialized from Loro, which is always
                 // MessagePack regardless of the collection's storage mode.
-                let doc = returning_doc::from_stored(&bytes, document_id, None)
-                    .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
+                let doc = match returning_doc::from_stored(&bytes, document_id, None) {
+                    Ok(doc) => doc,
+                    Err(e) => return self.response_error(task, e),
+                };
                 match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {
@@ -249,8 +251,10 @@ impl CoreLoop {
             if let Some(prior_bytes) = outcome.prior_value.as_deref() {
                 // No strict schema — see the upsert path: a CRDT row is
                 // materialized as MessagePack in either storage mode.
-                let doc = returning_doc::from_stored(prior_bytes, document_id, None)
-                    .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
+                let doc = match returning_doc::from_stored(prior_bytes, document_id, None) {
+                    Ok(doc) => doc,
+                    Err(e) => return self.response_error(task, e),
+                };
                 match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {

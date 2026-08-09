@@ -290,7 +290,7 @@ pub(super) fn execute_grouping_sets(
 
     all_rows.truncate(limit);
 
-    match super::super::response_codec::encode_json_vec(&all_rows) {
+    match super::super::response_codec::encode_json_vec_as_msgpack(&all_rows) {
         Ok(payload) => core.response_with_payload(task, payload),
         Err(e) => core.response_error(
             task,

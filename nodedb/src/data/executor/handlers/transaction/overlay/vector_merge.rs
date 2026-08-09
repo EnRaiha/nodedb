@@ -165,19 +165,22 @@ impl CoreLoop {
     /// -- see module doc) and truncating to `params.top_k`.
     ///
     /// A staged put is skipped (contributes no entry, and is removed if
-    /// already present from base) when: its body cannot be decoded under
-    /// the collection's registered storage mode, it has no `field_name`
-    /// field or that field is not a numeric array, its dimensionality does
-    /// not match `params.query_vector`, it is excluded by
+    /// already present from base) when: the collection is unregistered, it has
+    /// no `field_name` field or that field is not a numeric array, its
+    /// dimensionality does not match `params.query_vector`, it is excluded by
     /// `params.filter_bitmap`, or it fails `params.payload_filters`. A
     /// staged put that also appears in `hits` (from base) is re-scored and
     /// replaces the base entry's distance/body (an in-transaction re-insert
     /// should reflect the latest write).
+    ///
+    /// A staged body that will not decode is NOT in that list: the merge exists
+    /// so a transaction sees its own writes, so a staged row that would
+    /// silently drop out of the result fails the search instead.
     pub(in crate::data::executor) fn merge_vector_overlay_into_search(
         &self,
         params: VectorMergeParams<'_>,
         hits: &mut Vec<VectorSearchHit>,
-    ) {
+    ) -> crate::Result<()> {
         let VectorMergeParams {
             txn_id,
             database_id,
@@ -211,7 +214,7 @@ impl CoreLoop {
                         }
                     }
                     Staged::Put(body) => {
-                        let Some(doc) = self.decode_indexed_body(&config_key, body) else {
+                        let Some(doc) = self.decode_indexed_body(&config_key, body)? else {
                             continue;
                         };
                         let Some(vector) = extract_vector_field(&doc, field_name) else {
@@ -261,5 +264,6 @@ impl CoreLoop {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(top_k);
+        Ok(())
     }
 }
