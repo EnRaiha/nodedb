@@ -312,6 +312,7 @@ fn transaction_batch_records_sub_plan_versions() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })];
     let resp = core.execute_transaction_batch(&task, 1, &plans, &[], None);
     assert_eq!(resp.status, Status::Ok);
@@ -509,6 +510,7 @@ fn point_put_stores_schemaless_docs_as_canonical_msgpack_maps() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             })),
         })
         .unwrap();
@@ -552,6 +554,7 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 })),
             })
             .unwrap();
@@ -795,6 +798,7 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })];
     let write_resp = core.execute_transaction_batch(&write_task, 1, &write_plans, &[], None);
     assert_eq!(write_resp.status, Status::Ok);
@@ -819,6 +823,7 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })];
     let stale_reads = vec![point_entry("orders", 7, 5)];
     let second_resp =

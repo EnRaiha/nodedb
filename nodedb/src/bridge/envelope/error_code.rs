@@ -143,6 +143,23 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::BalanceViolation {
                 collection, detail, ..
             } => Self::BalanceViolation { collection, detail },
+            // A materialized-sum target that cannot be addressed breaks the
+            // balance invariant the target collection maintains, so it crosses
+            // the bridge as the same class of violation the Control Plane
+            // already renders it as — not as a generic `Internal`, which would
+            // reach the client as SQLSTATE `XX000` and lose the target
+            // collection, join column, and join value the message names.
+            crate::Error::MaterializedSumTargetNotFound {
+                target_collection,
+                join_column,
+                join_value,
+            } => Self::BalanceViolation {
+                collection: target_collection,
+                detail: format!(
+                    "no row with primary key '{join_value}', referenced by join column \
+                     '{join_column}'"
+                ),
+            },
             crate::Error::PeriodLocked { collection, .. } => Self::PeriodLocked { collection },
             crate::Error::RetentionViolation { collection, .. } => {
                 Self::RetentionViolation { collection }

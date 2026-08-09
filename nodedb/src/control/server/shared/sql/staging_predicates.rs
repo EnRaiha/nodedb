@@ -372,6 +372,7 @@ mod tests {
             returning: ret(),
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(is_point_write(&point_update));
         assert!(is_stageable_write(&point_update));
@@ -385,6 +386,7 @@ mod tests {
             returning: ret(),
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(is_stageable_write(&point_delete));
         assert_eq!(staged_tag_kind(&point_delete, &[]), StagedTagKind::Delete);

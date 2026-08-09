@@ -5,7 +5,7 @@
 //! Index key format: `"{database_id}:{tenant_id}:{collection}:{field}:{value}:{document_id}"`.
 //! Extracted from `btree.rs` — document CRUD stays there, index ops live here.
 
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
 use tracing::debug;
 
 use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err};
@@ -48,43 +48,67 @@ impl SparseEngine {
         collection: &str,
         document_id: &str,
     ) -> crate::Result<()> {
-        let prefix = coll_prefix(database_id, tenant_id, collection);
-        let end = format!("{prefix}\u{ffff}");
-        let suffix = format!(":{document_id}");
-
         let write_txn = self
             .db
             .begin_write()
             .map_err(|e| redb_err("write txn", e))?;
-        {
-            let mut table = write_txn
-                .open_table(INDEXES)
-                .map_err(|e| redb_err("open indexes", e))?;
-
-            let keys_to_remove: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("index range", e))?
-                .filter_map(|r| {
-                    r.ok().and_then(|(k, _)| {
-                        let key = k.value().to_string();
-                        if key.ends_with(&suffix) {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            for key in &keys_to_remove {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove index", e))?;
-            }
-        }
+        self.delete_indexes_for_document_in_txn(
+            &write_txn,
+            database_id,
+            tenant_id,
+            collection,
+            document_id,
+        )?;
         write_txn
             .commit()
             .map_err(|e| redb_err("commit index cascade", e))?;
+
+        Ok(())
+    }
+
+    /// Delete all secondary index entries for a document within an
+    /// externally-owned write transaction.
+    ///
+    /// The transactional form of [`SparseEngine::delete_indexes_for_document`],
+    /// used by the document-delete cascade so the index removals land in the
+    /// same redb transaction as the row removal that caused them. Does NOT
+    /// commit.
+    pub fn delete_indexes_for_document_in_txn(
+        &self,
+        txn: &WriteTransaction,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        document_id: &str,
+    ) -> crate::Result<()> {
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
+        let suffix = format!(":{document_id}");
+
+        let mut table = txn
+            .open_table(INDEXES)
+            .map_err(|e| redb_err("open indexes", e))?;
+
+        let keys_to_remove: Vec<String> = table
+            .range(prefix.as_str()..end.as_str())
+            .map_err(|e| redb_err("index range", e))?
+            .filter_map(|r| {
+                r.ok().and_then(|(k, _)| {
+                    let key = k.value().to_string();
+                    if key.ends_with(&suffix) {
+                        Some(key)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        for key in &keys_to_remove {
+            table
+                .remove(key.as_str())
+                .map_err(|e| redb_err("remove index", e))?;
+        }
 
         Ok(())
     }

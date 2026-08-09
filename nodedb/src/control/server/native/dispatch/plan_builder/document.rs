@@ -121,6 +121,7 @@ pub(crate) fn build_point_put(
                 // write projects nothing and needs no read gate.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }))
         }
     }
@@ -166,6 +167,7 @@ pub(crate) fn build_point_delete(
                 returning: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }))
         }
     }
@@ -232,6 +234,7 @@ pub(crate) fn build_batch_insert(
         // See `build_point_put`.
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -270,6 +273,7 @@ pub(crate) fn build_update(
         returning: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -317,6 +321,7 @@ pub(crate) fn build_upsert(
         // See `build_point_put`.
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     }))
 }
 

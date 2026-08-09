@@ -108,6 +108,7 @@ fn point_put_and_get() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -146,6 +147,7 @@ fn point_delete_removes() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -161,6 +163,7 @@ fn point_delete_removes() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -216,6 +219,7 @@ fn range_scan_returns_results() {
             pk_bytes: b"u1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
     send_ok(
@@ -230,6 +234,7 @@ fn range_scan_returns_results() {
             pk_bytes: b"u2".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -287,6 +292,7 @@ fn batch_insert_docs(
             surrogates,
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 }

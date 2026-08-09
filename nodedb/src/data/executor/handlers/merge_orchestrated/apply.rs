@@ -163,6 +163,7 @@ impl CoreLoop {
                                     surrogate: surrogate.as_u32(),
                                     is_delete: false,
                                     value: upd.body.clone(),
+                                    collection: None,
                                 });
                             }
                             if params.returning.is_some() {
@@ -283,6 +284,7 @@ impl CoreLoop {
                             surrogate: surrogate.as_u32(),
                             is_delete: false,
                             value: ins.body.clone(),
+                            collection: None,
                         });
                     }
                     if params.returning.is_some() {

@@ -319,6 +319,7 @@ impl CoreLoop {
                                 surrogate: surrogate.as_u32(),
                                 is_delete: false,
                                 value: stored_bytes,
+                                collection: None,
                             }];
                         }
                         response
@@ -428,6 +429,7 @@ impl CoreLoop {
                         surrogate: surrogate.as_u32(),
                         is_delete: false,
                         value: value.to_vec(),
+                        collection: None,
                     }];
                 }
                 response

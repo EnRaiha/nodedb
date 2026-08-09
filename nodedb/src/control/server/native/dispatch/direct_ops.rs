@@ -266,6 +266,18 @@ pub(crate) async fn handle_direct_op(
             return error_to_native(seq, &e);
         }
 
+        if let Err(e) = crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+            ctx.state,
+            &mut tasks,
+            tenant_id,
+            ctx.database_id(),
+            TraceId::ZERO,
+        )
+        .await
+        {
+            return error_to_native(seq, &e);
+        }
+
         // The expanded set is the dispatch authorization boundary. The no-edge
         // path retains its existing per-task capability consumption below.
         let authorized_tasks =

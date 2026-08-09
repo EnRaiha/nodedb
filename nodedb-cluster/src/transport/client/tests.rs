@@ -125,6 +125,7 @@ impl RaftRpcHandler for EchoHandler {
         crate::rpc_codec::AssignSurrogateResponse {
             surrogate: 0,
             error: None,
+            found: None,
         }
     }
 

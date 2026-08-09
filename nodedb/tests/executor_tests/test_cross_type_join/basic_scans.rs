@@ -174,6 +174,7 @@ fn schemaless_put_scan_roundtrip() {
             pk_bytes: b"d1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -190,6 +191,7 @@ fn schemaless_put_scan_roundtrip() {
             pk_bytes: b"d3".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 

@@ -113,6 +113,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::RemoteTyped { code, message } => {
             ("ERROR", numeric_code_to_sqlstate(*code), message.clone())
         }
+        // A materialized-sum join key that names no target row breaks the
+        // balance invariant, so it carries the same SQLSTATE the Data Plane's
+        // `BalanceViolation` does rather than a generic internal error.
+        crate::Error::MaterializedSumTargetNotFound { .. } => {
+            ("ERROR", sqlstate::BALANCE_VIOLATION, err.to_string())
+        }
         _ => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
     }
 }

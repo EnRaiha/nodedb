@@ -466,8 +466,15 @@ impl CoreLoop {
         if !preserve_collection_metadata {
             self.doc_configs
                 .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+            // In memory AND on disk, in lockstep: a persisted head left behind
+            // by a DROP is rehydrated at the next restart, so a collection
+            // recreated under the same name would resume the dropped
+            // collection's chain instead of starting at genesis. The
+            // clear-then-install path (`preserve_collection_metadata`) keeps
+            // both, so the map and the table never disagree.
             self.chain_hashes
                 .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+            self.sparse.delete_chain_head(db_raw, tid_raw, collection)?;
             self.invalidate_aggregate_cache_for_collection(db_raw, tid_raw, collection);
         }
 

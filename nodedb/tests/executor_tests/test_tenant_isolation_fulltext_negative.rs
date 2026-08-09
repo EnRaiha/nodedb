@@ -42,6 +42,7 @@ fn fulltext_cross_tenant_index_does_not_contaminate_search() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -85,6 +86,7 @@ fn fulltext_cross_tenant_index_does_not_contaminate_search() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

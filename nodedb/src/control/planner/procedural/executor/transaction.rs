@@ -158,6 +158,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

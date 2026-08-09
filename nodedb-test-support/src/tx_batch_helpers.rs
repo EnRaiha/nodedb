@@ -164,6 +164,7 @@ pub fn doc_put(collection: &str, doc_id: &str, val: &[u8]) -> PhysicalPlan {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 
@@ -189,6 +190,7 @@ pub fn doc_conflict(collection: &str, doc_id: &str) -> PhysicalPlan {
         if_absent: false,
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 

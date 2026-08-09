@@ -33,6 +33,7 @@ fn purge_removes_all_tenant_data() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -105,6 +106,7 @@ fn purge_removes_all_tenant_data() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -276,6 +278,7 @@ fn purge_is_idempotent() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 

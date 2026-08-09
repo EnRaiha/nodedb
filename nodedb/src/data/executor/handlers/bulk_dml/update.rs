@@ -327,7 +327,7 @@ impl CoreLoop {
                     {
                         return self.response_error(task, e);
                     }
-                    if let Err(e) = self.nonbitemporal_update_reindex(NonbitemporalUpdateReindex {
+                    let touched = match self.persist_bulk_update_row(NonbitemporalUpdateReindex {
                         database_id,
                         tid,
                         collection,
@@ -336,14 +336,28 @@ impl CoreLoop {
                         index_paths: &index_paths,
                         old_doc: &old_doc_json,
                         new_doc: &doc,
-                        wal_lsn: task.wal_lsn(),
                     }) {
-                        tracing::warn!(
-                            %doc_id,
-                            error = %e,
-                            "update reindex commit failed, skipping document"
+                        Ok(touched) => touched,
+                        Err(e) => {
+                            tracing::warn!(
+                                %doc_id,
+                                error = %e,
+                                "update reindex commit failed, skipping document"
+                            );
+                            continue;
+                        }
+                    };
+                    // Published only after the commit succeeded — the same
+                    // ordering the reindex helper used when it owned the
+                    // transaction.
+                    if let Some(lsn) = task.wal_lsn() {
+                        self.note_index_write_values(
+                            task.request.database_id,
+                            crate::types::TenantId::new(tid),
+                            collection,
+                            &touched,
+                            lsn,
                         );
-                        continue;
                     }
                     self.doc_cache.put(
                         task.request.database_id.as_u64(),
@@ -417,6 +431,7 @@ impl CoreLoop {
                             surrogate: surrogate.as_u32(),
                             is_delete: false,
                             value: updated_bytes,
+                            collection: None,
                         });
                     }
                 }

@@ -29,6 +29,7 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -46,6 +47,7 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -96,6 +98,7 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -115,6 +118,7 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
     let ok_or_not_found = resp_del.status == Status::Ok

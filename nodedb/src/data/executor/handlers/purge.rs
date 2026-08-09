@@ -160,8 +160,20 @@ impl CoreLoop {
         // 10. Doc configs: remove collection configs for this tenant.
         self.doc_configs.retain(|(_, t, _), _| *t != tid_key);
 
-        // Chain hashes: remove for this tenant.
+        // Chain hashes: remove for this tenant, in memory AND on disk. Dropping
+        // only the map would let the next restart rehydrate the head of a
+        // purged collection, so a tenant recreated under the same id would
+        // resume a chain whose rows are gone.
         self.chain_hashes.retain(|(_, t, _), _| *t != tid_key);
+        if let Err(e) = self.sparse.delete_chain_heads_for_tenant(tenant_id) {
+            warn!(tenant_id, error = %e, "sparse chain-head purge failed");
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("sparse chain-head purge: {e}"),
+                },
+            );
+        }
 
         // Sparse vector indexes: remove for this tenant (all databases).
         self.sparse_vector_indexes

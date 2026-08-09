@@ -197,18 +197,24 @@ fn autocommit_put(core: &mut Core) {
     txn.commit().unwrap();
 }
 
-/// Autocommit DELETE via `apply_point_delete`.
+/// Autocommit DELETE via `apply_point_delete` inside a self-owned redb txn
+/// (mirrors `execute_point_delete`).
 fn autocommit_delete(core: &mut Core) {
-    core.apply_point_delete(PointDeleteParams {
-        database_id: DB,
-        tid: TID,
-        collection: COLL,
-        document_id: PK,
-        surrogate: Surrogate::new(1),
-        user_roles: &[],
-        enforce: true,
-    })
+    let txn = core.sparse.begin_write().unwrap();
+    core.apply_point_delete(
+        &txn,
+        PointDeleteParams {
+            database_id: DB,
+            tid: TID,
+            collection: COLL,
+            document_id: PK,
+            surrogate: Surrogate::new(1),
+            user_roles: &[],
+            enforce: true,
+        },
+    )
     .unwrap();
+    txn.commit().unwrap();
 }
 
 /// A throwaway `ExecutionTask` (DEFAULT database id, inert `PointGet` plan) —
@@ -296,6 +302,7 @@ fn tx_put_commit_matches_autocommit_across_all_indexes() {
             value: &value,
             user_roles: &[],
             insert_if_absent: None,
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )
@@ -340,6 +347,7 @@ fn tx_put_rollback_restores_pre_tx_state_across_all_indexes() {
             value: &value,
             user_roles: &[],
             insert_if_absent: None,
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )

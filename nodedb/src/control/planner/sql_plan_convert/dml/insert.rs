@@ -281,6 +281,10 @@ pub(in super::super) fn convert_insert(
                         // filter by the RLS injection pass.
                         returning: None,
                         rls_filters: Vec::new(),
+                        // Filled by the materialized-sum resolution pass,
+                        // which runs after conversion (it needs the catalog
+                        // and, in cluster mode, a routed lookup).
+                        resolved_sum_targets: Vec::new(),
                     })
                 };
                 tasks.push(PhysicalTask {
@@ -438,6 +442,8 @@ pub(in super::super) fn convert_upsert(
                         rls_filters: Vec::new(),
                         // Filled in by the protocol layer's RETURNING injection.
                         returning: None,
+                        // Filled by the materialized-sum resolution pass.
+                        resolved_sum_targets: Vec::new(),
                     })
                 };
                 tasks.push(PhysicalTask {

@@ -30,6 +30,7 @@ fn transaction_batch_commits_atomically() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "docs".into(),
@@ -39,6 +40,7 @@ fn transaction_batch_commits_atomically() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
             ],
         }),
@@ -96,6 +98,7 @@ fn transaction_batch_response_uses_outer_request_id() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 })],
             }),
         ),
@@ -125,6 +128,7 @@ fn transaction_batch_rollback_on_failure() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -178,6 +182,7 @@ fn transaction_batch_rollback_on_failure() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
                 // Dimension mismatch: index is dim=3 but vector has 2 elements.
                 PhysicalPlan::Vector(VectorOp::Insert {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Protocol-neutral statement setup: plan, authorize, extract implicit edges,
-//! authorize again, and admit the descriptor leases — as ONE retried unit.
+//! resolve materialized-sum targets, authorize again, and admit the descriptor
+//! leases — as ONE retried unit.
 //!
 //! Planning reads the catalog and records a descriptor version; the lease that
 //! pins that version is only acquired afterwards. A descriptor drain that starts
@@ -107,6 +108,15 @@ async fn plan_authorize_and_admit_once(
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)?;
 
     crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+        state,
+        &mut tasks,
+        tenant_id,
+        database_id,
+        trace_id,
+    )
+    .await?;
+
+    crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
         state,
         &mut tasks,
         tenant_id,

@@ -383,6 +383,11 @@ pub struct SharedState {
     pub _test_state_dir: Option<tempfile::TempDir>,
     /// Schema version counter — bumped on CREATE/DROP/ALTER DDL.
     pub schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion,
+    /// Materialized-sum bindings indexed by SOURCE collection, cached per
+    /// schema version. Keeps the plan-time target resolution off the catalog
+    /// scan that deriving it from the target-side declarations would otherwise
+    /// need on every write.
+    pub materialized_sum_index: crate::control::planner::materialized_sum::MaterializedSumIndex,
     /// In-memory sequence registry (nextval/currval/setval).
     pub sequence_registry: Arc<crate::control::sequence::SequenceRegistry>,
     /// Per-collection DML counter for auto-ANALYZE triggering.

@@ -154,8 +154,13 @@ impl CoreLoop {
                 }),
             };
             match images {
-                Ok((old_doc, new_doc)) => self
-                    .nonbitemporal_update_reindex(
+                Ok((old_doc, new_doc)) => {
+                    // This handler owns the transaction the body and its
+                    // secondary-index diff share, so a failure in either drops
+                    // it un-committed and neither lands.
+                    let txn = self.sparse.begin_write()?;
+                    let touched = self.nonbitemporal_update_reindex(
+                        &txn,
                         super::super::update_reindex::NonbitemporalUpdateReindex {
                             database_id,
                             tid,
@@ -165,10 +170,26 @@ impl CoreLoop {
                             index_paths: &index_paths,
                             old_doc: &old_doc,
                             new_doc: &new_doc,
-                            wal_lsn,
                         },
-                    )
-                    .map(|()| None::<Vec<u8>>),
+                    )?;
+                    txn.commit().map_err(|e| crate::Error::Storage {
+                        engine: "sparse".into(),
+                        detail: format!("nonbitemporal update reindex commit: {e}"),
+                    })?;
+                    // Index write-versions are published only once the write
+                    // they describe is durable — same ordering as when the
+                    // commit lived inside `nonbitemporal_update_reindex`.
+                    if let Some(lsn) = wal_lsn {
+                        self.note_index_write_values(
+                            DatabaseId::new(database_id),
+                            TenantId::new(tid),
+                            collection,
+                            &touched,
+                            lsn,
+                        );
+                    }
+                    Ok(None::<Vec<u8>>)
+                }
                 Err(e) => {
                     // Both images are documents we just read / re-encoded.
                     // If one fails to decode we cannot compute the

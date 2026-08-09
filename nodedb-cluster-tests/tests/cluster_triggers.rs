@@ -38,6 +38,7 @@ fn async_trigger_not_in_raft_log() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
 
     // to_replicated_entry converts the plan to a Raft log entry.
@@ -200,6 +201,7 @@ fn replicated_entry_roundtrip_point_delete() {
         returning: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
@@ -256,6 +258,7 @@ fn procedure_dml_is_normal_write() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     // This is a normal write → replicates via Raft.
     assert!(

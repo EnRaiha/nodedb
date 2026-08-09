@@ -94,6 +94,20 @@ impl EnforcementOptions {
             || !self.state_constraints.is_empty()
             || !self.transition_checks.is_empty()
     }
+
+    /// Whether this collection declares enforcement that folds a write's PRE-
+    /// and POST-images: materialized-sum bindings, or a BALANCED constraint.
+    ///
+    /// Distinct from [`Self::has_put_checks`], which asks whether the stateless
+    /// admission checks need the prior row. This asks whether the prior row must
+    /// be DECODED into a document, which is a strictly stronger requirement: a
+    /// stored body is only guaranteed to be a readable document for a collection
+    /// that declares what its columns mean. A caller that decodes the pre-image
+    /// unconditionally fails every write to a collection carrying an opaque
+    /// body, including collections that declare no constraints at all.
+    pub fn has_image_enforcement(&self) -> bool {
+        !self.materialized_sum_sources.is_empty() || self.balanced.is_some()
+    }
 }
 
 /// A stored generated column: expression evaluated at write time.

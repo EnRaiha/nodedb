@@ -70,6 +70,23 @@ impl CoreLoop {
         // Column statistics store shares the sparse engine's redb database.
         let stats_store = crate::engine::sparse::stats::StatsStore::open(sparse.db().clone())?;
 
+        // Rehydrate the per-collection hash-chain heads written by previous
+        // runs. Without this every restart restarts every chain at
+        // `GENESIS_HASH`, so `VERIFY_HASH_CHAIN` breaks at the first row
+        // inserted after a restart and blames an untampered row.
+        //
+        // This reads the persisted heads; it does NOT rescan the collections to
+        // recompute them, and must not be "simplified" into one. `verify_chain`
+        // walks entries in INSERTION order, while a storage scan returns them in
+        // surrogate (key) order. The two coincide only if surrogates are
+        // allocated strictly monotonically per collection, which nothing
+        // guarantees: under cluster HiLo batching each node carves a disjoint
+        // reservation from the global watermark (see
+        // `control::surrogate::registry`) and hands surrogates out locally, so a
+        // later insert can carry a lower surrogate than an earlier one. A
+        // rescan would recompute a chain that is not the one that was written.
+        let chain_hashes = sparse.load_chain_heads()?;
+
         let array_root = data_dir.join(format!("array/core-{core_id}"));
         let array_engine = ArrayEngine::new(ArrayEngineConfig::new(array_root)).map_err(|e| {
             crate::Error::Internal {
@@ -135,7 +152,7 @@ impl CoreLoop {
             spatial_doc_map: std::collections::HashMap::new(),
             vector_doc_map: std::collections::HashMap::new(),
             doc_configs: HashMap::new(),
-            chain_hashes: HashMap::new(),
+            chain_hashes,
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
             graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
             ts_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),

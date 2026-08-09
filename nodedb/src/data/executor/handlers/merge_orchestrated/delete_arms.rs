@@ -2,13 +2,15 @@
 
 //! The MERGE DELETE arms, applied after the put transaction has committed.
 //!
-//! Its own file because it obeys the opposite transaction rule to the
+//! Its own file because it obeys a different transaction rule to the
 //! UPDATE/INSERT arms it follows. Those share one redb write transaction and
-//! are all-or-nothing; `apply_point_delete`'s cascade (document store, FTS,
-//! spatial, HNSW, secondary indexes) opens transactions of its own, so it
-//! cannot run inside that one and must follow the commit. Keeping the two
-//! phases in separate files stops a later edit from moving a delete back under
-//! the shared transaction, which would deadlock on the single redb writer.
+//! are all-or-nothing across the whole set; each DELETE arm instead takes its
+//! own transaction and commits on its own, which is what lets the arm's
+//! post-commit bookkeeping (affected count, RETURNING pre-image, redo
+//! write-set entry, delete event) observe a removal that is already durable.
+//! Keeping the two phases in separate files stops a later edit from folding a
+//! delete into the put phase's transaction, which would change when each
+//! removal becomes durable relative to the event it emits.
 
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
@@ -68,16 +70,35 @@ impl CoreLoop {
         for del in deletes {
             match del.surrogate {
                 Some(surrogate) => {
-                    match self.apply_point_delete(PointDeleteParams {
-                        database_id,
-                        tid,
-                        collection,
-                        document_id: &del.doc_id,
-                        surrogate,
-                        user_roles: &task.request.user_roles,
-                        enforce: true,
-                    }) {
+                    // One write txn per arm: the removal and its index cascades
+                    // commit together, and a failing arm drops the txn
+                    // un-committed so it leaves nothing behind.
+                    let txn = match self.sparse.begin_write() {
+                        Ok(txn) => txn,
+                        Err(e) => return Err(self.response_error(task, e)),
+                    };
+                    match self.apply_point_delete(
+                        &txn,
+                        PointDeleteParams {
+                            database_id,
+                            tid,
+                            collection,
+                            document_id: &del.doc_id,
+                            surrogate,
+                            user_roles: &task.request.user_roles,
+                            enforce: true,
+                        },
+                    ) {
                         Ok(outcome) => {
+                            if let Err(e) = txn.commit() {
+                                return Err(self.response_error(
+                                    task,
+                                    crate::Error::Storage {
+                                        engine: "sparse".into(),
+                                        detail: format!("merge delete commit: {e}"),
+                                    },
+                                ));
+                            }
                             if outcome.prior_value.is_some() {
                                 *affected += 1;
                                 // A DELETE arm returns the PRE-image — the row
@@ -97,6 +118,7 @@ impl CoreLoop {
                                         surrogate: surrogate.as_u32(),
                                         is_delete: true,
                                         value: Vec::new(),
+                                        collection: None,
                                     });
                                 }
                             }

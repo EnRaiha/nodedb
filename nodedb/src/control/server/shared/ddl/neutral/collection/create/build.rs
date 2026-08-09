@@ -26,7 +26,9 @@ use crate::control::state::SharedState;
 
 use super::super::super::super::catalog::propose_and_apply;
 use super::super::super::super::result::{DdlError, DdlResult};
-use super::super::enforcement::{parse_balanced_clause_from_raw, resolve_custom_type_columns};
+use super::super::enforcement::{
+    parse_and_validate_balanced_clause, resolve_custom_type_columns, validate_hash_chain_flags,
+};
 use super::engine_option::validate_engine_name;
 use super::request::CreateCollectionRequest;
 
@@ -272,9 +274,8 @@ pub async fn build_and_persist(
     let hash_chain = flags.iter().any(|f| f == "HASH_CHAIN");
     let bitemporal = bitemporal_flag;
     let crdt_signing_required = flags.iter().any(|flag| flag == "SIGNED_DELTAS");
-    if hash_chain && !append_only {
-        return Err(err("42601", "HASH_CHAIN requires APPEND_ONLY".to_string()));
-    }
+    validate_hash_chain_flags(hash_chain, append_only)
+        .map_err(|e| err(e.sqlstate(), e.to_string()))?;
 
     let crdt = resolve_crdt_flag(options, &collection_type)?;
     validate_crdt_signing_storage(
@@ -282,8 +283,18 @@ pub async fn build_and_persist(
         crdt,
         state.wal.payloads_authenticated(),
     )?;
-    let balanced =
-        parse_balanced_clause_from_raw(balanced_raw.unwrap_or("")).map_err(|e| err("42601", e))?;
+    // Custom-typed columns are physically TEXT, so BALANCED is checked against
+    // the resolved list, falling back to the columnar schema columns (empty for
+    // a truly schemaless collection, which makes the check a no-op).
+    let balanced = parse_and_validate_balanced_clause(
+        balanced_raw.unwrap_or(""),
+        if resolved_columns.is_empty() {
+            &fields
+        } else {
+            &resolved_columns
+        },
+    )
+    .map_err(|e| err(e.sqlstate(), e.to_string()))?;
 
     let partition_strategy =
         nodedb_types::PartitionStrategy::default_for_collection_type(&collection_type);

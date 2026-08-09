@@ -42,6 +42,7 @@ fn fulltext_search_isolated() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

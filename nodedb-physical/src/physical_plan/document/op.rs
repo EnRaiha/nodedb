@@ -72,6 +72,14 @@ pub enum DocumentOp {
         /// See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Point insert: write one document, fail on duplicate primary key.
@@ -102,6 +110,14 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Point delete: remove a document.
@@ -133,6 +149,14 @@ pub enum DocumentOp {
         /// two would turn a write gate into row redaction, or the reverse.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Point update: read-modify-write with field-level changes.
@@ -156,6 +180,14 @@ pub enum DocumentOp {
         /// image — see `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Full collection scan with filtering, sorting, and pagination.
@@ -205,6 +237,14 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time. One entry per DISTINCT join value across `documents`.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Range scan on a sparse/metadata index.
@@ -372,6 +412,14 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
+        /// Join-key value → target row surrogate for this collection's
+        /// materialized-sum bindings, resolved on the Control Plane at plan
+        /// time.
+        ///
+        /// The Data Plane cannot derive this: the PK→surrogate map lives in
+        /// the catalog redb, which is Control-Plane state.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, Surrogate)>,
     },
 
     /// Update target rows matched by a join with a source collection.

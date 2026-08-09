@@ -150,6 +150,7 @@ fn document_schemaless_non_bitemporal_byte_identical() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             })
         })
         .collect();
@@ -306,6 +307,7 @@ fn document_bitemporal_byte_identical() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             })
         })
         .collect();

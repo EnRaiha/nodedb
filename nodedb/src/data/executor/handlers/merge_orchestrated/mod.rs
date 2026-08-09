@@ -26,8 +26,8 @@
 //!    indexes keyed by the row's surrogate — so a merge-inserted row is
 //!    immediately resolvable from any cross-engine search. DELETE arms hit
 //!    existing registered rows via
-//!    [`crate::data::executor::core_loop::CoreLoop::apply_point_delete`]
-//!    (whose cascade opens its own transactions) after the put commit.
+//!    [`crate::data::executor::core_loop::CoreLoop::apply_point_delete`],
+//!    each in its own transaction, after the put commit.
 
 mod abort;
 mod apply;

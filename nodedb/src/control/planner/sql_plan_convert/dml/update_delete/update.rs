@@ -256,6 +256,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     returning: None,
                     rls_filters: Vec::new(),
                     rls_write_check: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 })
             };
             tasks.push(PhysicalTask {

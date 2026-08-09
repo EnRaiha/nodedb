@@ -15,7 +15,7 @@
 
 use tracing::info;
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -74,8 +74,22 @@ impl CoreLoop {
             tenant_id,
             name,
         );
+        // In memory AND on disk: a head left behind would be rehydrated at the
+        // next restart, so a materialized view recreated under the same name
+        // would resume the dropped view's chain.
         self.chain_hashes
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
+        if let Err(e) =
+            self.sparse
+                .delete_chain_head(task.request.database_id.as_u64(), tenant_id, name)
+        {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("materialized view chain-head reclaim: {e}"),
+                },
+            );
+        }
         self.doc_configs
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
 

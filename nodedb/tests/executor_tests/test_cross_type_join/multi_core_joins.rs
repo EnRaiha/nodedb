@@ -33,6 +33,7 @@ fn multi_core_broadcast_inner_join() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -175,6 +176,7 @@ fn multi_core_broadcast_left_join() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -291,6 +293,7 @@ fn multi_core_broadcast_merge_simulation() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -308,6 +311,7 @@ fn multi_core_broadcast_merge_simulation() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

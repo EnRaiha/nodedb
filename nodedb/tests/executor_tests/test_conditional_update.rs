@@ -62,6 +62,7 @@ fn insert_product(
             pk_bytes: id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 }
@@ -310,6 +311,7 @@ fn point_update_returns_affected_count() {
             rls_write_check: Vec::new(),
             surrogate: surrogate_for("pu1"),
             pk_bytes: b"pu1".to_vec(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -342,6 +344,7 @@ fn point_update_returning_returns_updated_document() {
             rls_write_check: Vec::new(),
             surrogate: surrogate_for("pu2"),
             pk_bytes: b"pu2".to_vec(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 

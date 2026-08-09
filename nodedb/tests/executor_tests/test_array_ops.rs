@@ -37,6 +37,7 @@ fn insert_product(
             pk_bytes: id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 }

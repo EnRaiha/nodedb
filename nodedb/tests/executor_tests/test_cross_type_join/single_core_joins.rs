@@ -32,6 +32,7 @@ fn single_core_cross_type_hash_join() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -137,6 +138,7 @@ fn single_core_left_join_with_nulls() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -225,6 +227,7 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
                 pk_bytes: id.as_bytes().to_vec(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -313,6 +316,7 @@ fn single_core_self_join_star_keeps_both_sides() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -401,6 +405,7 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
                 pk_bytes: id.as_bytes().to_vec(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

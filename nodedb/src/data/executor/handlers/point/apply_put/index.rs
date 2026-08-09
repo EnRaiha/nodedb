@@ -198,6 +198,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,

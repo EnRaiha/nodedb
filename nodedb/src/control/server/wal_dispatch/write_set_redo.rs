@@ -98,14 +98,27 @@ pub fn append_write_set_redo(
 ) -> crate::Result<Option<Lsn>> {
     let mut last: Option<Lsn> = None;
     for entry in write_set {
+        let entry_collection = entry.collection.as_deref().unwrap_or(collection);
         let doc_id = surrogate_to_doc_id(Surrogate::new(entry.surrogate));
+        // A cross-collection entry homes to a different vShard than the plan's
+        // own collection, so the vShard must be re-derived per entry rather
+        // than reusing the caller-hoisted `vshard_id` (which is correct only
+        // for `entry.collection == None`).
+        let entry_vshard_id = match &entry.collection {
+            Some(c) => VShardId::from_collection_in_database(database_id, c),
+            None => vshard_id,
+        };
         let lsn = if entry.is_delete {
-            let record = encode_document_delete_record(collection, &doc_id, entry.surrogate)?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &record)?
+            let record = encode_document_delete_record(entry_collection, &doc_id, entry.surrogate)?;
+            wal.append_delete(tenant_id, entry_vshard_id, database_id, &record)?
         } else {
-            let record =
-                encode_document_put_record(collection, &doc_id, &entry.value, entry.surrogate)?;
-            wal.append_put(tenant_id, vshard_id, database_id, &record)?
+            let record = encode_document_put_record(
+                entry_collection,
+                &doc_id,
+                &entry.value,
+                entry.surrogate,
+            )?;
+            wal.append_put(tenant_id, entry_vshard_id, database_id, &record)?
         };
         last = Some(lsn);
     }
@@ -175,6 +188,7 @@ mod tests {
             returning: None::<ReturningSpec>,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -235,6 +249,7 @@ mod tests {
             surrogates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -261,6 +276,7 @@ mod tests {
             surrogate: 9,
             is_delete: false,
             value: vec![1, 2, 3],
+            collection: None,
         }];
 
         let lsn = append_write_set_redo(
@@ -298,6 +314,7 @@ mod tests {
             surrogate: 9,
             is_delete: true,
             value: Vec::new(),
+            collection: None,
         }];
 
         append_write_set_redo(

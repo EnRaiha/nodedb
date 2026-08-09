@@ -26,6 +26,7 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -47,6 +48,7 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -68,6 +70,7 @@ fn inline_hash_join_honors_qualified_left_keys() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

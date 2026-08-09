@@ -73,6 +73,7 @@ impl CoreLoop {
                 pk_bytes: _,
                 returning,
                 rls_filters,
+                resolved_sum_targets: _,
             } => self.execute_point_put(
                 task,
                 crate::data::executor::handlers::point::put::PointPutExec {
@@ -94,6 +95,7 @@ impl CoreLoop {
                 surrogate,
                 returning,
                 rls_filters,
+                resolved_sum_targets: _,
             } => self.execute_point_insert(
                 crate::data::executor::handlers::point::insert::PointInsertParams {
                     task,
@@ -138,6 +140,7 @@ impl CoreLoop {
                 returning,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets: _,
             } => self.execute_point_update(
                 task,
                 crate::data::executor::handlers::point::update::PointUpdateParams {
@@ -192,6 +195,7 @@ impl CoreLoop {
                 surrogates,
                 returning,
                 rls_filters,
+                resolved_sum_targets: _,
             } => self.execute_document_batch_insert(
                 task,
                 crate::data::executor::handlers::document::write::DocumentBatchInsertParams {
@@ -313,6 +317,7 @@ impl CoreLoop {
                 rls_write_check,
                 returning,
                 rls_filters,
+                resolved_sum_targets: _,
             } => self.execute_upsert(
                 task,
                 crate::data::executor::handlers::upsert::UpsertParams {

@@ -24,6 +24,14 @@ pub struct WriteSetEntry {
     pub is_delete: bool,
     /// Post-image body for a put; empty for a delete.
     pub value: Vec<u8>,
+    /// Collection this entry's row belongs to.
+    ///
+    /// `None` means the statement's own collection, which is every entry a
+    /// single-collection write produces. `Some(c)` marks a cross-collection
+    /// side effect — a row written into a different collection as a
+    /// consequence of this statement — whose redo record must name `c` rather
+    /// than the plan's collection, and which homes to a different vShard.
+    pub collection: Option<String>,
 }
 
 /// Response envelope: Data Plane -> Control Plane.

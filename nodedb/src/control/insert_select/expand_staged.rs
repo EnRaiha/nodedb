@@ -117,6 +117,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
                 // orchestrator's paged batch insert.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,

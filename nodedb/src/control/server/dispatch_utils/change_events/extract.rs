@@ -463,6 +463,7 @@ mod tests {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::PointDelete {
                     collection: "users".into(),
@@ -472,6 +473,7 @@ mod tests {
                     returning: None,
                     rls_filters: Vec::new(),
                     rls_write_check: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
             ],
             txn_id: None,
@@ -705,6 +707,7 @@ mod tests {
             surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

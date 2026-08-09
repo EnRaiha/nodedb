@@ -121,6 +121,7 @@ fn commit_put(core: &mut CoreLoop) {
             value: &value,
             user_roles: &[],
             insert_if_absent: None,
+            resolved_sum_targets: &[],
         },
         &mut throwaway,
     )
@@ -187,6 +188,7 @@ fn strict_tx_put_rollback_removes_fts_postings() {
             value: &value,
             user_roles: &[],
             insert_if_absent: None,
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )

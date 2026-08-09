@@ -141,6 +141,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                               (no AssignRemoteSurrogate installed)"
                         .into(),
                 }),
+                found: None,
             },
         }
     }

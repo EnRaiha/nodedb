@@ -163,11 +163,12 @@ impl SurrogateAssigner {
     /// Used by point-read/update/delete planning where a missing
     /// binding means the row does not exist (semantic no-op).
     ///
-    /// When the credential store has no catalog (in-memory test
-    /// fixture), returns `Some(Surrogate::ZERO)` — mirroring the
-    /// `Surrogate::ZERO` allocation `assign` performs in the same
-    /// catalog-less mode, so a write/read pair against an unwired
-    /// catalog still resolves to the same identity.
+    /// Delegates straight to `catalog.get_surrogate_for_pk`: returns
+    /// `Ok(None)` when no binding exists for the key, `Ok(Some(surrogate))`
+    /// when one does, and `Err` on a catalog read failure. There is no
+    /// catalog-less fallback here — every caller goes through the real
+    /// catalog lookup, so a missing binding is always reported as `None`
+    /// rather than synthesized as `Surrogate::ZERO`.
     pub fn lookup(
         &self,
         database_id: DatabaseId,

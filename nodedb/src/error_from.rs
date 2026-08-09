@@ -155,6 +155,20 @@ impl From<Error> for NodeDbError {
             Error::BalanceViolation {
                 collection, detail, ..
             } => NodeDbError::balance_violation(collection, detail),
+            // A missing target row breaks the balance invariant this collection
+            // maintains, so it surfaces as the same class of violation and
+            // carries the target as the offending collection.
+            Error::MaterializedSumTargetNotFound {
+                target_collection,
+                join_column,
+                join_value,
+            } => NodeDbError::balance_violation(
+                target_collection,
+                format!(
+                    "no row with primary key '{join_value}', referenced by join column \
+                     '{join_column}'"
+                ),
+            ),
             Error::PeriodLocked {
                 collection, detail, ..
             } => NodeDbError::period_locked(collection, detail),

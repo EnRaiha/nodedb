@@ -35,6 +35,10 @@ pub(super) fn point_put(
         // nothing and needs no read gate — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
+        // The replicated record carries no materialized-sum resolution: the
+        // leader resolved it against the catalog at plan time and the record
+        // is the applied write, not the plan that produced it.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -67,6 +71,8 @@ pub(super) fn point_insert(
         // Replay projects nothing back — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -91,6 +97,8 @@ pub(super) fn point_delete(
         // committed, and a follower must apply exactly what the leader applied
         // or the replicas diverge. Both slots stay empty for the same reason.
         rls_write_check: Vec::new(),
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -114,6 +122,8 @@ pub(super) fn point_update(
         rls_filters: Vec::new(),
         // Empty on replay — see `point_delete`.
         rls_write_check: Vec::new(),
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -138,6 +148,8 @@ pub(super) fn doc_upsert(
         rls_write_check: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -193,6 +205,8 @@ pub(super) fn batch_insert(
         // Replay projects nothing back — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 

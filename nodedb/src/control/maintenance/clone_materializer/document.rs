@@ -160,6 +160,7 @@ pub(super) async fn materialize_document_collection(
                 // nothing and needs no read gate.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             });
 
             let resp =

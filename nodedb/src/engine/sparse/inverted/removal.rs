@@ -4,9 +4,10 @@
 //!
 //! Removal is expressed once, in transaction terms, and the standalone entry
 //! point wraps it in its own write transaction. The transactional variant is
-//! what an in-flight document write calls when an update leaves the document
-//! with no indexable text — that path already owns the only redb writer, so
-//! it cannot open a second one.
+//! what an in-flight document write calls — an update that leaves the document
+//! with no indexable text, or the delete cascade removing the row that owned
+//! the postings. Those paths already own the only redb writer, so they cannot
+//! open a second one.
 
 use redb::WriteTransaction;
 
@@ -51,7 +52,7 @@ impl InvertedIndex {
     /// than a second decrement of the corpus counters, and it is also what
     /// keeps the term-set fallback scan off the path of documents that were
     /// never indexed.
-    pub(super) fn remove_document_in_txn(
+    pub fn remove_document_in_txn(
         &self,
         txn: &WriteTransaction,
         scope: IndexDocScope<'_>,

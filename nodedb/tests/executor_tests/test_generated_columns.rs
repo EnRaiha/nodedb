@@ -110,6 +110,7 @@ fn insert_materializes_generated_column() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -152,6 +153,7 @@ fn insert_materializes_concat() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -196,6 +198,7 @@ fn update_recomputes_generated_column() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -218,6 +221,7 @@ fn update_recomputes_generated_column() {
             rls_write_check: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -256,6 +260,7 @@ fn update_generated_column_directly_rejected() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -278,6 +283,7 @@ fn update_generated_column_directly_rejected() {
             rls_write_check: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -327,6 +333,7 @@ fn chained_generated_columns() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 

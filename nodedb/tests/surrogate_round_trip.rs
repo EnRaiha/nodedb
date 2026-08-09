@@ -250,6 +250,7 @@ fn surrogate_round_trip_all_engines() {
                 pk_bytes: hex.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -389,6 +390,7 @@ fn surrogate_round_trip_all_engines() {
                 pk_bytes: hex.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -410,6 +412,7 @@ fn surrogate_round_trip_all_engines() {
                 pk_bytes: hex.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

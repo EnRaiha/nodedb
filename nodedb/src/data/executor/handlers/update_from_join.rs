@@ -329,6 +329,7 @@ impl CoreLoop {
                         surrogate: surrogate.as_u32(),
                         is_delete: false,
                         value: updated_bytes,
+                        collection: None,
                     });
                 }
                 affected += 1;

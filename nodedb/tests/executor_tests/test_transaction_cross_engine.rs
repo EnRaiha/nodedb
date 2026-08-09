@@ -28,6 +28,7 @@ fn transaction_edge_put_committed() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
     send_ok(
@@ -42,6 +43,7 @@ fn transaction_edge_put_committed() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -61,6 +63,7 @@ fn transaction_edge_put_committed() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
                     collection: "col".into(),
@@ -110,6 +113,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
     send_ok(
@@ -124,6 +128,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -234,6 +239,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             pk_bytes: b"n1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
     send_ok(
@@ -248,6 +254,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             pk_bytes: b"n2".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -300,6 +307,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
                     pk_bytes: b"n1".to_vec(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
                     collection: "col".into(),

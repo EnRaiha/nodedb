@@ -148,6 +148,7 @@ impl RaftRpcHandler for EchoHandler {
         nodedb_cluster::rpc_codec::AssignSurrogateResponse {
             surrogate: 0,
             error: None,
+            found: None,
         }
     }
 

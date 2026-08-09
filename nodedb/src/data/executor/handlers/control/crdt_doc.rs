@@ -202,15 +202,32 @@ impl CoreLoop {
 
         let tid = tenant_id.as_u64();
         let storage_key = surrogate_to_doc_id(surrogate);
-        let outcome = match self.apply_point_delete(PointDeleteParams {
-            database_id: task.request.database_id.as_u64(),
-            tid,
-            collection,
-            document_id: storage_key.as_str(),
-            surrogate,
-            user_roles: &task.request.user_roles,
-            enforce: false,
-        }) {
+        // The sparse-store removal and its index cascades run in one write txn
+        // this handler owns: on any failure it is dropped un-committed and none
+        // of them land.
+        let txn = match self.sparse.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        let outcome = match self.apply_point_delete(
+            &txn,
+            PointDeleteParams {
+                database_id: task.request.database_id.as_u64(),
+                tid,
+                collection,
+                document_id: storage_key.as_str(),
+                surrogate,
+                user_roles: &task.request.user_roles,
+                enforce: false,
+            },
+        ) {
             Ok(outcome) => outcome,
             Err(e) => {
                 return self.response_error(
@@ -221,6 +238,14 @@ impl CoreLoop {
                 );
             }
         };
+        if let Err(e) = txn.commit() {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("commit: {e}"),
+                },
+            );
+        }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         // Emit the delete to the Event Plane only when a row was actually

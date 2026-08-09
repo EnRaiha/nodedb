@@ -196,6 +196,7 @@ fn three_way_fts_vector_doc_bitmap() {
                 pk_bytes: hex.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -219,6 +220,7 @@ fn three_way_fts_vector_doc_bitmap() {
                 pk_bytes: hex.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

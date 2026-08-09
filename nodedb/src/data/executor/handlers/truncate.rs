@@ -96,6 +96,7 @@ impl CoreLoop {
                             surrogate: surrogate.as_u32(),
                             is_delete: true,
                             value: Vec::new(),
+                            collection: None,
                         });
                     }
                 }

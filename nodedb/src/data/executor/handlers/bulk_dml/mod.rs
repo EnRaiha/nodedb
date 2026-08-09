@@ -8,6 +8,7 @@
 pub mod delete;
 pub mod scan;
 pub mod update;
+pub mod update_persist;
 
 pub(in crate::data::executor) use delete::{BulkDeleteParams, OllpPrediction};
 pub(in crate::data::executor) use update::BulkUpdateParams;

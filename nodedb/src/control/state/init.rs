@@ -438,6 +438,8 @@ impl SharedState {
             data_dir: std::path::PathBuf::new(),
             schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion::new(
             ),
+            materialized_sum_index:
+                crate::control::planner::materialized_sum::MaterializedSumIndex::default(),
             sequence_registry: Arc::new(crate::control::sequence::SequenceRegistry::new()),
             dml_counter:
                 crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter::new(),

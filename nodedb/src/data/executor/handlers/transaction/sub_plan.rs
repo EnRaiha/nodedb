@@ -161,6 +161,7 @@ impl CoreLoop {
                 document_id,
                 value,
                 surrogate,
+                resolved_sum_targets,
                 ..
             } => self.tx_point_put(
                 TxPointPut {
@@ -172,6 +173,7 @@ impl CoreLoop {
                     value,
                     user_roles,
                     insert_if_absent: None,
+                    resolved_sum_targets,
                 },
                 undo_log,
             ),
@@ -182,6 +184,7 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
+                resolved_sum_targets,
                 ..
             } => self.tx_point_put(
                 TxPointPut {
@@ -193,6 +196,7 @@ impl CoreLoop {
                     value,
                     user_roles,
                     insert_if_absent: Some(*if_absent),
+                    resolved_sum_targets,
                 },
                 undo_log,
             ),

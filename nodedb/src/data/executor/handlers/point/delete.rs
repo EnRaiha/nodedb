@@ -52,25 +52,40 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
 
         // Gate the removal on the collection's write policy, decided against
-        // the row's pre-deletion image. The read happens BEFORE the cascade:
-        // `apply_point_delete` commits the doc-store removal internally, so
-        // checking its returned prior value would decide a row already gone.
+        // the row's pre-deletion image. The read happens BEFORE the write: the
+        // removal is staged into the transaction below, so checking a value
+        // read back through it would decide a row already gone.
         if let Err(e) = self.gate_point_delete(task, tid, collection, surrogate, rls_write_check) {
             return self.response_error(task, e);
         }
 
-        // Doc-store write + all index cascades, via `apply_point_delete`.
-        // The doc-store transaction is committed internally before any
-        // cascade runs (cascades open their own write transactions).
-        let outcome = match self.apply_point_delete(PointDeleteParams {
-            database_id,
-            tid,
-            collection,
-            document_id,
-            surrogate,
-            user_roles: &task.request.user_roles,
-            enforce: true,
-        }) {
+        // Doc-store write + all index cascades, via `apply_point_delete`, in a
+        // transaction this handler owns: every sparse-database write the delete
+        // performs lands on commit below, or none of it does if any step fails
+        // (the txn is dropped un-committed on every early return).
+        let txn = match self.sparse.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        let outcome = match self.apply_point_delete(
+            &txn,
+            PointDeleteParams {
+                database_id,
+                tid,
+                collection,
+                document_id,
+                surrogate,
+                user_roles: &task.request.user_roles,
+                enforce: true,
+            },
+        ) {
             Ok(outcome) => outcome,
             Err(e) => {
                 return self.response_error(
@@ -81,6 +96,14 @@ impl CoreLoop {
                 );
             }
         };
+        if let Err(e) = txn.commit() {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("commit: {e}"),
+                },
+            );
+        }
         let prior = outcome.prior_value;
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);

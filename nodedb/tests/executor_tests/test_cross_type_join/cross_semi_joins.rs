@@ -39,6 +39,7 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -143,6 +144,7 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -240,6 +242,7 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -272,6 +275,7 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

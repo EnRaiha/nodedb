@@ -120,7 +120,7 @@ impl CoreLoop {
                 // worst case here is a cache miss.
                 self.doc_cache
                     .invalidate(database_id, tid, &collection, &document_id);
-                self.undo_chain_hash(database_id, tid, &collection, chain_hash_prior);
+                self.undo_chain_hash(database_id, tid, &collection, entry_index, chain_hash_prior)?;
                 Ok(())
             }
             UndoEntry::DeleteDocument {
@@ -176,7 +176,7 @@ impl CoreLoop {
                 // stale post-delete cache entry must not linger.
                 self.doc_cache
                     .invalidate(database_id, tid, &collection, &document_id);
-                self.undo_chain_hash(database_id, tid, &collection, chain_hash_prior);
+                self.undo_chain_hash(database_id, tid, &collection, entry_index, chain_hash_prior)?;
                 Ok(())
             }
             _ => unreachable!("apply_undo_document called with non-document entry"),
@@ -294,32 +294,50 @@ impl CoreLoop {
     /// Reverse a hash-chain mutation performed by a document write. `None` =
     /// the op never touched the chain; `Some(None)` = remove the key (genesis
     /// insert); `Some(Some(prev))` = restore the key to its pre-image.
+    ///
+    /// Reverses the DURABLE head as well as the in-memory one. The forward
+    /// sub-plan committed its transaction, so the advanced head is already on
+    /// disk; restoring only the map would let the next restart rehydrate the
+    /// head of a rolled-back row. FATAL on failure, like the primary-store
+    /// restore: a rollback that leaves the persisted head ahead of the rows is
+    /// a chain that verifies as broken forever after.
     fn undo_chain_hash(
         &mut self,
         database_id: u64,
         tid: u64,
         collection: &str,
+        entry_index: usize,
         chain_hash_prior: Option<Option<String>>,
-    ) {
-        match chain_hash_prior {
-            None => {}
+    ) -> Result<(), (usize, String)> {
+        let key = (
+            crate::types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
+        let persisted = match chain_hash_prior {
+            None => return Ok(()),
             Some(None) => {
-                self.chain_hashes.remove(&(
-                    crate::types::DatabaseId::new(database_id),
-                    crate::types::TenantId::new(tid),
-                    collection.to_string(),
-                ));
+                self.chain_hashes.remove(&key);
+                self.sparse.delete_chain_head(database_id, tid, collection)
             }
             Some(Some(prev)) => {
-                self.chain_hashes.insert(
-                    (
-                        crate::types::DatabaseId::new(database_id),
-                        crate::types::TenantId::new(tid),
-                        collection.to_string(),
-                    ),
-                    prev,
-                );
+                self.chain_hashes.insert(key, prev.clone());
+                self.sparse
+                    .put_chain_head(database_id, tid, collection, &prev)
             }
-        }
+        };
+        persisted.map_err(|e| {
+            error!(
+                core = self.core_id,
+                entry_index,
+                collection = %collection,
+                error = %e,
+                "transaction undo: hash-chain head restore failed; shard state unknown"
+            );
+            (
+                entry_index,
+                format!("hash-chain head restore on {collection}: {e}"),
+            )
+        })
     }
 }

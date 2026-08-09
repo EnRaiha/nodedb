@@ -174,6 +174,7 @@ fn fts_derived_bitmap_filters_vector_search() {
                 pk_bytes: hex_id.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -327,6 +328,7 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
                 pk_bytes: hex_id.into_bytes(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

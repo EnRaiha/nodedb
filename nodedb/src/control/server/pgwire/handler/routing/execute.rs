@@ -72,6 +72,19 @@ impl NodeDbPgHandler {
                 .await
                 .map_err(StatementSetupError::from)?;
 
+                // Materialized-sum target rows are resolved here for the same
+                // reason: the PK→surrogate map lives in the catalog redb, which
+                // is Control-Plane state.
+                crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+                    &self.state,
+                    &mut tasks,
+                    tenant_id,
+                    edge_database_id,
+                    crate::types::TraceId::ZERO,
+                )
+                .await
+                .map_err(StatementSetupError::from)?;
+
                 // The final task set must be authorized before any clone
                 // interception, orchestration, staging, or dispatch path can
                 // observe it. Descriptor admission follows this check so an

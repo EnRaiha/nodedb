@@ -532,6 +532,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointInsert {
                 collection: "c".into(),
@@ -541,6 +542,7 @@ mod tests {
                 surrogate: Surrogate::ZERO,
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: "c".into(),
@@ -550,6 +552,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 collection: "c".into(),
@@ -560,6 +563,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Scan {
                 collection: "c".into(),
@@ -639,6 +643,7 @@ mod tests {
                 rls_write_check: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: non-OLLP (both None) — the buffered case.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
@@ -727,6 +732,7 @@ mod tests {
                 surrogates: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ];
         for p in &plans {

@@ -14,6 +14,8 @@
 
 use std::collections::BTreeSet;
 
+use redb::WriteTransaction;
+
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::document::store::{IndexPath, extract_index_values};
 use crate::engine::sparse::btree_versioned::{VersionedIndexEntry, VersionedPut};
@@ -52,9 +54,6 @@ pub(in crate::data::executor) struct NonbitemporalUpdateReindex<'a> {
     pub old_doc: &'a serde_json::Value,
     /// Post-update document image, for the secondary-index SET diff.
     pub new_doc: &'a serde_json::Value,
-    /// Committed WAL LSN for this write, if any. `None` skips recording into
-    /// the per-index write-value substrate (mirrors `note_surrogate_write_lsn`).
-    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 impl CoreLoop {
@@ -169,23 +168,31 @@ impl CoreLoop {
     }
 
     /// Write the new (non-bitemporal) document body and reconcile the plain
-    /// `INDEXES` secondary index atomically in a single write transaction.
+    /// `INDEXES` secondary index within an externally-owned WriteTransaction.
+    /// Does NOT commit.
     ///
     /// The autocommit bulk-UPDATE path uses this instead of the
     /// self-committing [`SparseEngine::put`](crate::engine::sparse::SparseEngine::put):
-    /// the primary row and the secondary-index SET diff commit in ONE redb
+    /// the primary row and the secondary-index SET diff land in ONE redb
     /// transaction, closing the crash window in which the index would still
     /// point at the pre-update value while the document already holds the new
     /// one — a desync that makes a later lookup on the new value miss the row
     /// and a lookup on the old value wrongly return it.
+    ///
+    /// On `Err` the caller MUST drop `txn` without committing.
+    ///
+    /// Returns the `(field, value)` tuples the index diff touched (added ∪
+    /// removed). The caller records them into the per-index write-value
+    /// substrate via `note_index_write_values` AFTER its commit succeeds —
+    /// those versions describe writes that are durable, so they must not be
+    /// published for a transaction that never lands.
     pub(in crate::data::executor) fn nonbitemporal_update_reindex(
         &mut self,
+        txn: &WriteTransaction,
         p: NonbitemporalUpdateReindex<'_>,
-    ) -> crate::Result<()> {
-        let txn = self.sparse.begin_write()?;
-
+    ) -> crate::Result<Vec<(String, String)>> {
         self.sparse.put_in_txn(
-            &txn,
+            txn,
             p.database_id,
             p.tid,
             p.collection,
@@ -195,7 +202,7 @@ impl CoreLoop {
 
         let (added, removed) = if !p.index_paths.is_empty() {
             self.apply_secondary_indexes_in_txn(
-                &txn,
+                txn,
                 crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
                     database_id: p.database_id,
                     tid: p.tid,
@@ -210,22 +217,8 @@ impl CoreLoop {
             (Vec::new(), Vec::new())
         };
 
-        txn.commit().map_err(|e| crate::Error::Storage {
-            engine: "sparse".into(),
-            detail: format!("nonbitemporal update reindex commit: {e}"),
-        })?;
-
-        if let Some(lsn) = p.wal_lsn {
-            let mut tuples = added;
-            tuples.extend(removed);
-            self.note_index_write_values(
-                nodedb_types::DatabaseId::new(p.database_id),
-                crate::types::TenantId::new(p.tid),
-                p.collection,
-                &tuples,
-                lsn,
-            );
-        }
-        Ok(())
+        let mut touched = added;
+        touched.extend(removed);
+        Ok(touched)
     }
 }

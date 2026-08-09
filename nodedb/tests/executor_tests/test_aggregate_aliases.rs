@@ -38,6 +38,7 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -179,6 +180,7 @@ fn aggregate_cache_separates_user_facing_output_aliases() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -230,6 +232,7 @@ fn aggregate_cache_separates_computed_group_expressions() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }
@@ -277,6 +280,7 @@ fn aggregate_cache_separates_limit_and_sort_shape() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
             );
             surrogate += 1;

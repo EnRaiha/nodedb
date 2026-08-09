@@ -12,7 +12,15 @@
 //!
 //! This handler only ever runs on the home vShard's LEADER (the coordinator
 //! routes the `AssignSurrogateRequest` there precisely so the assign is local to
-//! the data's home node). On `on_assign_surrogate`, the leader:
+//! the data's home node).
+//!
+//! A request carrying `lookup_only: Some(true)` takes the READ-ONLY branch:
+//! `SurrogateAssigner::lookup`, which never allocates and never writes. A miss
+//! comes back as `found: Some(false)` with no error — the key simply names no
+//! existing row, which is an answer, not a failure. Allocating on that path
+//! would mint identity for a row that does not exist.
+//!
+//! Otherwise, on `on_assign_surrogate`, the leader:
 //! 1. runs `SurrogateAssigner::assign(database_id, tenant_id, collection, pk)` —
 //!    a LOCAL assign that allocates from this node's HiLo batch on the first call
 //!    and returns the persisted binding on every later call;
@@ -57,15 +65,46 @@ impl RegistryAssignRemoteSurrogate {
 #[async_trait::async_trait]
 impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
     async fn on_assign_surrogate(&self, req: AssignSurrogateRequest) -> AssignSurrogateResponse {
-        match self.state.surrogate_assigner.assign(
-            DatabaseId::from(req.database_id),
-            TenantId::new(req.tenant_id),
-            &req.collection,
-            &req.pk,
-        ) {
+        let database_id = DatabaseId::from(req.database_id);
+        let tenant_id = TenantId::new(req.tenant_id);
+
+        if req.lookup_only == Some(true) {
+            return match self.state.surrogate_assigner.lookup(
+                database_id,
+                tenant_id,
+                &req.collection,
+                &req.pk,
+            ) {
+                Ok(Some(surrogate)) => AssignSurrogateResponse {
+                    surrogate: surrogate.as_u32(),
+                    error: None,
+                    found: Some(true),
+                },
+                Ok(None) => AssignSurrogateResponse {
+                    surrogate: 0,
+                    error: None,
+                    found: Some(false),
+                },
+                Err(e) => AssignSurrogateResponse {
+                    surrogate: 0,
+                    error: Some(TypedClusterError::Internal {
+                        code: 0,
+                        message: format!("assign-remote-surrogate local lookup failed: {e}"),
+                    }),
+                    found: None,
+                },
+            };
+        }
+
+        match self
+            .state
+            .surrogate_assigner
+            .assign(database_id, tenant_id, &req.collection, &req.pk)
+        {
             Ok(surrogate) => AssignSurrogateResponse {
                 surrogate: surrogate.as_u32(),
                 error: None,
+                found: None,
             },
             Err(e) => AssignSurrogateResponse {
                 surrogate: 0,
@@ -73,6 +112,7 @@ impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
                     code: 0,
                     message: format!("assign-remote-surrogate local assign failed: {e}"),
                 }),
+                found: None,
             },
         }
     }

@@ -25,6 +25,9 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // follower re-applies the write, it does not answer the client.
             returning: _,
             rls_filters: _,
+            // Resolved against the leader's catalog at plan time; the record
+            // carries the applied row, not the plan that produced it.
+            resolved_sum_targets: _,
         } => document::point_put(collection, document_id, value, surrogate.as_u32()),
         DocumentOp::PointInsert {
             collection,
@@ -34,6 +37,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             surrogate,
             returning: _,
             rls_filters: _,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => document::point_insert(
             collection,
             document_id,
@@ -65,6 +70,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             rls_write_check: _,
             returning: _,
             rls_filters: _,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => document::upsert(
             collection,
             document_id,
@@ -109,6 +116,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             surrogates,
             returning: _,
             rls_filters: _,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => document::batch_insert(collection, documents, surrogates),
 
         // Known replication gaps: genuine writes not yet wired to a

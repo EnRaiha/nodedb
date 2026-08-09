@@ -37,6 +37,7 @@ fn security_tenant_isolation() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -175,6 +176,7 @@ fn linearizability_read_after_write() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
 
@@ -216,6 +218,7 @@ fn linearizability_delete_visibility() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -231,6 +234,7 @@ fn linearizability_delete_visibility() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 
@@ -281,6 +285,7 @@ fn wal_replay_deterministic() {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
+                    resolved_sum_targets: Vec::new(),
                 }),
             );
         }
@@ -364,6 +369,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         );
     }

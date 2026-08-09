@@ -265,8 +265,8 @@ impl CoreLoop {
     }
 
     /// Apply one document DELETE through the shared `apply_point_delete` core
-    /// path (which owns its redb transaction internally). `enforce = false` for
-    /// the same reason as the put path. Returns whether a row was removed.
+    /// path in its own redb write transaction. `enforce = false` for the same
+    /// reason as the put path. Returns whether a row was removed.
     fn apply_document_delete(
         &mut self,
         database_id: u64,
@@ -276,20 +276,48 @@ impl CoreLoop {
     ) -> bool {
         let surrogate = Surrogate::new(surrogate_u32);
         let row_key = surrogate_to_doc_id(surrogate);
-        match self.apply_point_delete(PointDeleteParams {
-            database_id,
-            tid: tenant_id,
-            collection,
-            document_id: row_key.as_str(),
-            surrogate,
-            user_roles: &[],
-            enforce: false,
-        }) {
-            Ok(outcome) => {
-                self.checkpoint_coordinator.mark_dirty("sparse", 1);
-                outcome.prior_value.is_some()
-            }
+        let txn = match self.sparse.begin_write() {
+            Ok(t) => t,
             Err(e) => {
+                tracing::warn!(
+                    core = self.core_id,
+                    %collection,
+                    error = %e,
+                    "WAL document redo: begin_write failed; skipping delete"
+                );
+                return false;
+            }
+        };
+        match self.apply_point_delete(
+            &txn,
+            PointDeleteParams {
+                database_id,
+                tid: tenant_id,
+                collection,
+                document_id: row_key.as_str(),
+                surrogate,
+                user_roles: &[],
+                enforce: false,
+            },
+        ) {
+            Ok(outcome) => match txn.commit() {
+                Ok(()) => {
+                    self.checkpoint_coordinator.mark_dirty("sparse", 1);
+                    outcome.prior_value.is_some()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %collection,
+                        error = %e,
+                        "WAL document redo: commit failed; skipping delete"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                // The write txn is dropped un-committed (rolled back) on the
+                // early return.
                 tracing::warn!(
                     core = self.core_id,
                     %collection,

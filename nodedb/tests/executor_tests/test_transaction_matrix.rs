@@ -324,6 +324,7 @@ fn rollback_matrix_doc_doc_second_fails() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let resp = send_raw(
         &mut core,

@@ -160,6 +160,7 @@ fn dummy_task(id: &str) -> nodedb_physical::physical_task::PhysicalTask {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

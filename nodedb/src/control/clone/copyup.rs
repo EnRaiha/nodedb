@@ -232,6 +232,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         // projects nothing and needs no read gate of its own.
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
 
     let vshard_id = VShardId::from_collection_in_database(target_db_id, &target_coll_qualified);

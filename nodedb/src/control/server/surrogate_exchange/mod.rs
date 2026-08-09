@@ -9,4 +9,4 @@ pub mod hook;
 pub mod resolve;
 
 pub use hook::RegistryAssignRemoteSurrogate;
-pub use resolve::assign_surrogate_routed;
+pub use resolve::{assign_surrogate_routed, lookup_surrogate_routed};

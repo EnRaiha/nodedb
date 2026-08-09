@@ -357,6 +357,7 @@ mod tests {
                 rls_write_check: vec![],
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             Some(LockKey::Surrogate {
                 collection: Arc::from("docs"),

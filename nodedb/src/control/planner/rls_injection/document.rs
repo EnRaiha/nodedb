@@ -247,6 +247,7 @@ mod tests {
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 
@@ -260,6 +261,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 
@@ -309,6 +311,7 @@ mod tests {
             surrogates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),
@@ -404,6 +407,7 @@ mod tests {
             rls_write_check: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(!write_check(&plan).is_empty());

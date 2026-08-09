@@ -241,6 +241,7 @@ fn emit_arms(
                 // expands into are internal writes that answer no client.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ));
     }
@@ -261,6 +262,7 @@ fn emit_arms(
                 // See the insert arm above.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ));
     }
@@ -283,6 +285,7 @@ fn emit_arms(
                 // write predicate before this op was emitted, so re-checking it
                 // in the staging path would only re-run the same test.
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ));
     }

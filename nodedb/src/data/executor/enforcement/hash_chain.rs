@@ -227,6 +227,139 @@ mod tests {
         );
     }
 
+    /// The chain head is durable state: a restart must resume the chain where
+    /// the previous process left it.
+    ///
+    /// Before the head was persisted, `chain_hashes` was rebuilt as an empty
+    /// map at every boot, so the first row inserted after a restart chained
+    /// from `GENESIS_HASH` and `VERIFY_HASH_CHAIN` reported that untampered row
+    /// as the broken link. The assertions below pin both halves: the reopened
+    /// core carries the pre-restart head (not genesis), and `verify_chain`
+    /// walks the whole sequence from genesis straight across the restart
+    /// boundary.
+    #[test]
+    fn the_chain_head_survives_a_restart() {
+        use crate::bridge::envelope::Status;
+        use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+        use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
+        use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+        use nodedb_types::{DatabaseId, Surrogate, TenantId};
+
+        const TID: u64 = 1;
+        const COLL: &str = "ledger";
+
+        let db = DatabaseId::DEFAULT;
+        let config_key = (db, TenantId::new(TID), COLL.to_string());
+
+        let put_plan = |surrogate: u32, doc_id: &str, body: &[u8]| {
+            PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: COLL.to_string(),
+                document_id: doc_id.to_string(),
+                value: body.to_vec(),
+                surrogate: Surrogate::new(surrogate),
+                pk_bytes: doc_id.as_bytes().to_vec(),
+                returning: None,
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            })
+        };
+        let body = |amount: i64| {
+            nodedb_types::json_to_msgpack(&serde_json::json!({"amount": amount})).expect("encode")
+        };
+
+        // `(surrogate, document_id, body)` in the order they are inserted —
+        // rows 1 and 2 before the restart, row 3 after it.
+        let rows: Vec<(u32, String, Vec<u8>)> = vec![
+            (1, "doc-001".to_string(), body(10)),
+            (2, "doc-002".to_string(), body(20)),
+            (3, "doc-003".to_string(), body(30)),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = make_default_task();
+
+        let head_before_restart = {
+            let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+            let mut config = CollectionConfig::new(COLL);
+            config.enforcement.hash_chain = true;
+            core.doc_configs.insert(config_key.clone(), config);
+
+            for (surrogate, doc_id, value) in rows.iter().take(2) {
+                let resp = core.execute_transaction_batch(
+                    &task,
+                    TID,
+                    &[put_plan(*surrogate, doc_id, value)],
+                    &[],
+                    None,
+                );
+                assert_eq!(resp.status, Status::Ok, "pre-restart insert must succeed");
+            }
+            core.chain_hashes
+                .get(&config_key)
+                .cloned()
+                .expect("two chained inserts must leave a head")
+        };
+        assert_ne!(
+            head_before_restart, GENESIS_HASH,
+            "two inserts must have advanced the chain past genesis"
+        );
+
+        // Reopen the same directory: this is the boot that used to reset every
+        // chain to genesis.
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        assert_eq!(
+            core.chain_hashes.get(&config_key),
+            Some(&head_before_restart),
+            "the reopened core must rehydrate the persisted head, not restart at genesis"
+        );
+
+        let mut config = CollectionConfig::new(COLL);
+        config.enforcement.hash_chain = true;
+        core.doc_configs.insert(config_key.clone(), config);
+
+        let (surrogate, doc_id, value) = &rows[2];
+        let resp = core.execute_transaction_batch(
+            &task,
+            TID,
+            &[put_plan(*surrogate, doc_id, value)],
+            &[],
+            None,
+        );
+        assert_eq!(resp.status, Status::Ok, "post-restart insert must succeed");
+
+        // Every stored row carries the `_chain_hash` its INSERT computed. Feed
+        // them to `verify_chain` in insertion order together with the exact
+        // bodies that were hashed.
+        let stored_hashes: Vec<String> = rows
+            .iter()
+            .map(|(surrogate, _, _)| {
+                let row_key = surrogate_to_doc_id(Surrogate::new(*surrogate));
+                let stored = core
+                    .sparse
+                    .get(db.as_u64(), TID, COLL, &row_key)
+                    .expect("read back")
+                    .expect("row must exist");
+                let doc =
+                    super::super::super::doc_format::decode_document(&stored).expect("decode");
+                doc.get("_chain_hash")
+                    .and_then(|v| v.as_str())
+                    .expect("every chained row stores its link")
+                    .to_string()
+            })
+            .collect();
+
+        let entries = rows
+            .iter()
+            .zip(stored_hashes.iter())
+            .map(|((_, doc_id, value), hash)| (doc_id.as_str(), value.as_slice(), hash.as_str()));
+        let verified = verify_chain(GENESIS_HASH, entries);
+        assert_eq!(
+            verified,
+            Ok(stored_hashes[2].clone()),
+            "the chain must verify from genesis across the restart boundary"
+        );
+    }
+
     #[test]
     fn a_disabled_chain_is_not_an_error() {
         let mut chain_hashes = chain_map();

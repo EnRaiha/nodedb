@@ -135,6 +135,7 @@ fn classify_point_put_as_insert() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "orders");
@@ -155,6 +156,7 @@ fn classify_point_delete() {
         returning: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "orders");
@@ -176,6 +178,7 @@ fn classify_point_update() {
         pk_bytes: Vec::new(),
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "users");
@@ -662,6 +665,7 @@ fn classify_point_put_deserializes_json_value() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     let fields = info.new_fields.unwrap();
@@ -689,6 +693,7 @@ fn classify_point_put_deserializes_msgpack_value() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     let fields = info.new_fields.unwrap();

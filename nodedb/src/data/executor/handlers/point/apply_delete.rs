@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared "apply a PointDelete" helper — manages its own doc-store write
-//! transaction internally (see doc comment on `apply_point_delete`).
+//! Shared "apply a PointDelete inside an externally-owned transaction" helper.
 //!
 //! Reused by both the autocommit PointDelete path and the transactional
 //! `tx_point_delete` path. Every side-effect it performs (including the EXTRA
@@ -9,6 +8,7 @@
 //! [`PointDeleteOutcome`] so a transactional caller can build a fully
 //! reversible undo log.
 
+use redb::WriteTransaction;
 use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -92,20 +92,26 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
 }
 
 impl CoreLoop {
-    /// Apply a PointDelete, managing its own doc-store write transaction.
+    /// Apply a PointDelete within an externally-owned WriteTransaction.
     ///
     /// Handles the bitemporal-aware tombstone/versioned-index-tombstone
     /// branch, the non-bitemporal overwrite-delete branch, and all cascades
     /// (inverted index, secondary indexes, graph edges, spatial R-tree,
-    /// node-deleted bookkeeping, doc cache invalidation).
+    /// node-deleted bookkeeping, doc cache invalidation). Does NOT commit the
+    /// transaction.
     ///
-    /// The doc-store write transaction (bitemporal: an explicit
-    /// `begin_write`/`commit` pair; non-bitemporal: the self-committing
-    /// `SparseEngine::delete`) is committed BEFORE any cascade runs. Several
-    /// cascades (`delete_indexes_for_document`, the inverted index removal)
-    /// open their own internal write transactions, and redb allows only one
-    /// write transaction at a time — keeping the doc-store txn open across
-    /// those calls would deadlock every delete.
+    /// Every redb write this performs on the sparse database — the row removal
+    /// or bitemporal tombstone, the versioned index tombstones, the inverted
+    /// index removal, and the plain secondary-index cascade — goes into `txn`.
+    /// That is what makes the row and the indexes that describe it one
+    /// all-or-nothing durable unit, and it is also required: those cascades
+    /// share the sparse engine's redb database, which permits exactly one
+    /// writer, so they cannot open transactions of their own while the caller
+    /// holds this one. The graph edge store is a separate redb database and
+    /// the spatial / vector / sparse-vector removals are in-memory, so those
+    /// cascades are unaffected by the caller's transaction.
+    ///
+    /// On `Err` the caller MUST drop `txn` without committing.
     ///
     /// Does NOT emit WriteEvents, mark checkpoints dirty, or build
     /// RETURNING payloads — those stay with the caller.
@@ -117,6 +123,7 @@ impl CoreLoop {
     /// read only `prior_value`.
     pub(in crate::data::executor) fn apply_point_delete(
         &mut self,
+        txn: &WriteTransaction,
         params: PointDeleteParams<'_>,
     ) -> crate::Result<PointDeleteOutcome> {
         let PointDeleteParams {
@@ -164,9 +171,8 @@ impl CoreLoop {
                 }
                 let sys_from = self.bitemporal_now_ms();
                 bitemporal_sys_from_ms = Some(sys_from);
-                let txn = self.sparse.begin_write()?;
                 self.sparse.versioned_tombstone_in_txn(
-                    &txn,
+                    txn,
                     database_id,
                     tid,
                     collection,
@@ -198,7 +204,7 @@ impl CoreLoop {
                                 v
                             };
                             self.sparse.versioned_index_tombstone_in_txn(
-                                &txn,
+                                txn,
                                 crate::engine::sparse::btree_versioned::VersionedIndexEntry {
                                     database_id,
                                     tenant: tid,
@@ -213,10 +219,6 @@ impl CoreLoop {
                         }
                     }
                 }
-                txn.commit().map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("commit: {e}"),
-                })?;
             }
             prior
         } else {
@@ -231,7 +233,8 @@ impl CoreLoop {
                     old_value.as_deref(),
                 )?;
             }
-            self.sparse.delete(database_id, tid, collection, row_key)?
+            self.sparse
+                .delete_in_txn(txn, database_id, tid, collection, row_key)?
         };
 
         // Capture the plain secondary-index `(field, value)` tuples this
@@ -278,23 +281,42 @@ impl CoreLoop {
         // index was populated by `apply_point_put` with the substrate row
         // key (hex surrogate), not the user-visible PK — keep the cascade
         // keyed the same way so a delete actually wipes the term postings.
-        if let Err(e) = self.inverted.remove_document(
-            database_id,
-            crate::types::TenantId::new(tid),
-            collection,
-            surrogate,
+        //
+        // Propagated, not logged: the removal strips postings, clears the term
+        // set and decrements the corpus counters, all in the caller's txn. A
+        // failure part-way through leaves that work half-done, so continuing
+        // would commit an inverted index that disagrees with itself and with
+        // the removed row. Returning drops the caller's txn un-committed, which
+        // reverses the partial strip along with the row removal.
+        if let Err(e) = self.inverted.remove_document_in_txn(
+            txn,
+            crate::engine::sparse::inverted::IndexDocScope {
+                database_id,
+                tid: crate::types::TenantId::new(tid),
+                collection,
+                surrogate,
+            },
         ) {
-            warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index removal failed");
+            warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index removal failed; rejecting the delete");
+            return Err(e);
         }
 
         // Cascade 2: Remove secondary index entries for this document.
         // Secondary indexes use key format "{tenant}:{collection}:{field}:{value}:{doc_id}".
         // We scan and delete all entries ending with this doc_id.
-        if let Err(e) =
-            self.sparse
-                .delete_indexes_for_document(database_id, tid, collection, row_key)
-        {
-            warn!(core = self.core_id, %collection, %document_id, error = %e, "secondary index cascade failed");
+        //
+        // Propagated for the same reason as cascade 1: a partial removal
+        // committed alongside the row would leave index entries asserting a
+        // row that no longer exists, and nothing later re-derives them.
+        if let Err(e) = self.sparse.delete_indexes_for_document_in_txn(
+            txn,
+            database_id,
+            tid,
+            collection,
+            row_key,
+        ) {
+            warn!(core = self.core_id, %collection, %document_id, error = %e, "secondary index cascade failed; rejecting the delete");
+            return Err(e);
         }
 
         // Cascade 3: Remove graph edges where this document is src or dst.

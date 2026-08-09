@@ -129,6 +129,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
                 // puts it expands into answer no client.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,

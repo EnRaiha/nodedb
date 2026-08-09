@@ -78,6 +78,7 @@ fn insert_active(ctx: &mut TestCtx, id: &str) {
             pk_bytes: id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 }
@@ -106,6 +107,7 @@ fn insert_active_edge(ctx: &mut TestCtx, id: &str, from: &str, to: &str, etype: 
             pk_bytes: id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 }
@@ -591,6 +593,7 @@ fn bulk_update_superset_prediction_returns_ollp_retry_required() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         }),
     );
 

@@ -113,6 +113,7 @@ impl RaftRpcHandler for EchoHandler {
         nodedb_cluster::rpc_codec::AssignSurrogateResponse {
             surrogate: 0,
             error: None,
+            found: None,
         }
     }
 
@@ -264,6 +265,7 @@ impl RaftRpcHandler for SentinelHandler {
                 code: 0,
                 message: "sentinel: unexpected assign-surrogate dispatch".into(),
             }),
+            found: None,
         }
     }
 

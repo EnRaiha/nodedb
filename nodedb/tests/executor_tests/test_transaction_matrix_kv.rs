@@ -49,6 +49,7 @@ fn doc_put_conflict_seed(coll: &str) -> PhysicalPlan {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 
@@ -61,6 +62,7 @@ fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
         if_absent: false,
         returning: None,
         rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 

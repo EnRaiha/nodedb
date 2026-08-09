@@ -11,6 +11,11 @@
 //! and replies with exactly one [`AssignSurrogateResponse`]. One-shot
 //! request/response; no streaming.
 //!
+//! The same exchange also serves READ-ONLY resolution: with
+//! `lookup_only: Some(true)` the leader looks the binding up and never
+//! allocates, replying with `found: Some(false)` when the key names no
+//! existing row.
+//!
 //! Discriminants 34/35 are permanently assigned to these variants.
 
 use super::discriminants::*;
@@ -42,6 +47,12 @@ pub struct AssignSurrogateRequest {
     pub pk: Vec<u8>,
     pub deadline_remaining_ms: u64,
     pub trace_id: [u8; 16],
+    /// `Some(true)` = READ-ONLY resolution: the leader must look the binding up
+    /// and never allocate. Used when the key names a row that is expected to
+    /// already exist (e.g. a materialized-sum join key pointing at a target
+    /// row); allocating there would mint identity for a row that does not
+    /// exist. `Some(false)` / `None` = the historical get-or-create assign.
+    pub lookup_only: Option<bool>,
 }
 
 /// Terminal reply to an [`AssignSurrogateRequest`].
@@ -53,9 +64,18 @@ pub struct AssignSurrogateRequest {
 /// that case.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct AssignSurrogateResponse {
-    /// The authoritative surrogate. `0` only on error.
+    /// The authoritative surrogate. `0` only on error, or on a `lookup_only`
+    /// request that found no binding (`found: Some(false)`).
     pub surrogate: u32,
     pub error: Option<TypedClusterError>,
+    /// Reply to a `lookup_only` request: `Some(true)` = a binding exists and
+    /// `surrogate` carries it, `Some(false)` = no binding exists. `None` on a
+    /// reply to an assign request, which always binds.
+    ///
+    /// An explicit flag rather than `surrogate == 0`: zero is a reserved
+    /// sentinel that also appears in catalog-less fixtures, so overloading it
+    /// would make "no such row" indistinguishable from "row zero".
+    pub found: Option<bool>,
 }
 
 // ── Codec ────────────────────────────────────────────────────────────────────
@@ -140,6 +160,7 @@ mod tests {
             pk: vec![0x61, 0x6C, 0x69, 0x63, 0x65],
             deadline_remaining_ms: 5000,
             trace_id: [9u8; 16],
+            lookup_only: None,
         };
         let decoded = roundtrip_req(req.clone());
         assert_eq!(decoded.vshard_id, 512);
@@ -161,6 +182,7 @@ mod tests {
             pk: vec![],
             deadline_remaining_ms: 1000,
             trace_id: [0u8; 16],
+            lookup_only: None,
         };
         let decoded = roundtrip_req(req);
         assert!(decoded.pk.is_empty());
@@ -168,11 +190,42 @@ mod tests {
         assert_eq!(decoded.deadline_remaining_ms, 1000);
     }
 
+    /// A read-only request round-trips its flag: dropping it on the wire would
+    /// silently turn a lookup into an allocating assign on the leader.
+    #[test]
+    fn roundtrip_lookup_only_request() {
+        let req = AssignSurrogateRequest {
+            vshard_id: 3,
+            database_id: 1,
+            tenant_id: 2,
+            collection: "accounts".into(),
+            pk: b"acc-1".to_vec(),
+            deadline_remaining_ms: 1000,
+            trace_id: [1u8; 16],
+            lookup_only: Some(true),
+        };
+        let decoded = roundtrip_req(req);
+        assert_eq!(decoded.lookup_only, Some(true));
+    }
+
+    /// A lookup miss is carried by `found`, not by a zero surrogate.
+    #[test]
+    fn roundtrip_lookup_miss_response() {
+        let decoded = roundtrip_resp(AssignSurrogateResponse {
+            surrogate: 0,
+            error: None,
+            found: Some(false),
+        });
+        assert_eq!(decoded.found, Some(false));
+        assert!(decoded.error.is_none());
+    }
+
     #[test]
     fn roundtrip_assign_surrogate_response_ok() {
         let decoded = roundtrip_resp(AssignSurrogateResponse {
             surrogate: 12345,
             error: None,
+            found: None,
         });
         assert_eq!(decoded.surrogate, 12345);
         assert!(decoded.error.is_none());
@@ -186,6 +239,7 @@ mod tests {
                 code: 0x7,
                 message: "assign-remote-surrogate not configured".into(),
             }),
+            found: None,
         });
         assert_eq!(decoded.surrogate, 0);
         match decoded.error {

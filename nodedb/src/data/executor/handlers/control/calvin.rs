@@ -563,6 +563,7 @@ mod tests {
             surrogate: Surrogate::new(surrogate),
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 

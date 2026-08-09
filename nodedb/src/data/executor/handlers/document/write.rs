@@ -168,6 +168,7 @@ impl CoreLoop {
                     surrogate: surrogate.as_u32(),
                     is_delete: false,
                     value: value.clone(),
+                    collection: None,
                 });
             }
             if task.wal_lsn().is_some() {
@@ -422,6 +423,7 @@ mod tests {
                 surrogates: surrogates.to_vec(),
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,

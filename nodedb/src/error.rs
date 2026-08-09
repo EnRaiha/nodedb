@@ -71,6 +71,26 @@ pub enum Error {
     #[error("balance violation on {collection}: {detail}")]
     BalanceViolation { collection: String, detail: String },
 
+    /// A materialized-sum binding's join key names no row in the target
+    /// collection, so there is no balance to add the delta to.
+    ///
+    /// This fails the statement rather than skipping the row. The stored
+    /// balance is a derived total whose invariant is independently checkable by
+    /// `VERIFY_BALANCE`, which recomputes `SUM(...)` over EVERY source row — a
+    /// silently-skipped row would count toward the recomputed sum but never
+    /// toward the stored balance, so the feature would report itself broken.
+    /// Auto-inserting the target is worse still: it fabricates a target row
+    /// carrying a balance and none of its other columns.
+    #[error(
+        "materialized sum target not found: no row in '{target_collection}' has primary key \
+         '{join_value}', referenced by join column '{join_column}'"
+    )]
+    MaterializedSumTargetNotFound {
+        target_collection: String,
+        join_column: String,
+        join_value: String,
+    },
+
     #[error("period locked on {collection}: {detail}")]
     PeriodLocked { collection: String, detail: String },
 

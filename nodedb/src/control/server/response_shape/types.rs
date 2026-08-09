@@ -570,6 +570,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 returning: spec(),
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: "c".into(),
@@ -579,6 +580,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "c".into(),
@@ -586,6 +588,7 @@ mod tests {
                 surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Upsert {
                 collection: "c".into(),
@@ -596,6 +599,7 @@ mod tests {
                 rls_write_check: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ];
         for plan in &plans {

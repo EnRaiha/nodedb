@@ -54,6 +54,26 @@ impl CoreLoop {
             );
         }
 
+        // The sparse rename moved this collection's persisted hash-chain head
+        // along with its rows; move the in-memory head in lockstep so the two
+        // never disagree and the next INSERT under the new name chains from the
+        // row that preceded it instead of restarting at genesis.
+        let old_chain_key = (
+            crate::types::DatabaseId::new(old_database_id),
+            crate::types::TenantId::new(tenant_id),
+            old_collection.to_string(),
+        );
+        if let Some(head) = self.chain_hashes.remove(&old_chain_key) {
+            self.chain_hashes.insert(
+                (
+                    crate::types::DatabaseId::new(new_database_id),
+                    crate::types::TenantId::new(tenant_id),
+                    new_collection.to_string(),
+                ),
+                head,
+            );
+        }
+
         // KV engine.
         self.kv_engine
             .rename_collection(crate::engine::kv::RenameCollectionParams {

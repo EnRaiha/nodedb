@@ -80,6 +80,9 @@ pub(super) fn wal_append_document_op(
             // from the Data Plane's response, not from the journal.
             returning: _,
             rls_filters: _,
+            // The journal carries the row; the plan-time materialized-sum
+            // resolution is not part of the applied record.
+            resolved_sum_targets: _,
         } => {
             let entry =
                 encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
@@ -93,6 +96,8 @@ pub(super) fn wal_append_document_op(
             surrogate,
             returning: _,
             rls_filters: _,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => {
             let entry =
                 encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
@@ -180,6 +185,7 @@ mod tests {
             pk_bytes: vec![],
             returning: None,
             rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(
@@ -218,6 +224,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(

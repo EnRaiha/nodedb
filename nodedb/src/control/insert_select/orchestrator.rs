@@ -151,6 +151,7 @@ pub(crate) async fn run_insert_select(
                 // refused at planning rather than half-answered here.
                 returning: None,
                 rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             });
             let resp = dispatch_local(state, tenant_id, database_id, target_collection, plan, None)
                 .await?;
