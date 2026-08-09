@@ -198,6 +198,7 @@ fn classify_bulk_delete() {
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "logs");

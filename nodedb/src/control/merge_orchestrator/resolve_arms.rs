@@ -14,9 +14,15 @@
 /// non-surrogate-keyed row — unreachable for any surrogate-keyed collection),
 /// and the arm's resolved body (post-image for updates, the deleted row for
 /// deletes so its PK can be extracted). `inserts` carry `(join_key, body)`.
+///
+/// An UPDATE arm additionally carries the target row's PRE-image as a fourth
+/// element. A materialized-sum delta is the DIFFERENCE between the two images
+/// and a join-key rewrite moves value between TWO targets, so the pre-image
+/// join key has to be resolvable on the Control Plane; the post-image alone
+/// cannot express either.
 #[derive(Default)]
 pub(crate) struct ResolvedMergeArms {
-    pub(crate) updates: Vec<(String, Option<u32>, Vec<u8>)>,
+    pub(crate) updates: Vec<crate::query::ResolvedUpdateRowWire>,
     pub(crate) deletes: Vec<(String, Option<u32>, Vec<u8>)>,
     pub(crate) inserts: Vec<(String, Vec<u8>)>,
 }
@@ -28,7 +34,7 @@ pub(crate) fn decode_resolve(payload: &[u8]) -> crate::Result<ResolvedMergeArms>
         return Ok(ResolvedMergeArms::default());
     }
     type Wire = (
-        Vec<(String, Option<u32>, Vec<u8>)>,
+        Vec<(String, Option<u32>, Vec<u8>, Vec<u8>)>,
         Vec<(String, Option<u32>, Vec<u8>)>,
         Vec<(String, Vec<u8>)>,
     );

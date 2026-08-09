@@ -476,12 +476,14 @@ mod tests {
                     crate::ddl_ast::AlterCollectionOp::AddMaterializedSum {
                         target_collection,
                         target_column,
+                        target_column_type,
                         source_collection,
                         join_column,
                         value_expr,
                     } => {
                         assert_eq!(target_collection, "accounts");
                         assert_eq!(target_column, "balance");
+                        assert_eq!(target_column_type, "DECIMAL");
                         assert_eq!(source_collection, "orders");
                         assert_eq!(join_column, "account_id");
                         assert_eq!(value_expr, "amount");

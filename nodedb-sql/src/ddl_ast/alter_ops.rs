@@ -45,6 +45,11 @@ pub enum AlterCollectionOp {
         target_collection: String,
         /// Target column name to hold the sum (lowercased).
         target_column: String,
+        /// Declared type of the target column, as written (e.g. `DECIMAL`).
+        /// The statement declares a real column, so the handler adds it to the
+        /// target's schema — a maintenance write into a strict target is a full
+        /// document write and is rejected on a field the schema does not carry.
+        target_column_type: String,
         /// Source collection name (lowercased).
         source_collection: String,
         /// Join column on the source side (lowercased).

@@ -63,6 +63,7 @@ fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
         returning: None,
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     })
 }
 

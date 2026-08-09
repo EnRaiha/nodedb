@@ -156,6 +156,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: "c".into(),
             restart_identity: false,
+            resolved_sum_targets: Vec::new(),
         });
         assert!(plan_is_write(&plan));
         assert_eq!(funnel_minted_redo_engine(&plan), None);

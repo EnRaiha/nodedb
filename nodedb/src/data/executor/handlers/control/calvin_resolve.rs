@@ -154,6 +154,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         })
     }
 
@@ -169,6 +170,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 
@@ -186,6 +188,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 

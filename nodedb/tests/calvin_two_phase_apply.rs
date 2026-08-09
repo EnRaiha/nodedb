@@ -126,6 +126,7 @@ fn doc_insert(coll: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
         returning: None,
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     })
 }
 

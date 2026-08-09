@@ -507,4 +507,34 @@ pub enum ReplicatedWrite {
         #[serde(default)]
         field_name: String,
     },
+
+    /// Move a materialized-sum balance on a TARGET row that does not share the
+    /// source write's vShard. Appended last to preserve the positional ABI.
+    ///
+    /// A DELTA on the wire, like `KvIncr`, not an absolute balance: the record
+    /// says what the statement did, and every replica applies it once under
+    /// exactly-once, LSN-ordered Raft apply. An absolute image would be the
+    /// leader's arithmetic imposed on the follower, which is only equivalent
+    /// while the two agree — and the point of replicating the delta is that it
+    /// stays correct even when a follower reaches this entry from a different
+    /// (earlier-committed) balance.
+    ApplyBalanceDelta {
+        /// TARGET collection, db-qualified as the plan names it.
+        collection: String,
+        /// Target row's storage key — the hex-encoded surrogate.
+        document_id: String,
+        /// Target row's global identity. Surrogates are Raft-replicated, so the
+        /// follower addresses the same row the leader did.
+        surrogate: u32,
+        /// The balance column this delta moves.
+        column: String,
+        /// Signed amount, as an exact decimal string. `KvIncr` carries an `i64`
+        /// because a KV counter is integral; a balance is not, and a `f64` here
+        /// would lose precision the stored total deliberately keeps.
+        delta: String,
+        /// Binding's join column, for the typed not-found error on apply.
+        join_column: String,
+        /// Join value that resolved to `surrogate`, same purpose.
+        join_value: String,
+    },
 }

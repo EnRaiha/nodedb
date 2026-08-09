@@ -7,6 +7,7 @@ pub mod kv;
 pub mod project;
 pub mod redaction;
 pub mod request;
+pub mod returning;
 pub mod schema;
 pub mod types;
 

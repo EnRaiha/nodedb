@@ -198,7 +198,10 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
-        | DocumentOp::MaterializeScan { .. } => None,
+        | DocumentOp::MaterializeScan { .. }
+        // A derived balance write carries no user DML intent: the statement
+        // that caused it already fired its own triggers on the source row.
+        | DocumentOp::ApplyBalanceDelta { .. } => None,
     }
 }
 

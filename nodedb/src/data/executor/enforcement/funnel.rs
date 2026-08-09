@@ -37,7 +37,7 @@
 use redb::WriteTransaction;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::enforcement::balanced::{self, InsertEntry};
+use crate::data::executor::enforcement::balanced::{self, BalancedEntry};
 use crate::data::executor::enforcement::images::{EnforcementCtx, RowImages};
 use crate::data::executor::enforcement::materialized_sum::apply::TargetWrite;
 use crate::types::{DatabaseId, TenantId};
@@ -51,11 +51,13 @@ pub(in crate::data::executor) struct WriteEnforcementOutcome {
     /// Target rows the materialized-sum bindings updated, with their pre-images,
     /// so a transactional caller can push one undo entry per derived write.
     pub target_writes: Vec<TargetWrite>,
-    /// BALANCED entries this write contributes to its transaction's balance
-    /// check. The check itself spans the whole transaction — debits and credits
-    /// arrive on different rows — so the entries are handed back to the caller
-    /// that owns transaction scope rather than being checked here.
-    pub balanced_entries: Vec<InsertEntry>,
+    /// Signed BALANCED entries this write contributes to its boundary's
+    /// balance check. The check itself spans the whole boundary — debits and
+    /// credits arrive on different rows — so the entries are handed back to the
+    /// caller that owns that scope, which settles them through
+    /// [`CoreLoop::settle_balanced_entries`](crate::data::executor::core_loop::CoreLoop::settle_balanced_entries)
+    /// before it commits.
+    pub balanced_entries: Vec<BalancedEntry>,
 }
 
 /// Run every write-path enforcement for one write.
@@ -88,18 +90,13 @@ pub(in crate::data::executor) fn run_write_enforcement(
     let bindings = config.enforcement.materialized_sum_sources.clone();
     let balanced_def = config.enforcement.balanced.clone();
 
-    let balanced_entries = match (&balanced_def, &images) {
-        // A BALANCED constraint pairs debits against credits among the rows a
-        // transaction INSERTS. An update or a delete does not add a new line to
-        // a journal, so neither contributes an entry.
-        (Some(def), RowImages::Insert { new_doc }) => {
-            balanced::extract_entry(def, new_doc).into_iter().collect()
-        }
-        (Some(_), RowImages::Update { .. })
-        | (Some(_), RowImages::Delete { .. })
-        | (None, RowImages::Insert { .. })
-        | (None, RowImages::Update { .. })
-        | (None, RowImages::Delete { .. }) => Vec::new(),
+    // Every mutation shape contributes, signed by its effect on the stored set:
+    // an insert adds, a delete subtracts, an update does both. Counting inserts
+    // alone would let a boundary delete one leg of a balanced journal and still
+    // pass.
+    let balanced_entries = match &balanced_def {
+        Some(def) => balanced::entries_for(def, &images),
+        None => Vec::new(),
     };
 
     let target_writes = if bindings.is_empty() {

@@ -3,14 +3,28 @@
 //! Parse ALTER COLLECTION sub-operations.
 
 use crate::ddl_ast::statement::AlterCollectionOp;
+use crate::error::SqlError;
 use crate::parser::preprocess::lex::find_ascii_case_insensitive;
 
+/// Grammar quoted back to the client whenever a `MATERIALIZED_SUM` clause is
+/// present but malformed.
+const MATERIALIZED_SUM_SYNTAX: &str = "syntax: ALTER COLLECTION <target> ADD COLUMN <col> <type> \
+     MATERIALIZED_SUM SOURCE <source> ON <source>.<col> = <target>.<col> VALUE <source>.<col>";
+
+/// Parse the sub-operation of an `ALTER COLLECTION` / `ALTER TABLE` statement.
+///
+/// `None` means "not a typed sub-operation" — the statement belongs to another
+/// route and the caller falls through. `Some(Err(..))` means the sub-operation
+/// was recognised but is malformed, and the error is surfaced to the client as
+/// written; falling through instead would let a generic SQL parser reject the
+/// statement at the `COLLECTION` keyword with an error naming none of the
+/// grammar the user actually got wrong.
 pub(super) fn parse_alter_operation(
     upper: &str,
     parts: &[&str],
     trimmed: &str,
     collection_name: &str,
-) -> Option<AlterCollectionOp> {
+) -> Option<Result<AlterCollectionOp, SqlError>> {
     // Operations handled exclusively by the collaborative dispatcher (raw-SQL path).
     // Return None so try_parse returns Ok(None), letting the router fall through.
     if upper.contains("ADD CONSTRAINT")
@@ -24,21 +38,21 @@ pub(super) fn parse_alter_operation(
 
     // MATERIALIZED_SUM takes priority over ADD COLUMN.
     if upper.contains("MATERIALIZED_SUM") {
-        return parse_materialized_sum(parts, trimmed, collection_name);
+        return Some(parse_materialized_sum(parts, trimmed, collection_name));
     }
 
     if upper.contains("ADD COLUMN") || (upper.contains(" ADD ") && !upper.contains("MATERIALIZED"))
     {
-        return parse_add_column(parts);
+        return parse_add_column(parts).map(Ok);
     }
     if upper.contains("DROP COLUMN") {
-        return parse_drop_column(parts);
+        return parse_drop_column(parts).map(Ok);
     }
     if upper.contains("RENAME COLUMN") {
-        return parse_rename_column(parts);
+        return parse_rename_column(parts).map(Ok);
     }
     if upper.contains("ALTER COLUMN") && upper.contains(" TYPE ") {
-        return parse_alter_column_type(parts);
+        return parse_alter_column_type(parts).map(Ok);
     }
     if upper.contains("OWNER TO") {
         let new_owner = parts
@@ -46,64 +60,105 @@ pub(super) fn parse_alter_operation(
             .position(|p| p.eq_ignore_ascii_case("TO"))
             .and_then(|i| parts.get(i + 1))
             .map(|s| s.to_string())?;
-        return Some(AlterCollectionOp::OwnerTo { new_owner });
+        return Some(Ok(AlterCollectionOp::OwnerTo { new_owner }));
     }
     if upper.contains("SET RETENTION") {
         let value = extract_set_value(upper, "RETENTION")?;
-        return Some(AlterCollectionOp::SetRetention { value });
+        return Some(Ok(AlterCollectionOp::SetRetention { value }));
     }
     if upper.contains("SET APPEND_ONLY") {
-        return Some(AlterCollectionOp::SetAppendOnly);
+        return Some(Ok(AlterCollectionOp::SetAppendOnly));
     }
     if upper.contains("LAST_VALUE_CACHE") {
         let enabled =
             upper.contains("LAST_VALUE_CACHE = TRUE") || upper.contains("LAST_VALUE_CACHE=TRUE");
-        return Some(AlterCollectionOp::SetLastValueCache { enabled });
+        return Some(Ok(AlterCollectionOp::SetLastValueCache { enabled }));
     }
     if upper.contains("LEGAL_HOLD") {
         let enabled = upper.contains("LEGAL_HOLD = TRUE") || upper.contains("LEGAL_HOLD=TRUE");
         let tag = extract_tag_value(upper)?;
-        return Some(AlterCollectionOp::SetLegalHold { enabled, tag });
+        return Some(Ok(AlterCollectionOp::SetLegalHold { enabled, tag }));
     }
     None
+}
+
+/// Build a `MATERIALIZED_SUM` parse error naming the clause that failed.
+fn materialized_sum_error(what: &str) -> SqlError {
+    SqlError::Parse {
+        detail: format!("MATERIALIZED_SUM: {what}. {MATERIALIZED_SUM_SYNTAX}"),
+    }
 }
 
 /// Parse `ALTER COLLECTION <name> ADD [COLUMN] <col> ... MATERIALIZED_SUM SOURCE <src>
 /// ON <join> VALUE <expr>` into a typed [`AlterCollectionOp::AddMaterializedSum`].
 ///
-/// Returns `None` if any required keyword is absent — the router will surface a
-/// parse error to the client.
+/// Returns a typed parse error if any required keyword is absent, rather than
+/// declining the statement: no other route handles `MATERIALIZED_SUM`, so
+/// declining would surface an error about the `COLLECTION` keyword instead of
+/// about the clause the user actually got wrong.
 fn parse_materialized_sum(
     parts: &[&str],
     trimmed: &str,
     collection_name: &str,
-) -> Option<AlterCollectionOp> {
+) -> Result<AlterCollectionOp, SqlError> {
     // Target column: token after ADD [COLUMN].
     let col_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("COLUMN"))
-        .or_else(|| parts.iter().position(|p| p.eq_ignore_ascii_case("ADD")))?;
-    let target_column = parts.get(col_idx + 1)?.to_lowercase();
+        .or_else(|| parts.iter().position(|p| p.eq_ignore_ascii_case("ADD")))
+        .ok_or_else(|| materialized_sum_error("missing ADD [COLUMN] clause"))?;
+    let target_column = parts
+        .get(col_idx + 1)
+        .ok_or_else(|| materialized_sum_error("missing target column name"))?
+        .to_lowercase();
+
+    // Declared type of the target column: the token after its name. The column
+    // is real — it is read back with a plain SELECT and written by every
+    // maintenance write — so a type is required, not optional.
+    let target_column_type = parts
+        .get(col_idx + 2)
+        .filter(|t| {
+            !t.eq_ignore_ascii_case("MATERIALIZED_SUM")
+                && !t.eq_ignore_ascii_case("AS")
+                && !t.eq_ignore_ascii_case("DEFAULT")
+        })
+        .ok_or_else(|| materialized_sum_error("missing target column type"))?
+        .to_string();
 
     // Source collection: token after SOURCE.
     let source_idx = parts
         .iter()
-        .position(|p| p.eq_ignore_ascii_case("SOURCE"))?;
-    let source_collection = parts.get(source_idx + 1)?.to_lowercase();
+        .position(|p| p.eq_ignore_ascii_case("SOURCE"))
+        .ok_or_else(|| materialized_sum_error("missing SOURCE keyword"))?;
+    let source_collection = parts
+        .get(source_idx + 1)
+        .ok_or_else(|| materialized_sum_error("missing source collection name"))?
+        .to_lowercase();
 
     // Join column: extract from ON clause `source.col = target.id`.
-    let on_pos = find_ascii_case_insensitive(trimmed, " ON ")?;
+    let on_pos = find_ascii_case_insensitive(trimmed, " ON ")
+        .ok_or_else(|| materialized_sum_error("missing ON clause"))?;
     let after_on = &trimmed[on_pos + 4..];
-    let join_column = extract_join_column(after_on, &source_collection)?;
+    let join_column = extract_join_column(after_on, &source_collection).ok_or_else(|| {
+        materialized_sum_error(
+            "the ON clause must be an equality between a source column and a target column",
+        )
+    })?;
 
     // Value expression: token(s) after VALUE keyword.
-    let value_pos = find_ascii_case_insensitive(trimmed, " VALUE ")?;
+    let value_pos = find_ascii_case_insensitive(trimmed, " VALUE ")
+        .ok_or_else(|| materialized_sum_error("missing VALUE keyword"))?;
     let value_expr_raw = trimmed[value_pos + 7..].trim().trim_end_matches(';');
-    let value_expr = extract_value_expr(value_expr_raw, &source_collection)?;
+    let value_expr = extract_value_expr(value_expr_raw, &source_collection).ok_or_else(|| {
+        materialized_sum_error(
+            "VALUE must be a single column reference; use a pre-computed column for expressions",
+        )
+    })?;
 
-    Some(AlterCollectionOp::AddMaterializedSum {
+    Ok(AlterCollectionOp::AddMaterializedSum {
         target_collection: collection_name.to_lowercase(),
         target_column,
+        target_column_type,
         source_collection,
         join_column,
         value_expr,
@@ -275,5 +330,39 @@ mod tests {
                 && join_column == "customer_id"
                 && value_expr == "amount"
         ));
+    }
+
+    /// A malformed ON clause must produce a `MATERIALIZED_SUM` parse error, not
+    /// a decline. Declining hands the statement to the generic SQL parser,
+    /// which rejects it at the `COLLECTION` keyword and reports a list of ALTER
+    /// targets that says nothing about the clause that is actually wrong.
+    #[test]
+    fn on_clause_without_an_equality_reports_the_materialized_sum_grammar() {
+        let sql = "ALTER COLLECTION accounts ADD COLUMN balance TEXT \
+                   MATERIALIZED_SUM SOURCE entries ON account_id VALUE amount";
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let error = parse_materialized_sum(&parts, sql, "accounts")
+            .expect_err("an ON clause with no equality must not parse");
+        let SqlError::Parse { detail } = error else {
+            panic!("expected a parse error");
+        };
+        assert!(detail.contains("MATERIALIZED_SUM"), "{detail}");
+        assert!(
+            detail.contains("ON <source>.<col> = <target>.<col>"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_missing_source_keyword_reports_the_materialized_sum_grammar() {
+        let sql = "ALTER COLLECTION accounts ADD COLUMN balance TEXT \
+                   MATERIALIZED_SUM ON entries.account_id = accounts.id VALUE entries.amount";
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let error = parse_materialized_sum(&parts, sql, "accounts")
+            .expect_err("a missing SOURCE keyword must not parse");
+        let SqlError::Parse { detail } = error else {
+            panic!("expected a parse error");
+        };
+        assert!(detail.contains("missing SOURCE keyword"), "{detail}");
     }
 }

@@ -73,6 +73,7 @@ pub(super) fn point_insert(
         rls_filters: Vec::new(),
         // Not carried by the record — see `point_put`.
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     }))
 }
 
@@ -207,6 +208,7 @@ pub(super) fn batch_insert(
         rls_filters: Vec::new(),
         // Not carried by the record — see `point_put`.
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     }))
 }
 
@@ -235,6 +237,8 @@ pub(super) fn bulk_dml(
             rls_filters: Vec::new(),
             // Empty on replay — see `point_delete`.
             rls_write_check: Vec::new(),
+            // Not carried by the record — see `point_put`.
+            resolved_sum_targets: Vec::new(),
         })
     } else {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -246,6 +250,8 @@ pub(super) fn bulk_dml(
             rls_filters: Vec::new(),
             // Empty on replay — see `point_delete`.
             rls_write_check: Vec::new(),
+            // Not carried by the record — see `point_put`.
+            resolved_sum_targets: Vec::new(),
         })
     }
 }
@@ -258,6 +264,8 @@ pub(super) fn truncate(collection: &str, restart_identity: bool) -> PhysicalPlan
     PhysicalPlan::Document(DocumentOp::Truncate {
         collection: collection.to_owned(),
         restart_identity,
+        // Not carried by the record — see `point_put`.
+        resolved_sum_targets: Vec::new(),
     })
 }
 
@@ -272,5 +280,41 @@ pub(super) fn insert_select(
         source_collection: source_collection.to_owned(),
         source_filters: source_filters.to_vec(),
         source_limit,
+    })
+}
+
+/// Reconstruct an `ApplyBalanceDelta` plan.
+///
+/// No surrogate BINDING happens here, unlike the point ops: this record
+/// addresses a row of the TARGET collection that already exists — the leader
+/// resolved it from a join value against a row it had to find — and the
+/// surrogate space is Raft-replicated, so the carried identity names the same
+/// row on this replica. Binding it to `document_id` would install a
+/// primary-key mapping for a key that is not the target row's primary key at
+/// all; the document id here IS the hex surrogate.
+///
+/// Idempotent under exactly-once, LSN-ordered Raft apply for the same reason
+/// `KvIncr` is: the entry is applied once per replica, in log order, and the
+/// read-modify-write it drives reads the balance this replica has already
+/// committed. Re-applying it would double the delta — which is what
+/// exactly-once apply exists to prevent, and why the record carries a delta
+/// rather than being made idempotent by carrying an absolute total.
+pub(super) fn apply_balance_delta(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    column: &str,
+    delta: &str,
+    join_column: &str,
+    join_value: &str,
+) -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate: nodedb_types::Surrogate::new(surrogate),
+        column: column.to_owned(),
+        delta: delta.to_owned(),
+        join_column: join_column.to_owned(),
+        join_value: join_value.to_owned(),
     })
 }

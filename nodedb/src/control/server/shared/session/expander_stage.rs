@@ -39,7 +39,8 @@ use crate::control::merge_orchestrator::resolve_and_emit_merge_ops;
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops;
 use nodedb_physical::physical_plan::DocumentOp;
-use nodedb_physical::physical_task::PhysicalTask;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_types::Surrogate;
 
 use super::connection::SessionId;
 use super::staging_gate::{
@@ -145,11 +146,85 @@ where
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Insert)
         }
+        // A `BatchInsert` page is an AUTOCOMMIT shape. It exists so that a
+        // multi-row INSERT into a collection with a statement-scoped constraint
+        // (BALANCED) is ONE Data-Plane request and therefore one boundary,
+        // instead of one request per row. Inside a transaction the enclosing
+        // COMMIT batch already IS that boundary — entries accumulate across
+        // statements — so the page buys nothing and costs what only point ops
+        // have: an overlay post-image (read-your-own-writes for later
+        // statements in the same transaction), a per-row undo entry (so a
+        // constraint refused at COMMIT actually rolls the rows back), and a
+        // row-level redo shape (`classify_document_op` rejects a page outright
+        // — it has no staged post-image).
+        //
+        // So the page is expanded back into its constituent point inserts here,
+        // exactly as `INSERT ... SELECT` above is: same seam, same staging
+        // path, same reason.
+        PhysicalPlan::Document(DocumentOp::BatchInsert { .. }) => {
+            (expand_batch_insert(&task), StagedTagKind::Insert)
+        }
         _ => return Ok(ExpanderOutcome::Passthrough(Box::new(task))),
     };
     Ok(ExpanderOutcome::Handled(
         stage_and_aggregate(state, sessions, session_id, ops, kind, dispatch).await?,
     ))
+}
+
+/// Expand a `BatchInsert` page into one `PointInsert` op per row.
+///
+/// Nothing is resolved: the page already carries each row's document id, body
+/// and surrogate, so this is a pure reshaping of work the planner already did.
+/// Every op carries the page's whole materialized-sum resolution — a row folds
+/// against the entry its own join value selects — and its `deferred_sum_targets`,
+/// which name target COLLECTIONS and so apply to every row alike.
+///
+/// A plan that is not a page comes back empty, which stages nothing; the caller
+/// only reaches this on the arm that matched one.
+fn expand_batch_insert(task: &PhysicalTask) -> Vec<PhysicalTask> {
+    let PhysicalPlan::Document(DocumentOp::BatchInsert {
+        collection,
+        documents,
+        surrogates,
+        returning,
+        rls_filters,
+        resolved_sum_targets,
+        deferred_sum_targets,
+        ..
+    }) = &task.plan
+    else {
+        return Vec::new();
+    };
+    documents
+        .iter()
+        .enumerate()
+        .map(|(i, (document_id, value))| PhysicalTask {
+            tenant_id: task.tenant_id,
+            // The page and its rows are the same collection, so they home to
+            // the same vShard the page was routed to.
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::PointInsert {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                value: value.clone(),
+                // A page carries no per-row conflict behaviour, so neither does
+                // any op it expands to.
+                if_absent: false,
+                // Parallel to `documents` when present. A page whose producer
+                // filled no surrogates carries the documented `ZERO` sentinel,
+                // which leaves the row's identity to the Data Plane exactly as
+                // the page itself would have.
+                surrogate: surrogates.get(i).copied().unwrap_or(Surrogate::ZERO),
+                returning: returning.clone(),
+                rls_filters: rls_filters.clone(),
+                resolved_sum_targets: resolved_sum_targets.clone(),
+                deferred_sum_targets: deferred_sum_targets.clone(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: task.txn_id,
+        })
+        .collect()
 }
 
 /// Stage + buffer each concrete point op a resolved `MERGE` / `UPDATE ...

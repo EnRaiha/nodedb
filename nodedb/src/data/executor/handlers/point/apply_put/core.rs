@@ -599,6 +599,7 @@ mod tests {
                 value: BODY,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
             },
         );
 
@@ -634,6 +635,7 @@ mod tests {
                 value: BODY,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
             },
         );
 

@@ -4,34 +4,63 @@
 //! — ADD COLUMN variant that binds a computed balance to another collection's
 //! per-row contribution. Atomically maintained on INSERT into the source side.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::materialized_sum`
-//! handler; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The value-expression validation, duplicate
-//! binding guard, `materialized_sums` push, `PutCollection` propose,
-//! `schema_version` bump, and audit are unchanged, as is the `ALTER
-//! COLLECTION` command tag.
+//! The value-expression validation, duplicate binding guard,
+//! `materialized_sums` push, `PutCollection` propose, `schema_version` bump,
+//! and audit all live here, as does the `ALTER COLLECTION` command tag.
+//!
+//! The statement declares a real column as well as a binding, and both halves
+//! are applied. Declaring only the binding leaves a strict target with no
+//! `balance` field, and every maintenance write into it is a full document
+//! write that the Binary Tuple encoder rejects on a field the schema does not
+//! carry — the balance would never land, and neither would the source row that
+//! caused it. Column and binding are mutated into one `StoredCollection` and
+//! proposed as a single `PutCollection`, so no committed state ever holds a
+//! binding whose column does not exist.
 
-use nodedb_types::DatabaseId;
+use nodedb_types::columnar::StrictSchema;
+use nodedb_types::{CollectionType, DatabaseId};
 
 use crate::bridge::expr_eval::SqlExpr;
 use crate::control::security::audit::AuditEvent;
+use crate::control::security::catalog::StoredCollection;
 use crate::control::security::catalog::types::MaterializedSumDef;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::neutral::collection::helpers::parse_origin_column_def;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
 use super::support::{err, status};
 
-pub(super) fn add_materialized_sum(
+/// The fully parsed `ADD COLUMN ... MATERIALIZED_SUM ...` statement.
+pub(super) struct MaterializedSumRequest<'a> {
+    /// Collection whose column holds the running total.
+    pub target_collection: &'a str,
+    /// Column that holds the running total.
+    pub target_column: &'a str,
+    /// Declared type of that column, as written.
+    pub target_column_type: &'a str,
+    /// Collection whose rows contribute to the total.
+    pub source_collection: &'a str,
+    /// Column on the source side that names the target row.
+    pub join_column: &'a str,
+    /// Source column whose value each row contributes.
+    pub value_expr: &'a str,
+}
+
+pub(super) async fn add_materialized_sum(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    target_collection: &str,
-    target_column: &str,
-    source_collection: &str,
-    join_column: &str,
-    value_expr: &str,
+    req: &MaterializedSumRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
+    let MaterializedSumRequest {
+        target_collection,
+        target_column,
+        target_column_type,
+        source_collection,
+        join_column,
+        value_expr,
+    } = *req;
 
     let expr = parse_value_expression(value_expr)?;
 
@@ -74,9 +103,18 @@ pub(super) fn add_materialized_sum(
         .collect();
     validate_binding_depth(&existing_bindings, target_collection, source_collection)?;
 
+    declare_target_column(&mut coll, target_column, target_column_type)?;
     coll.materialized_sums.push(def);
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    super::support::propose_and_apply(state, &entry)?;
+    super::support::propose_and_apply_async(state, entry).await?;
+
+    // The Data Plane's in-memory shape is what the Binary Tuple encoder
+    // consults, so it must learn the new column before the first source write
+    // arrives; without this the binding is durable and the very next
+    // maintenance write is still rejected on an unknown field.
+    super::super::register::dispatch_register_from_stored(state, &coll)
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state.schema_version.bump();
 
@@ -88,6 +126,56 @@ pub(super) fn add_materialized_sum(
     );
 
     Ok(status("ALTER COLLECTION"))
+}
+
+/// Append the declared total column to a strict target's schema, in place.
+///
+/// A schemaless target carries no column list to append to, and its writes
+/// accept any field, so it needs no declaration. A strict target does: its
+/// encoder rejects fields the schema does not carry, and the maintenance write
+/// is an ordinary document write through that encoder.
+///
+/// Mirrors `ALTER ... ADD COLUMN`'s multi-version add — `added_at_version`
+/// stamp plus `schema.version` bump — so rows written before this statement
+/// keep reading back at their own version, and records the *declared* type
+/// alongside the resolved one so the column reports the same width on the wire
+/// as an identical column declared at CREATE time.
+fn declare_target_column(
+    coll: &mut StoredCollection,
+    column: &str,
+    declared_type: &str,
+) -> Result<(), DdlError> {
+    if !coll.collection_type.is_strict() {
+        return Ok(());
+    }
+
+    let config_json = coll.timeseries_config.as_deref().ok_or_else(|| {
+        err(
+            "XX000",
+            format!("strict collection '{}' has no stored schema", coll.name),
+        )
+    })?;
+    let mut schema: StrictSchema = sonic_rs::from_str(config_json)
+        .map_err(|e| err("XX000", format!("strict schema decode: {e}")))?;
+
+    if schema.columns.iter().any(|c| c.name == column) {
+        return Err(err(
+            "42P07",
+            format!("column '{column}' already exists on '{}'", coll.name),
+        ));
+    }
+
+    let mut col = parse_origin_column_def(&format!("{column} {declared_type}"))
+        .map_err(|e| err("42601", e.to_string()))?;
+    let new_version = schema.version.saturating_add(1);
+    col.added_at_version = new_version;
+    schema.columns.push(col);
+    schema.version = new_version;
+
+    coll.collection_type = CollectionType::strict(schema.clone());
+    coll.timeseries_config = sonic_rs::to_string(&schema).ok();
+    super::strict_schema::add_field(coll, column, declared_type);
+    Ok(())
 }
 
 /// Refuse a binding that would make some collection both a materialized-sum

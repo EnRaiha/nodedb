@@ -142,6 +142,27 @@ pub(crate) async fn run_insert_select(
                 documents.push((document_id, value));
                 surrogates.push(surrogate);
             }
+            // Resolve this page's materialized-sum targets. The orchestrator
+            // re-issues the copy as a `BatchInsert` through `dispatch_local`,
+            // which never passes through the statement-level resolution pass —
+            // so without this the page would ship an empty resolution and the
+            // Data-Plane fold would have no target to credit for rows the copy
+            // genuinely inserts. Resolved per PAGE because each page is its own
+            // atomic write; a page whose target collection drives no binding
+            // costs one cached index probe and issues no lookup.
+            let page_bodies: Vec<&[u8]> =
+                documents.iter().map(|(_, body)| body.as_slice()).collect();
+            let resolved_sum_targets =
+                crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
+                    state,
+                    &page_bodies,
+                    target_collection,
+                    tenant_id,
+                    database_id,
+                    crate::types::TraceId::ZERO,
+                )
+                .await?;
+
             let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: target_collection.to_string(),
                 documents,
@@ -151,7 +172,11 @@ pub(crate) async fn run_insert_select(
                 // refused at planning rather than half-answered here.
                 returning: None,
                 rls_filters: Vec::new(),
-                resolved_sum_targets: Vec::new(),
+                resolved_sum_targets,
+                // Every page dispatches locally to the target's own core, so a
+                // binding whose target is co-resident folds here; nothing is
+                // deferred to a sibling task.
+                deferred_sum_targets: Vec::new(),
             });
             let resp = dispatch_local(state, tenant_id, database_id, target_collection, plan, None)
                 .await?;

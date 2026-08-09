@@ -270,6 +270,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Document(DocumentOp::BackfillIndex { .. })
         | PhysicalPlan::Document(DocumentOp::EstimateCount { .. })
         | PhysicalPlan::Document(DocumentOp::MaterializeScan { .. })
+        // A derived balance write answers no client: it reports an affected
+        // count to the planner that appended it and shapes no row.
+        | PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. })
 
         // Default: opaque execution result. The specific arms above take
         // precedence; these inner wildcards catch every unmatched op of each
@@ -531,6 +534,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         })
     }
 
@@ -571,6 +575,7 @@ mod tests {
                 returning: spec(),
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: "c".into(),
@@ -589,6 +594,7 @@ mod tests {
                 returning: spec(),
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Upsert {
                 collection: "c".into(),

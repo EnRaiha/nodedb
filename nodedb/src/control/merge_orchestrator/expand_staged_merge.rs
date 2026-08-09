@@ -84,7 +84,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
         let bodies = arms
             .updates
             .iter()
-            .map(|(_, _, body)| body)
+            .map(|(_, _, body, _)| body)
             .chain(arms.deletes.iter().map(|(_, _, body)| body))
             .chain(arms.inserts.iter().map(|(_, body)| body));
         for body in bodies {
@@ -178,6 +178,9 @@ async fn resolve_merge_arms(
         // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        // The RESOLVE pass writes nothing, so it folds no materialized-sum
+        // delta. The point ops this expansion emits carry their own resolution.
+        resolved_sum_targets: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets `collect_target_docs` fold rows this transaction
@@ -242,11 +245,12 @@ fn emit_arms(
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
         ));
     }
 
-    for (doc_id, surrogate_u32, body) in arms.updates {
+    for (doc_id, surrogate_u32, body, _old_body) in arms.updates {
         let surrogate = require_surrogate(surrogate_u32, &doc_id, "MERGE")?;
         let document_id = derive_document_id(target_pk, &body, surrogate);
         let pk_bytes = document_id.clone().into_bytes();

@@ -25,9 +25,7 @@ use std::collections::HashSet;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::server::response_translate::dispatch::translate_search_response;
-use crate::data::executor::response_codec::{
-    ArraySliceResponse, RowsPayload, decode_payload_to_json,
-};
+use crate::data::executor::response_codec::{ArraySliceResponse, decode_payload_to_json};
 use nodedb_types::NodeDbError;
 use nodedb_types::columnar::schema::is_reserved_bitemporal_column;
 
@@ -35,6 +33,7 @@ use super::kv::apply_kv_wrap;
 use super::project::push_flat_rows;
 use super::redaction::RedactionCtx;
 use super::request::MaterializedShapeRequest;
+use super::returning::shape_returning_rows;
 use super::schema::OutputSchema;
 use super::types::{DdlColType, PlanKind, ShapedRows};
 
@@ -89,7 +88,9 @@ pub fn shape_response_materialized(
 
     let shaped = match plan_kind {
         PlanKind::ArraySlice => shape_array_slice(&translated, redaction),
-        PlanKind::ReturningRows => shape_returning_rows(&translated, redaction),
+        // `RETURNING` rows are held to the columns already announced to the
+        // client, when any were — see `super::returning`.
+        PlanKind::ReturningRows => shape_returning_rows(&translated, projection, redaction)?,
         PlanKind::SingleDocument | PlanKind::MultiRow => {
             shape_generic_rows(&translated, projection, redaction)
         }
@@ -114,15 +115,17 @@ pub fn shape_payload_no_plan(
     plan_kind: PlanKind,
     projection: Option<&OutputSchema>,
     redaction: Option<RedactionCtx<'_>>,
-) -> ShapeOutcome {
-    match plan_kind {
+) -> Result<ShapeOutcome, NodeDbError> {
+    Ok(match plan_kind {
         PlanKind::Execution | PlanKind::DmlResult(_) => ShapeOutcome::Passthrough,
         PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(payload, redaction)),
-        PlanKind::ReturningRows => ShapeOutcome::Rows(shape_returning_rows(payload, redaction)),
+        PlanKind::ReturningRows => {
+            ShapeOutcome::Rows(shape_returning_rows(payload, projection, redaction)?)
+        }
         PlanKind::SingleDocument | PlanKind::MultiRow => {
             ShapeOutcome::Rows(shape_generic_rows(payload, projection, redaction))
         }
-    }
+    })
 }
 
 /// Shape an `ArrayOp::Slice` response: decode the `ArraySliceResponse`
@@ -154,69 +157,6 @@ fn shape_array_slice(payload: &[u8], redaction: Option<RedactionCtx<'_>>) -> Sha
     };
     shaped.notice = notice;
     shaped
-}
-
-/// Shape a DML-with-`RETURNING` response: decode the `RowsPayload` envelope
-/// (already TEXT-formatted cells), falling back to a single "result" column
-/// on a malformed payload.
-///
-/// `RETURNING` delivers stored column values to the client just as a SELECT
-/// does, so the same redaction applies — the rows are built here rather than
-/// through `shape_decoded_rows`, so the hook runs on them directly.
-fn shape_returning_rows(payload: &[u8], redaction: Option<RedactionCtx<'_>>) -> ShapedRows {
-    if payload.is_empty() {
-        return single_result_column_empty();
-    }
-    match zerompk::from_msgpack::<RowsPayload>(payload) {
-        Ok(rp) => {
-            if rp.rows.is_empty() {
-                let columns = if rp.columns.is_empty() {
-                    vec!["result".to_string()]
-                } else {
-                    rp.columns
-                };
-                let column_types = ShapedRows::text_types(columns.len());
-                return ShapedRows {
-                    columns,
-                    column_types,
-                    rows: Vec::new(),
-                    notice: None,
-                };
-            }
-            let mut rows: Vec<Map<String, JsonValue>> = rp
-                .rows
-                .iter()
-                .map(|row_vals| {
-                    let mut map = Map::new();
-                    for (col, cell) in rp.columns.iter().zip(row_vals.iter()) {
-                        let v = match cell {
-                            Some(s) => JsonValue::String(s.clone()),
-                            None => JsonValue::Null,
-                        };
-                        map.insert(col.clone(), v);
-                    }
-                    map
-                })
-                .collect();
-            redact_rows(redaction.as_ref(), &mut rows);
-            let column_types = ShapedRows::text_types(rp.columns.len());
-            ShapedRows {
-                columns: rp.columns,
-                column_types,
-                rows,
-                notice: None,
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                payload_len = payload.len(),
-                "ReturningRows msgpack decode failed; falling back to single-column JSON"
-            );
-            let text = decode_payload_to_json(payload);
-            single_result_row(text)
-        }
-    }
 }
 
 /// Shape a `SingleDocument` / `MultiRow` response: decode to JSON, then
@@ -318,7 +258,10 @@ pub fn shape_decoded_rows(
 ///
 /// A `None` context means the producer has no requester identity in scope and
 /// therefore no roles to evaluate a policy against.
-fn redact_rows(redaction: Option<&RedactionCtx<'_>>, rows: &mut [Map<String, JsonValue>]) {
+pub(super) fn redact_rows(
+    redaction: Option<&RedactionCtx<'_>>,
+    rows: &mut [Map<String, JsonValue>],
+) {
     let Some(ctx) = redaction else {
         return;
     };
@@ -335,7 +278,7 @@ fn redact_rows(redaction: Option<&RedactionCtx<'_>>, rows: &mut [Map<String, Jso
 /// Cells are inserted under `cell_keys` (unique per column, see
 /// [`super::project::cell_keys`]) rather than the display names, which may
 /// repeat across columns and would otherwise collapse in the output map.
-fn project_row(
+pub(super) fn project_row(
     row: &Map<String, JsonValue>,
     lookup_keys: &[String],
     display_names: &[String],
@@ -417,18 +360,7 @@ fn empty_shaped() -> ShapedRows {
     }
 }
 
-/// Single "result" column with zero rows, matching `payload_to_response`'s
-/// `ReturningRows` arm when the payload itself is empty.
-fn single_result_column_empty() -> ShapedRows {
-    ShapedRows {
-        columns: vec!["result".to_string()],
-        column_types: ShapedRows::text_types(1),
-        rows: Vec::new(),
-        notice: None,
-    }
-}
-
-fn single_result_row(text: String) -> ShapedRows {
+pub(super) fn single_result_row(text: String) -> ShapedRows {
     let mut map = Map::new();
     map.insert("result".to_string(), JsonValue::String(text));
     ShapedRows {
@@ -517,7 +449,7 @@ mod tests {
         );
 
         let no_plan = shape_payload_no_plan(&payload, kind, None, None);
-        assert!(matches!(no_plan, ShapeOutcome::Passthrough));
+        assert!(matches!(no_plan, Ok(ShapeOutcome::Passthrough)));
         assert_eq!(
             payload, original_payload,
             "no-plan path must not rewrite bytes"

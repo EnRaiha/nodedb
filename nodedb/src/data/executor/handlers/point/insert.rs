@@ -12,6 +12,8 @@ use tracing::debug;
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
+use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
@@ -34,6 +36,15 @@ pub(in crate::data::executor) struct PointInsertParams<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled read policy bounding which of those rows may be shown back.
     pub rls_filters: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this insert may credit, resolved on the Control Plane at plan time. The
+    /// Data Plane never derives it: the primary-key → surrogate map is catalog
+    /// state that lives on the other side of the bridge.
+    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    /// Materialized-sum TARGET collections whose delta the Control Plane
+    /// settled at plan time and appended as its own `ApplyBalanceDelta` task,
+    /// homed on the target's vShard. This handler must not apply them as well.
+    pub deferred_sum_targets: &'a [String],
 }
 
 impl CoreLoop {
@@ -51,6 +62,8 @@ impl CoreLoop {
             if_absent,
             returning,
             rls_filters,
+            resolved_sum_targets,
+            deferred_sum_targets,
         } = p;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -60,9 +73,33 @@ impl CoreLoop {
             "point insert"
         );
 
+        let database_id = task.request.database_id.as_u64();
+        let hook_ctx = HookCtx {
+            database_id,
+            tid,
+            collection,
+            resolved_targets: resolved_sum_targets,
+            deferred_sum_targets,
+            wal_lsn: task.wal_lsn(),
+        };
+
+        // Hash chaining rewrites the BODY (it injects `_chain_hash`), so it runs
+        // before the body is encoded and stored — not through the image funnel,
+        // which only sees a write that has already been applied. This handler is
+        // INSERT-shaped by construction, so every write it performs is a link.
+        let mut chain = ChainGuard::begin(self, database_id, tid, collection);
+        let chained = match chain.chain_insert(self, database_id, tid, document_id, value) {
+            Ok(chained) => chained,
+            Err(e) => return self.response_error(task, e),
+        };
+        let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
-            Err(e) => return self.response_error(task, e),
+            Err(e) => {
+                chain.restore(self);
+                return self.response_error(task, e);
+            }
         };
 
         // Existence probe inside the write transaction: linearizable with
@@ -70,7 +107,6 @@ impl CoreLoop {
         // this check and our insert commit. Probe uses `document_id` as
         // the row key, which is how the primary key is encoded for strict
         // and schemaless collections alike (see `dml::convert_insert`).
-        let database_id = task.request.database_id.as_u64();
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
         let exists_result = if bitemporal {
             self.sparse
@@ -81,7 +117,10 @@ impl CoreLoop {
         };
         match exists_result {
             Ok(true) => {
-                // Drop the txn without committing — no-op on redb.
+                // Drop the txn without committing — no-op on redb. The chain
+                // head was advanced before the probe, so put it back: no row
+                // lands, so no link exists for it to cover.
+                chain.restore(self);
                 if if_absent {
                     // `INSERT ... ON CONFLICT DO NOTHING`: the row already
                     // exists, so nothing is inserted and the statement affects
@@ -111,7 +150,10 @@ impl CoreLoop {
                 );
             }
             Ok(false) => {}
-            Err(e) => return self.response_error(task, e),
+            Err(e) => {
+                chain.restore(self);
+                return self.response_error(task, e);
+            }
         }
 
         // `apply_point_put` returns prior bytes if any — for PointInsert that
@@ -126,7 +168,7 @@ impl CoreLoop {
                 collection,
                 document_id: row_key,
                 surrogate,
-                value,
+                value: effective_value,
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
@@ -134,8 +176,53 @@ impl CoreLoop {
             },
         ) {
             Ok(o) => o,
-            Err(e) => return self.response_error(task, e),
+            Err(e) => {
+                chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+                return self.response_error(task, e);
+            }
         };
+
+        // The advanced head lands in the SAME transaction as the row whose hash
+        // it is, so head and row commit or roll back as one unit.
+        if let Err(e) = chain.persist_head(self, &txn) {
+            chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+            return self.response_error(task, e);
+        }
+
+        // Image-folding enforcement runs one level ABOVE `apply_point_put` and
+        // inside THIS transaction, so a materialized-sum target write lands or
+        // rolls back with the row that credited it. The post-image is the
+        // SUBMITTED body, never the chained one: `_chain_hash` is a wrapper the
+        // chain adds around the row and no constraint is declared over it.
+        let enforcement = match write_hook::run(
+            self,
+            &txn,
+            &hook_ctx,
+            WriteImages::Insert {
+                new: ImageBody::Submitted(value),
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+                return self.response_error(task, e);
+            }
+        };
+        // Redo entries for the target rows this insert credited, attached to the
+        // response below so the Control Plane journals each derived write
+        // against its OWN collection — the statement's own redo names only the
+        // source row.
+        let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+
+        // BALANCED is settled before the commit, so a single-row insert of one
+        // journal leg — unbalanced by the constraint's own definition when the
+        // statement is its own transaction — leaves nothing behind.
+        if let Err(e) =
+            self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
+        {
+            chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+            return self.response_error(task, e);
+        }
 
         if let Err(e) = txn.commit() {
             return self.response_error(
@@ -182,22 +269,26 @@ impl CoreLoop {
 
         self.emit_put_event(task, tid, collection, row_key, value, None);
 
-        if let Some(spec) = returning {
+        let mut response = if let Some(spec) = returning {
             let strict_schema = self.strict_schema_for(
                 task.request.database_id,
                 crate::types::TenantId::new(tid),
                 collection,
             );
-            return self.stored_returning_response(
+            self.stored_returning_response(
                 task,
                 spec,
                 rls_filters,
                 strict_schema.as_ref(),
                 &[(document_id, stored_value.as_slice())],
-            );
+            )
+        } else {
+            // The row was inserted: exactly one row affected.
+            self.response_affected(task, 1)
+        };
+        if !target_write_set.is_empty() {
+            response.write_set = target_write_set;
         }
-
-        // The row was inserted: exactly one row affected.
-        self.response_affected(task, 1)
+        response
     }
 }

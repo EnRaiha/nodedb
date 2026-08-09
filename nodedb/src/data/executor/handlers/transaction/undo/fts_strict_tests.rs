@@ -150,6 +150,7 @@ fn strict_tx_delete_rollback_restores_fts_postings() {
             document_id: PK,
             surrogate: Surrogate::new(1),
             user_roles: &[],
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )

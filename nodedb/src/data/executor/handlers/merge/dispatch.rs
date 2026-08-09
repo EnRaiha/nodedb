@@ -54,6 +54,11 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// A separate slot from `rls_filters`: that one bounds what may be shown
     /// back, this one bounds what may be written. Empty = no write policy.
     pub rls_write_check: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this merge's arms may touch, resolved on the Control Plane from the
+    /// RESOLVE pass's classification. Empty on the RESOLVE pass itself, which
+    /// writes nothing and therefore folds nothing.
+    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
 }
 
 impl CoreLoop {
@@ -65,9 +70,17 @@ impl CoreLoop {
     ///   assignment (no writes).
     /// - `resolved_inserts.is_some()` → [`Self::execute_merge_apply`]: the
     ///   atomic apply with CP-assigned surrogates + resolve→apply drift verify.
-    /// - otherwise → `execute_merge_legacy`: the per-row apply retained only as
-    ///   a fallback (in-transaction MERGE is now expanded at COMMIT into
-    ///   concrete point ops before it could reach this path).
+    ///
+    /// There is no third mode. An UNRESOLVED merge (`resolve_only == false` and
+    /// `resolved_inserts == None`) is intercepted on the Control Plane by every
+    /// entry point — autocommit by the merge orchestrator, in-transaction by the
+    /// statement-time expander — so it cannot reach the Data Plane. It is
+    /// refused rather than executed: the per-row walk that once served it wrote
+    /// NOT-MATCHED inserts under a raw `sparse.put` with no surrogate (invisible
+    /// to every cross-engine index), minted no replicated entry, and applied
+    /// each arm outside any shared transaction. Keeping such a path alive would
+    /// mean a second, silent way for a merge to land — including one that folds
+    /// no materialized-sum delta.
     pub(in crate::data::executor) fn execute_merge(
         &mut self,
         task: &ExecutionTask,
@@ -80,6 +93,13 @@ impl CoreLoop {
         if params.resolved_inserts.is_some() {
             return self.execute_merge_apply(task, tid, params);
         }
-        self.execute_merge_legacy(task, tid, params)
+        self.response_error(
+            task,
+            crate::bridge::envelope::ErrorCode::Internal {
+                detail: "MERGE reached the Data Plane unresolved: every entry point \
+                         resolves it on the Control Plane before dispatch"
+                    .into(),
+            },
+        )
     }
 }

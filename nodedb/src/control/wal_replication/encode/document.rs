@@ -144,3 +144,30 @@ pub(super) fn insert_select(
         source_limit,
     }
 }
+
+/// `DocumentOp::ApplyBalanceDelta` replicates as the DELTA it is.
+///
+/// Modelled on `KvIncr`: the record says what the statement did, every replica
+/// applies it exactly once in log order, and the balance each replica ends up
+/// with is its own prior balance plus the same signed amount. The decimal
+/// travels as a string because a balance is not integral and `f64` is lossy
+/// past 15 significant digits — the same reason the stored total is a string.
+pub(super) fn apply_balance_delta(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    column: &str,
+    delta: &str,
+    join_column: &str,
+    join_value: &str,
+) -> ReplicatedWrite {
+    ReplicatedWrite::ApplyBalanceDelta {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate,
+        column: column.to_owned(),
+        delta: delta.to_owned(),
+        join_column: join_column.to_owned(),
+        join_value: join_value.to_owned(),
+    }
+}

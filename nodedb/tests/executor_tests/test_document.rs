@@ -293,6 +293,7 @@ fn batch_insert_docs(
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         }),
     );
 }

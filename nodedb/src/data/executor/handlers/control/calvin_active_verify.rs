@@ -54,30 +54,72 @@ impl CoreLoop {
         }
         let database_id = task.request.database_id.as_u64();
         for plan in plans {
-            let (collection, filter_bytes, predicted_surrogates, predicted_edges) = match plan {
-                PhysicalPlan::Document(DocumentOp::BulkDelete {
-                    collection,
-                    filters,
-                    ollp_predicted_surrogates,
-                    ollp_predicted_edges,
-                    ..
-                })
-                | PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                    collection,
-                    filters,
-                    ollp_predicted_surrogates,
-                    ollp_predicted_edges,
-                    ..
-                }) => (
-                    collection,
-                    filters,
-                    ollp_predicted_surrogates,
-                    ollp_predicted_edges,
-                ),
-                // Mirrors `stage_calvin_overlay`'s non-bulk arms: no OLLP
-                // prediction to verify.
-                _ => continue,
+            // Only the document engine carries an OLLP prediction. Listed
+            // exhaustively so a new `PhysicalPlan` variant forces a decision
+            // here rather than falling silently into "nothing to verify".
+            let document_op = match plan {
+                PhysicalPlan::Document(op) => op,
+                PhysicalPlan::Vector(_)
+                | PhysicalPlan::Graph(_)
+                | PhysicalPlan::Kv(_)
+                | PhysicalPlan::Text(_)
+                | PhysicalPlan::Columnar(_)
+                | PhysicalPlan::Timeseries(_)
+                | PhysicalPlan::Spatial(_)
+                | PhysicalPlan::Crdt(_)
+                | PhysicalPlan::Query(_)
+                | PhysicalPlan::Meta(_)
+                | PhysicalPlan::Array(_)
+                | PhysicalPlan::ClusterArray(_)
+                | PhysicalPlan::ClusterEvent(_) => continue,
             };
+            let (collection, filter_bytes, predicted_surrogates, predicted_edges) =
+                match document_op {
+                    DocumentOp::BulkDelete {
+                        collection,
+                        filters,
+                        ollp_predicted_surrogates,
+                        ollp_predicted_edges,
+                        ..
+                    }
+                    | DocumentOp::BulkUpdate {
+                        collection,
+                        filters,
+                        ollp_predicted_surrogates,
+                        ollp_predicted_edges,
+                        ..
+                    } => (
+                        collection,
+                        filters,
+                        ollp_predicted_surrogates,
+                        ollp_predicted_edges,
+                    ),
+                    // Mirrors `stage_calvin_overlay`'s non-bulk arms: no OLLP
+                    // prediction to verify. Exhaustive so a new predicate-DML
+                    // variant that carries a prediction cannot be added without
+                    // being named here.
+                    DocumentOp::PointGet { .. }
+                    | DocumentOp::PointPut { .. }
+                    | DocumentOp::PointInsert { .. }
+                    | DocumentOp::PointDelete { .. }
+                    | DocumentOp::PointUpdate { .. }
+                    | DocumentOp::Upsert { .. }
+                    | DocumentOp::BatchInsert { .. }
+                    | DocumentOp::Scan { .. }
+                    | DocumentOp::RangeScan { .. }
+                    | DocumentOp::Register { .. }
+                    | DocumentOp::IndexLookup { .. }
+                    | DocumentOp::IndexedFetch { .. }
+                    | DocumentOp::DropIndex { .. }
+                    | DocumentOp::BackfillIndex { .. }
+                    | DocumentOp::Truncate { .. }
+                    | DocumentOp::EstimateCount { .. }
+                    | DocumentOp::InsertSelect { .. }
+                    | DocumentOp::UpdateFromJoin { .. }
+                    | DocumentOp::Merge { .. }
+                    | DocumentOp::MaterializeScan { .. }
+                    | DocumentOp::ApplyBalanceDelta { .. } => continue,
+                };
             let Some(predicted) = predicted_surrogates.as_deref() else {
                 // A bulk op with no prediction is the non-OLLP (static-set)
                 // shape; `stage_calvin_overlay` rejects it loudly at staging.

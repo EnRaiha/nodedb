@@ -154,7 +154,12 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::Upsert { .. }
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Truncate { .. }
-            | DocumentOp::Merge { .. },
+            | DocumentOp::Merge { .. }
+            // A derived balance write mutates a target row, so it is decided at
+            // the same level as any other document write. It is never issued
+            // by a client: the planner appends it after the statement that
+            // caused it has already cleared its own authorization.
+            | DocumentOp::ApplyBalanceDelta { .. },
         ) => Permission::Write,
 
         PhysicalPlan::Graph(

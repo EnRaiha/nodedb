@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Document write handlers: PointPut, BatchInsert, Upsert, Register.
-//! Secondary-index lookup / fetch handlers live in `index_fetch`; index
-//! backfill / drop handlers live in `index_maintenance`.
+//! Atomic, fully-indexed document batch insert (`DocumentOp::BatchInsert`).
 
 use tracing::{debug, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::chain_guard::ChainGuard;
+use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
@@ -24,6 +24,14 @@ pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled read policy bounding which of those rows may be shown back.
     pub rls_filters: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this page may credit — one entry per DISTINCT join value across the
+    /// batch. Resolved on the Control Plane at plan time.
+    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    /// Materialized-sum TARGET collections whose delta the Control Plane
+    /// settled at plan time and appended as its own `ApplyBalanceDelta` task,
+    /// homed on the target's vShard. This page must not apply them as well.
+    pub deferred_sum_targets: &'a [String],
 }
 
 impl CoreLoop {
@@ -105,8 +113,21 @@ impl CoreLoop {
             surrogates,
             returning,
             rls_filters,
+            resolved_sum_targets,
+            deferred_sum_targets,
         } = params;
         let database_id = task.request.database_id.as_u64();
+        let hook_ctx = HookCtx {
+            database_id,
+            tid,
+            collection,
+            resolved_targets: resolved_sum_targets,
+            deferred_sum_targets,
+            wal_lsn: task.wal_lsn(),
+        };
+        // One guard for the whole page: each row advances the head, and a
+        // failure anywhere rolls the page back to the head it started from.
+        let mut chain = ChainGuard::begin(self, database_id, tid, collection);
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
             Err(e) => return self.response_error(task, e),
@@ -139,9 +160,38 @@ impl CoreLoop {
         // The exact bytes each row landed as, parallel to `documents`, kept only
         // when a `RETURNING` projection will read them.
         let mut stored_bodies: Vec<Vec<u8>> = Vec::new();
-        for (i, (_document_id, value)) in documents.iter().enumerate() {
+        // Redo entries for the target rows this page credited, accumulated
+        // across rows and attached to the response below.
+        let mut target_write_set: Vec<WriteSetEntry> = Vec::new();
+        // Signed BALANCED contributions, accumulated across the whole page: a
+        // multi-row INSERT is one boundary and one genuine set, so its rows are
+        // judged together and a journal written as several rows of one
+        // statement balances.
+        let mut balanced_entries = Vec::new();
+        // The row that failed, plus why. Collected rather than returned inline
+        // so the page's in-memory side effects — the advanced chain head and the
+        // document-cache entries `apply_point_put` populated — are reversed in
+        // one place. Dropping `txn` reverses the durable writes; it does not
+        // reverse either of those.
+        let mut failure: Option<(String, crate::Error)> = None;
+        for (i, (document_id, value)) in documents.iter().enumerate() {
             let surrogate = surrogates[i];
             let row_key = surrogate_to_doc_id(surrogate);
+            // Every row of a batch insert is INSERT-shaped, so every row is a
+            // chain link. The chain rewrites the BODY, so it runs before the
+            // body is encoded and stored. The link covers the user-visible
+            // document id — the same identity `VERIFY_HASH_CHAIN` recomputes
+            // against — not the storage key.
+            let chained = match chain.chain_insert(self, database_id, tid, document_id, value) {
+                Ok(chained) => chained,
+                Err(e) => {
+                    // Cloned, not moved: `row_key` is still borrowed by the
+                    // parameters of the call this arm is handling.
+                    failure = Some((row_key.clone(), e));
+                    break;
+                }
+            };
+            let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
             let outcome = match self.apply_point_put(
                 &txn,
                 PointPutParams {
@@ -150,7 +200,7 @@ impl CoreLoop {
                     collection,
                     document_id: &row_key,
                     surrogate,
-                    value,
+                    value: effective_value,
                     index_text: true,
                     user_roles: &task.request.user_roles,
                     enforce: true,
@@ -158,8 +208,35 @@ impl CoreLoop {
                 },
             ) {
                 Ok(o) => o,
-                Err(e) => return self.response_error(task, e),
+                Err(e) => {
+                    // Cloned, not moved: `row_key` is still borrowed by the
+                    // parameters of the call this arm is handling.
+                    failure = Some((row_key.clone(), e));
+                    break;
+                }
             };
+            // Image-folding enforcement per row, in the SAME transaction the
+            // page is being applied in, so a derived total lands or rolls back
+            // with every row that moved it. The post-image is the SUBMITTED
+            // body, never the chained one.
+            let enforcement = match write_hook::run(
+                self,
+                &txn,
+                &hook_ctx,
+                WriteImages::Insert {
+                    new: ImageBody::Submitted(value),
+                },
+            ) {
+                Ok(enforcement) => enforcement,
+                Err(e) => {
+                    // Cloned, not moved: `row_key` is still borrowed by the
+                    // parameters of the call this arm is handling.
+                    failure = Some((row_key.clone(), e));
+                    break;
+                }
+            };
+            target_write_set.extend(write_hook::target_write_set(&enforcement.target_writes));
+            balanced_entries.extend(enforcement.balanced_entries);
             if returning.is_some() {
                 stored_bodies.push(outcome.stored_value);
             }
@@ -178,6 +255,43 @@ impl CoreLoop {
                 row_index_tuples.push(tuples);
             }
             applied.push(row_key);
+        }
+
+        if let Some((failed_row_key, error)) = failure {
+            // The whole page rolls back, so put the chain head back where it
+            // started and drop every cache entry the abandoned rows populated —
+            // a cached body for a row that never committed is served to readers
+            // as though it had.
+            chain.restore(self);
+            for row_key in applied.iter().chain(std::iter::once(&failed_row_key)) {
+                self.doc_cache
+                    .invalidate(database_id, tid, collection, row_key);
+            }
+            return self.response_error(task, error);
+        }
+
+        // The whole page is one boundary, so it is judged once here — before
+        // the commit, so a page that leaves any journal group unbalanced writes
+        // no rows at all.
+        if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, balanced_entries)
+        {
+            chain.restore(self);
+            for row_key in &applied {
+                self.doc_cache
+                    .invalidate(database_id, tid, collection, row_key);
+            }
+            return self.response_error(task, e);
+        }
+
+        // The advanced head lands in the SAME transaction as the rows whose
+        // hashes it covers.
+        if let Err(e) = chain.persist_head(self, &txn) {
+            chain.restore(self);
+            for row_key in &applied {
+                self.doc_cache
+                    .invalidate(database_id, tid, collection, row_key);
+            }
+            return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
@@ -230,7 +344,7 @@ impl CoreLoop {
                 .collect();
             self.stored_returning_response(task, spec, rls_filters, strict_schema.as_ref(), &rows)
         } else {
-            match super::super::super::response_codec::encode_count("inserted", documents.len()) {
+            match crate::data::executor::response_codec::encode_count("inserted", documents.len()) {
                 Ok(bytes) => self.response_with_payload(task, bytes),
                 Err(e) => {
                     return self.response_error(
@@ -245,128 +359,11 @@ impl CoreLoop {
         if !write_set.is_empty() {
             response.write_set = write_set;
         }
+        // Derived target rows live in a DIFFERENT collection than this page's,
+        // so each carries its own `Some(collection)` and homes to that
+        // collection's vShard.
+        response.write_set.extend(target_write_set);
         response
-    }
-}
-
-/// Parameters for [`CoreLoop::execute_register_document_collection`].
-pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
-    pub tid: u64,
-    pub collection: &'a str,
-    pub indexes: &'a [nodedb_physical::physical_plan::RegisteredIndex],
-    pub crdt_enabled: bool,
-    pub storage_mode: &'a nodedb_physical::physical_plan::StorageMode,
-    pub enforcement: &'a nodedb_physical::physical_plan::EnforcementOptions,
-    pub bitemporal: bool,
-    /// Durable CRDT conflict-resolution policy (JSON-serialized
-    /// `CollectionPolicy`), persisted on the collection's catalog record.
-    /// `Some` rehydrates this core's `PolicyRegistry` so the policy survives
-    /// register/reboot instead of falling back to `CollectionPolicy::ephemeral()`.
-    pub conflict_policy: Option<&'a str>,
-    /// Declared columns + designated `TIME_KEY` when this is a timeseries
-    /// collection; `None` for every other engine.
-    pub timeseries: Option<&'a nodedb_physical::physical_plan::TimeseriesSchema>,
-    /// Vector-primary access-path config when this is a
-    /// `WITH (primary='vector')` collection; `None` for every other engine.
-    /// The read path decodes this collection's sparse rows as `zerompk`
-    /// TAGGED sidecars solely on the strength of this marker.
-    pub vector_primary: Option<&'a nodedb_types::VectorPrimaryConfig>,
-}
-
-impl CoreLoop {
-    /// Register a document collection's secondary index configuration.
-    ///
-    /// Stores the `CollectionConfig` in `self.doc_configs` so that subsequent
-    /// `PointPut` and `DocumentBatchInsert` operations extract and write secondary
-    /// index entries automatically.
-    pub(in crate::data::executor) fn execute_register_document_collection(
-        &mut self,
-        task: &ExecutionTask,
-        params: RegisterDocumentCollectionParams<'_>,
-    ) -> Response {
-        let RegisterDocumentCollectionParams {
-            tid,
-            collection,
-            indexes,
-            crdt_enabled,
-            storage_mode,
-            enforcement,
-            bitemporal,
-            conflict_policy,
-            timeseries,
-            vector_primary,
-        } = params;
-        let mode_label = match storage_mode {
-            nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
-            nodedb_physical::physical_plan::StorageMode::Strict { .. } => "document_strict",
-        };
-        debug!(
-            core = self.core_id,
-            %collection,
-            index_count = indexes.len(),
-            crdt_enabled,
-            storage_mode = mode_label,
-            append_only = enforcement.append_only,
-            hash_chain = enforcement.hash_chain,
-            balanced = enforcement.balanced.is_some(),
-            "register document collection"
-        );
-
-        // Struct literal with every field named — never `..Default::default()`.
-        // A `CollectionConfig` field left unassigned here would make the
-        // attribute silently absent on every registered collection instead of
-        // failing to compile.
-        let config = crate::engine::document::store::CollectionConfig {
-            name: collection.to_string(),
-            index_paths: indexes
-                .iter()
-                .map(crate::engine::document::store::IndexPath::from_registered)
-                .collect(),
-            crdt_enabled,
-            storage_mode: storage_mode.clone(),
-            enforcement: enforcement.clone(),
-            bitemporal,
-            conflict_policy: conflict_policy.map(str::to_string),
-            timeseries: timeseries.map(|ts| Box::new(ts.clone())),
-            vector_primary: vector_primary.map(|vp| Box::new(vp.clone())),
-        };
-
-        let config_key = (
-            task.request.database_id,
-            crate::types::TenantId::new(tid),
-            collection.to_string(),
-        );
-        self.doc_configs.insert(config_key, config);
-
-        // Rehydrate the durable CRDT conflict-resolution policy (if any) into
-        // this core's `PolicyRegistry`. Runs on every `Register` — live DDL
-        // apply AND boot rehydration replay — so `ALTER COLLECTION ... SET ON
-        // CONFLICT ...` survives a restart instead of silently reverting to
-        // `CollectionPolicy::ephemeral()`.
-        if let Some(policy_json) = conflict_policy {
-            match self.get_crdt_engine(task.request.database_id, crate::types::TenantId::new(tid)) {
-                Ok(engine) => {
-                    if let Err(e) = engine.set_collection_policy(collection, policy_json) {
-                        warn!(
-                            core = self.core_id,
-                            %collection,
-                            error = %e,
-                            "failed to rehydrate persisted conflict policy on register"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        core = self.core_id,
-                        %collection,
-                        error = %e,
-                        "failed to create CRDT engine for conflict policy rehydration"
-                    );
-                }
-            }
-        }
-
-        self.response_ok(task)
     }
 }
 
@@ -424,6 +421,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,
@@ -479,6 +477,8 @@ mod tests {
                 surrogates: &surrogates,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
+                deferred_sum_targets: &[],
             },
         );
 
@@ -515,6 +515,8 @@ mod tests {
                 surrogates: &surrogates,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
+                deferred_sum_targets: &[],
             },
         );
 
@@ -551,6 +553,8 @@ mod tests {
                 surrogates: &surrogates,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
+                deferred_sum_targets: &[],
             },
         );
 

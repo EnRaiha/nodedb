@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
+use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
@@ -37,6 +37,10 @@ pub(in crate::data::executor) struct BulkDeleteParams<'a> {
     /// bounds what may be shown back, this one bounds what may be removed.
     /// Empty = no write policy.
     pub rls_write_check: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// the rows this predicate matches contribute to, resolved on the Control
+    /// Plane from its recon scan of the same predicate.
+    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
     pub ollp: OllpPrediction<'a>,
 }
 
@@ -58,6 +62,7 @@ impl CoreLoop {
             returning,
             rls_filters,
             rls_write_check,
+            resolved_sum_targets,
             ollp,
         } = params;
         let ollp_predicted_surrogates = ollp.surrogates;
@@ -99,56 +104,26 @@ impl CoreLoop {
             }
         };
 
-        // OLLP determinism (multi-replica): the predicted surrogate set carried
-        // in the plan is the LEADER's verified write-set and the SINGLE SOURCE
-        // OF TRUTH every replica must mutate. The optimistic-lock VERIFICATION
-        // (`actual != predicted`) is the guard that the leader's prediction is
-        // still valid; it runs ONLY on the data-group leader. A follower whose
-        // local redb snapshot lags the leader's prediction window would compute
-        // a different `actual` set — so it must NOT independently re-derive a
-        // match nor independently raise a mismatch (that poisons the attempt and
-        // exhausts retries even on a static dataset). Instead, EVERY replica —
-        // leader and follower alike — applies the delete to EXACTLY the
-        // predicted set (resolved to doc-ids below), so all replicas mutate
-        // identical state. When no predicted set is present (single-shard /
-        // non-OLLP path) behavior is unchanged: apply over the local scan.
-        let apply_ids: Vec<String> = if let Some(predicted) = ollp_predicted_surrogates {
-            // Leader-only verification: compare the local actual matching set to
-            // the prediction; on drift return OllpRetryRequired WITHOUT writing.
-            // The set comparison is deterministic: both sides are sorted.
-            if self.ollp_is_group_leader
-                && !super::scan::ollp_surrogates_match(&matching_ids, predicted)
-            {
-                return self.response_error(task, ErrorCode::OllpRetryRequired);
-            }
-            // Apply set = the carried predicted surrogates (identical on every
-            // replica). On the leader this equals `matching_ids` post-verify; on
-            // a follower it is the leader's authoritative set, not a local scan.
-            super::scan::ollp_predicted_doc_ids(predicted)
-        } else {
-            matching_ids
+        // Settle the apply set and run every leader-only pre-write
+        // verification the plan's predictions call for. Any divergence returns
+        // here, before the first row is removed. A delete assigns nothing, so
+        // every matched row contributes the join value it currently holds and no
+        // other.
+        let apply_ids = match self.admit_bulk_predicate_write(
+            database_id,
+            tid,
+            matching_ids,
+            &super::BulkAdmission {
+                collection,
+                predicted_surrogates: ollp_predicted_surrogates,
+                predicted_edges: ollp_predicted_edges,
+                updates: &[],
+                resolved_sum_targets,
+            },
+        ) {
+            Ok(ids) => ids,
+            Err(code) => return self.response_error(task, code),
         };
-
-        // OLLP edge-content verification (LEADER-ONLY, same rationale): implicit-
-        // edge DELETE derives `EdgeDelete` tasks from the recon scan's
-        // `_from`/`_to`/`_type`. If a matched doc's edge fields were concurrently
-        // changed (or an edge appeared/disappeared among the matched docs)
-        // between recon and now, the wrong edge would be deleted / a new edge
-        // would dangle. The surrogate-set check above cannot see this — the
-        // surrogate set is unchanged. The leader recomputes the ACTUAL edge set
-        // from the matched docs and compares it to the predicted set carried in
-        // the plan; on ANY divergence it returns OllpRetryRequired WITHOUT
-        // writing. Followers trust the leader's decision. The actual-edge
-        // recompute keys off the predicted apply set so leader and follower
-        // reconcile the same edges.
-        if let Some(predicted) = ollp_predicted_edges
-            && self.ollp_is_group_leader
-        {
-            let actual = self.ollp_actual_edges(database_id, tid, collection, &apply_ids);
-            if !super::scan::ollp_edges_match(actual, predicted) {
-                return self.response_error(task, ErrorCode::OllpRetryRequired);
-            }
-        }
 
         // Gate secondary-vector maintenance once for the whole statement so a
         // collection with no vector field pays nothing. When a vector field is
@@ -213,6 +188,22 @@ impl CoreLoop {
             }
         }
 
+        // BALANCED, decided over the whole matched set BEFORE the first removal.
+        // Each row below commits in its own transaction, so a check that ran
+        // after the loop could only report a violation the earlier rows had
+        // already made durable. A removal SUBTRACTS its row's amount, so
+        // deleting one leg of a balanced journal is refused here — with nothing
+        // deleted — while deleting a whole journal nets to zero and proceeds.
+        match self.balanced_entries_for_stored_deletes(database_id, tid, collection, &apply_ids) {
+            Ok(entries) => {
+                if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, entries)
+                {
+                    return self.response_error(task, e);
+                }
+            }
+            Err(e) => return self.response_error(task, e),
+        }
+
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
         // One post-apply `Delete` redo entry per removed row on a vector
@@ -258,11 +249,66 @@ impl CoreLoop {
                 None
             };
 
+            // The removal and the materialized-sum deltas it owes share ONE
+            // transaction, so a debited target row can never outlive a removal
+            // that did not commit. The stored bytes the removal hands back are
+            // the row's only pre-image and the cheapest one available — the
+            // separate `pre_delete_doc` read above exists for RETURNING and the
+            // index diff, and is not widened for this.
+            let row_txn = match self.sparse.begin_write() {
+                Ok(txn) => txn,
+                Err(e) => return self.response_error(task, e),
+            };
             let deleted_bytes = self
                 .sparse
-                .delete(task.request.database_id.as_u64(), tid, collection, doc_id)
+                .delete_in_txn(
+                    &row_txn,
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    doc_id,
+                )
                 .ok()
                 .flatten();
+            let mut target_writes = Vec::new();
+            if let Some(bytes) = deleted_bytes.as_deref() {
+                match write_hook::run(
+                    self,
+                    &row_txn,
+                    &write_hook::HookCtx {
+                        database_id,
+                        tid,
+                        collection,
+                        resolved_targets: resolved_sum_targets,
+                        deferred_sum_targets: &[],
+                        wal_lsn: task.wal_lsn(),
+                    },
+                    write_hook::WriteImages::Delete {
+                        old: write_hook::ImageBody::Stored(bytes),
+                    },
+                ) {
+                    // The row's BALANCED contribution was settled for the whole
+                    // statement above, before any row was removed; taking it
+                    // again here would count the same removal twice.
+                    Ok(outcome) => target_writes = outcome.target_writes,
+                    // Dropping `row_txn` un-committed reverses both the removal
+                    // and every target it had already debited.
+                    Err(e) => return self.response_error(task, e),
+                }
+            }
+            if let Err(e) = row_txn.commit() {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("bulk delete commit: {e}"),
+                    },
+                );
+            }
+            // One durable redo entry per debited target row, naming the TARGET
+            // collection: this statement's own redo describes the removed source
+            // rows only, so without these a WAL-only restart leaves every total
+            // as it stood before the delete.
+            write_set.extend(write_hook::target_write_set(&target_writes));
             if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 // Cascade: inverted index. doc_id is the hex-encoded surrogate
                 // (the redb storage key). Parse back once for FTS removal and
@@ -426,65 +472,5 @@ impl CoreLoop {
             response.write_set = write_set;
         }
         response
-    }
-
-    /// Compute the sorted ACTUAL implicit-edge set for the matched docs.
-    ///
-    /// For each matched `doc_id`, parse its surrogate (same `len()==8` hex
-    /// parse as [`ollp_actual_surrogates`]), fetch the stored doc bytes via the
-    /// SAME `sparse.get` path the delete loop uses, decode it, and — only when
-    /// it carries BOTH `_from` and `_to` as strings — record an
-    /// [`OllpPredictedEdge`] with the raw `_type` as `label`. A matched doc
-    /// without both endpoints is not an edge and is skipped; if it gained an
-    /// edge after recon it appears here and forces a set mismatch (correct).
-    ///
-    /// The output is sorted via `OllpPredictedEdge`'s derived `Ord` so it
-    /// compares as a plain sorted-slice equality against the Control-Plane-sorted
-    /// predicted set. Edge docs are schemaless (`_from`/`_to`), so `decode_document`
-    /// (msgpack→JSON) is the field-extraction primitive — no hand-rolled
-    /// msgpack. Bytes that don't decode (e.g. a strict Binary Tuple) yield no
-    /// edge, matching the schemaless-only scope of implicit edges.
-    pub(in crate::data::executor) fn ollp_actual_edges(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        matching_ids: &[String],
-    ) -> Vec<OllpPredictedEdge> {
-        // `decode_document` returns `serde_json::Value`, whose `get`/`as_str`
-        // are inherent methods — no extra trait import needed.
-        let mut edges: Vec<OllpPredictedEdge> = Vec::new();
-        for doc_id in matching_ids {
-            let surrogate = if doc_id.len() == 8 {
-                match u32::from_str_radix(doc_id, 16) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                }
-            } else {
-                continue;
-            };
-            let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, doc_id) else {
-                continue;
-            };
-            let Ok(doc) = doc_format::decode_document(&bytes) else {
-                continue;
-            };
-            let from = doc.get("_from").and_then(|v| v.as_str());
-            let to = doc.get("_to").and_then(|v| v.as_str());
-            if let (Some(from), Some(to)) = (from, to) {
-                let label = doc
-                    .get("_type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                edges.push(OllpPredictedEdge {
-                    surrogate,
-                    from: from.to_string(),
-                    to: to.to_string(),
-                    label,
-                });
-            }
-        }
-        edges.sort_unstable();
-        edges
     }
 }

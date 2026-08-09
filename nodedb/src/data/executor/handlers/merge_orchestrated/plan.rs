@@ -28,6 +28,13 @@ pub(super) struct MergeUpdate {
     pub(super) surrogate: Option<Surrogate>,
     /// Post-update document as MessagePack (pre-strict-encoding).
     pub(super) body: Vec<u8>,
+    /// The target row as it stood BEFORE the arm, as MessagePack.
+    ///
+    /// An UPDATE arm's materialized-sum delta is the DIFFERENCE between the two
+    /// images, and a `RowImages::Update` cannot be constructed without both —
+    /// which is what stops the arm's whole new value being credited on top of
+    /// the contribution the row already holds.
+    pub(super) old_body: Vec<u8>,
 }
 
 /// A matched / not-matched-by-source DELETE arm resolved to a removal.
@@ -153,6 +160,7 @@ impl CoreLoop {
                             doc_id: doc_id.clone(),
                             surrogate,
                             body: encode_doc_body(&updated),
+                            old_body: encode_doc_body(&target_doc),
                         });
                     }
                     MergeActionOp::Delete => deletes.push(MergeDelete {

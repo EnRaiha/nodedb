@@ -14,6 +14,7 @@
 
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
@@ -33,6 +34,8 @@ pub(super) struct MergeDeleteArms<'a> {
     pub(super) has_vectors: bool,
     /// Whether the statement carries a `RETURNING` projection.
     pub(super) returning: bool,
+    /// Join-key VALUE → target row surrogate, resolved on the Control Plane.
+    pub(super) resolved_targets: &'a [(String, nodedb_types::Surrogate)],
 }
 
 /// The statement-wide accumulators these arms contribute to, shared with the
@@ -60,6 +63,7 @@ impl CoreLoop {
             deletes,
             has_vectors,
             returning,
+            resolved_targets,
         } = arms;
         let MergeDeleteTally {
             affected,
@@ -90,6 +94,40 @@ impl CoreLoop {
                         },
                     ) {
                         Ok(outcome) => {
+                            // A DELETE arm takes the removed row's contribution
+                            // back off its target, folded inside THIS arm's
+                            // transaction so the debit and the removal commit
+                            // together. The pre-image is the plan's captured
+                            // body — the only image a delete has.
+                            match write_hook::run(
+                                self,
+                                &txn,
+                                &write_hook::HookCtx {
+                                    database_id,
+                                    tid,
+                                    collection,
+                                    resolved_targets,
+                                    deferred_sum_targets: &[],
+                                    wal_lsn: task.wal_lsn(),
+                                },
+                                write_hook::WriteImages::Delete {
+                                    old: write_hook::ImageBody::Submitted(&del.body),
+                                },
+                            ) {
+                                // The arm's BALANCED contribution is NOT settled
+                                // here: these arms commit one transaction each,
+                                // after the caller's phase-A commit, so a
+                                // violation found here could no longer be
+                                // undone. The caller accounts every delete
+                                // arm's pre-image before phase A runs and
+                                // judges the whole MERGE there.
+                                Ok(enforcement) => write_set.extend(write_hook::target_write_set(
+                                    &enforcement.target_writes,
+                                )),
+                                // Dropping `txn` un-committed reverses the
+                                // removal and every target it had debited.
+                                Err(e) => return Err(self.response_error(task, e)),
+                            }
                             if let Err(e) = txn.commit() {
                                 return Err(self.response_error(
                                     task,

@@ -85,6 +85,18 @@ impl NodeDbPgHandler {
                 .await
                 .map_err(StatementSetupError::from)?;
 
+                // A target that does not share the source's vShard cannot ride
+                // the source write's transaction, so its balance is appended as
+                // its own task, homed on the target — the classifier then
+                // dual-homes the pair through Calvin.
+                crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
+                    &self.state,
+                    &mut tasks,
+                    tenant_id,
+                    edge_database_id,
+                )
+                .map_err(StatementSetupError::from)?;
+
                 // The final task set must be authorized before any clone
                 // interception, orchestration, staging, or dispatch path can
                 // observe it. Descriptor admission follows this check so an

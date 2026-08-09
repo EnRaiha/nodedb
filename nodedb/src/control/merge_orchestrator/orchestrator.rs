@@ -40,7 +40,7 @@
 //! and retries — the same predict-verify-retry contract the OLLP dependent-read
 //! path uses. Retries are bounded; exhaustion surfaces `OllpExhausted`.
 
-use nodedb_types::{DatabaseId, TenantId};
+use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
@@ -49,6 +49,7 @@ use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
 use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec};
 
 use super::resolve_arms::decode_resolve;
+use crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies;
 use crate::control::target_identity::{
     assign_target_surrogate, bare_collection_name, resolve_target_pk,
 };
@@ -103,6 +104,9 @@ pub async fn run_authorized_merge(
         returning,
         rls_filters,
         rls_write_check,
+        // Unresolved on the way in: the orchestrator's own RESOLVE pass is what
+        // produces the join keys this is filled from.
+        resolved_sum_targets: _,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -163,7 +167,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
         .await?;
 
         // Phase 1: resolve the NOT-MATCHED insert rows (read-only snapshot).
-        let resolve_plan = merge_plan(&args, true, None, Some(source_rows.clone()));
+        let resolve_plan = merge_plan(&args, true, None, Some(source_rows.clone()), Vec::new());
         let resolve_resp = dispatch_local(
             state,
             args.tenant_id,
@@ -176,7 +180,38 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
         if resolve_resp.status != Status::Ok {
             return Ok(resolve_resp);
         }
-        let insert_rows = decode_resolve(&resolve_resp.payload)?.inserts;
+        let arms = decode_resolve(&resolve_resp.payload)?;
+
+        // Phase 2a: resolve this merge's materialized-sum targets from the
+        // arms the RESOLVE pass just classified. Every arm moves a total — an
+        // INSERT credits, a DELETE debits, an UPDATE applies the difference and,
+        // when it rewrites the join key, both sides — so the pre- AND
+        // post-images of every arm contribute a join key. Resolution is by
+        // LOOKUP only: a join value naming no existing target row fails the
+        // statement rather than minting identity for a row that does not exist.
+        //
+        // Drift between this classification and the apply is caught by the
+        // apply's own insert-key verification, which returns
+        // `OllpRetryRequired` before writing and sends this loop round again
+        // with a fresh classification — the same guard the surrogates rely on.
+        let sum_bodies: Vec<&[u8]> = arms
+            .updates
+            .iter()
+            .flat_map(|(_, _, body, old_body)| [body.as_slice(), old_body.as_slice()])
+            .chain(arms.deletes.iter().map(|(_, _, body)| body.as_slice()))
+            .chain(arms.inserts.iter().map(|(_, body)| body.as_slice()))
+            .collect();
+        let resolved_sum_targets = resolve_sum_targets_for_bodies(
+            state,
+            &sum_bodies,
+            args.target_collection,
+            args.tenant_id,
+            args.database_id,
+            crate::types::TraceId::ZERO,
+        )
+        .await?;
+
+        let insert_rows = arms.inserts;
 
         // Phase 2: assign a fresh, registered surrogate per inserted row.
         let mut resolved: Vec<(String, u32)> = Vec::with_capacity(insert_rows.len());
@@ -195,7 +230,13 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
         // Phase 3: atomic apply with the pre-assigned surrogates + drift verify.
         // The apply reuses THIS attempt's source snapshot so the DP re-derives
         // the classification from the same source the resolve saw.
-        let apply_plan = merge_plan(&args, false, Some(resolved), Some(source_rows));
+        let apply_plan = merge_plan(
+            &args,
+            false,
+            Some(resolved),
+            Some(source_rows),
+            resolved_sum_targets,
+        );
         let apply_resp = dispatch_local(
             state,
             args.tenant_id,
@@ -247,6 +288,7 @@ fn merge_plan(
     resolve_only: bool,
     resolved_inserts: Option<Vec<(String, u32)>>,
     source_rows: Option<Vec<(String, Vec<u8>)>>,
+    resolved_sum_targets: Vec<(String, Surrogate)>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Merge {
         target_collection: args.target_collection.to_string(),
@@ -273,5 +315,8 @@ fn merge_plan(
         // byte-identical apart from the fields that must differ, so a future
         // writing resolve cannot silently lose the gate.
         rls_write_check: args.rls_write_check.to_vec(),
+        // Empty on the RESOLVE pass — it writes nothing, so it folds no delta.
+        // The APPLY pass carries the resolution derived from that pass's arms.
+        resolved_sum_targets,
     })
 }

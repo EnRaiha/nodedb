@@ -6,6 +6,8 @@ use tracing::{debug, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
+use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
@@ -15,11 +17,19 @@ impl CoreLoop {
     /// Iterates the DOCUMENTS table prefix and deletes every key. Cascades to
     /// inverted index, secondary indexes, graph edges, and document cache.
     /// Returns `{"truncated": N}` payload.
+    ///
+    /// Every removed row folds its own `RowImages::Delete` through the
+    /// enforcement funnel, from inside this loop. There is deliberately NO bulk
+    /// aggregate: TRUNCATE must leave the stored totals exactly where N
+    /// individual deletes would, and a separate aggregate path would be a second
+    /// implementation of the same arithmetic — free to drift from the per-row
+    /// one that every other delete path uses.
     pub(in crate::data::executor) fn execute_truncate(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
+        resolved_sum_targets: &[(String, nodedb_types::Surrogate)],
     ) -> Response {
         debug!(core = self.core_id, %collection, "truncate");
 
@@ -45,7 +55,47 @@ impl CoreLoop {
         // collection with no vector field pays nothing — mirrors
         // `execute_bulk_delete`'s `has_vectors` gate.
         let database_id = task.request.database_id.as_u64();
+
+        // Materialized-sum coverage verification (LEADER-ONLY), identical in
+        // contract to the bulk-DML paths: the resolution was derived from a
+        // Control-Plane recon scan of this collection taken before execution, and
+        // a row inserted since then debits a target the plan holds no surrogate
+        // for. TRUNCATE must leave every bound total at exactly what N individual
+        // deletes would leave it at, so a shortfall returns OllpRetryRequired
+        // WITHOUT removing anything rather than emptying the collection and
+        // leaving a total that still counts its rows.
+        if self.sum_targets_diverged_for_ids(
+            &SumTargetCheck {
+                database_id,
+                tid,
+                collection,
+                // TRUNCATE assigns nothing: every removed row contributes the
+                // join value it currently holds and no other.
+                updates: &[],
+                resolved: resolved_sum_targets,
+            },
+            &all_ids,
+        ) {
+            return self.response_error(task, ErrorCode::OllpRetryRequired);
+        }
+
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+
+        // BALANCED, decided over every row about to be removed and BEFORE the
+        // first removal — each row below commits in its own transaction, so a
+        // check after the loop could not undo what it found. Emptying a
+        // collection whose journals all balance nets to zero and proceeds;
+        // emptying one that holds an unbalanced group is refused with nothing
+        // removed.
+        match self.balanced_entries_for_stored_deletes(database_id, tid, collection, &all_ids) {
+            Ok(entries) => {
+                if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, entries)
+                {
+                    return self.response_error(task, e);
+                }
+            }
+            Err(e) => return self.response_error(task, e),
+        }
 
         // Delete each document with full cascade.
         let mut truncated = 0u64;
@@ -57,11 +107,51 @@ impl CoreLoop {
         // `execute_bulk_delete`'s `write_set` cascade.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
         for doc_id in &all_ids {
+            // One transaction per removed row, shared with the materialized-sum
+            // delta that row owes — identical to `execute_bulk_delete`, so a
+            // TRUNCATE and a `DELETE` with no predicate leave the same totals.
+            let row_txn = match self.sparse.begin_write() {
+                Ok(txn) => txn,
+                Err(e) => return self.response_error(task, e),
+            };
             let deleted_bytes = self
                 .sparse
-                .delete(database_id, tid, collection, doc_id)
+                .delete_in_txn(&row_txn, database_id, tid, collection, doc_id)
                 .ok()
                 .flatten();
+            let mut target_writes = Vec::new();
+            if let Some(bytes) = deleted_bytes.as_deref() {
+                match write_hook::run(
+                    self,
+                    &row_txn,
+                    &write_hook::HookCtx {
+                        database_id,
+                        tid,
+                        collection,
+                        resolved_targets: resolved_sum_targets,
+                        deferred_sum_targets: &[],
+                        wal_lsn: task.wal_lsn(),
+                    },
+                    write_hook::WriteImages::Delete {
+                        old: write_hook::ImageBody::Stored(bytes),
+                    },
+                ) {
+                    // The row's BALANCED contribution was settled for the whole
+                    // statement above, before any row was removed; taking it
+                    // again here would count the same removal twice.
+                    Ok(outcome) => target_writes = outcome.target_writes,
+                    Err(e) => return self.response_error(task, e),
+                }
+            }
+            if let Err(e) = row_txn.commit() {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("truncate commit: {e}"),
+                    },
+                );
+            }
+            write_set.extend(write_hook::target_write_set(&target_writes));
             if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 // doc_id is the hex-encoded surrogate (the redb storage key).
                 // Parse back to Surrogate for FTS removal. Non-hex keys

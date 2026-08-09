@@ -36,9 +36,6 @@ pub(in crate::data::executor) struct BitemporalUpdateReindex<'a> {
     pub old_doc: Option<&'a serde_json::Value>,
     /// Decoded post-update document, used to compute the current index values.
     pub new_doc: &'a serde_json::Value,
-    /// Committed WAL LSN for this write, if any. `None` skips recording into
-    /// the per-index write-value substrate (mirrors `note_surrogate_write_lsn`).
-    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 /// Inputs for [`CoreLoop::nonbitemporal_update_reindex`].
@@ -79,16 +76,29 @@ impl CoreLoop {
     }
 
     /// Write the new bitemporal body and reconcile the versioned secondary
-    /// index atomically. Removed values are tombstoned; current values are
-    /// asserted live at `sys_from_ms`.
+    /// index within an externally-owned WriteTransaction. Removed values are
+    /// tombstoned; current values are asserted live at `sys_from_ms`. Does NOT
+    /// commit.
+    ///
+    /// The transaction belongs to the caller because the body and its index
+    /// diff are only part of what an UPDATE lands: the collection's declared
+    /// constraints derive further writes from the same change, and those must
+    /// commit or roll back with it rather than in a transaction of their own.
+    ///
+    /// On `Err` the caller MUST drop `txn` without committing.
+    ///
+    /// Returns the `(field, value)` tuples the diff touched (removed ∪
+    /// current). The caller records them into the per-index write-value
+    /// substrate AFTER its commit succeeds — those versions describe writes
+    /// that are durable, so they must not be published for a transaction that
+    /// never lands.
     pub(in crate::data::executor) fn bitemporal_update_reindex(
         &mut self,
+        txn: &WriteTransaction,
         p: BitemporalUpdateReindex<'_>,
-    ) -> crate::Result<()> {
-        let txn = self.sparse.begin_write()?;
-
+    ) -> crate::Result<Vec<(String, String)>> {
         self.sparse.versioned_put_in_txn(
-            &txn,
+            txn,
             VersionedPut {
                 database_id: p.database_id,
                 tenant: p.tid,
@@ -102,7 +112,8 @@ impl CoreLoop {
         )?;
 
         // Collected up front (owned, no borrow of `self`) so it can be handed
-        // to `note_index_write_values` after commit without a borrow conflict.
+        // to `note_index_write_values` after the caller's commit without a
+        // borrow conflict.
         let mut touched_values: Vec<(String, String)> = Vec::new();
 
         for path in p.index_paths {
@@ -116,7 +127,7 @@ impl CoreLoop {
             // doc from `sys_from_ms` onward.
             for value in old_values.difference(&new_values) {
                 self.sparse.versioned_index_tombstone_in_txn(
-                    &txn,
+                    txn,
                     VersionedIndexEntry {
                         database_id: p.database_id,
                         tenant: p.tid,
@@ -132,7 +143,7 @@ impl CoreLoop {
             // Assert every current value live at the new system time.
             for value in &new_values {
                 self.sparse.versioned_index_put_in_txn(
-                    &txn,
+                    txn,
                     VersionedIndexEntry {
                         database_id: p.database_id,
                         tenant: p.tid,
@@ -150,21 +161,7 @@ impl CoreLoop {
             }
         }
 
-        txn.commit().map_err(|e| crate::Error::Storage {
-            engine: "sparse".into(),
-            detail: format!("bitemporal update reindex commit: {e}"),
-        })?;
-
-        if let Some(lsn) = p.wal_lsn {
-            self.note_index_write_values(
-                nodedb_types::DatabaseId::new(p.database_id),
-                crate::types::TenantId::new(p.tid),
-                p.collection,
-                &touched_values,
-                lsn,
-            );
-        }
-        Ok(())
+        Ok(touched_values)
     }
 
     /// Write the new (non-bitemporal) document body and reconcile the plain

@@ -3,12 +3,10 @@
 //! Pure helper functions for MERGE statement execution (arm selection, action application).
 
 use crate::bridge::scan_filter::ScanFilter;
-use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::handlers::rls_write_gate;
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_plan::document::merge_types::{
-    MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp,
+    MergeClauseKind as MergeClauseKindOp, MergeClauseOp,
 };
 
 /// Find the first clause of the given kind whose extra_predicate is satisfied
@@ -45,190 +43,6 @@ pub(super) fn find_arm<'a>(
         }
     }
     Ok(None)
-}
-
-/// Parameters for [`apply_action`].
-pub(super) struct ApplyActionParams<'a> {
-    pub database_id: u64,
-    pub tid: u64,
-    pub collection: &'a str,
-    pub doc_id: &'a str,
-    pub target_doc: &'a serde_json::Value,
-    pub source_doc: &'a serde_json::Value,
-    pub source_alias: &'a str,
-    pub clause: &'a MergeClauseOp,
-    pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
-    /// Whether the target collection has a secondary vector index. Gated once
-    /// by the caller so a non-vector collection pays nothing; when set, the
-    /// UPDATE / DELETE branches maintain the row's HNSW vectors (the merge path
-    /// otherwise never touches the vector index).
-    pub has_vectors: bool,
-    /// Compiled RLS write policy of the target collection. Each arm is decided
-    /// against the image it stores — the post-image for UPDATE, the pre-image
-    /// for DELETE. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
-}
-
-/// Apply a MATCHED / NOT MATCHED BY SOURCE arm (UPDATE or DELETE) to a target row.
-/// Returns `Ok(true)` when a write was performed.
-pub(super) fn apply_action(
-    core: &mut CoreLoop,
-    params: ApplyActionParams<'_>,
-) -> crate::Result<bool> {
-    let ApplyActionParams {
-        database_id,
-        tid,
-        collection,
-        doc_id,
-        target_doc,
-        source_doc,
-        source_alias,
-        clause,
-        strict_schema,
-        has_vectors,
-        rls_write_check,
-    } = params;
-    match &clause.action {
-        MergeActionOp::DoNothing => Ok(false),
-        MergeActionOp::Delete => {
-            // The row being removed is the only image a delete has, and it is
-            // already decoded here — gate before the store is touched.
-            rls_write_gate::admit_row(rls_write_check, target_doc, tid, collection)?;
-            core.sparse
-                .delete(database_id, tid, collection, doc_id)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("merge delete {doc_id}: {e}"),
-                })?;
-            // Soft-delete the row's HNSW vectors + drop the reverse-map entry,
-            // or the leaked node keeps scoring in KNN search. No-op unless the
-            // collection has a vector field (gated by the caller).
-            if has_vectors {
-                core.remove_document_vector_indexes(database_id, tid, collection, doc_id);
-            }
-            Ok(true)
-        }
-        MergeActionOp::Update { updates } => {
-            let updated = build_update_doc(target_doc, source_doc, source_alias, updates)?;
-            // Decide the post-image — the row that will exist afterwards —
-            // before it is encoded or stored.
-            rls_write_gate::admit_row(rls_write_check, &updated, tid, collection)?;
-
-            let updated_bytes = if let Some(schema) = strict_schema {
-                let ndb_val: nodedb_types::Value = updated.clone().into();
-                super::super::strict_format::value_to_binary_tuple(&ndb_val, schema).map_err(
-                    |e| crate::Error::Storage {
-                        engine: "sparse".into(),
-                        detail: format!("merge strict re-encode: {e}"),
-                    },
-                )?
-            } else {
-                doc_format::encode_to_msgpack(&updated)
-            };
-
-            core.sparse
-                .put(database_id, tid, collection, doc_id, &updated_bytes)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("merge update {doc_id}: {e}"),
-                })?;
-            core.doc_cache
-                .put(database_id, tid, collection, doc_id, &updated_bytes);
-            // Re-index the merged row's vectors (soft-delete the old HNSW node +
-            // insert the new one, keyed by the stable surrogate), or KNN search
-            // keeps returning the pre-merge embedding. No-op unless the
-            // collection has a vector field (gated by the caller).
-            if has_vectors
-                && let Some(surrogate) = crate::engine::document::store::doc_id_to_surrogate(doc_id)
-            {
-                core.update_reindex_vector_indexes(
-                    crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex {
-                        database_id,
-                        tid,
-                        collection,
-                        row_key: doc_id,
-                        surrogate,
-                        new_body: &updated_bytes,
-                        is_strict: strict_schema.is_some(),
-                        has_vectors,
-                    },
-                )?;
-            }
-            Ok(true)
-        }
-        MergeActionOp::Insert { .. } => {
-            // INSERT in a MATCHED arm is unusual — ignore it.
-            Ok(false)
-        }
-    }
-}
-
-/// Parameters for [`apply_insert_action`].
-pub(super) struct ApplyInsertActionParams<'a> {
-    pub database_id: u64,
-    pub tid: u64,
-    pub collection: &'a str,
-    pub source_doc: &'a serde_json::Value,
-    pub source_alias: &'a str,
-    pub clause: &'a MergeClauseOp,
-    pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
-    /// Compiled RLS write policy of the target collection, decided against the
-    /// inserted row. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
-}
-
-/// Apply a NOT MATCHED arm (INSERT) using the source document.
-pub(super) fn apply_insert_action(
-    core: &mut CoreLoop,
-    params: ApplyInsertActionParams<'_>,
-) -> crate::Result<bool> {
-    let ApplyInsertActionParams {
-        database_id,
-        tid,
-        collection,
-        source_doc,
-        source_alias,
-        clause,
-        strict_schema,
-        rls_write_check,
-    } = params;
-    match &clause.action {
-        MergeActionOp::DoNothing => Ok(false),
-        MergeActionOp::Delete | MergeActionOp::Update { .. } => {
-            // DELETE / UPDATE in a NOT MATCHED arm is a no-op (no target row exists).
-            Ok(false)
-        }
-        MergeActionOp::Insert { columns, values } => {
-            let json_doc = build_insert_doc(columns, values, source_doc, source_alias)?;
-            // The inserted row is the image the policy decides; gate it before
-            // it is encoded or stored.
-            rls_write_gate::admit_row(rls_write_check, &json_doc, tid, collection)?;
-            let doc_id = json_doc
-                .get("id")
-                .map(json_to_str)
-                .unwrap_or_else(uuid_v4_str);
-
-            let encoded = if let Some(schema) = strict_schema {
-                let ndb_val: nodedb_types::Value = json_doc.clone().into();
-                super::super::strict_format::value_to_binary_tuple(&ndb_val, schema).map_err(
-                    |e| crate::Error::Storage {
-                        engine: "sparse".into(),
-                        detail: format!("merge insert strict encode: {e}"),
-                    },
-                )?
-            } else {
-                doc_format::encode_to_msgpack(&json_doc)
-            };
-
-            core.sparse
-                .put(database_id, tid, collection, &doc_id, &encoded)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("merge insert {doc_id}: {e}"),
-                })?;
-            Ok(true)
-        }
-    }
 }
 
 /// Build the JSON document a NOT-MATCHED `INSERT` arm produces from a source
@@ -334,13 +148,4 @@ pub(super) fn json_to_str(v: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
-}
-
-pub(super) fn uuid_v4_str() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("merge-{nanos}")
 }

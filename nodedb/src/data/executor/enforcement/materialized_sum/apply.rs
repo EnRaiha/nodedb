@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Applying folded materialized-sum deltas to their target rows.
+//! Applying folded materialized-sum deltas to their target rows, for every
+//! binding the plan did not defer onto a task of its own.
 //!
 //! The target write is a full document write, not a byte poke at the store. It
 //! goes through [`CoreLoop::apply_point_put`] inside the CALLER'S transaction,
@@ -8,12 +9,28 @@
 //! WAL-consistent transaction membership, inverted-index maintenance, secondary
 //! and versioned index maintenance, column statistics, document-cache
 //! population, aggregate-cache invalidation — and lands or rolls back together
-//! with the source row that caused it.
+//! with the source row that caused it. The read-modify-write itself lives in
+//! [`super::rmw`], shared with the cross-shard handler so the two paths cannot
+//! total differently.
 //!
 //! The previous implementation wrote with a bare `sparse.put`, which has none of
 //! those. A balance updated that way left the target's FTS postings, secondary
 //! indexes and column statistics asserting the value it used to hold, and put
 //! the row's new bytes outside the transaction the source row was landing in.
+//!
+//! # A DEFERRED target is not applied here
+//!
+//! This transaction belongs to the source collection's core, and a target that
+//! homes to a different vShard has no rows on it — a write here would land the
+//! balance in a store no reader of the target collection ever looks at. When the
+//! Control Plane can settle such a binding's delta at plan time it appends an
+//! [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)
+//! task homed on the target's vShard, dual-homed with the source write through
+//! Calvin, and names that binding on the plan's deferral list. A named binding
+//! is skipped here, so the delta is applied exactly once. The list is read, not
+//! re-derived: a second derivation of "did the Control Plane defer this?" is
+//! free to disagree with the first, and disagreement is a double-counted or a
+//! dropped balance.
 //!
 //! # Identity comes from the plan, never from a store probe
 //!
@@ -32,14 +49,11 @@ use rust_decimal::Decimal;
 use nodedb_physical::physical_plan::MaterializedSumBinding;
 use nodedb_types::Surrogate;
 
-use super::delta::{fold_sum_deltas, json_to_decimal};
+use super::delta::fold_sum_deltas;
+use super::rmw::BalanceRmw;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::images::{EnforcementCtx, RowImages};
-use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
-use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPutParams};
-use crate::data::executor::sparse_body_format::SparseBodyFormat;
-use crate::engine::document::store::surrogate_to_doc_id;
+use crate::data::executor::handlers::point::apply_put::PointPutOutcome;
 
 /// A target row this write updated, captured so a transactional caller can
 /// reverse it.
@@ -52,6 +66,14 @@ pub(in crate::data::executor) struct TargetWrite {
     /// the forward write used. The old code had no surrogate to record and
     /// pushed `Surrogate::ZERO`.
     pub surrogate: Surrogate,
+    /// The MessagePack body this write handed to `apply_point_put` — NOT the
+    /// bytes that reached storage.
+    ///
+    /// A durable redo record replays through `apply_point_put`, which encodes
+    /// the body into whatever the target collection stores. Journalling the
+    /// STORED bytes would hand a strict target's Binary Tuple back to the
+    /// encoder on replay and store a tuple of a tuple.
+    pub body: Vec<u8>,
     /// Everything the derived write mutated: the pre-image, the versioned and
     /// secondary index tuples, the vector and spatial inserts, the column-stats
     /// pre-images. A transactional caller reverses a target write with exactly
@@ -81,6 +103,22 @@ impl CoreLoop {
     ) -> crate::Result<Vec<TargetWrite>> {
         let mut writes: Vec<TargetWrite> = Vec::new();
         for binding in bindings {
+            // A binding the plan DEFERRED is applied by its own
+            // `ApplyBalanceDelta` task on the target's core. Applying it here as
+            // well would double-count it — and this transaction belongs to the
+            // source's core, so the row it wrote would land in a store no reader
+            // of the target collection consults.
+            //
+            // The deferral is read off the plan, never re-derived here, for the
+            // same reason the target's identity is: the Control Plane decided it
+            // when it appended the sibling task, and a second derivation is free
+            // to disagree with the first.
+            if ctx
+                .deferred_sum_targets
+                .contains(&binding.target_collection)
+            {
+                continue;
+            }
             for (join_value, delta) in coalesce(fold_sum_deltas(binding, images)?) {
                 // A zero net delta leaves the stored total unchanged, so the
                 // read-modify-write would rewrite the row byte-for-byte. An
@@ -111,8 +149,12 @@ impl CoreLoop {
         Ok(writes)
     }
 
-    /// Read one target row, add `delta` to its balance column, and write it back
-    /// through the full document write path.
+    /// Resolve the target row and hand the balance move to the shared
+    /// read-modify-write.
+    ///
+    /// Identity comes from the plan and only from the plan: the surrogate
+    /// resolved on the Control Plane is the one thing that may address the
+    /// target row.
     fn apply_one_delta(
         &mut self,
         txn: &WriteTransaction,
@@ -128,149 +170,20 @@ impl CoreLoop {
                 join_value: join_value.to_string(),
             }
         })?;
-        let document_id = surrogate_to_doc_id(surrogate);
-
-        // The TARGET collection's encoding is resolved from `doc_configs`, not
-        // assumed: the target is a different collection from the source and may
-        // be strict (Binary Tuples), which the schemaless decoder cannot read.
-        let format = self.sparse_body_format(
-            crate::types::DatabaseId::new(ctx.database_id),
-            crate::types::TenantId::new(ctx.tid),
-            &binding.target_collection,
-        );
-        if matches!(format, SparseBodyFormat::VectorSidecar) {
-            // A vector-primary collection's rows are TAGGED `zerompk` sidecars
-            // written by the vector upsert handler, not document bodies. The
-            // document write path below would store an untagged map over them,
-            // which reads back as tag arrays. Refusing is the only outcome that
-            // does not corrupt the row.
-            return Err(crate::Error::Storage {
-                engine: "materialized_sum".into(),
-                detail: format!(
-                    "target collection '{}' is vector-primary; its rows are metadata \
-                     sidecars and cannot carry a materialized sum",
-                    binding.target_collection
-                ),
-            });
-        }
-
-        let old_bytes = self.read_target_row(txn, ctx, &binding.target_collection, &document_id)?;
-        let Some(old_bytes) = old_bytes else {
-            // The Control Plane resolved this join value to a surrogate, so the
-            // row is expected to exist. Skipping instead would leave the stored
-            // total short of the `SUM(...)` that `VERIFY_BALANCE` recomputes
-            // over every source row — the feature would report itself broken.
-            return Err(crate::Error::MaterializedSumTargetNotFound {
-                target_collection: binding.target_collection.clone(),
-                join_column: binding.join_column.clone(),
-                join_value: join_value.to_string(),
-            });
-        };
-
-        let mut target_doc = decode_scanned_document(&old_bytes, format.as_format_ref())?;
-        let current = target_doc
-            .get(&binding.target_column)
-            .and_then(json_to_decimal)
-            .unwrap_or(Decimal::ZERO);
-        let new_balance = current + delta;
-
-        // Always stored as a string: `f64` is lossy past 15 significant digits,
-        // and a balance is exactly the column where that shows up.
-        let Some(object) = target_doc.as_object_mut() else {
-            return Err(crate::Error::Storage {
-                engine: "materialized_sum".into(),
-                detail: format!(
-                    "target row {}/{document_id} is not an object",
-                    binding.target_collection
-                ),
-            });
-        };
-        object.insert(
-            binding.target_column.clone(),
-            serde_json::Value::String(new_balance.to_string()),
-        );
-
-        // `apply_point_put` takes an incoming BODY and encodes it into whatever
-        // the target collection stores — a Binary Tuple for a strict target —
-        // so the body handed to it is MessagePack for every storage mode. The
-        // decode above still has to be format-aware, because the bytes read back
-        // out of the store are in the collection's own encoding.
-        let body = doc_format::encode_to_msgpack(&target_doc);
-
-        let put = self.apply_point_put(
+        self.apply_balance_delta(
             txn,
-            PointPutParams {
+            &BalanceRmw {
                 database_id: ctx.database_id,
                 tid: ctx.tid,
-                collection: &binding.target_collection,
-                document_id: &document_id,
+                target_collection: &binding.target_collection,
+                target_column: &binding.target_column,
                 surrogate,
-                value: &body,
-                index_text: true,
-                // A derived write carries no user intent and no user roles: its
-                // admission was decided when the SOURCE row was admitted. Running
-                // the target's own PUT admission (append-only, period lock,
-                // role-gated state transitions) against it would refuse a write
-                // the user never issued, on a row whose only changed column is
-                // one the engine maintains.
-                user_roles: &[],
-                enforce: false,
+                delta,
+                join_column: &binding.join_column,
+                join_value,
                 wal_lsn: ctx.wal_lsn,
             },
-        );
-        let outcome = match put {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // A rejection late in `apply_point_put` lands after it has already
-                // cached the row it wrote. The caller drops `txn`, so that cache
-                // entry would outlive a balance update that never committed.
-                self.doc_cache.invalidate(
-                    ctx.database_id,
-                    ctx.tid,
-                    &binding.target_collection,
-                    &document_id,
-                );
-                return Err(e);
-            }
-        };
-
-        Ok(TargetWrite {
-            collection: binding.target_collection.clone(),
-            document_id,
-            surrogate,
-            outcome,
-        })
-    }
-
-    /// Read the target row's current stored bytes.
-    ///
-    /// The plain read goes through the CALLER'S write transaction so a second
-    /// delta against the same row in the same transaction sees the first one's
-    /// result. A bitemporal target reads its current version the same way
-    /// `apply_point_put` reads its own pre-image.
-    fn read_target_row(
-        &self,
-        txn: &WriteTransaction,
-        ctx: &EnforcementCtx<'_>,
-        target_collection: &str,
-        document_id: &str,
-    ) -> crate::Result<Option<Vec<u8>>> {
-        if self.is_bitemporal(ctx.database_id, ctx.tid, target_collection) {
-            self.sparse.versioned_get_current(
-                ctx.database_id,
-                ctx.tid,
-                target_collection,
-                document_id,
-            )
-        } else {
-            self.sparse.get_in_txn(
-                txn,
-                ctx.database_id,
-                ctx.tid,
-                target_collection,
-                document_id,
-            )
-        }
+        )
     }
 }
 
@@ -307,11 +220,12 @@ mod tests {
     use super::*;
 
     use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::doc_format;
     use crate::data::executor::enforcement::funnel::{
         WriteEnforcementOutcome, run_write_enforcement,
     };
     use crate::data::executor::strict_format;
-    use crate::engine::document::store::CollectionConfig;
+    use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
     use crate::types::{DatabaseId, TenantId};
     use nodedb_physical::physical_plan::StorageMode;
     use nodedb_types::Value;
@@ -365,6 +279,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 resolved_targets: &[(ACCOUNT.to_string(), TARGET_SURROGATE)],
+                deferred_sum_targets: &[],
                 wal_lsn: None,
             },
             RowImages::Insert { new_doc },
@@ -523,6 +438,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 resolved_targets: &[(ACCOUNT.to_string(), TARGET_SURROGATE)],
+                deferred_sum_targets: &[],
                 wal_lsn: None,
             },
             RowImages::Delete { old_doc: &old_doc },
@@ -565,6 +481,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 resolved_targets: &[],
+                deferred_sum_targets: &[],
                 wal_lsn: None,
             },
             RowImages::Insert { new_doc: &new_doc },

@@ -98,6 +98,7 @@ pub(super) fn wal_append_document_op(
             rls_filters: _,
             // See `PointPut`.
             resolved_sum_targets: _,
+            deferred_sum_targets: _,
         } => {
             let entry =
                 encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
@@ -122,7 +123,11 @@ pub(super) fn wal_append_document_op(
         | DocumentOp::IndexLookup { .. }
         | DocumentOp::IndexedFetch { .. }
         | DocumentOp::EstimateCount { .. }
-        | DocumentOp::MaterializeScan { .. } => None,
+        | DocumentOp::MaterializeScan { .. }
+        // Durability comes from the post-apply write-set redo, which names the
+        // TARGET collection and re-derives its vShard per entry — the same
+        // route the co-resident derived write already takes.
+        | DocumentOp::ApplyBalanceDelta { .. } => None,
         // DurableElsewhere — row is redb-synchronous-durable; secondary-vector-index
         // restart fidelity would need an apply-time per-row Put/Delete record —
         // tracked, not built here

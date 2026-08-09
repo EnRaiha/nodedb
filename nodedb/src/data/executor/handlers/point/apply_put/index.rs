@@ -241,6 +241,7 @@ mod tests {
                 value: doc,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
             },
         );
         assert_eq!(resp.status, Status::Ok);
@@ -284,6 +285,7 @@ mod tests {
                 value: doc,
                 returning: None,
                 rls_filters: &[],
+                resolved_sum_targets: &[],
             },
         );
         assert_eq!(resp.status, Status::Ok);

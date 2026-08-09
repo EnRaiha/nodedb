@@ -5,6 +5,7 @@
 //! Operates on raw msgpack payloads — no decode/re-encode round-trip.
 
 use pgwire::api::results::{FieldFormat, Response};
+use pgwire::error::PgWireResult;
 
 use nodedb_physical::physical_task::PostSetOp;
 
@@ -12,6 +13,7 @@ use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::RedactionCtx;
 use crate::control::server::response_shape::schema::OutputSchema;
 
+use super::super::super::types::sqlstate_error;
 use super::super::plan::{PlanKind, multirow_payload_to_response};
 use super::super::shape_encode;
 
@@ -23,7 +25,7 @@ pub(super) fn apply_set_ops(
     projection: Option<&OutputSchema>,
     result_formats: &[FieldFormat],
     redaction: Option<RedactionCtx<'_>>,
-) -> (Response, Option<String>) {
+) -> PgWireResult<(Response, Option<String>)> {
     let merged = match dedup_set_op {
         PostSetOp::Intersect | PostSetOp::IntersectAll => {
             merge_set_op_payloads(dedup_payloads, SetMergeMode::Intersect)
@@ -33,13 +35,19 @@ pub(super) fn apply_set_ops(
         }
         _ => dedup_union_payloads(dedup_payloads),
     };
-    match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection, redaction) {
-        ShapeOutcome::Rows(shaped) => shape_encode::shaped_query_response(shaped, result_formats),
-        ShapeOutcome::Passthrough => {
-            let shaped = multirow_payload_to_response(&merged);
-            (shaped.response, shaped.notice)
-        }
-    }
+    Ok(
+        match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection, redaction)
+            .map_err(|e| sqlstate_error("XX000", e.message()))?
+        {
+            ShapeOutcome::Rows(shaped) => {
+                shape_encode::shaped_query_response(shaped, result_formats)
+            }
+            ShapeOutcome::Passthrough => {
+                let shaped = multirow_payload_to_response(&merged);
+                (shaped.response, shaped.notice)
+            }
+        },
+    )
 }
 
 /// Merge multiple Data Plane response payloads and deduplicate rows (UNION DISTINCT).

@@ -67,7 +67,12 @@ fn document_is_write(op: &DocumentOp) -> bool {
         // classified `true` here upstream of this change; left as-is, out
         // of this task's scope, since `plan_vshard` is not being changed.
         | DocumentOp::UpdateFromJoin { .. }
-        | DocumentOp::Truncate { .. } => true,
+        | DocumentOp::Truncate { .. }
+        // A balance write mutates a row like any other document write, and it
+        // is precisely the task that has to enter the write-key set: without it
+        // the pair it belongs to classifies as single-shard and the source
+        // write commits without the balance.
+        | DocumentOp::ApplyBalanceDelta { .. } => true,
         DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }

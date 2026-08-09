@@ -125,6 +125,15 @@ async fn plan_authorize_and_admit_once(
     )
     .await?;
 
+    // Follows the resolution: it consumes the surrogates that pass bound, and
+    // issues no lookup of its own.
+    crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
+        state,
+        &mut tasks,
+        tenant_id,
+        database_id,
+    )?;
+
     let authorized_tasks =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)?;
 

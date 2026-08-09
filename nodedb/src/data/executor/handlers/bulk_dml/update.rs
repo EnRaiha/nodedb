@@ -5,7 +5,7 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
+use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateReindex;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_doc;
@@ -14,6 +14,8 @@ use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec};
+
+use super::update_project::{ProjectUpdateRows, ProjectedUpdateRow};
 
 /// Parameters for a bulk update operation.
 pub(in crate::data::executor) struct BulkUpdateParams<'a> {
@@ -35,6 +37,12 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     /// bounds what may be shown back, this one bounds what may be written.
     /// Empty = no write policy.
     pub rls_write_check: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// the rows this predicate matches may touch, resolved on the Control Plane
+    /// from its recon scan of the same predicate. Both sides of a join-key
+    /// change are present, so a row moved between targets is debited and
+    /// credited in the same pass.
+    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
 }
 
 impl CoreLoop {
@@ -61,6 +69,7 @@ impl CoreLoop {
             ollp_predicted_edges,
             rls_filters,
             rls_write_check,
+            resolved_sum_targets,
         } = params;
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk update");
 
@@ -113,61 +122,24 @@ impl CoreLoop {
             }
         };
 
-        // OLLP determinism (multi-replica): the predicted surrogate set carried
-        // in the plan is the LEADER's verified write-set and the SINGLE SOURCE
-        // OF TRUTH every replica must mutate. The optimistic-lock VERIFICATION
-        // (`actual != predicted`) is the guard that the leader's prediction is
-        // still valid; it runs ONLY on the data-group leader. A follower whose
-        // local redb snapshot lags the leader's prediction window would compute
-        // a different `actual` set — so it must NOT independently re-derive a
-        // match nor independently raise a mismatch (that poisons the attempt and
-        // exhausts retries even on a static dataset). Instead, EVERY replica —
-        // leader and follower alike — applies the update to EXACTLY the
-        // predicted set (resolved to doc-ids below), so all replicas mutate
-        // identical state. When no predicted set is present (single-shard /
-        // non-OLLP path) behavior is unchanged: apply over the local scan.
-        let apply_ids: Vec<String> = if let Some(predicted) = ollp_predicted_surrogates {
-            // Leader-only verification: compare the local actual matching set to
-            // the prediction; on drift return OllpRetryRequired WITHOUT writing.
-            // The set comparison is deterministic: both sides are sorted.
-            if self.ollp_is_group_leader
-                && !super::scan::ollp_surrogates_match(&matching_ids, predicted)
-            {
-                return self.response_error(task, ErrorCode::OllpRetryRequired);
-            }
-            // Apply set = the carried predicted surrogates (identical on every
-            // replica). On the leader this equals `matching_ids` post-verify; on
-            // a follower it is the leader's authoritative set, not a local scan.
-            super::scan::ollp_predicted_doc_ids(predicted)
-        } else {
-            matching_ids
-        };
-
-        // OLLP edge-content verification (LEADER-ONLY, same rationale): the
-        // Control Plane derived the implicit edge reconciliation (EdgeDelete of
-        // the OLD edge + EdgePut of the NEW edge) from the recon scan's
-        // `_from`/`_to`/`_type`. If a matched doc's edge fields were concurrently
-        // changed (or an edge appeared/disappeared among the matched docs)
-        // between recon and now, the wrong old edge would be retracted / a stale
-        // edge would dangle. The surrogate-set check above cannot see this — the
-        // surrogate set is unchanged. The leader recomputes the ACTUAL OLD
-        // (pre-update) edge set from the apply set — this runs BEFORE any write
-        // below, so `sparse.get` returns the pre-mutation content — and compares
-        // it to the predicted set; on ANY divergence it returns OllpRetryRequired
-        // WITHOUT writing. Followers trust the leader's decision.
-        if let Some(predicted) = ollp_predicted_edges
-            && self.ollp_is_group_leader
-        {
-            let actual = self.ollp_actual_edges(
-                task.request.database_id.as_u64(),
-                tid,
+        // Settle the apply set and run every leader-only pre-write
+        // verification the plan's predictions call for. Any divergence returns
+        // here, before the first row is touched.
+        let apply_ids = match self.admit_bulk_predicate_write(
+            task.request.database_id.as_u64(),
+            tid,
+            matching_ids,
+            &super::BulkAdmission {
                 collection,
-                &apply_ids,
-            );
-            if !super::scan::ollp_edges_match(actual, predicted) {
-                return self.response_error(task, ErrorCode::OllpRetryRequired);
-            }
-        }
+                predicted_surrogates: ollp_predicted_surrogates,
+                predicted_edges: ollp_predicted_edges,
+                updates,
+                resolved_sum_targets,
+            },
+        ) {
+            Ok(ids) => ids,
+            Err(code) => return self.response_error(task, code),
+        };
 
         // Check if this is a strict (Binary Tuple) collection.
         let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
@@ -216,226 +188,185 @@ impl CoreLoop {
             Vec::new()
         };
 
-        for doc_id in &apply_ids {
-            match self
-                .sparse
-                .get(task.request.database_id.as_u64(), tid, collection, doc_id)
-            {
-                Ok(Some(current_bytes)) => {
-                    // Decode current value — format depends on storage mode.
-                    let mut doc = if let Some(ref schema) = strict_schema {
-                        match super::super::super::strict_format::binary_tuple_to_json(
-                            &current_bytes,
-                            schema,
-                        ) {
-                            Some(v) => v,
-                            None => continue,
-                        }
-                    } else {
-                        // A row skipped here is one the UPDATE silently leaves
-                        // untouched while reporting a smaller affected count as
-                        // the truth.
-                        match doc_format::decode_document(&current_bytes) {
-                            Ok(v) => v,
-                            Err(e) => return self.response_error(task, e),
-                        }
-                    };
-                    // Pre-mutation image, captured before any field is changed.
-                    // Feeds the secondary-index SET diff so values the UPDATE
-                    // drops are removed from the index atomically with the write.
-                    let old_doc_json = doc.clone();
-                    // Snapshot the current row for expression evaluation. All
-                    // expression assignments see the pre-update state — multiple
-                    // assignments in the same UPDATE do not observe each other,
-                    // matching PostgreSQL semantics.
-                    let eval_doc: nodedb_types::Value = doc.clone().into();
-                    if let Some(obj) = doc.as_object_mut() {
-                        for (field, update_val) in updates {
-                            let val: serde_json::Value = match update_val {
-                                nodedb_physical::physical_plan::UpdateValue::Literal(bytes) => {
-                                    match nodedb_types::json_from_msgpack(bytes) {
-                                        Ok(v) => v,
-                                        Err(_) => continue,
-                                    }
-                                }
-                                nodedb_physical::physical_plan::UpdateValue::Expr(expr) => {
-                                    let result: nodedb_types::Value = match expr.eval(&eval_doc) {
-                                        Ok(v) => v,
-                                        // A division/modulo-by-zero in an
-                                        // UPDATE assignment fails the whole
-                                        // statement, unlike the literal-
-                                        // decode-failure case above which
-                                        // skips just that field.
-                                        Err(e) => {
-                                            return self
-                                                .response_error(task, crate::Error::from(e));
-                                        }
-                                    };
-                                    result.into()
-                                }
-                            };
-                            obj.insert(field.clone(), val);
-                        }
-                    }
-                    // Recompute generated columns if any dependency changed.
-                    if let Some(config) = self.doc_configs.get(&config_key)
-                        && !config.enforcement.generated_columns.is_empty()
-                        && super::super::generated::needs_recomputation(
-                            updates,
-                            &config.enforcement.generated_columns,
-                        )
-                        && let Err(e) = super::super::generated::evaluate_generated_columns(
-                            &mut doc,
-                            &config.enforcement.generated_columns,
-                        )
-                    {
-                        tracing::warn!(
-                            %doc_id,
-                            error = ?e,
-                            "generated column recomputation failed, skipping document"
-                        );
-                        continue;
-                    }
-                    // Re-encode — format depends on storage mode.
-                    let updated_bytes = if let Some(ref schema) = strict_schema {
-                        let ndb_val: nodedb_types::Value = doc.clone().into();
-                        match super::super::super::strict_format::value_to_binary_tuple(
-                            &ndb_val, schema,
-                        ) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(
-                                    %doc_id,
-                                    error = %e,
-                                    "strict re-encode failed, skipping document"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        doc_format::encode_to_msgpack(&doc)
-                    };
-                    // Gate the persist on the collection's write policy, decided
-                    // against this row's post-update image — `doc` already has
-                    // the assignments and any regenerated columns applied, so it
-                    // is the row that would exist afterwards. A rejected row
-                    // fails the statement rather than being skipped: a skipped
-                    // row would be reported as unaffected while the rest of the
-                    // predicate's matches were rewritten.
-                    if let Err(e) =
-                        rls_write_gate::admit_row(rls_write_check, &doc, tid, collection)
-                    {
-                        return self.response_error(task, e);
-                    }
-                    let touched = match self.persist_bulk_update_row(NonbitemporalUpdateReindex {
+        // Project every matched row to its post-image BEFORE anything is
+        // written. The apply loop below commits one transaction per row, so a
+        // statement-wide constraint judged while it iterated could only report a
+        // violation the rows ahead of it had already made durable.
+        let projected = match self.project_bulk_update_rows(ProjectUpdateRows {
+            database_id,
+            tid,
+            collection,
+            doc_ids: &apply_ids,
+            updates,
+            strict_schema: strict_schema.as_ref(),
+        }) {
+            Ok(projected) => projected,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // BALANCED over the statement's whole matched set. An update takes the
+        // old amount off its group and puts the new one on, so an update that
+        // moves one leg's amount is refused here — before any row is rewritten
+        // — while one that moves both legs by the same amount nets to zero and
+        // proceeds.
+        let balanced_entries = {
+            let images: Vec<(&serde_json::Value, &serde_json::Value)> = projected
+                .iter()
+                .map(|row| (&row.old_doc, &row.doc))
+                .collect();
+            self.balanced_entries_for_json_updates(database_id, tid, collection, &images)
+        };
+        if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, balanced_entries)
+        {
+            return self.response_error(task, e);
+        }
+        for row in projected {
+            let ProjectedUpdateRow {
+                doc_id,
+                current_bytes,
+                old_doc: old_doc_json,
+                mut doc,
+                updated_bytes,
+            } = row;
+            let doc_id = doc_id.as_str();
+            // Gate the persist on the collection's write policy, decided
+            // against this row's post-update image — `doc` already has
+            // the assignments and any regenerated columns applied, so it
+            // is the row that would exist afterwards. A rejected row
+            // fails the statement rather than being skipped: a skipped
+            // row would be reported as unaffected while the rest of the
+            // predicate's matches were rewritten.
+            if let Err(e) = rls_write_gate::admit_row(rls_write_check, &doc, tid, collection) {
+                return self.response_error(task, e);
+            }
+            // Both images are already materialized here — `old_doc_json`
+            // for the secondary-index diff and `doc` as the post-image —
+            // so the row's materialized-sum delta costs no extra read
+            // and no extra decode. It is folded inside the SAME
+            // transaction the row's body and index diff commit in, so a
+            // credited target can never outlive the row that caused it.
+            let persisted = self.persist_bulk_update_row(
+                NonbitemporalUpdateReindex {
+                    database_id,
+                    tid,
+                    collection,
+                    doc_id,
+                    new_body: &updated_bytes,
+                    index_paths: &index_paths,
+                    old_doc: &old_doc_json,
+                    new_doc: &doc,
+                },
+                &write_hook::HookCtx {
+                    database_id,
+                    tid,
+                    collection,
+                    resolved_targets: resolved_sum_targets,
+                    deferred_sum_targets: &[],
+                    wal_lsn: task.wal_lsn(),
+                },
+            );
+            let (touched, target_writes) = match persisted {
+                // The row's own reindex failed and it is skipped, as it
+                // always was — the helper logged which row and why.
+                Ok(None) => continue,
+                Ok(Some(persisted)) => (persisted.touched, persisted.target_writes),
+                // A rejected materialized sum is NOT a skippable row:
+                // skipping it would report a smaller affected count as
+                // the truth while the rest of the predicate's matches
+                // were rewritten, and leave the stored total short of the
+                // `SUM(...)` over the rows that did land.
+                Err(e) => return self.response_error(task, e),
+            };
+            // One durable redo entry per derived target row, naming the
+            // TARGET collection: the statement's own redo describes the
+            // source row only, so without these a WAL-only restart
+            // leaves every total as it stood before the statement.
+            write_set.extend(write_hook::target_write_set(&target_writes));
+            // Published only after the commit succeeded — the same
+            // ordering the reindex helper used when it owned the
+            // transaction.
+            if let Some(lsn) = task.wal_lsn() {
+                self.note_index_write_values(
+                    task.request.database_id,
+                    crate::types::TenantId::new(tid),
+                    collection,
+                    &touched,
+                    lsn,
+                );
+            }
+            self.doc_cache.put(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                doc_id,
+                &updated_bytes,
+            );
+            // Record the committed row's write version against its
+            // surrogate + collection. Parsed once and reused below
+            // for the write-set entry (the row's doc_id is the
+            // hex-encoded surrogate storage key either way).
+            let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
+            if let Some(surrogate) = row_surrogate {
+                self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                // Re-index the row's vectors from the new body
+                // (soft-delete the old HNSW node + insert the new
+                // one, keyed by the stable surrogate). No-op unless
+                // the collection has a vector field (gated above).
+                if has_vectors
+                    && let Err(e) = self.update_reindex_vector_indexes(UpdateVectorReindex {
                         database_id,
                         tid,
                         collection,
-                        doc_id,
+                        row_key: doc_id,
+                        surrogate,
                         new_body: &updated_bytes,
-                        index_paths: &index_paths,
-                        old_doc: &old_doc_json,
-                        new_doc: &doc,
-                    }) {
-                        Ok(touched) => touched,
-                        Err(e) => {
-                            tracing::warn!(
-                                %doc_id,
-                                error = %e,
-                                "update reindex commit failed, skipping document"
-                            );
-                            continue;
-                        }
-                    };
-                    // Published only after the commit succeeded — the same
-                    // ordering the reindex helper used when it owned the
-                    // transaction.
-                    if let Some(lsn) = task.wal_lsn() {
-                        self.note_index_write_values(
-                            task.request.database_id,
-                            crate::types::TenantId::new(tid),
-                            collection,
-                            &touched,
-                            lsn,
-                        );
-                    }
-                    self.doc_cache.put(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        collection,
-                        doc_id,
-                        &updated_bytes,
-                    );
-                    // Record the committed row's write version against its
-                    // surrogate + collection. Parsed once and reused below
-                    // for the write-set entry (the row's doc_id is the
-                    // hex-encoded surrogate storage key either way).
-                    let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
-                    if let Some(surrogate) = row_surrogate {
-                        self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
-                        // Re-index the row's vectors from the new body
-                        // (soft-delete the old HNSW node + insert the new
-                        // one, keyed by the stable surrogate). No-op unless
-                        // the collection has a vector field (gated above).
-                        if has_vectors
-                            && let Err(e) =
-                                self.update_reindex_vector_indexes(UpdateVectorReindex {
-                                    database_id,
-                                    tid,
-                                    collection,
-                                    row_key: doc_id,
-                                    surrogate,
-                                    new_body: &updated_bytes,
-                                    is_strict: strict_schema.is_some(),
-                                    has_vectors,
-                                })
-                        {
-                            return self.response_error(task, e);
-                        }
-                    }
-                    // Emit an update event per affected row to the Event Plane,
-                    // so AFTER-UPDATE triggers and CDC/change-stream consumers
-                    // see each row a bulk UPDATE touched — mirroring
-                    // `execute_point_update`'s single-row emit. `current_bytes`
-                    // is the pre-update row read above; `emit_put_event` derives
-                    // `WriteOp::Update` from the Some prior + Some new pair and
-                    // handles strict->msgpack conversion on both sides. Emitted
-                    // per row (not a `WriteOp::BulkUpdate` summary) because the
-                    // Event Plane's WAL-replay bulk variants are aggregate
-                    // metadata reconstructed only when the live per-row events
-                    // were lost — the live path always emits per row.
-                    self.emit_put_event(
-                        task,
-                        tid,
-                        collection,
-                        doc_id,
-                        &updated_bytes,
-                        Some(&current_bytes),
-                    );
-                    affected += 1;
-                    if returning.is_some() {
-                        // `doc_id` is the surrogate hex storage key, which only
-                        // stands in as `id` for a row that declares no primary
-                        // key of its own — overwriting a declared key would
-                        // return a value the client never wrote.
-                        returning_doc::attach_row_id(&mut doc, doc_id);
-                        returned_docs.push(doc);
-                    }
-                    // Carry the surrogate + post-image back for a post-apply
-                    // `Put` redo. `updated_bytes` is moved as its last use;
-                    // gated on `has_vectors` so a non-vector collection pays
-                    // nothing. Keyed by the row's surrogate parsed from its
-                    // doc_id (the hex-encoded surrogate storage key).
-                    if has_vectors && let Some(surrogate) = row_surrogate {
-                        write_set.push(WriteSetEntry {
-                            surrogate: surrogate.as_u32(),
-                            is_delete: false,
-                            value: updated_bytes,
-                            collection: None,
-                        });
-                    }
+                        is_strict: strict_schema.is_some(),
+                        has_vectors,
+                    })
+                {
+                    return self.response_error(task, e);
                 }
-                _ => continue,
+            }
+            // Emit an update event per affected row to the Event Plane,
+            // so AFTER-UPDATE triggers and CDC/change-stream consumers
+            // see each row a bulk UPDATE touched — mirroring
+            // `execute_point_update`'s single-row emit. `current_bytes`
+            // is the pre-update row read above; `emit_put_event` derives
+            // `WriteOp::Update` from the Some prior + Some new pair and
+            // handles strict->msgpack conversion on both sides. Emitted
+            // per row (not a `WriteOp::BulkUpdate` summary) because the
+            // Event Plane's WAL-replay bulk variants are aggregate
+            // metadata reconstructed only when the live per-row events
+            // were lost — the live path always emits per row.
+            self.emit_put_event(
+                task,
+                tid,
+                collection,
+                doc_id,
+                &updated_bytes,
+                Some(&current_bytes),
+            );
+            affected += 1;
+            if returning.is_some() {
+                // `doc_id` is the surrogate hex storage key, which only
+                // stands in as `id` for a row that declares no primary
+                // key of its own — overwriting a declared key would
+                // return a value the client never wrote.
+                returning_doc::attach_row_id(&mut doc, doc_id);
+                returned_docs.push(doc);
+            }
+            // Carry the surrogate + post-image back for a post-apply
+            // `Put` redo. `updated_bytes` is moved as its last use;
+            // gated on `has_vectors` so a non-vector collection pays
+            // nothing. Keyed by the row's surrogate parsed from its
+            // doc_id (the hex-encoded surrogate storage key).
+            if has_vectors && let Some(surrogate) = row_surrogate {
+                write_set.push(WriteSetEntry {
+                    surrogate: surrogate.as_u32(),
+                    is_delete: false,
+                    value: updated_bytes,
+                    collection: None,
+                });
             }
         }
 

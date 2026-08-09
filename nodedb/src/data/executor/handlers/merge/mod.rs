@@ -16,7 +16,6 @@
 //!   MATCHED arms in order; apply the first whose extra_predicate is satisfied.
 
 pub(in crate::data::executor) mod dispatch;
-pub(in crate::data::executor) mod legacy_apply;
 pub(in crate::data::executor) mod source_map;
 pub(in crate::data::executor) mod target_docs;
 

@@ -63,7 +63,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::DropIndex { .. }
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::EstimateCount { .. }
-            | DocumentOp::MaterializeScan { .. },
+            | DocumentOp::MaterializeScan { .. }
+            // Appended by the planner AFTER statement admission and dispatched
+            // as its own task; it never reaches the transaction write buffer.
+            | DocumentOp::ApplyBalanceDelta { .. },
         ) => false,
 
         // Buffered. Neither `Merge` nor `UpdateFromJoin` reaches this predicate in
@@ -543,6 +546,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: "c".into(),
@@ -655,6 +659,7 @@ mod tests {
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -664,6 +669,7 @@ mod tests {
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP surrogate set present — the
             // Calvin-routed, not-buffered case.
@@ -676,6 +682,7 @@ mod tests {
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -685,6 +692,7 @@ mod tests {
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP edge set present, surrogates None —
             // the other half of the `Some` guard.
@@ -702,6 +710,7 @@ mod tests {
                 }]),
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection: "c".into(),
@@ -716,6 +725,7 @@ mod tests {
                 }]),
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::MaterializeScan {
                 collection: "c".into(),
@@ -733,6 +743,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
         ];
         for p in &plans {
@@ -2012,6 +2023,7 @@ mod tests {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: "t".into(),
@@ -2026,6 +2038,7 @@ mod tests {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                 collection: "c".into(),
@@ -2058,6 +2071,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::Truncate {
                 collection: "c".into(),
                 restart_identity: false,
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Truncate {
                 collection: "c".into(),

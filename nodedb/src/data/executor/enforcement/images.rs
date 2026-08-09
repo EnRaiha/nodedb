@@ -86,6 +86,22 @@ pub(in crate::data::executor) struct EnforcementCtx<'a> {
     /// is a planning outcome to be reported, not a lookup for the Data Plane
     /// to retry locally.
     pub resolved_targets: &'a [(String, Surrogate)],
+    /// Materialized-sum TARGET collections whose delta this write must NOT
+    /// apply, because the Control Plane settled it at plan time and appended an
+    /// [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)
+    /// task of its own, homed on the target's vShard.
+    ///
+    /// A target that homes elsewhere has no rows on this core, so applying its
+    /// delta inside this transaction would write the balance into a store no
+    /// reader of the target collection consults — and, once the appended task
+    /// runs, count it twice.
+    ///
+    /// Read off the plan, never re-derived: the Control Plane decided the
+    /// deferral when it appended the sibling task, and a second derivation is
+    /// free to disagree with the first. Empty for every write with no deferred
+    /// binding, which is every write on a collection whose targets are
+    /// co-resident and every write on a collection with no binding at all.
+    pub deferred_sum_targets: &'a [String],
     /// WAL LSN the Control Plane allocated for this write, or `None` for
     /// writes with no threaded LSN. Enforcements that persist derived state
     /// stamp it with this so replay can tell what it has already absorbed.

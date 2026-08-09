@@ -43,8 +43,11 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// One resolved UPDATE row from the RESOLVE pass: `(target storage doc_id, its
 /// registered surrogate — `None` only for a legacy non-surrogate-keyed row, the
-/// post-image body)`.
-type ResolvedUpdateArm = (String, Option<u32>, Vec<u8>);
+/// post-image body, the PRE-image body)`.
+///
+/// The pre-image is what lets the Control Plane resolve BOTH sides of a
+/// materialized-sum join-key rewrite; see `encode_resolved_update_rows`.
+pub(crate) type ResolvedUpdateArm = (String, Option<u32>, Vec<u8>, Vec<u8>);
 
 /// Resolve one in-transaction `DocumentOp::UpdateFromJoin` task into the
 /// concrete, surrogate-carrying `PointPut` tasks its matched target rows expand
@@ -84,7 +87,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
     // without the check here, expanding a governed update would launder it into
     // ungoverned point writes.
     if !rls_write_check.is_empty() {
-        for (_, _, body) in &resolved {
+        for (_, _, body, _) in &resolved {
             crate::control::security::rls::admit_compiled_write_image(
                 &rls_write_check,
                 body,
@@ -110,8 +113,31 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
     // `INSERT ... SELECT` expanders do.
     let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
 
+    // Resolve this expansion's materialized-sum targets from the arms the
+    // RESOLVE pass classified. BOTH images of every matched row contribute a
+    // join key: an update that rewrites the join column debits the target the
+    // row leaves and credits the one it joins, so resolving the post-images
+    // alone would leave the abandoned target permanently overstated. Every
+    // emitted point op carries the whole resolution — a row is folded against
+    // the entry its own join value selects, and an entry no op needs costs one
+    // unused surrogate.
+    let sum_bodies: Vec<&[u8]> = resolved
+        .iter()
+        .flat_map(|(_, _, body, old_body)| [body.as_slice(), old_body.as_slice()])
+        .collect();
+    let resolved_sum_targets =
+        crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
+            state,
+            &sum_bodies,
+            &target_collection,
+            tenant_id,
+            task.database_id,
+            crate::types::TraceId::ZERO,
+        )
+        .await?;
+
     let mut out: Vec<PhysicalTask> = Vec::with_capacity(resolved.len());
-    for (doc_id, surrogate_u32, body) in resolved {
+    for (doc_id, surrogate_u32, body, _old_body) in resolved {
         let surrogate = require_surrogate(surrogate_u32, &doc_id, "UPDATE ... FROM")?;
         let document_id = derive_document_id(&target_pk, &body, surrogate);
         let pk_bytes = document_id.clone().into_bytes();
@@ -129,7 +155,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
                 // puts it expands into answer no client.
                 returning: None,
                 rls_filters: Vec::new(),
-                resolved_sum_targets: Vec::new(),
+                resolved_sum_targets: resolved_sum_targets.clone(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,
@@ -196,6 +222,9 @@ async fn resolve_update_rows(
         // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        // The RESOLVE pass writes nothing, so it folds no materialized-sum
+        // delta. The point ops this expansion emits carry their own resolution.
+        resolved_sum_targets: Vec::new(),
     });
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets the target scan fold rows this transaction staged
@@ -223,7 +252,7 @@ async fn resolve_update_rows(
 
 /// Decode the RESOLVE pass payload (a msgpack `Vec<(doc_id, Option<surrogate>,
 /// post_image_body)>`; see `encode_resolved_update_rows`).
-fn decode_resolved_update_rows(payload: &[u8]) -> crate::Result<Vec<ResolvedUpdateArm>> {
+pub(crate) fn decode_resolved_update_rows(payload: &[u8]) -> crate::Result<Vec<ResolvedUpdateArm>> {
     if payload.is_empty() {
         return Ok(Vec::new());
     }

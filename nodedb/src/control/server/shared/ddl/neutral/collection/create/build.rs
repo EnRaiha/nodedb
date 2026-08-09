@@ -15,7 +15,9 @@
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! [`build_and_persist`] is the single body; [`Variant`] supplies the five
-//! differences declaratively.
+//! differences declaratively. Name/flag validation lives in
+//! [`build_flags`], vector-primary resolution in [`build_primary_engine`],
+//! and post-create side effects in [`build_post_create`].
 
 use nodedb_types::DatabaseId;
 
@@ -32,69 +34,9 @@ use super::super::enforcement::{
 use super::engine_option::validate_engine_name;
 use super::request::CreateCollectionRequest;
 
-fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
-}
-
-/// Parse a `WITH (crdt=...)` option value as a boolean, accepting
-/// `"true"`/`"false"` case-insensitively. Any other value is a
-/// user error surfaced as a typed DDL error (SQLSTATE 42601).
-fn parse_crdt_flag(value: &str) -> Result<bool, DdlError> {
-    match value.trim() {
-        v if v.eq_ignore_ascii_case("true") => Ok(true),
-        v if v.eq_ignore_ascii_case("false") => Ok(false),
-        other => Err(err(
-            "42601",
-            format!("invalid value for WITH (crdt=...): '{other}'; expected 'true' or 'false'"),
-        )),
-    }
-}
-
-/// Resolve the CRDT storage flag from the `WITH (...)` option list.
-///
-/// A missing `crdt` option defaults to `false`. CRDT (Loro) storage is a
-/// document-engine capability, so `crdt=true` is rejected with SQLSTATE
-/// 42601 on any non-document collection rather than persisting a flag no
-/// engine would honor.
-fn resolve_crdt_flag(
-    options: &[(String, String)],
-    collection_type: &nodedb_types::CollectionType,
-) -> Result<bool, DdlError> {
-    let crdt = match options.iter().find(|(k, _)| k.eq_ignore_ascii_case("crdt")) {
-        Some((_, v)) => parse_crdt_flag(v)?,
-        None => false,
-    };
-    if crdt && !matches!(collection_type, nodedb_types::CollectionType::Document(_)) {
-        return Err(err(
-            "42601",
-            "WITH (crdt=true) is only supported on document collections".to_string(),
-        ));
-    }
-    Ok(crdt)
-}
-
-fn validate_crdt_signing_storage(
-    signing_required: bool,
-    crdt: bool,
-    wal_authenticated: bool,
-) -> Result<(), DdlError> {
-    if signing_required && !crdt {
-        return Err(err(
-            "42601",
-            "SIGNED_DELTAS requires WITH (crdt=true)".to_string(),
-        ));
-    }
-    if signing_required && !wal_authenticated {
-        return Err(err(
-            "55000",
-            "SIGNED_DELTAS requires authenticated WAL encryption".to_string(),
-        ));
-    }
-    Ok(())
-}
+use super::build_flags::{err, resolve_crdt_flag, validate_crdt_signing_storage, validate_name};
+use super::build_post_create::{create_serial_sequences, log_vector_fields};
+use super::build_primary_engine::resolve_primary_engine;
 
 /// Per-surface configuration. The fields are the entire surface-level
 /// difference between `CREATE COLLECTION` and `CREATE TABLE`.
@@ -283,18 +225,18 @@ pub async fn build_and_persist(
         crdt,
         state.wal.payloads_authenticated(),
     )?;
-    // Custom-typed columns are physically TEXT, so BALANCED is checked against
-    // the resolved list, falling back to the columnar schema columns (empty for
-    // a truly schemaless collection, which makes the check a no-op).
-    let balanced = parse_and_validate_balanced_clause(
-        balanced_raw.unwrap_or(""),
-        if resolved_columns.is_empty() {
-            &fields
-        } else {
-            &resolved_columns
-        },
-    )
-    .map_err(|e| err(e.sqlstate(), e.to_string()))?;
+    // Checked only against an ENFORCED schema. Custom-typed columns are
+    // physically TEXT, so the resolved list is the one to check.
+    //
+    // A schemaless collection is deliberately not checked: its field list is
+    // advisory, a write may carry any field whether or not it appears there,
+    // and the commit-time check reads whatever the row actually holds. Refusing
+    // a BALANCED column that is merely absent from that list would reject
+    // `CREATE COLLECTION x WITH BALANCED ON (...)` — a declaration with no
+    // column list at all, which is the ordinary schemaless spelling.
+    let balanced =
+        parse_and_validate_balanced_clause(balanced_raw.unwrap_or(""), &resolved_columns)
+            .map_err(|e| err(e.sqlstate(), e.to_string()))?;
 
     let partition_strategy =
         nodedb_types::PartitionStrategy::default_for_collection_type(&collection_type);
@@ -370,233 +312,4 @@ pub async fn build_and_persist(
         command: variant.response_tag.to_string(),
         rows_affected: None,
     }])
-}
-
-/// Reject names that aren't `[A-Za-z0-9_-]+`. Both `collection` and
-/// `table` share the rule; only the error label differs.
-fn validate_name(name: &str, label: &str) -> Result<(), DdlError> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(err(
-            "42601",
-            format!(
-                "invalid {label} name '{name}': only letters, digits, '-', and '_' are allowed"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Resolve `PrimaryEngine` + optional `VectorPrimaryConfig` from the
-/// WITH-clause `primary=` / `vector_field=` knobs. Validates the
-/// vector field exists in the column list and the declared `dim`
-/// matches the column's `VECTOR(n)` type when both are present.
-fn resolve_primary_engine(
-    options: &[(String, String)],
-    columns: &[(String, String)],
-    fields: &[(String, String)],
-    collection_type: &nodedb_types::CollectionType,
-) -> Result<
-    (
-        nodedb_types::PrimaryEngine,
-        Option<nodedb_types::VectorPrimaryConfig>,
-    ),
-    DdlError,
-> {
-    match nodedb_sql::ddl_ast::parse::vector_primary::parse_vector_primary_options_from_kvs(options)
-    {
-        Ok(Some(mut vp_cfg)) => {
-            let col_list: Vec<(String, String)> = if fields.is_empty() {
-                columns.to_vec()
-            } else {
-                fields.to_vec()
-            };
-            nodedb_sql::ddl_ast::parse::vector_primary::validate_vector_field(&vp_cfg, &col_list)
-                .map_err(|e| err("42601", e.to_string()))?;
-            nodedb_sql::ddl_ast::parse::vector_primary::validate_payload_indexes(
-                &mut vp_cfg,
-                &col_list,
-            )
-            .map_err(|e| err("42601", e.to_string()))?;
-            // Infer dim from VECTOR(n) column type when not in WITH clause.
-            if let Some((_, type_str)) = col_list
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(&vp_cfg.vector_field))
-            {
-                let upper_t = type_str.to_uppercase();
-                if let Some(inner) = upper_t
-                    .strip_prefix("VECTOR(")
-                    .and_then(|s| s.strip_suffix(')'))
-                    && let Ok(d) = inner.trim().parse::<u32>()
-                {
-                    if vp_cfg.dim == 0 {
-                        vp_cfg.dim = d;
-                    } else if vp_cfg.dim != d {
-                        return Err(err(
-                            "42601",
-                            format!(
-                                "vector dim mismatch: WITH clause specifies {}, column type VECTOR({}) specifies {}",
-                                vp_cfg.dim, d, d
-                            ),
-                        ));
-                    }
-                }
-            }
-            Ok((nodedb_types::PrimaryEngine::Vector, Some(vp_cfg)))
-        }
-        Ok(None) => Ok((
-            nodedb_types::PrimaryEngine::infer_from_collection_type(collection_type),
-            None,
-        )),
-        Err(e) => Err(err("42601", e.to_string())),
-    }
-}
-
-/// INFO-log every detected vector field so operators can see what
-/// the engine auto-configured during a CREATE.
-fn log_vector_fields(collection_name: &str, fields: &[(String, String)]) {
-    let vector_fields =
-        crate::control::server::shared::ddl::schema_validation::extract_vector_fields(fields);
-    for (field_name, _dim, metric) in &vector_fields {
-        tracing::info!(
-            name = %collection_name,
-            field = %field_name,
-            %metric,
-            "auto-configuring vector field"
-        );
-    }
-}
-
-/// Materialise one `StoredSequence` per `SERIAL` column declared on
-/// the new collection. Each sequence rides the same propose+apply
-/// path as a standalone `CREATE SEQUENCE` so the OWNERS row lands
-/// alongside it.
-fn create_serial_sequences(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    collection_name: &str,
-    serial_fields: &[String],
-    now: u64,
-) -> Result<(), DdlError> {
-    for field_name in serial_fields {
-        let seq_name = format!("{collection_name}_{field_name}_seq");
-        let mut seq_def = crate::control::security::catalog::sequence_types::StoredSequence::new(
-            identity.tenant_id.as_u64(),
-            seq_name.clone(),
-            identity.username.clone(),
-        );
-        seq_def.created_at = now;
-        // Route the auto-created sequence through the proposer +
-        // local apply path so the OWNERS row lands alongside the
-        // sequence row — the same architectural guarantee CREATE
-        // SEQUENCE has, applied to SERIAL columns.
-        let seq_entry =
-            crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(seq_def.clone()));
-        propose_and_apply(state, &seq_entry)?;
-        let _ = state.sequence_registry.create(seq_def);
-        tracing::info!(
-            collection = %collection_name,
-            field = %field_name,
-            sequence = %seq_name,
-            "auto-created SERIAL sequence"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    //! Collection name validation tests. Relocated verbatim from the pgwire
-    //! `pgwire::ddl::collection::create::tests` module (now deleted).
-
-    use super::{resolve_crdt_flag, validate_crdt_signing_storage};
-
-    fn opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn crdt_true_on_document_collection_resolves_true() {
-        let options = opts(&[("crdt", "true")]);
-        let flag = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
-            .expect("crdt=true on a document collection must resolve");
-        assert!(flag);
-    }
-
-    #[test]
-    fn crdt_true_on_non_document_collection_rejected() {
-        let options = opts(&[("crdt", "true")]);
-        let err = resolve_crdt_flag(&options, &nodedb_types::CollectionType::columnar())
-            .expect_err("crdt=true on a non-document collection must be rejected");
-        assert_eq!(err.sqlstate, "42601");
-    }
-
-    #[test]
-    fn crdt_garbage_value_rejected() {
-        let options = opts(&[("crdt", "maybe")]);
-        let err = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
-            .expect_err("a non-boolean crdt value must be rejected");
-        assert_eq!(err.sqlstate, "42601");
-    }
-
-    #[test]
-    fn signed_deltas_require_crdt_and_authenticated_wal() {
-        let no_crdt = validate_crdt_signing_storage(true, false, true)
-            .expect_err("signed deltas without CRDT must be rejected");
-        assert_eq!(no_crdt.sqlstate, "42601");
-
-        let unauthenticated_wal = validate_crdt_signing_storage(true, true, false)
-            .expect_err("signed deltas without authenticated WAL must be rejected");
-        assert_eq!(unauthenticated_wal.sqlstate, "55000");
-
-        validate_crdt_signing_storage(true, true, true)
-            .expect("signed CRDT deltas with authenticated WAL must be accepted");
-        validate_crdt_signing_storage(false, false, false)
-            .expect("ordinary collections do not require WAL encryption");
-    }
-
-    #[test]
-    fn crdt_absent_defaults_false() {
-        let options = opts(&[("engine", "kv")]);
-        let flag = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
-            .expect("absent crdt option must resolve to a default");
-        assert!(!flag);
-    }
-
-    /// Collection name validation: allowed chars are `[a-zA-Z0-9_-]`.
-    fn validate_name(name: &str) -> bool {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    }
-
-    #[test]
-    fn valid_collection_names() {
-        assert!(validate_name("docs"));
-        assert!(validate_name("my_collection"));
-        assert!(validate_name("my-collection"));
-        assert!(validate_name("Collection123"));
-        assert!(validate_name("a"));
-    }
-
-    #[test]
-    fn invalid_collection_names_rejected() {
-        // Semicolons are sent by psql in multi-statement queries —
-        // must be rejected with a clear error, not stored silently.
-        assert!(!validate_name("docs;"));
-        assert!(!validate_name("bad;name"));
-        assert!(!validate_name("bad name"));
-        assert!(!validate_name("bad.name"));
-        assert!(!validate_name("bad/name"));
-        assert!(!validate_name(""));
-        assert!(!validate_name("events;"));
-        assert!(!validate_name("orders;"));
-    }
 }

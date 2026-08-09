@@ -482,8 +482,13 @@ pub fn build_output_schema<C: SqlCatalog>(
         // `returning: true` are shaped downstream via
         // `PlanKind::ReturningRows` -> `shape_returning_rows`, which reads
         // column names/values directly out of the response payload
-        // (`RowsPayload` msgpack) and never consults `OutputSchema`. An
-        // empty schema here is therefore correct, not a placeholder.
+        // (`RowsPayload` msgpack) when no columns were announced to the
+        // client. An empty schema here is therefore correct, not a
+        // placeholder: it says "nothing announced", which is exactly true of
+        // the simple-query path, where the RowDescription is built from those
+        // same payload-derived rows. The extended-query path announces its
+        // columns at Describe time and supplies them as the projection
+        // instead, and the shaper then holds the rows to them.
         SqlPlan::Merge { .. } => OutputSchema::default(),
         // `ArrayAgg` / `ArrayElementwise` compile to `ArrayOp::Aggregate` /
         // `ArrayOp::Elementwise`, which `describe_plan` classifies as

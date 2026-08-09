@@ -39,6 +39,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             rls_filters: _,
             // See `PointPut`.
             resolved_sum_targets: _,
+            deferred_sum_targets: _,
         } => document::point_insert(
             collection,
             document_id,
@@ -87,6 +88,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_edges: None,
             rls_filters: _,
             rls_write_check: _,
+            // See `PointPut`: the record is the applied write, not the plan.
+            resolved_sum_targets: _,
         } => document::bulk_delete(collection, filters),
         DocumentOp::BulkUpdate {
             collection,
@@ -97,6 +100,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_edges: None,
             rls_filters: _,
             rls_write_check: _,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => document::bulk_update(collection, filters, updates),
         DocumentOp::InsertSelect {
             target_collection,
@@ -118,6 +123,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             rls_filters: _,
             // See `PointPut`.
             resolved_sum_targets: _,
+            deferred_sum_targets: _,
         } => document::batch_insert(collection, documents, surrogates),
 
         // Known replication gaps: genuine writes not yet wired to a
@@ -130,11 +136,31 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         DocumentOp::Truncate {
             collection,
             restart_identity,
+            // See `PointPut`.
+            resolved_sum_targets: _,
         } => document::truncate(collection, *restart_identity),
         // OLLP-prepared bulk plans carrying predicted surrogates/edges route
         // via the cross-shard Calvin path, not single-shard Raft proposal, so
         // they are intentionally not encoded here.
         DocumentOp::BulkDelete { .. } | DocumentOp::BulkUpdate { .. } => return None,
+
+        DocumentOp::ApplyBalanceDelta {
+            collection,
+            document_id,
+            surrogate,
+            column,
+            delta,
+            join_column,
+            join_value,
+        } => document::apply_balance_delta(
+            collection,
+            document_id,
+            surrogate.as_u32(),
+            column,
+            delta,
+            join_column,
+            join_value,
+        ),
 
         // Not a write — reads / scans / index DDL-metadata / system ops.
         DocumentOp::PointGet { .. }

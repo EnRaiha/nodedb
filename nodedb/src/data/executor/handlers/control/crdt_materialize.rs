@@ -18,6 +18,14 @@
 //! exclusion is inverted BM25 text indexing: the sync stream delivers that via
 //! a separate `FtsIndexDoc` frame, so `index_text` is `false` here to avoid
 //! double-indexing the same surrogate.
+//!
+//! Write-path enforcement is deliberately NOT run here either. Materialization
+//! calls `apply_point_put` directly, one level BELOW the enforcement funnel, so
+//! no materialized-sum delta is folded for a synced row. A delta is a RELATIVE
+//! change to a target row's total, and these deltas already passed admission on
+//! the ORIGIN replica — where the write was issued, its constraints decided, and
+//! its target row credited. Folding again as the merged row lands on each
+//! receiving replica would add the same amount once per replica.
 
 use tracing::warn;
 

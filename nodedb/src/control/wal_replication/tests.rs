@@ -520,6 +520,7 @@ fn doc_batch_insert_roundtrip() {
         returning: None,
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
@@ -559,6 +560,7 @@ fn doc_truncate_roundtrip() {
     let plan = PhysicalPlan::Document(DocumentOp::Truncate {
         collection: "docs".into(),
         restart_identity: true,
+        resolved_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("DocumentOp::Truncate should produce a ReplicatedEntry");
@@ -570,6 +572,7 @@ fn doc_truncate_roundtrip() {
         PhysicalPlan::Document(DocumentOp::Truncate {
             collection,
             restart_identity,
+            ..
         }) => {
             assert_eq!(collection, "docs");
             assert!(restart_identity, "restart_identity must round-trip");
@@ -1654,6 +1657,7 @@ fn known_write_gaps_are_not_replicated() {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ),
         (
@@ -1671,6 +1675,7 @@ fn known_write_gaps_are_not_replicated() {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
         ),
         (

@@ -17,11 +17,16 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// Resolve the materialized-sum target row for every value-carrying document
 /// write in `tasks`, storing the result in that op's `resolved_sum_targets`.
 ///
-/// Only ops that carry a row BODY are resolved: the join key is a column of the
-/// row being written, so an op with no body has no key to resolve. Predicate-
-/// driven plans (`BulkUpdate`, `BulkDelete`, `Truncate`, `UpdateFromJoin`,
-/// `InsertSelect`, `Merge`) match their rows in the Data Plane and are resolved
-/// elsewhere.
+/// Two shapes are resolved here. An op that carries a row BODY reads its join
+/// key straight off that body. `BulkUpdate`, `BulkDelete` and `TRUNCATE` name
+/// their rows by PREDICATE and carry no body, so
+/// [`predicate::resolve_predicate_sum_targets`](super::predicate) resolves them
+/// from a reconnaissance scan of the same predicate instead.
+///
+/// `UpdateFromJoin`, `InsertSelect` and `Merge` are resolved by their own
+/// Control-Plane orchestrators, which hold the concrete rows the statement
+/// resolved to — a resolution derived from the plan alone would over-approximate
+/// their match sets.
 ///
 /// A collection that drives no binding — nearly all of them — costs one cached
 /// index probe and nothing else: no catalog read, no surrogate lookup.
@@ -39,6 +44,20 @@ pub async fn resolve_materialized_sum_targets(
         let PhysicalPlan::Document(op) = &mut task.plan else {
             continue;
         };
+        // Predicate-driven plans resolve from their own recon scan and are
+        // accounted for by that call; the body-driven path below never sees
+        // them.
+        if super::predicate::resolve_predicate_sum_targets(
+            state,
+            op,
+            tenant_id,
+            database_id,
+            trace_id,
+        )
+        .await?
+        {
+            continue;
+        }
         let Some((collection, bodies)) = value_carrying(op) else {
             continue;
         };
@@ -105,7 +124,10 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
-        | DocumentOp::MaterializeScan { .. } => None,
+        | DocumentOp::MaterializeScan { .. }
+        // Already resolved: this op IS the resolution, carrying the target
+        // row's surrogate the Control Plane looked up when it appended it.
+        | DocumentOp::ApplyBalanceDelta { .. } => None,
     }
 }
 
@@ -146,8 +168,101 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<(String, Surrogate)>) {
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
-        | DocumentOp::MaterializeScan { .. } => {}
+        | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::ApplyBalanceDelta { .. } => {}
     }
+}
+
+/// Resolve the materialized-sum targets for a set of row BODIES of one source
+/// collection, for a caller that holds the bodies itself rather than a plan.
+///
+/// This is the seam the Control-Plane orchestrators use. `INSERT ... SELECT`,
+/// `MERGE` and `UPDATE ... FROM` all resolve their rows on the Control Plane and
+/// re-issue concrete work (a `BatchInsert` page, an APPLY pass, a write pass)
+/// through `dispatch_local`, which never passes through
+/// [`resolve_materialized_sum_targets`]. Without this they would ship an empty
+/// resolution and the Data-Plane fold would have no target to address.
+///
+/// `source_collection` is the db-qualified name as it appears on the plan.
+/// Returns an empty vec — and issues no lookup at all — when the collection
+/// drives no binding.
+pub async fn resolve_sum_targets_for_bodies(
+    state: &SharedState,
+    bodies: &[&[u8]],
+    source_collection: &str,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+) -> crate::Result<Vec<(String, Surrogate)>> {
+    let schema_version = state.schema_version.current();
+    let catalog = state.credentials.catalog();
+    let source = strip_db_prefix(database_id, source_collection);
+    let Some(bindings) = state.materialized_sum_index.bindings_for_source(
+        catalog,
+        schema_version,
+        database_id,
+        tenant_id,
+        source,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    resolve_bodies(state, &bindings, bodies, tenant_id, database_id, trace_id).await
+}
+
+/// Whether `source_collection` drives any materialized-sum binding.
+///
+/// The gate every predicate-driven resolver checks FIRST: a collection that
+/// drives nothing must not pay for a recon scan, which is the whole cost of the
+/// predicate path. `source_collection` is the db-qualified plan name.
+pub fn source_drives_bindings(
+    state: &SharedState,
+    source_collection: &str,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+) -> crate::Result<Option<Arc<Vec<MaterializedSumBinding>>>> {
+    let schema_version = state.schema_version.current();
+    let catalog = state.credentials.catalog();
+    let source = strip_db_prefix(database_id, source_collection);
+    state.materialized_sum_index.bindings_for_source(
+        catalog,
+        schema_version,
+        database_id,
+        tenant_id,
+        source,
+    )
+}
+
+/// Resolve one already-extracted join VALUE to its target row's surrogate.
+///
+/// `lookup_surrogate_routed`, never `assign_surrogate_routed`: a join value that
+/// names no existing target row must fail the statement, not mint identity for a
+/// row that does not exist.
+pub(super) async fn lookup_join_value(
+    state: &SharedState,
+    binding: &MaterializedSumBinding,
+    join_value: &str,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+) -> crate::Result<Surrogate> {
+    let target = db_qualified(database_id, &binding.target_collection);
+    let vshard = VShardId::from_key(join_value.as_bytes());
+    lookup_surrogate_routed(
+        state,
+        vshard,
+        database_id,
+        tenant_id,
+        &target,
+        join_value.as_bytes(),
+        trace_id,
+    )
+    .await?
+    .ok_or_else(|| crate::Error::MaterializedSumTargetNotFound {
+        target_collection: binding.target_collection.clone(),
+        join_column: binding.join_column.clone(),
+        join_value: join_value.to_string(),
+    })
 }
 
 /// Resolve every `(binding, body)` pair to its target row's surrogate.
@@ -181,7 +296,7 @@ async fn resolve_bodies(
                 vshard,
                 database_id,
                 tenant_id,
-                &target,
+                target.as_str(),
                 join_value.as_bytes(),
                 trace_id,
             )
@@ -292,6 +407,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -414,6 +530,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

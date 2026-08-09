@@ -67,6 +67,9 @@ pub(super) fn convert_truncate(
         plan: PhysicalPlan::Document(DocumentOp::Truncate {
             collection: collection.into(),
             restart_identity,
+            // Filled in by the materialized-sum resolution pass, which recon-
+            // scans the rows this TRUNCATE will remove.
+            resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use nodedb_sql::types::{EngineType, SqlExpr, SqlValue};
+use nodedb_sql::types::{EngineType, SqlValue};
 use nodedb_types::Surrogate;
 use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
 
@@ -10,9 +10,7 @@ use nodedb_physical::physical_plan::ColumnarInsertIntent;
 use nodedb_physical::physical_plan::*;
 
 use super::super::convert::ConvertContext;
-use super::super::value::{
-    assignments_to_update_values, row_to_msgpack, rows_to_msgpack_array, sql_value_to_string,
-};
+use super::super::value::{row_to_msgpack, rows_to_msgpack_array, sql_value_to_string};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Build a `ColumnarSchema` from raw catalog column-type strings.
@@ -74,7 +72,7 @@ pub(crate) fn build_columnar_schema(column_schema: &[(String, String)]) -> Optio
 ///
 /// Returns an empty `Vec` when `column_schema` is empty or fails validation
 /// — see [`build_columnar_schema`] for the typed builder this wraps.
-fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
+pub(super) fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
     build_columnar_schema(column_schema)
         .map(|schema| zerompk::to_msgpack_vec(&schema).unwrap_or_default())
         .unwrap_or_default()
@@ -83,7 +81,7 @@ fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
 /// Extract the document-id value from a row, keyed off the declared
 /// `primary_key` column when present, falling back to the legacy
 /// `id`/`document_id`/`key` convention otherwise.
-fn extract_doc_id(row: &[(String, SqlValue)], primary_key: Option<&str>) -> String {
+pub(super) fn extract_doc_id(row: &[(String, SqlValue)], primary_key: Option<&str>) -> String {
     row.iter()
         .find(|(k, _)| match primary_key {
             Some(pk) => k == pk,
@@ -112,7 +110,7 @@ pub(super) fn assign_fresh(ctx: &ConvertContext, collection: &str) -> crate::Res
 /// Whether a collection's declared primary key is the auto-generated `_rowid`
 /// sentinel — injected by strict-schema construction when no `PRIMARY KEY` was
 /// declared. Such rows carry no user identity: each needs a fresh surrogate.
-fn is_auto_rowid_pk(primary_key: Option<&str>) -> bool {
+pub(super) fn is_auto_rowid_pk(primary_key: Option<&str>) -> bool {
     primary_key == Some("_rowid")
 }
 
@@ -189,10 +187,13 @@ pub(in super::super) fn convert_insert(
     let mut tasks = Vec::new();
     let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
 
-    // Detect CRDT document collections once (never re-hit the catalog per row).
+    // Both INSERT routing gates, read from the catalog once for the whole
+    // statement (never re-hit per row).
+    //
     // `IF NOT EXISTS` (ON CONFLICT DO NOTHING → `if_absent`) cannot be honored by
     // `CrdtOp::DocUpsert`, which is an unconditional LWW full-replace: reject.
-    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    let gates = super::balanced_gate::document_collection_write_gates(ctx, collection)?;
+    let is_crdt = gates.crdt;
     if is_crdt && if_absent {
         return Err(crate::Error::BadRequest {
             detail: format!(
@@ -201,6 +202,27 @@ pub(in super::super) fn convert_insert(
             ),
         });
     }
+
+    // A balanced collection's rows are judged as a set, so the statement lowers
+    // to ONE page rather than one task per row — see `balanced_gate`.
+    let is_balanced = gates.balanced && !is_crdt;
+    // `ON CONFLICT DO NOTHING` skips rows whose key already exists, and which
+    // rows those are is decided per row at apply time. A journal that silently
+    // loses one leg that way is exactly the unbalanced state the constraint
+    // exists to refuse, and the page shape cannot express the per-row skip, so
+    // the combination is rejected rather than half-honored.
+    if is_balanced && if_absent {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "INSERT ... IF NOT EXISTS on BALANCED collection '{collection}' is not \
+                 supported; a row skipped on conflict would leave its journal unbalanced"
+            ),
+        });
+    }
+    // Rows of a balanced INSERT, accumulated across the loop below and emitted
+    // as one `BatchInsert` task after it.
+    let mut balanced_documents: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut balanced_surrogates: Vec<Surrogate> = Vec::new();
 
     let mut expanded_rows: Vec<Vec<(String, SqlValue)>> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -259,6 +281,14 @@ pub(in super::super) fn convert_insert(
                     let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
                     (doc_id, s)
                 };
+                // One page for the whole statement: the rows of a balanced
+                // INSERT are judged together, so they may not be split across
+                // one task — one boundary — per row.
+                if is_balanced {
+                    balanced_documents.push((doc_id, value_bytes));
+                    balanced_surrogates.push(surrogate);
+                    continue;
+                }
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: collection.into(),
@@ -285,6 +315,7 @@ pub(in super::super) fn convert_insert(
                         // which runs after conversion (it needs the catalog
                         // and, in cluster mode, a routed lookup).
                         resolved_sum_targets: Vec::new(),
+                        deferred_sum_targets: Vec::new(),
                     })
                 };
                 tasks.push(PhysicalTask {
@@ -304,6 +335,19 @@ pub(in super::super) fn convert_insert(
                 });
             }
         }
+    }
+
+    if !balanced_documents.is_empty() {
+        tasks.push(super::balanced_gate::balanced_batch_task(
+            super::balanced_gate::BalancedBatch {
+                collection,
+                tenant_id,
+                vshard,
+                documents: balanced_documents,
+                surrogates: balanced_surrogates,
+            },
+            ctx.database_id,
+        ));
     }
 
     if !columnar_rows.is_empty() {
@@ -335,160 +379,6 @@ pub(in super::super) fn convert_insert(
                 // and the row-level-security injector from the collection's read
                 // policy. Filling either here would duplicate a decision that
                 // has one owner.
-                returning: None,
-                rls_filters: Vec::new(),
-            }),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        });
-    }
-
-    Ok(tasks)
-}
-
-/// Bundled arguments for [`convert_upsert`].
-pub(in super::super) struct ConvertUpsertArgs<'a> {
-    pub collection: &'a str,
-    pub engine: &'a EngineType,
-    pub rows: &'a [Vec<(String, SqlValue)>],
-    pub column_defaults: &'a [(String, String)],
-    pub column_schema: &'a [(String, String)],
-    pub on_conflict_updates: &'a [(String, SqlExpr)],
-    pub primary_key: Option<&'a str>,
-    pub tenant_id: TenantId,
-    pub ctx: &'a ConvertContext,
-}
-
-pub(in super::super) fn convert_upsert(
-    args: ConvertUpsertArgs<'_>,
-) -> crate::Result<Vec<PhysicalTask>> {
-    let ConvertUpsertArgs {
-        collection,
-        engine,
-        rows,
-        column_defaults,
-        column_schema,
-        on_conflict_updates,
-        primary_key,
-        tenant_id,
-        ctx,
-    } = args;
-    let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
-    let collection = coll_qualified.as_str();
-    let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
-    let mut tasks = Vec::new();
-
-    // Detect CRDT document collections once. An explicit `ON CONFLICT DO UPDATE
-    // SET ...` cannot be honored: CRDT conflict resolution IS the LWW
-    // full-replace `DocUpsert` performs, so a caller-supplied merge clause has
-    // no place to run. Reject rather than silently ignore it.
-    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
-    if is_crdt && !on_conflict_updates.is_empty() {
-        return Err(crate::Error::BadRequest {
-            detail: format!(
-                "UPSERT with ON CONFLICT DO UPDATE on CRDT collection '{collection}' is not \
-                 supported; CRDT documents converge via last-writer-wins full replace"
-            ),
-        });
-    }
-
-    let on_conflict_values = if on_conflict_updates.is_empty() {
-        Vec::new()
-    } else {
-        assignments_to_update_values(on_conflict_updates)?
-    };
-
-    let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
-
-    for row in rows {
-        let doc_id = extract_doc_id(row, primary_key);
-
-        match engine {
-            EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
-                let value_bytes = row_to_msgpack(row)?;
-                // A row with no primary-key value (auto-`_rowid` collection or
-                // an upsert that omitted the pk column) has no identity to match
-                // on, so the upsert degenerates to an insert with a fresh
-                // surrogate; the on-conflict clause can never match a prior row.
-                // Content-addressing the empty pk would instead collapse every
-                // id-less row onto one document.
-                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) || doc_id.is_empty() {
-                    let s = assign_fresh(ctx, collection)?;
-                    (s.as_u32().to_string(), s)
-                } else {
-                    let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
-                    (doc_id, s)
-                };
-                let plan = if is_crdt {
-                    PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-                        collection: collection.into(),
-                        document_id: doc_id,
-                        fields_json: super::crdt_gate::row_to_fields_json(row)?,
-                        surrogate,
-                        partial: false,
-                        returning: None,
-                        rls_filters: Vec::new(),
-                    })
-                } else {
-                    PhysicalPlan::Document(DocumentOp::Upsert {
-                        collection: collection.into(),
-                        document_id: doc_id,
-                        value: value_bytes,
-                        on_conflict_updates: on_conflict_values.clone(),
-                        surrogate,
-                        // Filled in by the RLS injection pass, which runs after
-                        // conversion.
-                        rls_write_check: Vec::new(),
-                        rls_filters: Vec::new(),
-                        // Filled in by the protocol layer's RETURNING injection.
-                        returning: None,
-                        // Filled by the materialized-sum resolution pass.
-                        resolved_sum_targets: Vec::new(),
-                    })
-                };
-                tasks.push(PhysicalTask {
-                    tenant_id,
-                    vshard_id: vshard,
-                    database_id: ctx.database_id,
-                    plan,
-                    post_set_op: PostSetOp::None,
-                    txn_id: None,
-                });
-            }
-            EngineType::Columnar | EngineType::Spatial => {
-                columnar_rows.push(row);
-            }
-            EngineType::Timeseries | EngineType::KeyValue | EngineType::Array => {
-                return Err(crate::Error::PlanError {
-                    detail: format!(
-                        "UPSERT into '{collection}': engine type {engine:?} does not support upsert"
-                    ),
-                });
-            }
-        }
-    }
-
-    if !columnar_rows.is_empty() {
-        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults)?;
-        let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows, primary_key)?;
-        let schema_bytes = build_schema_bytes(column_schema);
-        tasks.push(PhysicalTask {
-            tenant_id,
-            vshard_id: vshard,
-            database_id: ctx.database_id,
-            plan: PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: collection.into(),
-                payload,
-                format: "msgpack".into(),
-                intent: ColumnarInsertIntent::Put,
-                on_conflict_updates: on_conflict_values,
-                surrogates,
-                schema_bytes,
-                provenance: None,
-                wal_lsn: None,
-                rls_write_check: Vec::new(),
-                // Filled by the later `inject_returning_spec` / row-level-security
-                // passes — see the plain-insert site above.
                 returning: None,
                 rls_filters: Vec::new(),
             }),

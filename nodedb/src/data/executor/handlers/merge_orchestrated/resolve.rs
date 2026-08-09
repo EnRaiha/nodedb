@@ -13,9 +13,11 @@ impl CoreLoop {
     /// RESOLVE pass: return ALL resolved arms without writing.
     ///
     /// Response payload is a msgpack 3-tuple `(updates, deletes, inserts)`:
-    /// - `updates`: `Vec<(doc_id, Option<surrogate_u32>, body_msgpack)>` — the
-    ///   existing target row's storage key, its registered surrogate, and the
-    ///   post-update body.
+    /// - `updates`: `Vec<(doc_id, Option<surrogate_u32>, body_msgpack,
+    ///   old_body_msgpack)>` — the existing target row's storage key, its
+    ///   registered surrogate, the post-update body, and the row's PRE-image
+    ///   (which is what lets the Control Plane resolve BOTH sides of a
+    ///   materialized-sum join-key rewrite).
     /// - `deletes`: `Vec<(doc_id, Option<surrogate_u32>, body_msgpack)>` — the
     ///   existing target row's storage key, its registered surrogate, and the
     ///   pre-delete body (so the CP can extract its primary key).
@@ -39,10 +41,17 @@ impl CoreLoop {
             Ok(p) => p,
             Err(e) => return self.response_error(task, e),
         };
-        let updates: Vec<(String, Option<u32>, Vec<u8>)> = plan
+        let updates: Vec<crate::query::ResolvedUpdateRowWire> = plan
             .updates
             .into_iter()
-            .map(|u| (u.doc_id, u.surrogate.map(|s| s.as_u32()), u.body))
+            .map(|u| {
+                (
+                    u.doc_id,
+                    u.surrogate.map(|s| s.as_u32()),
+                    u.body,
+                    u.old_body,
+                )
+            })
             .collect();
         let deletes: Vec<(String, Option<u32>, Vec<u8>)> = plan
             .deletes

@@ -82,7 +82,13 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
-        | DocumentOp::Upsert { collection, .. } => ctx.authorize(collection, PermTreeLevel::Write),
+        | DocumentOp::Upsert { collection, .. }
+        // Named directly like the point writes above. The balance column is
+        // maintained by the engine, not chosen by the writer, but the row it
+        // lands on is still a row of the target collection.
+        | DocumentOp::ApplyBalanceDelta { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Write)
+        }
 
         // Filter (write level): the bulk update selects its rows through
         // `filters`, so the subtree narrows which rows are written in addition
@@ -215,6 +221,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(apply(&mut plan, &cache).is_ok());
         match &plan {

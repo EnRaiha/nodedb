@@ -214,6 +214,14 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => Ok(()),
+
+        // No-op: a derived balance write carries no user intent and no user
+        // identity. Its admission was decided when the SOURCE row it was
+        // derived from was admitted; deciding it again against the TARGET's own
+        // policy would refuse every governed write on the strength of a row
+        // whose only changed column is one the engine maintains — the same
+        // reason the co-resident derived write runs with `enforce: false`.
+        DocumentOp::ApplyBalanceDelta { .. } => Ok(()),
     }
 }
 
@@ -248,6 +256,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         })
     }
 
@@ -312,6 +321,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         });
         assert!(matches!(
             inject(&mut plan, &store),
@@ -365,6 +375,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(!write_check(&plan).is_empty());
@@ -388,6 +399,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(!write_check(&plan).is_empty());
@@ -458,6 +470,7 @@ mod tests {
         let mut plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: "orders".into(),
             restart_identity: false,
+            resolved_sum_targets: Vec::new(),
         });
         assert_write_refused(inject(&mut plan, &store), "orders");
     }
@@ -576,6 +589,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {
@@ -615,6 +629,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {

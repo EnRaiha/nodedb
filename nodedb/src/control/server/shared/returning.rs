@@ -461,6 +461,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         });
         assert!(refuse_unprojectable_insert_returning(&plan).is_ok());
     }

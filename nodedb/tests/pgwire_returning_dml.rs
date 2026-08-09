@@ -414,6 +414,99 @@ async fn extended_query_update_returning_star() {
     );
 }
 
+/// `RETURNING *` over the extended protocol is the one shape where the two
+/// column lists are decided in different places: Describe answers with a
+/// RowDescription BEFORE any row exists (from the target's catalog schema),
+/// while the rows carry the columns of the row actually stored. pgwire sends
+/// no second RowDescription with the DataRows, so any disagreement is
+/// unreadable to the client — the statement fails with "DataRow field count
+/// does not match the number of columns".
+///
+/// This pins BOTH sides at once: the announced list is the stored row's own
+/// columns, and every DataRow carries exactly one field per announced column,
+/// each holding that column's value. A padded or truncated row would keep the
+/// counts equal while sliding values under the wrong names, so the values are
+/// checked by NAME, not just counted.
+#[tokio::test]
+async fn extended_query_returning_star_matches_the_announced_row_description() {
+    let server = TestServer::start().await;
+    seed_docs(&server).await;
+
+    // The stored row's own columns, as the row-derived shaping reports them.
+    let stored = server
+        .query_named_rows("SELECT * FROM items WHERE id = 'b'")
+        .await
+        .expect("read back the stored row");
+    assert_eq!(stored.len(), 1, "one seeded row with id='b'");
+    let stored = &stored[0];
+
+    let stmt = server
+        .client
+        .prepare_typed(
+            "UPDATE items SET score = $1 WHERE id = $2 RETURNING *",
+            &[Type::UNKNOWN, Type::UNKNOWN],
+        )
+        .await
+        .expect("prepare should succeed");
+
+    // --- Announced side: the RowDescription Describe returned at Parse time.
+    let announced: Vec<String> = stmt
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+    let mut announced_sorted = announced.clone();
+    announced_sorted.sort();
+    let mut stored_names: Vec<String> = stored.keys().cloned().collect();
+    stored_names.sort();
+    assert_eq!(
+        announced_sorted, stored_names,
+        "RETURNING * must announce the stored row's own columns, got {announced:?}"
+    );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&"77", &"b"])
+        .await
+        .expect("prepared UPDATE RETURNING should succeed");
+    assert_eq!(rows.len(), 1, "expected one row");
+    let row = &rows[0];
+
+    // --- DataRow side: one field per announced column, no padding, no
+    // truncation.
+    assert_eq!(
+        row.len(),
+        announced.len(),
+        "DataRow field count must equal the announced column count"
+    );
+
+    // --- And each field carries THAT column's value, read in the type the
+    // RowDescription announced for it.
+    for (i, column) in row.columns().iter().enumerate() {
+        let ty = column.type_();
+        let value = if *ty == Type::INT8 {
+            row.get::<_, i64>(i).to_string()
+        } else if *ty == Type::FLOAT8 {
+            row.get::<_, f64>(i).to_string()
+        } else {
+            row.get::<_, String>(i)
+        };
+        let expected = match column.name() {
+            "id" => "b",
+            "name" => "beta",
+            // The value this statement just wrote.
+            "score" => "77",
+            other => panic!("unexpected RETURNING * column {other}"),
+        };
+        assert_eq!(
+            value,
+            expected,
+            "column {} must carry its own value",
+            column.name()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UTF-8 statement boundaries
 // ---------------------------------------------------------------------------

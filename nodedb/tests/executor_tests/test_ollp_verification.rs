@@ -138,6 +138,7 @@ fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 
@@ -151,6 +152,7 @@ fn bulk_delete_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 
@@ -168,6 +170,7 @@ fn bulk_delete_plan_with_edges(
         ollp_predicted_edges: edges,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        resolved_sum_targets: Vec::new(),
     })
 }
 

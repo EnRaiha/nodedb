@@ -101,6 +101,24 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
     // `UPDATE ... FROM` expanders do.
     let vshard_id = VShardId::from_collection_in_database(task.database_id, target_collection);
 
+    // Resolve the materialized-sum targets these copied rows credit. The point
+    // ops this expansion emits are staged directly and never pass through the
+    // statement-level resolution pass, so without this an in-transaction
+    // `INSERT ... SELECT` into a bound collection would fold against an empty
+    // resolution. Every op carries the whole resolution — a row is folded
+    // against the entry its own join value selects.
+    let sum_bodies: Vec<&[u8]> = rows.iter().map(|(_, value, _)| value.as_slice()).collect();
+    let resolved_sum_targets =
+        crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
+            state,
+            &sum_bodies,
+            target_collection,
+            tenant_id,
+            task.database_id,
+            crate::types::TraceId::ZERO,
+        )
+        .await?;
+
     let mut out: Vec<PhysicalTask> = Vec::with_capacity(rows.len());
     for (document_id, value, surrogate) in rows {
         out.push(PhysicalTask {
@@ -117,7 +135,8 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
                 // orchestrator's paged batch insert.
                 returning: None,
                 rls_filters: Vec::new(),
-                resolved_sum_targets: Vec::new(),
+                resolved_sum_targets: resolved_sum_targets.clone(),
+                deferred_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,

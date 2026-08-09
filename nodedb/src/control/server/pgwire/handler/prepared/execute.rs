@@ -118,9 +118,12 @@ impl NodeDbPgHandler {
         // SELECT-read producer shapes and projects the response in one pass.
         // When no result columns were declared, no projection is applied.
         //
-        // DML RETURNING rows are shaped as multi-column `RowsPayload` by the
-        // `ReturningRows` producer (which ignores projection), so they stay
-        // correct without any guard.
+        // DML RETURNING rows are shaped from a `RowsPayload` whose own column
+        // list comes from the STORED row, which for `RETURNING *` on a
+        // schemaless collection need not match the columns Describe already
+        // announced. The same projection therefore governs them: the shaper
+        // holds those rows to exactly the announced columns, so the DataRow
+        // field count equals the RowDescription column count by construction.
         // Resolve the client's requested per-column result formats (from the
         // Bind message), downgrading any column whose binary encoding is
         // feature-blocked back to text. Parallel to `stmt.result_fields`.

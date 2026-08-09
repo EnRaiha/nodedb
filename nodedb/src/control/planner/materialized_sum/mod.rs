@@ -15,10 +15,16 @@
 //! Control-Plane RPC I/O only — no storage I/O, no io_uring, no Data-Plane
 //! access from this module.
 
+pub mod cross_shard;
 pub mod extract;
 pub mod index;
+pub mod predicate;
+pub mod recon;
 pub mod resolve;
 
+pub use cross_shard::append_cross_shard_balance_tasks;
 pub use extract::join_value_from_body;
 pub use index::MaterializedSumIndex;
-pub use resolve::resolve_materialized_sum_targets;
+pub use resolve::{
+    resolve_materialized_sum_targets, resolve_sum_targets_for_bodies, source_drives_bindings,
+};

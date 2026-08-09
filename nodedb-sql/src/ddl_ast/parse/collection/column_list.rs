@@ -43,6 +43,18 @@ pub(super) fn extract_column_pairs(body: &str) -> Result<Vec<(String, String)>, 
         None => return Ok(Vec::new()),
     };
 
+    // A column list follows the collection NAME — directly, or after one of the
+    // keywords that introduce it. Any other text between the name and the paren
+    // means the paren belongs to THAT clause instead: `WITH (...)` carries
+    // options and `BALANCED ON (...)` carries a constraint definition. Reading
+    // either as a column list invents a schema the statement never declared —
+    // `CREATE COLLECTION ledger WITH BALANCED ON (group_key = journal_id, ...)`
+    // produced columns literally named `group_key` and `debit`, and then
+    // refused its own constraint because `journal_id` was "not declared".
+    if !introduces_column_list(&body[..paren_start]) {
+        return Ok(Vec::new());
+    }
+
     let paren_end = match find_column_list_paren_end(body) {
         Some(p) => p,
         None => return Ok(Vec::new()),
@@ -59,6 +71,37 @@ pub(super) fn extract_column_pairs(body: &str) -> Result<Vec<(String, String)>, 
     }
 
     split_column_pairs(inner)
+}
+
+/// Keywords that introduce a clause carrying its OWN parenthesised argument.
+///
+/// `WITH (...)` carries options and `BALANCED ON (...)` carries a constraint
+/// definition, so a paren that follows either belongs to that clause.
+const PAREN_OWNING_CLAUSE_KEYWORDS: [&str; 5] = ["WITH", "BALANCED", "ON", "PARTITION", "USING"];
+
+/// Does the text between the collection name and a paren introduce that paren
+/// as the COLUMN LIST?
+///
+/// The column list, when present, comes FIRST — before any clause. So the
+/// paren is the column list unless a clause that owns its own parentheses was
+/// opened before it: reading `CREATE COLLECTION ledger WITH BALANCED ON
+/// (group_key = journal_id, ...)` as a column list invented columns literally
+/// named `group_key` and `debit`, and the constraint then refused itself
+/// because `journal_id` was "not declared".
+///
+/// Everything else between the name and the paren describes the collection
+/// the list belongs to and must not suppress it: the list follows the name
+/// directly (`CREATE TABLE t (id INT)`), a spelling that names it explicitly
+/// (`COLUMNS`/`FIELDS`/`STRICT`), or a type declaration
+/// (`TYPE DOCUMENT (...)`, `TYPE DOCUMENT STRICT (...)`). Suppressing those
+/// dropped every declared column from the catalog, leaving collections whose
+/// schema the server no longer knew.
+fn introduces_column_list(prefix: &str) -> bool {
+    !prefix.split_whitespace().any(|token| {
+        PAREN_OWNING_CLAUSE_KEYWORDS
+            .iter()
+            .any(|keyword| token.eq_ignore_ascii_case(keyword))
+    })
 }
 
 /// Heuristic: does the first token in the paren body look like a WITH-clause
@@ -330,6 +373,77 @@ mod tests {
                 .expect("WITH options")
                 .is_empty()
         );
+    }
+
+    /// `BALANCED ON (...)` owns its parentheses. Reading them as a column list
+    /// declared columns called `group_key` / `debit` / `credit` on a collection
+    /// whose statement declared none, and the constraint then refused itself
+    /// because the column it names was "not declared".
+    #[test]
+    fn balanced_clause_is_not_a_column_list() {
+        let columns = extract_column_pairs(
+            "WITH BALANCED ON (group_key = journal_id, debit = 'DEBIT', \
+             credit = 'CREDIT', amount = amount)",
+        )
+        .expect("BALANCED clause");
+        assert!(
+            columns.is_empty(),
+            "the BALANCED clause must not be read as columns, got {columns:?}"
+        );
+    }
+
+    /// A WITH clause whose first key is not one of the known option keywords is
+    /// still a WITH clause: the keyword before the paren says so.
+    #[test]
+    fn with_clause_with_unknown_key_is_not_a_column_list() {
+        assert!(
+            extract_column_pairs("WITH (ttl = 60)")
+                .expect("WITH options")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn column_list_following_the_name_is_parsed() {
+        let columns = extract_column_pairs("(id TEXT, amount NUMERIC) WITH BALANCED ON (a = b)")
+            .expect("column list");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].0, "id");
+        assert_eq!(columns[1].0, "amount");
+    }
+
+    /// A `TYPE ...` declaration describes the collection the column list
+    /// belongs to; it does not own the parentheses. Treating it as a clause
+    /// that does dropped every declared column, so the catalog reported a
+    /// collection with nothing but its primary key — and a `RETURNING *`
+    /// prepared statement then announced one column and returned three.
+    #[test]
+    fn type_declaration_before_the_column_list_is_parsed() {
+        for body in [
+            "TYPE DOCUMENT (id STRING, name STRING, score INT)",
+            "TYPE document (id STRING, name STRING, score INT)",
+            "TYPE DOCUMENT STRICT (id STRING, name STRING, score INT)",
+        ] {
+            let columns = extract_column_pairs(body).expect("column list");
+            assert_eq!(
+                columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                ["id", "name", "score"],
+                "body {body} must declare its three columns"
+            );
+        }
+    }
+
+    /// The spellings that name the list explicitly still reach it.
+    #[test]
+    fn keyword_introduced_column_lists_are_parsed() {
+        for body in [
+            "COLUMNS (id TEXT, v FLOAT) WITH (engine='columnar')",
+            "FIELDS (id TEXT, v FLOAT)",
+            "STRICT (id TEXT, v FLOAT)",
+        ] {
+            let columns = extract_column_pairs(body).expect("column list");
+            assert_eq!(columns.len(), 2, "body {body} should declare two columns");
+        }
     }
 
     #[test]

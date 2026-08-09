@@ -33,6 +33,18 @@
 //! DELETE removes it. Re-applying either converges — no checkpoint gate needed.
 //! Applied through the same shared core write path the transaction batch uses
 //! (`apply_point_put` / `apply_point_delete`), never a reimplementation.
+//!
+//! ## Write-path enforcement is deliberately NOT run on redo
+//!
+//! Replay calls `apply_point_put` / `apply_point_delete` directly, one level
+//! BELOW the enforcement funnel, so no materialized-sum delta is folded here —
+//! and that is the correct behaviour, not an omission. A delta is a RELATIVE
+//! change to a target row's stored total, so re-applying one over a target row
+//! that is already durable double-counts it. Document rows are
+//! redb-synchronous-durable: by the time this replay runs, the target balance
+//! the original write produced is already on disk, and the derived target write
+//! carries its own redo record naming the target collection. Folding again on
+//! replay would add the same amount a second time.
 
 use nodedb_types::Surrogate;
 use nodedb_types::sync::wire::SyncProvenance;

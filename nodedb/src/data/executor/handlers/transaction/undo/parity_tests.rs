@@ -411,6 +411,7 @@ fn tx_delete_commit_matches_autocommit_across_all_indexes() {
             document_id: PK,
             surrogate: Surrogate::new(1),
             user_roles: &[],
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )
@@ -463,6 +464,7 @@ fn tx_delete_rollback_restores_pre_tx_state_across_all_indexes() {
             document_id: PK,
             surrogate: Surrogate::new(1),
             user_roles: &[],
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )
@@ -545,6 +547,7 @@ fn tx_delete_rollback_preserves_pre_existing_node_tombstone() {
             document_id: PK,
             surrogate: Surrogate::new(1),
             user_roles: &[],
+            resolved_sum_targets: &[],
         },
         &mut undo_log,
     )

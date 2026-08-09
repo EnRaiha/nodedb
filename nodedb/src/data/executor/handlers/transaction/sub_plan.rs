@@ -205,6 +205,7 @@ impl CoreLoop {
                 collection,
                 document_id,
                 surrogate,
+                resolved_sum_targets,
                 ..
             } => self.tx_point_delete(
                 TxPointDelete {
@@ -214,6 +215,7 @@ impl CoreLoop {
                     document_id,
                     surrogate: *surrogate,
                     user_roles,
+                    resolved_sum_targets,
                 },
                 undo_log,
             ),

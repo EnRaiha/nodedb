@@ -71,7 +71,29 @@ impl CoreLoop {
                 .get(&txn_id)
                 .and_then(|overlay| overlay.resolved_system_from());
         }
+        // Open the transaction's BALANCED accumulator for the duration of the
+        // sub-plans. Every write handler they reach — including the ones
+        // reached by passing an ordinary statement plan back through
+        // `execute` — settles its entries onto this instead of checking them on
+        // its own, so one leg of a journal per statement is allowed inside an
+        // explicit transaction and only the whole batch has to balance.
+        //
+        // A batch reached from inside another batch (a `MetaOp::TransactionBatch`
+        // sub-plan passes back through `execute`) does NOT open its own: the
+        // outer boundary is the one that commits, so the inner batch's entries
+        // belong to it and are left in place for it to judge.
+        let owns_scope = self.balanced_txn_entries.is_none();
+        if owns_scope {
+            self.balanced_txn_entries = Some(Vec::new());
+        }
         let sub = self.run_sub_plans(task, tid, plans, undo_log, crdt_deltas);
+        // Taken on EVERY exit path, so a failed batch can never leave its
+        // entries behind for the next transaction on this core to be judged by.
+        let balanced_entries = if owns_scope {
+            self.balanced_txn_entries.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.active_bitemporal_stamps.clear();
         self.active_graph_system_from = None;
         let (last_response, undo_log, crdt_deltas) = match sub {
@@ -80,7 +102,11 @@ impl CoreLoop {
         };
 
         let constraint_check = catch_unwind(AssertUnwindSafe(|| {
-            self.check_balanced_constraints(task.request.database_id.as_u64(), tid, &undo_log)
+            self.check_balanced_constraints(
+                task.request.database_id.as_u64(),
+                tid,
+                balanced_entries,
+            )
         }));
         match constraint_check {
             Ok(Ok(())) => {}

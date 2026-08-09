@@ -131,44 +131,26 @@ fn contribution(
 }
 
 /// The source row's join-key value, or `None` when the row does not carry one.
+///
+/// Delegates to the plane-neutral rule so the Control-Plane fold — which
+/// settles a cross-shard target's delta at plan time — cannot disagree with
+/// this one about which rows participate.
 fn join_value_of(binding: &MaterializedSumBinding, doc: &serde_json::Value) -> Option<String> {
-    doc.get(&binding.join_column)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    crate::query::binding_join_value(binding, doc)
 }
 
 /// Evaluate the binding's value expression against one row image.
 ///
-/// A materialized-sum binding fires on the write path, so a division or modulus
-/// by zero fails the write rather than silently skipping the balance update. An
-/// expression that evaluates to NULL or to something non-numeric contributes
-/// zero — the row is in the binding but has nothing to add.
+/// Plane-neutral, for the same reason [`join_value_of`] is: an amount computed
+/// differently on the two planes is a stored total that disagrees with the
+/// `SUM(...)` over the source rows.
 fn amount_of(binding: &MaterializedSumBinding, doc: &serde_json::Value) -> crate::Result<Decimal> {
-    let row = nodedb_types::Value::from(doc.clone());
-    let evaluated = binding
-        .value_expr
-        .eval(&row)
-        .map_err(|_e| crate::Error::DivisionByZero)?;
-    Ok(json_to_decimal(&serde_json::Value::from(evaluated)).unwrap_or(Decimal::ZERO))
+    crate::query::binding_amount(binding, doc)
 }
 
 /// Convert a JSON value to `rust_decimal::Decimal`.
-///
-/// Strings parse exactly, which is how a balance survives more than 15
-/// significant digits: the write-back stores the total as a string for the same
-/// reason.
 pub(in crate::data::executor) fn json_to_decimal(v: &serde_json::Value) -> Option<Decimal> {
-    match v {
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(Decimal::from(i))
-            } else {
-                n.as_f64().and_then(|f| Decimal::try_from(f).ok())
-            }
-        }
-        serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
-        _ => None,
-    }
+    crate::query::json_to_decimal(v)
 }
 
 #[cfg(test)]

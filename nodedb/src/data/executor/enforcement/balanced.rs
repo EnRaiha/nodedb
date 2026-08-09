@@ -1,33 +1,76 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! BALANCED constraint: at commit time, for each distinct group_key value,
-//! `SUM(amount WHERE entry_type = debit_value)` must equal
+//! BALANCED constraint: at the end of a write boundary, for each distinct
+//! group_key value, `SUM(amount WHERE entry_type = debit_value)` must equal
 //! `SUM(amount WHERE entry_type = credit_value)`.
 //!
-//! Only checked within a single transaction boundary (cross-transaction
-//! balance is application concern).
+//! The boundary is a single transaction (cross-transaction balance is an
+//! application concern), and an autocommit statement IS a transaction — so a
+//! statement that writes one leg of a journal on its own is unbalanced by the
+//! definition and is refused.
+//!
+//! Every mutation a boundary performs contributes, with the sign of its effect
+//! on the stored set: an INSERT adds its post-image, a DELETE subtracts its
+//! pre-image, and an UPDATE does both. A boundary that only ever added would
+//! let a transaction remove one leg of a balanced journal and still pass, which
+//! is the same "unbalanced ledger" state the constraint exists to refuse.
 
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
-use crate::bridge::envelope::ErrorCode;
+use crate::data::executor::enforcement::images::RowImages;
 use nodedb_physical::physical_plan::BalancedDef;
 
-/// A single insert tracked for balance validation.
-pub struct InsertEntry {
+/// One row image's signed contribution to a boundary's balance.
+pub struct BalancedEntry {
     /// Value of the group_key column (e.g. journal_id).
     pub group_key: String,
     /// Value of the entry_type column (e.g. "DEBIT" or "CREDIT").
     pub entry_type: String,
-    /// Monetary amount.
+    /// Monetary amount, NEGATIVE for a pre-image the boundary removed.
     pub amount: Decimal,
+}
+
+impl BalancedEntry {
+    /// The same entry as the removal of the row it describes.
+    fn negated(self) -> Self {
+        Self {
+            group_key: self.group_key,
+            entry_type: self.entry_type,
+            amount: -self.amount,
+        }
+    }
+}
+
+/// The signed entries one write contributes to its boundary's balance.
+///
+/// The mutation shape decides the signs, which is why this takes [`RowImages`]
+/// rather than a document plus a flag: a caller cannot describe a delete as an
+/// insert, and an update always carries both legs — the old contribution out,
+/// the new one in.
+pub(in crate::data::executor) fn entries_for(
+    def: &BalancedDef,
+    images: &RowImages<'_>,
+) -> Vec<BalancedEntry> {
+    match images {
+        RowImages::Insert { new_doc } => extract_entry(def, new_doc).into_iter().collect(),
+        RowImages::Delete { old_doc } => extract_entry(def, old_doc)
+            .map(BalancedEntry::negated)
+            .into_iter()
+            .collect(),
+        RowImages::Update { old_doc, new_doc } => extract_entry(def, old_doc)
+            .map(BalancedEntry::negated)
+            .into_iter()
+            .chain(extract_entry(def, new_doc))
+            .collect(),
+    }
 }
 
 /// Extract a balanced entry from a JSON document using the constraint definition.
 ///
-/// Returns `None` if any required field is missing (the insert is not part of
+/// Returns `None` if any required field is missing (the row is not part of
 /// the balanced group and is ignored by the constraint).
-pub fn extract_entry(def: &BalancedDef, doc: &serde_json::Value) -> Option<InsertEntry> {
+pub fn extract_entry(def: &BalancedDef, doc: &serde_json::Value) -> Option<BalancedEntry> {
     let obj = doc.as_object()?;
 
     let group_key = obj.get(&def.group_key_column)?.as_str().map(String::from)?;
@@ -39,14 +82,14 @@ pub fn extract_entry(def: &BalancedDef, doc: &serde_json::Value) -> Option<Inser
 
     let amount = extract_decimal(obj.get(&def.amount_column)?)?;
 
-    Some(InsertEntry {
+    Some(BalancedEntry {
         group_key,
         entry_type,
         amount,
     })
 }
 
-/// Validate the balanced constraint across all inserts in a transaction.
+/// Validate the balanced constraint across every entry a boundary produced.
 ///
 /// Groups entries by `group_key`, then for each group checks that
 /// `SUM(debit amounts) == SUM(credit amounts)`. Returns the first
@@ -54,8 +97,8 @@ pub fn extract_entry(def: &BalancedDef, doc: &serde_json::Value) -> Option<Inser
 pub fn check_balanced(
     collection: &str,
     def: &BalancedDef,
-    entries: &[InsertEntry],
-) -> Result<(), ErrorCode> {
+    entries: &[BalancedEntry],
+) -> crate::Result<()> {
     // Group by group_key → (debit_sum, credit_sum).
     let mut groups: HashMap<&str, (Decimal, Decimal)> = HashMap::new();
 
@@ -71,7 +114,7 @@ pub fn check_balanced(
 
     for (group_key, (debit_sum, credit_sum)) in &groups {
         if debit_sum != credit_sum {
-            return Err(ErrorCode::BalanceViolation {
+            return Err(crate::Error::BalanceViolation {
                 collection: collection.to_string(),
                 detail: format!(
                     "group '{}': debits {} != credits {}",
@@ -122,12 +165,12 @@ mod tests {
     #[test]
     fn balanced_passes() {
         let entries = vec![
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "DEBIT".into(),
                 amount: d("100.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("100.00"),
@@ -139,12 +182,12 @@ mod tests {
     #[test]
     fn unbalanced_fails() {
         let entries = vec![
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "DEBIT".into(),
                 amount: d("100.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("99.99"),
@@ -158,23 +201,23 @@ mod tests {
     fn multiple_groups_independent() {
         let entries = vec![
             // Group j-001: balanced
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "DEBIT".into(),
                 amount: d("50.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("50.00"),
             },
             // Group j-002: unbalanced
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-002".into(),
                 entry_type: "DEBIT".into(),
                 amount: d("200.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-002".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("150.00"),
@@ -186,17 +229,17 @@ mod tests {
     #[test]
     fn multi_line_journal() {
         let entries = vec![
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "DEBIT".into(),
                 amount: d("1000.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("800.00"),
             },
-            InsertEntry {
+            BalancedEntry {
                 group_key: "j-001".into(),
                 entry_type: "CREDIT".into(),
                 amount: d("200.00"),
@@ -240,5 +283,99 @@ mod tests {
     fn extract_entry_missing_field() {
         let doc = serde_json::json!({"journal_id": "j-001"});
         assert!(extract_entry(&test_def(), &doc).is_none());
+    }
+
+    fn leg(entry_type: &str, amount: &str) -> serde_json::Value {
+        serde_json::json!({
+            "journal_id": "j-001",
+            "entry_type": entry_type,
+            "amount": amount,
+        })
+    }
+
+    #[test]
+    fn insert_contributes_positive() {
+        let doc = leg("DEBIT", "100.00");
+        let entries = entries_for(&test_def(), &RowImages::Insert { new_doc: &doc });
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].amount, d("100.00"));
+    }
+
+    #[test]
+    fn delete_contributes_negative() {
+        let doc = leg("DEBIT", "100.00");
+        let entries = entries_for(&test_def(), &RowImages::Delete { old_doc: &doc });
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].amount, d("-100.00"));
+    }
+
+    #[test]
+    fn update_contributes_both_legs() {
+        let old_doc = leg("DEBIT", "100.00");
+        let new_doc = leg("DEBIT", "140.00");
+        let entries = entries_for(
+            &test_def(),
+            &RowImages::Update {
+                old_doc: &old_doc,
+                new_doc: &new_doc,
+            },
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].amount, d("-100.00"));
+        assert_eq!(entries[1].amount, d("140.00"));
+    }
+
+    /// Deleting one leg of a balanced journal leaves the other behind, so the
+    /// boundary's net effect is unbalanced and must be refused. Before the
+    /// signed entries this was the hole: a delete contributed nothing at all.
+    #[test]
+    fn deleting_one_leg_is_refused() {
+        let debit = leg("DEBIT", "100.00");
+        let entries = entries_for(&test_def(), &RowImages::Delete { old_doc: &debit });
+        assert!(check_balanced("ledger", &test_def(), &entries).is_err());
+    }
+
+    /// Deleting a whole journal nets to zero and is allowed.
+    #[test]
+    fn deleting_both_legs_is_allowed() {
+        let debit = leg("DEBIT", "100.00");
+        let credit = leg("CREDIT", "100.00");
+        let def = test_def();
+        let mut entries = entries_for(&def, &RowImages::Delete { old_doc: &debit });
+        entries.extend(entries_for(&def, &RowImages::Delete { old_doc: &credit }));
+        assert!(check_balanced("ledger", &def, &entries).is_ok());
+    }
+
+    /// An UPDATE that moves one leg's amount unbalances the group, even though
+    /// the row count did not change.
+    #[test]
+    fn update_that_unbalances_is_refused() {
+        let old_doc = leg("DEBIT", "100.00");
+        let new_doc = leg("DEBIT", "140.00");
+        let def = test_def();
+        let entries = entries_for(
+            &def,
+            &RowImages::Update {
+                old_doc: &old_doc,
+                new_doc: &new_doc,
+            },
+        );
+        assert!(check_balanced("ledger", &def, &entries).is_err());
+    }
+
+    /// An UPDATE that leaves the balanced columns alone nets to zero.
+    #[test]
+    fn update_that_preserves_amount_is_allowed() {
+        let old_doc = leg("DEBIT", "100.00");
+        let new_doc = leg("DEBIT", "100.00");
+        let def = test_def();
+        let entries = entries_for(
+            &def,
+            &RowImages::Update {
+                old_doc: &old_doc,
+                new_doc: &new_doc,
+            },
+        );
+        assert!(check_balanced("ledger", &def, &entries).is_ok());
     }
 }

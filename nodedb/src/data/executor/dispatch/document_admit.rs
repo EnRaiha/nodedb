@@ -33,6 +33,7 @@ pub(super) fn is_document_write(op: &DocumentOp) -> bool {
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::Merge { .. }
+            | DocumentOp::ApplyBalanceDelta { .. }
     )
 }
 

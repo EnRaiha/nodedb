@@ -4,15 +4,12 @@
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
-use crate::data::executor::enforcement::funnel::{self, WriteEnforcementOutcome};
-use crate::data::executor::enforcement::hash_chain;
-use crate::data::executor::enforcement::images::{EnforcementCtx, RowImages};
-use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
+use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
+use crate::data::executor::enforcement::funnel::WriteEnforcementOutcome;
+use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::{DatabaseId, TenantId};
 
 /// Parameters for [`CoreLoop::tx_point_put`].
 pub(in crate::data::executor::handlers::transaction) struct TxPointPut<'a> {
@@ -36,73 +33,7 @@ pub(in crate::data::executor::handlers::transaction) struct TxPointPut<'a> {
     pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
 }
 
-/// What an abort after `apply_point_put` has to reverse in memory.
-struct PostApplyAbort<'a> {
-    /// Whether this op advanced the hash-chain head.
-    mutated_chain: bool,
-    /// Key the chain head is tracked under.
-    chain_key: &'a (DatabaseId, TenantId, String),
-    /// Captured chain-head pre-image, per [`CoreLoop::restore_chain_head`].
-    chain_prior: &'a Option<Option<String>>,
-    database_id: u64,
-    tid: u64,
-    collection: &'a str,
-    /// Storage key of the row the aborted put wrote.
-    row_key: &'a str,
-}
-
 impl CoreLoop {
-    /// Restore a hash-chain head pre-image after an aborted insert.
-    ///
-    /// `mutated` is whether this op actually advanced the chain head (only true
-    /// on an insert into a hash-chain collection). `prior` is the captured
-    /// pre-image: `None` = not a hash-chain collection; `Some(None)` = no prior
-    /// head (genesis); `Some(Some(prev))` = restore this head.
-    ///
-    /// In-memory only, and correctly so: every caller aborts before the write
-    /// transaction commits, so the persisted head was never written. Reversing
-    /// a head that already reached disk is the rollback path's job
-    /// (`undo_chain_hash`).
-    fn restore_chain_head(
-        &mut self,
-        mutated: bool,
-        config_key: &(DatabaseId, TenantId, String),
-        prior: &Option<Option<String>>,
-    ) {
-        if !mutated {
-            return;
-        }
-        match prior {
-            Some(None) => {
-                self.chain_hashes.remove(config_key);
-            }
-            Some(Some(prev)) => {
-                self.chain_hashes.insert(config_key.clone(), prev.clone());
-            }
-            None => {}
-        }
-    }
-
-    /// Undo the in-memory side-effects an abort AFTER `apply_point_put` leaves
-    /// behind, before the caller drops its transaction uncommitted.
-    ///
-    /// `apply_point_put` populates the read-through document cache with the body
-    /// it wrote. Dropping the redb transaction reverses the durable write but not
-    /// that cache entry, so every subsequent read of the row would be served the
-    /// post-image of a write that never landed — a row visible to readers and
-    /// absent from storage. Restoring the hash-chain head is the same class of
-    /// in-memory reversal, so both happen here rather than one being remembered
-    /// at each abort site and the other forgotten.
-    fn abort_after_apply(&mut self, abort: PostApplyAbort<'_>) {
-        self.restore_chain_head(abort.mutated_chain, abort.chain_key, abort.chain_prior);
-        self.doc_cache.invalidate(
-            abort.database_id,
-            abort.tid,
-            abort.collection,
-            abort.row_key,
-        );
-    }
-
     /// Execute a PointPut within a transaction.
     pub(in crate::data::executor::handlers::transaction) fn tx_point_put(
         &mut self,
@@ -130,54 +61,39 @@ impl CoreLoop {
         // an insert, which is how a running total came to double-count one.
         // The authoritative prior value for the undo entry comes from
         // `apply_point_put`'s outcome, which is bitemporal-aware.
-        let config_key = (
-            dummy_task.request.database_id,
-            TenantId::new(tid),
-            collection.to_string(),
-        );
-        let chain_key = (
-            dummy_task.request.database_id,
-            TenantId::new(tid),
-            collection.to_string(),
-        );
-        let prior_bytes = self
-            .sparse
-            .get(database_id, tid, collection, row_key)
-            .ok()
-            .flatten();
-        let is_insert = prior_bytes.is_none();
-
-        let hash_chain_enabled = self
-            .doc_configs
-            .get(&config_key)
-            .is_some_and(|c| c.enforcement.hash_chain);
-
-        // Capture the hash-chain head pre-image BEFORE `apply_chain_on_insert`
-        // overwrites it, so the undo entry can restore it exactly.
-        // `None` = not a hash-chain collection; `Some(None)` = no prior head
-        // (genesis insert); `Some(Some(prev))` = prior head present.
-        let chain_hash_prior: Option<Option<String>> = if hash_chain_enabled {
-            Some(self.chain_hashes.get(&chain_key).cloned())
+        //
+        // Read only when something needs it: a collection that declares neither
+        // a chain nor an image-folding constraint must not pay for a read whose
+        // result nothing consults.
+        let hook_ctx = HookCtx {
+            database_id,
+            tid,
+            collection,
+            resolved_targets: resolved_sum_targets,
+            deferred_sum_targets: &[],
+            wal_lsn: dummy_task.wal_lsn(),
+        };
+        let mut chain = ChainGuard::begin(self, database_id, tid, collection);
+        let folds_images = write_hook::folds_images(self, &hook_ctx);
+        let prior_bytes = if chain.enabled() || folds_images {
+            self.sparse
+                .get(database_id, tid, collection, row_key)
+                .ok()
+                .flatten()
         } else {
             None
         };
+        let is_insert = prior_bytes.is_none();
 
         // Hash-chain wraps the document with a `_chain_hash` field on insert;
         // feed that wrapped value into `apply_point_put` so it stores/indexes
         // the chained form.
         let chained: Option<Vec<u8>> = if is_insert {
-            hash_chain::apply_chain_on_insert(
-                &mut self.chain_hashes,
-                database_id,
-                tid,
-                collection,
-                document_id,
-                value,
-                hash_chain_enabled,
-            )
-            .map_err(|e| ErrorCode::Internal {
-                detail: format!("hash chain: {e}"),
-            })?
+            chain
+                .chain_insert(self, database_id, tid, document_id, value)
+                .map_err(|e| ErrorCode::Internal {
+                    detail: format!("hash chain: {e}"),
+                })?
         } else {
             None
         };
@@ -207,14 +123,17 @@ impl CoreLoop {
                 self.sparse
                     .exists_in_txn(&txn, database_id, tid, collection, row_key)
             };
-            let exists = exists_result.map_err(|e| {
-                // Restore any chain-head pre-image mutated above before bailing.
-                self.restore_chain_head(chained.is_some(), &chain_key, &chain_hash_prior);
-                ErrorCode::from(e)
-            })?;
+            let exists = match exists_result {
+                Ok(exists) => exists,
+                Err(e) => {
+                    // Restore any chain-head pre-image mutated above before bailing.
+                    chain.restore(self);
+                    return Err(ErrorCode::from(e));
+                }
+            };
             if exists {
                 // No write, no undo push — drop the txn without committing.
-                self.restore_chain_head(chained.is_some(), &chain_key, &chain_hash_prior);
+                chain.restore(self);
                 if if_absent {
                     // `INSERT ... ON CONFLICT DO NOTHING`: silent skip.
                     return Ok(self.response_ok(dummy_task));
@@ -258,45 +177,17 @@ impl CoreLoop {
                 // after we mutated the chain head and, on the later rejections,
                 // after it had already cached the row. Reverse both so the
                 // aborted op leaves no trace, then propagate the typed error.
-                self.abort_after_apply(PostApplyAbort {
-                    mutated_chain: chained.is_some(),
-                    chain_key: &chain_key,
-                    chain_prior: &chain_hash_prior,
-                    database_id,
-                    tid,
-                    collection,
-                    row_key,
-                });
+                chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
                 return Err(e.into());
             }
         };
 
         // Persist the advanced chain head inside the SAME write transaction the
-        // chained row lands in, so head and row commit or roll back as one
-        // atomic unit. A head that can advance without its row (or a row that
-        // lands without its head) is the same broken-chain bug persistence
-        // exists to prevent. Every abort path above returns before this point
+        // chained row lands in. Every abort path above returns before this point
         // and drops `txn` uncommitted, so a rejected insert never leaves a head
         // behind on disk either.
-        let advanced_head = if chained.is_some() {
-            self.chain_hashes.get(&chain_key).cloned()
-        } else {
-            None
-        };
-        if let Some(head) = advanced_head
-            && let Err(e) =
-                self.sparse
-                    .put_chain_head_in_txn(&txn, database_id, tid, collection, &head)
-        {
-            self.abort_after_apply(PostApplyAbort {
-                mutated_chain: true,
-                chain_key: &chain_key,
-                chain_prior: &chain_hash_prior,
-                database_id,
-                tid,
-                collection,
-                row_key,
-            });
+        if let Err(e) = chain.persist_head(self, &txn) {
+            chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
             return Err(ErrorCode::from(e));
         }
 
@@ -307,97 +198,40 @@ impl CoreLoop {
         // and `txn` is dropped uncommitted, leaving neither the row nor any
         // target it credited behind.
         //
-        // Folding a write's images means DECODING its stored pre-image, and a
-        // stored body is only guaranteed to be a readable document for a
-        // collection that declares what its columns mean. An opaque body — one
-        // written to a collection that registered no schema — is not one, and
-        // reading it is a hard error by design. So the pre-image is decoded ONLY
-        // when the collection declares enforcement that folds it. Deciding
-        // otherwise fails every write to a constraint-free collection carrying
-        // such a body, and fails it BEFORE the undo entry below is pushed, which
-        // leaves a batch rollback with nothing to reverse for that row.
-        let folds_images = self
-            .doc_configs
-            .get(&config_key)
-            .is_some_and(|config| config.enforcement.has_image_enforcement());
-        let enforcement = if folds_images {
-            let source_format = self.sparse_body_format(
-                dummy_task.request.database_id,
-                TenantId::new(tid),
-                collection,
-            );
-            // Here — where the collection HAS declared constraints over its
-            // columns — a stored row that will not decode is corruption, not "no
-            // pre-image": treating it as an INSERT would credit a target with the
-            // row's whole new value on top of the contribution it already holds.
-            let old_doc = match prior_bytes {
-                Some(ref bytes) => {
-                    match decode_scanned_document(bytes, source_format.as_format_ref()) {
-                        Ok(doc) => Some(doc),
-                        Err(e) => {
-                            self.abort_after_apply(PostApplyAbort {
-                                mutated_chain: chained.is_some(),
-                                chain_key: &chain_key,
-                                chain_prior: &chain_hash_prior,
-                                database_id,
-                                tid,
-                                collection,
-                                row_key,
-                            });
-                            return Err(ErrorCode::from(e));
-                        }
-                    }
-                }
-                None => None,
-            };
-            // The SUBMITTED body, not the chained one: `_chain_hash` is a wrapper
-            // the hash chain adds around the row, and no constraint is declared
-            // over it. An incoming body with no readable fields carries no column
-            // any binding or BALANCED definition can read, so it folds to nothing.
-            let new_doc = doc_format::decode_document(value).ok();
-            let images = match (old_doc.as_ref(), new_doc.as_ref()) {
-                (None, Some(new_doc)) => Some(RowImages::Insert { new_doc }),
-                (Some(old_doc), Some(new_doc)) => Some(RowImages::Update { old_doc, new_doc }),
-                (Some(_), None) | (None, None) => None,
-            };
-            match images {
-                Some(images) => {
-                    let ctx = EnforcementCtx {
-                        database_id,
-                        tid,
-                        collection,
-                        resolved_targets: resolved_sum_targets,
-                        wal_lsn: dummy_task.wal_lsn(),
-                    };
-                    match funnel::run_write_enforcement(self, &txn, ctx, images) {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            self.abort_after_apply(PostApplyAbort {
-                                mutated_chain: chained.is_some(),
-                                chain_key: &chain_key,
-                                chain_prior: &chain_hash_prior,
-                                database_id,
-                                tid,
-                                collection,
-                                row_key,
-                            });
-                            return Err(ErrorCode::from(e));
-                        }
-                    }
-                }
-                None => WriteEnforcementOutcome::default(),
+        // The post-image is the SUBMITTED body, not the chained one:
+        // `_chain_hash` is a wrapper the hash chain adds around the row, and no
+        // constraint is declared over it.
+        let images = match prior_bytes {
+            Some(ref old) => WriteImages::Update {
+                old: ImageBody::Stored(old),
+                new: ImageBody::Submitted(value),
+            },
+            None => WriteImages::Insert {
+                new: ImageBody::Submitted(value),
+            },
+        };
+        let enforcement = match write_hook::run(self, &txn, &hook_ctx, images) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+                return Err(ErrorCode::from(e));
             }
-        } else {
-            WriteEnforcementOutcome::default()
         };
         let WriteEnforcementOutcome {
             target_writes,
-            // The BALANCED check spans the whole transaction — debits and
-            // credits arrive on different rows — so its entries belong to the
-            // caller that owns transaction scope, which still recomputes them
-            // from the committed rows.
-            balanced_entries: _balanced_entries,
+            balanced_entries,
         } = enforcement;
+
+        // The BALANCED check spans the whole transaction — debits and credits
+        // arrive on different rows — so this row's signed contributions are
+        // accumulated onto the open batch, which judges them all at its commit
+        // boundary. Nothing is checked here: one leg per statement is legal
+        // inside an explicit transaction.
+        if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, balanced_entries)
+        {
+            chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
+            return Err(ErrorCode::from(e));
+        }
 
         txn.commit().map_err(|e| ErrorCode::Internal {
             detail: format!("commit: {e}"),
@@ -448,7 +282,7 @@ impl CoreLoop {
             // rollback so the index returns to its pre-tx state.
             secondary_index_added: outcome.secondary_index_added,
             secondary_index_removed: outcome.secondary_index_removed,
-            chain_hash_prior,
+            chain_hash_prior: chain.prior(),
         });
 
         // Reverse any HNSW vector inserts on rollback (one `InsertVector` undo

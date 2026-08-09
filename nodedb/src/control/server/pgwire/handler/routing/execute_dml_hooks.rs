@@ -15,12 +15,13 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::session::SessionId;
 use crate::control::trigger::dml_hook::DmlWriteInfo;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::types::error_to_sqlstate;
+use super::super::super::types::{error_to_sqlstate, sqlstate_error};
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::PlanKind;
 
@@ -158,18 +159,41 @@ pub(super) struct PreDispatchProceed {
     pub(super) truncate_restart_collection: Option<String>,
 }
 
+/// Per-statement inputs the pre-dispatch hooks need alongside the task.
+///
+/// Grouped rather than passed positionally: the hooks need the requester, the
+/// session, the plan's response classification and the statement's announced
+/// output columns, and a positional list that long is easy to transpose.
+#[derive(Clone, Copy)]
+pub(super) struct PreDispatchContext<'a> {
+    pub(super) identity: &'a AuthenticatedIdentity,
+    pub(super) auth: &'a AuthContext,
+    pub(super) tenant_id: TenantId,
+    pub(super) session_id: SessionId,
+    pub(super) plan_kind: PlanKind,
+    /// The statement's resolved output columns, when any were announced to the
+    /// client. A hook that answers the statement itself (clone write-path
+    /// interception) shapes its rows against these, exactly as the normal
+    /// dispatch path does — the client holds one RowDescription either way.
+    pub(super) projection: Option<&'a OutputSchema>,
+}
+
 impl NodeDbPgHandler {
     /// Run trigger interception and clone write-path interception for a
     /// single write task, before it reaches normal dispatch.
     pub(super) async fn run_pre_dispatch_hooks(
         &self,
-        identity: &AuthenticatedIdentity,
-        auth: &AuthContext,
-        tenant_id: TenantId,
-        session_id: SessionId,
-        plan_kind: PlanKind,
+        context: PreDispatchContext<'_>,
         mut task: PhysicalTask,
     ) -> PgWireResult<PreDispatchOutcome> {
+        let PreDispatchContext {
+            identity,
+            auth,
+            tenant_id,
+            session_id,
+            plan_kind,
+            projection,
+        } = context;
         // --- Trigger interception for DML writes ---
         let mut dml_info = crate::control::trigger::dml_hook::classify_dml_write(&task.plan);
 
@@ -266,6 +290,7 @@ impl NodeDbPgHandler {
                 nodedb_physical::physical_plan::DocumentOp::Truncate {
                     collection,
                     restart_identity: true,
+                    ..
                 },
             ) = &task.plan
             {
@@ -295,9 +320,11 @@ impl NodeDbPgHandler {
                     match shape_payload_no_plan(
                         resp.payload.as_ref(),
                         plan_kind,
-                        None,
+                        projection,
                         Some(redaction.ctx(&self.state.redaction)),
-                    ) {
+                    )
+                    .map_err(|e| sqlstate_error("XX000", e.message()))?
+                    {
                         ShapeOutcome::Rows(shaped) => {
                             // Clone write-path DML result (PointUpdate/PointDelete):
                             // no client-requested result formats, so text.

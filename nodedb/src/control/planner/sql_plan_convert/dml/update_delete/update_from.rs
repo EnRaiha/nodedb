@@ -107,6 +107,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
             // predicate gating the persist are separate slots.
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            // Filled in by the materialized-sum resolution pass, which
+            // recon-scans the target rows this join matches.
+            resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

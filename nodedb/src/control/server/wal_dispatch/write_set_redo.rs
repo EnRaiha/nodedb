@@ -53,12 +53,25 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// for `Truncate` either, so without this every truncated row's HNSW vector
 /// would resurrect on a WAL-only restart (the original insert `Put` record
 /// replays with no matching `Delete` to cancel it).
+/// `PointPut`, `PointInsert` and `PointDelete` qualify for a different reason:
+/// their OWN row is journalled on the pre-dispatch WAL path, but a collection
+/// with a materialized-sum binding also writes a row in the TARGET collection,
+/// and no record names that write. Those entries carry `Some(target)` and are
+/// appended here. A point write on a collection with no such binding returns an
+/// empty write-set, which appends nothing.
+///
 /// Additional post-apply redo variants (`Merge`) will extend this as their
 /// post-apply redo is built — do not add them until that handler support exists,
 /// or a write would be admitted with its guard held for a redo that is never
 /// appended.
 pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     if let PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::PointInsert { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::PointDelete { collection, .. }) = plan {
         Some(collection.clone())
     } else if let PhysicalPlan::Document(DocumentOp::Upsert { collection, .. }) = plan {
         Some(collection.clone())
@@ -75,6 +88,14 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     }) = plan
     {
         Some(target_collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { collection, .. }) = plan {
+        // The cross-shard balance write journals nothing of its own on the
+        // pre-dispatch WAL path: no record names the target row it moves. Its
+        // one write-set entry carries the row's absolute post-image and names
+        // the target collection, so the redo appended here homes with the row.
+        // Without it a WAL-only restart replays every source row and leaves the
+        // total as it stood BEFORE the statement.
+        Some(collection.clone())
     } else {
         None
     }
@@ -204,6 +225,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -223,6 +245,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -237,6 +260,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
@@ -250,6 +274,7 @@ mod tests {
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }

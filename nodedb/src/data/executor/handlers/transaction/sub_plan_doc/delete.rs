@@ -4,6 +4,8 @@
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::funnel::WriteEnforcementOutcome;
+use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
@@ -16,6 +18,9 @@ pub(in crate::data::executor::handlers::transaction) struct TxPointDelete<'a> {
     pub document_id: &'a str,
     pub surrogate: nodedb_types::Surrogate,
     pub user_roles: &'a [String],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this delete must debit, resolved on the Control Plane at plan time.
+    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
 }
 
 impl CoreLoop {
@@ -32,10 +37,19 @@ impl CoreLoop {
             document_id,
             surrogate,
             user_roles,
+            resolved_sum_targets,
         } = p;
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         let database_id = dummy_task.request.database_id.as_u64();
+        let hook_ctx = HookCtx {
+            database_id,
+            tid,
+            collection,
+            resolved_targets: resolved_sum_targets,
+            deferred_sum_targets: &[],
+            wal_lsn: dummy_task.wal_lsn(),
+        };
 
         // Core delete path shared with the autocommit caller: bitemporal-vs-plain
         // primary tombstone/delete (including versioned index tombstones),
@@ -67,10 +81,70 @@ impl CoreLoop {
             },
         )?;
 
+        // Image-folding enforcement, inside the SAME transaction the removal was
+        // staged in, so a materialized-sum debit and the row's removal land or
+        // roll back together. The pre-image is the only image a delete has, and
+        // it is what a running total has to subtract; a delete that matched
+        // nothing folds nothing.
+        let enforcement = match outcome.prior_value {
+            Some(ref old) => write_hook::run(
+                self,
+                &txn,
+                &hook_ctx,
+                WriteImages::Delete {
+                    old: ImageBody::Stored(old),
+                },
+            )?,
+            None => WriteEnforcementOutcome::default(),
+        };
+        let WriteEnforcementOutcome {
+            target_writes,
+            balanced_entries,
+        } = enforcement;
+
+        // A removal SUBTRACTS the row's amount from its group, so it is
+        // accumulated onto the open batch like any other write: a transaction
+        // that deletes one leg of a balanced journal leaves the group
+        // unbalanced and is refused at the batch's commit boundary.
+        self.settle_balanced_entries(database_id, tid, collection, balanced_entries)?;
+
         txn.commit().map_err(|e| ErrorCode::Internal {
             detail: format!("commit: {e}"),
         })?;
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
+
+        // Reverse every derived materialized-sum target write with the SAME set
+        // of undo entries a source row uses: the target write is a full document
+        // write, so it has index, vector, spatial and stats side-effects of its
+        // own to reverse.
+        for target in target_writes {
+            undo_log.push(UndoEntry::PutDocument {
+                collection: target.collection,
+                document_id: target.document_id,
+                surrogate: target.surrogate,
+                old_value: target.outcome.prior_value,
+                bitemporal_sys_from_ms: target.outcome.bitemporal_sys_from_ms,
+                bitemporal_index_tuples: target.outcome.bitemporal_index_tuples,
+                secondary_index_added: target.outcome.secondary_index_added,
+                secondary_index_removed: target.outcome.secondary_index_removed,
+                chain_hash_prior: None,
+            });
+            for delta in target.outcome.vector_inserts {
+                undo_log.push(UndoEntry::InsertVector {
+                    index_key: delta.index_key,
+                    vector_id: delta.vector_id,
+                    collection: delta.collection,
+                    field: delta.field,
+                    doc_id: delta.doc_id,
+                });
+            }
+            for (key, entry_id) in target.outcome.spatial_inserts {
+                undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
+            }
+            for (key, prior) in target.outcome.stats_prior {
+                undo_log.push(UndoEntry::StatsRestore { key, prior });
+            }
+        }
 
         // Only push an undo entry when a row was actually removed — a delete
         // against a non-existent key has nothing to reverse.

@@ -1,77 +1,51 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! BALANCED constraint check across all new inserts in a transaction.
+//! BALANCED constraint check at a transaction's commit boundary.
+//!
+//! The entries checked here are the signed contributions every write in the
+//! transaction handed to
+//! [`settle_balanced_entries`](crate::data::executor::core_loop::CoreLoop::settle_balanced_entries)
+//! as it ran — an insert's post-image added, a delete's pre-image subtracted,
+//! an update's both. They are NOT re-derived from the undo log, and that is the
+//! point:
+//!
+//! * the undo log records a delete as an entry to be REVERSED, not as an amount
+//!   the transaction removed, so a transaction that deleted one leg of a
+//!   balanced journal contributed nothing and passed;
+//! * `old_value: None` is not "this was an insert" — a `PointPut` onto an
+//!   absent row inside a rolled-back savepoint carries the same shape;
+//! * re-reading each row from the store to recover its body repeats a read for
+//!   bytes the write itself already held and decoded.
 
 use std::collections::HashMap;
 
-use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::enforcement::balanced;
-
-use super::UndoEntry;
+use crate::data::executor::enforcement::balanced::{self, BalancedEntry};
 
 impl CoreLoop {
-    /// Check BALANCED constraints across all new inserts in this transaction.
+    /// Check BALANCED constraints across everything this transaction wrote.
     ///
-    /// For each collection with a BALANCED constraint, collects all new inserts
-    /// (undo entries where `old_value == None`), extracts the balanced fields,
-    /// and validates that debits == credits per group_key.
+    /// `entries` is the transaction's accumulated `(collection, entry)` set,
+    /// grouped here so each collection is judged against its own definition.
     pub(in crate::data::executor::handlers::transaction) fn check_balanced_constraints(
         &self,
         database_id: u64,
         tid: u64,
-        undo_log: &[UndoEntry],
-    ) -> Result<(), ErrorCode> {
-        // Group new inserts by collection: (collection_name → [(doc_id, stored_bytes)]).
-        let mut inserts_by_collection: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        for entry in undo_log {
-            if let UndoEntry::PutDocument {
-                collection,
-                document_id,
-                old_value: None,
-                ..
-            } = entry
-                && let Ok(Some(stored)) = self.sparse.get(database_id, tid, collection, document_id)
-            {
-                inserts_by_collection
-                    .entry(collection.clone())
-                    .or_default()
-                    .push(stored);
-            }
+        entries: Vec<(String, BalancedEntry)>,
+    ) -> crate::Result<()> {
+        let mut by_collection: HashMap<String, Vec<BalancedEntry>> = HashMap::new();
+        for (collection, entry) in entries {
+            by_collection.entry(collection).or_default().push(entry);
         }
 
-        for (collection, stored_docs) in &inserts_by_collection {
-            let config_key = (
-                crate::types::DatabaseId::new(database_id),
-                crate::types::TenantId::new(tid),
-                collection.to_string(),
-            );
-            let Some(config) = self.doc_configs.get(&config_key) else {
+        for (collection, collection_entries) in &by_collection {
+            // A collection with entries but no definition can only happen if
+            // the constraint was dropped mid-transaction; there is then no rule
+            // left to judge those entries against.
+            let Some(def) = self.balanced_def(database_id, tid, collection) else {
                 continue;
             };
-            let Some(ref balanced_def) = config.enforcement.balanced else {
-                continue;
-            };
-
-            let mut entries = Vec::with_capacity(stored_docs.len());
-            for stored_bytes in stored_docs {
-                // These are STORED bodies, so the decoder comes from the
-                // collection's registered storage mode — a strict collection
-                // stores Binary Tuples, which the schemaless decoder cannot
-                // read at all. A row that contributes no entry lets an
-                // unbalanced set of inserts pass the balance check, which is
-                // the one thing this function exists to refuse.
-                let json = self
-                    .decode_stored_document(config, stored_bytes)
-                    .map_err(|e| ErrorCode::Internal {
-                        detail: format!("balanced constraint on '{collection}': {e}"),
-                    })?;
-                if let Some(entry) = balanced::extract_entry(balanced_def, &json) {
-                    entries.push(entry);
-                }
-            }
-
-            balanced::check_balanced(collection, balanced_def, &entries)?;
+            balanced::check_balanced(collection, &def, collection_entries)?;
         }
 
         Ok(())

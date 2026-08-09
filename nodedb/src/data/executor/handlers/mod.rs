@@ -67,6 +67,8 @@ pub mod unregister_materialized_view;
 pub mod update_from_join;
 pub(super) mod update_from_join_collect;
 pub(super) mod update_from_join_source_map;
+pub(super) mod update_from_join_types;
+pub(super) mod update_from_join_write;
 pub mod upsert;
 pub mod vector;
 pub mod vector_index_drop;
@@ -81,3 +83,6 @@ pub mod vector_sparse;
 pub mod vector_upsert;
 pub mod vector_write;
 pub mod write_batch;
+
+#[cfg(test)]
+mod write_hook_tests;

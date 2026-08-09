@@ -104,7 +104,7 @@ pub(in crate::ddl_ast::parse) fn try_parse(
             };
             let operation = match parse_alter_operation(upper, parts, trimmed, &name) {
                 None => return Ok(None),
-                Some(op) => op,
+                Some(op) => op?,
             };
             return Ok(Some(NodedbStatement::Collection(
                 CollectionStmt::AlterCollection { name, operation },

@@ -99,7 +99,12 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         | DocumentOp::Upsert { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
-        | DocumentOp::Truncate { collection, .. } => {
+        | DocumentOp::Truncate { collection, .. }
+        // The balance write is homed on the TARGET collection it names, which
+        // is the whole point of it being a task of its own: the source write it
+        // was derived from homes elsewhere, and the pair is dual-homed by the
+        // two tasks' own vshards rather than by one plan claiming both.
+        | DocumentOp::ApplyBalanceDelta { collection, .. } => {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         DocumentOp::InsertSelect {
@@ -495,6 +500,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: "docs".to_owned(),
             restart_identity: false,
+            resolved_sum_targets: Vec::new(),
         });
         let want = collection_vshard("docs").as_u32();
         assert_eq!(vshards_of(&plan), vec![want]);
@@ -512,6 +518,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: collection.clone(),
             restart_identity: false,
+            resolved_sum_targets: Vec::new(),
         });
         let expected = collection_vshard_in_database(DatabaseId::new(7), &collection);
         match plan_vshard_in_database(&plan, DatabaseId::new(7)) {
@@ -621,6 +628,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }
@@ -651,6 +659,7 @@ mod tests {
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

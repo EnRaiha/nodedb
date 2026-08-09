@@ -400,6 +400,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(is_stageable_write(&bulk_update));
         assert_eq!(staged_tag_kind(&bulk_update, &[]), StagedTagKind::Update);
@@ -412,6 +413,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
         assert!(is_stageable_write(&bulk_delete));
         assert_eq!(staged_tag_kind(&bulk_delete, &[]), StagedTagKind::Delete);

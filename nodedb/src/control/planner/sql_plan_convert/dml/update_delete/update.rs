@@ -218,6 +218,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                // Filled in by the materialized-sum resolution pass, which
+                // recon-scans the rows this predicate matches.
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -300,6 +303,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                // Filled in by the materialized-sum resolution pass, which
+                // recon-scans the rows this predicate matches.
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

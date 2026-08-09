@@ -241,6 +241,10 @@ impl CoreLoop {
                 ollp_predicted_edges: _,
                 rls_filters: _,
                 rls_write_check,
+                // The staged post-images become concrete point ops at COMMIT,
+                // and those carry their own resolution; a staged predicate
+                // write applies no delta of its own here.
+                resolved_sum_targets: _,
             } => self.stage_bulk_update(StageBulkUpdateParams {
                 task,
                 tid,
@@ -263,6 +267,8 @@ impl CoreLoop {
                 ollp_predicted_edges: _,
                 rls_filters: _,
                 rls_write_check,
+                // See the `BulkUpdate` arm: staging carries no delta.
+                resolved_sum_targets: _,
             } => self.stage_bulk_delete(StageBulkDeleteParams {
                 task,
                 tid,
@@ -309,7 +315,8 @@ impl CoreLoop {
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Merge { .. }
-            | DocumentOp::MaterializeScan { .. } => self.stage_not_point_write(task),
+            | DocumentOp::MaterializeScan { .. }
+            | DocumentOp::ApplyBalanceDelta { .. } => self.stage_not_point_write(task),
         }
     }
 

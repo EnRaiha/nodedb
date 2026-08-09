@@ -263,6 +263,7 @@ mod tests {
                 ollp_predicted_edges: None,
                 rls_filters: vec![],
                 rls_write_check: vec![],
+                resolved_sum_targets: Vec::new(),
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,

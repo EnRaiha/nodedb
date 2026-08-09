@@ -64,6 +64,7 @@ pub(super) async fn dispatch_task(
             source_rows: _,
             rls_filters: _,
             rls_write_check: _,
+            resolved_sum_targets: _,
         },
     ) = &task.plan
     {
@@ -92,6 +93,7 @@ pub(super) async fn dispatch_task(
             source_rows: None,
             rls_filters: _,
             rls_write_check: _,
+            resolved_sum_targets: _,
         },
     ) = &task.plan
     {

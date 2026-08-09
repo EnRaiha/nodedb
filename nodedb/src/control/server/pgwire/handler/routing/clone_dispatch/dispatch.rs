@@ -29,7 +29,7 @@ use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::super::types::error_to_sqlstate;
+use super::super::super::super::types::{error_to_sqlstate, sqlstate_error};
 use super::super::super::core::NodeDbPgHandler;
 use super::merge::{filter_kv_tombstoned_rows, merge_msgpack_arrays, wrap_single_map_as_array};
 use super::temporal::extract_system_as_of_ms;
@@ -142,7 +142,9 @@ impl NodeDbPgHandler {
                     PlanKind::MultiRow,
                     projection,
                     Some(redaction.ctx(&self.state.redaction)),
-                ) {
+                )
+                .map_err(|e| sqlstate_error("XX000", e.message()))?
+                {
                     ShapeOutcome::Rows(shaped) => {
                         let (response, notice) =
                             shape_encode::shaped_query_response(shaped, result_formats);
@@ -340,7 +342,9 @@ impl NodeDbPgHandler {
                         PlanKind::MultiRow,
                         projection,
                         Some(redaction.ctx(&self.state.redaction)),
-                    ) {
+                    )
+                    .map_err(|e| sqlstate_error("XX000", e.message()))?
+                    {
                         ShapeOutcome::Rows(shaped) => {
                             let (response, notice) =
                                 shape_encode::shaped_query_response(shaped, result_formats);

@@ -514,6 +514,24 @@ pub struct CoreLoop {
     /// mutation in the current live apply/replay scope.
     pub(in crate::data::executor) active_graph_system_from: Option<i64>,
 
+    /// Signed BALANCED entries accumulated for the transaction batch currently
+    /// applying on this core, as `(collection, entry)`.
+    ///
+    /// `Some` ONLY between the start and the end of
+    /// `execute_transaction_batch`, which is what makes the same write handler
+    /// serve both scopes: with a batch open, a handler's entries accumulate
+    /// here and the batch checks them once at its commit boundary; with none
+    /// open the handler is its own boundary and checks its entries itself. An
+    /// explicit transaction may legitimately write one leg of a journal per
+    /// statement, so a per-statement check inside a batch would refuse writes
+    /// the constraint permits.
+    pub(in crate::data::executor) balanced_txn_entries: Option<
+        Vec<(
+            String,
+            crate::data::executor::enforcement::balanced::BalancedEntry,
+        )>,
+    >,
+
     /// Staged Calvin write plans awaiting the local commit verdict, keyed by
     /// `(epoch, position, vshard)`. `CalvinExecuteStatic` validates a
     /// transaction and inserts its plans here WITHOUT mutating base; the

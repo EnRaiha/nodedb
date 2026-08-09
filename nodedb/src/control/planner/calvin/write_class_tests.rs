@@ -89,6 +89,7 @@ fn is_write_plan_true_for_document_truncate() {
     let plan = PhysicalPlan::Document(DocumentOp::Truncate {
         collection: "docs".to_owned(),
         restart_identity: false,
+        resolved_sum_targets: Vec::new(),
     });
     assert!(is_write_plan(&plan), "DocumentOp::Truncate must be a write");
 }

@@ -157,9 +157,22 @@ pub(super) fn result_fields_for_returning(
         }
     }
 
+    // Every write that can carry a RETURNING clause resolves its target here.
+    // A write whose target is missed announces NO result columns while its
+    // response still ships one field per stored column, which the client
+    // cannot read against the RowDescription it was given — so the list is
+    // the write plans, not just the two that first needed it.
     let collection = match plan? {
-        nodedb_sql::SqlPlan::Update { collection, .. } => collection.as_str(),
-        nodedb_sql::SqlPlan::Delete { collection, .. } => collection.as_str(),
+        nodedb_sql::SqlPlan::Update { collection, .. }
+        | nodedb_sql::SqlPlan::UpdateFrom { collection, .. }
+        | nodedb_sql::SqlPlan::Delete { collection, .. }
+        | nodedb_sql::SqlPlan::Insert { collection, .. }
+        | nodedb_sql::SqlPlan::KvInsert { collection, .. }
+        | nodedb_sql::SqlPlan::Upsert { collection, .. }
+        | nodedb_sql::SqlPlan::TimeseriesIngest { collection, .. }
+        | nodedb_sql::SqlPlan::VectorPrimaryInsert { collection, .. } => collection.as_str(),
+        nodedb_sql::SqlPlan::Merge { target, .. }
+        | nodedb_sql::SqlPlan::InsertSelect { target, .. } => target.as_str(),
         _ => return None,
     };
 

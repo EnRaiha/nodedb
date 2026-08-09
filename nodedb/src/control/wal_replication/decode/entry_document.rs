@@ -83,6 +83,23 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             source_filters,
             *source_limit,
         )),
+        ReplicatedWrite::ApplyBalanceDelta {
+            collection,
+            document_id,
+            surrogate,
+            column,
+            delta,
+            join_column,
+            join_value,
+        } => Ok(document::apply_balance_delta(
+            collection,
+            document_id,
+            *surrogate,
+            column,
+            delta,
+            join_column,
+            join_value,
+        )),
         _ => Err(crate::Error::Internal {
             detail: "entry_document::decode_arm called with a non-Document ReplicatedWrite \
                 variant (dispatch bug in decode/entry.rs's grouped Document match arm)"

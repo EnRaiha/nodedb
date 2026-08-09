@@ -41,6 +41,10 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     /// what may be shown back, this one bounds what may be written. Empty = no
     /// write policy.
     pub rls_write_check: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this update may touch — both sides of a join-key change. Resolved on the
+    /// Control Plane at plan time.
+    pub resolved_sum_targets: &'a [(String, Surrogate)],
 }
 
 impl CoreLoop {
@@ -58,6 +62,7 @@ impl CoreLoop {
             returning,
             rls_filters,
             rls_write_check,
+            resolved_sum_targets,
         } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -94,6 +99,20 @@ impl CoreLoop {
             && let Err(e) = crate::data::executor::handlers::generated::check_generated_readonly(
                 updates,
                 &config.enforcement.generated_columns,
+            )
+        {
+            return self.response_error(task, e);
+        }
+
+        // Refuse the statement outright on a collection that declared its rows
+        // immutable. A hash-chained collection is refused here for the reason
+        // its links exist: each link covers its predecessor's hash, so rewriting
+        // a row makes `verify_chain` report the row AFTER it as broken, and the
+        // tamper-evidence would accuse an untampered row.
+        if let Some(config) = self.doc_configs.get(&config_key)
+            && let Err(e) = crate::data::executor::enforcement::append_only::check_point_update(
+                collection,
+                &config.enforcement,
             )
         {
             return self.response_error(task, e);
@@ -169,9 +188,10 @@ impl CoreLoop {
                     bitemporal,
                     sys_from_ms: sys_from_for_encode,
                     wal_lsn: task.wal_lsn(),
+                    resolved_sum_targets,
                 });
                 match write_result {
-                    Ok(()) => {
+                    Ok(target_write_set) => {
                         self.doc_cache.put(
                             task.request.database_id.as_u64(),
                             tid,
@@ -256,6 +276,12 @@ impl CoreLoop {
                                 collection: None,
                             }];
                         }
+                        // Derived target rows live in a DIFFERENT collection
+                        // than this statement's, so each carries its own
+                        // `Some(collection)` and homes to that collection's
+                        // vShard. Appended rather than replacing: the row's own
+                        // vector redo above and these are both required.
+                        response.write_set.extend(target_write_set);
                         response
                     }
                     Err(e) => self.response_error(

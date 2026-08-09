@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::response_codec::encode_json_as_msgpack;
@@ -87,6 +88,20 @@ impl CoreLoop {
         // needs to survive a WAL-only restart. Empty on non-vector targets.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
 
+        // The whole MERGE is ONE boundary, so its DELETE arms are accounted
+        // here, before any phase runs: those arms apply in their own
+        // transactions AFTER the phase-A commit, so entries collected as they
+        // ran could only report a violation phase A had already made durable.
+        // Their pre-images are the plan's captured bodies, which the classifier
+        // already holds — nothing is re-read.
+        let delete_bodies: Vec<&[u8]> = plan.deletes.iter().map(|d| d.body.as_slice()).collect();
+        let mut balanced_entries = self.balanced_entries_for_submitted_deletes(
+            database_id,
+            tid,
+            params.target_collection,
+            &delete_bodies,
+        );
+
         // Phase A: matched UPDATE + NOT-MATCHED INSERT share ONE redb write
         // transaction. Any per-row error (including a UNIQUE violation from
         // `apply_point_put`) aborts, dropping the txn and rolling the whole set
@@ -158,6 +173,45 @@ impl CoreLoop {
                     ) {
                         Ok(mut outcome) => {
                             record_put_index_undo(&mut undo_log, &mut outcome);
+                            // The arm's materialized-sum delta is folded inside
+                            // the SAME transaction the arm's row lands in, so a
+                            // moved total rolls back with the row that moved it.
+                            // Both images come from the plan: the classifier held
+                            // the pre-image already, so nothing is re-read.
+                            match write_hook::run(
+                                self,
+                                &txn,
+                                &write_hook::HookCtx {
+                                    database_id,
+                                    tid,
+                                    collection: params.target_collection,
+                                    resolved_targets: params.resolved_sum_targets,
+                                    deferred_sum_targets: &[],
+                                    wal_lsn: task.wal_lsn(),
+                                },
+                                write_hook::WriteImages::Update {
+                                    old: write_hook::ImageBody::Submitted(&upd.old_body),
+                                    new: write_hook::ImageBody::Submitted(&upd.body),
+                                },
+                            ) {
+                                Ok(enforcement) => {
+                                    write_set.extend(write_hook::target_write_set(
+                                        &enforcement.target_writes,
+                                    ));
+                                    balanced_entries.extend(enforcement.balanced_entries);
+                                }
+                                Err(e) => {
+                                    return self.abort_merge_apply(MergeAbort {
+                                        task,
+                                        database_id,
+                                        tid,
+                                        collection: params.target_collection,
+                                        applied_keys: &applied_keys,
+                                        undo_log,
+                                        err: e.into(),
+                                    });
+                                }
+                            }
                             if has_vectors {
                                 write_set.push(WriteSetEntry {
                                     surrogate: surrogate.as_u32(),
@@ -279,6 +333,41 @@ impl CoreLoop {
             ) {
                 Ok(mut outcome) => {
                     record_put_index_undo(&mut undo_log, &mut outcome);
+                    // A NOT-MATCHED INSERT arm credits its target with the whole
+                    // new row — post-image only, which is exactly what
+                    // `RowImages::Insert` expresses.
+                    match write_hook::run(
+                        self,
+                        &txn,
+                        &write_hook::HookCtx {
+                            database_id,
+                            tid,
+                            collection: params.target_collection,
+                            resolved_targets: params.resolved_sum_targets,
+                            deferred_sum_targets: &[],
+                            wal_lsn: task.wal_lsn(),
+                        },
+                        write_hook::WriteImages::Insert {
+                            new: write_hook::ImageBody::Submitted(&ins.body),
+                        },
+                    ) {
+                        Ok(enforcement) => {
+                            write_set
+                                .extend(write_hook::target_write_set(&enforcement.target_writes));
+                            balanced_entries.extend(enforcement.balanced_entries);
+                        }
+                        Err(e) => {
+                            return self.abort_merge_apply(MergeAbort {
+                                task,
+                                database_id,
+                                tid,
+                                collection: params.target_collection,
+                                applied_keys: &applied_keys,
+                                undo_log,
+                                err: e.into(),
+                            });
+                        }
+                    }
                     if has_vectors {
                         write_set.push(WriteSetEntry {
                             surrogate: surrogate.as_u32(),
@@ -320,6 +409,27 @@ impl CoreLoop {
             }
         }
 
+        // Every arm of the statement — the UPDATE and INSERT arms folded above
+        // and the DELETE arms accounted before phase A — is judged once here,
+        // before the phase-A commit, so a MERGE that leaves a journal group
+        // unbalanced writes nothing at all.
+        if let Err(e) = self.settle_balanced_entries(
+            database_id,
+            tid,
+            params.target_collection,
+            balanced_entries,
+        ) {
+            return self.abort_merge_apply(MergeAbort {
+                task,
+                database_id,
+                tid,
+                collection: params.target_collection,
+                applied_keys: &applied_keys,
+                undo_log,
+                err: e.into(),
+            });
+        }
+
         if let Err(e) = txn.commit() {
             return self.abort_merge_apply(MergeAbort {
                 task,
@@ -358,6 +468,7 @@ impl CoreLoop {
                 deletes: &plan.deletes,
                 has_vectors,
                 returning: params.returning.is_some(),
+                resolved_targets: params.resolved_sum_targets,
             },
             MergeDeleteTally {
                 affected: &mut affected,

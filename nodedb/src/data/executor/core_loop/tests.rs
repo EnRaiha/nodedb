@@ -150,6 +150,7 @@ fn point_put_records_write_version_and_advances_watermark() {
             value: &doc_value("a", "1"),
             returning: None,
             rls_filters: &[],
+            resolved_sum_targets: &[],
         },
     );
     assert_eq!(resp.status, Status::Ok);
@@ -176,6 +177,7 @@ fn point_put_records_write_version_and_advances_watermark() {
             value: &doc_value("a", "2"),
             returning: None,
             rls_filters: &[],
+            resolved_sum_targets: &[],
         },
     );
     assert_eq!(
@@ -200,6 +202,7 @@ fn point_put_records_write_version_and_advances_watermark() {
             value: &doc_value("a", "3"),
             returning: None,
             rls_filters: &[],
+            resolved_sum_targets: &[],
         },
     );
     assert_eq!(
@@ -220,6 +223,7 @@ fn point_put_records_write_version_and_advances_watermark() {
             value: &doc_value("a", "4"),
             returning: None,
             rls_filters: &[],
+            resolved_sum_targets: &[],
         },
     );
     assert_eq!(
@@ -351,6 +355,7 @@ fn no_wal_lsn_records_nothing() {
             value: &doc_value("a", "1"),
             returning: None,
             rls_filters: &[],
+            resolved_sum_targets: &[],
         },
     );
     assert_eq!(

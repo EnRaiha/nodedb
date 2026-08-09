@@ -235,6 +235,7 @@ pub(crate) fn build_batch_insert(
         returning: None,
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
     }))
 }
 
@@ -359,6 +360,8 @@ pub(crate) fn build_bulk_update(
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        // Filled in by the materialized-sum resolution pass.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -381,6 +384,8 @@ pub(crate) fn build_bulk_delete(
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
+        // Filled in by the materialized-sum resolution pass.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 
@@ -388,6 +393,8 @@ pub(crate) fn build_truncate(collection: &str) -> crate::Result<PhysicalPlan> {
     Ok(PhysicalPlan::Document(DocumentOp::Truncate {
         collection: collection.to_string(),
         restart_identity: false,
+        // Filled in by the materialized-sum resolution pass.
+        resolved_sum_targets: Vec::new(),
     }))
 }
 

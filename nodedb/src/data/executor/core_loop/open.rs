@@ -203,6 +203,7 @@ impl CoreLoop {
             calvin_flush_index_tuples: HashMap::new(),
             active_bitemporal_stamps: HashMap::new(),
             active_graph_system_from: None,
+            balanced_txn_entries: None,
         })
     }
 }

@@ -95,18 +95,25 @@ pub async fn dispatch_alter_collection(
         AlterCollectionOp::AddMaterializedSum {
             target_collection,
             target_column,
+            target_column_type,
             source_collection,
             join_column,
             value_expr,
-        } => super::materialized_sum::add_materialized_sum(
-            state,
-            identity,
-            target_collection,
-            target_column,
-            source_collection,
-            join_column,
-            value_expr,
-        ),
+        } => {
+            super::materialized_sum::add_materialized_sum(
+                state,
+                identity,
+                &super::materialized_sum::MaterializedSumRequest {
+                    target_collection,
+                    target_column,
+                    target_column_type,
+                    source_collection,
+                    join_column,
+                    value_expr,
+                },
+            )
+            .await
+        }
 
         AlterCollectionOp::SetOnConflict {
             policy,

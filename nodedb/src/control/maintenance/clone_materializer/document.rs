@@ -161,6 +161,7 @@ pub(super) async fn materialize_document_collection(
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             });
 
             let resp =

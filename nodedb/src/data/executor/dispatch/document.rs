@@ -73,7 +73,7 @@ impl CoreLoop {
                 pk_bytes: _,
                 returning,
                 rls_filters,
-                resolved_sum_targets: _,
+                resolved_sum_targets,
             } => self.execute_point_put(
                 task,
                 crate::data::executor::handlers::point::put::PointPutExec {
@@ -84,6 +84,7 @@ impl CoreLoop {
                     value,
                     returning: returning.as_ref(),
                     rls_filters,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -95,7 +96,8 @@ impl CoreLoop {
                 surrogate,
                 returning,
                 rls_filters,
-                resolved_sum_targets: _,
+                resolved_sum_targets,
+                deferred_sum_targets,
             } => self.execute_point_insert(
                 crate::data::executor::handlers::point::insert::PointInsertParams {
                     task,
@@ -107,6 +109,8 @@ impl CoreLoop {
                     if_absent: *if_absent,
                     returning: returning.as_ref(),
                     rls_filters,
+                    resolved_sum_targets,
+                    deferred_sum_targets,
                 },
             ),
 
@@ -117,6 +121,7 @@ impl CoreLoop {
                 returning,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets,
                 ..
             } => self.execute_point_delete(
                 task,
@@ -128,6 +133,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -140,7 +146,7 @@ impl CoreLoop {
                 returning,
                 rls_filters,
                 rls_write_check,
-                resolved_sum_targets: _,
+                resolved_sum_targets,
             } => self.execute_point_update(
                 task,
                 crate::data::executor::handlers::point::update::PointUpdateParams {
@@ -152,6 +158,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -195,7 +202,8 @@ impl CoreLoop {
                 surrogates,
                 returning,
                 rls_filters,
-                resolved_sum_targets: _,
+                resolved_sum_targets,
+                deferred_sum_targets,
             } => self.execute_document_batch_insert(
                 task,
                 crate::data::executor::handlers::document::write::DocumentBatchInsertParams {
@@ -205,6 +213,8 @@ impl CoreLoop {
                     surrogates,
                     returning: returning.as_ref(),
                     rls_filters,
+                    resolved_sum_targets,
+                    deferred_sum_targets,
                 },
             ),
 
@@ -241,6 +251,7 @@ impl CoreLoop {
                 source_rows,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets,
             } => self.execute_update_from_join(
                 task,
                 tid,
@@ -257,6 +268,7 @@ impl CoreLoop {
                     source_rows: source_rows.as_deref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -269,6 +281,7 @@ impl CoreLoop {
                 ollp_predicted_edges,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets,
             } => self.execute_bulk_update(
                 task,
                 tid,
@@ -281,6 +294,7 @@ impl CoreLoop {
                     ollp_predicted_edges: ollp_predicted_edges.as_deref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -292,6 +306,7 @@ impl CoreLoop {
                 ollp_predicted_edges,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets,
             } => self.execute_bulk_delete(
                 task,
                 tid,
@@ -301,6 +316,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                     ollp: crate::data::executor::handlers::bulk_dml::OllpPrediction {
                         surrogates: ollp_predicted_surrogates.as_deref(),
                         edges: ollp_predicted_edges.as_deref(),
@@ -317,7 +333,7 @@ impl CoreLoop {
                 rls_write_check,
                 returning,
                 rls_filters,
-                resolved_sum_targets: _,
+                resolved_sum_targets,
             } => self.execute_upsert(
                 task,
                 crate::data::executor::handlers::upsert::UpsertParams {
@@ -330,10 +346,15 @@ impl CoreLoop {
                     rls_write_check,
                     returning: returning.as_ref(),
                     rls_filters,
+                    resolved_sum_targets,
                 },
             ),
 
-            DocumentOp::Truncate { collection, .. } => self.execute_truncate(task, tid, collection),
+            DocumentOp::Truncate {
+                collection,
+                resolved_sum_targets,
+                ..
+            } => self.execute_truncate(task, tid, collection, resolved_sum_targets),
 
             DocumentOp::EstimateCount { collection, field } => {
                 self.execute_estimate_count(task, tid, collection, field)
@@ -431,6 +452,7 @@ impl CoreLoop {
                 source_rows,
                 rls_filters,
                 rls_write_check,
+                resolved_sum_targets,
             } => self.execute_merge(
                 task,
                 tid,
@@ -447,6 +469,7 @@ impl CoreLoop {
                     returning: returning.as_ref(),
                     rls_filters,
                     rls_write_check,
+                    resolved_sum_targets,
                 },
             ),
 
@@ -482,6 +505,28 @@ impl CoreLoop {
                 cursor,
                 *count,
                 *system_as_of_ms,
+            ),
+
+            DocumentOp::ApplyBalanceDelta {
+                collection,
+                document_id,
+                surrogate,
+                column,
+                delta,
+                join_column,
+                join_value,
+            } => self.execute_apply_balance_delta(
+                task,
+                super::super::handlers::document::apply_balance_delta::ApplyBalanceDeltaParams {
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    column,
+                    delta,
+                    join_column,
+                    join_value,
+                },
             ),
         }
     }

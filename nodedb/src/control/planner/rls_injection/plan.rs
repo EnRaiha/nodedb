@@ -392,6 +392,7 @@ mod tests {
         let mut plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: "docs".into(),
             restart_identity: false,
+            resolved_sum_targets: Vec::new(),
         });
         let before = plan.clone();
         assert!(inject(&mut plan, &store).is_ok());

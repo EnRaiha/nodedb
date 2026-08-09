@@ -278,6 +278,17 @@ pub(crate) async fn handle_direct_op(
             return error_to_native(seq, &e);
         }
 
+        // Follows the resolution: it consumes the surrogates that pass bound,
+        // and issues no lookup of its own.
+        if let Err(e) = crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
+            ctx.state,
+            &mut tasks,
+            tenant_id,
+            ctx.database_id(),
+        ) {
+            return error_to_native(seq, &e);
+        }
+
         // The expanded set is the dispatch authorization boundary. The no-edge
         // path retains its existing per-task capability consumption below.
         let authorized_tasks =

@@ -7,6 +7,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
@@ -30,6 +31,9 @@ pub(in crate::data::executor) struct PointDeleteExec<'a> {
     /// `rls_filters`: that one bounds what may be shown back, this one bounds
     /// what may be removed. Empty = no write policy.
     pub rls_write_check: &'a [u8],
+    /// Join-key VALUE → target row surrogate for every materialized-sum target
+    /// this delete must debit, resolved on the Control Plane at plan time.
+    pub resolved_sum_targets: &'a [(String, Surrogate)],
 }
 
 impl CoreLoop {
@@ -46,10 +50,19 @@ impl CoreLoop {
             returning,
             rls_filters,
             rls_write_check,
+            resolved_sum_targets,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, "point delete");
 
         let database_id = task.request.database_id.as_u64();
+        let hook_ctx = HookCtx {
+            database_id,
+            tid,
+            collection,
+            resolved_targets: resolved_sum_targets,
+            deferred_sum_targets: &[],
+            wal_lsn: task.wal_lsn(),
+        };
 
         // Gate the removal on the collection's write policy, decided against
         // the row's pre-deletion image. The read happens BEFORE the write: the
@@ -96,6 +109,46 @@ impl CoreLoop {
                 );
             }
         };
+        // Image-folding enforcement, inside the SAME transaction the removal was
+        // staged in: a materialized-sum target write is itself a document write,
+        // so the debit and the row's removal land or roll back together. A
+        // delete that matched nothing changes no total and folds nothing —
+        // `apply_point_delete` reports that as a `None` pre-image.
+        //
+        // `outcome.prior_value` is the pre-image, which is the ONLY image a
+        // delete has. An enforcement API that could report only a post-image
+        // could not express this write at all, which is why a deleted row's
+        // contribution used to stay on the total forever.
+        let enforcement = match outcome.prior_value {
+            Some(ref old) => match write_hook::run(
+                self,
+                &txn,
+                &hook_ctx,
+                WriteImages::Delete {
+                    old: ImageBody::Stored(old),
+                },
+            ) {
+                Ok(enforcement) => enforcement,
+                Err(e) => {
+                    // `apply_point_delete` already invalidated this row's cache
+                    // entry, and dropping `txn` reverses every durable write it
+                    // staged, so nothing else has to be undone here.
+                    return self.response_error(task, e);
+                }
+            },
+            None => Default::default(),
+        };
+        let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+
+        // A delete subtracts the removed row's amount, so removing one leg of a
+        // balanced journal on its own is a violation. Settled before the commit,
+        // and dropping `txn` un-committed reverses the removal.
+        if let Err(e) =
+            self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
+        {
+            return self.response_error(task, e);
+        }
+
         if let Err(e) = txn.commit() {
             return self.response_error(
                 task,
@@ -151,7 +204,7 @@ impl CoreLoop {
             );
         }
 
-        if let (Some(spec), Some(prior_bytes)) = (returning, prior.as_deref()) {
+        let mut response = if let (Some(spec), Some(prior_bytes)) = (returning, prior.as_deref()) {
             // Decode the pre-deletion image with the collection's storage mode:
             // on a strict collection the prior bytes are a Binary Tuple, which
             // the MessagePack decoder accepts without erroring and turns into a
@@ -202,7 +255,15 @@ impl CoreLoop {
             // primary key (surrogates outlive the row they were assigned to),
             // so the surrogate is no evidence a row was there to remove.
             self.response_affected(task, u64::from(prior.is_some()))
+        };
+        // Redo entries for the target rows this delete debited: the statement's
+        // own redo names only the removed row, so without these a WAL-only
+        // restart replays the removal and leaves every total still carrying the
+        // contribution of a row that is gone.
+        if !target_write_set.is_empty() {
+            response.write_set = target_write_set;
         }
+        response
     }
 
     /// Decide a single row's removal against the compiled write policy.

@@ -360,7 +360,10 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
         | DocumentOp::PointDelete { collection, .. }
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
-        | DocumentOp::BulkDelete { collection, .. } => {
+        | DocumentOp::BulkDelete { collection, .. }
+        // A balance write stages like any other point write: one target row,
+        // one absolute post-image, keyed by the row's own surrogate.
+        | DocumentOp::ApplyBalanceDelta { collection, .. } => {
             collections.insert(collection.clone());
             Ok(())
         }
@@ -860,6 +863,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
 
         let resp = core.execute_stage_write(&task, TID, &plan);
@@ -914,6 +918,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
 
         let resp = core.execute_stage_write(&task, TID, &plan);
@@ -964,6 +969,7 @@ mod tests {
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            resolved_sum_targets: Vec::new(),
         });
 
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
@@ -1022,6 +1028,7 @@ mod tests {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: "t".to_string(),
@@ -1036,6 +1043,7 @@ mod tests {
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: Vec::new(),
+                resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "notes".to_string(),
@@ -1044,6 +1052,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
         ];
 

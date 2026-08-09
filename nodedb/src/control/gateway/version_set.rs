@@ -179,7 +179,11 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | Upsert { collection, .. }
                 | BulkUpdate { collection, .. }
                 | BulkDelete { collection, .. }
-                | MaterializeScan { collection, .. } => out.push(collection.clone()),
+                | MaterializeScan { collection, .. }
+                // The TARGET collection whose balance this derived write moves.
+                // It is the only collection the op touches — the source row that
+                // caused it rides a separate task on its own vShard.
+                | ApplyBalanceDelta { collection, .. } => out.push(collection.clone()),
 
                 InsertSelect {
                     target_collection,

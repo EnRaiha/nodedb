@@ -90,8 +90,9 @@ pub(in super::super) fn convert_merge(
             // Autocommit MERGE is intercepted at the dispatch entry points and
             // driven by the Control-Plane orchestrator (`control::merge_orchestrator`),
             // which re-issues this op with `resolve_only` / `resolved_inserts`
-            // set. The plan produced here is the neutral form: it also serves
-            // in-transaction buffered replay, which runs the legacy per-row path.
+            // set. The plan produced here is the neutral form: in-transaction
+            // MERGE is expanded into concrete point ops at statement time, so
+            // this shape never reaches the Data Plane.
             resolve_only: false,
             resolved_inserts: None,
             // The source rows are shipped in by the Control-Plane orchestrator
@@ -102,6 +103,9 @@ pub(in super::super) fn convert_merge(
             // predicate gating the persist are separate slots.
             rls_filters: Vec::new(),
             rls_write_check: Vec::new(),
+            // Filled in by the merge orchestrator from its RESOLVE pass's arms;
+            // the neutral plan has no classification to derive keys from.
+            resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

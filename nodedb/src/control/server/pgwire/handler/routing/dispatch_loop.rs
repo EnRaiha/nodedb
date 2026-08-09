@@ -205,7 +205,17 @@ impl NodeDbPgHandler {
             // interception (moved to execute_dml_hooks.rs to keep this file
             // under the size limit; behavior is unchanged).
             let (dml_info, old_row, truncate_restart_collection) = match self
-                .run_pre_dispatch_hooks(identity, auth_ctx, tenant_id, session_id, plan_kind, task)
+                .run_pre_dispatch_hooks(
+                    super::execute_dml_hooks::PreDispatchContext {
+                        identity,
+                        auth: auth_ctx,
+                        tenant_id,
+                        session_id,
+                        plan_kind,
+                        projection,
+                    },
+                    task,
+                )
                 .await?
             {
                 super::execute_dml_hooks::PreDispatchOutcome::Handled(resp) => {
@@ -429,7 +439,7 @@ impl NodeDbPgHandler {
                 set_op_redaction
                     .as_ref()
                     .map(|r| r.ctx(&self.state.redaction)),
-            );
+            )?;
             if let Some(n) = notice {
                 self.sessions.push_notice(session_id, n);
             }

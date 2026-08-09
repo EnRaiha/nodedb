@@ -302,6 +302,7 @@ mod tests {
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
+                deferred_sum_targets: Vec::new(),
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,
