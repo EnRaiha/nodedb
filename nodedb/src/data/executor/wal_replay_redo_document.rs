@@ -45,6 +45,26 @@
 //! the original write produced is already on disk, and the derived target write
 //! carries its own redo record naming the target collection. Folding again on
 //! replay would add the same amount a second time.
+//!
+//! ### Why Raft replication does the opposite
+//!
+//! Replication re-EXECUTES rather than re-APPLIES, and the two answers follow
+//! from that difference alone — not from a policy about who may fold.
+//!
+//! A redo record is a POST-IMAGE: the row as it ended up, plus a sibling redo
+//! record for the target row as IT ended up. Replaying both restores the pair
+//! exactly, and a delta folded on top would be a third, uncounted contribution.
+//!
+//! A replicated record is the SOURCE row only — no post-image of the target
+//! exists on the wire, and no node but the proposer ever computed one. A replica
+//! that skipped enforcement would install the source row and leave its own copy
+//! of the target's balance untouched, serving a total short by every row it ever
+//! replicated while looking perfectly healthy. So it must fold, which is why the
+//! replicated record carries the resolution the fold needs (see
+//! `control::wal_replication::decode::document`).
+//!
+//! Both paths run exactly once over their own node's state; they differ only in
+//! whether that state already contains the effect.
 
 use nodedb_types::Surrogate;
 use nodedb_types::sync::wire::SyncProvenance;

@@ -22,6 +22,7 @@ fn replicated_entry_roundtrip() {
             document_id: "u1".into(),
             value: b"alice".to_vec(),
             surrogate: 1,
+            resolved_sum_targets: Vec::new(),
         },
     );
     let original_key = entry.idempotency_key;
@@ -41,11 +42,13 @@ fn replicated_entry_roundtrip() {
             document_id,
             value,
             surrogate,
+            resolved_sum_targets,
         } => {
             assert_eq!(collection, "users");
             assert_eq!(document_id, "u1");
             assert_eq!(value, b"alice");
             assert_eq!(surrogate, 1);
+            assert!(resolved_sum_targets.is_empty());
         }
         other => panic!("expected PointPut, got {other:?}"),
     }
@@ -111,11 +114,13 @@ fn all_write_variants_serialize() {
             document_id: "d".into(),
             value: vec![1, 2, 3],
             surrogate: 1,
+            resolved_sum_targets: vec![("acc-1".into(), 4242)],
         },
         ReplicatedWrite::PointDelete {
             collection: "c".into(),
             document_id: "d".into(),
             surrogate: 1,
+            resolved_sum_targets: Vec::new(),
         },
         ReplicatedWrite::VectorInsert {
             collection: "v".into(),
@@ -300,6 +305,92 @@ fn to_replicated_entry_writes_only() {
         valid_at_ms: None,
     });
     assert!(to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan).is_none());
+}
+
+/// The materialized-sum resolution survives the wire, on the insert shape and
+/// on the predicate shape.
+///
+/// A replica re-executes the write and folds its own delta, so the join-key →
+/// target-surrogate table and the deferral list have to arrive with it. Losing
+/// either is invisible until a balance is read: an empty resolution makes the
+/// fold fail on a write the leader accepted, and a lost deferral makes the
+/// replica fold a delta its sibling `ApplyBalanceDelta` entry also applies.
+#[test]
+fn materialized_sum_resolution_roundtrips() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
+        collection: "entries".into(),
+        document_id: "e1".into(),
+        value: vec![1, 2, 3],
+        if_absent: false,
+        surrogate: Surrogate::new(900),
+        returning: None,
+        rls_filters: Vec::new(),
+        resolved_sum_targets: vec![
+            ("acc-1".to_string(), Surrogate::new(4242)),
+            ("acc-2".to_string(), Surrogate::new(4243)),
+        ],
+        deferred_sum_targets: vec!["accounts_elsewhere".to_string()],
+    });
+    let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("a document insert must replicate")
+        .to_bytes();
+    let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded {
+        PhysicalPlan::Document(DocumentOp::PointInsert {
+            resolved_sum_targets,
+            deferred_sum_targets,
+            ..
+        }) => {
+            assert_eq!(
+                resolved_sum_targets,
+                vec![
+                    ("acc-1".to_string(), Surrogate::new(4242)),
+                    ("acc-2".to_string(), Surrogate::new(4243)),
+                ],
+                "a replica cannot resolve a join key itself — the table must arrive with \
+                 the write"
+            );
+            assert_eq!(
+                deferred_sum_targets,
+                vec!["accounts_elsewhere".to_string()],
+                "a lost deferral is a double count, not a missing one"
+            );
+        }
+        other => panic!("expected PointInsert, got {other:?}"),
+    }
+
+    let bulk = PhysicalPlan::Document(DocumentOp::BulkDelete {
+        collection: "entries".into(),
+        filters: vec![7, 7],
+        returning: None,
+        ollp_predicted_surrogates: None,
+        ollp_predicted_edges: None,
+        rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
+        resolved_sum_targets: vec![("acc-1".to_string(), Surrogate::new(4242))],
+    });
+    let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &bulk)
+        .expect("a single-shard bulk delete must replicate")
+        .to_bytes();
+    let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded {
+        PhysicalPlan::Document(DocumentOp::BulkDelete {
+            resolved_sum_targets,
+            ..
+        }) => assert_eq!(
+            resolved_sum_targets,
+            vec![("acc-1".to_string(), Surrogate::new(4242))],
+            "a replica re-derives which rows matched, never which target they credit"
+        ),
+        other => panic!("expected BulkDelete, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1603,6 +1694,7 @@ fn pre_database_id_entry_decodes_to_default_database() {
             document_id: "d".into(),
             value: vec![9, 9, 9],
             surrogate: 1,
+            resolved_sum_targets: Vec::new(),
         },
     };
     let bytes = zerompk::to_msgpack_vec(&legacy).expect("legacy entry encode failed");

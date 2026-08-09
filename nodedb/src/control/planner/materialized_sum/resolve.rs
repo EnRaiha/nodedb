@@ -10,18 +10,26 @@ use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::Surrogate;
 
 use super::extract::join_value_from_body;
+use super::stored::stored_row_scope;
 use crate::control::server::surrogate_exchange::lookup_surrogate_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
-/// Resolve the materialized-sum target row for every value-carrying document
-/// write in `tasks`, storing the result in that op's `resolved_sum_targets`.
+/// Resolve the materialized-sum target rows for every document write in
+/// `tasks`, storing the result in that op's `resolved_sum_targets`.
 ///
-/// Two shapes are resolved here. An op that carries a row BODY reads its join
-/// key straight off that body. `BulkUpdate`, `BulkDelete` and `TRUNCATE` name
-/// their rows by PREDICATE and carry no body, so
-/// [`predicate::resolve_predicate_sum_targets`](super::predicate) resolves them
-/// from a reconnaissance scan of the same predicate instead.
+/// Three sources of join values feed the resolution, and one op may draw on more
+/// than one of them:
+///
+/// - the row BODIES an op carries, read straight off each body;
+/// - the PREDICATE `BulkUpdate`, `BulkDelete` and `TRUNCATE` name their rows by,
+///   resolved by [`predicate::resolve_predicate_sum_targets`](super::predicate)
+///   from a reconnaissance scan of that same predicate;
+/// - the STORED row a point write rewrites or removes, resolved by
+///   [`stored::extend_with_stored_row`](super::stored) from a routed read of the
+///   one row. `PointDelete` and `PointUpdate` have no other source at all, and
+///   `PointPut` / `Upsert` need it for the target a join-key rewrite ABANDONS,
+///   which the submitted body cannot name.
 ///
 /// `UpdateFromJoin`, `InsertSelect` and `Merge` are resolved by their own
 /// Control-Plane orchestrators, which hold the concrete rows the statement
@@ -58,24 +66,56 @@ pub async fn resolve_materialized_sum_targets(
         {
             continue;
         }
-        let Some((collection, bodies)) = value_carrying(op) else {
-            continue;
-        };
+        // The read of `op` is scoped so the borrows the two classifications hold
+        // end before the resolution is written back through `&mut op`.
+        let resolved = {
+            let carried = value_carrying(op);
+            let stored = stored_row_scope(op);
+            // The two classifications name the same collection when both apply;
+            // an op that is neither carries no join value at all and is skipped.
+            let Some(collection) = stored
+                .as_ref()
+                .map(|scope| scope.collection)
+                .or_else(|| carried.as_ref().map(|(collection, _)| *collection))
+            else {
+                continue;
+            };
 
-        let source = strip_db_prefix(database_id, collection);
-        let Some(bindings) = state.materialized_sum_index.bindings_for_source(
-            catalog,
-            schema_version,
-            database_id,
-            tenant_id,
-            source,
-        )?
-        else {
-            continue;
-        };
+            // The gate, before any read: a collection driving nothing pays one
+            // cached index probe and nothing else.
+            let source = strip_db_prefix(database_id, collection);
+            let Some(bindings) = state.materialized_sum_index.bindings_for_source(
+                catalog,
+                schema_version,
+                database_id,
+                tenant_id,
+                source,
+            )?
+            else {
+                continue;
+            };
 
-        let resolved =
-            resolve_bodies(state, &bindings, &bodies, tenant_id, database_id, trace_id).await?;
+            let mut resolved = match &carried {
+                Some((_, bodies)) => {
+                    resolve_bodies(state, &bindings, bodies, tenant_id, database_id, trace_id)
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            if let Some(scope) = &stored {
+                super::stored::extend_with_stored_row(
+                    state,
+                    &bindings,
+                    scope,
+                    &mut resolved,
+                    tenant_id,
+                    database_id,
+                    trace_id,
+                )
+                .await?;
+            }
+            resolved
+        };
         set_resolved(op, resolved);
     }
 
@@ -105,8 +145,9 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
             documents.iter().map(|(_, v)| v.as_slice()).collect(),
         )),
         // No row body at plan time: a delete names a row it does not carry, and
-        // an update carries field assignments rather than a whole row. Both keep
-        // the slot for symmetry with the ops that do resolve.
+        // an update carries field assignments rather than a whole row. Their
+        // join values come off the STORED row instead — see
+        // [`stored_row_scope`].
         DocumentOp::PointDelete { .. } | DocumentOp::PointUpdate { .. } => None,
         // Predicate-driven and read-only ops.
         DocumentOp::PointGet { .. }
@@ -150,10 +191,18 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<(String, Surrogate)>) {
         | DocumentOp::BatchInsert {
             resolved_sum_targets,
             ..
+        }
+        // Resolved from the STORED row rather than from a carried body, but the
+        // slot they travel in is the same one.
+        | DocumentOp::PointDelete {
+            resolved_sum_targets,
+            ..
+        }
+        | DocumentOp::PointUpdate {
+            resolved_sum_targets,
+            ..
         } => *resolved_sum_targets = resolved,
-        DocumentOp::PointDelete { .. }
-        | DocumentOp::PointUpdate { .. }
-        | DocumentOp::PointGet { .. }
+        DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::Register { .. }

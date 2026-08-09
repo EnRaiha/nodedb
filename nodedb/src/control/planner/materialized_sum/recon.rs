@@ -9,6 +9,13 @@
 //! write set — one scan of the same predicate, before execution — and resolves
 //! the join values that scan surfaces.
 //!
+//! A `PointUpdate` / `PointDelete` names ONE row and carries no body either — an
+//! update carries field assignments, a delete carries only a key — so its join
+//! key is likewise only readable from the stored row.
+//! [`recon_point_row`] reads that one row through the SAME routing, so there is
+//! one way to read a source row at plan time rather than two that can disagree
+//! about where the collection lives.
+//!
 //! Like the OLLP pre-execution scan, the read is routed through the gateway when
 //! one is wired: a bare local dispatch on a coordinator that does not host the
 //! collection's vShard returns nothing, which would silently under-resolve and
@@ -20,7 +27,7 @@
 //! bridge (or the gateway) exactly as a `SELECT` does — no storage I/O and no
 //! io_uring here.
 
-use nodedb_types::TenantId;
+use nodedb_types::{Surrogate, TenantId};
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
@@ -60,6 +67,73 @@ pub(super) async fn recon_scan_rows(
         prefilter: None,
     });
 
+    let payloads = execute_read(state, tenant_id, database_id, collection, scan_plan).await?;
+    let mut rows = Vec::new();
+    for payload in &payloads {
+        rows.extend(decode_rows(payload.as_slice()));
+    }
+    Ok(rows)
+}
+
+/// Read the ONE stored row `surrogate` addresses, or `None` when no such row
+/// exists.
+///
+/// The point-shaped counterpart of [`recon_scan_rows`], for the write plans that
+/// name a single row and carry no body: `PointUpdate` and `PointDelete` read
+/// their join key off this image, and `PointPut` / `Upsert` read off it the join
+/// key the row is ABOUT to leave, which the submitted body cannot report.
+///
+/// `None` is the ordinary answer, not a failure: an upsert that inserts, and an
+/// update or delete whose primary key matches nothing, all rewrite no stored row
+/// and so owe no target anything.
+///
+/// Identity is the surrogate, exactly as on the write path — `document_id` is
+/// the user-facing primary key and carries no storage addressing.
+pub(super) async fn recon_point_row(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+    document_id: &str,
+    surrogate: Surrogate,
+) -> crate::Result<Option<serde_json::Value>> {
+    let get_plan = PhysicalPlan::Document(DocumentOp::PointGet {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate,
+        pk_bytes: document_id.as_bytes().to_vec(),
+        // No RLS filters, for the same reason the recon scan carries none: this
+        // read decides which TOTAL a write moves, not what a principal may see.
+        // Filtering it would let a row the caller cannot read leave its
+        // contribution stranded on a target forever.
+        rls_filters: Vec::new(),
+        system_time: nodedb_types::SystemTimeScope::Current,
+        valid_at_ms: None,
+    });
+
+    let payloads = execute_read(state, tenant_id, database_id, collection, get_plan).await?;
+    // A point get answers with the row's normalized MessagePack body, and with
+    // an EMPTY payload when the row is absent.
+    Ok(payloads
+        .iter()
+        .find(|payload| !payload.is_empty())
+        .and_then(|payload| nodedb_types::json_from_msgpack(payload.as_slice()).ok()))
+}
+
+/// Run one read plan against `collection`, through the gateway when one is
+/// wired and over the SPSC bridge otherwise, returning the raw payloads.
+///
+/// A bare local dispatch on a coordinator that does not host the collection's
+/// vShard returns nothing, which would silently under-resolve and leave the
+/// write with no target to address — so the gateway is preferred whenever it
+/// exists, for every shape of plan-time read alike.
+async fn execute_read(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+    plan: PhysicalPlan,
+) -> crate::Result<Vec<Vec<u8>>> {
     if let Some(gateway) = state.gateway.get() {
         let gw_ctx = crate::control::gateway::core::QueryContext {
             tenant_id,
@@ -67,18 +141,13 @@ pub(super) async fn recon_scan_rows(
             database_id,
             txn_id: None,
         };
-        let payloads = gateway
-            .execute_internal(&gw_ctx, scan_plan)
+        return gateway
+            .execute_internal(&gw_ctx, plan)
             .await
             .map_err(|e| crate::Error::Storage {
                 engine: "materialized-sum-recon".into(),
-                detail: format!("reconnaissance scan failed: {e}"),
-            })?;
-        let mut rows = Vec::new();
-        for payload in payloads {
-            rows.extend(decode_rows(&payload));
-        }
-        return Ok(rows);
+                detail: format!("reconnaissance read failed: {e}"),
+            });
     }
 
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
@@ -87,17 +156,17 @@ pub(super) async fn recon_scan_rows(
         tenant_id,
         database_id,
         vshard_id,
-        scan_plan,
+        plan,
         TraceId::ZERO,
     )
     .await?;
     if response.status != crate::bridge::envelope::Status::Ok {
         return Err(crate::Error::Storage {
             engine: "materialized-sum-recon".into(),
-            detail: format!("reconnaissance scan failed: {:?}", response.error_code),
+            detail: format!("reconnaissance read failed: {:?}", response.error_code),
         });
     }
-    Ok(decode_rows(&response.payload))
+    Ok(vec![response.payload.to_vec()])
 }
 
 /// Decode a document-scan payload into one document per row.

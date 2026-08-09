@@ -42,6 +42,12 @@
 //! [`EnforcementCtx::resolved_targets`](crate::data::executor::enforcement::images::EnforcementCtx).
 //! Deriving it here would mean a Data-Plane copy of the primary-key → surrogate
 //! map, which is Control-Plane catalog state.
+//!
+//! A replica reaches this code too — replication ships the SOURCE row and every
+//! node re-executes the plan, so every node folds its own delta — and it gets
+//! the same resolution the same way: carried on the replicated record, decided
+//! once by the node that accepted the statement. Nothing on this path resolves
+//! anything, on a leader or anywhere else.
 
 use redb::WriteTransaction;
 use rust_decimal::Decimal;
@@ -155,6 +161,18 @@ impl CoreLoop {
     /// Identity comes from the plan and only from the plan: the surrogate
     /// resolved on the Control Plane is the one thing that may address the
     /// target row.
+    ///
+    /// A join value the plan carries no entry for is
+    /// [`MaterializedSumResolutionMissing`](crate::Error::MaterializedSumResolutionMissing),
+    /// NOT `MaterializedSumTargetNotFound`. "The target row does not exist" is a
+    /// verdict on the user's statement and it is reached on the Control Plane,
+    /// where the resolution pass fails the statement before any row is written.
+    /// Whatever reaches here has already passed that gate — including every
+    /// write a replica re-executes, which the leader accepted and resolved — so
+    /// an absent entry means the resolution and the fold disagree about which
+    /// rows participate. On a replica there is additionally no user to report a
+    /// user error to, and reporting one would blame the application for a row
+    /// the leader found.
     fn apply_one_delta(
         &mut self,
         txn: &WriteTransaction,
@@ -164,7 +182,7 @@ impl CoreLoop {
         delta: Decimal,
     ) -> crate::Result<TargetWrite> {
         let surrogate = resolved_target(ctx, join_value).ok_or_else(|| {
-            crate::Error::MaterializedSumTargetNotFound {
+            crate::Error::MaterializedSumResolutionMissing {
                 target_collection: binding.target_collection.clone(),
                 join_column: binding.join_column.clone(),
                 join_value: join_value.to_string(),
@@ -459,10 +477,16 @@ mod tests {
         );
     }
 
-    /// A join value with no resolved target fails the write with the typed
-    /// error that names the collection, column and value.
+    /// A join value the plan carries no resolution for fails the write with the
+    /// INTERNAL error, not the user-facing "target not found".
+    ///
+    /// Nothing here says the target row is missing — the plan simply never
+    /// carried its identity. A replica re-executing a write the leader accepted
+    /// hits exactly this shape when the resolution fails to reach it, and
+    /// reporting it as `MaterializedSumTargetNotFound` would tell an operator
+    /// the application referenced an account that does not exist.
     #[test]
-    fn an_unresolved_target_fails_with_the_typed_error() {
+    fn an_unresolved_target_fails_as_an_internal_shortfall() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         core.doc_configs.insert(
@@ -490,7 +514,7 @@ mod tests {
         .unwrap_or_else(|| panic!("an unresolvable target must fail the write"));
 
         match error {
-            crate::Error::MaterializedSumTargetNotFound {
+            crate::Error::MaterializedSumResolutionMissing {
                 target_collection,
                 join_column,
                 join_value,
@@ -499,7 +523,11 @@ mod tests {
                 assert_eq!(join_column, "account_id");
                 assert_eq!(join_value, "a-missing");
             }
-            other => panic!("expected MaterializedSumTargetNotFound, got {other:?}"),
+            other => panic!(
+                "an absent resolution must surface as MaterializedSumResolutionMissing — \
+                 'target not found' is the Control Plane's verdict on the user's statement, \
+                 got {other:?}"
+            ),
         }
     }
 }

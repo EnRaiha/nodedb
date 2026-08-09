@@ -1,10 +1,42 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Document`.
+//!
+//! # The materialized-sum resolution is read off the record, never re-derived
+//!
+//! An applying node re-EXECUTES the write — the record carries the source row,
+//! not a post-image of the derived total — so its own enforcement funnel folds
+//! the delta and maintains the target's balance. That fold needs two things the
+//! node cannot work out for itself: which target row each join-key value names,
+//! and which targets were split onto a sibling `ApplyBalanceDelta` entry. Both
+//! were decided once, by the node that accepted the statement, and both travel
+//! on the record (see `ReplicatedWrite::PointPut::resolved_sum_targets`).
+//!
+//! Re-resolving here was the alternative, and it is not open to us. The
+//! pk → surrogate binding for a target row lives in the catalog of the vShard
+//! that owns that row's primary key — `lookup_surrogate_routed` routes the probe
+//! to that vShard's LEADER — so a node replicating only the source's vShard has
+//! no local answer, and the remote answer is an async round-trip through another
+//! node's committed state taken from inside a synchronous apply loop. Two
+//! replicas asking at different instants could get different answers, which is
+//! precisely the divergence replication exists to prevent. This is the same
+//! contract every other non-derivable value on this wire follows: the leader's
+//! surrogate travels beside `pk_bytes` and is `bind`-installed rather than
+//! re-allocated, and `KvPut::resolved_now_ms` carries the leader's clock rather
+//! than letting each replica read its own.
 
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
+
+/// Lift the wire resolution back into plan shape.
+fn plan_targets(wire: &[(String, u32)]) -> Vec<(String, nodedb_types::Surrogate)> {
+    wire.iter()
+        .map(|(join_value, surrogate)| {
+            (join_value.clone(), nodedb_types::Surrogate::new(*surrogate))
+        })
+        .collect()
+}
 
 pub(super) fn point_put(
     ctx: &DecodeCtx,
@@ -12,6 +44,7 @@ pub(super) fn point_put(
     document_id: &str,
     value: &[u8],
     surrogate: u32,
+    resolved_sum_targets: &[(String, u32)],
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -35,11 +68,23 @@ pub(super) fn point_put(
         // nothing and needs no read gate — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
-        // The replicated record carries no materialized-sum resolution: the
-        // leader resolved it against the catalog at plan time and the record
-        // is the applied write, not the plan that produced it.
-        resolved_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
+}
+
+/// The materialized-sum decisions the proposer made, carried on the record.
+///
+/// The two travel together because they are one decision per binding: the
+/// proposer either resolved the target and folds inline, or deferred it onto a
+/// sibling task. Splitting them across parameters lets a caller pass one and
+/// forget the other, which is a double-counted or a dropped balance.
+pub(super) struct SumDecisions<'a> {
+    /// Join value → target surrogate, resolved by the node that accepted the
+    /// statement. Never re-resolved here — see this module's doc.
+    pub resolved: &'a [(String, u32)],
+    /// Bindings whose delta a sibling task owns, so the inline fold skips them.
+    pub deferred: &'a [String],
 }
 
 pub(super) fn point_insert(
@@ -49,7 +94,12 @@ pub(super) fn point_insert(
     value: &[u8],
     if_absent: bool,
     surrogate: u32,
+    sums: SumDecisions<'_>,
 ) -> crate::Result<PhysicalPlan> {
+    let SumDecisions {
+        resolved: resolved_sum_targets,
+        deferred: deferred_sum_targets,
+    } = sums;
     let pk_bytes = document_id.as_bytes();
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = match ctx.assigner {
@@ -71,9 +121,9 @@ pub(super) fn point_insert(
         // Replay projects nothing back — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
-        deferred_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
+        deferred_sum_targets: deferred_sum_targets.to_vec(),
     }))
 }
 
@@ -82,6 +132,7 @@ pub(super) fn point_delete(
     collection: &str,
     document_id: &str,
     surrogate: u32,
+    resolved_sum_targets: &[(String, u32)],
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -98,8 +149,8 @@ pub(super) fn point_delete(
         // committed, and a follower must apply exactly what the leader applied
         // or the replicas diverge. Both slots stay empty for the same reason.
         rls_write_check: Vec::new(),
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
 }
 
@@ -109,6 +160,7 @@ pub(super) fn point_update(
     document_id: &str,
     updates: &[(String, UpdateValue)],
     surrogate: u32,
+    resolved_sum_targets: &[(String, u32)],
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -123,8 +175,8 @@ pub(super) fn point_update(
         rls_filters: Vec::new(),
         // Empty on replay — see `point_delete`.
         rls_write_check: Vec::new(),
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
 }
 
@@ -135,6 +187,7 @@ pub(super) fn doc_upsert(
     value: &[u8],
     on_conflict_updates: &[(String, UpdateValue)],
     surrogate: u32,
+    resolved_sum_targets: &[(String, u32)],
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -149,8 +202,8 @@ pub(super) fn doc_upsert(
         rls_write_check: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
 }
 
@@ -165,6 +218,8 @@ pub(super) fn batch_insert(
     collection: &str,
     documents: &[(String, Vec<u8>)],
     surrogates: &[u32],
+    resolved_sum_targets: &[(String, u32)],
+    deferred_sum_targets: &[String],
 ) -> crate::Result<PhysicalPlan> {
     // `zip` below stops at the shorter side, so a record that lost surrogates
     // would decode into a plan whose rows have no cross-engine identity — the
@@ -206,9 +261,9 @@ pub(super) fn batch_insert(
         // Replay projects nothing back — see `point_delete`.
         returning: None,
         rls_filters: Vec::new(),
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
-        deferred_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
+        deferred_sum_targets: deferred_sum_targets.to_vec(),
     }))
 }
 
@@ -225,7 +280,12 @@ pub(super) fn bulk_dml(
     filters: &[u8],
     is_update: bool,
     updates: &[(String, UpdateValue)],
+    resolved_sum_targets: &[(String, u32)],
 ) -> PhysicalPlan {
+    // The MATCHES are re-derived locally (same log position ⇒ same rows); the
+    // identity of the targets those matches credit is read off the record — see
+    // this module's doc.
+    let resolved_sum_targets = plan_targets(resolved_sum_targets);
     if is_update {
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
             collection: collection.to_owned(),
@@ -237,8 +297,7 @@ pub(super) fn bulk_dml(
             rls_filters: Vec::new(),
             // Empty on replay — see `point_delete`.
             rls_write_check: Vec::new(),
-            // Not carried by the record — see `point_put`.
-            resolved_sum_targets: Vec::new(),
+            resolved_sum_targets,
         })
     } else {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -250,8 +309,7 @@ pub(super) fn bulk_dml(
             rls_filters: Vec::new(),
             // Empty on replay — see `point_delete`.
             rls_write_check: Vec::new(),
-            // Not carried by the record — see `point_put`.
-            resolved_sum_targets: Vec::new(),
+            resolved_sum_targets,
         })
     }
 }
@@ -260,12 +318,16 @@ pub(super) fn bulk_dml(
 /// and clearing a collection is idempotent + deterministic, so every replica
 /// safely re-executes the same clear on apply. No surrogate binding: there is
 /// no per-row identity, just a whole-collection clear.
-pub(super) fn truncate(collection: &str, restart_identity: bool) -> PhysicalPlan {
+pub(super) fn truncate(
+    collection: &str,
+    restart_identity: bool,
+    resolved_sum_targets: &[(String, u32)],
+) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Truncate {
         collection: collection.to_owned(),
         restart_identity,
-        // Not carried by the record — see `point_put`.
-        resolved_sum_targets: Vec::new(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
     })
 }
 

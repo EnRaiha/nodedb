@@ -19,6 +19,25 @@ pub enum ReplicatedWrite {
         document_id: String,
         value: Vec<u8>,
         surrogate: u32,
+        /// The materialized-sum resolution the PROPOSING node performed: each
+        /// join-key VALUE this write's rows carry, paired with the surrogate of
+        /// the target row that value names.
+        ///
+        /// Carried on the wire for the same reason `KvPut::resolved_now_ms` is:
+        /// it is resolved once, by the node that accepted the statement, and no
+        /// applying node may re-derive it. The pk → surrogate map lives in the
+        /// catalog of the vShard that OWNS the target's primary key
+        /// (`lookup_surrogate_routed` routes the probe to that vShard's leader),
+        /// so an applier holding only the SOURCE vShard's replica cannot answer
+        /// the question locally, and answering it remotely would put a network
+        /// round-trip — and another node's clock of committed state — inside the
+        /// apply loop. Shipping the answer makes the follower's derived total
+        /// identical to the leader's by construction.
+        ///
+        /// Empty for every write whose collection drives no binding, which is
+        /// nearly all of them.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     PointInsert {
         collection: String,
@@ -27,17 +46,36 @@ pub enum ReplicatedWrite {
         #[serde(default)]
         if_absent: bool,
         surrogate: u32,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
+        /// Target collections whose delta the proposing node split onto its own
+        /// `ApplyBalanceDelta` entry because the target homes to a different
+        /// vShard.
+        ///
+        /// Travels with the write for the same reason the resolution does, and
+        /// with sharper consequences: an applier that did not read this list
+        /// would fold the delta locally AND receive the sibling entry, counting
+        /// the same amount twice.
+        #[serde(default)]
+        deferred_sum_targets: Vec<String>,
     },
     PointDelete {
         collection: String,
         document_id: String,
         surrogate: u32,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     PointUpdate {
         collection: String,
         document_id: String,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
         surrogate: u32,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     DocUpsert {
         collection: String,
@@ -45,11 +83,20 @@ pub enum ReplicatedWrite {
         value: Vec<u8>,
         on_conflict_updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
         surrogate: u32,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     DocBatchInsert {
         collection: String,
         documents: Vec<(String, Vec<u8>)>,
         surrogates: Vec<u32>,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointInsert::deferred_sum_targets`.
+        #[serde(default)]
+        deferred_sum_targets: Vec<String>,
     },
     VectorInsert {
         collection: String,
@@ -389,6 +436,15 @@ pub enum ReplicatedWrite {
         filters: Vec<u8>,
         is_update: bool,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
+        /// See `PointPut::resolved_sum_targets`.
+        ///
+        /// A predicate write re-derives its MATCHING rows on every replica, but
+        /// not the identity of the target rows those matches credit: that came
+        /// from a reconnaissance scan the proposing node ran against the target
+        /// collection's catalog. The matches are deterministic; the resolution
+        /// is not derivable.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     ColumnarBulkDml {
         collection: String,
@@ -449,6 +505,11 @@ pub enum ReplicatedWrite {
     DocTruncate {
         collection: String,
         restart_identity: bool,
+        /// See `BulkDml::resolved_sum_targets` — a truncate names its rows by
+        /// the whole collection, and every one of them takes its contribution
+        /// back off a target the proposing node had to resolve.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
     },
     KvTruncate {
         collection: String,

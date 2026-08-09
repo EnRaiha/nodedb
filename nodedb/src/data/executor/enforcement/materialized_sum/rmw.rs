@@ -65,6 +65,14 @@ impl BalanceRmw<'_> {
     /// Skipping instead would leave the stored total short of the `SUM(...)`
     /// that `VERIFY_BALANCE` recomputes over every source row — the feature
     /// would report itself broken.
+    ///
+    /// This one IS about the user's data, unlike
+    /// [`MaterializedSumResolutionMissing`](crate::Error::MaterializedSumResolutionMissing):
+    /// identity resolved, and the row that identity names is not in storage —
+    /// the target was deleted while its binding survived. A replica applying a
+    /// write the leader accepted cannot reach it: the target row's own write
+    /// precedes this one in the same log, so by the time this delta applies the
+    /// row is present on every replica that has applied that far.
     fn target_not_found(&self) -> crate::Error {
         crate::Error::MaterializedSumTargetNotFound {
             target_collection: self.target_collection.to_string(),

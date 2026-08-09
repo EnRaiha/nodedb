@@ -169,6 +169,13 @@ impl From<Error> for NodeDbError {
                      '{join_column}'"
                 ),
             ),
+            // NOT a balance violation: nothing about the user's data is wrong.
+            // The plan and the fold disagreed about which rows participate, so
+            // it surfaces as the internal defect it is rather than accusing the
+            // statement of naming a row that does not exist.
+            err @ Error::MaterializedSumResolutionMissing { .. } => {
+                NodeDbError::internal(err.to_string())
+            }
             Error::PeriodLocked {
                 collection, detail, ..
             } => NodeDbError::period_locked(collection, detail),

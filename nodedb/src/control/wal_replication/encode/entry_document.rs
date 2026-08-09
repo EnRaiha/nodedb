@@ -25,10 +25,18 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // follower re-applies the write, it does not answer the client.
             returning: _,
             rls_filters: _,
-            // Resolved against the leader's catalog at plan time; the record
-            // carries the applied row, not the plan that produced it.
-            resolved_sum_targets: _,
-        } => document::point_put(collection, document_id, value, surrogate.as_u32()),
+            // Resolved against the proposing node's catalog at plan time, and
+            // copied onto the record: the applier re-executes this write and
+            // maintains the derived total itself, but cannot resolve the target
+            // row's identity — see `document`'s module doc.
+            resolved_sum_targets,
+        } => document::point_put(
+            collection,
+            document_id,
+            value,
+            surrogate.as_u32(),
+            resolved_sum_targets,
+        ),
         DocumentOp::PointInsert {
             collection,
             document_id,
@@ -38,28 +46,45 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             returning: _,
             rls_filters: _,
             // See `PointPut`.
-            resolved_sum_targets: _,
-            deferred_sum_targets: _,
+            resolved_sum_targets,
+            deferred_sum_targets,
         } => document::point_insert(
             collection,
             document_id,
             value,
             *if_absent,
             surrogate.as_u32(),
+            resolved_sum_targets,
+            deferred_sum_targets,
         ),
         DocumentOp::PointDelete {
             collection,
             document_id,
             surrogate,
+            // See `PointPut`.
+            resolved_sum_targets,
             ..
-        } => document::point_delete(collection, document_id, surrogate.as_u32()),
+        } => document::point_delete(
+            collection,
+            document_id,
+            surrogate.as_u32(),
+            resolved_sum_targets,
+        ),
         DocumentOp::PointUpdate {
             collection,
             document_id,
             updates,
             surrogate,
+            // See `PointPut`.
+            resolved_sum_targets,
             ..
-        } => document::point_update(collection, document_id, updates, surrogate.as_u32()),
+        } => document::point_update(
+            collection,
+            document_id,
+            updates,
+            surrogate.as_u32(),
+            resolved_sum_targets,
+        ),
         DocumentOp::Upsert {
             collection,
             document_id,
@@ -72,13 +97,14 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             returning: _,
             rls_filters: _,
             // See `PointPut`.
-            resolved_sum_targets: _,
+            resolved_sum_targets,
         } => document::upsert(
             collection,
             document_id,
             value,
             on_conflict_updates,
             surrogate.as_u32(),
+            resolved_sum_targets,
         ),
         DocumentOp::BulkDelete {
             collection,
@@ -88,9 +114,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_edges: None,
             rls_filters: _,
             rls_write_check: _,
-            // See `PointPut`: the record is the applied write, not the plan.
-            resolved_sum_targets: _,
-        } => document::bulk_delete(collection, filters),
+            // See `PointPut`. The predicate's MATCHES are re-derived by every
+            // replica; the identity of the targets they credit is not.
+            resolved_sum_targets,
+        } => document::bulk_delete(collection, filters, resolved_sum_targets),
         DocumentOp::BulkUpdate {
             collection,
             filters,
@@ -100,9 +127,9 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_edges: None,
             rls_filters: _,
             rls_write_check: _,
-            // See `PointPut`.
-            resolved_sum_targets: _,
-        } => document::bulk_update(collection, filters, updates),
+            // See `BulkDelete`.
+            resolved_sum_targets,
+        } => document::bulk_update(collection, filters, updates, resolved_sum_targets),
         DocumentOp::InsertSelect {
             target_collection,
             source_collection,
@@ -122,9 +149,15 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             returning: _,
             rls_filters: _,
             // See `PointPut`.
-            resolved_sum_targets: _,
-            deferred_sum_targets: _,
-        } => document::batch_insert(collection, documents, surrogates),
+            resolved_sum_targets,
+            deferred_sum_targets,
+        } => document::batch_insert(
+            collection,
+            documents,
+            surrogates,
+            resolved_sum_targets,
+            deferred_sum_targets,
+        ),
 
         // Known replication gaps: genuine writes not yet wired to a
         // `ReplicatedWrite`. The data still lands via the leader's own
@@ -137,8 +170,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             collection,
             restart_identity,
             // See `PointPut`.
-            resolved_sum_targets: _,
-        } => document::truncate(collection, *restart_identity),
+            resolved_sum_targets,
+        } => document::truncate(collection, *restart_identity, resolved_sum_targets),
         // OLLP-prepared bulk plans carrying predicted surrogates/edges route
         // via the cross-shard Calvin path, not single-shard Raft proposal, so
         // they are intentionally not encoded here.

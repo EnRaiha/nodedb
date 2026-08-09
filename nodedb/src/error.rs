@@ -91,6 +91,38 @@ pub enum Error {
         join_value: String,
     },
 
+    /// A plan reached the write path carrying no target surrogate for a join
+    /// value its own rows require.
+    ///
+    /// Distinct from [`Self::MaterializedSumTargetNotFound`], and never
+    /// interchangeable with it. That error is a verdict about the USER's
+    /// statement: the join key names no row in the target collection, and it is
+    /// reached on the Control Plane, while the statement is still in scope and
+    /// the client is still there to be told. By the time a plan reaches the
+    /// write path, that question has already been answered — a resolution is
+    /// either present or the statement never got here. So a value the fold
+    /// requires and the plan does not carry means the resolution pass and the
+    /// fold disagree about which rows participate, which is a defect in this
+    /// system, not in the statement.
+    ///
+    /// The distinction is load-bearing on a replica. A replica re-executing a
+    /// write the leader accepted has no user to report a user error to, and
+    /// "the target row does not exist" would be a false statement about a row
+    /// the leader resolved successfully. Reporting the internal shortfall as
+    /// what it is keeps a replication defect from being read — by an operator or
+    /// by an error-code consumer — as the application referencing a missing
+    /// account.
+    #[error(
+        "materialized sum resolution missing: the plan carries no target row in \
+         '{target_collection}' for join value '{join_value}' of join column '{join_column}', \
+         which the rows it is writing require"
+    )]
+    MaterializedSumResolutionMissing {
+        target_collection: String,
+        join_column: String,
+        join_value: String,
+    },
+
     #[error("period locked on {collection}: {detail}")]
     PeriodLocked { collection: String, detail: String },
 
