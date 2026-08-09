@@ -3,7 +3,8 @@
 //! Roundtrip tests for json_msgpack reader/writer.
 
 use crate::json_msgpack::{
-    json_from_msgpack, json_to_msgpack, value_from_msgpack, value_to_msgpack,
+    MsgpackError, json_from_msgpack, json_to_msgpack, msgpack_to_json_string, value_from_msgpack,
+    value_to_msgpack,
 };
 use serde_json::json;
 
@@ -124,6 +125,47 @@ fn native_value_roundtrip() {
         }
         other => panic!("expected Array, got {other:?}"),
     }
+}
+
+/// The readers decode exactly one top-level value. Bytes left over mean the
+/// input is not the value it claims to be, so returning the leading value would
+/// report success on corrupt input.
+#[test]
+fn trailing_byte_is_rejected() {
+    let val = json!({"a": 1, "b": "two"});
+    let mut bytes = json_to_msgpack(&val).unwrap();
+    assert_eq!(json_from_msgpack(&bytes).unwrap(), val);
+
+    bytes.push(0xC0);
+    match json_from_msgpack(&bytes) {
+        Err(MsgpackError::TrailingBytes { consumed, total }) => {
+            assert_eq!(total, consumed + 1);
+        }
+        other => panic!("expected TrailingBytes, got {other:?}"),
+    }
+    assert!(value_from_msgpack(&bytes).is_err());
+    assert!(msgpack_to_json_string(&bytes).is_err());
+}
+
+#[test]
+fn two_concatenated_values_are_rejected() {
+    let first = json_to_msgpack(&json!({"a": 1})).unwrap();
+    let second = json_to_msgpack(&json!({"b": 2})).unwrap();
+    let mut joined = first.clone();
+    joined.extend_from_slice(&second);
+
+    assert!(json_from_msgpack(&first).is_ok());
+    assert!(json_from_msgpack(&joined).is_err());
+    assert!(value_from_msgpack(&joined).is_err());
+    assert!(msgpack_to_json_string(&joined).is_err());
+}
+
+#[test]
+fn empty_input_is_unchanged() {
+    // Readers still fail on empty input; the transcoder still yields "".
+    assert!(json_from_msgpack(&[]).is_err());
+    assert!(value_from_msgpack(&[]).is_err());
+    assert_eq!(msgpack_to_json_string(&[]).unwrap(), "");
 }
 
 #[test]

@@ -5,6 +5,8 @@
 //! Deterministic raw byte parser — the first byte of each msgpack value
 //! unambiguously identifies its type per the msgpack specification.
 
+use super::error::{MsgpackError, MsgpackResult};
+
 pub(crate) struct Cursor<'a> {
     pub(crate) data: &'a [u8],
     pub(crate) pos: usize,
@@ -54,18 +56,46 @@ impl<'a> Cursor<'a> {
         let b = self.take_n(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
+
+    /// Assert the whole input belonged to the value just read.
+    ///
+    /// A body carries exactly one top-level value, so anything left over means
+    /// the bytes are not the value they claim to be — a stray suffix, a
+    /// truncated body with another appended, or two values in one slot.
+    /// Returning the leading value and dropping the rest would report success
+    /// on corrupt bytes, so the remainder is an error.
+    pub(crate) fn finish(&self) -> MsgpackResult<()> {
+        if self.pos == self.data.len() {
+            Ok(())
+        } else {
+            Err(MsgpackError::TrailingBytes {
+                consumed: self.pos,
+                total: self.data.len(),
+            })
+        }
+    }
 }
 
 /// Deserialize a `serde_json::Value` from MessagePack bytes.
-pub fn json_from_msgpack(bytes: &[u8]) -> zerompk::Result<serde_json::Value> {
+///
+/// The input must contain exactly one top-level value and nothing else;
+/// trailing bytes are rejected.
+pub fn json_from_msgpack(bytes: &[u8]) -> MsgpackResult<serde_json::Value> {
     let mut cursor = Cursor::new(bytes);
-    read_json_value(&mut cursor)
+    let value = read_json_value(&mut cursor)?;
+    cursor.finish()?;
+    Ok(value)
 }
 
 /// Deserialize a `nodedb_types::Value` from standard MessagePack bytes.
-pub fn value_from_msgpack(bytes: &[u8]) -> zerompk::Result<crate::Value> {
+///
+/// The input must contain exactly one top-level value and nothing else;
+/// trailing bytes are rejected.
+pub fn value_from_msgpack(bytes: &[u8]) -> MsgpackResult<crate::Value> {
     let mut cursor = Cursor::new(bytes);
-    read_native_value(&mut cursor)
+    let value = read_native_value(&mut cursor)?;
+    cursor.finish()?;
+    Ok(value)
 }
 
 // ── JSON value reader ──

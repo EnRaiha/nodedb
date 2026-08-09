@@ -8,16 +8,21 @@
 
 use std::fmt::Write as _;
 
+use super::error::MsgpackResult;
 use super::reader::{Cursor, base64_encode};
 
 /// Transcode raw msgpack bytes to a JSON string without intermediate types.
-pub fn msgpack_to_json_string(bytes: &[u8]) -> zerompk::Result<String> {
+///
+/// The input must contain exactly one top-level value and nothing else;
+/// trailing bytes are rejected rather than silently dropped.
+pub fn msgpack_to_json_string(bytes: &[u8]) -> MsgpackResult<String> {
     if bytes.is_empty() {
         return Ok(String::new());
     }
     let mut c = Cursor::new(bytes);
     let mut out = String::with_capacity(bytes.len() * 2);
     transcode_value(&mut c, &mut out)?;
+    c.finish()?;
     Ok(out)
 }
 

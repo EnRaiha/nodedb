@@ -60,7 +60,7 @@ pub enum ColumnarError {
     #[error("MessagePack deserialization error for column '{column}': {source}")]
     MsgpackDeserialize {
         column: String,
-        source: zerompk::Error,
+        source: nodedb_types::MsgpackError,
     },
 
     #[error("null violation: column '{0}' is NOT NULL")]
