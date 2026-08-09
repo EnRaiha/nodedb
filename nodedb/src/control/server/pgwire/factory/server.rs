@@ -18,6 +18,7 @@ use crate::control::state::SharedState;
 use super::super::connection_identity::PgConnectionContext;
 use super::super::connection_registry::{ConnectionRegistry, ConnectionRegistryError};
 use super::super::handler::{NodeDbCopyHandler, NodeDbPgHandler};
+use super::super::wire_safe_error::WireSafeErrorHandler;
 use super::auth::NodeDbAuthSource;
 use super::provider::nodedb_parameter_provider;
 use super::startup::AuthStartup;
@@ -32,7 +33,10 @@ pub(crate) struct ConnectionHandlers {
     pub(crate) query: Arc<NodeDbPgHandler>,
     pub(crate) copy: Arc<NodeDbCopyHandler>,
     pub(crate) cancel: Arc<NoopHandler>,
-    pub(crate) error: Arc<NoopHandler>,
+    /// Last-stop wire safety: rewrites any control byte an error message picked
+    /// up from a stored value or a foreign error's `Display` before pgwire
+    /// serialises it, since an interior NUL desynchronises the whole frame.
+    pub(crate) error: Arc<WireSafeErrorHandler>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,7 +136,7 @@ impl NodeDbPgHandlerFactory {
                 connection_id: context.id,
             }),
             cancel: Arc::new(NoopHandler),
-            error: Arc::new(NoopHandler),
+            error: Arc::new(WireSafeErrorHandler),
         }
     }
 

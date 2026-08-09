@@ -13,3 +13,4 @@ pub mod numeric_narrow;
 pub mod session_encode;
 pub mod system_functions;
 pub mod types;
+pub(crate) mod wire_safe_error;
