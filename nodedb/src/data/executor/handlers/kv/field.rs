@@ -86,7 +86,7 @@ impl CoreLoop {
             result.insert(f.clone(), v);
         }
 
-        match response_codec::encode_json(&serde_json::Value::Object(result)) {
+        match response_codec::encode_json_as_msgpack(&serde_json::Value::Object(result)) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
@@ -146,7 +146,7 @@ impl CoreLoop {
             surrogate,
         });
         self.note_kv_write_lsn(task, did, tid, collection, key);
-        match response_codec::encode_json(
+        match response_codec::encode_json_as_msgpack(
             &serde_json::json!({ "fields_added": computed.fields_added }),
         ) {
             Ok(payload) => self.response_with_payload(task, payload),

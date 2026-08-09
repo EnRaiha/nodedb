@@ -215,7 +215,7 @@ impl CoreLoop {
             },
         );
 
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "source_key": src_str,
             "dest_key": dst_str,
             "field": field,
@@ -328,7 +328,7 @@ impl CoreLoop {
             None,
         );
 
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "item_key": item_str,
             "dest_key": dest_str,
             "source_collection": source_collection,

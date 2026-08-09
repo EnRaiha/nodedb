@@ -159,7 +159,7 @@ impl CoreLoop {
         if let Err(e) = self.stage_put_capped(ctx, computed.new_value) {
             return self.response_error(ctx.task, e);
         }
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "fields_added": computed.fields_added,
         })) {
             Ok(payload) => self.response_with_payload(ctx.task, payload),
@@ -229,7 +229,7 @@ impl CoreLoop {
 
         let src_str = String::from_utf8_lossy(source_key);
         let dst_str = String::from_utf8_lossy(dest_key);
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "source_key": src_str,
             "dest_key": dst_str,
             "field": field,
@@ -289,7 +289,7 @@ impl CoreLoop {
 
         let item_str = String::from_utf8_lossy(item_key);
         let dest_str = String::from_utf8_lossy(dest_key);
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "item_key": item_str,
             "dest_key": dest_str,
             "source_collection": source_collection,

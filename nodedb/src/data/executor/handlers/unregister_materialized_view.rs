@@ -96,7 +96,7 @@ impl CoreLoop {
             "engines_removed": engines_removed,
             "segments_removed": segments_removed,
         });
-        match crate::data::executor::response_codec::encode_json(&summary) {
+        match crate::data::executor::response_codec::encode_json_as_msgpack(&summary) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(_) => self.response_ok(task),
         }

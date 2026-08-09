@@ -76,7 +76,7 @@ impl CoreLoop {
             "index": index_name,
             "backfilled": backfilled,
         });
-        match response_codec::encode_json(&result) {
+        match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
         }
@@ -93,7 +93,7 @@ impl CoreLoop {
 
         if self.kv_engine.drop_sorted_index(did, tid, index_name) {
             let result = serde_json::json!({ "dropped": index_name });
-            match response_codec::encode_json(&result) {
+            match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(task, e),
             }
@@ -117,14 +117,18 @@ impl CoreLoop {
             .kv_engine
             .sorted_index_rank(did, tid, index_name, primary_key, now_ms)
         {
-            Some(rank) => match response_codec::encode_json(&serde_json::json!({ "rank": rank })) {
-                Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(task, e),
-            },
-            None => match response_codec::encode_json(&serde_json::json!({ "rank": null })) {
-                Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(task, e),
-            },
+            Some(rank) => {
+                match response_codec::encode_json_as_msgpack(&serde_json::json!({ "rank": rank })) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => self.response_error(task, e),
+                }
+            }
+            None => {
+                match response_codec::encode_json_as_msgpack(&serde_json::json!({ "rank": null })) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => self.response_error(task, e),
+                }
+            }
         }
     }
 
@@ -245,15 +249,18 @@ impl CoreLoop {
             Some(sort_key) => {
                 let b64 =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sort_key);
-                match response_codec::encode_json(&serde_json::json!({ "score": b64 })) {
+                match response_codec::encode_json_as_msgpack(&serde_json::json!({ "score": b64 })) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(task, e),
                 }
             }
-            None => match response_codec::encode_json(&serde_json::json!({ "score": null })) {
-                Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(task, e),
-            },
+            None => {
+                match response_codec::encode_json_as_msgpack(&serde_json::json!({ "score": null }))
+                {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => self.response_error(task, e),
+                }
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::data::executor::response_codec::encode_json;
+use crate::data::executor::response_codec::encode_json_as_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
@@ -380,7 +380,7 @@ impl CoreLoop {
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
-            match encode_json(&result) {
+            match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(

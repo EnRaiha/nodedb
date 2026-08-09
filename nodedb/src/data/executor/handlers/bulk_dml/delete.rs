@@ -409,7 +409,7 @@ impl CoreLoop {
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
-            match response_codec::encode_json(&result) {
+            match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => {
                     return self.response_error(

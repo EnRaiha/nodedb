@@ -207,7 +207,7 @@ impl CoreLoop {
             "l1_bytes_freed": l1_stats.bytes_freed,
         });
 
-        match crate::data::executor::response_codec::encode_json(&summary) {
+        match crate::data::executor::response_codec::encode_json_as_msgpack(&summary) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(_) => self.response_ok(task),
         }

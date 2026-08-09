@@ -25,7 +25,7 @@ use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorR
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
-use crate::data::executor::response_codec::encode_json;
+use crate::data::executor::response_codec::encode_json_as_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
 
@@ -162,7 +162,7 @@ impl CoreLoop {
                 return self.encode_resolved_update_rows(task, Vec::new());
             }
             let result = serde_json::json!({ "affected": 0u64 });
-            return match encode_json(&result) {
+            return match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
                     task,
@@ -355,7 +355,7 @@ impl CoreLoop {
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
-            match encode_json(&result) {
+            match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
                     task,

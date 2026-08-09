@@ -370,7 +370,7 @@ impl CoreLoop {
     /// Encode the shared `{"affected": N}` payload columnar predicate DML
     /// returns (matching `execute_columnar_delete` / `execute_columnar_update`).
     fn stage_columnar_dml_response(&self, task: &ExecutionTask, affected: usize) -> Response {
-        match response_codec::encode_json(&serde_json::json!({ "affected": affected })) {
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

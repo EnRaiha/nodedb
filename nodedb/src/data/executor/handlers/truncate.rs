@@ -157,7 +157,7 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, truncated, "truncate complete");
         let result = serde_json::json!({ "truncated": truncated });
-        let mut response = match response_codec::encode_json(&result) {
+        let mut response = match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 return self.response_error(
@@ -194,7 +194,7 @@ impl CoreLoop {
                     "row_count": stats.row_count,
                     "null_count": stats.null_count,
                 });
-                match response_codec::encode_json(&result) {
+                match response_codec::encode_json_as_msgpack(&result) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,
@@ -212,7 +212,7 @@ impl CoreLoop {
                     "row_count": 0,
                     "null_count": 0,
                 });
-                match response_codec::encode_json(&result) {
+                match response_codec::encode_json_as_msgpack(&result) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,

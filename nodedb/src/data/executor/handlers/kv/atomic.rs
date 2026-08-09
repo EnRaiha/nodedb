@@ -86,7 +86,9 @@ impl CoreLoop {
                     None,
                 );
                 self.note_kv_write_lsn(task, did, tid, collection, key);
-                match response_codec::encode_json(&serde_json::json!({ "value": new_value })) {
+                match response_codec::encode_json_as_msgpack(
+                    &serde_json::json!({ "value": new_value }),
+                ) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,
@@ -172,7 +174,9 @@ impl CoreLoop {
                     None,
                 );
                 self.note_kv_write_lsn(task, did, tid, collection, key);
-                match response_codec::encode_json(&serde_json::json!({ "value": new_value })) {
+                match response_codec::encode_json_as_msgpack(
+                    &serde_json::json!({ "value": new_value }),
+                ) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,
@@ -269,7 +273,7 @@ impl CoreLoop {
             .current_value
             .as_ref()
             .map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v));
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "success": result.success,
             "current_value": current_b64,
         })) {
@@ -367,7 +371,7 @@ impl CoreLoop {
 
         let old_b64 = disclosable_old
             .map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v));
-        match response_codec::encode_json(&serde_json::json!({ "old_value": old_b64 })) {
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({ "old_value": old_b64 })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

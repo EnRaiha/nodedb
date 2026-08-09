@@ -6,7 +6,7 @@
 //!
 //! # Every encoder here emits MessagePack
 //!
-//! Including the ones whose names mention JSON: `encode_json` and
+//! Including the ones whose names mention JSON: `encode_json_as_msgpack` and
 //! `encode_json_vec_as_msgpack` are named for the `serde_json::Value` they
 //! TAKE, never for what they produce. A Control-Plane caller that hands these
 //! bytes to a JSON parser gets a parse failure on the first byte, and a caller
@@ -35,7 +35,9 @@ pub(in crate::data::executor) fn encode<T: zerompk::ToMessagePack>(
 ///
 /// Named for its INPUT: the output is MessagePack, like every encoder in this
 /// module. Read back with [`decode_payload`] / [`decode_payload_to_json`].
-pub(in crate::data::executor) fn encode_json(value: &serde_json::Value) -> crate::Result<Vec<u8>> {
+pub(in crate::data::executor) fn encode_json_as_msgpack(
+    value: &serde_json::Value,
+) -> crate::Result<Vec<u8>> {
     nodedb_types::json_to_msgpack(value).map_err(|e| crate::Error::Codec {
         detail: format!("response serialization: {e}"),
     })
@@ -52,7 +54,7 @@ pub(in crate::data::executor) fn encode_serde<T: serde::Serialize>(
     let json_value = serde_json::to_value(value).map_err(|e| crate::Error::Codec {
         detail: format!("serde serialization: {e}"),
     })?;
-    encode_json(&json_value)
+    encode_json_as_msgpack(&json_value)
 }
 
 /// Encode a slice of `serde_json::Value` rows as MessagePack bytes.
@@ -112,7 +114,7 @@ pub(in crate::data::executor) fn encode_count(key: &str, count: usize) -> crate:
 ///
 /// THE counterpart to the encoders above, and the only correct way for a
 /// Control-Plane caller to read one of their payloads back. Every encoder in
-/// this module emits MessagePack — including `encode_json` and
+/// this module emits MessagePack — including `encode_json_as_msgpack` and
 /// `encode_json_vec_as_msgpack`, which are named for the `serde_json::Value`
 /// they take — so a bare `sonic_rs::from_slice` / `serde_json::from_slice` on
 /// these bytes fails on the first byte, every time.

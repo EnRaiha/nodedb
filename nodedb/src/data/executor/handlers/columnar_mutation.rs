@@ -239,7 +239,7 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, affected, "columnar update complete");
         let result = serde_json::json!({ "affected": affected });
-        match super::super::response_codec::encode_json(&result) {
+        match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
@@ -392,7 +392,7 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, affected, "columnar delete complete");
         let result = serde_json::json!({ "affected": affected });
-        match super::super::response_codec::encode_json(&result) {
+        match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

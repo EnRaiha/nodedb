@@ -15,7 +15,7 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::response_codec::encode_json;
+use crate::data::executor::response_codec::encode_json_as_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::document::merge_types::MergeClauseKind as MergeClauseKindOp;
 
@@ -239,7 +239,7 @@ impl CoreLoop {
         }
 
         let result = serde_json::json!({ "affected": affected });
-        match encode_json(&result) {
+        match encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

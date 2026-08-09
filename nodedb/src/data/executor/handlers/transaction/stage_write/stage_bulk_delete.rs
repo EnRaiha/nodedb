@@ -135,7 +135,7 @@ impl CoreLoop {
             affected += 1;
         }
 
-        match response_codec::encode_json(&serde_json::json!({ "affected": affected })) {
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

@@ -203,7 +203,7 @@ impl CoreLoop {
             "spatial_indexes_removed": spatial_removed,
         });
 
-        match crate::data::executor::response_codec::encode_json(&summary) {
+        match crate::data::executor::response_codec::encode_json_as_msgpack(&summary) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(_) => self.response_ok(task),
         }

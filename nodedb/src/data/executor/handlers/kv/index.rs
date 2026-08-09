@@ -47,7 +47,7 @@ impl CoreLoop {
                 backfill,
                 now_ms,
             });
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "index": field,
             "backfilled": backfilled,
             "write_amp_estimate": format!("{:.0}%", 15.0 + 10.0 * self.kv_engine.index_count(did, tid, collection) as f64),
@@ -72,7 +72,7 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, %field, "kv drop index");
         let removed = self.kv_engine.drop_index(did, tid, collection, field);
-        match response_codec::encode_json(&serde_json::json!({
+        match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "index": field,
             "entries_removed": removed,
         })) {

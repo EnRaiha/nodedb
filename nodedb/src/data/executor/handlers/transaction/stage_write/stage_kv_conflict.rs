@@ -111,7 +111,7 @@ impl CoreLoop {
             return self.response_error(ctx.task, e);
         }
 
-        let payload = match response_codec::encode_json(&serde_json::json!({
+        let payload = match response_codec::encode_json_as_msgpack(&serde_json::json!({
             "affected": 1,
             "op": op,
         })) {

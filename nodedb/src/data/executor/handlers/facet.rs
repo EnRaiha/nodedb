@@ -109,7 +109,9 @@ impl CoreLoop {
             self.aggregate_cache.insert(cache_key, bytes);
         }
 
-        match super::super::response_codec::encode_json(&serde_json::Value::Object(facet_result)) {
+        match super::super::response_codec::encode_json_as_msgpack(&serde_json::Value::Object(
+            facet_result,
+        )) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

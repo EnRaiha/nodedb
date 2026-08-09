@@ -365,7 +365,7 @@ impl CoreLoop {
     // ── Shared response helpers ──────────────────────────────────────────
 
     fn kv_atomic_json_response(&self, task: &ExecutionTask, value: &serde_json::Value) -> Response {
-        match response_codec::encode_json(value) {
+        match response_codec::encode_json_as_msgpack(value) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
         }

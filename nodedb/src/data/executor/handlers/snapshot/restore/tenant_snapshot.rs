@@ -364,7 +364,7 @@ impl CoreLoop {
             "timeseries_restored": ts_written,
             "columnar_engines_restored": snap.columnar_engines.len(),
         });
-        match crate::data::executor::response_codec::encode_json(&result) {
+        match crate::data::executor::response_codec::encode_json_as_msgpack(&result) {
             Ok(p) => self.response_with_payload(task, p),
             Err(e) => self.response_error(
                 task,

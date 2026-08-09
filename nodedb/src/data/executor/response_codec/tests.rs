@@ -235,7 +235,7 @@ fn decode_payload_treats_an_empty_payload_as_an_empty_result() {
 #[test]
 fn decode_payload_errors_on_an_undecodable_payload() {
     // Valid msgpack, wrong shape for the target type.
-    let payload = encode_json(&serde_json::json!("not a row list")).unwrap();
+    let payload = encode_json_as_msgpack(&serde_json::json!("not a row list")).unwrap();
     let decoded: crate::Result<Vec<serde_json::Value>> = decode_payload(&payload);
     assert!(
         decoded.is_err(),

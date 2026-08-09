@@ -419,7 +419,7 @@ impl CoreLoop {
                 "collection": collection,
             })
         };
-        let json = match response_codec::encode_json(&result) {
+        let json = match response_codec::encode_json_as_msgpack(&result) {
             Ok(b) => b,
             Err(e) => {
                 return self.response_error(

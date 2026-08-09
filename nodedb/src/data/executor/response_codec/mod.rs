@@ -35,7 +35,8 @@ pub use arrow::encode_as_arrow_ipc;
 pub(in crate::data::executor) use decode::decode_response_to_docs;
 pub use encode::{decode_payload, decode_payload_to_json};
 pub(in crate::data::executor) use encode::{
-    encode, encode_count, encode_json, encode_json_vec_as_msgpack, encode_serde, encode_value_vec,
+    encode, encode_count, encode_json_as_msgpack, encode_json_vec_as_msgpack, encode_serde,
+    encode_value_vec,
 };
 #[allow(unused_imports)]
 pub(crate) use hits::ArrayAggregateResponse;

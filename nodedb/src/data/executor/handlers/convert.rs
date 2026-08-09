@@ -60,7 +60,7 @@ impl CoreLoop {
                     "target_type": target_type,
                     "collection": collection,
                 });
-                match response_codec::encode_json(&result) {
+                match response_codec::encode_json_as_msgpack(&result) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
                         task,
@@ -165,7 +165,7 @@ impl CoreLoop {
             "target_type": "document_strict",
             "collection": collection,
         });
-        match response_codec::encode_json(&result) {
+        match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
