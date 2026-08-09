@@ -13,7 +13,7 @@
 //! handler; only the result construction changed from pgwire `Response` /
 //! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
-use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::{MovePhase, MoveTenantJournalEntry, SystemCatalog};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
@@ -21,7 +21,7 @@ use crate::types::{DatabaseId, TenantId};
 use super::super::super::super::result::{DdlError, DdlResult};
 use super::super::support::{ddl_err, status};
 use super::entry::SNAPSHOT_TIMEOUT;
-use super::journal::{self, MovePhase, MoveTenantJournalEntry};
+use super::journal;
 use super::{cutover, drain, snapshot};
 use nodedb_types::error::sqlstate;
 

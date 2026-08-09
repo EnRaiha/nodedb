@@ -3,14 +3,12 @@
 //! `_system.move_tenant_journal` redb CRUD.
 //!
 //! These methods live inside the `catalog` module so they have direct access
-//! to `SystemCatalog::db`.  They are called exclusively by the
-//! `control::server::shared::ddl::neutral::tenant::move_tenant::journal` module.
+//! to `SystemCatalog::db`. The `MOVE TENANT` workflow drives them through the
+//! thin wrappers it keeps beside the rest of that workflow.
 
+use super::move_tenant_journal_types::{MOVE_TENANT_JOURNAL, MoveTenantJournalEntry};
 use super::system_catalog::SystemCatalog;
 use super::types::catalog_err;
-use crate::control::server::shared::ddl::neutral::tenant::move_tenant::journal::{
-    MOVE_TENANT_JOURNAL, MoveTenantJournalEntry,
-};
 use redb::ReadableDatabase;
 
 impl SystemCatalog {

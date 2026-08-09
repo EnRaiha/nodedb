@@ -133,6 +133,5 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "mirror_collection_map" => MIRROR_COLLECTION_MAP,
     "mirror_lag" => MIRROR_LAG,
     // ── Tenant relocation ──
-    "move_tenant_journal" =>
-        crate::control::server::shared::ddl::neutral::tenant::move_tenant::journal::MOVE_TENANT_JOURNAL,
+    "move_tenant_journal" => super::move_tenant_journal_types::MOVE_TENANT_JOURNAL,
 ];

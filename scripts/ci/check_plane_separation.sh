@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Plane-separation gate.
+# Plane-separation and layering gate.
 #
 # NodeDB's three-plane execution model (Control / Data / Event) is a
-# correctness boundary, not a performance hint. This gate enforces three
+# correctness boundary, not a performance hint. This gate enforces four
 # structural invariants:
 #
 #   1. Data Plane purity: `nodedb/src/data/**` must not import or call
@@ -20,6 +20,16 @@
 #      `Arc<RwLock<…>>`. The bridge is a lock-free SPSC ring; lock-based
 #      sync at the boundary is by definition the wrong shape.
 #
+#   4. Security-layer direction: `nodedb/src/control/security/**` must not
+#      reference `crate::control::server::*`. `security` is the lower
+#      layer — the catalog, identities, scopes and policies that `server`
+#      is built on top of. An item both need belongs in `security` (or a
+#      module below both), with `server` importing it from there; a
+#      `security` -> `server` edge makes the dependency a cycle in intent
+#      and forces the lower layer to be rebuilt around the higher one.
+#      Doc-comment cross-references are not code edges and are excluded
+#      by the pure-comment skip below.
+#
 # Marker form: `// no-plane-separation: <reason>` placed on the same
 # line as the offending construct OR on the directly-preceding source
 # line. Mirrors `// no-determinism:`, `// no-governor:`, and
@@ -35,16 +45,18 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-# Each rule is (label, scan_path, regex). Three rules total.
+# Each rule is (label, scan_path, regex). Four rules total.
 rule_labels=(
     "Data Plane: no tokio in nodedb/src/data/"
     "Control Plane: no io_uring in nodedb/src/control/"
     "Bridge boundary: no Arc<Mutex>/Arc<RwLock>"
+    "Layering: no crate::control::server in nodedb/src/control/security/"
 )
 rule_paths=(
     "nodedb/src/data"
     "nodedb/src/control"
     "nodedb-bridge/src nodedb/src/bridge"
+    "nodedb/src/control/security"
 )
 # Patterns:
 #   - Rule 1: `use tokio` (imports), `tokio::` (path calls). Inert string
@@ -53,10 +65,13 @@ rule_paths=(
 #     `io_uring::` path calls.
 #   - Rule 3: `Arc<Mutex<` / `Arc<RwLock<` and tokio-async variants
 #     `Arc<tokio::sync::Mutex<` / `Arc<tokio::sync::RwLock<`.
+#   - Rule 4: `use crate::control::server` imports and inline
+#     `crate::control::server::` path references.
 rule_patterns=(
     '^[[:space:]]*use[[:space:]]+tokio\b|\btokio::'
     '^[[:space:]]*use[[:space:]]+(io_uring|tokio_uring)\b|\b(io_uring|tokio_uring)::'
     'Arc<[[:space:]]*Mutex<|Arc<[[:space:]]*RwLock<|Arc<[[:space:]]*tokio::sync::(Mutex|RwLock)<'
+    '^[[:space:]]*use[[:space:]]+crate::control::server\b|\bcrate::control::server::'
 )
 
 violations=()
@@ -119,6 +134,9 @@ if [ ${#violations[@]} -gt 0 ]; then
     echo "  - Control Plane (nodedb/src/control/) is Send + Sync: no io_uring."
     echo "  - Bridge (nodedb-bridge/, nodedb/src/bridge/) is lock-free SPSC:"
     echo "    no Arc<Mutex<...>> / Arc<RwLock<...>>."
+    echo "  - security (nodedb/src/control/security/) is below server:"
+    echo "    move the shared item down into security and import it there"
+    echo "    from server; never re-export a server item from security."
     exit 1
 fi
-echo "OK: plane-separation gate clean."
+echo "OK: plane-separation and layering gate clean."

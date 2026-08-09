@@ -43,5 +43,5 @@ pub mod preflight;
 pub mod recovery;
 pub mod snapshot;
 
+pub use crate::control::security::catalog::{MovePhase, MoveTenantJournalEntry};
 pub use entry::handle_move_tenant;
-pub use journal::{MovePhase, MoveTenantJournalEntry};

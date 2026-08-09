@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use nodedb_types::error::sqlstate;
 
+use crate::control::security::catalog::{MovePhase, MoveTenantJournalEntry};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -22,7 +23,7 @@ use crate::types::TenantId;
 use super::super::super::super::result::{DdlError, DdlResult};
 use super::super::super::database::gate::require_superuser;
 use super::super::support::{ddl_err, status};
-use super::journal::{self, MovePhase, MoveTenantJournalEntry};
+use super::journal;
 use super::{cutover, drain, preflight, recovery, snapshot};
 
 /// Drain timeout for phase 2: how long we wait for in-flight operations to

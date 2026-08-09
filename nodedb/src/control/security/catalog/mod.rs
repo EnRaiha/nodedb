@@ -37,6 +37,7 @@ pub mod materialized_views;
 pub mod metadata;
 pub mod mirror;
 pub mod move_tenant_journal;
+pub mod move_tenant_journal_types;
 pub mod oidc_providers;
 pub mod orgs;
 pub mod owner_rewrite;
@@ -91,6 +92,7 @@ pub use function_types::{
 pub use index_record::{IndexKind, StoredIndexRecord};
 pub use l2_cleanup_queue::StoredL2CleanupEntry;
 pub use lockout::StoredLockoutRecord;
+pub use move_tenant_journal_types::{MovePhase, MoveTenantJournalEntry};
 pub use oidc_providers::{StoredClaimMappingRule, StoredOidcProvider};
 pub use orgs::{StoredOrg, StoredOrgMember};
 pub use pending_reclaim::StoredPendingReclaim;
