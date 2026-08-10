@@ -303,6 +303,7 @@ fn tx_put_commit_matches_autocommit_across_all_indexes() {
             user_roles: &[],
             insert_if_absent: None,
             resolved_sum_targets: &[],
+            deferred_sum_targets: &[],
         },
         &mut undo_log,
     )
@@ -348,6 +349,7 @@ fn tx_put_rollback_restores_pre_tx_state_across_all_indexes() {
             user_roles: &[],
             insert_if_absent: None,
             resolved_sum_targets: &[],
+            deferred_sum_targets: &[],
         },
         &mut undo_log,
     )

@@ -47,6 +47,11 @@ impl CoreLoop {
             tid,
             collection,
             resolved_targets: resolved_sum_targets,
+            // A delete carries no deferral list, and needs none: `PointDelete`
+            // has no such field because its balance is settled from the stored
+            // row's image and deferred by OMISSION from the resolution above,
+            // which this helper already forwards. Empty here is complete, not a
+            // dropped field.
             deferred_sum_targets: &[],
             wal_lsn: dummy_task.wal_lsn(),
         };
@@ -80,6 +85,12 @@ impl CoreLoop {
                 enforce: true,
             },
         )?;
+
+        // Whether a row was actually removed, captured before `prior_value` is
+        // moved into the undo entry below. A delete against an absent key is the
+        // same plan as one that removed a row, so the count is only knowable
+        // here.
+        let removed = outcome.prior_value.is_some();
 
         // Image-folding enforcement, inside the SAME transaction the removal was
         // staged in, so a materialized-sum debit and the row's removal land or
@@ -218,6 +229,13 @@ impl CoreLoop {
                 old_properties,
             });
         }
-        Ok(self.response_ok(dummy_task))
+
+        // `PointDelete` renders a `DELETE <n>` command tag, so its response
+        // carries the count — 0 when the key was absent — exactly as the
+        // autocommit handler (`handlers/point/delete.rs`) reports it. A bare
+        // `Ok` here leaves a Calvin-flushed delete with no count for the
+        // coordinator to render, since `execute_transaction_batch` hands the
+        // last sub-plan's payload back as the participant's applied response.
+        Ok(self.response_affected(dummy_task, u64::from(removed)))
     }
 }

@@ -811,3 +811,167 @@ fn two_bindings_sharing_a_join_column_each_receive_their_own_total() {
         "so does the second — a delete debits the row the credit landed on"
     );
 }
+
+/// The CALVIN apply path honours a deferral, and it is the only path that ever
+/// sees one.
+///
+/// `execute_calvin_flush` replays every staged plan through
+/// `execute_transaction_batch`, which intercepts `PointInsert` for undo
+/// tracking instead of re-dispatching it. That interception used to forward
+/// `resolved_sum_targets` and drop `deferred_sum_targets`, so the source core
+/// folded a balance the Control Plane had already shipped on its own
+/// `ApplyBalanceDelta` task and the total moved twice.
+///
+/// It was invisible for two compounding reasons: a deferral is only ever set on
+/// a CROSS-SHARD statement, and a cross-shard statement only ever commits
+/// through Calvin — so the marker was dropped on every write that had one, and
+/// never on a write that could notice. The direct-dispatch path forwards it
+/// correctly, which is why every single-shard test stayed green.
+///
+/// Asserted through `execute_transaction_batch` rather than through the funnel:
+/// the funnel was never where the field was lost.
+#[test]
+fn the_transaction_batch_path_honours_a_deferred_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+    register_collections_onto(&mut core, REMOTE_TARGET);
+    seed_target_in(&mut core, REMOTE_TARGET, SURROGATE_A, ACCOUNT_A, "100");
+
+    let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::PointInsert {
+            collection: SOURCE.to_string(),
+            document_id: "e1".to_string(),
+            value: doc_format::encode_to_msgpack(
+                &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),
+            ),
+            if_absent: false,
+            surrogate: Surrogate(1),
+            returning: None,
+            rls_filters: Vec::new(),
+            // Resolved AND deferred: an insert's balance is settled at plan
+            // time, so the resolution stays on the plan and the deferral is
+            // what stops this core applying it.
+            resolved_sum_targets: vec![ResolvedSumTarget::new(
+                REMOTE_TARGET,
+                ACCOUNT_A,
+                SURROGATE_A,
+            )],
+            deferred_sum_targets: vec![REMOTE_TARGET.to_string()],
+        },
+    )];
+
+    let task = make_default_task();
+    let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+    assert_eq!(
+        response.status,
+        Status::Ok,
+        "the source write itself must succeed: {:?}",
+        response.error_code
+    );
+
+    assert_eq!(
+        balance_in(&core, REMOTE_TARGET, SURROGATE_A),
+        "100",
+        "the sibling ApplyBalanceDelta task owns this delta; folding it here too \
+         is the double-count the deferral exists to prevent"
+    );
+    assert!(
+        core.sparse
+            .get(DB, TID, SOURCE, &surrogate_to_doc_id(Surrogate(1)))
+            .expect("read source row")
+            .is_some(),
+        "the source row must still have been written"
+    );
+}
+
+/// The same path, with the deferral ABSENT, must still apply the balance.
+///
+/// Without this the fix above could be "never fold on the transaction batch
+/// path", which would silently drop every CO-RESIDENT balance committed through
+/// Calvin — a wrong total in the other direction, and one no cross-shard test
+/// would catch.
+#[test]
+fn the_transaction_batch_path_still_folds_an_undeferred_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+    register_collections(&mut core);
+    seed_target(&mut core, SURROGATE_A, ACCOUNT_A, "100");
+
+    let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::PointInsert {
+            collection: SOURCE.to_string(),
+            document_id: "e1".to_string(),
+            value: doc_format::encode_to_msgpack(
+                &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),
+            ),
+            if_absent: false,
+            surrogate: Surrogate(1),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: vec![ResolvedSumTarget::new(TARGET, ACCOUNT_A, SURROGATE_A)],
+            deferred_sum_targets: Vec::new(),
+        },
+    )];
+
+    let task = make_default_task();
+    let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+    assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+    assert_eq!(
+        balance_of(&core, SURROGATE_A),
+        "125",
+        "a co-resident binding is this core's to apply, on every path"
+    );
+}
+
+/// A source write replayed on the transaction-batch path reports its
+/// affected-row count.
+///
+/// `execute_calvin_flush` replays a participant's staged plans through
+/// `execute_transaction_batch` and returns the LAST sub-plan's payload as that
+/// participant's applied response. The scheduler deposits it, and the
+/// coordinator shapes the statement's `INSERT <n>` tag from it — so a bare `Ok`
+/// from the sub-plan leaves an autocommit CROSS-SHARD insert with no count at
+/// all and the statement fails with "write response carried no affected-row
+/// count".
+///
+/// It stayed hidden because the other consumer of this payload is the
+/// single-shard COMMIT flush, whose tag is `COMMIT` and which discards the
+/// count entirely. The cross-shard materialized-sum pair is the first shape
+/// that makes a ONE-STATEMENT autocommit write commit through Calvin, and it
+/// only appeared to work while the sibling balance participant — whose handler
+/// does report a count — happened to win the race to deposit first.
+#[test]
+fn the_transaction_batch_path_reports_its_affected_count() {
+    use crate::control::server::shared::sql::staging_predicates::require_affected_count;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+    register_collections(&mut core);
+    seed_target(&mut core, SURROGATE_A, ACCOUNT_A, "100");
+
+    let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::PointInsert {
+            collection: SOURCE.to_string(),
+            document_id: "e1".to_string(),
+            value: doc_format::encode_to_msgpack(
+                &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),
+            ),
+            if_absent: false,
+            surrogate: Surrogate(1),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: vec![ResolvedSumTarget::new(TARGET, ACCOUNT_A, SURROGATE_A)],
+            deferred_sum_targets: Vec::new(),
+        },
+    )];
+
+    let task = make_default_task();
+    let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+    assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+    assert_eq!(
+        require_affected_count(response.payload.as_bytes())
+            .expect("a batch whose last sub-plan renders an INSERT tag must carry its count"),
+        1,
+        "one row was inserted, so the batch's applied response reports one"
+    );
+}

@@ -31,6 +31,22 @@ pub(in crate::data::executor::handlers::transaction) struct TxPointPut<'a> {
     /// Data Plane addresses target rows with these and never derives them: the
     /// primary-key → surrogate map is Control-Plane catalog state.
     pub resolved_sum_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
+    /// Materialized-sum TARGET collections whose delta the Control Plane
+    /// settled at plan time and shipped on its own `ApplyBalanceDelta` task.
+    /// This write must not apply them as well.
+    ///
+    /// It travels this far because the CALVIN apply path runs through here:
+    /// `execute_calvin_flush` replays every staged plan via
+    /// `execute_transaction_batch`, which routes `PointInsert` into this
+    /// helper. A cross-shard statement is the only kind that ever carries a
+    /// deferral AND the only kind that commits through Calvin, so dropping it
+    /// here dropped it on every write that has one — the source core folded
+    /// the balance inline and the sibling task folded it again.
+    ///
+    /// Empty for a PUT: `PointPut` carries no deferral list, because its
+    /// balance is settled from row images and deferred by OMISSION from
+    /// `resolved_sum_targets` above, which this struct already forwards.
+    pub deferred_sum_targets: &'a [String],
 }
 
 impl CoreLoop {
@@ -50,6 +66,7 @@ impl CoreLoop {
             user_roles,
             insert_if_absent,
             resolved_sum_targets,
+            deferred_sum_targets,
         } = p;
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -70,7 +87,7 @@ impl CoreLoop {
             tid,
             collection,
             resolved_targets: resolved_sum_targets,
-            deferred_sum_targets: &[],
+            deferred_sum_targets,
             wal_lsn: dummy_task.wal_lsn(),
         };
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
@@ -135,8 +152,10 @@ impl CoreLoop {
                 // No write, no undo push — drop the txn without committing.
                 chain.restore(self);
                 if if_absent {
-                    // `INSERT ... ON CONFLICT DO NOTHING`: silent skip.
-                    return Ok(self.response_ok(dummy_task));
+                    // `INSERT ... ON CONFLICT DO NOTHING`: silent skip, which
+                    // affected NO row. The count is reported, not omitted —
+                    // see the count contract at the end of this function.
+                    return Ok(self.response_affected(dummy_task, 0));
                 }
                 return Err(ErrorCode::from(crate::Error::RejectedConstraint {
                     collection: collection.to_string(),
@@ -309,6 +328,20 @@ impl CoreLoop {
             undo_log.push(UndoEntry::StatsRestore { key, prior });
         }
 
-        Ok(self.response_ok(dummy_task))
+        // One row was written, and the count is REPORTED — `PointPut` and
+        // `PointInsert` both render an `INSERT <n>` command tag, so their
+        // response must carry the count `response_affected` documents as
+        // mandatory for every count-bearing plan. The autocommit handlers
+        // (`handlers/point/put.rs`, `handlers/point/insert.rs`) already do.
+        //
+        // This path is not only the explicit-transaction commit, where the tag
+        // is `COMMIT` and the count is discarded: `execute_calvin_flush` replays
+        // a participant's staged plans through `execute_transaction_batch`,
+        // which returns the LAST sub-plan's payload as the whole participant's
+        // applied response — and that response is what the scheduler deposits
+        // and what the coordinator shapes a cross-shard statement's tag from.
+        // Returning a bare `Ok` here left an autocommit cross-shard INSERT with
+        // no count to render at all.
+        Ok(self.response_affected(dummy_task, 1))
     }
 }

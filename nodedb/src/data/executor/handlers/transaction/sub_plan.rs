@@ -174,6 +174,10 @@ impl CoreLoop {
                     user_roles,
                     insert_if_absent: None,
                     resolved_sum_targets,
+                    // A put carries no deferral list of its own: its balance is
+                    // settled from row images and deferred by OMISSION from the
+                    // resolution just above, which travels with it.
+                    deferred_sum_targets: &[],
                 },
                 undo_log,
             ),
@@ -185,6 +189,12 @@ impl CoreLoop {
                 if_absent,
                 surrogate,
                 resolved_sum_targets,
+                // An insert's rows are new by construction, so its cross-shard
+                // balance is settled at plan time and marked here rather than
+                // omitted from the resolution. Forwarding it is not optional:
+                // this arm is on the CALVIN apply path, which is the only path
+                // a deferral-carrying write ever takes.
+                deferred_sum_targets,
                 ..
             } => self.tx_point_put(
                 TxPointPut {
@@ -197,6 +207,7 @@ impl CoreLoop {
                     user_roles,
                     insert_if_absent: Some(*if_absent),
                     resolved_sum_targets,
+                    deferred_sum_targets,
                 },
                 undo_log,
             ),
