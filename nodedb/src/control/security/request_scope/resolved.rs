@@ -81,6 +81,16 @@ impl<'a> RequestAuthScope<'a> {
     /// independently writing `builder(..).with_session_database(Some(db)).build()`,
     /// which is exactly the kind of duplication that let the task/`$auth.*`
     /// database drift this type exists to prevent creep back in a second time.
+    ///
+    /// This constructor resolves **no client address**, so the scope it
+    /// returns carries no `$auth.risk_score` and cannot satisfy a `REQUIRE IP`
+    /// grant condition. That is correct for its callers — scopes resolved
+    /// downstream of a transport that already admitted the request, for
+    /// row-level security, redaction and metering — and it is why the
+    /// request-admission gate does not accept this type at all. A scope that
+    /// will be presented to an admission door comes from
+    /// [`ClientRequestScope::for_database`](super::ClientRequestScope::for_database)
+    /// instead, which takes the peer address as a required argument.
     pub fn for_database(
         identity: &'a AuthenticatedIdentity,
         stores: AuthStores<'a>,

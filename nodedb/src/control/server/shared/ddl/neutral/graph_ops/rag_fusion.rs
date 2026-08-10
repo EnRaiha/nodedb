@@ -129,11 +129,9 @@ pub async fn rag_fusion(
         collection: &collection,
         plan,
         timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+        // Admitted at this request's own transport entry; this handler has no
+        // session or peer information of its own.
         admission: user_dispatch::RequestAdmission::AlreadyAdmitted,
-        // `AlreadyAdmitted` never reaches the blacklist check this door
-        // performs, and this handler has no session/peer info — see
-        // `DispatchRequest::peer_addr`.
-        peer_addr: "",
     })
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;

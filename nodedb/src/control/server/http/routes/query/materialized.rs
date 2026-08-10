@@ -59,7 +59,7 @@ pub async fn query(
     // exactly `database_id`, and the verified JWT (when this request
     // authenticated via JWT bearer) reproduces the same claim-derived
     // enrichment `resolve_auth` would have given an `AuthContext`.
-    let scope = build_request_scope(
+    let request = build_request_scope(
         &identity,
         verified_jwt.as_ref(),
         &headers,
@@ -78,10 +78,10 @@ pub async fn query(
     // IP-blacklist and risk halves of that gate live on this route.
     let rate_limit_result = crate::control::server::session_auth::check_request_admission(
         &state.shared,
-        &scope,
-        peer.as_str(),
+        &request,
         "sql",
     )?;
+    let scope = request.into_scope();
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 

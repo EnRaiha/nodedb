@@ -21,7 +21,33 @@ pub async fn do_handshake(
     addr: std::net::SocketAddr,
     hello: &HelloFrame,
 ) -> Result<(TcpStream, HelloAckFrame), HelloErrorFrame> {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    do_handshake_from(None, addr, hello).await
+}
+
+/// Like [`do_handshake`], but binds the client socket to `source` first so the
+/// server observes a chosen peer address.
+///
+/// Loopback is a whole `/8`, so a test can drive two connections to the same
+/// server from two distinct addresses (`127.0.0.1` and `127.0.0.2`) and assert
+/// that an address-scoped guard tells them apart. Without a bound source the
+/// kernel picks one for every client alike, and no such assertion is possible.
+pub async fn do_handshake_from(
+    source: Option<std::net::SocketAddr>,
+    addr: std::net::SocketAddr,
+    hello: &HelloFrame,
+) -> Result<(TcpStream, HelloAckFrame), HelloErrorFrame> {
+    let mut stream = match source {
+        Some(source) => {
+            let socket = match source {
+                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }
+            .expect("create client socket");
+            socket.bind(source).expect("bind client source address");
+            socket.connect(addr).await.expect("connect from source")
+        }
+        None => TcpStream::connect(addr).await.expect("connect"),
+    };
     stream
         .write_all(&hello.encode())
         .await

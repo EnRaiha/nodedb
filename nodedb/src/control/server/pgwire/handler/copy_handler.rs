@@ -79,25 +79,23 @@ impl NodeDbPgHandler {
         let database_id = identity
             .default_database
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        let peer_addr = peer_addr.to_string();
+        let request = crate::control::security::request_scope::ClientRequestScope::for_database(
             identity,
             self.state.auth_stores(),
             database_id,
+            &peer_addr,
         );
-        crate::control::server::session_auth::check_blacklist_and_status(
-            &self.state,
-            &scope,
-            &peer_addr.to_string(),
-        )
-        .map_err(|e| {
-            let (severity, code, message) =
-                crate::control::server::pgwire::types::error_to_sqlstate(&e);
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                code.to_owned(),
-                message,
-            )))
-        })?;
+        crate::control::server::session_auth::check_blacklist_and_status(&self.state, &request)
+            .map_err(|e| {
+                let (severity, code, message) =
+                    crate::control::server::pgwire::types::error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
 
         // Backup and restore both operate on a whole tenant — authorize
         // against the tenant-scoped `Backup` permission. Superuser bypasses
@@ -134,7 +132,7 @@ impl NodeDbPgHandler {
                 // `tenant:<id>` marker rather than a real collection name.
                 // `rows: None` — the backup produces a byte blob, not a row
                 // count; `meter_dispatch` charges one unit for `None`.
-                meter_backup_restore(&self.state, &scope, tenant_id, None);
+                meter_backup_restore(&self.state, request.scope(), tenant_id, None);
                 let copy_data = Ok(CopyData::new(bytes));
                 let stream = stream::once(async move { copy_data });
                 Ok(Response::CopyOut(CopyResponse::new(0, 0, stream)))

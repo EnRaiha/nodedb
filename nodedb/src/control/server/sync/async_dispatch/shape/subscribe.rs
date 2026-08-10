@@ -4,6 +4,10 @@
 
 use tracing::{info, warn};
 
+use nodedb_types::DatabaseId;
+
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::sync::session::SyncSession;
 use crate::control::state::SharedState;
 
@@ -41,16 +45,10 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     // `check_blacklist_and_status` runs that half of
     // `check_request_admission`'s gate (plus the internal-service exemption
     // every other transport gets) using the session's real remote address.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
-        identity,
-        shared.auth_stores(),
-        database_id,
-    );
-    if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(
-        shared,
-        &scope,
-        &session.device_metadata.remote_addr,
-    ) {
+    let request = subscription_admission_scope(shared, identity, database_id, session);
+    if let Err(e) =
+        crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
+    {
         warn!(
             tenant_id = tenant_id.as_u64(),
             error = %e,
@@ -172,17 +170,12 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     let database_id = session.database_id();
 
     // See `handle_shape_subscribe_async` above: blacklist + account status,
-    // no rate limit, with the same internal-service exemption.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
-        identity,
-        shared.auth_stores(),
-        database_id,
-    );
-    if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(
-        shared,
-        &scope,
-        &session.device_metadata.remote_addr,
-    ) {
+    // no rate limit, with the same internal-service exemption, resolved
+    // against the same real remote address.
+    let request = subscription_admission_scope(shared, identity, database_id, session);
+    if let Err(e) =
+        crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
+    {
         warn!(
             tenant_id = tenant_id.as_u64(),
             error = %e,
@@ -231,6 +224,28 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     SyncFrame::try_encode(SyncMessageType::ShapeSnapshot, &snapshot)
 }
 
+/// Resolve the admission scope for a shape subscription or resync from the
+/// session's own real remote address.
+///
+/// Shared by both handlers so neither can resolve a scope the other would not.
+/// The address is the session's, not a placeholder: it is what stamps
+/// `$auth.risk_score` — without it the risk gate refuses every subscription as
+/// unassessed once `[auth.risk]` is enabled — and what lets a `REQUIRE IP`
+/// scope grant apply to this subscriber instead of being silently withheld.
+fn subscription_admission_scope<'a>(
+    shared: &'a SharedState,
+    identity: &'a AuthenticatedIdentity,
+    database_id: DatabaseId,
+    session: &'a SyncSession,
+) -> ClientRequestScope<'a, 'a> {
+    ClientRequestScope::for_database(
+        identity,
+        shared.auth_stores(),
+        database_id,
+        &session.device_metadata.remote_addr,
+    )
+}
+
 fn log_refusal(session_id: &str, shape_id: &str, failure: ShapeAuthorizationFailure) {
     match failure {
         ShapeAuthorizationFailure::IdentityNotEstablished => warn!(
@@ -241,5 +256,136 @@ fn log_refusal(session_id: &str, shape_id: &str, failure: ShapeAuthorizationFail
             session = session_id,
             shape_id, "shape read refused: no read grant on the shape's collection"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
+    use crate::control::security::risk::RiskConfig;
+    use crate::control::security::scope::grant::ScopeGrantParams;
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    use super::*;
+
+    /// A shared state whose risk scorer is enabled with an allow band that
+    /// covers every score, so anything the gate refuses was refused because
+    /// nothing could be scored — not because the score was bad.
+    fn state_with_risk(risk: RiskConfig) -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create shape admission test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("shape-admission.wal"))
+                .expect("open shape admission test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new_with_risk_config(dispatcher, wal, risk)
+            .expect("construct shape admission state");
+        (state, dir)
+    }
+
+    fn subscriber() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            77,
+            "device",
+            TenantId::new(1),
+            AuthMethod::ApiKey,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
+        )
+    }
+
+    fn session_from(remote_addr: &str) -> SyncSession {
+        let mut session = SyncSession::new("s_shape_admission".into());
+        session.device_metadata.remote_addr = remote_addr.to_string();
+        session
+    }
+
+    /// The subscription scope must carry the session's own remote address, so
+    /// risk scoring produces a verdict instead of the gate refusing every
+    /// subscription as unassessed. Before the address reached this scope, an
+    /// operator enabling `[auth.risk]` took shape subscribe and resync offline
+    /// entirely.
+    #[test]
+    fn subscription_scope_is_scored_from_the_sessions_remote_address() {
+        let (state, _dir) = state_with_risk(RiskConfig {
+            enabled: true,
+            allow_threshold: 1.0,
+            deny_threshold: 2.0,
+            ..Default::default()
+        });
+        let identity = subscriber();
+        let session = session_from("10.0.0.7:44321");
+
+        let request =
+            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &session);
+
+        assert_eq!(request.peer_addr(), "10.0.0.7:44321");
+        assert!(
+            request.scope().auth().risk_score.is_some(),
+            "the session's address must reach the risk scorer"
+        );
+        assert!(
+            state
+                .risk_scorer
+                .refusal_for(request.scope().auth())
+                .is_none(),
+            "an assessed, in-band subscription must not be refused"
+        );
+    }
+
+    /// The silent half of the same defect: a grant conditioned on the client's
+    /// network must apply to a subscriber inside it. With no address in the
+    /// scope the condition can never be satisfied, so the scope was withheld
+    /// with no error anywhere.
+    #[test]
+    fn ip_conditional_grant_is_honoured_for_a_subscriber_inside_the_network() {
+        let (state, _dir) = state_with_risk(RiskConfig::default());
+        let identity = subscriber();
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "sync:shapes",
+                grantee_type: "user",
+                grantee_id: "77",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+                conditions: vec![
+                    crate::control::security::conditional::GrantCondition::RequireIp {
+                        allowed_cidrs: vec!["10.0.0.0/8".into()],
+                    },
+                ],
+            })
+            .expect("grant the IP-conditional scope");
+
+        let inside = session_from("10.0.0.7:44321");
+        let granted = subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &inside);
+        assert_eq!(
+            granted
+                .scope()
+                .auth()
+                .metadata
+                .get("scope_status.sync:shapes"),
+            Some(&"active".to_string()),
+            "a subscriber inside the permitted network must hold the conditional scope"
+        );
+
+        let outside = session_from("203.0.113.9:44321");
+        let withheld =
+            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &outside);
+        assert!(
+            !withheld
+                .scope()
+                .auth()
+                .metadata
+                .contains_key("scope_status.sync:shapes"),
+            "a subscriber outside the permitted network must not hold it"
+        );
     }
 }

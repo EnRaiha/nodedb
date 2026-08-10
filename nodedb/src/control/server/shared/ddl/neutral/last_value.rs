@@ -45,11 +45,9 @@ pub async fn query_last_values(
             collection,
             plan,
             timeout: Duration::from_secs(5),
+            // Admitted at this request's own transport entry; this handler
+            // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
-            // `AlreadyAdmitted` never reaches the blacklist check this door
-            // performs, and this handler has no session/peer info — see
-            // `DispatchRequest::peer_addr`.
-            peer_addr: "",
         },
     )
     .await
@@ -117,11 +115,9 @@ pub async fn query_last_value(
             collection,
             plan,
             timeout: Duration::from_secs(5),
+            // Admitted at this request's own transport entry; this handler
+            // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
-            // `AlreadyAdmitted` never reaches the blacklist check this door
-            // performs, and this handler has no session/peer info — see
-            // `DispatchRequest::peer_addr`.
-            peer_addr: "",
         },
     )
     .await

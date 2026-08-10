@@ -90,7 +90,7 @@ pub async fn query_ndjson(
     //
     // NDJSON does not extract a per-query `ON DENY` clause (unlike the
     // materialized `/v1/query` route) — that is pre-existing behavior.
-    let scope = build_request_scope(
+    let request = build_request_scope(
         &identity,
         verified_jwt.as_ref(),
         &headers,
@@ -107,13 +107,13 @@ pub async fn query_ndjson(
     // halves of that gate live on this route.
     let rate_limit_result = match crate::control::server::session_auth::check_request_admission(
         &state.shared,
-        &scope,
-        peer.as_str(),
+        &request,
         "sql",
     ) {
         Ok(result) => result,
         Err(error) => return ApiError::from(error).into_response(),
     };
+    let scope = request.into_scope();
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 

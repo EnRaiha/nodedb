@@ -14,7 +14,7 @@ use crate::control::planner::calvin::{
 };
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_task_set;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
@@ -58,9 +58,13 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     // able to keep ingesting, though — `check_blacklist_and_status` runs
     // that half of `check_request_admission`'s gate (plus the
     // internal-service exemption every other transport gets) using the real
-    // peer address of the ILP connection or OTLP HTTP/gRPC request.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-    crate::control::server::session_auth::check_blacklist_and_status(state, &scope, peer_addr)?;
+    // peer address of the ILP connection or OTLP HTTP/gRPC request. The scope
+    // is resolved against that same address, so `$auth.risk_score` is stamped
+    // and an IP-conditional grant is evaluated for this sender rather than
+    // being withheld.
+    let request =
+        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr);
+    crate::control::server::session_auth::check_blacklist_and_status(state, &request)?;
 
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
     let groups = preflight_ilp_batch(
@@ -81,7 +85,7 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     state.check_tenant_quota(tenant_id)?;
     let _request = state.tenant_request_guard(tenant_id);
 
-    flush_ilp_batch_inner(state, identity, database_id, groups).await
+    flush_ilp_batch_inner(state, identity, database_id, peer_addr, groups).await
 }
 
 /// At most one schema-projection merge is ever in flight, process-wide.
@@ -160,6 +164,7 @@ async fn flush_ilp_batch_inner(
     state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
+    peer_addr: &str,
     groups: Vec<IlpMeasurementBatch>,
 ) -> crate::Result<u64> {
     let tenant_id = identity.tenant_id;
@@ -178,7 +183,14 @@ async fn flush_ilp_batch_inner(
     // the tasks (it compiles the write predicate onto each `Ingest`), and an
     // authorized task set is what gets dispatched, so injecting afterwards
     // would dispatch the un-injected copies.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    //
+    // Resolved against the sender's real address like the admission scope
+    // above, so a `WHEN`/`REQUIRE IP` scope grant contributes to `$auth.*`
+    // here — an RLS policy or metering rule keyed on such a grant must not
+    // read differently on this transport than it does on a planned `INSERT`.
+    let scope =
+        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)
+            .into_scope();
     crate::control::planner::rls_injection::inject_rls(&mut tasks, &state.rls, scope.auth())?;
 
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
@@ -435,6 +447,92 @@ mod tests {
             matches!(error, crate::Error::RejectedAuthz { .. }),
             "the refusal must come from the RLS pass, got {error:?}"
         );
+    }
+
+    // ── Risk gate. ILP is the shared ingest door for native line protocol,
+    //    OTLP, and Prometheus remote write, so what happens here happens to
+    //    all three. ─────────────────────────────────────────────────────────
+
+    /// Build ingest state whose risk scorer is configured, not merely present.
+    fn risk_state(
+        risk: crate::control::security::risk::RiskConfig,
+    ) -> (Arc<SharedState>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("create ILP risk test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("ilp-risk.wal"))
+                .expect("open ILP risk test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new_with_risk_config(dispatcher, wal, risk)
+            .expect("construct ILP risk state");
+        (state, directory)
+    }
+
+    fn rejection_reason(error: &crate::Error) -> String {
+        match error {
+            crate::Error::RejectedAuthz { resource, .. } => resource.clone(),
+            other => panic!("expected an authz rejection, got {other:?}"),
+        }
+    }
+
+    /// With scoring enabled and every score inside the allow band, an ingest
+    /// batch must pass the admission gate and fail only on its own merits —
+    /// here, the missing write grant that preflight refuses.
+    ///
+    /// Before the sender's address reached this scope there was no score to
+    /// enforce, so the gate failed closed: turning on `[auth.risk]` took ILP,
+    /// OTLP and Prometheus remote write offline for every client.
+    #[tokio::test]
+    async fn scored_ingest_passes_the_admission_gate_instead_of_failing_closed() {
+        let (state, _dir) = risk_state(crate::control::security::risk::RiskConfig {
+            enabled: true,
+            allow_threshold: 1.0,
+            deny_threshold: 2.0,
+            ..Default::default()
+        });
+        let database_id = DatabaseId::new(7);
+
+        let error = flush_authenticated_ilp_batch(
+            &state,
+            &identity(database_id),
+            database_id,
+            "10.0.0.7:9009",
+            "cpu value=1i\n",
+        )
+        .await
+        .expect_err("the batch still has no write grant");
+
+        assert!(
+            matches!(&error, crate::Error::BadRequest { detail } if detail == "ILP batch rejected"),
+            "an in-band sender must reach preflight, got {error:?}"
+        );
+    }
+
+    /// The score is the sender's, not a constant: the same request is refused
+    /// by risk policy once the deny band covers it — a verdict only reachable
+    /// when the address was actually scored.
+    #[tokio::test]
+    async fn deny_band_ingest_is_refused_by_the_risk_gate() {
+        let (state, _dir) = risk_state(crate::control::security::risk::RiskConfig {
+            enabled: true,
+            allow_threshold: -1.0,
+            deny_threshold: 0.0,
+            ..Default::default()
+        });
+        let database_id = DatabaseId::new(7);
+        grant_write(&state.permissions, "cpu");
+
+        let error = flush_authenticated_ilp_batch(
+            &state,
+            &identity(database_id),
+            database_id,
+            "10.0.0.7:9009",
+            "cpu value=1i\n",
+        )
+        .await
+        .expect_err("a deny-band sender must be refused");
+
+        assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
 
     #[test]

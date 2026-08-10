@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crash_harness::CrashHarness;
 use crash_harness::Session;
-use crash_harness::ilp_client;
+use nodedb_test_support::ilp_client;
 
 const ILP_PASSWORD: &str = "crash-ilp-ts-secret-1";
 const COLLECTION: &str = "crash_ilp_ts";

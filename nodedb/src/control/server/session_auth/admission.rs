@@ -10,7 +10,7 @@
 use nodedb_types::DatabaseId;
 
 use crate::control::security::ratelimit::limiter::RateLimitResult;
-use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::state::SharedState;
 
 use super::guards::{check_blacklist, check_rate_limit, check_risk};
@@ -43,12 +43,23 @@ use super::guards::{check_blacklist, check_rate_limit, check_risk};
 ///    not consume the caller's rate-limit budget.
 /// 5. [`check_rate_limit`] — runs last, and before any planning/catalog work,
 ///    so load is shed before it is spent.
+///
+/// The request arrives as a [`ClientRequestScope`], never as a bare
+/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// plus a separate address argument. Those used to be two independent
+/// parameters, and a transport that resolved an address-less scope while
+/// passing a real address here looked correct at the call site but left
+/// `$auth.risk_score` unstamped — refused as unassessed by step 4 the moment
+/// risk scoring was enabled, and silently short of every `REQUIRE IP` grant.
+/// One value means the address the blacklist parses is provably the address
+/// the scope was scored and IP-matched against.
 pub fn check_request_admission(
     state: &SharedState,
-    scope: &RequestAuthScope<'_>,
-    peer_addr: &str,
+    request: &ClientRequestScope<'_, '_>,
     operation: &str,
 ) -> crate::Result<Option<RateLimitResult>> {
+    let scope = request.scope();
+    let peer_addr = request.peer_addr();
     if scope.identity().is_internal_service() {
         return Ok(None);
     }
@@ -83,11 +94,16 @@ pub fn check_request_admission(
 /// gate is not part of the rate-limiter's cost model, so it belongs on this
 /// door too: a request refused by risk policy must be refused on every door,
 /// not only the ones that also meter QPS.
+///
+/// Takes a [`ClientRequestScope`] for the reason [`check_request_admission`]
+/// documents — and this door is where that mattered most, since every one of
+/// its callers is a transport that builds its own scope by hand.
 pub fn check_blacklist_and_status(
     state: &SharedState,
-    scope: &RequestAuthScope<'_>,
-    peer_addr: &str,
+    request: &ClientRequestScope<'_, '_>,
 ) -> crate::Result<()> {
+    let scope = request.scope();
+    let peer_addr = request.peer_addr();
     if scope.identity().is_internal_service() {
         return Ok(());
     }
@@ -106,6 +122,7 @@ mod tests {
     use crate::control::security::identity::{
         AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
     };
+    use crate::control::security::request_scope::RequestAuthScope;
     use crate::types::TenantId;
     use crate::wal::WalManager;
 
@@ -174,10 +191,14 @@ mod tests {
             .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
             .expect("blacklist user");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1",
+        );
 
-        let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get")
+        let result = check_request_admission(&state, &request, "point_get")
             .expect("internal-service identity must never be blocked");
         assert!(
             result.is_none(),
@@ -194,10 +215,14 @@ mod tests {
             .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
             .expect("blacklist user");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1",
+        );
 
-        let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get");
+        let result = check_request_admission(&state, &request, "point_get");
         assert!(
             result.is_err(),
             "blacklisted regular identity must be rejected"
@@ -224,10 +249,14 @@ mod tests {
             .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
             .expect("blacklist user");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1",
+        );
 
-        let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get");
+        let result = check_request_admission(&state, &request, "point_get");
         assert!(
             result.is_err(),
             "a trust-mode identity built via the normal external path must not be exempt"
@@ -247,12 +276,12 @@ mod tests {
             "s_test_suspended".into(),
         );
         ctx.status = AuthStatus::Suspended;
-        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
+        let request = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
-            .build();
+            .build_for_client("127.0.0.1");
 
-        let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get");
+        let result = check_request_admission(&state, &request, "point_get");
         assert!(result.is_err(), "suspended account must be rejected");
     }
 
@@ -260,10 +289,14 @@ mod tests {
     async fn happy_path_returns_rate_limit_result() {
         let (state, _dir) = test_state().await;
         let identity = regular_identity(9005, AuthMethod::ScramSha256);
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1",
+        );
 
-        let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get")
+        let result = check_request_admission(&state, &request, "point_get")
             .expect("non-blacklisted, active, unthrottled request must be admitted");
         assert!(
             result.is_some(),
@@ -285,15 +318,17 @@ mod tests {
         }
     }
 
-    fn scoped<'a>(
+    fn scoped<'a, 'p>(
         state: &'a SharedState,
         identity: &'a AuthenticatedIdentity,
-        peer_addr: &str,
-    ) -> RequestAuthScope<'a> {
-        RequestAuthScope::builder(identity, state.auth_stores())
-            .with_session_database(Some(DatabaseId::DEFAULT))
-            .with_peer_addr(peer_addr)
-            .build()
+        peer_addr: &'p str,
+    ) -> ClientRequestScope<'a, 'p> {
+        ClientRequestScope::for_database(
+            identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            peer_addr,
+        )
     }
 
     fn rejection_reason(error: &crate::Error) -> String {
@@ -312,17 +347,18 @@ mod tests {
         let identity = regular_identity(9201, AuthMethod::ScramSha256);
         let scope = scoped(&state, &identity, "10.0.0.1:5432");
 
-        let result = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+        let result = check_request_admission(&state, &scope, "point_get")
             .expect("an in-band score must be admitted");
         assert!(result.is_some());
 
         let score = scope
+            .scope()
             .auth()
             .risk_score
             .expect("an enabled scorer must stamp a score");
         let resolved =
             crate::control::security::predicate::PredicateValue::AuthRef("risk_score".to_string())
-                .resolve(scope.auth());
+                .resolve(scope.scope().auth());
         assert_eq!(
             resolved,
             Some(serde_json::json!(score)),
@@ -337,7 +373,7 @@ mod tests {
         let identity = regular_identity(9202, AuthMethod::ScramSha256);
         let scope = scoped(&state, &identity, "10.0.0.1:5432");
 
-        let error = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+        let error = check_request_admission(&state, &scope, "point_get")
             .expect_err("a deny-band score must be refused");
         assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
@@ -352,7 +388,7 @@ mod tests {
         let identity = regular_identity(9203, AuthMethod::ScramSha256);
         let scope = scoped(&state, &identity, "10.0.0.1:5432");
 
-        let error = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+        let error = check_request_admission(&state, &scope, "point_get")
             .expect_err("the step-up band must not be admitted");
         assert_eq!(rejection_reason(&error), "step-up authentication required");
     }
@@ -366,11 +402,11 @@ mod tests {
         let scope = scoped(&state, &identity, "10.0.0.1:5432");
 
         assert_eq!(
-            scope.auth().risk_score,
+            scope.scope().auth().risk_score,
             None,
             "exempt identities are unscored"
         );
-        let result = check_request_admission(&state, &scope, "10.0.0.1:5432", "point_get")
+        let result = check_request_admission(&state, &scope, "point_get")
             .expect("internal-service identities must never be risk-refused");
         assert!(result.is_none());
     }
@@ -385,7 +421,7 @@ mod tests {
         // from it.
         let scope = scoped(&state, &identity, "http");
 
-        let error = check_request_admission(&state, &scope, "http", "point_get")
+        let error = check_request_admission(&state, &scope, "point_get")
             .expect_err("an unassessed request must not be admitted");
         assert_eq!(
             rejection_reason(&error),
@@ -402,16 +438,16 @@ mod tests {
 
         let (denying, _dir_a) = test_state_with_risk(risk_config(true, -1.0, 0.0)).await;
         let scope = scoped(&denying, &identity, "10.0.0.1:5432");
-        assert!(check_request_admission(&denying, &scope, "10.0.0.1:5432", "point_get").is_err());
+        assert!(check_request_admission(&denying, &scope, "point_get").is_err());
 
         let (permitting, _dir_b) = test_state_with_risk(risk_config(true, 1.0, 2.0)).await;
         let scope = scoped(&permitting, &identity, "10.0.0.1:5432");
-        assert!(check_request_admission(&permitting, &scope, "10.0.0.1:5432", "point_get").is_ok());
+        assert!(check_request_admission(&permitting, &scope, "point_get").is_ok());
 
         let (disabled, _dir_c) = test_state_with_risk(risk_config(false, -1.0, 0.0)).await;
         let scope = scoped(&disabled, &identity, "10.0.0.1:5432");
-        assert_eq!(scope.auth().risk_score, None);
-        assert!(check_request_admission(&disabled, &scope, "10.0.0.1:5432", "point_get").is_ok());
+        assert_eq!(scope.scope().auth().risk_score, None);
+        assert!(check_request_admission(&disabled, &scope, "point_get").is_ok());
     }
 
     #[tokio::test]
@@ -420,7 +456,7 @@ mod tests {
         let identity = regular_identity(9207, AuthMethod::ApiKey);
         let scope = scoped(&state, &identity, "10.0.0.1:5432");
 
-        let error = check_blacklist_and_status(&state, &scope, "10.0.0.1:5432")
+        let error = check_blacklist_and_status(&state, &scope)
             .expect_err("the non-rate-limited door must refuse a deny-band request too");
         assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
@@ -438,10 +474,14 @@ mod tests {
             .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
             .expect("blacklist user");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1:5432",
+        );
 
-        let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
+        let result = check_blacklist_and_status(&state, &request);
         assert!(
             result.is_err(),
             "a user-blacklisted identity must be rejected"
@@ -460,16 +500,25 @@ mod tests {
             .blacklist_ip("10.0.0.0/8", "test ip ban", "admin", 0)
             .expect("blacklist CIDR range");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
-
-        let allowed = check_blacklist_and_status(&state, &scope, "203.0.113.5:5432");
+        let outside = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "203.0.113.5:5432",
+        );
+        let allowed = check_blacklist_and_status(&state, &outside);
         assert!(
             allowed.is_ok(),
             "an address outside the blacklisted range must be admitted"
         );
 
-        let denied = check_blacklist_and_status(&state, &scope, "10.1.2.3:5432");
+        let inside = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "10.1.2.3:5432",
+        );
+        let denied = check_blacklist_and_status(&state, &inside);
         assert!(
             denied.is_err(),
             "an address inside the blacklisted CIDR range must be rejected, proving the real \
@@ -486,12 +535,12 @@ mod tests {
             "s_test_suspended_no_ratelimit".into(),
         );
         ctx.status = AuthStatus::Suspended;
-        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
+        let request = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
-            .build();
+            .build_for_client("127.0.0.1:5432");
 
-        let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
+        let result = check_blacklist_and_status(&state, &request);
         assert!(
             result.is_err(),
             "a suspended account must be rejected even though no rate limit runs on this door"
@@ -507,10 +556,14 @@ mod tests {
             .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
             .expect("blacklist user");
 
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1:5432",
+        );
 
-        let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
+        let result = check_blacklist_and_status(&state, &request);
         assert!(
             result.is_ok(),
             "internal-service identities must never be blocked, even when blacklisted"
@@ -521,10 +574,14 @@ mod tests {
     async fn blacklist_and_status_allows_active_unblocked_identity() {
         let (state, _dir) = test_state().await;
         let identity = regular_identity(9105, AuthMethod::ApiKey);
-        let scope =
-            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
+        let request = ClientRequestScope::for_database(
+            &identity,
+            state.auth_stores(),
+            DatabaseId::DEFAULT,
+            "127.0.0.1:5432",
+        );
 
-        let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
+        let result = check_blacklist_and_status(&state, &request);
         assert!(
             result.is_ok(),
             "a non-blacklisted, active identity must be admitted with no rate limit involved"

@@ -182,7 +182,7 @@ impl BlacklistStore {
             cidrs.find(ip, BlacklistEntry::is_expired)
         };
         for key in expired {
-            self.remove_entry(&key);
+            self.evict_expired(&key);
         }
         found
     }
@@ -193,8 +193,7 @@ impl BlacklistStore {
         let entry = entries.get(key)?;
         if entry.is_expired() {
             drop(entries);
-            // Lazy cleanup: remove expired entry.
-            self.remove_entry(key);
+            self.evict_expired(key);
             None
         } else {
             Some(entry.clone())
@@ -314,12 +313,30 @@ impl BlacklistStore {
         Ok(())
     }
 
-    /// Remove a blacklist entry (exact-match or CIDR-range).
-    pub fn remove_entry(&self, key: &str) -> bool {
-        if let Some(ref catalog) = self.catalog
-            && let Err(e) = catalog.delete_blacklist_entry(key)
-        {
-            warn!(key = %key, error = %e, "failed to delete blacklist entry from catalog");
+    /// Lazily drop an entry whose TTL has passed.
+    ///
+    /// Unlike an operator-issued removal this cannot fail the caller: an
+    /// expired entry is already unenforced by every read path, so a catalog
+    /// delete that does not land only means the eviction is retried on the
+    /// next lookup. The failure is still surfaced, because a delete that keeps
+    /// failing is a storage problem the retry will never resolve.
+    fn evict_expired(&self, key: &str) {
+        if let Err(e) = self.remove_entry(key) {
+            warn!(key = %key, error = %e, "failed to evict expired blacklist entry");
+        }
+    }
+
+    /// Remove a blacklist entry (exact-match or CIDR-range), reporting whether
+    /// one was present.
+    ///
+    /// The catalog delete happens first and its failure is fatal to the whole
+    /// removal: dropping the entry from memory anyway would report a lifted
+    /// ban to the operator while leaving it on disk to be reloaded, verbatim,
+    /// by the next restart. Persistence and cache therefore either both change
+    /// or neither does.
+    pub fn remove_entry(&self, key: &str) -> crate::Result<bool> {
+        if let Some(ref catalog) = self.catalog {
+            catalog.delete_blacklist_entry(key)?;
         }
 
         let removed_exact = {
@@ -327,15 +344,15 @@ impl BlacklistStore {
             entries.remove(key).is_some()
         };
         if removed_exact {
-            return true;
+            return Ok(true);
         }
 
         let mut cidrs = self.cidr_entries.write().unwrap_or_else(|p| p.into_inner());
-        cidrs.remove(key)
+        Ok(cidrs.remove(key))
     }
 
     /// Remove a user from the blacklist.
-    pub fn unblacklist_user(&self, user_id: &str) -> bool {
+    pub fn unblacklist_user(&self, user_id: &str) -> crate::Result<bool> {
         self.remove_entry(&format!("user:{user_id}"))
     }
 
@@ -348,7 +365,7 @@ impl BlacklistStore {
     /// (`2001:0db8::1` and `2001:db8::1`), so removing by the raw caller
     /// string would no-op whenever the spelling differed from the one used to
     /// add it — leaving a ban in place that an operator believes they lifted.
-    pub fn unblacklist_ip(&self, addr: &str) -> bool {
+    pub fn unblacklist_ip(&self, addr: &str) -> crate::Result<bool> {
         if addr.contains('/') {
             return self.remove_entry(&format!("ip:{addr}"));
         }
@@ -493,7 +510,7 @@ mod tests {
         store.blacklist_user("user_42", "spam", "admin", 0).unwrap();
         assert!(store.check_user("user_42").is_some());
 
-        store.unblacklist_user("user_42");
+        store.unblacklist_user("user_42").expect("lift the ban");
         assert!(store.check_user("user_42").is_none());
     }
 
@@ -618,7 +635,7 @@ mod tests {
             .unwrap();
         assert!(store.check_ip("10.0.0.5").is_some());
 
-        assert!(store.unblacklist_ip("10.0.0.0/8"));
+        assert!(store.unblacklist_ip("10.0.0.0/8").expect("lift the ban"));
         assert!(store.check_ip("10.0.0.5").is_none());
     }
 
@@ -634,7 +651,7 @@ mod tests {
             .expect("blacklist a valid IPv6 address");
         assert!(store.check_ip("2001:db8::1").is_some());
 
-        assert!(store.unblacklist_ip("2001:0db8::1"));
+        assert!(store.unblacklist_ip("2001:0db8::1").expect("lift the ban"));
         assert!(store.check_ip("2001:db8::1").is_none());
     }
 

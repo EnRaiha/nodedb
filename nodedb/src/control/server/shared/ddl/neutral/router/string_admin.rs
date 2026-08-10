@@ -123,6 +123,10 @@ pub(super) async fn try_string(
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(blacklist::handle_blacklist(state, identity, &parts));
     }
+    if upper.starts_with("UNBLACKLIST ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(blacklist::handle_unblacklist(state, identity, &parts));
+    }
     if upper.starts_with("SHOW BLACKLIST") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(blacklist::show_blacklist(state, identity, &parts));

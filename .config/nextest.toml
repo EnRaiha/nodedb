@@ -82,6 +82,12 @@ threads-required = 'num-test-threads'
 # is too tight to distinguish "slow" from "hung". Only the ceiling moves — the
 # in-test truncation wait is bounded separately and fails on its own.
 #
+# `ilp_client_address` joins them for the same reason: its assertions are
+# "the row arrived" / "the row did not", each bounded by its own poll, so a
+# second real server competing for the same disk and cores turns a healthy
+# ingest into a false negative. Serializing it is enough — unlike the bulk ILP
+# binary above it sends a single line per assertion.
+#
 # These are also the heaviest real-server tests, so they get their OWN group
 # ('server-process-serial', max-threads = 1) rather than the shared
 # 'server-process' group (max-threads = 2): running two of them at once makes
@@ -92,7 +98,7 @@ threads-required = 'num-test-threads'
 # Settings are resolved per-key by first match, so this test-group wins over the
 # general server-process override below for this binary.
 [[profile.default.overrides]]
-filter = 'binary(crash_wal_truncation) | binary(crash_ilp_timeseries_write)'
+filter = 'binary(crash_wal_truncation) | binary(crash_ilp_timeseries_write) | binary(ilp_client_address)'
 test-group = 'server-process-serial'
 slow-timeout = { period = "30s", terminate-after = 8 }
 

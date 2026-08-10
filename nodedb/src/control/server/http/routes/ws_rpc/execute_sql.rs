@@ -41,22 +41,19 @@ pub async fn execute_sql(
     // The RPC-selected database is authoritative for RLS variables — passed
     // as the session database so `scope.database_id()` resolves to exactly
     // `database_id` rather than falling back through `identity`'s default.
-    let scope = RequestAuthScope::builder(identity, shared.auth_stores())
+    let request = RequestAuthScope::builder(identity, shared.auth_stores())
         .with_session_database(Some(database_id))
-        .with_peer_addr(peer_addr)
-        .build();
+        .build_for_client(peer_addr);
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before any planning/dispatch, so load is
     // shed before it is spent. WebSocket RPC has no HTTP response headers to
     // attach `X-RateLimit-*` to, so the rate-limit outcome is discarded on
     // success; a denial still fails the request closed via `?`.
-    crate::control::server::session_auth::check_request_admission(
-        shared, &scope, peer_addr, "sql",
-    )?;
+    crate::control::server::session_auth::check_request_admission(shared, &request, "sql")?;
 
     let (clean_sql, scope) =
-        crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
+        crate::control::server::session_auth::apply_per_query_on_deny(sql, request.into_scope());
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. The scope
     // is retained through every orchestrated or Data-Plane execution and

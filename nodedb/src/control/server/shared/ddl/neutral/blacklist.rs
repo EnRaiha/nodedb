@@ -6,8 +6,14 @@
 //! BLACKLIST AUTH USER 'user_42' [UNTIL '2026-12-31T00:00:00Z'] REASON 'spam'
 //! BLACKLIST IP '192.168.1.100' REASON 'abuse'
 //! BLACKLIST IP '10.0.0.0/8' REASON 'blocked network'
+//! UNBLACKLIST AUTH USER 'user_42'
+//! UNBLACKLIST IP '10.0.0.0/8'
 //! SHOW BLACKLIST [IP | USER | ALL]
 //! ```
+//!
+//! Every ban this module can create it can also lift: an entry is persisted to
+//! the system catalog and reloaded at boot, so without a removal command an
+//! operator who bans a range has no way back short of editing storage.
 //!
 //! Ported from the pgwire `ddl::blacklist_ddl` handlers. The superuser gate,
 //! blacklist-registry mutations, `WITH KILL SESSIONS` session termination, and
@@ -147,6 +153,93 @@ fn handle_blacklist_ip(
     );
 
     Ok(status("BLACKLIST"))
+}
+
+/// Handle UNBLACKLIST commands (AUTH USER or IP).
+pub fn handle_unblacklist(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    if !identity.is_superuser {
+        return Err(err("42501", "permission denied: requires superuser"));
+    }
+
+    if parts.len() < 3 {
+        return Err(err(
+            "42601",
+            "syntax: UNBLACKLIST AUTH USER '<id>' | UNBLACKLIST IP '<addr>'",
+        ));
+    }
+
+    match parts[1].to_uppercase().as_str() {
+        "AUTH" => handle_unblacklist_user(state, identity, parts),
+        "IP" => handle_unblacklist_ip(state, identity, parts),
+        _ => Err(err(
+            "42601",
+            "expected: UNBLACKLIST AUTH USER ... or UNBLACKLIST IP ...",
+        )),
+    }
+}
+
+/// UNBLACKLIST AUTH USER '<user_id>'
+fn handle_unblacklist_user(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    if parts.len() < 4 {
+        return Err(err("42601", "syntax: UNBLACKLIST AUTH USER '<id>'"));
+    }
+
+    let user_id = parts[3].trim_matches('\'');
+    lift(state, identity, "user", user_id, |store| {
+        store.unblacklist_user(user_id)
+    })
+}
+
+/// UNBLACKLIST IP '<addr_or_cidr>'
+fn handle_unblacklist_ip(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    let addr = parts[2].trim_matches('\'');
+    lift(state, identity, "IP", addr, |store| {
+        store.unblacklist_ip(addr)
+    })
+}
+
+/// Run a removal, audit it, and report whether an entry was actually lifted.
+///
+/// A removal that matched nothing is an error rather than a silent success:
+/// the operator's next belief is "that ban is gone", and a typo'd address
+/// leaving the real entry in place must never be reported as `UNBLACKLIST`.
+fn lift(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    kind: &str,
+    key: &str,
+    remove: impl FnOnce(
+        &crate::control::security::blacklist::store::BlacklistStore,
+    ) -> crate::Result<bool>,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let removed = remove(&state.blacklist).map_err(|e| err("XX000", e.to_string()))?;
+    if !removed {
+        return Err(err(
+            "42704",
+            format!("no blacklist entry for {kind} '{key}'"),
+        ));
+    }
+
+    state.audit_record(
+        crate::control::security::audit::AuditEvent::AdminAction,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!("lifted blacklist on {kind} '{key}'"),
+    );
+
+    Ok(status("UNBLACKLIST"))
 }
 
 /// SHOW BLACKLIST [IP | USER | ALL]

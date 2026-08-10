@@ -11,7 +11,7 @@
 //! * `RequireMfa` — `$auth.metadata.mfa_verified` absent or not `"true"`
 //!   fails. An unauthenticated-for-MFA request is not an MFA-verified one.
 //! * `RequireIp` — no client address available (a transport that never
-//!   called `with_peer_addr`, or one whose peer address did not parse)
+//!   resolved without a client address, or one whose peer address did not parse)
 //!   fails, exactly like risk scoring refuses an unassessed request rather
 //!   than admitting it.
 //! * `StepUpAuth` — `$auth.auth_time` absent or zero fails: with no known

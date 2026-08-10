@@ -12,6 +12,7 @@ use crate::control::security::jwks::registry::VerifiedJwtClaims;
 use crate::control::security::risk::client_ip_from_peer;
 use crate::control::security::scope::enrichment::enrich_auth_context_with_scopes;
 
+use super::client_scope::ClientRequestScope;
 use super::resolved::RequestAuthScope;
 use super::stores::AuthStores;
 
@@ -52,23 +53,6 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             adopted_auth_context: None,
             client_ip: None,
         }
-    }
-
-    /// The transport's real peer address for this request, in whatever shape
-    /// its socket layer produced (`10.1.2.3:5432`, `[::1]:5432`, or a bare
-    /// address). Used to stamp `$auth.risk_score` and to evaluate a scope
-    /// grant's `REQUIRE IP` condition.
-    ///
-    /// Pass the genuine remote address or nothing at all — never a
-    /// placeholder. Anything that does not parse as an address is discarded
-    /// by [`client_ip_from_peer`], and a scope with no client address leaves
-    /// `risk_score` unset, which the request-admission gate treats as
-    /// "unassessed" and refuses whenever risk scoring is enabled. A fake
-    /// address would instead be scored as if it were real, mis-scoring every
-    /// request behind that transport.
-    pub fn with_peer_addr(mut self, peer_addr: &str) -> Self {
-        self.client_ip = client_ip_from_peer(peer_addr);
-        self
     }
 
     /// The session's currently active database (from `USE DATABASE` or a
@@ -165,8 +149,8 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     ///    those conditions need, so a grant whose conditions fail is dropped
     ///    here and contributes no scope.
     /// 6. Stamp `auth.risk_score` when risk scoring is enabled, the identity
-    ///    is not an internal service, and [`Self::with_peer_addr`] supplied a
-    ///    usable client address. Enforcement of the resulting decision lives
+    ///    is not an internal service, and [`Self::build_for_client`] supplied
+    ///    a usable client address. Enforcement of the resulting decision lives
     ///    at the request-admission gate, not here — `build` stays infallible.
     pub fn build(self) -> RequestAuthScope<'a> {
         let resolved_db = self
@@ -222,6 +206,34 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         }
 
         RequestAuthScope::new(self.identity, auth, resolved_db)
+    }
+
+    /// Resolve the scope against the transport's real peer address and keep
+    /// the two bound together as a [`ClientRequestScope`].
+    ///
+    /// This is the only way a client address enters a scope, and the only way
+    /// to produce the value the request-admission gate accepts. Both facts are
+    /// deliberate: before this existed, the address was an optional builder
+    /// method *and* a separate argument to the gate, so a transport could pass
+    /// the gate a real address while its scope carried none — leaving
+    /// `$auth.risk_score` unstamped (which the gate refuses as unassessed once
+    /// risk scoring is enabled) and every `REQUIRE IP` grant silently
+    /// withheld, with nothing at the call site to show for it.
+    ///
+    /// `peer_addr` must be the genuine remote address in whatever shape its
+    /// socket layer produced (`10.1.2.3:5432`, `[::1]:5432`, or a bare
+    /// address) — never a placeholder and never a transport label. Anything
+    /// that does not parse as an address is discarded by
+    /// [`client_ip_from_peer`], leaving the scope unassessed rather than
+    /// mis-scoring every request behind that transport as if the placeholder
+    /// were a real client.
+    ///
+    /// A scope that is never presented to an admission door — row-level
+    /// security and redaction resolution inside the SQL execution tree — uses
+    /// [`Self::build`] instead.
+    pub fn build_for_client<'p>(mut self, peer_addr: &'p str) -> ClientRequestScope<'a, 'p> {
+        self.client_ip = client_ip_from_peer(peer_addr);
+        ClientRequestScope::new(self.build(), peer_addr)
     }
 }
 
@@ -527,16 +539,16 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let inside = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("10.0.0.1:5432")
-            .build();
+            .build_for_client("10.0.0.1:5432")
+            .into_scope();
         assert_eq!(
             inside.auth().metadata.get("scope_status.pro:all"),
             Some(&"active".to_string())
         );
 
         let outside = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("203.0.113.9:5432")
-            .build();
+            .build_for_client("203.0.113.9:5432")
+            .into_scope();
         assert!(
             !outside.auth().metadata.contains_key("scope_status.pro:all"),
             "a request from outside the permitted network must not get the scope"
@@ -607,8 +619,8 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("10.0.0.1:5432")
-            .build();
+            .build_for_client("10.0.0.1:5432")
+            .into_scope();
 
         assert_eq!(scope.auth().risk_score, None);
     }
@@ -622,8 +634,8 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("10.0.0.1:5432")
-            .build();
+            .build_for_client("10.0.0.1:5432")
+            .into_scope();
 
         let score = scope
             .auth()
@@ -651,8 +663,8 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("10.0.0.1:5432")
-            .build();
+            .build_for_client("10.0.0.1:5432")
+            .into_scope();
 
         let refusal = scorer
             .refusal_for(scope.auth())
@@ -672,8 +684,8 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("http")
-            .build();
+            .build_for_client("http")
+            .into_scope();
 
         assert_eq!(scope.auth().risk_score, None);
         assert!(scorer.refusal_for(scope.auth()).is_some());
@@ -696,8 +708,8 @@ mod tests {
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
         let scope = RequestAuthScope::builder(&identity, stores)
-            .with_peer_addr("10.0.0.1:5432")
-            .build();
+            .build_for_client("10.0.0.1:5432")
+            .into_scope();
 
         assert_eq!(scope.auth().risk_score, None);
     }

@@ -186,8 +186,9 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
             collection: req.collection,
             plan,
             timeout: Duration::from_secs(10),
-            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted,
-            peer_addr: req.peer_addr,
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted {
+                peer_addr: req.peer_addr,
+            },
         },
     )
     .await

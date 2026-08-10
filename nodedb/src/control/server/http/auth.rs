@@ -254,7 +254,7 @@ pub(crate) fn on_deny_header_mode(
 }
 
 /// Build a request-scoped
-/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// [`ClientRequestScope`](crate::control::security::request_scope::ClientRequestScope)
 /// for an HTTP request already bound to `database_id`, from the identity and
 /// verified JWT resolved earlier in the same handler via
 /// [`resolve_auth_parts`].
@@ -266,15 +266,17 @@ pub(crate) fn on_deny_header_mode(
 /// `peer_addr` must be the accepted socket's address, from
 /// [`PeerAddr`](super::peer::PeerAddr) — the scope stamps `$auth.risk_score`
 /// from it, and a scope built without one is treated as unassessed and refused
-/// by the request-admission gate whenever risk scoring is enabled.
-pub(crate) fn build_request_scope<'a>(
+/// by the request-admission gate whenever risk scoring is enabled. The result
+/// keeps that address bound to the scope so the gate cannot be handed a
+/// different one.
+pub(crate) fn build_request_scope<'a, 'p>(
     identity: &'a AuthenticatedIdentity,
     verified_jwt: Option<&'a crate::control::security::jwks::registry::VerifiedJwtClaims>,
     headers: &HeaderMap,
     state: &'a AppState,
     database_id: crate::types::DatabaseId,
-    peer_addr: &str,
-) -> crate::control::security::request_scope::RequestAuthScope<'a> {
+    peer_addr: &'p str,
+) -> crate::control::security::request_scope::ClientRequestScope<'a, 'p> {
     crate::control::security::request_scope::RequestAuthScope::builder(
         identity,
         state.shared.auth_stores(),
@@ -282,8 +284,7 @@ pub(crate) fn build_request_scope<'a>(
     .with_session_database(Some(database_id))
     .with_on_deny(on_deny_header_mode(headers))
     .with_optional_verified_jwt(verified_jwt)
-    .with_peer_addr(peer_addr)
-    .build()
+    .build_for_client(peer_addr)
 }
 
 /// Apply [`on_deny_header_mode`] to an already-built `AuthContext`.

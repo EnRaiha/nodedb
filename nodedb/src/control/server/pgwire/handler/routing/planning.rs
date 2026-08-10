@@ -49,25 +49,20 @@ impl NodeDbPgHandler {
                 })?,
             SessionId::LegacySocket(peer_addr) => peer_addr,
         };
-        let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
+        let peer_addr = peer_addr.to_string();
+        let request = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
-            .with_peer_addr(&peer_addr.to_string())
-            .build();
-        crate::control::server::session_auth::check_request_admission(
-            &self.state,
-            &scope,
-            &peer_addr.to_string(),
-            "sql",
-        )
-        .map_err(|e| {
-            let (severity, code, message) =
-                crate::control::server::pgwire::types::error_to_sqlstate(&e);
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                code.to_owned(),
-                message,
-            )))
-        })?;
+            .build_for_client(&peer_addr);
+        crate::control::server::session_auth::check_request_admission(&self.state, &request, "sql")
+            .map_err(|e| {
+                let (severity, code, message) =
+                    crate::control::server::pgwire::types::error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
         Ok(())
     }
 
@@ -175,16 +170,20 @@ impl NodeDbPgHandler {
         // context never received after the moment it was created.
         let mut scope_builder = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
-            .with_on_deny(session_on_deny)
-            // The planning scope is a different value than the one
-            // `admit_statement` built, so `$auth.risk_score` has to be
-            // stamped here too or RLS predicates that gate on it would
-            // fail closed on every pgwire statement.
-            .with_peer_addr(&peer_addr.to_string());
+            .with_on_deny(session_on_deny);
         if let Some(adopted) = adopted_auth_ctx {
             scope_builder = scope_builder.with_adopted_auth_context(adopted);
         }
-        let scope = scope_builder.build();
+        // The planning scope is a different value than the one
+        // `admit_statement` built, so it is resolved against the same
+        // connection address — otherwise `$auth.risk_score` would be unset and
+        // an IP-conditional grant withheld on every pgwire statement, even
+        // though admission itself passed. This scope is never presented to an
+        // admission door (that already ran), so the binding is unwrapped
+        // immediately.
+        let scope = scope_builder
+            .build_for_client(&peer_addr.to_string())
+            .into_scope();
 
         // Request-admission already ran once for this statement in
         // `execute_single_sql`, before it branched to `shared::ddl::dispatch`

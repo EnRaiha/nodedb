@@ -25,7 +25,10 @@ use std::time::{Duration, Instant};
 // `crash_metadata_applier_wedge.rs`), not just via the panic-path
 // diagnostics this module already wires into `pgwire.rs`.
 pub mod diagnostics;
-pub mod ilp_client;
+// The ILP client helper lives in `nodedb-test-support`, because tests outside
+// this harness drive the same handshake. A test that needs it imports it from
+// there directly rather than through a re-export here, which every crash-test
+// binary that does NOT use it would have to suppress as unused.
 mod pgwire;
 pub mod resp_client;
 

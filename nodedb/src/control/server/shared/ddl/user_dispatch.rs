@@ -39,22 +39,29 @@ use super::sync_dispatch::dispatch_authorized;
 /// runs only blacklist + account status + quota, not the full gate) and must pass
 /// [`RequestAdmission::NotYetAdmitted`] so this remains the one place that
 /// request is ever admitted.
+///
+/// The peer address lives on the `NotYetAdmitted` variant rather than beside
+/// it, because it is read on exactly that path and nowhere else. When it was a
+/// separate field, every `AlreadyAdmitted` caller had to supply an empty
+/// string it knew would never be read — a placeholder indistinguishable from a
+/// transport that simply forgot its address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestAdmission {
+pub(crate) enum RequestAdmission<'a> {
     /// The caller's own transport entry already ran the full admission gate
     /// for this request; running it again here would double-charge it.
     AlreadyAdmitted,
     /// Nothing upstream of this call has admitted the request yet — this is
-    /// the one gate it passes through.
-    NotYetAdmitted,
+    /// the one gate it passes through, against `peer_addr`: the caller's real
+    /// remote address, which reaches both the IP blacklist and the risk
+    /// scorer.
+    NotYetAdmitted { peer_addr: &'a str },
 }
 
 /// Parameters for [`dispatch_for_identity`].
 ///
 /// Grouped into a struct rather than passed positionally because the
 /// argument count (state, identity, database, collection, plan, timeout,
-/// admission, peer address) exceeds what a positional call stays readable
-/// at.
+/// admission) exceeds what a positional call stays readable at.
 pub(crate) struct DispatchRequest<'a> {
     pub state: &'a SharedState,
     pub identity: &'a AuthenticatedIdentity,
@@ -62,13 +69,9 @@ pub(crate) struct DispatchRequest<'a> {
     pub collection: &'a str,
     pub plan: PhysicalPlan,
     pub timeout: Duration,
-    pub admission: RequestAdmission,
-    /// Remote peer address for the IP-blacklist half of
-    /// [`check_request_admission`](crate::control::server::session_auth::check_request_admission).
-    /// Only read when `admission` is [`RequestAdmission::NotYetAdmitted`] —
-    /// an `AlreadyAdmitted` caller's own transport already ran the full gate,
-    /// so this door never re-checks it and the value is provably unread.
-    pub peer_addr: &'a str,
+    /// Whether this request still has to pass the admission gate, and — when
+    /// it does — the real remote address it is admitted against.
+    pub admission: RequestAdmission<'a>,
 }
 
 /// Authorize `plan` for `identity`, apply row-level security, and dispatch it.
@@ -84,7 +87,6 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         plan,
         timeout,
         admission,
-        peer_addr,
     } = req;
     // Extracted before `plan` is moved into `authorize_for_identity` (which
     // consumes it for RLS injection and task construction) — metering needs
@@ -97,15 +99,8 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
-    let authorized = authorize_for_identity(
-        state,
-        identity,
-        database_id,
-        collection,
-        plan,
-        admission,
-        peer_addr,
-    )?;
+    let authorized =
+        authorize_for_identity(state, identity, database_id, collection, plan, admission)?;
     let result = dispatch_authorized(state, authorized, collection, timeout).await;
     if result.is_ok() {
         // Metered only on the success path returned by `dispatch_authorized`
@@ -123,7 +118,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         // unit for `None`, which is correct for the lookup/mutation that
         // just happened.
         if let Some(info) = &plan_metering_info {
-            let metering_scope = resolve_dispatch_scope(state, identity, database_id, peer_addr);
+            let metering_scope = resolve_dispatch_scope(state, identity, database_id, admission);
             meter_dispatch(state, &metering_scope, info, None);
         }
     }
@@ -150,28 +145,31 @@ fn authorize_for_identity(
     database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
-    admission: RequestAdmission,
-    peer_addr: &str,
+    admission: RequestAdmission<'_>,
 ) -> crate::Result<AuthorizedTask> {
     let mut plan = plan;
-    let scope = resolve_dispatch_scope(state, identity, database_id, peer_addr);
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
     // so load is shed before it is spent. Skipped when the caller's own
     // transport entry already ran this gate for the request — see
-    // [`RequestAdmission`] for why both cases exist. `peer_addr` is the
-    // caller-supplied real remote address for the one `NotYetAdmitted`
-    // caller (the CDC-sync shape-snapshot path); `AlreadyAdmitted` callers
-    // pass an empty string because this branch never runs for them.
-    if admission == RequestAdmission::NotYetAdmitted {
-        crate::control::server::session_auth::check_request_admission(
-            state,
-            &scope,
-            peer_addr,
-            operation_for_plan(&plan),
-        )?;
-    }
+    // [`RequestAdmission`] for why both cases exist.
+    let scope = match admission {
+        RequestAdmission::AlreadyAdmitted => {
+            resolve_dispatch_scope(state, identity, database_id, admission)
+        }
+        RequestAdmission::NotYetAdmitted { peer_addr } => {
+            let request = RequestAuthScope::builder(identity, state.auth_stores())
+                .with_session_database(Some(database_id))
+                .build_for_client(peer_addr);
+            crate::control::server::session_auth::check_request_admission(
+                state,
+                &request,
+                operation_for_plan(&plan),
+            )?;
+            request.into_scope()
+        }
+    };
 
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         identity.tenant_id.as_u64(),
@@ -219,20 +217,26 @@ fn authorize_for_identity(
 /// [`authorize_for_identity`] so that guarantee is directly unit-testable.
 /// Reads the auth stores off `state`.
 ///
-/// `peer_addr` is the caller-supplied real remote address; it reaches the
-/// risk scorer so `$auth.risk_score` is stamped on this path too. Callers
-/// that already ran the admission gate for the request pass an empty
-/// string, which is not an address and is therefore never scored.
+/// A `NotYetAdmitted` request carries its real remote address, so the scope is
+/// resolved against it and `$auth.risk_score` plus any IP-conditional grant
+/// are live on this path too. An `AlreadyAdmitted` request was admitted at its
+/// own transport entry and reaches this fan-in door with no address in hand;
+/// its scope is resolved without one rather than against a placeholder that
+/// would be scored as if it were a real client.
 fn resolve_dispatch_scope<'a>(
     state: &'a SharedState,
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
-    peer_addr: &str,
+    admission: RequestAdmission<'_>,
 ) -> RequestAuthScope<'a> {
-    RequestAuthScope::builder(identity, state.auth_stores())
-        .with_session_database(Some(database_id))
-        .with_peer_addr(peer_addr)
-        .build()
+    let builder = RequestAuthScope::builder(identity, state.auth_stores())
+        .with_session_database(Some(database_id));
+    match admission {
+        RequestAdmission::AlreadyAdmitted => builder.build(),
+        RequestAdmission::NotYetAdmitted { peer_addr } => {
+            builder.build_for_client(peer_addr).into_scope()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,7 +300,14 @@ mod tests {
         );
         identity.default_database = Some(identity_default);
 
-        let scope = resolve_dispatch_scope(&state, &identity, dispatch_target, "127.0.0.1:5432");
+        let scope = resolve_dispatch_scope(
+            &state,
+            &identity,
+            dispatch_target,
+            RequestAdmission::NotYetAdmitted {
+                peer_addr: "127.0.0.1:5432",
+            },
+        );
 
         assert_eq!(scope.database_id(), dispatch_target);
         assert_eq!(scope.auth().database_id, Some(dispatch_target));
@@ -336,8 +347,9 @@ mod tests {
             dispatch_target,
             "widgets",
             plan,
-            RequestAdmission::NotYetAdmitted,
-            "127.0.0.1:9",
+            RequestAdmission::NotYetAdmitted {
+                peer_addr: "127.0.0.1:9",
+            },
         )
         .expect("authorize task for identity");
 
@@ -388,8 +400,9 @@ mod tests {
             DatabaseId::DEFAULT,
             "widgets",
             trivial_kv_get_plan(),
-            RequestAdmission::NotYetAdmitted,
-            "127.0.0.1:9",
+            RequestAdmission::NotYetAdmitted {
+                peer_addr: "127.0.0.1:9",
+            },
         );
         assert!(
             denied.is_err(),
@@ -406,7 +419,6 @@ mod tests {
             "widgets",
             trivial_kv_get_plan(),
             RequestAdmission::AlreadyAdmitted,
-            "",
         );
         assert!(
             allowed.is_ok(),
@@ -502,7 +514,6 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
-            peer_addr: "",
         })
         .await;
         responder.await.expect("responder completes");
@@ -537,8 +548,9 @@ mod tests {
             collection: "widgets",
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
-            admission: RequestAdmission::NotYetAdmitted,
-            peer_addr: "127.0.0.1:9",
+            admission: RequestAdmission::NotYetAdmitted {
+                peer_addr: "127.0.0.1:9",
+            },
         })
         .await;
 
@@ -571,7 +583,6 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
-            peer_addr: "",
         })
         .await;
         responder.await.expect("responder completes");
@@ -601,7 +612,6 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
-            peer_addr: "",
         })
         .await;
         responder.await.expect("responder completes");

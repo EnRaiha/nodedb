@@ -15,7 +15,7 @@ use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::dispatch_utils;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::state::SharedState;
@@ -168,7 +168,7 @@ fn meter_resp_dispatch(
         database_id,
         &session.peer_addr,
     );
-    meter_dispatch(state, &scope, info, Some(1));
+    meter_dispatch(state, scope.scope(), info, Some(1));
 }
 
 fn authorize_resp_task(
@@ -187,7 +187,7 @@ fn authorize_resp_task(
             resource: "RESP AUTH required before data access".into(),
         })?;
 
-    let scope = resp_auth_scope(
+    let request = resp_auth_scope(
         identity,
         state.auth_stores(),
         database_id,
@@ -200,12 +200,8 @@ fn authorize_resp_task(
     // every RESP command reaches the Data Plane through here, so this one
     // call covers the whole protocol, including the IP-blacklist half via
     // `session.peer_addr` (set at connection accept).
-    crate::control::server::session_auth::check_request_admission(
-        state,
-        &scope,
-        &session.peer_addr,
-        operation,
-    )?;
+    crate::control::server::session_auth::check_request_admission(state, &request, operation)?;
+    let scope = request.into_scope();
 
     // Row-level security is injected here, before the capability is minted, for
     // the same reason the native path injects before dispatch: the plan the
@@ -262,7 +258,7 @@ fn authorize_resp_task(
 /// RESP carries no session/database selector, so `database_id` is always
 /// `DatabaseId::DEFAULT` at every current call site (see `dispatch_kv` /
 /// `dispatch_kv_write`) — deliberate, not a fall-through. It is threaded
-/// through `RequestAuthScope::builder` as the session database rather than
+/// through the scope builder as the session database rather than
 /// resolving `$auth.database_id` from `identity` separately, so
 /// `scope.database_id()` (used for `PhysicalTask::database_id`) and
 /// `scope.auth().database_id` (used for RLS substitution) cannot disagree —
@@ -271,16 +267,13 @@ fn authorize_resp_task(
 ///
 /// `peer_addr` is the connection's accept-time remote address; it reaches
 /// the risk scorer so `$auth.risk_score` is stamped for RESP commands too.
-fn resp_auth_scope<'a>(
+fn resp_auth_scope<'a, 'p>(
     identity: &'a AuthenticatedIdentity,
     stores: crate::control::security::request_scope::AuthStores<'a>,
     database_id: DatabaseId,
-    peer_addr: &str,
-) -> RequestAuthScope<'a> {
-    RequestAuthScope::builder(identity, stores)
-        .with_session_database(Some(database_id))
-        .with_peer_addr(peer_addr)
-        .build()
+    peer_addr: &'p str,
+) -> ClientRequestScope<'a, 'p> {
+    ClientRequestScope::for_database(identity, stores, database_id, peer_addr)
 }
 
 /// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
@@ -369,8 +362,8 @@ mod tests {
             "127.0.0.1:6379",
         );
 
-        assert_eq!(scope.database_id(), DatabaseId::DEFAULT);
-        assert_eq!(scope.auth().database_id, Some(DatabaseId::DEFAULT));
+        assert_eq!(scope.scope().database_id(), DatabaseId::DEFAULT);
+        assert_eq!(scope.scope().auth().database_id, Some(DatabaseId::DEFAULT));
     }
 
     /// RESP threads `session.peer_addr` (set at connection accept, see

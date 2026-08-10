@@ -87,12 +87,11 @@ pub async fn crdt_state(
             collection,
             plan,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            // This handler receives no session or peer information; the
+            // request was admitted at its own transport entry, and
+            // `AlreadyAdmitted` carries no address precisely so there is
+            // nothing to invent here.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
-            // `AlreadyAdmitted` never reaches the blacklist check this door
-            // performs — see `DispatchRequest::peer_addr` — so this handler
-            // (no session or peer info reaches it) has nothing honest to
-            // supply and the empty string is provably unread.
-            peer_addr: "",
         },
     )
     .await

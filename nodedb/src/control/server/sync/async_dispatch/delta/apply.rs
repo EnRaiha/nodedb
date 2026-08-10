@@ -114,13 +114,17 @@ pub(crate) async fn apply_delta_and_finalize(
     // runs that half of `check_request_admission`'s gate (plus the
     // internal-service exemption every other transport gets) using the sync
     // session's real remote address.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+    // The scope is resolved against that same address, so `$auth.risk_score`
+    // is stamped and an IP-conditional grant is evaluated for this device
+    // rather than being withheld.
+    let request = crate::control::security::request_scope::ClientRequestScope::for_database(
         identity,
         shared.auth_stores(),
         database_id,
+        peer_addr,
     );
     if let Err(e) =
-        crate::control::server::session_auth::check_blacklist_and_status(shared, &scope, peer_addr)
+        crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
     {
         warn!(error = %e, "sync: delta rejected by blacklist or account status");
         return terminal_reject(
@@ -345,7 +349,7 @@ pub(crate) async fn apply_delta_and_finalize(
     if dispatch_result.is_ok()
         && let Some(info) = &plan_metering_info
     {
-        meter_dispatch(shared, &scope, info, Some(trimmed_ops));
+        meter_dispatch(shared, request.scope(), info, Some(trimmed_ops));
     }
 
     DeltaDispatchOutcome {
@@ -393,4 +397,156 @@ fn terminal_reject(
         compensation: Some(compensation),
     };
     DeltaDispatchOutcome::refused(SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::identity::{AuthMethod, DatabaseSet, Permission, Role};
+    use crate::control::security::risk::RiskConfig;
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    use super::*;
+
+    const PEER_ADDR: &str = "10.0.0.7:44321";
+
+    fn state_with_risk(risk: RiskConfig) -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create delta admission test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("delta-admission.wal"))
+                .expect("open delta admission test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new_with_risk_config(dispatcher, wal, risk)
+            .expect("construct delta admission state");
+        (state, dir)
+    }
+
+    fn pusher() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            88,
+            "device",
+            TenantId::new(3),
+            AuthMethod::ApiKey,
+            vec![Role::ReadWrite],
+            Some(DatabaseId::DEFAULT),
+            DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
+        )
+    }
+
+    /// The delta must be authorized before it reaches the admission gate, or
+    /// the test would be measuring the wrong refusal.
+    fn grant_write(shared: &SharedState) {
+        shared
+            .permissions
+            .grant(
+                "collection:3:notes",
+                "user:device",
+                Permission::Write,
+                "admin",
+                None,
+            )
+            .expect("in-memory write grant succeeds");
+    }
+
+    fn delta() -> DeltaPushMsg {
+        DeltaPushMsg {
+            collection: "notes".into(),
+            document_id: "doc-1".into(),
+            delta: Vec::new(),
+            peer_id: 1,
+            mutation_id: 42,
+            checksum: 0,
+            device_valid_time_ms: None,
+            producer_id: 1,
+            epoch: 1,
+            seq: 1,
+            device_id: 0,
+            delta_signature: [0u8; 32],
+        }
+    }
+
+    fn session(identity: &AuthenticatedIdentity) -> DeltaSessionContext<'_> {
+        DeltaSessionContext {
+            identity: Some(identity),
+            signing_key: None,
+            producer_id: 1,
+            epoch: 1,
+            peer_addr: PEER_ADDR,
+        }
+    }
+
+    fn reject_reason(outcome: &DeltaDispatchOutcome) -> String {
+        let frame = outcome
+            .frame
+            .as_ref()
+            .expect("a refused delta always answers with a frame");
+        assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
+        frame
+            .decode_body::<DeltaRejectMsg>()
+            .expect("decode the reject frame")
+            .reason
+    }
+
+    fn ack() -> SyncFrame {
+        SyncFrame::try_encode(
+            SyncMessageType::DeltaAck,
+            &nodedb_types::sync::wire::DeltaAckMsg {
+                mutation_id: 42,
+                lsn: 0,
+                clock_skew_warning_ms: None,
+                applied_seq: 0,
+                status: Default::default(),
+            },
+        )
+        .expect("encode provisional ack")
+    }
+
+    /// With risk scoring enabled and every score inside the allow band, an
+    /// authorized delta must pass the admission gate and be refused only by
+    /// the next step (its collection does not exist here).
+    ///
+    /// Before the session's address reached this scope, the gate had no score
+    /// to enforce and failed closed: enabling `[auth.risk]` refused every
+    /// delta push with "sender is blocked" no matter who sent it.
+    #[tokio::test]
+    async fn scored_delta_passes_the_admission_gate_instead_of_failing_closed() {
+        let (state, _dir) = state_with_risk(RiskConfig {
+            enabled: true,
+            allow_threshold: 1.0,
+            deny_threshold: 2.0,
+            ..Default::default()
+        });
+        grant_write(&state);
+        let identity = pusher();
+
+        let outcome = apply_delta_and_finalize(&state, &delta(), ack(), session(&identity)).await;
+
+        assert_eq!(
+            reject_reason(&outcome),
+            "collection not found",
+            "the delta must reach the step after admission, not be refused as unassessed"
+        );
+    }
+
+    /// The same address that admits an in-band delta refuses an out-of-band
+    /// one — proof the score is the session's, not a constant.
+    #[tokio::test]
+    async fn deny_band_delta_is_refused_by_the_risk_gate() {
+        let (state, _dir) = state_with_risk(RiskConfig {
+            enabled: true,
+            allow_threshold: -1.0,
+            deny_threshold: 0.0,
+            ..Default::default()
+        });
+        grant_write(&state);
+        let identity = pusher();
+
+        let outcome = apply_delta_and_finalize(&state, &delta(), ack(), session(&identity)).await;
+
+        assert_eq!(reject_reason(&outcome), "sender is blocked");
+    }
 }

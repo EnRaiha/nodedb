@@ -162,15 +162,15 @@ impl NativeSession {
         // the auth frame established, on every request, not just the first.
         // Authority still comes from `identity` alone; `with_optional_verified_jwt`
         // never lets the token elevate it (see `AuthContext::from_verified_jwt`).
-        let scope = crate::control::security::request_scope::RequestAuthScope::builder(
+        let peer_addr = self.peer_addr.to_string();
+        let request_scope = crate::control::security::request_scope::RequestAuthScope::builder(
             identity,
             self.state.auth_stores(),
         )
         .with_session_database(Some(current_database))
         .with_session_id(session_id)
         .with_optional_verified_jwt(self.verified_jwt.as_ref())
-        .with_peer_addr(&self.peer_addr.to_string())
-        .build();
+        .build_for_client(&peer_addr);
 
         // Request-admission gate: internal-service exemption, blacklist,
         // account status, then rate limit — run once per request, before any
@@ -181,8 +181,7 @@ impl NativeSession {
         let operation = dispatch::admission_operation(op);
         if let Err(e) = crate::control::server::session_auth::check_request_admission(
             &self.state,
-            &scope,
-            &self.peer_addr.to_string(),
+            &request_scope,
             operation,
         ) {
             return SqlOutcome::Response(Box::new(dispatch::error_to_native(seq, &e)));
@@ -191,7 +190,7 @@ impl NativeSession {
         let ctx = DispatchCtx {
             state: &self.state,
             identity,
-            scope,
+            scope: request_scope.into_scope(),
             query_ctx: &self.query_ctx,
             sessions: &self.sessions,
             peer_addr: &self.peer_addr,
