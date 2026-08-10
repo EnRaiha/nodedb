@@ -76,10 +76,7 @@ impl RiskScorer {
         }
 
         // Signal: device_not_trusted.
-        if auth_ctx
-            .metadata
-            .get("device_trusted")
-            .is_none_or(|v| v != "true")
+        if !auth_ctx.metadata_flag("device_trusted")
             && let Some(&w) = self.config.weights.get("device_not_trusted")
         {
             total += w;

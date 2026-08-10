@@ -7,6 +7,34 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### ⚠️ Breaking changes
+
+- **JWT `metadata` claims keep their JSON type.** Previously every value in the
+  `metadata` claim object was coerced to a string, and any value that was not
+  already a JSON string — a number, a boolean, a nested object or array — was
+  dropped silently, with no error and no log line. A policy keyed on such a
+  claim failed open and gave no indication why. Values of every type now
+  survive with their type intact.
+
+  This changes RLS comparison semantics for providers that issue typed claims.
+  A policy written as `$auth.metadata.seats = 5` compared text before and
+  compares numerically now, if the provider sends `"seats": 5` as a JSON
+  number. Providers already sending `"seats": "5"` as a string are unaffected
+  and still compare as text. The same applies to booleans.
+
+  Scope- and quota-derived metadata (`quota_remaining.*`, `quota_pct.*`,
+  `scope_expires_at.*`) is likewise numeric rather than stringified, so a
+  predicate comparing it against a numeric literal now matches where it
+  previously required a string literal.
+
+  Boolean metadata flags (`device_trusted`, `mfa_verified`) accept both a real
+  JSON boolean and the legacy string `"true"`, so a provider can adopt typed
+  claims without a coordinated cutover.
+
+---
+
 ## [0.5.0] - 2026-08-04
 
 A security and durability release. It closes silent-failure paths in the WAL, replay, checkpoint, and sync layers, enforces authorization uniformly across transports, and makes expression errors, declared column widths, and affected-row counts report the truth instead of a plausible-looking wrong answer.

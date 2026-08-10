@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::DatabaseId;
+use nodedb_types::conversion::json_to_value;
+use nodedb_types::{DatabaseId, Value};
 
 use crate::types::TenantId;
 
@@ -97,7 +98,13 @@ pub struct AuthContext {
     /// Account status.
     pub status: AuthStatus,
     /// Arbitrary key-value metadata from JWT or DB (plan tier, region, etc.).
-    pub metadata: HashMap<String, String>,
+    ///
+    /// Typed rather than stringly: a provider that issues `"seats": 5` or
+    /// `"beta": true` must have that survive as `Value::Integer` /
+    /// `Value::Bool`, not get silently dropped (string-only) or forced back
+    /// to text at read time, which would make numeric/boolean custom claims
+    /// unusable in RLS predicates.
+    pub metadata: HashMap<String, Value>,
     /// How the user authenticated.
     pub auth_method: AuthMethod,
     /// When the user last authenticated (Unix epoch seconds).
@@ -153,13 +160,19 @@ impl AuthContext {
             .and_then(|s| s.parse::<AuthStatus>().ok())
             .unwrap_or(AuthStatus::Active);
 
-        let mut metadata: HashMap<String, String> = claims
+        // Every claim value is kept, whatever its JSON type. A claim that
+        // silently vanished here (the old behavior for non-string values)
+        // is indistinguishable from one the provider never sent, so an RLS
+        // policy keyed on it would fail open with no diagnostic — a numeric
+        // `seats` or boolean `beta` claim must reach `$auth.metadata.*`
+        // typed, not be dropped or coerced to text.
+        let mut metadata: HashMap<String, Value> = claims
             .extra
             .get("metadata")
             .and_then(|v| v.as_object())
             .map(|obj| {
                 obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .map(|(k, v)| (k.clone(), json_to_value(v.clone())))
                     .collect()
             })
             .unwrap_or_default();
@@ -172,7 +185,10 @@ impl AuthContext {
         {
             for (scope_name, ts) in scope_expires {
                 if let Some(ts_val) = ts.as_u64() {
-                    metadata.insert(format!("scope_expires_at.{scope_name}"), ts_val.to_string());
+                    metadata.insert(
+                        format!("scope_expires_at.{scope_name}"),
+                        Value::Integer(ts_val as i64),
+                    );
                 }
             }
         }
@@ -322,11 +338,18 @@ impl AuthContext {
             // than reading a fabricated zero score as "no risk".
             "risk_score" => self.risk_score.map(|s| serde_json::json!(s)),
             // Metadata sub-fields: $auth.metadata.<key>
+            //
+            // Converts via `Value`'s own `From` impl rather than a hand-rolled
+            // match: `Value` is `#[non_exhaustive]`, so a local match would
+            // need a wildcard arm that silently drops future variants. Using
+            // the shared impl also keeps a numeric/boolean claim numeric or
+            // boolean here instead of re-flattening it to a JSON string,
+            // which would re-introduce the exact typing loss this type fixes.
             other if other.starts_with("metadata.") => {
                 let key = &other["metadata.".len()..];
                 self.metadata
                     .get(key)
-                    .map(|v| serde_json::Value::String(v.clone()))
+                    .map(|v| serde_json::Value::from(v.clone()))
             }
             _ => None,
         }
@@ -335,6 +358,24 @@ impl AuthContext {
     /// Whether this context represents a superuser.
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
+    }
+
+    /// Whether `metadata[key]` is an affirmative boolean flag.
+    ///
+    /// Accepts both `Value::Bool(true)` — what a provider issuing a proper
+    /// JSON boolean claim now produces — and the legacy `Value::String("true")`
+    /// that every existing deployment still sends, since the claim parser
+    /// used to coerce every metadata value to a string. Accepting only one
+    /// of the two forms would break either new correctly-typed providers or
+    /// every deployment already in the field. An absent key, or any other
+    /// value (including `Value::Bool(false)` / `Value::String("false")`), is
+    /// not affirmative — flags fail closed rather than defaulting to set.
+    pub fn metadata_flag(&self, key: &str) -> bool {
+        match self.metadata.get(key) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => s == "true",
+            _ => false,
+        }
     }
 }
 
@@ -424,6 +465,144 @@ mod tests {
             Some(serde_json::json!("pro"))
         );
         assert_eq!(ctx.resolve_variable("metadata.missing"), None);
+    }
+
+    /// A JWT `metadata` claim carrying a JSON number survives claim parsing
+    /// as `Value::Integer`, not as a string and not dropped.
+    #[test]
+    fn jwt_metadata_claim_carrying_a_number_survives_as_value_integer() {
+        let mut extra = HashMap::new();
+        extra.insert("metadata".into(), serde_json::json!({"seats": 5}));
+        let claims = JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 1,
+            roles: vec!["readwrite".into()],
+            exp: 9_999_999_999,
+            nbf: 0,
+            iat: 0,
+            iss: "nodedb-auth".into(),
+            aud: vec!["nodedb".into()],
+            user_id: 42,
+            is_superuser: false,
+            extra,
+        };
+
+        let ctx = AuthContext::from_verified_claims(&claims, &test_identity(), "s_num".into());
+
+        assert_eq!(ctx.metadata.get("seats"), Some(&Value::Integer(5)));
+    }
+
+    /// A JWT `metadata` claim carrying a JSON boolean survives claim parsing
+    /// as `Value::Bool`, not stringified.
+    #[test]
+    fn jwt_metadata_claim_carrying_a_boolean_survives_as_value_bool() {
+        let mut extra = HashMap::new();
+        extra.insert("metadata".into(), serde_json::json!({"beta": true}));
+        let claims = JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 1,
+            roles: vec!["readwrite".into()],
+            exp: 9_999_999_999,
+            nbf: 0,
+            iat: 0,
+            iss: "nodedb-auth".into(),
+            aud: vec!["nodedb".into()],
+            user_id: 42,
+            is_superuser: false,
+            extra,
+        };
+
+        let ctx = AuthContext::from_verified_claims(&claims, &test_identity(), "s_bool".into());
+
+        assert_eq!(ctx.metadata.get("beta"), Some(&Value::Bool(true)));
+    }
+
+    /// A JWT `metadata` claim carrying a JSON string still survives unchanged
+    /// — no regression from typing the map.
+    #[test]
+    fn jwt_metadata_claim_carrying_a_string_survives_unchanged() {
+        let mut extra = HashMap::new();
+        extra.insert("metadata".into(), serde_json::json!({"plan": "pro"}));
+        let claims = JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 1,
+            roles: vec!["readwrite".into()],
+            exp: 9_999_999_999,
+            nbf: 0,
+            iat: 0,
+            iss: "nodedb-auth".into(),
+            aud: vec!["nodedb".into()],
+            user_id: 42,
+            is_superuser: false,
+            extra,
+        };
+
+        let ctx = AuthContext::from_verified_claims(&claims, &test_identity(), "s_str".into());
+
+        assert_eq!(ctx.metadata.get("plan"), Some(&Value::String("pro".into())));
+    }
+
+    /// A JWT `metadata` claim carrying a nested object or array survives
+    /// rather than being dropped by the claim parser.
+    #[test]
+    fn jwt_metadata_claim_carrying_a_nested_object_or_array_survives() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "metadata".into(),
+            serde_json::json!({
+                "limits": {"max_rows": 100},
+                "tags": ["a", "b"],
+            }),
+        );
+        let claims = JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 1,
+            roles: vec!["readwrite".into()],
+            exp: 9_999_999_999,
+            nbf: 0,
+            iat: 0,
+            iss: "nodedb-auth".into(),
+            aud: vec!["nodedb".into()],
+            user_id: 42,
+            is_superuser: false,
+            extra,
+        };
+
+        let ctx = AuthContext::from_verified_claims(&claims, &test_identity(), "s_nested".into());
+
+        match ctx.metadata.get("limits") {
+            Some(Value::Object(obj)) => {
+                assert_eq!(obj.get("max_rows"), Some(&Value::Integer(100)));
+            }
+            other => panic!("expected Value::Object for nested claim, got {other:?}"),
+        }
+        match ctx.metadata.get("tags") {
+            Some(Value::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    &vec![Value::String("a".into()), Value::String("b".into())]
+                );
+            }
+            other => panic!("expected Value::Array for array claim, got {other:?}"),
+        }
+    }
+
+    /// `resolve_variable("metadata.<key>")` returns a typed `serde_json::Value`
+    /// — a claim number stays a JSON number rather than being flattened to a
+    /// string, since that would re-drop the typing the parser now preserves.
+    #[test]
+    fn resolve_variable_metadata_returns_a_typed_value_not_a_stringified_one() {
+        let mut ctx = AuthContext::from_identity(&test_identity(), "s_test_typed".into());
+        ctx.metadata.insert("seats".into(), Value::Integer(5));
+
+        let resolved = ctx
+            .resolve_variable("metadata.seats")
+            .expect("metadata.seats must resolve");
+        assert!(
+            resolved.is_number(),
+            "expected a JSON number, got {resolved:?}"
+        );
+        assert_eq!(resolved, serde_json::json!(5));
     }
 
     #[test]

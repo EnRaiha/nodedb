@@ -7,6 +7,8 @@ use std::collections::HashSet;
 
 use tracing::debug;
 
+use nodedb_types::Value;
+
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::conditional::evaluate_conditions;
 use crate::control::security::metering::quota::QuotaManager;
@@ -135,8 +137,10 @@ pub fn enrich_auth_context_with_scopes(
             continue;
         };
         if !effective.contains(scope_name.as_str()) {
-            ctx.metadata
-                .insert(format!("{SCOPE_DENIED_PREFIX}{scope_name}"), reason.clone());
+            ctx.metadata.insert(
+                format!("{SCOPE_DENIED_PREFIX}{scope_name}"),
+                Value::String(reason.clone()),
+            );
         }
     }
 
@@ -144,23 +148,23 @@ pub fn enrich_auth_context_with_scopes(
         let status = scope_grants.scope_status(scope_name, "user", &ctx.id);
         ctx.metadata.insert(
             format!("{SCOPE_STATUS_PREFIX}{scope_name}"),
-            status.to_string(),
+            Value::String(status.to_string()),
         );
         let expires_at = scope_grants.scope_expires_at(scope_name, "user", &ctx.id);
         if expires_at > 0 {
             ctx.metadata.insert(
                 format!("{SCOPE_EXPIRES_PREFIX}{scope_name}"),
-                expires_at.to_string(),
+                Value::Integer(expires_at as i64),
             );
         }
         if let Some(quota_status) = quota_manager.get_status(scope_name, &ctx.id, now_secs) {
             ctx.metadata.insert(
                 format!("{QUOTA_REMAINING_PREFIX}{scope_name}"),
-                quota_status.remaining.to_string(),
+                Value::Integer(quota_status.remaining as i64),
             );
             ctx.metadata.insert(
                 format!("{QUOTA_PCT_PREFIX}{scope_name}"),
-                quota_status.pct_used.to_string(),
+                Value::Float(quota_status.pct_used),
             );
         }
     }
@@ -168,7 +172,8 @@ pub fn enrich_auth_context_with_scopes(
     // Also set a comma-separated list of effective scopes.
     let scope_list: Vec<&str> = effective.into_iter().collect();
     if !scope_list.is_empty() {
-        ctx.metadata.insert(SCOPES_KEY.into(), scope_list.join(","));
+        ctx.metadata
+            .insert(SCOPES_KEY.into(), Value::String(scope_list.join(",")));
     }
 }
 
@@ -231,11 +236,11 @@ mod tests {
 
         assert_eq!(
             ctx.metadata.get("quota_remaining.pro:all"),
-            Some(&"750".to_string())
+            Some(&Value::Integer(750))
         );
         assert_eq!(
             ctx.metadata.get("quota_pct.pro:all"),
-            Some(&"0.25".to_string())
+            Some(&Value::Float(0.25))
         );
     }
 
@@ -298,11 +303,11 @@ mod tests {
 
         assert_eq!(
             ctx.metadata.get("quota_remaining.pro:all"),
-            Some(&"1000".to_string())
+            Some(&Value::Integer(1000))
         );
         assert_eq!(
             ctx.metadata.get("quota_pct.pro:all"),
-            Some(&"0".to_string())
+            Some(&Value::Float(0.0))
         );
     }
 
@@ -358,9 +363,12 @@ mod tests {
         );
         assert_eq!(
             inside.metadata.get("scope_status.pro:all"),
-            Some(&"active".to_string())
+            Some(&Value::String("active".into()))
         );
-        assert_eq!(inside.metadata.get("scopes"), Some(&"pro:all".to_string()));
+        assert_eq!(
+            inside.metadata.get("scopes"),
+            Some(&Value::String("pro:all".into()))
+        );
 
         let mut outside = test_ctx("u10");
         enrich_auth_context_with_scopes(
@@ -378,7 +386,7 @@ mod tests {
         assert!(!outside.metadata.contains_key("scopes"));
         assert_eq!(
             outside.metadata.get("scope_denied.pro:all"),
-            Some(&"outside the grant's permitted hours".to_string())
+            Some(&Value::String("outside the grant's permitted hours".into()))
         );
     }
 
@@ -406,7 +414,7 @@ mod tests {
         );
         assert_eq!(
             inside.metadata.get("scope_status.ops:all"),
-            Some(&"active".to_string())
+            Some(&Value::String("active".into()))
         );
 
         let mut elsewhere = test_ctx("u11");
@@ -450,7 +458,9 @@ mod tests {
         assert!(!ctx.metadata.contains_key("scope_status.ops:all"));
         assert_eq!(
             ctx.metadata.get("scope_denied.ops:all"),
-            Some(&"client address unavailable for an IP-restricted grant".to_string())
+            Some(&Value::String(
+                "client address unavailable for an IP-restricted grant".into()
+            ))
         );
     }
 
@@ -476,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             ctx.metadata.get("scope_denied.admin:all"),
-            Some(&STEP_UP_REQUIRED.to_string())
+            Some(&Value::String(STEP_UP_REQUIRED.to_string()))
         );
 
         let mut verified = test_ctx("u13");
@@ -493,7 +503,7 @@ mod tests {
         );
         assert_eq!(
             verified.metadata.get("scope_status.admin:all"),
-            Some(&"active".to_string())
+            Some(&Value::String("active".into()))
         );
     }
 

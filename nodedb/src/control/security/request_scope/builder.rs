@@ -375,7 +375,7 @@ mod tests {
 
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
-            Some(&"active".to_string())
+            Some(&nodedb_types::Value::String("active".into()))
         );
     }
 
@@ -423,11 +423,11 @@ mod tests {
 
         assert_eq!(
             scope.auth().metadata.get("quota_remaining.pro:all"),
-            Some(&"90".to_string())
+            Some(&nodedb_types::Value::Integer(90))
         );
         assert_eq!(
             scope.auth().metadata.get("quota_pct.pro:all"),
-            Some(&"0.1".to_string())
+            Some(&nodedb_types::Value::Float(0.1))
         );
     }
 
@@ -503,7 +503,7 @@ mod tests {
 
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
-            Some(&"active".to_string())
+            Some(&nodedb_types::Value::String("active".into()))
         );
     }
 
@@ -545,7 +545,7 @@ mod tests {
             .into_scope();
         assert_eq!(
             inside.auth().metadata.get("scope_status.pro:all"),
-            Some(&"active".to_string())
+            Some(&nodedb_types::Value::String("active".into()))
         );
 
         let outside = RequestAuthScope::builder(&identity, stores)
@@ -578,7 +578,9 @@ mod tests {
         assert!(!scope.auth().metadata.contains_key("scope_status.pro:all"));
         assert_eq!(
             scope.auth().metadata.get("scope_denied.pro:all"),
-            Some(&"client address unavailable for an IP-restricted grant".to_string())
+            Some(&nodedb_types::Value::String(
+                "client address unavailable for an IP-restricted grant".into()
+            ))
         );
     }
 
@@ -597,7 +599,7 @@ mod tests {
 
         assert_eq!(
             scope.auth().metadata.get("scope_denied.pro:all"),
-            Some(&STEP_UP_REQUIRED.to_string())
+            Some(&nodedb_types::Value::String(STEP_UP_REQUIRED.to_string()))
         );
     }
 

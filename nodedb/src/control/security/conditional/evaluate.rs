@@ -165,10 +165,13 @@ pub fn evaluate_conditions(
     Ok(())
 }
 
-/// True when `auth.metadata[key]` is exactly `"true"`. An absent key is
-/// false — the marker has to be present and affirmative.
+/// True when `auth.metadata[key]` is an affirmative boolean flag. An absent
+/// key is false — the marker has to be present and affirmative. Delegates to
+/// `AuthContext::metadata_flag` so this idiom has exactly one implementation
+/// shared with the risk scorer's `device_trusted` check, rather than two
+/// copies that could silently drift.
 fn flag_is_set(auth: &AuthContext, key: &str) -> bool {
-    auth.metadata.get(key).is_some_and(|v| v == "true")
+    auth.metadata_flag(key)
 }
 
 /// Whether `hour` falls in `[start, end)`, wrapping past midnight when the
@@ -320,6 +323,40 @@ mod tests {
         assert!(evaluate_conditions(std::slice::from_ref(&cond), &ctx, None, 10_000).is_ok());
         ctx.auth_time = Some(1_000);
         assert!(evaluate_conditions(std::slice::from_ref(&cond), &ctx, None, 10_000).is_err());
+    }
+
+    /// `flag_is_set` accepts both a real `Value::Bool(true)` (what a provider
+    /// issuing a proper JSON boolean claim now produces) and the legacy
+    /// `Value::String("true")` every existing deployment still sends, and
+    /// rejects `Value::Bool(false)`, `Value::String("false")`, and a missing
+    /// key — accepting only one typed form would break the other.
+    #[test]
+    fn flag_is_set_accepts_both_bool_and_string_true_and_rejects_everything_else() {
+        let mut ctx = auth();
+        assert!(!flag_is_set(&ctx, "verified"), "missing key must be false");
+
+        ctx.metadata
+            .insert("verified".into(), nodedb_types::Value::Bool(true));
+        assert!(flag_is_set(&ctx, "verified"), "Value::Bool(true) must pass");
+
+        ctx.metadata
+            .insert("verified".into(), nodedb_types::Value::Bool(false));
+        assert!(
+            !flag_is_set(&ctx, "verified"),
+            "Value::Bool(false) must fail"
+        );
+
+        ctx.metadata.insert("verified".into(), "true".into());
+        assert!(
+            flag_is_set(&ctx, "verified"),
+            "legacy Value::String(\"true\") must pass"
+        );
+
+        ctx.metadata.insert("verified".into(), "false".into());
+        assert!(
+            !flag_is_set(&ctx, "verified"),
+            "Value::String(\"false\") must fail"
+        );
     }
 
     #[test]

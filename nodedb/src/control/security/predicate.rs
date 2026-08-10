@@ -249,25 +249,27 @@ mod tests {
     #[test]
     fn quota_remaining_auth_func_resolves_from_metadata() {
         let mut auth = make_auth();
-        auth.metadata
-            .insert("quota_remaining.pro:all".into(), "750".into());
+        auth.metadata.insert(
+            "quota_remaining.pro:all".into(),
+            nodedb_types::Value::Integer(750),
+        );
         let value = PredicateValue::AuthFunc {
             func: "quota_remaining".into(),
             args: vec!["pro:all".into()],
         };
-        assert_eq!(value.resolve(&auth), Some(serde_json::json!("750")));
+        assert_eq!(value.resolve(&auth), Some(serde_json::json!(750)));
     }
 
     #[test]
     fn quota_pct_auth_func_resolves_from_metadata() {
         let mut auth = make_auth();
         auth.metadata
-            .insert("quota_pct.pro:all".into(), "0.25".into());
+            .insert("quota_pct.pro:all".into(), nodedb_types::Value::Float(0.25));
         let value = PredicateValue::AuthFunc {
             func: "quota_pct".into(),
             args: vec!["pro:all".into()],
         };
-        assert_eq!(value.resolve(&auth), Some(serde_json::json!("0.25")));
+        assert_eq!(value.resolve(&auth), Some(serde_json::json!(0.25)));
     }
 
     /// Before enrichment writes the metadata key (or for a scope with no

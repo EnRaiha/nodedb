@@ -372,7 +372,7 @@ mod tests {
                 .auth()
                 .metadata
                 .get("scope_status.sync:shapes"),
-            Some(&"active".to_string()),
+            Some(&nodedb_types::Value::String("active".into())),
             "a subscriber inside the permitted network must hold the conditional scope"
         );
 

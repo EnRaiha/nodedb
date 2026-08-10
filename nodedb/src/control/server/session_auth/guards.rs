@@ -223,7 +223,7 @@ pub fn check_rate_limit(
 ) -> crate::Result<crate::control::security::ratelimit::limiter::RateLimitResult> {
     use crate::control::security::ratelimit::limiter::QuotaCheckParams;
 
-    let plan_tier = auth_ctx.metadata.get("plan").map(|s| s.as_str());
+    let plan_tier = auth_ctx.metadata.get("plan").and_then(|v| v.as_str());
 
     // Resolve tenant and database QPS caps from the quota catalog if available.
     let quota_params = {

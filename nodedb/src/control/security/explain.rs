@@ -122,7 +122,7 @@ pub fn explain_permission(
     let rl_result = state.rate_limiter.check(
         &user_id,
         &org_ids,
-        auth_ctx.metadata.get("plan").map(|s| s.as_str()),
+        auth_ctx.metadata.get("plan").and_then(|v| v.as_str()),
         "point_get",
         None,
     );
