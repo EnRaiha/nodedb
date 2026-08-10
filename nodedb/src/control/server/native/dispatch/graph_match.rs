@@ -6,6 +6,7 @@ use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 
 use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
@@ -77,6 +78,14 @@ pub(crate) async fn handle_graph_match(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
+
+    // A spent hard quota refuses the task before it runs; the charge below is
+    // on the success path and so can never refuse anything itself.
+    if let Some(info) = &plan_metering_info
+        && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
+    {
+        return NativeResponse::error(seq, "53400", e.to_string());
+    }
     let _request = ctx.state.tenant_request_guard(tenant_id);
     let raw = dispatch_authorized_single_task(ctx, tenant_id, vshard_id, plan, txn_id).await;
 

@@ -193,6 +193,20 @@ async fn flush_ilp_batch_inner(
             .into_scope();
     crate::control::planner::rls_injection::inject_rls(&mut tasks, &state.rls, scope.auth())?;
 
+    // A spent hard quota refuses the batch before any of it is staged. The
+    // charge below runs once the atomic Calvin write has committed, so it can
+    // never be where a cap blocks anything. Checked across every measurement
+    // in the batch, because the batch commits atomically: admitting part of
+    // it is not an option the write path offers.
+    if state.metering_config.enabled {
+        for task in &tasks {
+            let info = PlanMeteringInfo::extract(&task.plan);
+            crate::control::server::shared::quota_admission::admit_quota_for_dispatch(
+                state, &scope, &info,
+            )?;
+        }
+    }
+
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
     let authorized =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)

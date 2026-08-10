@@ -123,6 +123,11 @@ impl NodeDbPgHandler {
 
         match intent {
             CopyIntent::BackupTenant { tenant_id } => {
+                // A spent hard quota refuses the backup before it reads a
+                // byte. The charge below is on the success path and so can
+                // never be where a cap blocks anything.
+                admit_backup_restore_quota(&self.state, request.scope(), tenant_id)
+                    .map_err(internal)?;
                 let bytes = backup::backup_tenant(&self.state, tenant_id)
                     .await
                     .map_err(internal)?;
@@ -177,6 +182,31 @@ impl NodeDbPgHandler {
 /// this builds a [`PlanMeteringInfo`] directly via
 /// [`PlanMeteringInfo::for_collection`] instead of extracting one from a
 /// plan.
+/// Refuse a backup/restore whose covering scope has already spent its cap.
+///
+/// The sibling of [`meter_backup_restore`], and it describes the request the
+/// same way: a whole-tenant operation has no `PhysicalPlan`, so the collection
+/// dimension is the synthetic `tenant:<id>` marker that function bills under.
+/// A scope grant therefore only caps this if it was written against that same
+/// marker — which is exactly the entitlement an operator would define to cap
+/// backups.
+fn admit_backup_restore_quota(
+    state: &SharedState,
+    scope: &RequestAuthScope<'_>,
+    tenant_id: u64,
+) -> crate::Result<()> {
+    if !state.metering_config.enabled {
+        return Ok(());
+    }
+    let info = PlanMeteringInfo::for_collection(
+        format!("tenant:{tenant_id}"),
+        EngineTag::Meta,
+        "sql",
+        Permission::Backup,
+    );
+    crate::control::server::shared::quota_admission::admit_quota_for_dispatch(state, scope, &info)
+}
+
 fn meter_backup_restore(
     state: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -248,6 +278,20 @@ impl CopyHandler for NodeDbCopyHandler {
                 "no restore pending on this connection",
             )
         })?;
+        // Scope resolved here rather than only below, so the quota gate can
+        // refuse the restore before it writes anything — the charge further
+        // down is on the success path and so can never refuse anything.
+        let database_id = pending
+            .identity
+            .default_database
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let scope = RequestAuthScope::for_database(
+            &pending.identity,
+            self.state.auth_stores(),
+            database_id,
+        );
+        admit_backup_restore_quota(&self.state, &scope, pending.tenant_id).map_err(internal)?;
+
         let stats = backup::restore_tenant(
             &self.state,
             pending.tenant_id,
@@ -264,19 +308,10 @@ impl CopyHandler for NodeDbCopyHandler {
         let rows =
             stats.documents + stats.kv_tables + stats.vectors + stats.timeseries + stats.edges;
         // Metered on the success path, using the same `rows` count the
-        // command tag below reports — `pending.identity` is the caller who
-        // opened this COPY IN back in `intent_to_response`, carried through
-        // `RestorePending` since this per-connection `CopyHandler` has no
-        // identity of its own.
-        let database_id = pending
-            .identity
-            .default_database
-            .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        let scope = RequestAuthScope::for_database(
-            &pending.identity,
-            self.state.auth_stores(),
-            database_id,
-        );
+        // command tag below reports, and the same scope the quota gate above
+        // resolved — `pending.identity` is the caller who opened this COPY IN
+        // back in `intent_to_response`, carried through `RestorePending`
+        // since this per-connection `CopyHandler` has no identity of its own.
         meter_backup_restore(&self.state, &scope, pending.tenant_id, Some(rows as u64));
         let tag = Tag::new("RESTORE TENANT").with_rows(rows);
         client

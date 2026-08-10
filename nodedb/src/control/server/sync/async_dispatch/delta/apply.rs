@@ -309,6 +309,19 @@ pub(crate) async fn apply_delta_and_finalize(
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
 
+    // A spent hard quota refuses the delta before it is applied. The charge
+    // below runs only once dispatch succeeded, so it can never be where a cap
+    // blocks anything. A refusal is surfaced through the same dispatch-error
+    // path an authorization failure takes, so the client sees one shape.
+    let quota_refusal = plan_metering_info.as_ref().and_then(|info| {
+        crate::control::server::shared::quota_admission::admit_quota_for_dispatch(
+            shared,
+            request.scope(),
+            info,
+        )
+        .err()
+    });
+
     let vshard_id =
         crate::types::VShardId::from_collection_in_database(database_id, &delta_msg.collection);
     let authorized = super::super::super::raft_dispatch::authorize_sync_task(
@@ -320,19 +333,22 @@ pub(crate) async fn apply_delta_and_finalize(
         plan,
     );
     let _request = shared.tenant_request_guard(tenant_id);
-    let dispatch_result = match authorized {
-        Ok(authorized) => {
-            super::super::super::raft_dispatch::dispatch_sync_bytes(
-                shared,
-                &delta_msg.collection,
-                authorized,
-                Duration::from_secs(10),
-                crate::event::EventSource::CrdtSync,
-                &policy,
-            )
-            .await
-        }
-        Err(error) => Err(error),
+    let dispatch_result = match quota_refusal {
+        Some(refusal) => Err(refusal),
+        None => match authorized {
+            Ok(authorized) => {
+                super::super::super::raft_dispatch::dispatch_sync_bytes(
+                    shared,
+                    &delta_msg.collection,
+                    authorized,
+                    Duration::from_secs(10),
+                    crate::event::EventSource::CrdtSync,
+                    &policy,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
     };
 
     let trimmed_ops = dispatch_result

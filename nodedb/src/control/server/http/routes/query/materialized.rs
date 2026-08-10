@@ -18,6 +18,7 @@ use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch}
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::super::peer::PeerAddr;
@@ -174,6 +175,12 @@ pub async fn query(
             // after this task's dispatch succeeds.
             let plan_metering_info =
                 metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+            // A spent hard quota refuses the task before it runs; the
+            // charging calls below are all on the success path and so can
+            // never refuse anything themselves.
+            if let Some(info) = &plan_metering_info {
+                admit_quota_for_dispatch(&state.shared, &scope, info).map_err(gateway_error)?;
+            }
             let rows_before = result_rows.len();
             // `INSERT ... SELECT` is orchestrated on the Control Plane: the
             // source is scanned, each target row gets its OWN fresh, registered

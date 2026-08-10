@@ -148,6 +148,24 @@ impl NodeDbPgHandler {
         // the policy was consulted.
         let redaction = Some(QueryRedaction::for_plan(task.tenant_id, auth, &child_plan));
 
+        // The streaming fast path bypasses the dispatch loop's own metering
+        // call, so without this every pgwire autocommit SELECT that streams
+        // would go unbilled — and a token quota over reads would never
+        // accumulate anything to enforce against. The guard charges on drop,
+        // when the stream finishes or the client disconnects, so what is
+        // billed is rows actually written. `None` when metering is disabled.
+        let meter_guard = {
+            let scope = crate::control::security::request_scope::RequestAuthScope::builder(
+                identity,
+                state.auth_stores(),
+            )
+            .with_session_database(Some(task.database_id))
+            .build();
+            let info =
+                crate::control::server::shared::metering::PlanMeteringInfo::extract(&task.plan);
+            crate::control::server::shared::metering::DetachedMeterGuard::new(&state, &scope, &info)
+        };
+
         let response = match shaping.projection {
             Some(s) if !s.is_star && !s.columns.is_empty() => {
                 stream_response::streaming_shaped_response(
@@ -155,20 +173,33 @@ impl NodeDbPgHandler {
                     limit,
                     s.clone(),
                     shaping.formats,
-                    lease_scope,
-                    redaction,
-                    std::sync::Arc::clone(&state),
+                    stream_response::StreamResponseContext {
+                        lease_scope,
+                        redaction,
+                        state: std::sync::Arc::clone(&state),
+                        meter_guard,
+                    },
                 )
             }
             Some(s) if s.is_star => {
-                stream_response::streaming_star_response(stream, limit, redaction, &state).await
+                stream_response::streaming_star_response(
+                    stream,
+                    limit,
+                    redaction,
+                    &state,
+                    meter_guard,
+                )
+                .await
             }
             _ => stream_response::streaming_multirow_response(
                 stream,
                 limit,
-                lease_scope,
-                redaction,
-                std::sync::Arc::clone(&state),
+                stream_response::StreamResponseContext {
+                    lease_scope,
+                    redaction,
+                    state: std::sync::Arc::clone(&state),
+                    meter_guard,
+                },
             ),
         };
 

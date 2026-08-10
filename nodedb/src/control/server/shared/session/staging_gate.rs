@@ -21,7 +21,8 @@ use std::future::Future;
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
 use crate::control::security::request_scope::RequestAuthScope;
-use crate::control::server::shared::metering::meter_staged_write;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_staged_write};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::sql::staging_predicates::{
     is_stageable_write, require_affected_count, staged_tag_kind,
 };
@@ -214,6 +215,21 @@ where
         post_set_op: PostSetOp::None,
         txn_id: sessions.tx_id(session_id),
     };
+
+    // A spent hard quota refuses the staged write before it touches the
+    // overlay. This mirrors the charge at the bottom of this function, which
+    // is on the success path and so can never refuse anything itself — and
+    // like that charge, gating here covers every `Staged` route at once
+    // rather than being duplicated in each caller's dispatch closure.
+    if state.metering_config.enabled
+        && let Some(identity) = sessions.identity(session_id)
+    {
+        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
+            .with_session_database(Some(task.database_id))
+            .build();
+        let info = PlanMeteringInfo::extract(&task.plan);
+        admit_quota_for_dispatch(state, &scope, &info).map_err(StagingGateError::Dispatch)?;
+    }
 
     // Stage on the vShard's CURRENT leader. When this node leads the vShard (or
     // single-node), the existing local dispatch runs byte-identically; otherwise

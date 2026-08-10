@@ -53,6 +53,13 @@ pub(super) struct StartConfig {
     /// node without any `[auth.jwt]` provider, which makes every presented
     /// bearer token unverifiable and therefore refused.
     pub jwks_registry: Option<Arc<nodedb::control::security::jwks::registry::JwksRegistry>>,
+    /// When `Some`, replaces `SharedState::metering_config` before the state
+    /// is shared. Metering is off by default, and both usage accounting and
+    /// quota enforcement are no-ops while it is — so a test that exercises
+    /// either has to turn it on here. Only the config is replaced: the
+    /// catalog-backed `quota_manager` built by `new_with_credentials` is left
+    /// in place, so quota definitions stay durable.
+    pub metering: Option<nodedb::control::security::metering::config::MeteringConfig>,
 }
 
 impl Default for StartConfig {
@@ -66,6 +73,7 @@ impl Default for StartConfig {
             idle_timeout_secs: 0,
             session_absolute_timeout_secs: 0,
             jwks_registry: None,
+            metering: None,
         }
     }
 }
@@ -83,6 +91,19 @@ impl TestServer {
     pub async fn start_empty_store_trust() -> Self {
         Self::start_with_config(StartConfig {
             provision_superuser: false,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Spawn a single-core NodeDB server with usage metering enabled, so
+    /// quota accounting and enforcement actually run. All other settings stay
+    /// at their defaults (trust-mode auth, lockout disabled).
+    pub async fn start_with_metering(
+        metering: nodedb::control::security::metering::config::MeteringConfig,
+    ) -> Self {
+        Self::start_with_config(StartConfig {
+            metering: Some(metering),
             ..Default::default()
         })
         .await
@@ -210,6 +231,9 @@ impl TestServer {
                 s.cluster_routing = Some(std::sync::Arc::new(std::sync::RwLock::new(routing)));
             }
             s.jwks_registry = cfg.jwks_registry;
+            if let Some(metering) = cfg.metering {
+                s.metering_config = metering;
+            }
             s.set_session_timeouts_for_test(
                 cfg.idle_timeout_secs,
                 cfg.session_absolute_timeout_secs,

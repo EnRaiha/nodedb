@@ -10,6 +10,7 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::types::TraceId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -97,6 +98,17 @@ pub(crate) async fn handle_direct_op(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
+
+    // A spent hard quota refuses the op before it runs; the charges below are
+    // all on the success path and so can never refuse anything themselves.
+    // The branches that route through `dispatch_single_task` are gated there
+    // too, on the plan actually dispatched — harmless, since a scope already
+    // over its cap refuses either way.
+    if let Some(info) = &plan_metering_info
+        && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
+    {
+        return NativeResponse::error(seq, "53400", e.to_string());
+    }
 
     // Whether the blanket metering call below (after the block) still needs
     // to run. It does for every branch that dispatches directly (Control-

@@ -14,6 +14,7 @@ use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch}
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId};
 
@@ -91,6 +92,12 @@ pub async fn execute_sql(
         // this task's dispatch succeeds. `results.len()` before dispatch
         // gives this task's row-count baseline for the delta metered below.
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+        // A spent hard quota refuses the task before it runs; the charging
+        // calls below are all on the success path and so can never refuse
+        // anything themselves.
+        if let Some(info) = &plan_metering_info {
+            admit_quota_for_dispatch(shared, &scope, info)?;
+        }
         let rows_before = results.len();
         // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh,
         // registered surrogate per target row + atomic `BatchInsert`), never

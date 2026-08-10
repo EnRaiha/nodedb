@@ -17,12 +17,29 @@ use crate::control::server::response_shape::redaction::{QueryRedaction, redact_e
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::DdlColType;
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::metering::DetachedMeterGuard;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
 use super::super::ddl_encode::col_type_to_field_with_format;
 use super::super::types::{error_to_sqlstate, text_field};
 use super::shape_encode::{encode_shaped_row, shaped_query_response};
+
+/// The per-request plumbing a lazily-streamed pgwire response owns for its
+/// whole lifetime.
+///
+/// These travel together because they share one lifetime rule: each must stay
+/// alive until the stream finishes or the client disconnects. The lease scope
+/// holds descriptor leases open, the meter guard charges on drop, and the
+/// shared state backs both — so handing them to a stream separately invites
+/// one being dropped early.
+pub(crate) struct StreamResponseContext {
+    pub(crate) lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+    pub(crate) redaction: Option<QueryRedaction>,
+    pub(crate) state: Arc<SharedState>,
+    /// `None` when metering is disabled, or when this request is not billable.
+    pub(crate) meter_guard: Option<DetachedMeterGuard>,
+}
 
 /// Build a streaming multi-row pgwire `Response` whose `DataRow`s are pulled
 /// lazily from a [`ResultStream`].
@@ -39,11 +56,16 @@ use super::shape_encode::{encode_shaped_row, shaped_query_response};
 pub(crate) fn streaming_multirow_response(
     stream: ResultStream,
     limit: usize,
-    lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
-    redaction: Option<QueryRedaction>,
-    state: Arc<SharedState>,
+    context: StreamResponseContext,
 ) -> Response {
     use futures::StreamExt;
+
+    let StreamResponseContext {
+        lease_scope,
+        redaction,
+        state,
+        meter_guard,
+    } = context;
 
     let schema = Arc::new(vec![text_field("result")]);
     let row_schema = schema.clone();
@@ -53,6 +75,11 @@ pub(crate) fn streaming_multirow_response(
         // scope so descriptor leases remain held while the client polls rows,
         // including on a mid-stream error, until completion or disconnect.
         let _lease_scope = lease_scope;
+        // Owned by the lazy response for the same reason the lease scope is:
+        // it charges on drop, which must be when the stream finishes or the
+        // client disconnects — so what gets billed is rows actually written
+        // to the client, not rows planned.
+        let mut meter_guard = meter_guard;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while let Some(batch) = batches.next().await {
@@ -93,6 +120,9 @@ pub(crate) fn streaming_multirow_response(
                         )))
                     })?;
                     emitted += 1;
+                    if let Some(guard) = meter_guard.as_mut() {
+                        guard.add_rows(1);
+                    }
                     yield encoder.take_row();
                 }
             }
@@ -116,11 +146,16 @@ pub(crate) fn streaming_shaped_response(
     limit: usize,
     schema_out: OutputSchema,
     formats: &[FieldFormat],
-    lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
-    redaction: Option<QueryRedaction>,
-    state: Arc<SharedState>,
+    context: StreamResponseContext,
 ) -> Response {
     use futures::StreamExt;
+
+    let StreamResponseContext {
+        lease_scope,
+        redaction,
+        state,
+        meter_guard,
+    } = context;
 
     let display_columns: Vec<String> = schema_out
         .columns
@@ -158,6 +193,11 @@ pub(crate) fn streaming_shaped_response(
         // handler stack frame; dropping it on wire completion or disconnect
         // releases the descriptor leases.
         let _lease_scope = lease_scope;
+        // Owned by the lazy response for the same reason the lease scope is:
+        // it charges on drop, which must be when the stream finishes or the
+        // client disconnects — so what gets billed is rows actually written
+        // to the client, not rows planned.
+        let mut meter_guard = meter_guard;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while let Some(batch) = batches.next().await {
@@ -196,6 +236,9 @@ pub(crate) fn streaming_shaped_response(
                 let encoded =
                     encode_shaped_row(&row_schema, &cell_keys, &column_types, &row_formats, row)?;
                 emitted += 1;
+                if let Some(guard) = meter_guard.as_mut() {
+                    guard.add_rows(1);
+                }
                 yield encoded;
             }
         }
@@ -225,6 +268,7 @@ pub(crate) async fn streaming_star_response(
     limit: usize,
     redaction: Option<QueryRedaction>,
     state: &SharedState,
+    meter_guard: Option<DetachedMeterGuard>,
 ) -> Response {
     use futures::StreamExt;
 
@@ -272,6 +316,12 @@ pub(crate) async fn streaming_star_response(
                 ))));
             }
         }
+    }
+
+    // Materialized, so the exact row count is known here rather than
+    // accumulated as rows go out; charge it before the guard drops.
+    if let Some(mut guard) = meter_guard {
+        guard.add_rows(values.len() as u64);
     }
 
     if values.is_empty() {

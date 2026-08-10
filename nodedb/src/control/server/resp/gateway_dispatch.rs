@@ -18,6 +18,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::dispatch_utils;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, RequestId, TraceId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -54,6 +55,9 @@ pub(super) async fn dispatch_kv(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
+    if let Some(info) = &plan_metering_info {
+        admit_resp_quota(state, session, database_id, info)?;
+    }
     let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")?;
     let result = match state.gateway.get() {
         Some(gw) => {
@@ -105,6 +109,9 @@ pub(super) async fn dispatch_kv_write(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
+    if let Some(info) = &plan_metering_info {
+        admit_resp_quota(state, session, database_id, info)?;
+    }
     let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_put")?;
     let result = match state.gateway.get() {
         Some(gw) => {
@@ -133,6 +140,29 @@ pub(super) async fn dispatch_kv_write(
         meter_resp_dispatch(state, session, database_id, info);
     }
     result
+}
+
+/// Refuse the command when a covering scope's hard quota is already spent.
+///
+/// The sibling of [`meter_resp_dispatch`], run before dispatch rather than
+/// after it: charging happens on the success path by design and so can never
+/// be where a cap blocks anything.
+fn admit_resp_quota(
+    state: &SharedState,
+    session: &RespSession,
+    database_id: DatabaseId,
+    info: &PlanMeteringInfo,
+) -> crate::Result<()> {
+    let Some(identity) = session.identity.as_ref() else {
+        return Ok(());
+    };
+    let scope = resp_auth_scope(
+        identity,
+        state.auth_stores(),
+        database_id,
+        &session.peer_addr,
+    );
+    admit_quota_for_dispatch(state, scope.scope(), info)
 }
 
 /// Meter one completed RESP KV dispatch, once dispatch above has already

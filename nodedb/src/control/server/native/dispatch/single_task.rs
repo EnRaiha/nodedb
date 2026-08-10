@@ -9,6 +9,7 @@ use nodedb_types::protocol::NativeResponse;
 use crate::bridge::envelope::{Payload, Response, Status};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
 };
@@ -69,6 +70,15 @@ pub(super) async fn dispatch_single_task(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan_for_staged_response));
+
+    // A spent hard quota refuses the task before it runs. The charging call
+    // below is on the success path by design and so can never refuse
+    // anything itself.
+    if let Some(info) = &plan_metering_info
+        && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
+    {
+        return NativeResponse::error(seq, "53400", e.to_string());
+    }
 
     let task = match route_in_tx_write(
         ctx.state,

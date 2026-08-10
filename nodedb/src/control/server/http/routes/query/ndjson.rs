@@ -19,6 +19,7 @@ use crate::control::server::shared::metering::{
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::super::peer::PeerAddr;
@@ -217,6 +218,18 @@ pub async fn query_ndjson(
         // Resolved once per task, reused for every payload it produced.
         let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+
+        // A spent hard quota refuses the task before it runs; the charging
+        // call at the end of this loop is on the success path and so can
+        // never refuse anything itself. Reported as an error line and the
+        // task skipped, matching how this stream reports a dispatch error.
+        if let Some(info) = &plan_metering_info
+            && let Err(e) = admit_quota_for_dispatch(&state.shared, &scope, info)
+        {
+            ndjson.push_str(&serde_json::json!({"error": e.to_string()}).to_string());
+            ndjson.push('\n');
+            continue;
+        }
 
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = if matches!(
             &task.plan,
