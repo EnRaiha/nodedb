@@ -34,12 +34,21 @@ pub fn put_owner_sync(stored: &StoredCollection, shared: Arc<SharedState>) {
 /// Called via `block_in_place` inside `spawn_post_apply_async_side_effects`
 /// for `PutCollection` — it completes synchronously before the applied-index
 /// watcher bumps, making it part of the applied-index contract.
+///
+/// A collection this entry names as a materialized-sum SOURCE is re-registered
+/// too. The binding travels on the target, but the config that decides whether a
+/// write folds it is derived for the source, so propagating the target alone
+/// leaves every source on this node folding nothing.
 pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
-    match crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
-        &shared, &stored,
-    )
-    .await
-    {
+    use crate::control::server::shared::ddl::neutral::collection::{
+        dispatch_register_for_sum_sources, dispatch_register_from_stored,
+    };
+
+    let registered = match dispatch_register_from_stored(&shared, &stored).await {
+        Ok(()) => dispatch_register_for_sum_sources(&shared, &stored).await,
+        Err(e) => Err(e),
+    };
+    match registered {
         Ok(()) => {
             debug!(
                 collection = %stored.name,

@@ -116,6 +116,16 @@ pub(super) async fn add_materialized_sum(
         .await
         .map_err(|e| err("XX000", e.to_string()))?;
 
+    // The SOURCE has to be re-registered too, and it is the half that decides
+    // whether anything is folded at all: the binding is stored here on the
+    // target, but the Data-Plane config that drives the write-path fold is
+    // derived for the source. Registering only the target leaves the source
+    // asserting it drives no binding, so every co-resident write into it folds
+    // nothing and the total silently stays where it was.
+    super::super::register::dispatch_register_for_sum_sources(state, &coll)
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
+
     state.schema_version.bump();
 
     state.audit_record(

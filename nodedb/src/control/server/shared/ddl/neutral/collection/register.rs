@@ -112,6 +112,51 @@ pub async fn dispatch_register_from_stored(
     dispatch_register_from_stored_inner(state, tenant_id, coll, indexes).await
 }
 
+/// Re-register every collection that DRIVES a materialized-sum binding `coll`
+/// declares, so those sources learn they now drive one.
+///
+/// A binding is stored on the TARGET collection, but the Data-Plane config that
+/// decides whether a write folds it is derived for the SOURCE:
+/// [`find_materialized_sum_bindings`] scans every collection for bindings that
+/// name the collection BEING REGISTERED as their source. Registering the target
+/// alone therefore propagates nothing — a target carries no binding it is the
+/// target OF — and a source registered before the binding existed keeps a config
+/// asserting it drives nothing. Every write into it then folds nothing at all
+/// and the stored total silently stays where it was.
+///
+/// Only the co-resident path reads that config, which is why this could go
+/// unnoticed: a cross-shard binding is settled on the Control Plane at plan time
+/// from the catalog and travels on its own `ApplyBalanceDelta` task, which
+/// consults no Data-Plane config.
+///
+/// Call only AFTER the catalog carries `coll`, so the scan sees the binding
+/// being propagated. A source that is not in the catalog is skipped: its own
+/// registration derives the binding when it lands.
+pub async fn dispatch_register_for_sum_sources(
+    state: &SharedState,
+    coll: &StoredCollection,
+) -> crate::Result<()> {
+    let mut registered: Vec<&str> = Vec::new();
+    for def in &coll.materialized_sums {
+        let source = def.source_collection.as_str();
+        // The target's own registration already covers it, and two bindings
+        // fanning out of one source share a single re-registration.
+        if source == coll.name || registered.contains(&source) {
+            continue;
+        }
+        registered.push(source);
+        let stored =
+            state
+                .credentials
+                .catalog()
+                .get_collection(coll.database_id, coll.tenant_id, source)?;
+        if let Some(stored) = stored {
+            dispatch_register_from_stored(state, &stored).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Per-field auto-derived indexes (schemaless default: each declared field
 /// becomes a non-unique `$.field` index). Always `Ready` — these exist
 /// from the moment the collection is created.

@@ -27,7 +27,7 @@ use nodedb::types::{DatabaseId, VShardId};
 
 /// Target and source. The names are chosen for their HASHES: they collide on
 /// one vShard, which is what makes every test below the co-resident path. See
-/// [`source_and_target_are_co_resident`].
+/// [`materialized_sum_source_and_target_are_co_resident`].
 const TARGET: &str = "uo_accounts";
 const SOURCE: &str = "uo_entries";
 
@@ -35,7 +35,7 @@ const SOURCE: &str = "uo_entries";
 /// balance rides the source write's own transaction rather than travelling on
 /// an appended task.
 #[test]
-fn source_and_target_are_co_resident() {
+fn materialized_sum_source_and_target_are_co_resident() {
     assert_eq!(
         VShardId::from_collection_in_database(DatabaseId::DEFAULT, SOURCE),
         VShardId::from_collection_in_database(DatabaseId::DEFAULT, TARGET),
@@ -105,6 +105,34 @@ async fn balance(server: &TestServer, id: &str) -> String {
         .unwrap_or_else(|| panic!("target row {id} must exist"))
 }
 
+/// A binding declared AFTER its source collection exists must still fold.
+///
+/// The binding is stored on the TARGET, but the Data-Plane config that decides
+/// whether a write folds it is derived for the SOURCE — from a catalog scan for
+/// bindings naming that collection as their source. Propagating only the target
+/// after the `ALTER` left the source asserting it drove nothing, so a plain
+/// INSERT folded nothing and the total silently stayed put.
+///
+/// The narrowest statement of that defect, kept separate from the point shapes
+/// because it has nothing to do with them: it is an INSERT, the shape that
+/// always carried its own join value. Restarting the server would have healed
+/// it — the boot seed re-derives every collection's config from the whole
+/// catalog — so this must stay a first-write assertion, with no restart between
+/// the `ALTER` and the `INSERT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materialized_sum_binding_declared_after_the_source_folds_on_the_next_write() {
+    let server = start_with_binding().await;
+    seed_account(&server, "acc-1").await;
+
+    insert_entry(&server, "e1", "acc-1", "25").await;
+
+    assert_eq!(
+        balance(&server, "acc-1").await,
+        "25",
+        "the very first write after the binding was declared must credit the target"
+    );
+}
+
 /// A point UPDATE contributes the DIFFERENCE between the row's old and new
 /// amount — and it must be applied at all.
 ///
@@ -113,7 +141,7 @@ async fn balance(server: &TestServer, id: &str) -> String {
 /// resolution that skipped this shape left the statement with no target to
 /// address and failed the most ordinary write against a source collection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_point_update_moves_the_balance_by_the_difference() {
+async fn materialized_sum_point_update_moves_the_balance_by_the_difference() {
     let server = start_with_binding().await;
     seed_account(&server, "acc-1").await;
     insert_entry(&server, "e1", "acc-1", "25").await;
@@ -135,7 +163,7 @@ async fn a_point_update_moves_the_balance_by_the_difference() {
 
 /// A point DELETE takes the removed row's contribution back off the total.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_point_delete_takes_the_rows_contribution_off_the_balance() {
+async fn materialized_sum_point_delete_takes_the_rows_contribution_off_the_balance() {
     let server = start_with_binding().await;
     seed_account(&server, "acc-1").await;
     insert_entry(&server, "e1", "acc-1", "25").await;
@@ -169,7 +197,7 @@ async fn a_point_delete_takes_the_rows_contribution_off_the_balance() {
 /// value — and neither side is named by the plan: the target the row leaves
 /// lives in the stored row, the target it joins in the assignment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_point_update_that_changes_the_join_key_moves_value_between_targets() {
+async fn materialized_sum_point_update_changing_the_join_key_moves_value_between_targets() {
     let server = start_with_binding().await;
     seed_account(&server, "acc-1").await;
     seed_account(&server, "acc-2").await;
@@ -203,7 +231,7 @@ async fn a_point_update_that_changes_the_join_key_moves_value_between_targets() 
 /// joins. The one it abandons is named by the stored row and by nothing else —
 /// the same gap as the point update, reached through a different statement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_upsert_that_changes_the_join_key_debits_the_target_it_abandons() {
+async fn materialized_sum_upsert_changing_the_join_key_debits_the_target_it_abandons() {
     let server = start_with_binding().await;
     seed_account(&server, "acc-1").await;
     seed_account(&server, "acc-2").await;
@@ -237,7 +265,7 @@ async fn an_upsert_that_changes_the_join_key_debits_the_target_it_abandons() {
 /// silently-skipped row: a skipped row is a stored total that disagrees with the
 /// `SUM(...)` over the source rows forever after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_point_update_onto_a_missing_target_is_refused() {
+async fn materialized_sum_point_update_onto_a_missing_target_is_refused() {
     let server = start_with_binding().await;
     seed_account(&server, "acc-1").await;
     insert_entry(&server, "e1", "acc-1", "30").await;
