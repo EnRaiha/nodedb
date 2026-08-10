@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! The `Error` enum: internal actionable errors, grouped by subsystem —
+//! write path, read path, routing, client input, and infrastructure — plus
+//! the crate's `Result<T>` alias built on it.
+//!
+//! This is the crate's single central error type; it is deliberately one
+//! `thiserror` sum type rather than nested per-subsystem enums so that every
+//! existing `match crate::Error::Variant { .. }` across the workspace keeps
+//! resolving unchanged. `From` impls that build an `Error` from
+//! external-crate error types live in [`super::conversions`]; conversions
+//! *out* of `Error` (into the public `NodeDbError`, cluster wire errors,
+//! etc.) live in `crate::error_from`.
+
 use crate::types::{DatabaseId, RequestId, TenantId, VShardId};
 
 /// Internal actionable errors; public conversion hides infrastructure details.
@@ -497,41 +509,6 @@ pub enum Error {
         /// Human-readable detail including actual lag if available.
         detail: String,
     },
-}
-
-impl From<nodedb_physical::physical_plan::wire::WireError> for Error {
-    fn from(e: nodedb_physical::physical_plan::wire::WireError) -> Self {
-        Error::Internal {
-            detail: e.to_string(),
-        }
-    }
-}
-
-impl From<nodedb_physical::ConvertError> for Error {
-    fn from(e: nodedb_physical::ConvertError) -> Self {
-        use nodedb_physical::ConvertError;
-        match e {
-            ConvertError::PlanError(detail) => Error::PlanError { detail },
-            ConvertError::BadRequest(detail) => Error::BadRequest { detail },
-            ConvertError::LimitExceeded {
-                limit_name,
-                value,
-                max,
-            } => Error::LimitExceeded {
-                limit_name,
-                value,
-                max,
-            },
-            ConvertError::Surrogate(s) => Error::Internal {
-                detail: s.to_string(),
-            },
-            ConvertError::Serialization(detail) => Error::Serialization {
-                format: "msgpack".into(),
-                detail,
-            },
-            ConvertError::Other(detail) => Error::Internal { detail },
-        }
-    }
 }
 
 /// Result alias for NodeDB operations.
