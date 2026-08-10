@@ -149,10 +149,52 @@ pub fn apply_update_assignments(
     doc: &serde_json::Value,
     updates: &[(String, UpdateValue)],
 ) -> crate::Result<serde_json::Value> {
+    assign(doc, updates, None)
+}
+
+/// The document an UPSERT's CONFLICT branch produces from the stored row and
+/// the body the statement submitted.
+///
+/// The conflict branch has two forms and they produce different post-images, so
+/// both are spelled out here rather than approximated by one of them:
+///
+/// * with no `ON CONFLICT DO UPDATE SET` assignments, the submitted body is
+///   OVERLAID onto the stored row — the columns it carries win, the ones it
+///   omits are kept;
+/// * with assignments, the stored row is rewritten by them, and `EXCLUDED.col`
+///   resolves against the SUBMITTED body.
+///
+/// Both are what the write path does. Evaluating the assignments without the
+/// submitted body would resolve every `EXCLUDED.col` to NULL — and
+/// `SET amount = EXCLUDED.amount`, the ordinary way to write this statement,
+/// would then fold as if the row's value had been cleared: the target loses the
+/// row's whole old contribution instead of gaining the difference.
+pub fn apply_conflict_assignments(
+    stored: &serde_json::Value,
+    submitted: &serde_json::Value,
+    updates: &[(String, UpdateValue)],
+) -> crate::Result<serde_json::Value> {
+    if updates.is_empty() {
+        return Ok(overlay(stored, submitted));
+    }
+    assign(stored, updates, Some(submitted))
+}
+
+/// Apply a statement's assignments to one pre-image, with `excluded` standing in
+/// for the `EXCLUDED.*` row when the statement has one.
+///
+/// `None` leaves `EXCLUDED.col` resolving to NULL, which is what the evaluator
+/// does for a statement that carries no such row at all.
+fn assign(
+    doc: &serde_json::Value,
+    updates: &[(String, UpdateValue)],
+    excluded: Option<&serde_json::Value>,
+) -> crate::Result<serde_json::Value> {
     if updates.is_empty() {
         return Ok(doc.clone());
     }
     let snapshot = nodedb_types::Value::from(doc.clone());
+    let excluded_row = excluded.map(|row| nodedb_types::Value::from(row.clone()));
     let mut post = doc.clone();
     let Some(object) = post.as_object_mut() else {
         return Ok(post);
@@ -165,12 +207,32 @@ pub fn apply_update_assignments(
                 }
             }
             UpdateValue::Expr(expr) => {
-                let evaluated = expr.eval(&snapshot).map_err(crate::Error::from)?;
+                let evaluated = match &excluded_row {
+                    Some(row) => expr.eval_with_excluded(&snapshot, row),
+                    None => expr.eval(&snapshot),
+                }
+                .map_err(crate::Error::from)?;
                 object.insert(field.clone(), serde_json::Value::from(evaluated));
             }
         }
     }
     Ok(post)
+}
+
+/// Overlay `submitted`'s fields onto `stored`, the merge an UPSERT with no
+/// conflict assignments performs. Two images that are not both objects resolve
+/// to the submitted one entirely, exactly as the write path's merge does.
+fn overlay(stored: &serde_json::Value, submitted: &serde_json::Value) -> serde_json::Value {
+    match (stored.as_object(), submitted.as_object()) {
+        (Some(base), Some(incoming)) => {
+            let mut merged = base.clone();
+            for (field, value) in incoming {
+                merged.insert(field.clone(), value.clone());
+            }
+            serde_json::Value::Object(merged)
+        }
+        _ => submitted.clone(),
+    }
 }
 
 /// Which way a single-image contribution points.
@@ -351,5 +413,103 @@ mod tests {
     fn no_assignments_leaves_the_document_alone() {
         let doc = row("a1", 25);
         assert_eq!(apply_update_assignments(&doc, &[]).expect("assign"), doc);
+    }
+
+    /// `SET col = EXCLUDED.col` resolves against the SUBMITTED body.
+    ///
+    /// Without it the post-image's value column is NULL, which folds to zero:
+    /// the target loses the row's whole old contribution instead of gaining the
+    /// difference between the stored row and the merged one.
+    #[test]
+    fn a_conflict_assignment_reads_the_submitted_body() {
+        let updates = vec![(
+            "amount".to_string(),
+            UpdateValue::Expr(nodedb_query::expr::SqlExpr::ExcludedColumn(
+                "amount".to_string(),
+            )),
+        )];
+        let post = apply_conflict_assignments(&row("a1", 25), &row("a1", 60), &updates)
+            .expect("conflict assign");
+        assert_eq!(post.get("amount").and_then(|v| v.as_i64()), Some(60));
+        assert_eq!(
+            binding_image_deltas(&binding(), Some(&row("a1", 25)), Some(&post)).expect("fold"),
+            vec![BindingDelta {
+                join_value: "a1".to_string(),
+                delta: d("35"),
+            }]
+        );
+    }
+
+    /// A conflict assignment still reads the STORED row for a plain column
+    /// reference, so `SET amount = amount + EXCLUDED.amount` accumulates.
+    #[test]
+    fn a_conflict_assignment_still_reads_the_stored_row() {
+        let updates = vec![(
+            "amount".to_string(),
+            UpdateValue::Expr(nodedb_query::expr::SqlExpr::BinaryOp {
+                left: Box::new(nodedb_query::expr::SqlExpr::Column("amount".to_string())),
+                op: nodedb_query::expr::BinaryOp::Add,
+                right: Box::new(nodedb_query::expr::SqlExpr::ExcludedColumn(
+                    "amount".to_string(),
+                )),
+            }),
+        )];
+        let post = apply_conflict_assignments(&row("a1", 25), &row("a1", 60), &updates)
+            .expect("conflict assign");
+        assert_eq!(post.get("amount").and_then(|v| v.as_i64()), Some(85));
+    }
+
+    /// An UPSERT with NO conflict assignments merges the submitted body over the
+    /// stored row: the columns it carries win, the ones it omits are kept.
+    ///
+    /// Treating it as "no assignments, so nothing changed" would settle a zero
+    /// delta for a statement that did move the row's value.
+    #[test]
+    fn a_conflict_branch_without_assignments_overlays_the_body() {
+        let stored = serde_json::json!({"account_id": "a1", "amount": 25, "memo": "kept"});
+        let submitted = serde_json::json!({"account_id": "a1", "amount": 60});
+        let post = apply_conflict_assignments(&stored, &submitted, &[]).expect("conflict merge");
+        assert_eq!(post.get("amount").and_then(|v| v.as_i64()), Some(60));
+        assert_eq!(
+            post.get("memo").and_then(|v| v.as_str()),
+            Some("kept"),
+            "a column the body omits survives the merge"
+        );
+    }
+
+    /// A conflict branch that rewrites the join column moves the row between two
+    /// targets, and the value it moves comes off the submitted body.
+    #[test]
+    fn a_conflict_assignment_can_move_the_join_key() {
+        let updates = vec![
+            (
+                "account_id".to_string(),
+                UpdateValue::Expr(nodedb_query::expr::SqlExpr::ExcludedColumn(
+                    "account_id".to_string(),
+                )),
+            ),
+            (
+                "amount".to_string(),
+                UpdateValue::Expr(nodedb_query::expr::SqlExpr::ExcludedColumn(
+                    "amount".to_string(),
+                )),
+            ),
+        ];
+        let stored = row("a1", 25);
+        let post =
+            apply_conflict_assignments(&stored, &row("a2", 60), &updates).expect("conflict assign");
+        assert_eq!(
+            binding_image_deltas(&binding(), Some(&stored), Some(&post)).expect("fold"),
+            vec![
+                BindingDelta {
+                    join_value: "a1".to_string(),
+                    delta: d("-25"),
+                },
+                BindingDelta {
+                    join_value: "a2".to_string(),
+                    delta: d("60"),
+                },
+            ]
+        );
     }
 }

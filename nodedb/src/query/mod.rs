@@ -20,7 +20,8 @@ pub use materialized_sum_delta::{
 };
 pub use materialized_sum_homing::{db_qualified, sum_target_is_co_resident, sum_target_vshard};
 pub use materialized_sum_images::{
-    BindingDelta, apply_update_assignments, binding_image_deltas, coalesce_binding_deltas,
+    BindingDelta, apply_conflict_assignments, apply_update_assignments, binding_image_deltas,
+    coalesce_binding_deltas,
 };
 pub use materialized_sum_keys::{binding_join_keys, missing_join_key};
 pub use resolved_update_row::ResolvedUpdateRowWire;

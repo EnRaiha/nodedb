@@ -32,12 +32,18 @@
 //!
 //! # Both sides of a join-key change
 //!
-//! [`binding_join_keys`](crate::query::binding_join_keys) is what turns the one
-//! stored row into join values, so the pre-image's value and the value the
-//! statement's assignment produces are BOTH resolved. Resolving one side only
-//! leaves the other target's total wrong by the row's whole value — and it is
-//! the same function the Data-Plane leader re-derives its coverage check from,
-//! so the two cannot drift.
+//! [`binding_join_keys`](crate::query::binding_join_keys) turns the write's
+//! IMAGES into join values, so the pre-image's value and the post-image's are
+//! BOTH resolved. Resolving one side only leaves the other target's total wrong
+//! by the row's whole value.
+//!
+//! The images are what it reads, not the assignments, because two of these four
+//! shapes form their post-image from the submitted BODY as well: a put replaces
+//! the stored row with it wholesale, and an upsert's conflict branch merges it
+//! in — either by overlaying it when the statement carries no conflict
+//! assignments, or by answering `EXCLUDED.col` from it when it does. Deriving
+//! the keys from the assignments alone would name a target the fold never
+//! addresses, and miss the one it does.
 
 use std::sync::Arc;
 
@@ -65,8 +71,11 @@ pub(super) enum PostImage<'a> {
     Assigned,
     /// The submitted body, replacing the stored row wholesale.
     Body(&'a [u8]),
-    /// The submitted body when no row is stored, the stored row with the
-    /// conflict assignments applied when one is.
+    /// The submitted body when no row is stored; when one is, the CONFLICT
+    /// branch's merge of the stored row with that same body — the body overlaid
+    /// on it when the statement carries no conflict assignments, and the stored
+    /// row rewritten by those assignments (with the body answering
+    /// `EXCLUDED.col`) when it does.
     BodyOrAssigned(&'a [u8]),
 }
 
@@ -234,15 +243,26 @@ pub(super) async fn extend_with_stored_row(
         read_version_lsn: read.read_version_lsn,
     };
 
-    let Some(row) = read.rows else {
+    if read.rows.is_none() {
         // Nothing stored: the body-driven resolution already covers the only
         // target such a write can address.
         return Ok(outcome);
-    };
+    }
 
-    let rows = [row];
+    // Both sides of every image pair, so a write that rewrites the join column
+    // resolves the target it LEAVES and the one it JOINS. The join values are
+    // read off the images the deltas will be folded from rather than re-derived
+    // from the assignments: the two shapes that carry a body form their
+    // post-image from the body as well as from the assignments, and a
+    // re-derivation that saw only the assignments would resolve a target the
+    // fold never addresses — or miss the one it does.
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(outcome.images.len() * 2);
+    for (old, new) in &outcome.images {
+        rows.extend(old.iter().cloned());
+        rows.extend(new.iter().cloned());
+    }
     for binding in bindings.iter() {
-        for join_value in crate::query::binding_join_keys(binding, scope.updates, &rows)? {
+        for join_value in crate::query::binding_join_keys(binding, &[], &rows)? {
             // One entry per DISTINCT `(target collection, join value)` PAIR
             // across every binding and every source of join values, mirroring
             // the body-driven resolution: a write whose old and new join keys
@@ -291,8 +311,24 @@ fn images_of(
             vec![(Some(old.clone()), decode_body(body))]
         }
         (PostImage::Body(body), None) => vec![(None, decode_body(body))],
-        (PostImage::BodyOrAssigned(_), Some(old)) => {
-            vec![(Some(old.clone()), Some(assigned(old)?))]
+        (PostImage::BodyOrAssigned(body), Some(old)) => {
+            // The CONFLICT branch. The submitted body is half of the answer —
+            // it is what `EXCLUDED.col` resolves to, and it is what an upsert
+            // with no conflict assignments merges over the stored row. A body
+            // that will not decode carries no column either form can read, so
+            // it stands in as an empty row: `EXCLUDED.col` is then NULL, which
+            // is what the evaluator answers for a column the excluded row does
+            // not carry.
+            let submitted =
+                decode_body(body).unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            vec![(
+                Some(old.clone()),
+                Some(crate::query::apply_conflict_assignments(
+                    old,
+                    &submitted,
+                    scope.updates,
+                )?),
+            )]
         }
         (PostImage::BodyOrAssigned(body), None) => vec![(None, decode_body(body))],
         // Nothing stored and nothing submitted: the write rewrites no row.
@@ -443,5 +479,148 @@ mod tests {
             let scope = stored_row_scope(&op).expect("a point write names its stored row");
             assert!(scope.updates.is_empty(), "{op:?}");
         }
+    }
+
+    fn body(account: &str, amount: i64) -> Vec<u8> {
+        nodedb_types::json_to_msgpack(&serde_json::json!({
+            "account_id": account,
+            "amount": amount,
+        }))
+        .expect("encode body")
+    }
+
+    fn upsert_with(value: Vec<u8>, on_conflict_updates: Vec<(String, UpdateValue)>) -> DocumentOp {
+        DocumentOp::Upsert {
+            collection: "entries".to_string(),
+            document_id: "e1".to_string(),
+            value,
+            on_conflict_updates,
+            surrogate: ROW,
+            rls_write_check: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+        }
+    }
+
+    fn excluded(column: &str) -> UpdateValue {
+        UpdateValue::Expr(nodedb_query::expr::SqlExpr::ExcludedColumn(
+            column.to_string(),
+        ))
+    }
+
+    fn amount_of(image: Option<&serde_json::Value>) -> Option<i64> {
+        image
+            .and_then(|row| row.get("amount"))
+            .and_then(serde_json::Value::as_i64)
+    }
+
+    /// The conflict branch's post-image takes its value from the SUBMITTED
+    /// body. `SET amount = EXCLUDED.amount` is the ordinary way to write the
+    /// statement, and evaluating it without that body resolves `EXCLUDED.amount`
+    /// to NULL — the fold then reads the post-image's value as zero and debits
+    /// the target the row's whole old contribution instead of crediting the
+    /// difference.
+    #[test]
+    fn an_upsert_conflict_branch_folds_the_submitted_body() {
+        let op = upsert_with(
+            body("acc-1", 60),
+            vec![("amount".to_string(), excluded("amount"))],
+        );
+        let scope = stored_row_scope(&op).expect("an upsert names its stored row");
+        let stored = serde_json::json!({"account_id": "acc-1", "amount": 25});
+        let images = images_of(&scope, Some(&stored)).expect("images");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0.as_ref(), Some(&stored));
+        assert_eq!(amount_of(images[0].1.as_ref()), Some(60));
+    }
+
+    /// An upsert with NO conflict assignments merges the submitted body over
+    /// the stored row, so a body that raises the value settles the difference
+    /// rather than nothing at all.
+    #[test]
+    fn an_upsert_without_conflict_assignments_merges_the_body() {
+        let op = upsert_with(body("acc-1", 60), Vec::new());
+        let scope = stored_row_scope(&op).expect("an upsert names its stored row");
+        let stored = serde_json::json!({"account_id": "acc-1", "amount": 25, "memo": "kept"});
+        let images = images_of(&scope, Some(&stored)).expect("images");
+
+        assert_eq!(amount_of(images[0].1.as_ref()), Some(60));
+        assert_eq!(
+            images[0]
+                .1
+                .as_ref()
+                .and_then(|row| row.get("memo"))
+                .and_then(serde_json::Value::as_str),
+            Some("kept"),
+            "a column the body omits survives the merge"
+        );
+    }
+
+    /// A conflict assignment that rewrites the join column from `EXCLUDED`
+    /// moves the row between two targets, and the post-image names the one it
+    /// moves ONTO.
+    #[test]
+    fn an_upsert_conflict_branch_can_move_the_join_key() {
+        let op = upsert_with(
+            body("acc-2", 60),
+            vec![
+                ("account_id".to_string(), excluded("account_id")),
+                ("amount".to_string(), excluded("amount")),
+            ],
+        );
+        let scope = stored_row_scope(&op).expect("an upsert names its stored row");
+        let stored = serde_json::json!({"account_id": "acc-1", "amount": 25});
+        let images = images_of(&scope, Some(&stored)).expect("images");
+
+        assert_eq!(
+            images[0]
+                .1
+                .as_ref()
+                .and_then(|row| row.get("account_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("acc-2")
+        );
+        assert_eq!(amount_of(images[0].1.as_ref()), Some(60));
+    }
+
+    /// With no stored row the upsert INSERTS, so its post-image is the
+    /// submitted body and it owes the target the row's whole value.
+    #[test]
+    fn an_upsert_onto_no_row_folds_the_body_as_an_insert() {
+        let op = upsert_with(
+            body("acc-1", 60),
+            vec![("amount".to_string(), excluded("amount"))],
+        );
+        let scope = stored_row_scope(&op).expect("an upsert names its stored row");
+        let images = images_of(&scope, None).expect("images");
+
+        assert_eq!(images.len(), 1);
+        assert!(images[0].0.is_none(), "an insert has no pre-image");
+        assert_eq!(amount_of(images[0].1.as_ref()), Some(60));
+    }
+
+    /// A whole-row PUT does not share the conflict branch's gap: it carries no
+    /// assignments at all, so its post-image is the submitted body and there is
+    /// no `EXCLUDED` reference to resolve.
+    #[test]
+    fn a_put_onto_an_existing_row_folds_the_body_wholesale() {
+        let op = DocumentOp::PointPut {
+            collection: "entries".to_string(),
+            document_id: "e1".to_string(),
+            value: body("acc-1", 60),
+            surrogate: ROW,
+            pk_bytes: b"e1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+        };
+        let scope = stored_row_scope(&op).expect("a put names its stored row");
+        let stored = serde_json::json!({"account_id": "acc-1", "amount": 25});
+        let images = images_of(&scope, Some(&stored)).expect("images");
+
+        assert_eq!(images[0].0.as_ref(), Some(&stored));
+        assert_eq!(amount_of(images[0].1.as_ref()), Some(60));
     }
 }
