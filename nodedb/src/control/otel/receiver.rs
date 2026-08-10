@@ -21,6 +21,7 @@ use tracing::info;
 
 use super::proto;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::tls_policy::TransportSecurity;
 use crate::control::server::session_auth;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -51,20 +52,27 @@ pub async fn run(config: OtelConfig, shared: Arc<SharedState>) -> std::io::Resul
         return Ok(());
     }
 
-    let router = Router::new()
-        .route("/v1/metrics", post(receive_metrics))
-        .route("/v1/traces", post(receive_traces))
-        .route("/v1/logs", post(receive_logs))
-        .with_state(shared);
-
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     info!(addr = %config.listen, "OTLP/HTTP receiver started");
     axum::serve(
         listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
+        router(shared).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .map_err(std::io::Error::other)
+}
+
+/// The OTLP/HTTP route table.
+///
+/// Split out of [`run`] so a caller can serve these handlers on a listener it
+/// owns — the transport gate they run is only observable end to end, over a
+/// real socket.
+pub fn router(shared: Arc<SharedState>) -> Router {
+    Router::new()
+        .route("/v1/metrics", post(receive_metrics))
+        .route("/v1/traces", post(receive_traces))
+        .route("/v1/logs", post(receive_logs))
+        .with_state(shared)
 }
 
 /// POST `/v1/metrics` — OTLP metrics receiver.
@@ -77,7 +85,7 @@ pub async fn receive_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &state).await {
+    let identity = match authenticate_otel(&headers, &state, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return (StatusCode::UNAUTHORIZED, message),
     };
@@ -126,7 +134,7 @@ pub async fn receive_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &state).await {
+    let identity = match authenticate_otel(&headers, &state, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return (StatusCode::UNAUTHORIZED, message),
     };
@@ -151,7 +159,7 @@ pub async fn receive_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &state).await {
+    let identity = match authenticate_otel(&headers, &state, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return (StatusCode::UNAUTHORIZED, message),
     };
@@ -380,9 +388,26 @@ fn escape_ilp_string(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Neither OTLP receiver terminates TLS: [`run`] and the sibling gRPC
+/// receiver both serve a bare `TcpListener`, so every request that reaches a
+/// handler arrived in the clear. Stated once, here, rather than assumed at
+/// each call site — if either receiver ever gains TLS termination, this
+/// constant is what has to stop being a constant.
+const OTLP_TRANSPORT: TransportSecurity = TransportSecurity::Cleartext;
+
+/// Authenticate an OTLP request and check it against the TLS policy.
+///
+/// The transport check lives inside authentication rather than beside it so a
+/// handler cannot get the bearer gate while silently skipping
+/// `reject_cleartext`. That is the failure this fixes: both receivers bind
+/// `0.0.0.0` by default and consulted no transport policy at all, so an
+/// operator who demanded TLS still got plaintext ingest ports accepting
+/// authenticated writes. Folding it in is also what surfaced the gRPC
+/// receiver's three handlers — they were a compile error, not a second audit.
 pub(super) async fn authenticate_otel(
     headers: &HeaderMap,
     shared: &SharedState,
+    peer_addr: &str,
 ) -> Result<AuthenticatedIdentity, String> {
     let header = headers
         .get("authorization")
@@ -406,10 +431,27 @@ pub(super) async fn authenticate_otel(
             identity.tenant_id,
         )
         .map_err(|_| "invalid bearer token".to_owned())?;
-        return Ok(identity);
+        return admit_transport(shared, identity, peer_addr);
     }
-    session_auth::verify_api_key_identity(shared, token, "otlp", "OTLP")
-        .ok_or_else(|| "invalid bearer token".to_owned())
+    let identity = session_auth::verify_api_key_identity(shared, token, "otlp", "OTLP")
+        .ok_or_else(|| "invalid bearer token".to_owned())?;
+    admit_transport(shared, identity, peer_addr)
+}
+
+/// Refuse an authenticated OTLP request whose transport the TLS policy will
+/// not accept.
+///
+/// Runs after authentication because the policy's superuser carve-out for
+/// cleartext needs the identity — the same ordering `handle_ilp_connection`
+/// uses for its own transport check.
+fn admit_transport(
+    shared: &SharedState,
+    identity: AuthenticatedIdentity,
+    peer_addr: &str,
+) -> Result<AuthenticatedIdentity, String> {
+    session_auth::check_transport_security(shared, &identity, OTLP_TRANSPORT, peer_addr)
+        .map_err(|e| e.to_string())?;
+    Ok(identity)
 }
 
 async fn ingest_ilp(

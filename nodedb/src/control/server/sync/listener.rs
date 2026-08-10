@@ -255,6 +255,16 @@ pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> 
     // Plaintext `ws://` sync must terminate TLS at a loopback proxy: reject any
     // public bind here so both the fail-fast boot path (`bind_listeners`) and
     // the convenience `start_sync_listener` path are covered by one guard.
+    //
+    // This guard, not `check_transport_security`, is this listener's transport
+    // control, and the omission is deliberate. The socket always sees
+    // cleartext because TLS is terminated by the proxy in front of it, so
+    // applying the TLS policy here would refuse every session under
+    // `reject_cleartext` and make the only supported deployment impossible.
+    // Refusing to bind anywhere but loopback is the stronger guarantee: no
+    // sync byte crosses a network in the clear, whatever the policy says.
+    // Contrast the OTLP receivers, which bind `0.0.0.0` and therefore cannot
+    // prove a proxy is in front — they do consult the policy and fail closed.
     if !addr.ip().is_loopback() {
         return Err(crate::Error::Config {
             detail: format!(

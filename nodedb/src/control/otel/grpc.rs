@@ -59,7 +59,7 @@ async fn grpc_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &shared).await {
+    let identity = match authenticate_otel(&headers, &shared, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
     };
@@ -79,7 +79,7 @@ async fn grpc_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &shared).await {
+    let identity = match authenticate_otel(&headers, &shared, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
     };
@@ -99,7 +99,7 @@ async fn grpc_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let identity = match authenticate_otel(&headers, &shared).await {
+    let identity = match authenticate_otel(&headers, &shared, &peer.to_string()).await {
         Ok(identity) => identity,
         Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
     };
