@@ -68,7 +68,9 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::Surrogate;
 use nodedb_types::id::TxnId;
 
-use crate::control::server::shared::session::read_set::{EngineTag, ReadKey, ReadSetEntry};
+use crate::control::server::shared::session::read_set::{
+    EngineTag, ReadKey, ReadOrigin, ReadSetEntry,
+};
 use crate::engine::document::store::surrogate_to_doc_id;
 use crate::query::{db_qualified, sum_target_is_co_resident, sum_target_vshard};
 use crate::types::{DatabaseId, KeyRepr, Lsn, TenantId};
@@ -268,6 +270,13 @@ fn image_read_entry(
         },
         read_lsn: input.read_version_lsn,
         read_version_lsn: input.read_version_lsn,
+        // A DERIVATION read, never a read-your-own-write. The image was read
+        // from committed base state before this transaction existed, and the
+        // delta shipped to the target rests entirely on it; the statement writes
+        // the source collection too, so an entry marked `Session` here would be
+        // dropped by the own-write exclusion and the fold would never be
+        // validated against a concurrent writer.
+        origin: ReadOrigin::PlanDerivation,
     }
 }
 

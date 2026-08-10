@@ -9,7 +9,9 @@ use crate::Error;
 use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
-use crate::control::server::shared::session::read_set::{EngineTag, ReadKey, ReadSetEntry};
+use crate::control::server::shared::session::read_set::{
+    EngineTag, ReadKey, ReadOrigin, ReadSetEntry,
+};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{ColumnarOp, CrdtOp, DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -305,6 +307,7 @@ fn read_entry_on_foreign_collection_widens_class_to_multishard() {
         key: ReadKey::Predicate,
         read_lsn: Lsn::new(1),
         read_version_lsn: Lsn::ZERO,
+        origin: ReadOrigin::Session,
     };
 
     // The homing step under test: a foreign-collection read must home to a

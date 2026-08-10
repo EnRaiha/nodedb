@@ -203,19 +203,35 @@ fn build_static_tx_class_impl(
     // Sort by collection name for determinism.
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
-    // Read-your-own-write: a read of a collection this txn also WRITES must NOT
-    // enter the OCC read set. The txn's own staged write advances that
+    // Read-your-own-write: a SESSION read of a collection this txn also WRITES
+    // must NOT enter the OCC read set. The txn's own staged write advances that
     // collection's write floor, so validating the earlier read against it would
     // flag it stale and abort the commit — a false serialization conflict. This
     // mirrors the written-collection exclusion the single-shard
     // `si_conflict_abort` path already applies.
+    //
+    // A PLAN-DERIVATION read is exempt, and the exemption is what makes the
+    // derivation guard exist at all. Such a read observed COMMITTED base state
+    // BEFORE this transaction existed, and it is precisely the observation a
+    // value the transaction ships was computed from — a cross-shard
+    // materialized-sum settlement folds a delta from a pre-image of the source
+    // row and sends it to another shard. The source collection is one this
+    // statement always writes, so the exclusion would drop every such entry and
+    // `read_set_still_current` would validate nothing: a concurrent write
+    // between the fold and the apply would commit a total folded from an image
+    // that has moved. The kind is carried on the entry rather than inferred
+    // here, so no entry can be classified by accident of which collection it
+    // names.
     let written_collections: std::collections::HashSet<String> = write_sets
         .iter()
         .map(|ks| ks.collection().to_string())
         .collect();
     let owned_reads: Vec<ReadSetEntry> = reads
         .iter()
-        .filter(|e| !written_collections.contains(e.collection.as_str()))
+        .filter(|e| {
+            e.origin.survives_own_write_exclusion()
+                || !written_collections.contains(e.collection.as_str())
+        })
         .cloned()
         .collect();
 
@@ -267,7 +283,7 @@ fn build_static_tx_class_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::server::shared::session::read_set::{EngineTag, ReadKey};
+    use crate::control::server::shared::session::read_set::{EngineTag, ReadKey, ReadOrigin};
     use crate::types::{DatabaseId, KeyRepr, Lsn};
     use nodedb_physical::physical_plan::DocumentOp;
     use nodedb_types::Surrogate;
@@ -310,6 +326,15 @@ mod tests {
     }
 
     fn read_entry(collection: &str, key: ReadKey, read_lsn: u64) -> ReadSetEntry {
+        origin_read_entry(collection, key, read_lsn, ReadOrigin::Session)
+    }
+
+    fn origin_read_entry(
+        collection: &str,
+        key: ReadKey,
+        read_lsn: u64,
+        origin: ReadOrigin,
+    ) -> ReadSetEntry {
         ReadSetEntry {
             engine: EngineTag::Document,
             database_id: DatabaseId::DEFAULT,
@@ -320,6 +345,7 @@ mod tests {
             // The per-collection read-version is the OCC comparand
             // `versioned_reads_from` propagates; give it the same synthetic LSN.
             read_version_lsn: Lsn::new(read_lsn),
+            origin,
         }
     }
 
@@ -445,6 +471,84 @@ mod tests {
         assert_eq!(
             tx.participating_vshards(),
             tx.write_set.participating_vshards().as_slice()
+        );
+    }
+
+    /// A PLAN-DERIVATION read of a collection the transaction WRITES survives
+    /// the own-write exclusion, reaching BOTH the routing read_set and the
+    /// LSN-versioned `versioned_reads` the Data Plane's
+    /// `read_set_still_current` check consumes.
+    ///
+    /// This is the whole of the cross-shard materialized-sum guard: the delta
+    /// shipped to the target was folded from a pre-image of a source row, and
+    /// the source collection is one the statement always writes. Dropped here,
+    /// nothing validates the fold and a concurrent write to the source row
+    /// between the fold and the apply commits a wrong total.
+    #[test]
+    fn a_derivation_read_of_a_written_collection_survives_the_own_write_exclusion() {
+        let (col_a, col_b) = two_distinct_collections();
+        let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
+
+        let reads = vec![origin_read_entry(
+            &col_a,
+            ReadKey::Point {
+                repr: KeyRepr::Surrogate(11),
+            },
+            42,
+            ReadOrigin::PlanDerivation,
+        )];
+
+        let tx = build_static_tx_class(&tasks, TenantId::new(1), &reads)
+            .expect("valid multi-vShard TxClass");
+
+        assert_eq!(
+            tx.versioned_reads.len(),
+            1,
+            "a derivation read must reach versioned_reads — that set IS the guard"
+        );
+        assert_eq!(tx.versioned_reads.0[0].collection, col_a);
+        assert_eq!(tx.versioned_reads.0[0].read_lsn, Lsn::new(42));
+        assert_eq!(
+            tx.versioned_reads.0[0].key,
+            nodedb_cluster::calvin::types::ReadKeyIdent::Point(KeyRepr::Surrogate(11))
+        );
+
+        let read_colls: std::collections::BTreeSet<&str> =
+            tx.read_set.0.iter().map(|ks| ks.collection()).collect();
+        assert!(
+            read_colls.contains(col_a.as_str()),
+            "a derivation read must also reach the routing read_set"
+        );
+    }
+
+    /// The other half: an ordinary SESSION read of a collection the transaction
+    /// writes is STILL excluded. Without this, the fix above could be "passed"
+    /// by disabling the exclusion, and every transaction that reads a row it
+    /// then writes would abort on its own staged write.
+    #[test]
+    fn a_session_read_of_a_written_collection_is_still_excluded() {
+        let (col_a, col_b) = two_distinct_collections();
+        let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
+
+        let reads = vec![read_entry(
+            &col_a,
+            ReadKey::Point {
+                repr: KeyRepr::Surrogate(11),
+            },
+            42,
+        )];
+
+        let tx = build_static_tx_class(&tasks, TenantId::new(1), &reads)
+            .expect("valid multi-vShard TxClass");
+
+        assert!(
+            tx.versioned_reads.is_empty(),
+            "a session read of a self-written collection must not be validated \
+             against the transaction's own staged write"
+        );
+        assert!(
+            tx.read_set.is_empty(),
+            "and it must not enter the routing read_set either"
         );
     }
 

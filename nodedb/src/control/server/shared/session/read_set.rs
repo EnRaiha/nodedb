@@ -73,6 +73,46 @@ pub enum ReadKey {
     },
 }
 
+/// Why a read is on the transaction's read-set — and therefore whether the
+/// read-your-own-write exclusion is allowed to drop it.
+///
+/// The exclusion (in the Calvin `TxClass` builders) removes reads whose
+/// collection the transaction also WRITES, because validating such a read
+/// against the transaction's own staged write would abort the transaction on
+/// itself. That reasoning holds only for reads the SESSION issued inside the
+/// transaction. It does NOT hold for a read the Control Plane performed at plan
+/// time to DERIVE a value the transaction now ships, so the two kinds are
+/// distinguished here rather than guessed at the filter site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOrigin {
+    /// A read this transaction itself issued, through any transport, after it
+    /// began. Its observation may legitimately be superseded by the
+    /// transaction's own writes, so the own-write exclusion applies.
+    Session,
+    /// A read the Control Plane performed BEFORE the transaction existed, whose
+    /// observed value a value this transaction writes was computed from — a
+    /// materialized-sum settlement's pre-image is the case that exists today.
+    ///
+    /// This is NOT a read-your-own-write. It observed COMMITTED base state at a
+    /// point in time, and the derived value the transaction ships is only
+    /// correct if that observation still holds at apply time. Dropping it
+    /// because the transaction happens to write the same collection would
+    /// discard the one check that catches a concurrent writer moving the base
+    /// row out from under the derivation, so it survives the exclusion.
+    PlanDerivation,
+}
+
+impl ReadOrigin {
+    /// Whether an entry of this origin must stay in the OCC read-set even when
+    /// the transaction also writes the entry's collection.
+    pub fn survives_own_write_exclusion(self) -> bool {
+        match self {
+            ReadOrigin::Session => false,
+            ReadOrigin::PlanDerivation => true,
+        }
+    }
+}
+
 /// One LSN-versioned, predicate-aware read-set entry. Scoped by
 /// `(database_id, tenant_id)` exactly like the write path so two tenants (or
 /// databases) never alias.
@@ -90,6 +130,11 @@ pub struct ReadSetEntry {
     /// write versions in that one domain. `read_lsn` above stays the core-global
     /// watermark used by single-shard SI (`si_conflict_abort`).
     pub read_version_lsn: Lsn,
+    /// Whether this observation is the transaction's own session read or a
+    /// plan-time derivation read. Required at construction — the own-write
+    /// exclusion in the `TxClass` builders reads it, and an entry that guessed
+    /// would be silently dropped from validation.
+    pub origin: ReadOrigin,
 }
 
 /// The observed read passed to [`record_read_set`]: the executed plan, the
@@ -179,6 +224,9 @@ pub async fn record_read_set(
             key: key.clone(),
             read_lsn: *read_lsn,
             read_version_lsn: effective_read_version,
+            // Every entry captured here is a read the session issued inside its
+            // own transaction, so the own-write exclusion applies to it.
+            origin: ReadOrigin::Session,
         })
         .collect();
 

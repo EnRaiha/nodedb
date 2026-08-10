@@ -44,7 +44,9 @@ pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
 };
-pub use self::read_set::{EngineTag, ReadCapture, ReadKey, ReadSetEntry, record_read_set};
+pub use self::read_set::{
+    EngineTag, ReadCapture, ReadKey, ReadOrigin, ReadSetEntry, record_read_set,
+};
 pub use self::record_reads::{ResponseReads, record_reads_for_response};
 pub use self::savepoint_ops::SavepointError;
 pub use self::staging_gate::{
