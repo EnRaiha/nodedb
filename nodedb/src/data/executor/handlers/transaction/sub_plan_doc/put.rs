@@ -30,7 +30,7 @@ pub(in crate::data::executor::handlers::transaction) struct TxPointPut<'a> {
     /// plan time for every materialized-sum target this write may touch. The
     /// Data Plane addresses target rows with these and never derives them: the
     /// primary-key → surrogate map is Control-Plane catalog state.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
 }
 
 impl CoreLoop {

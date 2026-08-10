@@ -44,8 +44,7 @@
 //! "abort before any mutation" contract, on the images the shipped deltas were
 //! actually folded from.
 
-use nodedb_physical::physical_plan::UpdateValue;
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, UpdateValue};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
@@ -64,7 +63,7 @@ pub(in crate::data::executor) struct SumTargetCheck<'a> {
     /// post-images itself.
     pub updates: &'a [(String, UpdateValue)],
     /// The resolution the plan carried.
-    pub resolved: &'a [(String, Surrogate)],
+    pub resolved: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {
@@ -116,7 +115,11 @@ impl CoreLoop {
             let Ok(required) = crate::query::binding_join_keys(binding, check.updates, rows) else {
                 continue;
             };
-            if let Some(missing) = crate::query::missing_join_key(&required, check.resolved) {
+            if let Some(missing) = crate::query::missing_join_key(
+                &binding.target_collection,
+                &required,
+                check.resolved,
+            ) {
                 tracing::debug!(
                     core = self.core_id,
                     collection = %check.collection,

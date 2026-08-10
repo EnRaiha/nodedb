@@ -27,13 +27,56 @@
 
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
+use crate::control::wal_replication::types::ReplicatedSumTarget;
+use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, UpdateValue};
+
+/// The two slots a record carries its materialized-sum resolution in.
+///
+/// They travel together because they are one answer in two shapes, and a caller
+/// that passed only the older one would silently strip every entry's target
+/// collection — which is the ambiguity the newer slot exists to remove.
+pub(super) struct WireSumResolution<'a> {
+    /// The AUTHORITATIVE slot: `(target collection, join value)` → surrogate.
+    pub bindings: &'a [ReplicatedSumTarget],
+    /// The superseded `(join value, surrogate)` slot. Read only when `bindings`
+    /// is empty — see [`plan_targets`].
+    pub legacy: &'a [(String, u32)],
+}
 
 /// Lift the wire resolution back into plan shape.
-fn plan_targets(wire: &[(String, u32)]) -> Vec<(String, nodedb_types::Surrogate)> {
-    wire.iter()
+///
+/// `bindings` wins whenever it carries anything: a node that wrote it knew each
+/// entry's target collection, and that is the key both planes look the
+/// resolution up by.
+///
+/// The older slot is the fallback for one case only — a record committed before
+/// that slot existed, which every node replays out of its own log across the
+/// upgrade. Its entries name no target collection, so they are lifted
+/// UNTARGETED and match any binding by join value alone. That is exactly what
+/// the record meant when it was written; inventing a target collection for it
+/// would be a resolution nobody made.
+///
+/// A record that carries both — every record a current node writes — is read
+/// from `bindings`, so the fallback never widens a resolution that already knows
+/// its targets.
+fn plan_targets(wire: &WireSumResolution<'_>) -> Vec<ResolvedSumTarget> {
+    if !wire.bindings.is_empty() {
+        return wire
+            .bindings
+            .iter()
+            .map(|entry| {
+                ResolvedSumTarget::new(
+                    &entry.target_collection,
+                    &entry.join_value,
+                    nodedb_types::Surrogate::new(entry.surrogate),
+                )
+            })
+            .collect();
+    }
+    wire.legacy
+        .iter()
         .map(|(join_value, surrogate)| {
-            (join_value.clone(), nodedb_types::Surrogate::new(*surrogate))
+            ResolvedSumTarget::untargeted(join_value, nodedb_types::Surrogate::new(*surrogate))
         })
         .collect()
 }
@@ -44,7 +87,7 @@ pub(super) fn point_put(
     document_id: &str,
     value: &[u8],
     surrogate: u32,
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -80,9 +123,10 @@ pub(super) fn point_put(
 /// sibling task. Splitting them across parameters lets a caller pass one and
 /// forget the other, which is a double-counted or a dropped balance.
 pub(super) struct SumDecisions<'a> {
-    /// Join value → target surrogate, resolved by the node that accepted the
-    /// statement. Never re-resolved here — see this module's doc.
-    pub resolved: &'a [(String, u32)],
+    /// `(target collection, join value)` → target surrogate, resolved by the
+    /// node that accepted the statement. Never re-resolved here — see this
+    /// module's doc.
+    pub resolved: WireSumResolution<'a>,
     /// Bindings whose delta a sibling task owns, so the inline fold skips them.
     pub deferred: &'a [String],
 }
@@ -122,7 +166,7 @@ pub(super) fn point_insert(
         returning: None,
         rls_filters: Vec::new(),
         // Read off the record — see this module's doc.
-        resolved_sum_targets: plan_targets(resolved_sum_targets),
+        resolved_sum_targets: plan_targets(&resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
     }))
 }
@@ -132,7 +176,7 @@ pub(super) fn point_delete(
     collection: &str,
     document_id: &str,
     surrogate: u32,
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -160,7 +204,7 @@ pub(super) fn point_update(
     document_id: &str,
     updates: &[(String, UpdateValue)],
     surrogate: u32,
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -187,7 +231,7 @@ pub(super) fn doc_upsert(
     value: &[u8],
     on_conflict_updates: &[(String, UpdateValue)],
     surrogate: u32,
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -218,7 +262,7 @@ pub(super) fn batch_insert(
     collection: &str,
     documents: &[(String, Vec<u8>)],
     surrogates: &[u32],
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
     deferred_sum_targets: &[String],
 ) -> crate::Result<PhysicalPlan> {
     // `zip` below stops at the shorter side, so a record that lost surrogates
@@ -280,7 +324,7 @@ pub(super) fn bulk_dml(
     filters: &[u8],
     is_update: bool,
     updates: &[(String, UpdateValue)],
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> PhysicalPlan {
     // The MATCHES are re-derived locally (same log position ⇒ same rows); the
     // identity of the targets those matches credit is read off the record — see
@@ -321,7 +365,7 @@ pub(super) fn bulk_dml(
 pub(super) fn truncate(
     collection: &str,
     restart_identity: bool,
-    resolved_sum_targets: &[(String, u32)],
+    resolved_sum_targets: &WireSumResolution<'_>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Truncate {
         collection: collection.to_owned(),

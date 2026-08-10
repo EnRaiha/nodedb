@@ -11,7 +11,9 @@ use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec, StorageMode};
+use nodedb_physical::physical_plan::{
+    OllpPredictedEdge, ResolvedSumTarget, ReturningSpec, StorageMode,
+};
 
 /// OLLP prediction inputs threaded to `execute_bulk_delete`: the predicted
 /// matched-doc surrogate set and the predicted implicit-edge set. Both are
@@ -40,7 +42,7 @@ pub(in crate::data::executor) struct BulkDeleteParams<'a> {
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// the rows this predicate matches contribute to, resolved on the Control
     /// Plane from its recon scan of the same predicate.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
     pub ollp: OllpPrediction<'a>,
 }
 

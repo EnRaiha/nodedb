@@ -35,7 +35,7 @@ pub(super) struct MergeDeleteArms<'a> {
     /// Whether the statement carries a `RETURNING` projection.
     pub(super) returning: bool,
     /// Join-key VALUE → target row surrogate, resolved on the Control Plane.
-    pub(super) resolved_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub(super) resolved_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
 }
 
 /// The statement-wide accumulators these arms contribute to, shared with the

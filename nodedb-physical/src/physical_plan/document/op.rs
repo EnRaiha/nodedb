@@ -4,6 +4,7 @@ use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use super::merge_types::MergeClauseOp;
 use super::ollp_edge::OllpPredictedEdge;
+use super::sum_target::ResolvedSumTarget;
 use super::timeseries_schema::TimeseriesSchema;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
 
@@ -72,14 +73,15 @@ pub enum DocumentOp {
         /// See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. Keyed on the PAIR because one source may drive
+        /// two bindings that share a join column and name different targets.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Point insert: write one document, fail on duplicate primary key.
@@ -110,14 +112,15 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. Keyed on the PAIR because one source may drive
+        /// two bindings that share a join column and name different targets.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
         /// Materialized-sum TARGET collections whose delta this write must NOT
         /// apply itself: the Control Plane settled each at plan time and
         /// appended an
@@ -162,14 +165,15 @@ pub enum DocumentOp {
         /// two would turn a write gate into row redaction, or the reverse.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. Keyed on the PAIR because one source may drive
+        /// two bindings that share a join column and name different targets.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Point update: read-modify-write with field-level changes.
@@ -193,14 +197,15 @@ pub enum DocumentOp {
         /// image — see `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. Keyed on the PAIR because one source may drive
+        /// two bindings that share a join column and name different targets.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Full collection scan with filtering, sorting, and pagination.
@@ -250,14 +255,14 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time. One entry per DISTINCT join value across `documents`.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. One entry per DISTINCT pair across `documents`.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
         /// Materialized-sum TARGET collections whose delta this write must NOT
         /// apply itself: the Control Plane settled each at plan time and
         /// appended an
@@ -397,9 +402,9 @@ pub enum DocumentOp {
     Truncate {
         collection: String,
         restart_identity: bool,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane from a
-        /// recon scan of the rows this statement will remove.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane from a recon scan of the rows this statement will remove.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in the
         /// catalog redb, which is Control-Plane state. Because the set is
@@ -407,7 +412,7 @@ pub enum DocumentOp {
         /// re-derives the actual join-key set and returns
         /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Estimate count via HLL cardinality stats.
@@ -449,14 +454,15 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane at plan
-        /// time.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane at plan time. Keyed on the PAIR because one source may drive
+        /// two bindings that share a join column and name different targets.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in
         /// the catalog redb, which is Control-Plane state.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Update target rows matched by a join with a source collection.
@@ -520,9 +526,10 @@ pub enum DocumentOp {
         /// writes is a target row. See `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for `target_collection`'s
-        /// materialized-sum bindings, resolved on the Control Plane from a
-        /// recon scan of the target rows this statement will rewrite. Both
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// `target_collection`'s materialized-sum bindings, resolved on the
+        /// Control Plane from a recon scan of the target rows this statement
+        /// will rewrite. Both
         /// sides of a join-key change are resolved, so a row moved from one
         /// sum target to another can be debited and credited in one pass.
         ///
@@ -532,7 +539,7 @@ pub enum DocumentOp {
         /// re-derives the actual join-key set and returns
         /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Bulk update: scan + apply field updates to all matches.
@@ -566,9 +573,10 @@ pub enum DocumentOp {
         /// row's post-update image — see `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane from a
-        /// recon scan of the rows the predicate matches. Both sides of a
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane from a recon scan of the rows the predicate matches. Both
+        /// sides of a
         /// join-key change are resolved, so a row moved from one sum target to
         /// another can be debited and credited in one pass.
         ///
@@ -578,7 +586,7 @@ pub enum DocumentOp {
         /// re-derives the actual join-key set and returns
         /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Bulk delete: scan + delete all matches.
@@ -614,9 +622,9 @@ pub enum DocumentOp {
         /// `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for this collection's
-        /// materialized-sum bindings, resolved on the Control Plane from a
-        /// recon scan of the rows the predicate matches.
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// this collection's materialized-sum bindings, resolved on the Control
+        /// Plane from a recon scan of the rows the predicate matches.
         ///
         /// The Data Plane cannot derive this: the PK→surrogate map lives in the
         /// catalog redb, which is Control-Plane state. Because the set is
@@ -624,7 +632,7 @@ pub enum DocumentOp {
         /// re-derives the actual join-key set and returns
         /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// MERGE: join-based multi-action DML (INSERT / UPDATE / DELETE per WHEN arm).
@@ -697,9 +705,10 @@ pub enum DocumentOp {
         /// `PointDelete::rls_write_check`.
         #[serde(default)]
         rls_write_check: Vec<u8>,
-        /// Join-key value → target row surrogate for `target_collection`'s
-        /// materialized-sum bindings, resolved on the Control Plane from the
-        /// RESOLVE pass's classification. Every arm moves the total: an INSERT
+        /// `(target collection, join-key value)` → target row surrogate for
+        /// `target_collection`'s materialized-sum bindings, resolved on the
+        /// Control Plane from the RESOLVE pass's classification. Every arm
+        /// moves the total: an INSERT
         /// arm credits, a DELETE arm debits, an UPDATE arm applies the
         /// difference and, when the arm rewrites the join key, both sides.
         ///
@@ -709,7 +718,7 @@ pub enum DocumentOp {
         /// `ErrorCode::OllpRetryRequired` on drift BEFORE writing, which is the
         /// same guard this set relies on.
         #[serde(default)]
-        resolved_sum_targets: Vec<(String, Surrogate)>,
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.

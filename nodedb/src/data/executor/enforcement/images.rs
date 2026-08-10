@@ -11,7 +11,7 @@
 //! INSERT. [`RowImages`] makes the shape of the mutation the type itself, so
 //! that class of caller mistake stops compiling.
 
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::ResolvedSumTarget;
 
 use crate::types::Lsn;
 
@@ -70,9 +70,15 @@ pub(in crate::data::executor) struct EnforcementCtx<'a> {
     /// Collection the written row belongs to — the *source* collection, not
     /// any target an enforcement may fan out to.
     pub collection: &'a str,
-    /// Join-key VALUE → the surrogate of the target row that value identifies,
-    /// for every target this write may touch (both sides of a join-key change
-    /// on an [`RowImages::Update`]).
+    /// `(target collection, join-key value)` → the surrogate of the target row
+    /// that pair identifies, for every target this write may touch (both sides
+    /// of a join-key change on an [`RowImages::Update`]).
+    ///
+    /// The target collection is half the key, not decoration. One source
+    /// collection may drive two bindings that read the SAME join column into
+    /// DIFFERENT target collections; keyed on the value alone the second
+    /// binding's fold would address the first binding's row and both stored
+    /// totals would be wrong, with no error raised on either plane.
     ///
     /// This is resolved on the **Control Plane** at plan time and travels on
     /// the plan. The Data Plane never derives it, and must never try to: the
@@ -85,7 +91,7 @@ pub(in crate::data::executor) struct EnforcementCtx<'a> {
     /// A target absent from this slice was not resolvable at plan time; that
     /// is a planning outcome to be reported, not a lookup for the Data Plane
     /// to retry locally.
-    pub resolved_targets: &'a [(String, Surrogate)],
+    pub resolved_targets: &'a [ResolvedSumTarget],
     /// Materialized-sum TARGET collections whose delta this write must NOT
     /// apply, because the Control Plane settled it at plan time and appended an
     /// [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)

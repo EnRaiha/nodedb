@@ -2,7 +2,7 @@
 //! Append-only Raft write wire ABI; variants must never be reordered.
 
 use super::aliases::{default_ivf_cells, default_ivf_nprobe, default_pq_m};
-use super::wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge};
+use super::wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
 
 #[derive(
@@ -36,8 +36,33 @@ pub enum ReplicatedWrite {
         ///
         /// Empty for every write whose collection drives no binding, which is
         /// nearly all of them.
+        ///
+        /// SUPERSEDED by `resolved_sum_target_bindings`, and retained only
+        /// because this enum is an append-only wire ABI: a peer running an
+        /// older binary reads this slot and behaves exactly as it does today.
+        /// New appliers read it only when `resolved_sum_target_bindings` is
+        /// empty — see there.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// The same resolution, keyed on the `(target collection, join value)`
+        /// PAIR — the authoritative slot.
+        ///
+        /// `resolved_sum_targets` above cannot express the answer when a source
+        /// drives two bindings that read the SAME join column into DIFFERENT
+        /// target collections: one entry per join value means the second
+        /// binding's fold finds the first binding's target row and writes its
+        /// balance there. Both stored totals are then wrong and nothing reports
+        /// it.
+        ///
+        /// Appended rather than replacing the older slot, which is what this
+        /// wire ABI does with every added field. A record written before this
+        /// field existed carries an empty vec here and a populated vec above;
+        /// the decoder then lifts the older slot as untargeted entries, which
+        /// match any binding by value alone — exactly what that record meant
+        /// when it was written, and what lets a node replay its own committed
+        /// log across the upgrade.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     PointInsert {
         collection: String,
@@ -59,6 +84,9 @@ pub enum ReplicatedWrite {
         /// the same amount twice.
         #[serde(default)]
         deferred_sum_targets: Vec<String>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     PointDelete {
         collection: String,
@@ -67,6 +95,9 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     PointUpdate {
         collection: String,
@@ -76,6 +107,9 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     DocUpsert {
         collection: String,
@@ -86,6 +120,9 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     DocBatchInsert {
         collection: String,
@@ -97,6 +134,9 @@ pub enum ReplicatedWrite {
         /// See `PointInsert::deferred_sum_targets`.
         #[serde(default)]
         deferred_sum_targets: Vec<String>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     VectorInsert {
         collection: String,
@@ -445,6 +485,9 @@ pub enum ReplicatedWrite {
         /// is not derivable.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     ColumnarBulkDml {
         collection: String,
@@ -510,6 +553,9 @@ pub enum ReplicatedWrite {
         /// back off a target the proposing node had to resolve.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
     },
     KvTruncate {
         collection: String,

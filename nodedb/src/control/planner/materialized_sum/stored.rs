@@ -41,7 +41,9 @@
 
 use std::sync::Arc;
 
-use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, UpdateValue};
+use nodedb_physical::physical_plan::{
+    DocumentOp, MaterializedSumBinding, ResolvedSumTarget, UpdateValue,
+};
 use nodedb_types::Surrogate;
 
 use super::recon::recon_point_row;
@@ -212,7 +214,7 @@ pub(super) async fn extend_with_stored_row(
     state: &SharedState,
     bindings: &Arc<Vec<MaterializedSumBinding>>,
     scope: &StoredRowScope<'_>,
-    resolved: &mut Vec<(String, Surrogate)>,
+    resolved: &mut Vec<ResolvedSumTarget>,
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
@@ -241,11 +243,16 @@ pub(super) async fn extend_with_stored_row(
     let rows = [row];
     for binding in bindings.iter() {
         for join_value in crate::query::binding_join_keys(binding, scope.updates, &rows)? {
-            // One entry per DISTINCT join value across every binding and every
-            // source of join values, mirroring the body-driven resolution: a
-            // write whose old and new join keys are the same resolves that
-            // target once.
-            if resolved.iter().any(|(value, _)| *value == join_value) {
+            // One entry per DISTINCT `(target collection, join value)` PAIR
+            // across every binding and every source of join values, mirroring
+            // the body-driven resolution: a write whose old and new join keys
+            // are the same resolves that target once, while two bindings that
+            // share a join column and name different targets each keep their
+            // own entry.
+            if resolved
+                .iter()
+                .any(|entry| entry.addresses(&binding.target_collection, &join_value))
+            {
                 continue;
             }
             let surrogate = lookup_join_value(
@@ -257,7 +264,11 @@ pub(super) async fn extend_with_stored_row(
                 trace_id,
             )
             .await?;
-            resolved.push((join_value, surrogate));
+            resolved.push(ResolvedSumTarget::new(
+                &binding.target_collection,
+                join_value,
+                surrogate,
+            ));
         }
     }
     Ok(outcome)

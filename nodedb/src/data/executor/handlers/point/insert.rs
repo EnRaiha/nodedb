@@ -17,7 +17,7 @@ use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, W
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use nodedb_physical::physical_plan::ReturningSpec;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec};
 use nodedb_types::Surrogate;
 
 /// Parameters for [`CoreLoop::execute_point_insert`].
@@ -40,7 +40,7 @@ pub(in crate::data::executor) struct PointInsertParams<'a> {
     /// this insert may credit, resolved on the Control Plane at plan time. The
     /// Data Plane never derives it: the primary-key → surrogate map is catalog
     /// state that lives on the other side of the bridge.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
     /// Materialized-sum TARGET collections whose delta the Control Plane
     /// settled at plan time and appended as its own `ApplyBalanceDelta` task,
     /// homed on the target's vShard. This handler must not apply them as well.

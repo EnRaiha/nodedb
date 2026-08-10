@@ -5,13 +5,15 @@
 
 use std::sync::Arc;
 
-use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, PhysicalPlan};
+use nodedb_physical::physical_plan::{
+    DocumentOp, MaterializedSumBinding, PhysicalPlan, ResolvedSumTarget,
+};
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::Surrogate;
 
 use super::extract::join_value_from_body;
 use super::settle::{
-    SettleInput, co_resident_join_values, omit_shipped, settle_cross_shard_images,
+    SettleInput, co_resident_target_keys, omit_shipped, settle_cross_shard_images,
 };
 use super::stored::stored_row_scope;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
@@ -167,7 +169,7 @@ pub async fn resolve_materialized_sum_targets(
                     omit_shipped(
                         &mut resolved,
                         &settlement.shipped,
-                        &co_resident_join_values(&bindings, &input, database_id)?,
+                        &co_resident_target_keys(&bindings, &input, database_id)?,
                     );
                     (resolved, Some(settlement))
                 }
@@ -237,7 +239,7 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
 
 /// Write the resolution into the op's slot. Exhaustive for the same reason
 /// [`value_carrying`] is.
-fn set_resolved(op: &mut DocumentOp, resolved: Vec<(String, Surrogate)>) {
+fn set_resolved(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
     match op {
         DocumentOp::PointInsert {
             resolved_sum_targets,
@@ -305,7 +307,7 @@ pub async fn resolve_sum_targets_for_bodies(
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<Vec<(String, Surrogate)>> {
+) -> crate::Result<Vec<ResolvedSumTarget>> {
     let schema_version = state.schema_version.current();
     let catalog = state.credentials.catalog();
     let source = strip_db_prefix(database_id, source_collection);
@@ -379,8 +381,11 @@ pub(super) async fn lookup_join_value(
 
 /// Resolve every `(binding, body)` pair to its target row's surrogate.
 ///
-/// One entry per DISTINCT join value: a batch that touches the same target row
-/// many times resolves it once.
+/// One entry per DISTINCT `(target collection, join value)` PAIR: a batch that
+/// touches the same target row many times resolves it once, while two bindings
+/// that share a join column and name different targets each get their own entry
+/// — deduping on the value alone would resolve the first and silently hand its
+/// target row to the second.
 async fn resolve_bodies(
     state: &SharedState,
     bindings: &Arc<Vec<MaterializedSumBinding>>,
@@ -388,8 +393,8 @@ async fn resolve_bodies(
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<Vec<(String, Surrogate)>> {
-    let mut resolved: Vec<(String, Surrogate)> = Vec::new();
+) -> crate::Result<Vec<ResolvedSumTarget>> {
+    let mut resolved: Vec<ResolvedSumTarget> = Vec::new();
     for binding in bindings.iter() {
         let target = db_qualified(database_id, &binding.target_collection);
         for body in bodies {
@@ -399,7 +404,10 @@ async fn resolve_bodies(
                 // and nothing to add a delta to.
                 continue;
             };
-            if resolved.iter().any(|(v, _)| *v == join_value) {
+            if resolved
+                .iter()
+                .any(|entry| entry.addresses(&binding.target_collection, &join_value))
+            {
                 continue;
             }
             let vshard = VShardId::from_key(join_value.as_bytes());
@@ -418,7 +426,11 @@ async fn resolve_bodies(
                 join_column: binding.join_column.clone(),
                 join_value: join_value.clone(),
             })?;
-            resolved.push((join_value, surrogate));
+            resolved.push(ResolvedSumTarget::new(
+                &binding.target_collection,
+                join_value,
+                surrogate,
+            ));
         }
     }
     Ok(resolved)
@@ -489,6 +501,24 @@ mod tests {
         state.materialized_sum_index.invalidate();
     }
 
+    /// Declare a SECOND materialized sum on the same source, reading the SAME
+    /// join column into a DIFFERENT target collection.
+    fn declare_second_binding(state: &SharedState) {
+        let catalog = state.credentials.catalog();
+        let mut target = StoredCollection::new(TENANT.as_u64(), "audit_totals", "tester");
+        target.materialized_sums.push(MaterializedSumDef {
+            target_collection: "audit_totals".to_string(),
+            target_column: "balance".to_string(),
+            source_collection: "entries".to_string(),
+            join_column: "account_id".to_string(),
+            value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
+        });
+        catalog
+            .put_collection(DB, &target)
+            .expect("persist second target collection");
+        state.materialized_sum_index.invalidate();
+    }
+
     fn body(account_id: &str) -> Vec<u8> {
         let map = rmpv::Value::Map(vec![
             (
@@ -526,7 +556,7 @@ mod tests {
         }
     }
 
-    fn resolved_of(task: &PhysicalTask) -> &[(String, Surrogate)] {
+    fn resolved_of(task: &PhysicalTask) -> &[ResolvedSumTarget] {
         match &task.plan {
             PhysicalPlan::Document(DocumentOp::PointInsert {
                 resolved_sum_targets,
@@ -554,7 +584,62 @@ mod tests {
 
         assert_eq!(
             resolved_of(&tasks[0]),
-            &[("acc-1".to_string(), target_surrogate)]
+            &[ResolvedSumTarget::new(
+                "accounts",
+                "acc-1",
+                target_surrogate
+            )]
+        );
+    }
+
+    /// Two bindings of one source that share a join column resolve to TWO
+    /// entries, one per target collection — not one entry the second binding
+    /// silently inherits.
+    ///
+    /// Deduped on the join value alone, the second lookup never happens and the
+    /// plan carries only `accounts`' row. The Data-Plane fold then writes
+    /// `audit_totals`' balance into a row of that surrogate, and both stored
+    /// totals are wrong with nothing reported.
+    #[tokio::test]
+    async fn two_bindings_sharing_a_join_column_resolve_separately() {
+        let (state, _directory) = test_state();
+        declare_binding(&state);
+        declare_second_binding(&state);
+        let accounts_row = state
+            .surrogate_assigner
+            .assign(DB, TENANT, "accounts", b"acc-1")
+            .expect("bind accounts row");
+        let audit_row = state
+            .surrogate_assigner
+            .assign(DB, TENANT, "audit_totals", b"acc-1")
+            .expect("bind audit_totals row");
+        assert_ne!(
+            accounts_row, audit_row,
+            "the two targets must be different rows, or the test cannot fail"
+        );
+
+        let mut tasks = vec![insert_task("entries", body("acc-1"))];
+        resolve_materialized_sum_targets(&state, &mut tasks, TENANT, DB, TraceId::ZERO)
+            .await
+            .expect("resolution succeeds");
+
+        let resolved = resolved_of(&tasks[0]);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "one entry per binding, not one per join value: {resolved:?}"
+        );
+        assert_eq!(
+            nodedb_physical::physical_plan::resolved_sum_surrogate(resolved, "accounts", "acc-1"),
+            Some(accounts_row)
+        );
+        assert_eq!(
+            nodedb_physical::physical_plan::resolved_sum_surrogate(
+                resolved,
+                "audit_totals",
+                "acc-1"
+            ),
+            Some(audit_row)
         );
     }
 
@@ -657,7 +742,11 @@ mod tests {
                 ..
             }) => assert_eq!(
                 resolved_sum_targets,
-                &[("acc-1".to_string(), target_surrogate)]
+                &[ResolvedSumTarget::new(
+                    "accounts",
+                    "acc-1",
+                    target_surrogate
+                )]
             ),
             other => panic!("plan shape changed: {other:?}"),
         }

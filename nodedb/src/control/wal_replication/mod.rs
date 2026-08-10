@@ -20,7 +20,7 @@ pub use encode::to_replicated_entry;
 pub(crate) use propose::propose_replicated_entry;
 pub use types::{
     AsyncRaftProposer, ConstraintChangeOp, RaftAppliedIndexSink, RaftCompactor, RaftProposer,
-    ReplicatedEntry, ReplicatedWrite,
+    ReplicatedEntry, ReplicatedSumTarget, ReplicatedWrite,
 };
 
 pub use crate::control::distributed_applier::{

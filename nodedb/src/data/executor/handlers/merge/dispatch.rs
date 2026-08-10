@@ -58,7 +58,7 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// this merge's arms may touch, resolved on the Control Plane from the
     /// RESOLVE pass's classification. Empty on the RESOLVE pass itself, which
     /// writes nothing and therefore folds nothing.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
 }
 
 impl CoreLoop {

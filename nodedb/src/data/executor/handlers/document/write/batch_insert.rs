@@ -11,7 +11,7 @@ use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, W
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use nodedb_physical::physical_plan::ReturningSpec;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec};
 
 /// Parameters for [`CoreLoop::execute_document_batch_insert`].
 pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
@@ -27,7 +27,7 @@ pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this page may credit — one entry per DISTINCT join value across the
     /// batch. Resolved on the Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
     /// Materialized-sum TARGET collections whose delta the Control Plane
     /// settled at plan time and appended as its own `ApplyBalanceDelta` task,
     /// homed on the target's vShard. This page must not apply them as well.

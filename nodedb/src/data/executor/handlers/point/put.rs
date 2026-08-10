@@ -12,7 +12,7 @@ use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, W
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use nodedb_physical::physical_plan::ReturningSpec;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec};
 use nodedb_types::Surrogate;
 
 /// Dispatch-side arguments for [`CoreLoop::execute_point_put`].
@@ -29,7 +29,7 @@ pub(in crate::data::executor) struct PointPutExec<'a> {
     pub rls_filters: &'a [u8],
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this write may touch, resolved on the Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

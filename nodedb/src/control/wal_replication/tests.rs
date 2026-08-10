@@ -4,8 +4,8 @@ use super::*;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
-    ColumnarInsertIntent, ColumnarOp, CrdtOp, DocumentOp, GraphOp, SpatialOp, TextOp, TimeseriesOp,
-    VectorOp,
+    ColumnarInsertIntent, ColumnarOp, CrdtOp, DocumentOp, GraphOp, ResolvedSumTarget, SpatialOp,
+    TextOp, TimeseriesOp, VectorOp,
 };
 use nodedb_types::geometry::Geometry;
 use nodedb_types::sync::wire::SyncProvenance;
@@ -23,6 +23,7 @@ fn replicated_entry_roundtrip() {
             value: b"alice".to_vec(),
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
+            resolved_sum_target_bindings: Vec::new(),
         },
     );
     let original_key = entry.idempotency_key;
@@ -43,12 +44,14 @@ fn replicated_entry_roundtrip() {
             value,
             surrogate,
             resolved_sum_targets,
+            resolved_sum_target_bindings,
         } => {
             assert_eq!(collection, "users");
             assert_eq!(document_id, "u1");
             assert_eq!(value, b"alice");
             assert_eq!(surrogate, 1);
             assert!(resolved_sum_targets.is_empty());
+            assert!(resolved_sum_target_bindings.is_empty());
         }
         other => panic!("expected PointPut, got {other:?}"),
     }
@@ -115,12 +118,18 @@ fn all_write_variants_serialize() {
             value: vec![1, 2, 3],
             surrogate: 1,
             resolved_sum_targets: vec![("acc-1".into(), 4242)],
+            resolved_sum_target_bindings: vec![ReplicatedSumTarget {
+                target_collection: "accounts".into(),
+                join_value: "acc-1".into(),
+                surrogate: 4242,
+            }],
         },
         ReplicatedWrite::PointDelete {
             collection: "c".into(),
             document_id: "d".into(),
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
+            resolved_sum_target_bindings: Vec::new(),
         },
         ReplicatedWrite::VectorInsert {
             collection: "v".into(),
@@ -329,8 +338,12 @@ fn materialized_sum_resolution_roundtrips() {
         returning: None,
         rls_filters: Vec::new(),
         resolved_sum_targets: vec![
-            ("acc-1".to_string(), Surrogate::new(4242)),
-            ("acc-2".to_string(), Surrogate::new(4243)),
+            ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+            ResolvedSumTarget::new("accounts", "acc-2", Surrogate::new(4243)),
+            // A SECOND binding of the same source, reading the same join column
+            // into a different target. Keyed on the join value alone this entry
+            // could not travel at all — its value is already spoken for.
+            ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
         ],
         deferred_sum_targets: vec!["accounts_elsewhere".to_string()],
     });
@@ -349,11 +362,13 @@ fn materialized_sum_resolution_roundtrips() {
             assert_eq!(
                 resolved_sum_targets,
                 vec![
-                    ("acc-1".to_string(), Surrogate::new(4242)),
-                    ("acc-2".to_string(), Surrogate::new(4243)),
+                    ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                    ResolvedSumTarget::new("accounts", "acc-2", Surrogate::new(4243)),
+                    ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
                 ],
                 "a replica cannot resolve a join key itself — the table must arrive with \
-                 the write"
+                 the write, and each entry must arrive with the TARGET it was resolved \
+                 against"
             );
             assert_eq!(
                 deferred_sum_targets,
@@ -372,7 +387,11 @@ fn materialized_sum_resolution_roundtrips() {
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
         rls_write_check: Vec::new(),
-        resolved_sum_targets: vec![("acc-1".to_string(), Surrogate::new(4242))],
+        resolved_sum_targets: vec![ResolvedSumTarget::new(
+            "accounts",
+            "acc-1",
+            Surrogate::new(4242),
+        )],
     });
     let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &bulk)
         .expect("a single-shard bulk delete must replicate")
@@ -386,10 +405,126 @@ fn materialized_sum_resolution_roundtrips() {
             ..
         }) => assert_eq!(
             resolved_sum_targets,
-            vec![("acc-1".to_string(), Surrogate::new(4242))],
+            vec![ResolvedSumTarget::new(
+                "accounts",
+                "acc-1",
+                Surrogate::new(4242)
+            )],
             "a replica re-derives which rows matched, never which target they credit"
         ),
         other => panic!("expected BulkDelete, got {other:?}"),
+    }
+}
+
+/// A record committed BEFORE the target collection travelled on the wire still
+/// decodes, and its entries still resolve.
+///
+/// Every node replays its own committed Raft log across an upgrade, so refusing
+/// such a record would refuse to start. The superseded slot names no target, so
+/// its entries are lifted UNTARGETED and match any binding by join value alone —
+/// which is exactly what that record meant when the proposing node wrote it.
+#[test]
+fn a_record_without_target_collections_decodes_as_untargeted() {
+    let entry = ReplicatedEntry::new(
+        1,
+        0,
+        0,
+        ReplicatedWrite::PointDelete {
+            collection: "entries".into(),
+            document_id: "e1".into(),
+            surrogate: 900,
+            resolved_sum_targets: vec![("acc-1".into(), 4242)],
+            resolved_sum_target_bindings: Vec::new(),
+        },
+    );
+    let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded {
+        PhysicalPlan::Document(DocumentOp::PointDelete {
+            resolved_sum_targets,
+            ..
+        }) => {
+            assert_eq!(
+                resolved_sum_targets,
+                vec![ResolvedSumTarget::untargeted("acc-1", Surrogate::new(4242))],
+                "the older slot must still be read when the newer one is empty"
+            );
+            assert!(
+                resolved_sum_targets[0].addresses("accounts", "acc-1"),
+                "an untargeted entry answers for whichever binding asks"
+            );
+        }
+        other => panic!("expected PointDelete, got {other:?}"),
+    }
+}
+
+/// A record a current node writes carries the resolution in BOTH slots, and the
+/// newer one is what a current node reads.
+///
+/// The older slot stays populated so a peer running an older binary parses the
+/// record and behaves exactly as it does today, rather than seeing an empty
+/// resolution and dropping every balance. It is derived from the newer slot, so
+/// the two cannot disagree.
+#[test]
+fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
+    let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+        collection: "entries".into(),
+        document_id: "e1".into(),
+        surrogate: Surrogate::new(900),
+        pk_bytes: b"e1".to_vec(),
+        returning: None,
+        rls_filters: Vec::new(),
+        rls_write_check: Vec::new(),
+        resolved_sum_targets: vec![
+            ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+            ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+        ],
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("a point delete must replicate");
+    match &entry.write {
+        ReplicatedWrite::PointDelete {
+            resolved_sum_targets,
+            resolved_sum_target_bindings,
+            ..
+        } => {
+            assert_eq!(
+                resolved_sum_target_bindings.len(),
+                2,
+                "both bindings must travel; the newer slot is the authoritative one"
+            );
+            assert_eq!(
+                resolved_sum_targets,
+                &vec![("acc-1".to_string(), 4242)],
+                "the superseded slot keeps its one-entry-per-value shape, so an older \
+                 peer reads what it has always read"
+            );
+        }
+        other => panic!("expected PointDelete, got {other:?}"),
+    }
+
+    let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded {
+        PhysicalPlan::Document(DocumentOp::PointDelete {
+            resolved_sum_targets,
+            ..
+        }) => assert_eq!(
+            resolved_sum_targets,
+            vec![
+                ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+            ],
+            "the newer slot wins, so the second binding keeps its own target row"
+        ),
+        other => panic!("expected PointDelete, got {other:?}"),
     }
 }
 
@@ -1695,6 +1830,7 @@ fn pre_database_id_entry_decodes_to_default_database() {
             value: vec![9, 9, 9],
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
+            resolved_sum_target_bindings: Vec::new(),
         },
     };
     let bytes = zerompk::to_msgpack_vec(&legacy).expect("legacy entry encode failed");

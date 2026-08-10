@@ -32,7 +32,7 @@
 
 use redb::WriteTransaction;
 
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::ResolvedSumTarget;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -81,9 +81,11 @@ pub(in crate::data::executor) struct HookCtx<'a> {
     pub tid: u64,
     /// The SOURCE collection the row was written to.
     pub collection: &'a str,
-    /// Join-key VALUE → target row surrogate, resolved on the Control Plane at
-    /// plan time and carried on the plan. Never derived here.
-    pub resolved_targets: &'a [(String, Surrogate)],
+    /// `(target collection, join-key value)` → target row surrogate, resolved
+    /// on the Control Plane at plan time and carried on the plan. Never derived
+    /// here. See [`EnforcementCtx::resolved_targets`] for why the target
+    /// collection is half the key.
+    pub resolved_targets: &'a [ResolvedSumTarget],
     /// Materialized-sum TARGET collections whose delta the Control Plane
     /// deferred onto its own `ApplyBalanceDelta` task — see
     /// [`EnforcementCtx::deferred_sum_targets`]. Empty for every op whose plan

@@ -13,6 +13,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::write_hook::HookCtx;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
+use nodedb_physical::physical_plan::ResolvedSumTarget;
 use nodedb_types::Surrogate;
 
 use super::insert::InsertCtx;
@@ -38,7 +39,7 @@ pub(in crate::data::executor) struct UpsertParams<'a> {
     pub rls_filters: &'a [u8],
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this upsert may touch, resolved on the Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

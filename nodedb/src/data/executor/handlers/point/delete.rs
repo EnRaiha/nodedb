@@ -13,7 +13,7 @@ use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::{ReturningSpec, StorageMode};
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec, StorageMode};
 use nodedb_types::Surrogate;
 
 /// Borrowed arguments for [`CoreLoop::execute_point_delete`], grouped so the
@@ -33,7 +33,7 @@ pub(in crate::data::executor) struct PointDeleteExec<'a> {
     pub rls_write_check: &'a [u8],
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this delete must debit, resolved on the Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

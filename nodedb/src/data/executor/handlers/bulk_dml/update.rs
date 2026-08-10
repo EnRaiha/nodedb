@@ -13,7 +13,7 @@ use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec};
+use nodedb_physical::physical_plan::{OllpPredictedEdge, ResolvedSumTarget, ReturningSpec};
 
 use super::update_project::{ProjectUpdateRows, ProjectedUpdateRow};
 
@@ -42,7 +42,7 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     /// from its recon scan of the same predicate. Both sides of a join-key
     /// change are present, so a row moved between targets is debited and
     /// credited in the same pass.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

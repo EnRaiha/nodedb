@@ -30,14 +30,15 @@
 
 use std::sync::Arc;
 
-use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, UpdateValue};
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::{
+    DocumentOp, MaterializedSumBinding, ResolvedSumTarget, UpdateValue,
+};
 use nodedb_types::id::TxnId;
 
 use super::recon::recon_scan_rows;
 use super::resolve::{lookup_join_value, source_drives_bindings};
 use super::settle::{
-    SettleInput, Settlement, co_resident_join_values, omit_shipped, settle_cross_shard_images,
+    SettleInput, Settlement, co_resident_target_keys, omit_shipped, settle_cross_shard_images,
 };
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
@@ -128,7 +129,7 @@ pub(super) async fn resolve_predicate_sum_targets(
     omit_shipped(
         &mut resolved,
         &settlement.shipped,
-        &co_resident_join_values(&bindings, &input, database_id)?,
+        &co_resident_target_keys(&bindings, &input, database_id)?,
     );
     set_predicate_resolution(op, resolved);
     Ok(Some(settlement))
@@ -155,9 +156,10 @@ fn predicate_images(
 /// Resolve every join value the scanned rows need into its target row's
 /// surrogate.
 ///
-/// One entry per DISTINCT join value across every binding, mirroring the
+/// One entry per DISTINCT `(target collection, join value)` PAIR, mirroring the
 /// body-driven resolution: a predicate matching many rows against one target
-/// resolves that target once.
+/// resolves that target once, and two bindings that share a join column but
+/// name different targets each get their own entry.
 async fn resolve_scanned_rows(
     state: &SharedState,
     bindings: &Arc<Vec<MaterializedSumBinding>>,
@@ -166,11 +168,14 @@ async fn resolve_scanned_rows(
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<Vec<(String, Surrogate)>> {
-    let mut resolved: Vec<(String, Surrogate)> = Vec::new();
+) -> crate::Result<Vec<ResolvedSumTarget>> {
+    let mut resolved: Vec<ResolvedSumTarget> = Vec::new();
     for binding in bindings.iter() {
         for join_value in crate::query::binding_join_keys(binding, updates, rows)? {
-            if resolved.iter().any(|(value, _)| *value == join_value) {
+            if resolved
+                .iter()
+                .any(|entry| entry.addresses(&binding.target_collection, &join_value))
+            {
                 continue;
             }
             let surrogate = lookup_join_value(
@@ -182,7 +187,11 @@ async fn resolve_scanned_rows(
                 trace_id,
             )
             .await?;
-            resolved.push((join_value, surrogate));
+            resolved.push(ResolvedSumTarget::new(
+                &binding.target_collection,
+                join_value,
+                surrogate,
+            ));
         }
     }
     Ok(resolved)
@@ -254,7 +263,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
 
 /// Write the resolution into the op's slot. Exhaustive for the same reason
 /// [`predicate_scope`] is.
-fn set_predicate_resolution(op: &mut DocumentOp, resolved: Vec<(String, Surrogate)>) {
+fn set_predicate_resolution(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
     match op {
         DocumentOp::BulkUpdate {
             resolved_sum_targets,

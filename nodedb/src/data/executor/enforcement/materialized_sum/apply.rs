@@ -32,8 +32,9 @@
 //! * an INSERT-shaped write names the binding on the plan's deferral list, and
 //!   a named binding is skipped;
 //! * every other shape's balance is settled from row IMAGES, and the settlement
-//!   REMOVES the join value from the plan's resolution — so a cross-shard
-//!   target with no resolved surrogate is one somebody else is applying.
+//!   REMOVES that binding's `(target collection, join value)` pair from the
+//!   plan's resolution — so a cross-shard target with no resolved surrogate is
+//!   one somebody else is applying.
 //!
 //! Neither is re-derived: a second derivation of "did the Control Plane defer
 //! this?" is free to disagree with the first, and disagreement is a
@@ -173,7 +174,9 @@ impl CoreLoop {
                 // sibling task — `MERGE`, `UPDATE ... FROM`, `INSERT ... SELECT`
                 // and the staged-transaction expanders all dispatch their own
                 // concrete work — so it is still this transaction's to apply.
-                if !co_resident && resolved_target(ctx, &join_value).is_none() {
+                if !co_resident
+                    && resolved_target(ctx, &binding.target_collection, &join_value).is_none()
+                {
                     continue;
                 }
                 match self.apply_one_delta(txn, ctx, binding, &join_value, delta) {
@@ -225,13 +228,14 @@ impl CoreLoop {
         join_value: &str,
         delta: Decimal,
     ) -> crate::Result<TargetWrite> {
-        let surrogate = resolved_target(ctx, join_value).ok_or_else(|| {
-            crate::Error::MaterializedSumResolutionMissing {
-                target_collection: binding.target_collection.clone(),
-                join_column: binding.join_column.clone(),
-                join_value: join_value.to_string(),
-            }
-        })?;
+        let surrogate =
+            resolved_target(ctx, &binding.target_collection, join_value).ok_or_else(|| {
+                crate::Error::MaterializedSumResolutionMissing {
+                    target_collection: binding.target_collection.clone(),
+                    join_column: binding.join_column.clone(),
+                    join_value: join_value.to_string(),
+                }
+            })?;
         self.apply_balance_delta(
             txn,
             &BalanceRmw {
@@ -249,12 +253,23 @@ impl CoreLoop {
     }
 }
 
-/// The surrogate the Control Plane resolved this join value to.
-fn resolved_target(ctx: &EnforcementCtx<'_>, join_value: &str) -> Option<Surrogate> {
-    ctx.resolved_targets
-        .iter()
-        .find(|(value, _)| value.as_str() == join_value)
-        .map(|(_, surrogate)| *surrogate)
+/// The surrogate the Control Plane resolved THIS BINDING's join value to.
+///
+/// The binding's target collection is half the lookup key. One source may drive
+/// two bindings that read the same join column into different targets: keyed on
+/// the value alone, the second binding would find the first binding's entry and
+/// this pass would write its balance into a row of the wrong collection —
+/// silently, since a resolution IS present.
+fn resolved_target(
+    ctx: &EnforcementCtx<'_>,
+    target_collection: &str,
+    join_value: &str,
+) -> Option<Surrogate> {
+    nodedb_physical::physical_plan::resolved_sum_surrogate(
+        ctx.resolved_targets,
+        target_collection,
+        join_value,
+    )
 }
 
 /// Sum the deltas that address the same target, preserving first-seen order.
@@ -289,7 +304,7 @@ mod tests {
     use crate::data::executor::strict_format;
     use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
     use crate::types::TenantId;
-    use nodedb_physical::physical_plan::StorageMode;
+    use nodedb_physical::physical_plan::{ResolvedSumTarget, StorageMode};
     use nodedb_types::Value;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
 
@@ -375,7 +390,7 @@ mod tests {
                 database_id: DB,
                 tid: TID,
                 collection: SOURCE,
-                resolved_targets: &[(ACCOUNT.to_string(), TARGET_SURROGATE)],
+                resolved_targets: &[ResolvedSumTarget::new(TARGET, ACCOUNT, TARGET_SURROGATE)],
                 deferred_sum_targets: &[],
                 wal_lsn: None,
             },
@@ -534,7 +549,7 @@ mod tests {
                 database_id: DB,
                 tid: TID,
                 collection: SOURCE,
-                resolved_targets: &[(ACCOUNT.to_string(), TARGET_SURROGATE)],
+                resolved_targets: &[ResolvedSumTarget::new(TARGET, ACCOUNT, TARGET_SURROGATE)],
                 deferred_sum_targets: &[],
                 wal_lsn: None,
             },

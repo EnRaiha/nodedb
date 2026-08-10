@@ -26,7 +26,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::engine::document::store::IndexPath;
 use crate::types::{DatabaseId, Lsn, TenantId};
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::ResolvedSumTarget;
 
 /// Inputs to [`CoreLoop::persist_point_update`].
 pub(in crate::data::executor) struct PointUpdatePersist<'a> {
@@ -44,10 +44,11 @@ pub(in crate::data::executor) struct PointUpdatePersist<'a> {
     pub(in crate::data::executor) bitemporal: bool,
     pub(in crate::data::executor) sys_from_ms: i64,
     pub(in crate::data::executor) wal_lsn: Option<Lsn>,
-    /// Join-key VALUE → target row surrogate for every materialized-sum target
-    /// this update may touch — BOTH sides when the update moves a row between
-    /// targets by changing its join key. Resolved on the Control Plane.
-    pub(in crate::data::executor) resolved_sum_targets: &'a [(String, Surrogate)],
+    /// `(target collection, join-key value)` → target row surrogate for every
+    /// materialized-sum target this update may touch — BOTH sides when the
+    /// update moves a row between targets by changing its join key. Resolved on
+    /// the Control Plane.
+    pub(in crate::data::executor) resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

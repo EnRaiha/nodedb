@@ -21,8 +21,10 @@
 //!
 //! # Deferral is the ABSENCE of a resolution
 //!
-//! A settled binding's join values are removed from the source op's
-//! `resolved_sum_targets` before the plan leaves the Control Plane. The Data
+//! A settled binding's `(target collection, join value)` pairs are removed from
+//! the source op's `resolved_sum_targets` before the plan leaves the Control
+//! Plane — the pair, so a settled binding never strips the resolution of a
+//! sibling binding that happens to read the same join column. The Data
 //! Plane skips a delta whose binding is not co-resident AND whose join value it
 //! holds no resolution for, so the delta lands exactly once — on the
 //! [`ApplyBalanceDelta`](DocumentOp::ApplyBalanceDelta) task appended here,
@@ -58,7 +60,10 @@
 
 use rust_decimal::Decimal;
 
-use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, PhysicalPlan};
+use nodedb_physical::physical_plan::{
+    DocumentOp, MaterializedSumBinding, PhysicalPlan, ResolvedSumTarget, SumTargetKey,
+    resolved_sum_surrogate,
+};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::Surrogate;
 use nodedb_types::id::TxnId;
@@ -90,10 +95,14 @@ pub(super) struct SettleInput<'a> {
 pub(super) struct Settlement {
     /// Balance tasks to append to the plan.
     pub tasks: Vec<PhysicalTask>,
-    /// Join values whose delta now travels on one of those tasks. The caller
-    /// removes them from the source op's resolution — that removal is the whole
-    /// of the deferral signal.
-    pub shipped: Vec<String>,
+    /// `(target collection, join value)` pairs whose delta now travels on one
+    /// of those tasks. The caller removes them from the source op's resolution
+    /// — that removal is the whole of the deferral signal.
+    ///
+    /// Keyed on the PAIR, never on the value: two bindings of one source can
+    /// share a join column, and shipping one binding's value would otherwise
+    /// strip the other binding's resolution and silently drop its delta.
+    pub shipped: Vec<SumTargetKey>,
     /// Read-set entries covering the images the deltas were folded from.
     pub reads: Vec<ReadSetEntry>,
 }
@@ -126,7 +135,7 @@ impl Settlement {
 pub(super) fn settle_cross_shard_images(
     bindings: &[MaterializedSumBinding],
     input: &SettleInput<'_>,
-    resolved: &[(String, Surrogate)],
+    resolved: &[ResolvedSumTarget],
     txn_id: Option<TxnId>,
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -158,19 +167,20 @@ pub(super) fn settle_cross_shard_images(
             // join value is still recorded as shipped: the source core must not
             // apply it either, and applying nothing is what it does when the
             // resolution is absent.
-            if !settlement.shipped.contains(&join_value) {
-                settlement.shipped.push(join_value.clone());
+            let shipped_key = SumTargetKey::new(&binding.target_collection, &join_value);
+            if !settlement.shipped.contains(&shipped_key) {
+                settlement.shipped.push(shipped_key);
             }
             if delta == Decimal::ZERO {
                 continue;
             }
-            let surrogate = resolved_surrogate(resolved, &join_value).ok_or_else(|| {
-                crate::Error::MaterializedSumTargetNotFound {
-                    target_collection: binding.target_collection.clone(),
-                    join_column: binding.join_column.clone(),
-                    join_value: join_value.clone(),
-                }
-            })?;
+            let surrogate =
+                resolved_sum_surrogate(resolved, &binding.target_collection, &join_value)
+                    .ok_or_else(|| crate::Error::MaterializedSumTargetNotFound {
+                        target_collection: binding.target_collection.clone(),
+                        join_column: binding.join_column.clone(),
+                        join_value: join_value.clone(),
+                    })?;
             settlement.tasks.push(balance_task(BalanceTaskSpec {
                 txn_id,
                 database_id,
@@ -261,30 +271,36 @@ fn image_read_entry(
     }
 }
 
-/// Remove every shipped join value from a resolution, unless a CO-RESIDENT
-/// binding of the same source still needs it.
+/// Remove every shipped `(target collection, join value)` pair from a
+/// resolution, unless a CO-RESIDENT binding of the same source still needs the
+/// same pair.
 ///
 /// The removal is the deferral signal, so it has to be exact in both
-/// directions: a value left behind is applied twice, and a value removed that a
-/// co-resident binding still addresses is a delta dropped on the floor.
+/// directions: a pair left behind is applied twice, and a pair removed that a
+/// co-resident binding still addresses is a delta dropped on the floor. Matching
+/// on the join value alone would do both at once when a source drives two
+/// bindings that share a join column — the cross-shard one's shipment would
+/// strip the co-resident one's entry.
 pub(super) fn omit_shipped(
-    resolved: &mut Vec<(String, Surrogate)>,
-    shipped: &[String],
-    still_needed: &[String],
+    resolved: &mut Vec<ResolvedSumTarget>,
+    shipped: &[SumTargetKey],
+    still_needed: &[SumTargetKey],
 ) {
-    resolved.retain(|(join_value, _)| {
-        !shipped.contains(join_value) || still_needed.contains(join_value)
+    resolved.retain(|entry| {
+        !shipped.iter().any(|key| entry.matches_key(key))
+            || still_needed.iter().any(|key| entry.matches_key(key))
     });
 }
 
-/// The join values the CO-RESIDENT bindings of `bindings` still address for
-/// `images` — the resolution entries [`omit_shipped`] must keep.
-pub(super) fn co_resident_join_values(
+/// The `(target collection, join value)` pairs the CO-RESIDENT bindings of
+/// `bindings` still address for `images` — the resolution entries
+/// [`omit_shipped`] must keep.
+pub(super) fn co_resident_target_keys(
     bindings: &[MaterializedSumBinding],
     input: &SettleInput<'_>,
     database_id: DatabaseId,
-) -> crate::Result<Vec<String>> {
-    let mut keep: Vec<String> = Vec::new();
+) -> crate::Result<Vec<SumTargetKey>> {
+    let mut keep: Vec<SumTargetKey> = Vec::new();
     for binding in bindings {
         if !sum_target_is_co_resident(
             database_id,
@@ -295,21 +311,14 @@ pub(super) fn co_resident_join_values(
         }
         for (old, new) in input.images {
             for entry in crate::query::binding_image_deltas(binding, old.as_ref(), new.as_ref())? {
-                if !keep.contains(&entry.join_value) {
-                    keep.push(entry.join_value);
+                let key = SumTargetKey::new(&binding.target_collection, entry.join_value);
+                if !keep.contains(&key) {
+                    keep.push(key);
                 }
             }
         }
     }
     Ok(keep)
-}
-
-/// The surrogate the resolve pass bound this join value to.
-fn resolved_surrogate(resolved: &[(String, Surrogate)], join_value: &str) -> Option<Surrogate> {
-    resolved
-        .iter()
-        .find(|(value, _)| value.as_str() == join_value)
-        .map(|(_, surrogate)| *surrogate)
 }
 
 #[cfg(test)]
@@ -346,6 +355,17 @@ mod tests {
         serde_json::json!({"account_id": account, "amount": amount})
     }
 
+    /// The resolution the resolve pass produces for `target`: every entry names
+    /// the target collection it was resolved against.
+    fn resolution(target: &str, entries: &[(&str, u32)]) -> Vec<ResolvedSumTarget> {
+        entries
+            .iter()
+            .map(|(join_value, surrogate)| {
+                ResolvedSumTarget::new(target, *join_value, Surrogate::new(*surrogate))
+            })
+            .collect()
+    }
+
     fn delta_of(task: &PhysicalTask) -> (String, String) {
         match &task.plan {
             PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
@@ -371,7 +391,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&target, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
@@ -385,7 +405,10 @@ mod tests {
             sum_target_vshard(DB, &target),
             "the balance must be homed where the TARGET's rows live"
         );
-        assert_eq!(settlement.shipped, vec!["acc-1".to_string()]);
+        assert_eq!(
+            settlement.shipped,
+            vec![SumTargetKey::new(&target, "acc-1")]
+        );
     }
 
     /// The join-key MOVE ships TWO tasks: the abandoned target loses the old
@@ -403,10 +426,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[
-                ("acc-1".to_string(), Surrogate::new(500)),
-                ("acc-2".to_string(), Surrogate::new(501)),
-            ],
+            &resolution(&target, &[("acc-1", 500), ("acc-2", 501)]),
             None,
             TENANT,
             DB,
@@ -424,7 +444,10 @@ mod tests {
         );
         assert_eq!(
             settlement.shipped,
-            vec!["acc-1".to_string(), "acc-2".to_string()],
+            vec![
+                SumTargetKey::new(&target, "acc-1"),
+                SumTargetKey::new(&target, "acc-2")
+            ],
             "BOTH sides must be deferred; a side left resolved is applied twice"
         );
     }
@@ -443,7 +466,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&target, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
@@ -467,14 +490,17 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&target, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
         )
         .expect("settle");
         assert!(settlement.tasks.is_empty());
-        assert_eq!(settlement.shipped, vec!["acc-1".to_string()]);
+        assert_eq!(
+            settlement.shipped,
+            vec![SumTargetKey::new(&target, "acc-1")]
+        );
     }
 
     /// A CO-RESIDENT binding is left entirely alone: nothing shipped, nothing
@@ -494,7 +520,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&source)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&source, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
@@ -521,7 +547,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&target, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
@@ -554,7 +580,7 @@ mod tests {
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
             &input,
-            &[("acc-1".to_string(), Surrogate::new(500))],
+            &resolution(&target, &[("acc-1", 500)]),
             None,
             TENANT,
             DB,
@@ -563,20 +589,48 @@ mod tests {
         assert_eq!(settlement.reads[0].key, ReadKey::Predicate);
     }
 
-    /// A join value a shipped task addresses is removed from the resolution —
-    /// that removal IS the instruction that stops the source core applying it —
-    /// unless a co-resident binding still needs the same value resolved.
+    /// A pair a shipped task addresses is removed from the resolution — that
+    /// removal IS the instruction that stops the source core applying it —
+    /// unless a co-resident binding still needs the same pair resolved.
     #[test]
     fn shipping_removes_the_resolution_but_keeps_what_is_still_needed() {
+        let mut resolved = resolution("accounts", &[("acc-1", 500), ("acc-2", 501)]);
+        omit_shipped(
+            &mut resolved,
+            &[
+                SumTargetKey::new("accounts", "acc-1"),
+                SumTargetKey::new("accounts", "acc-2"),
+            ],
+            &[SumTargetKey::new("accounts", "acc-2")],
+        );
+        assert_eq!(resolved, resolution("accounts", &[("acc-2", 501)]));
+    }
+
+    /// Shipping a CROSS-SHARD binding's join value must not strip the
+    /// resolution of a SIBLING binding that reads the same join column into a
+    /// different target.
+    ///
+    /// Keyed on the join value alone, the shipment below would remove both
+    /// entries and the co-resident target's delta would be dropped: no error,
+    /// a total silently short by the row's whole value.
+    #[test]
+    fn shipping_one_target_leaves_a_sibling_targets_resolution_intact() {
         let mut resolved = vec![
-            ("acc-1".to_string(), Surrogate::new(500)),
-            ("acc-2".to_string(), Surrogate::new(501)),
+            ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(500)),
+            ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(900)),
         ];
         omit_shipped(
             &mut resolved,
-            &["acc-1".to_string(), "acc-2".to_string()],
-            &["acc-2".to_string()],
+            &[SumTargetKey::new("accounts", "acc-1")],
+            &[SumTargetKey::new("audit_totals", "acc-1")],
         );
-        assert_eq!(resolved, vec![("acc-2".to_string(), Surrogate::new(501))]);
+        assert_eq!(
+            resolved,
+            vec![ResolvedSumTarget::new(
+                "audit_totals",
+                "acc-1",
+                Surrogate::new(900)
+            )]
+        );
     }
 }

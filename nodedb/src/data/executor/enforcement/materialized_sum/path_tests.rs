@@ -10,7 +10,7 @@
 //! that silently disagrees with the `SUM(...)` over the source rows. These tests
 //! assert the total actually moved, per path.
 
-use nodedb_physical::physical_plan::{MaterializedSumBinding, UpdateValue};
+use nodedb_physical::physical_plan::{MaterializedSumBinding, ResolvedSumTarget, UpdateValue};
 use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{ErrorCode, Status};
@@ -158,6 +158,15 @@ fn balance_in(core: &CoreLoop, collection: &str, surrogate: Surrogate) -> String
         .to_string()
 }
 
+/// The resolution the Control Plane produces for the local binding: every entry
+/// names `TARGET`, the collection it was resolved against.
+fn resolved_onto_target(entries: &[(&str, Surrogate)]) -> Vec<ResolvedSumTarget> {
+    entries
+        .iter()
+        .map(|(join_value, surrogate)| ResolvedSumTarget::new(TARGET, *join_value, *surrogate))
+        .collect()
+}
+
 fn literal(value: serde_json::Value) -> UpdateValue {
     UpdateValue::Literal(nodedb_types::json_to_msgpack(&value).expect("encode literal"))
 }
@@ -175,7 +184,7 @@ fn bulk_update_moves_the_total_by_the_difference() {
     seed_source(&mut core, Surrogate(2), ACCOUNT_A, 20);
 
     let updates = vec![("amount".to_string(), literal(serde_json::json!(50)))];
-    let resolved = vec![(ACCOUNT_A.to_string(), SURROGATE_A)];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
     let task = make_default_task();
     let response = core.execute_bulk_update(
         &task,
@@ -207,7 +216,7 @@ fn bulk_delete_subtracts_every_removed_rows_contribution() {
     seed_source(&mut core, Surrogate(1), ACCOUNT_A, 30);
     seed_source(&mut core, Surrogate(2), ACCOUNT_A, 20);
 
-    let resolved = vec![(ACCOUNT_A.to_string(), SURROGATE_A)];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
     let task = make_default_task();
     let response = core.execute_bulk_delete(
         &task,
@@ -243,10 +252,7 @@ fn truncate_zeroes_every_target_balance() {
     seed_source(&mut core, Surrogate(1), ACCOUNT_A, 30);
     seed_source(&mut core, Surrogate(2), ACCOUNT_B, 50);
 
-    let resolved = vec![
-        (ACCOUNT_A.to_string(), SURROGATE_A),
-        (ACCOUNT_B.to_string(), SURROGATE_B),
-    ];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A), (ACCOUNT_B, SURROGATE_B)]);
     let task = make_default_task();
     let response = core.execute_truncate(&task, TID, SOURCE, &resolved);
 
@@ -285,7 +291,7 @@ fn update_from_join_moves_the_total_by_the_difference() {
     )];
 
     let updates = vec![("amount".to_string(), literal(serde_json::json!(80)))];
-    let resolved = vec![(ACCOUNT_A.to_string(), SURROGATE_A)];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
     let task = make_default_task();
     let response = core.execute_update_from_join(
         &task,
@@ -338,7 +344,7 @@ fn insert_select_page_credits_its_targets() {
         ),
     ];
     let surrogates = vec![Surrogate(1), Surrogate(2)];
-    let resolved = vec![(ACCOUNT_A.to_string(), SURROGATE_A)];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
     let task = make_default_task();
     let response = core.execute_document_batch_insert(
         &task,
@@ -386,7 +392,7 @@ fn an_uncovered_join_value_retries_instead_of_writing_a_wrong_total() {
     // Control Plane scanned.
     seed_source(&mut core, Surrogate(2), ACCOUNT_B, 20);
 
-    let resolved = vec![(ACCOUNT_A.to_string(), SURROGATE_A)];
+    let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
     let task = make_default_task();
     let response = core.execute_bulk_delete(
         &task,
@@ -516,11 +522,11 @@ fn an_over_resolved_plan_is_not_a_divergence() {
     seed_target(&mut core, SURROGATE_B, ACCOUNT_B, "50");
     seed_source(&mut core, Surrogate(1), ACCOUNT_A, 30);
 
-    let resolved = vec![
-        (ACCOUNT_A.to_string(), SURROGATE_A),
+    let resolved = resolved_onto_target(&[
+        (ACCOUNT_A, SURROGATE_A),
         // Resolved, then the row that needed it was removed by someone else.
-        (ACCOUNT_B.to_string(), SURROGATE_B),
-    ];
+        (ACCOUNT_B, SURROGATE_B),
+    ]);
     let task = make_default_task();
     let response = core.execute_bulk_delete(
         &task,
@@ -572,10 +578,10 @@ fn a_merge_update_arm_that_moves_the_join_key_touches_both_targets() {
             database_id: DB,
             tid: TID,
             collection: SOURCE,
-            resolved_targets: &[
-                (ACCOUNT_A.to_string(), SURROGATE_A),
-                (ACCOUNT_B.to_string(), SURROGATE_B),
-            ],
+            resolved_targets: &resolved_onto_target(&[
+                (ACCOUNT_A, SURROGATE_A),
+                (ACCOUNT_B, SURROGATE_B),
+            ]),
             deferred_sum_targets: &[],
             wal_lsn: None,
         },
@@ -596,5 +602,212 @@ fn a_merge_update_arm_that_moves_the_join_key_touches_both_targets() {
         balance_of(&core, SURROGATE_B),
         "90",
         "the target the row joined gains its new value"
+    );
+}
+
+/// The surrogate of the SECOND target's row for `ACCOUNT_A`.
+///
+/// Deliberately not `SURROGATE_A`: the two bindings read the same join VALUE, so
+/// the only thing that can tell their target rows apart is the collection each
+/// was resolved against. Giving both targets the same surrogate would let a
+/// resolution that lost the collection still land on the right row and hide the
+/// defect this fixture exists to catch.
+const SECOND_TARGET_SURROGATE: Surrogate = Surrogate(7777);
+
+/// Letters the second target's generated suffix is drawn from.
+///
+/// LETTERS, not digits, and that is the whole point — see
+/// [`co_resident_second_target`].
+const SECOND_TARGET_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// Name prefix the second target is generated under.
+const SECOND_TARGET_PREFIX: &str = "local_audit_totals_";
+
+/// A SECOND target collection that shares `SOURCE`'s vShard.
+///
+/// Solved for rather than named, for the same reason
+/// [`the_local_fixture_is_co_resident`] asserts rather than assumes: every test
+/// in this file drives the INLINE fold and reads the target row back out of the
+/// SOURCE core's own store, which only observes the write when one core owns
+/// both rows.
+///
+/// # Why the suffix is letters and not a counter
+///
+/// vShard homing is a base-31 polynomial over the name's bytes reduced modulo
+/// the vShard count, which is a power of two — so only the polynomial's low bits
+/// survive. A fixed prefix with a short DECIMAL suffix varies just ten
+/// contiguous byte values per position, which leaves that residue space only
+/// partly covered, and WHICH part depends entirely on the prefix. Counting is
+/// therefore not a widening: this prefix with a four-digit counter reaches
+/// roughly seven tenths of the vShards and `SOURCE`'s own is not among them, so
+/// a counter-based search finds nothing however far it counts.
+///
+/// A 26-letter alphabet over suffixes of length one to three reaches EVERY
+/// vShard, with no fewer than thirteen names landing on each. So the search
+/// terminates for any source collection, not just this one, and keeps a wide
+/// margin if the hash is ever changed.
+fn co_resident_second_target() -> String {
+    let alphabet = SECOND_TARGET_ALPHABET.len();
+    for width in 1..=3u32 {
+        for code in 0..alphabet.pow(width) {
+            let mut suffix = String::with_capacity(width as usize);
+            let mut rest = code;
+            for _ in 0..width {
+                suffix.push(char::from(SECOND_TARGET_ALPHABET[rest % alphabet]));
+                rest /= alphabet;
+            }
+            let candidate = format!("{SECOND_TARGET_PREFIX}{suffix}");
+            // A name already registered by this fixture would collapse the two
+            // bindings into one collection and prove nothing.
+            if [SOURCE, TARGET, JOIN_SOURCE].contains(&candidate.as_str()) {
+                continue;
+            }
+            if crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, &candidate) {
+                return candidate;
+            }
+        }
+    }
+    panic!(
+        "no '{SECOND_TARGET_PREFIX}*' name of up to three letters shares '{SOURCE}'s vShard. \
+         That alphabet reaches every vShard under the current homing hash, so the hash has \
+         changed and this fixture can no longer build the two-co-resident-target \
+         configuration it exists to pin"
+    )
+}
+
+/// Register `SOURCE` driving TWO bindings that read the SAME join column into
+/// DIFFERENT target collections, plus both targets.
+fn register_two_binding_source(core: &mut CoreLoop, second_target: &str) {
+    let mut source = CollectionConfig::new(SOURCE);
+    source.enforcement.materialized_sum_sources =
+        vec![binding_onto(TARGET), binding_onto(second_target)];
+    core.doc_configs.insert(config_key(SOURCE), source);
+    core.doc_configs
+        .insert(config_key(TARGET), CollectionConfig::new(TARGET));
+    core.doc_configs.insert(
+        config_key(second_target),
+        CollectionConfig::new(second_target),
+    );
+}
+
+/// Fold one write's images through the enforcement funnel and commit.
+fn fold_images(core: &mut CoreLoop, resolved: &[ResolvedSumTarget], images: RowImages<'_>) {
+    let txn = core.sparse.begin_write().expect("begin write");
+    run_write_enforcement(
+        core,
+        &txn,
+        EnforcementCtx {
+            database_id: DB,
+            tid: TID,
+            collection: SOURCE,
+            resolved_targets: resolved,
+            deferred_sum_targets: &[],
+            wal_lsn: None,
+        },
+        images,
+    )
+    .expect("both bindings must fold");
+    txn.commit().expect("commit");
+}
+
+/// Two materialized sums on ONE source, reading the SAME join column into
+/// DIFFERENT target collections, each keep their own correct total — across an
+/// insert, an update and a delete.
+///
+/// This is the configuration a value-keyed resolution cannot express. Resolving
+/// by join value alone, the first binding claims `"a1"` and the second is
+/// skipped as a duplicate; the fold then looks `"a1"` up, gets the FIRST
+/// binding's target row surrogate, and applies the SECOND binding's delta to a
+/// row of that surrogate inside the second target collection — a row nothing
+/// else writes or reads. No error is raised on either plane. The first target
+/// ends up correct by luck, the second permanently frozen at its seed value, and
+/// a phantom row accumulates the deltas that should have landed on it.
+///
+/// The two target rows deliberately carry DIFFERENT surrogates and DIFFERENT
+/// seed balances, so neither a lost collection nor a swapped row can pass.
+#[test]
+fn two_bindings_sharing_a_join_column_each_receive_their_own_total() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+    let second_target = co_resident_second_target();
+    // Premise one: the two bindings really do point at two DIFFERENT
+    // collections. A fixture that collapsed them would pass without ever
+    // building the configuration under test.
+    assert_ne!(
+        second_target.as_str(),
+        TARGET,
+        "the two bindings must name different target collections"
+    );
+    // Premise two: BOTH targets are co-resident with the source, so both inline
+    // folds land in this core's own store and are observable here. Asserted,
+    // never assumed — a cross-shard target would silently exercise the DEFERRED
+    // path instead and leave the collision this test exists for uncovered.
+    for target in [TARGET, second_target.as_str()] {
+        assert!(
+            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, target),
+            "'{target}' must share '{SOURCE}'s vShard for its inline fold to be observable"
+        );
+    }
+
+    register_two_binding_source(&mut core, &second_target);
+    seed_target_in(&mut core, TARGET, SURROGATE_A, ACCOUNT_A, "100");
+    seed_target_in(
+        &mut core,
+        &second_target,
+        SECOND_TARGET_SURROGATE,
+        ACCOUNT_A,
+        "500",
+    );
+
+    // One join value, TWO resolutions — one per binding. Keyed on the value
+    // alone only the first of these could exist.
+    let resolved = vec![
+        ResolvedSumTarget::new(TARGET, ACCOUNT_A, SURROGATE_A),
+        ResolvedSumTarget::new(&second_target, ACCOUNT_A, SECOND_TARGET_SURROGATE),
+    ];
+
+    let inserted = serde_json::json!({"account_id": ACCOUNT_A, "amount": 30});
+    fold_images(
+        &mut core,
+        &resolved,
+        RowImages::Insert { new_doc: &inserted },
+    );
+    assert_eq!(balance_in(&core, TARGET, SURROGATE_A), "130");
+    assert_eq!(
+        balance_in(&core, &second_target, SECOND_TARGET_SURROGATE),
+        "530",
+        "the second binding must credit its OWN target row, not the first binding's"
+    );
+
+    let updated = serde_json::json!({"account_id": ACCOUNT_A, "amount": 50});
+    fold_images(
+        &mut core,
+        &resolved,
+        RowImages::Update {
+            old_doc: &inserted,
+            new_doc: &updated,
+        },
+    );
+    assert_eq!(balance_in(&core, TARGET, SURROGATE_A), "150");
+    assert_eq!(
+        balance_in(&core, &second_target, SECOND_TARGET_SURROGATE),
+        "550",
+        "an update moves each target by the difference, on its own row"
+    );
+
+    fold_images(
+        &mut core,
+        &resolved,
+        RowImages::Delete { old_doc: &updated },
+    );
+    assert_eq!(
+        balance_in(&core, TARGET, SURROGATE_A),
+        "100",
+        "the first target returns to its seed"
+    );
+    assert_eq!(
+        balance_in(&core, &second_target, SECOND_TARGET_SURROGATE),
+        "500",
+        "so does the second — a delete debits the row the credit landed on"
     );
 }

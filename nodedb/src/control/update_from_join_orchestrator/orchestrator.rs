@@ -30,7 +30,7 @@
 //! and commit atomically with sibling ops, indexing into every cross-engine
 //! index.
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
@@ -39,7 +39,7 @@ use crate::control::planner::materialized_sum::{
 };
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::expand_staged_update_from_join::decode_resolved_update_rows;
-use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, ReturningSpec, UpdateValue};
 
 /// Attempts an `UPDATE ... FROM` makes before a materialized-sum resolution that
 /// keeps drifting is reported rather than retried forever. Mirrors the MERGE
@@ -257,7 +257,7 @@ async fn resolve_matched_sum_targets(
     state: &SharedState,
     args: &UpdateFromJoinArgs<'_>,
     source_rows: Vec<(String, Vec<u8>)>,
-) -> crate::Result<Option<Vec<(String, Surrogate)>>> {
+) -> crate::Result<Option<Vec<ResolvedSumTarget>>> {
     let resolve_plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection: args.target_collection.to_string(),
         source_collection: args.source_collection.to_string(),

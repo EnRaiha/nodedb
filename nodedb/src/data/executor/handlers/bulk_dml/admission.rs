@@ -18,13 +18,11 @@
 //! statement shape — and because a fourth prediction should have one place to be
 //! added.
 
-use nodedb_types::Surrogate;
-
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
-use nodedb_physical::physical_plan::{OllpPredictedEdge, UpdateValue};
+use nodedb_physical::physical_plan::{OllpPredictedEdge, ResolvedSumTarget, UpdateValue};
 
 /// The predictions one bulk statement carries.
 pub(in crate::data::executor) struct BulkAdmission<'a> {
@@ -35,7 +33,7 @@ pub(in crate::data::executor) struct BulkAdmission<'a> {
     /// materialized-sum join column is verified against the target it moves rows
     /// ONTO as well. Empty for a delete.
     pub updates: &'a [(String, UpdateValue)],
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

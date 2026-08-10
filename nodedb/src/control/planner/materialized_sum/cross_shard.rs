@@ -40,9 +40,10 @@
 
 use rust_decimal::Decimal;
 
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{
+    DocumentOp, PhysicalPlan, ResolvedSumTarget, resolved_sum_surrogate,
+};
 use nodedb_physical::physical_task::PhysicalTask;
-use nodedb_types::Surrogate;
 
 use crate::control::state::SharedState;
 use crate::query::sum_target_is_co_resident;
@@ -110,13 +111,13 @@ pub fn append_cross_shard_balance_tasks(
                 if delta == Decimal::ZERO {
                     continue;
                 }
-                let surrogate = resolved_surrogate(resolved, &join_value).ok_or_else(|| {
-                    crate::Error::MaterializedSumTargetNotFound {
-                        target_collection: binding.target_collection.clone(),
-                        join_column: binding.join_column.clone(),
-                        join_value: join_value.clone(),
-                    }
-                })?;
+                let surrogate =
+                    resolved_sum_surrogate(resolved, &binding.target_collection, &join_value)
+                        .ok_or_else(|| crate::Error::MaterializedSumTargetNotFound {
+                            target_collection: binding.target_collection.clone(),
+                            join_column: binding.join_column.clone(),
+                            join_value: join_value.clone(),
+                        })?;
                 for_task.push(AppendedDelta {
                     binding_target: binding.target_collection.clone(),
                     task: super::settle::balance_task(super::settle::BalanceTaskSpec {
@@ -155,7 +156,7 @@ pub fn append_cross_shard_balance_tasks(
 struct SettleableInsert<'a> {
     collection: &'a str,
     docs: Vec<serde_json::Value>,
-    resolved: &'a [(String, Surrogate)],
+    resolved: &'a [ResolvedSumTarget],
 }
 
 /// The settleable shape of `op`, or `None` for every other op.
@@ -278,14 +279,6 @@ fn decode_bodies<B: AsRef<[u8]>>(bodies: &[B]) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|body| nodedb_types::json_from_msgpack(body.as_ref()).ok())
         .collect()
-}
-
-/// The surrogate the resolve pass bound this join value to.
-fn resolved_surrogate(resolved: &[(String, Surrogate)], join_value: &str) -> Option<Surrogate> {
-    resolved
-        .iter()
-        .find(|(value, _)| value.as_str() == join_value)
-        .map(|(_, surrogate)| *surrogate)
 }
 
 /// Strip the `"<db_id>/"` prefix a planned collection name carries, yielding the

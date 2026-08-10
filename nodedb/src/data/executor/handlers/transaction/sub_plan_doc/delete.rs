@@ -20,7 +20,7 @@ pub(in crate::data::executor::handlers::transaction) struct TxPointDelete<'a> {
     pub user_roles: &'a [String],
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this delete must debit, resolved on the Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, nodedb_types::Surrogate)],
+    pub resolved_sum_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
 }
 
 impl CoreLoop {

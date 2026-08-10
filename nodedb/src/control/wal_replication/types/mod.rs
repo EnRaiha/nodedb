@@ -25,4 +25,4 @@ mod wire_shapes;
 pub use aliases::{AsyncRaftProposer, RaftAppliedIndexSink, RaftCompactor, RaftProposer};
 pub use replicated_entry::ReplicatedEntry;
 pub use replicated_write::ReplicatedWrite;
-pub use wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge};
+pub use wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget};

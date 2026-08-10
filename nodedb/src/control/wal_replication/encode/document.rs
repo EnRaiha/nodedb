@@ -12,19 +12,53 @@
 //! `ReplicatedWrite::PointPut::resolved_sum_targets` for why no applying node
 //! can answer either question locally.
 
-use super::super::types::ReplicatedWrite;
-use nodedb_physical::physical_plan::UpdateValue;
+use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
+use nodedb_physical::physical_plan::{ResolvedSumTarget, UpdateValue};
 use nodedb_types::Surrogate;
 
-/// Flatten a plan's resolution into its wire shape.
+/// Flatten a plan's resolution into the AUTHORITATIVE wire shape.
 ///
 /// `Surrogate` is a newtype over `u32` and every other identity on this wire
 /// travels as the bare `u32`, so the resolution does too.
-fn wire_targets(resolved: &[(String, Surrogate)]) -> Vec<(String, u32)> {
+///
+/// An entry that names no target collection cannot arise here: only the decoder
+/// mints those, when it lifts a record written before this slot existed. Such an
+/// entry is dropped rather than encoded with an invented collection name — a
+/// re-proposal that guessed the target would replicate a resolution nobody made.
+fn wire_target_bindings(resolved: &[ResolvedSumTarget]) -> Vec<ReplicatedSumTarget> {
     resolved
         .iter()
-        .map(|(join_value, surrogate)| (join_value.clone(), surrogate.as_u32()))
+        .filter_map(|entry| {
+            entry
+                .target_collection
+                .as_ref()
+                .map(|target_collection| ReplicatedSumTarget {
+                    target_collection: target_collection.clone(),
+                    join_value: entry.join_value.clone(),
+                    surrogate: entry.surrogate.as_u32(),
+                })
+        })
         .collect()
+}
+
+/// The same resolution in the SUPERSEDED `(join_value, surrogate)` shape, kept
+/// populated so a peer running an older binary reads the record and behaves
+/// exactly as it does today — see
+/// `ReplicatedWrite::PointPut::resolved_sum_targets`.
+///
+/// Derived from the authoritative slot rather than carried separately, so the
+/// two can never disagree. One entry per join value, first binding wins: that is
+/// precisely what the old resolver produced, and it is all the old shape can
+/// express.
+fn wire_targets(resolved: &[ResolvedSumTarget]) -> Vec<(String, u32)> {
+    let mut legacy: Vec<(String, u32)> = Vec::with_capacity(resolved.len());
+    for entry in resolved {
+        if legacy.iter().any(|(value, _)| *value == entry.join_value) {
+            continue;
+        }
+        legacy.push((entry.join_value.clone(), entry.surrogate.as_u32()));
+    }
+    legacy
 }
 
 pub(super) fn point_put(
@@ -32,7 +66,7 @@ pub(super) fn point_put(
     document_id: &str,
     value: &[u8],
     surrogate: u32,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointPut {
         collection: collection.to_owned(),
@@ -40,6 +74,7 @@ pub(super) fn point_put(
         value: value.to_vec(),
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -49,7 +84,7 @@ pub(super) fn point_insert(
     value: &[u8],
     if_absent: bool,
     surrogate: u32,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
     deferred_sum_targets: &[String],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointInsert {
@@ -59,6 +94,7 @@ pub(super) fn point_insert(
         if_absent,
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
     }
 }
@@ -67,13 +103,14 @@ pub(super) fn point_delete(
     collection: &str,
     document_id: &str,
     surrogate: u32,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointDelete {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -82,7 +119,7 @@ pub(super) fn point_update(
     document_id: &str,
     updates: &[(String, UpdateValue)],
     surrogate: u32,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointUpdate {
         collection: collection.to_owned(),
@@ -90,6 +127,7 @@ pub(super) fn point_update(
         updates: updates.to_vec(),
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -99,7 +137,7 @@ pub(super) fn upsert(
     value: &[u8],
     on_conflict_updates: &[(String, UpdateValue)],
     surrogate: u32,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::DocUpsert {
         collection: collection.to_owned(),
@@ -108,6 +146,7 @@ pub(super) fn upsert(
         on_conflict_updates: on_conflict_updates.to_vec(),
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -115,7 +154,7 @@ pub(super) fn batch_insert(
     collection: &str,
     documents: &[(String, Vec<u8>)],
     surrogates: &[Surrogate],
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
     deferred_sum_targets: &[String],
 ) -> ReplicatedWrite {
     ReplicatedWrite::DocBatchInsert {
@@ -123,6 +162,7 @@ pub(super) fn batch_insert(
         documents: documents.to_vec(),
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
     }
 }
@@ -135,12 +175,13 @@ pub(super) fn batch_insert(
 pub(super) fn truncate(
     collection: &str,
     restart_identity: bool,
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::DocTruncate {
         collection: collection.to_owned(),
         restart_identity,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -154,7 +195,7 @@ pub(super) fn truncate(
 pub(super) fn bulk_delete(
     collection: &str,
     filters: &[u8],
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::BulkDml {
         collection: collection.to_owned(),
@@ -162,6 +203,7 @@ pub(super) fn bulk_delete(
         is_update: false,
         updates: Vec::new(),
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 
@@ -169,7 +211,7 @@ pub(super) fn bulk_update(
     collection: &str,
     filters: &[u8],
     updates: &[(String, UpdateValue)],
-    resolved_sum_targets: &[(String, Surrogate)],
+    resolved_sum_targets: &[ResolvedSumTarget],
 ) -> ReplicatedWrite {
     ReplicatedWrite::BulkDml {
         collection: collection.to_owned(),
@@ -177,6 +219,7 @@ pub(super) fn bulk_update(
         is_update: true,
         updates: updates.to_vec(),
         resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
     }
 }
 

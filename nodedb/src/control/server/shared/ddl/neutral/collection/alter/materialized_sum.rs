@@ -283,6 +283,22 @@ mod tests {
         assert!(validate_binding_depth(&existing, "accounts", "adjustments").is_ok());
     }
 
+    /// One source driving TWO bindings that read the SAME join column into
+    /// DIFFERENT targets is legal, and must stay legal.
+    ///
+    /// It is still depth 1 — neither target feeds anything and the source is fed
+    /// by nothing — so the chain rule has nothing to say about it. Nothing else
+    /// needs to: the resolution a write carries is keyed on the
+    /// `(target collection, join value)` PAIR, so each binding resolves, defers
+    /// and folds against its own target row independently. There is nothing left
+    /// for a DDL-time guard to protect, and refusing the shape here would reject
+    /// a schema the engine now maintains correctly.
+    #[test]
+    fn a_second_binding_on_the_same_source_and_join_column_is_accepted() {
+        let existing = vec![binding("entries", "accounts")];
+        assert!(validate_binding_depth(&existing, "audit_totals", "entries").is_ok());
+    }
+
     #[test]
     fn extending_an_existing_target_into_a_source_is_rejected() {
         // entries -> accounts already exists; accounts -> ledger would chain.

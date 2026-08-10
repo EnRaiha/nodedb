@@ -6,7 +6,7 @@
 
 use nodedb_types::Surrogate;
 
-use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec, UpdateValue};
 
 /// One target row matched by the join, with its post-image resolved but not yet
 /// written. Produced by [`crate::data::executor::core_loop::CoreLoop::collect_update_from_join_rows`]
@@ -67,5 +67,5 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     pub rls_write_check: &'a [u8],
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// the matched target rows may touch, resolved on the Control Plane.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }

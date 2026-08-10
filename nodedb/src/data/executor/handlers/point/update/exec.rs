@@ -19,7 +19,7 @@ use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use nodedb_physical::physical_plan::{ReturningSpec, StorageMode, UpdateValue};
+use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec, StorageMode, UpdateValue};
 use nodedb_types::Surrogate;
 
 use super::super::update_reindex_secondary::UpdateSecondaryReindex;
@@ -44,7 +44,7 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this update may touch — both sides of a join-key change. Resolved on the
     /// Control Plane at plan time.
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
 }
 
 impl CoreLoop {

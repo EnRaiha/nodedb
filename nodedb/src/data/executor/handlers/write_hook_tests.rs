@@ -23,7 +23,7 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::{
-    DocumentOp, MaterializedSumBinding, PhysicalPlan, UpdateValue,
+    DocumentOp, MaterializedSumBinding, PhysicalPlan, ResolvedSumTarget, UpdateValue,
 };
 use nodedb_types::Surrogate;
 
@@ -66,9 +66,13 @@ fn binding() -> MaterializedSumBinding {
     }
 }
 
-/// Both accounts, resolved the way the Control Plane resolves them at plan time.
-fn resolved() -> Vec<(String, Surrogate)> {
-    vec![(A1.to_string(), T1), (A2.to_string(), T2)]
+/// Both accounts, resolved the way the Control Plane resolves them at plan time
+/// — each entry naming the TARGET collection its binding points at.
+fn resolved() -> Vec<ResolvedSumTarget> {
+    vec![
+        ResolvedSumTarget::new(TARGET, A1, T1),
+        ResolvedSumTarget::new(TARGET, A2, T2),
+    ]
 }
 
 fn config_key(collection: &str) -> (DatabaseId, TenantId, String) {

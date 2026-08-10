@@ -4,7 +4,7 @@
 //! already matched and resolved, one row/transaction at a time, folding each
 //! into its materialized-sum target and re-indexing its vectors.
 
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::ResolvedSumTarget;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
@@ -33,7 +33,7 @@ pub(in crate::data::executor) struct UpdateFromJoinWriteOutcome {
 pub(in crate::data::executor) struct WriteResolvedRowsCtx<'a> {
     pub tid: u64,
     pub target_collection: &'a str,
-    pub resolved_sum_targets: &'a [(String, Surrogate)],
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
     pub has_vectors: bool,
     pub is_strict: bool,
     pub want_returning: bool,

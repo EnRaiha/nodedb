@@ -40,7 +40,7 @@
 //! and retries — the same predict-verify-retry contract the OLLP dependent-read
 //! path uses. Retries are bounded; exhaustion surfaces `OllpExhausted`.
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
@@ -288,7 +288,7 @@ fn merge_plan(
     resolve_only: bool,
     resolved_inserts: Option<Vec<(String, u32)>>,
     source_rows: Option<Vec<(String, Vec<u8>)>>,
-    resolved_sum_targets: Vec<(String, Surrogate)>,
+    resolved_sum_targets: Vec<nodedb_physical::physical_plan::ResolvedSumTarget>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Merge {
         target_collection: args.target_collection.to_string(),

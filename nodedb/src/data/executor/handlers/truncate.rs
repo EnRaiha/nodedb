@@ -29,7 +29,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
-        resolved_sum_targets: &[(String, nodedb_types::Surrogate)],
+        resolved_sum_targets: &[nodedb_physical::physical_plan::ResolvedSumTarget],
     ) -> Response {
         debug!(core = self.core_id, %collection, "truncate");
 

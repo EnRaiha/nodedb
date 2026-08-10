@@ -33,8 +33,9 @@ pub use columnar::{ColumnarInsertIntent, ColumnarOp};
 pub use crdt::CrdtOp;
 pub use document::{
     BalancedDef, DocumentOp, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding,
-    OllpPredictedEdge, PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ReturningColumns,
-    ReturningItem, ReturningSpec, StorageMode, TimeseriesSchema, UpdateValue,
+    OllpPredictedEdge, PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ResolvedSumTarget,
+    ReturningColumns, ReturningItem, ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema,
+    UpdateValue, resolved_sum_surrogate,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{

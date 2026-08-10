@@ -15,8 +15,7 @@
 //! Everything here is pure: documents in, join values out. No storage handle, no
 //! transaction, no plane state.
 
-use nodedb_physical::physical_plan::{MaterializedSumBinding, UpdateValue};
-use nodedb_types::Surrogate;
+use nodedb_physical::physical_plan::{MaterializedSumBinding, ResolvedSumTarget, UpdateValue};
 
 /// Sorted, distinct join values `binding` needs resolved for `rows`, given the
 /// statement's `SET` assignments.
@@ -86,17 +85,25 @@ pub fn binding_join_keys(
     Ok(keys)
 }
 
-/// The first value in `required` that `resolved` does not carry a surrogate for.
+/// The first value in `required` that `resolved` does not bind a surrogate to
+/// FOR `target_collection`.
 ///
-/// `None` means the resolution covers every target the write will address.
+/// The target collection is part of the question, not context: a resolution
+/// entry for some other binding's target happens to carry the same join value
+/// and answers nothing here. Ignoring it would report coverage the write does
+/// not have, and the fold would then address the wrong row.
+///
+/// `None` means the resolution covers every row this binding will address.
 pub fn missing_join_key<'a>(
+    target_collection: &str,
     required: &'a [String],
-    resolved: &[(String, Surrogate)],
+    resolved: &[ResolvedSumTarget],
 ) -> Option<&'a str> {
-    required
-        .iter()
-        .map(String::as_str)
-        .find(|key| !resolved.iter().any(|(value, _)| value == key))
+    required.iter().map(String::as_str).find(|key| {
+        !resolved
+            .iter()
+            .any(|entry| entry.addresses(target_collection, key))
+    })
 }
 
 /// A join value is a STRING or it is nothing — the same rule the delta fold
@@ -173,16 +180,44 @@ mod tests {
 
     #[test]
     fn a_covered_resolution_reports_nothing_missing() {
-        let resolved = vec![("a1".to_string(), Surrogate::new(4))];
-        assert_eq!(missing_join_key(&["a1".to_string()], &resolved), None);
+        let resolved = vec![ResolvedSumTarget::new(
+            "accounts",
+            "a1",
+            nodedb_types::Surrogate::new(4),
+        )];
+        assert_eq!(
+            missing_join_key("accounts", &["a1".to_string()], &resolved),
+            None
+        );
     }
 
     #[test]
     fn an_uncovered_join_value_is_reported() {
-        let resolved = vec![("a1".to_string(), Surrogate::new(4))];
+        let resolved = vec![ResolvedSumTarget::new(
+            "accounts",
+            "a1",
+            nodedb_types::Surrogate::new(4),
+        )];
         assert_eq!(
-            missing_join_key(&["a1".to_string(), "a2".to_string()], &resolved),
+            missing_join_key("accounts", &["a1".to_string(), "a2".to_string()], &resolved),
             Some("a2")
+        );
+    }
+
+    /// A resolution entry for ANOTHER target that carries the same join value
+    /// covers nothing here. Reported as missing, the statement retries against a
+    /// fresh recon rather than folding this binding's delta into the other
+    /// binding's row.
+    #[test]
+    fn a_sibling_targets_entry_does_not_cover_this_binding() {
+        let resolved = vec![ResolvedSumTarget::new(
+            "accounts",
+            "a1",
+            nodedb_types::Surrogate::new(4),
+        )];
+        assert_eq!(
+            missing_join_key("audit_totals", &["a1".to_string()], &resolved),
+            Some("a1")
         );
     }
 }
