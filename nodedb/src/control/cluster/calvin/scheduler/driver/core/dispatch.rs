@@ -52,10 +52,25 @@ fn participant_change_sets(
         .collect()
 }
 
+/// Whether this vShard's slice carries the USER'S own write, as opposed to a
+/// derived side effect the Control Plane appended alongside it.
+///
+/// It gates the applied-response deposit, and that is the whole reason the
+/// distinction has to be made: a statement's `CommandComplete` is shaped from
+/// ONE deposited response, primary-write participants coalesce first-wins, and
+/// a derived participant's response describes a row the user's statement never
+/// named. A balance write that won that race handed an `INSERT` tag a count —
+/// or, when its flush found the commit already resolved and answered with an
+/// empty payload, no count at all — belonging to a different write entirely.
+///
+/// `is_derived_side_effect` is the named predicate rather than an inline
+/// `!matches!(plan, PhysicalPlan::Graph(_))`: the implicit graph edge and the
+/// cross-shard balance are the same concept, and spelling it inline here is why
+/// the second one never inherited the exclusion.
 pub(crate) fn plans_have_primary_write(plans: &[PhysicalPlan]) -> bool {
     plans.iter().any(|plan| {
         crate::control::planner::calvin::is_write_plan(plan)
-            && !matches!(plan, PhysicalPlan::Graph(_))
+            && !crate::control::planner::calvin::write_class::is_derived_side_effect(plan)
     })
 }
 

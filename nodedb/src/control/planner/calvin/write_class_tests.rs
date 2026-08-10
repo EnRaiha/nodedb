@@ -297,3 +297,61 @@ fn is_write_plan_true_for_graph_remove_node_labels() {
         "GraphOp::RemoveNodeLabels must be a write"
     );
 }
+
+// ── is_derived_side_effect ──────────────────────────────────────────────────
+
+fn balance_delta_plan() -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+        collection: "accounts".to_owned(),
+        document_id: "0000010f".to_owned(),
+        surrogate: Surrogate::new(271),
+        column: "balance".to_owned(),
+        delta: "25".to_owned(),
+        join_column: "account_id".to_owned(),
+        join_value: "acc-1".to_owned(),
+    })
+}
+
+fn point_insert_plan() -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::PointInsert {
+        collection: "entries".to_owned(),
+        document_id: "e1".to_owned(),
+        value: Vec::new(),
+        if_absent: false,
+        surrogate: Surrogate::new(11),
+        returning: None,
+        rls_filters: Vec::new(),
+        resolved_sum_targets: Vec::new(),
+        deferred_sum_targets: Vec::new(),
+    })
+}
+
+/// A balance write is a DERIVED side effect, exactly as an implicit graph edge
+/// is.
+///
+/// Both are appended by the Control Plane alongside a statement they do not
+/// appear in, and neither may own that statement's applied response: the
+/// `CommandComplete` tag is shaped from ONE deposited response, so a derived
+/// participant winning the deposit hands the user's `INSERT` a count that
+/// belongs to a row the statement never named.
+#[test]
+fn a_balance_write_is_a_derived_side_effect() {
+    assert!(is_derived_side_effect(&balance_delta_plan()));
+}
+
+/// The user's own write is not, so it remains the participant that deposits.
+/// Without this the fix would leave every cross-shard statement with no applied
+/// response at all.
+#[test]
+fn the_users_own_write_is_not_a_derived_side_effect() {
+    assert!(!is_derived_side_effect(&point_insert_plan()));
+}
+
+/// Derived does NOT mean "not a write": both still enter Calvin's write-key
+/// set, which is what makes the pair multi-shard and commit atomically. The two
+/// classifications answer different questions and must not be collapsed.
+#[test]
+fn a_derived_side_effect_is_still_a_calvin_write() {
+    assert!(is_write_plan(&balance_delta_plan()));
+    assert!(is_write_plan(&point_insert_plan()));
+}

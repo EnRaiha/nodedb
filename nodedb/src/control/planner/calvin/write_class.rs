@@ -91,6 +91,48 @@ fn document_is_write(op: &DocumentOp) -> bool {
     }
 }
 
+/// Whether `plan` is a DERIVED side effect rather than the user's own write.
+///
+/// Two shapes qualify, and they are the same shape: a cross-collection write
+/// the Control Plane appends alongside a statement it did not appear in.
+///
+/// * a `GraphOp` edge write mirroring a document that carries `_from`/`_to`;
+/// * a [`DocumentOp::ApplyBalanceDelta`] moving a materialized-sum balance
+///   whose target does not share the source's vShard.
+///
+/// Both are real writes and both must enter Calvin's write-key set — they are
+/// what makes the pair multi-shard and commit atomically. What they must NOT do
+/// is answer the client. A statement's `CommandComplete` tag is shaped from ONE
+/// applied response, and a derived participant's response describes a row the
+/// user's statement never named: shaping `INSERT` from it reports a count that
+/// belongs to a different write.
+///
+/// The distinction is named here, once, rather than spelled as an inline
+/// negation at the place the responses are folded. It was an inline
+/// `!matches!(plan, PhysicalPlan::Graph(_))` in
+/// `plans_have_primary_write`, so the balance write — added later, and
+/// deliberately modelled on the implicit graph edge — never inherited it and
+/// raced the source write to deposit the statement's applied response.
+pub fn is_derived_side_effect(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Graph(_) => true,
+        PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. }) => true,
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => false,
+    }
+}
+
 fn kv_is_write(op: &KvOp) -> bool {
     match op {
         KvOp::Put { .. }

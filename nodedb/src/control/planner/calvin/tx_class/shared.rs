@@ -197,18 +197,22 @@ pub(super) fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>
 }
 
 /// Extract the collection name from a write plan.
+///
+/// The name this returns is what the participant set is derived from
+/// ([`ReadWriteSet::participating_vshards_in_database`] hashes it), so a write
+/// whose name comes back EMPTY does not fail — it homes to whatever the empty
+/// string hashes to, which in the default database is vShard 0. The scheduler
+/// then enlists that shard, the routing oracle sends the plan to its real home,
+/// and the enlisted shard aborts the transaction with "homes no local write
+/// plans or reads". An op missing from this extractor is therefore a routing
+/// bug that surfaces nowhere near its cause.
+///
+/// The document arm is exhaustive for exactly that reason, mirroring the
+/// scheduler's own `plan_vshard` routing oracle: a new `DocumentOp` is a
+/// compile error here rather than a silent empty name.
 pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
     match plan {
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { collection, .. }
-            | DocumentOp::PointInsert { collection, .. }
-            | DocumentOp::PointDelete { collection, .. }
-            | DocumentOp::PointUpdate { collection, .. }
-            | DocumentOp::BatchInsert { collection, .. }
-            | DocumentOp::Upsert { collection, .. }
-            | DocumentOp::BulkUpdate { collection, .. }
-            | DocumentOp::BulkDelete { collection, .. },
-        ) => collection.clone(),
+        PhysicalPlan::Document(op) => document_write_collection(op),
         PhysicalPlan::Kv(
             KvOp::Put { collection, .. }
             | KvOp::Insert { collection, .. }
@@ -236,6 +240,47 @@ pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
     }
 }
 
+/// The collection a DOCUMENT write plan homes on, exhaustively.
+fn document_write_collection(op: &DocumentOp) -> String {
+    match op {
+        DocumentOp::PointPut { collection, .. }
+        | DocumentOp::PointInsert { collection, .. }
+        | DocumentOp::PointDelete { collection, .. }
+        | DocumentOp::PointUpdate { collection, .. }
+        | DocumentOp::BatchInsert { collection, .. }
+        | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BulkUpdate { collection, .. }
+        | DocumentOp::BulkDelete { collection, .. }
+        | DocumentOp::Truncate { collection, .. }
+        // The derived balance write homes on the TARGET collection it names —
+        // the same collection the routing oracle sends it to. Leaving it out
+        // enlisted the empty name's vShard as a participant while the plan
+        // itself went to the target's, so the enlisted shard received nothing.
+        | DocumentOp::ApplyBalanceDelta { collection, .. } => collection.clone(),
+        DocumentOp::InsertSelect {
+            target_collection, ..
+        } => target_collection.clone(),
+        // Cross-collection writes whose source/target co-location nothing
+        // enforces. Their Control-Plane orchestrators resolve them into
+        // concrete point writes before dispatch, so no raw plan of either shape
+        // reaches this builder; the routing oracle names them `Unroutable` for
+        // the same reason.
+        DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => String::new(),
+        // Reads and index DDL: the caller skips every plan `is_write_plan`
+        // rejects before it gets here.
+        DocumentOp::PointGet { .. }
+        | DocumentOp::Scan { .. }
+        | DocumentOp::RangeScan { .. }
+        | DocumentOp::IndexLookup { .. }
+        | DocumentOp::IndexedFetch { .. }
+        | DocumentOp::EstimateCount { .. }
+        | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::Register { .. }
+        | DocumentOp::DropIndex { .. }
+        | DocumentOp::BackfillIndex { .. } => String::new(),
+    }
+}
+
 /// Extract a surrogate from a write plan (returns 0 when unavailable).
 pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
     match plan {
@@ -244,7 +289,13 @@ pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
             | DocumentOp::PointInsert { surrogate, .. }
             | DocumentOp::PointDelete { surrogate, .. }
             | DocumentOp::PointUpdate { surrogate, .. }
-            | DocumentOp::Upsert { surrogate, .. },
+            | DocumentOp::Upsert { surrogate, .. }
+            // The TARGET row's identity, which is the row this write actually
+            // mutates — so two balance writes onto one row serialize and two
+            // onto different rows do not. Falling through to `0` locked every
+            // balance write against every other one, and against any write that
+            // also failed to report a surrogate.
+            | DocumentOp::ApplyBalanceDelta { surrogate, .. },
         ) => surrogate.as_u32(),
         _ => 0,
     }
@@ -384,5 +435,159 @@ mod lockstep_tests {
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
         }));
+    }
+}
+
+/// The participant set and the routing oracle must agree about where a plan
+/// lives.
+///
+/// These are two independent derivations of the same fact:
+/// [`collection_name_from_plan`] feeds the participant list the sequencer
+/// enlists, and the scheduler's `plan_vshard` oracle decides which participant
+/// actually receives the plan. When they disagree, a shard is enlisted and then
+/// handed nothing, and the whole transaction aborts with "homes no local write
+/// plans or reads for vshard N" — a message that names the enlisted shard and
+/// says nothing about the plan that caused it.
+///
+/// An op missing from the extractor produces an EMPTY collection name, and the
+/// empty name is not rejected anywhere: it simply hashes, landing on vShard 0 in
+/// the default database. So the failure is silent at the point of the bug and
+/// loud somewhere unrelated. These tests pin the agreement directly.
+#[cfg(test)]
+mod routing_agreement_tests {
+    use super::*;
+    use crate::control::planner::calvin::tx_class::static_builder::build_static_tx_class;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+    use nodedb_types::Surrogate;
+
+    const TENANT: TenantId = TenantId::new(1);
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+    /// The source a materialized-sum binding drives, and the target its balance
+    /// lands on. Asserted to hash apart by
+    /// [`the_fixture_spans_two_vshards`] — a co-resident pair would never
+    /// produce the two-task plan this file is about.
+    const SOURCE: &str = "route_entries";
+    const TARGET: &str = "route_accounts";
+
+    /// Build a task homed the way PRODUCTION homes it — deliberately not by
+    /// asking [`collection_name_from_plan`], which is one of the two
+    /// derivations under test. Deriving the home from the extractor would make
+    /// the agreement true by construction and prove nothing.
+    fn task(plan: PhysicalPlan, vshard_id: VShardId) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TENANT,
+            vshard_id,
+            database_id: DB,
+            plan,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// The pair a cross-shard materialized-sum statement produces: the source
+    /// write, and the balance task homed by the same function
+    /// `append_cross_shard_balance_tasks` homes it with.
+    fn statement_tasks() -> Vec<PhysicalTask> {
+        vec![
+            task(
+                source_write(),
+                VShardId::from_collection_in_database(DB, SOURCE),
+            ),
+            task(balance_write(), crate::query::sum_target_vshard(DB, TARGET)),
+        ]
+    }
+
+    fn source_write() -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::PointInsert {
+            collection: SOURCE.to_owned(),
+            document_id: "e1".to_owned(),
+            value: Vec::new(),
+            if_absent: false,
+            surrogate: Surrogate::new(11),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
+        })
+    }
+
+    fn balance_write() -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+            collection: TARGET.to_owned(),
+            document_id: "0000010f".to_owned(),
+            surrogate: Surrogate::new(271),
+            column: "balance".to_owned(),
+            delta: "25".to_owned(),
+            join_column: "account_id".to_owned(),
+            join_value: "acc-1".to_owned(),
+        })
+    }
+
+    #[test]
+    fn the_fixture_spans_two_vshards() {
+        assert_ne!(
+            VShardId::from_collection_in_database(DB, SOURCE),
+            VShardId::from_collection_in_database(DB, TARGET),
+            "the balance-pairing case only exists when source and target hash apart"
+        );
+    }
+
+    /// A balance write reports the TARGET collection it names.
+    ///
+    /// Reporting an empty name here is what enlisted vShard 0 as a participant
+    /// of every cross-shard materialized-sum statement while the plan itself
+    /// went to the target's shard.
+    #[test]
+    fn a_balance_write_reports_the_collection_it_mutates() {
+        assert_eq!(collection_name_from_plan(&balance_write()), TARGET);
+    }
+
+    /// And the TARGET ROW's surrogate, so it locks the key a direct write of
+    /// that row would take. Falling through to `0` made every balance write
+    /// share one lock key.
+    #[test]
+    fn a_balance_write_reports_the_target_rows_surrogate() {
+        assert_eq!(surrogate_from_plan(&balance_write()), 271);
+    }
+
+    /// The pair enlists exactly the two shards that hold work — the source's
+    /// and the target's — and no third one.
+    ///
+    /// This is the assertion the production failure would have caught: before
+    /// the extractor named `ApplyBalanceDelta`, the participants came back as
+    /// the source's shard plus vShard 0, and vShard 0 held no plan.
+    #[test]
+    fn the_pair_enlists_only_the_shards_that_hold_work() {
+        let tasks = statement_tasks();
+        let tx = build_static_tx_class(&tasks, TENANT, &[]).expect("build the transaction class");
+
+        let mut expected = vec![
+            VShardId::from_collection_in_database(DB, SOURCE),
+            VShardId::from_collection_in_database(DB, TARGET),
+        ];
+        expected.sort_by_key(|v| v.as_u32());
+        assert_eq!(
+            tx.participating_vshards(),
+            expected.as_slice(),
+            "every enlisted shard must be one the routing oracle sends a plan to"
+        );
+    }
+
+    /// Every task's own home agrees with the participant the class enlists for
+    /// it. Stated over the task list rather than over one op, so a future write
+    /// shape appended alongside a source write is covered by the same rule.
+    #[test]
+    fn every_task_homes_on_a_shard_the_class_enlists() {
+        let tasks = statement_tasks();
+        let tx = build_static_tx_class(&tasks, TENANT, &[]).expect("build the transaction class");
+        for task in &tasks {
+            assert!(
+                tx.participating_vshards().contains(&task.vshard_id),
+                "task homed on {:?} is not enlisted; it would be dispatched to a shard \
+                 that never voted",
+                task.vshard_id
+            );
+        }
     }
 }

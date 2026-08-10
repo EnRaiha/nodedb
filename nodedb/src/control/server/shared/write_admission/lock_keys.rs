@@ -110,12 +110,32 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
             collection: Arc::from(collection.as_str()),
             surrogate: surrogate.as_u32(),
         }),
+        // Multi-row and cross-collection writes have no single point identity;
+        // they route to the deterministic scheduler, which owns their ordering.
         DocumentOp::BatchInsert { .. }
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
-        | DocumentOp::UpdateFromJoin { .. } => None,
-        _ => None,
+        | DocumentOp::UpdateFromJoin { .. }
+        | DocumentOp::Truncate { .. }
+        | DocumentOp::Merge { .. }
+        // A derived balance write DOES name one row, but it is never admitted
+        // through this gate: it only exists as the sibling of a source write
+        // that already classified multi-shard, so the scheduler is what locks
+        // it — on `(target collection, target surrogate)`, the same key a direct
+        // write of that row takes.
+        | DocumentOp::ApplyBalanceDelta { .. }
+        // Reads and index DDL take no write lock at all.
+        | DocumentOp::PointGet { .. }
+        | DocumentOp::Scan { .. }
+        | DocumentOp::RangeScan { .. }
+        | DocumentOp::IndexLookup { .. }
+        | DocumentOp::IndexedFetch { .. }
+        | DocumentOp::EstimateCount { .. }
+        | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::Register { .. }
+        | DocumentOp::DropIndex { .. }
+        | DocumentOp::BackfillIndex { .. } => None,
     }
 }
 
