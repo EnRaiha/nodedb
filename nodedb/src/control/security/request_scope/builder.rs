@@ -399,13 +399,15 @@ mod tests {
                 conditions: Vec::new(),
             })
             .unwrap();
-        quotas.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 100,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        quotas
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 100,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         // `build()` reads quota state on the wall clock, and a quota period
         // rolls over lazily on access — so seed the usage on that same clock,
         // or the read lands past the period end and reports a fresh allowance.

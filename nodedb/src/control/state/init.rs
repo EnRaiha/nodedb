@@ -86,6 +86,13 @@ impl SharedState {
                 crate::control::security::jit::auth_user::AuthUserStore::open(catalog.clone())?;
             s.scope_grants =
                 crate::control::security::scope::grant::ScopeGrantStore::open(catalog)?;
+            // Same reasoning as the grants above: a quota definition is a
+            // durable catalog object, and a memory-only manager here would
+            // report every cap as absent after a restart.
+            s.quota_manager = QuotaManager::open(
+                s.metering_config.max_tracked_quota_grantees,
+                credentials.catalog(),
+            )?;
             s.credentials = credentials;
             s.ep_topic_registry
                 .load_from_catalog(s.credentials.catalog())?;

@@ -69,6 +69,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "org_members" => ORG_MEMBERS,
     "scopes" => SCOPES,
     "scope_grants" => SCOPE_GRANTS,
+    "scope_quotas" => SCOPE_QUOTAS,
     "oidc_providers" => OIDC_PROVIDERS,
     // ── Collections + storage bookkeeping ──
     "collections" => COLLECTIONS,

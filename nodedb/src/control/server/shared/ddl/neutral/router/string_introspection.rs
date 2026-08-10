@@ -17,6 +17,7 @@ use super::super::inspect_audit;
 use super::super::metering_ddl;
 use super::super::observability;
 use super::super::org_ddl;
+use super::super::quota_ddl;
 use super::super::scope_ddl;
 use super::super::scope_query_ddl;
 use super::super::session_admin;
@@ -227,6 +228,21 @@ pub(super) async fn try_string(
     if upper.starts_with("SHOW QUOTA ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(metering_ddl::show_quota(state, identity, &parts));
+    }
+    // Per-scope token quotas. `SHOW QUOTAS` cannot collide with the
+    // `SHOW QUOTA ` prefix above: that guard requires a space where this one
+    // has an `S`.
+    if upper.starts_with("DEFINE QUOTA ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(quota_ddl::define_quota(state, identity, &parts));
+    }
+    if upper.starts_with("DROP QUOTA ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(quota_ddl::drop_quota(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW QUOTAS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(quota_ddl::show_quotas(state, identity, &parts));
     }
 
     // Organization management. None of `CREATE ORG`, `ALTER ORG`, `DROP ORG`,

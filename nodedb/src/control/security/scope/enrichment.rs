@@ -215,13 +215,15 @@ mod tests {
             })
             .unwrap();
         let quotas = QuotaManager::new();
-        quotas.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        quotas
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         quotas.record_usage("pro:all", "u1", 250, 1_000);
 
         let mut ctx = test_ctx("u1");
@@ -280,13 +282,15 @@ mod tests {
             })
             .unwrap();
         let quotas = QuotaManager::new();
-        quotas.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        quotas
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         quotas.record_usage("pro:all", "u3", 250, 1_000);
 
         let mut ctx = test_ctx("u3");
@@ -502,13 +506,15 @@ mod tests {
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
         grant_with(&grants, "pro:all", "u14", vec![GrantCondition::RequireMfa]);
-        quotas.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        quotas
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         quotas.record_usage("pro:all", "u14", 250, INSIDE_BUSINESS_HOURS);
 
         let mut ctx = test_ctx("u14");

@@ -17,6 +17,7 @@ use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -171,6 +172,18 @@ impl NodeDbPgHandler {
             // not metered here.
             let plan_metering_info =
                 metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_response));
+
+            // A spent hard quota refuses the task BEFORE it runs. The
+            // charging call at the bottom of this loop is on the success
+            // path by design, so it can never be the place a cap blocks
+            // anything — by the time it runs the work is already done.
+            if let Some(info) = &plan_metering_info {
+                let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
+                    .with_session_database(Some(task_database_id))
+                    .build();
+                admit_quota_for_dispatch(&self.state, &scope, info)
+                    .map_err(|e| sqlstate_error("53400", &e.to_string()))?;
+            }
 
             // Single-node pgwire streaming fast path (autocommit SELECT only).
             // In-transaction reads skip streaming so the transaction id rides on

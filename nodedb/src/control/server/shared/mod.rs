@@ -7,6 +7,7 @@ pub mod panic_isolation;
 pub mod plan_admission;
 pub mod plan_util;
 pub mod planning_overrides;
+pub mod quota_admission;
 pub mod retry;
 pub mod returning;
 pub mod session;

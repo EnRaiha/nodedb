@@ -259,6 +259,14 @@ pub(super) const LOCKOUT_STATE: TableDefinition<&str, &[u8]> =
 pub(super) const BLACKLIST: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.blacklist");
 
+/// Table: scope name -> MessagePack-serialized `StoredScopeQuota`.
+///
+/// Quota definitions are admin-authored catalog objects, like scope grants:
+/// a definition that lived only in process memory would be forgotten by every
+/// restart, silently lifting every cap it expressed.
+pub(super) const SCOPE_QUOTAS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("_system.scope_quotas");
+
 /// Table: auth_user_id -> MessagePack-serialized auth user record (JIT-provisioned).
 pub(super) const AUTH_USERS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.auth_users");

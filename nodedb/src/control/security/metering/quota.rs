@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::control::security::catalog::types::{StoredScopeQuota, SystemCatalog};
+
 /// Default cap on the number of distinct `"{scope_name}:{grantee_id}"` keys
 /// tracked in `QuotaManager::usage`. Lazy rollover (see
 /// [`QuotaManager::record_usage`] / [`QuotaManager::get_status`]) bounds
@@ -47,6 +49,61 @@ pub struct QuotaDefinition {
     pub warning_threshold: f64,
 }
 
+impl QuotaEnforcement {
+    /// The stored spelling, and the one `SHOW QUOTAS` displays.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+            Self::Throttle => "throttle",
+            Self::Overage => "overage",
+        }
+    }
+
+    /// Parse an operator- or catalog-supplied mode, case-insensitively.
+    ///
+    /// An unrecognised mode is an error, never a silent fallback to the
+    /// permissive mode: `ENFORCEMENT HRAD` must be a syntax error, not an
+    /// unenforced cap the operator believes is blocking.
+    pub fn parse(text: &str) -> crate::Result<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "hard" => Ok(Self::Hard),
+            "soft" => Ok(Self::Soft),
+            "throttle" => Ok(Self::Throttle),
+            "overage" => Ok(Self::Overage),
+            other => Err(crate::Error::BadRequest {
+                detail: format!(
+                    "unknown quota enforcement '{other}': expected HARD, SOFT, THROTTLE, or OVERAGE"
+                ),
+            }),
+        }
+    }
+}
+
+impl QuotaDefinition {
+    /// Convert to its persisted form.
+    pub fn to_stored(&self) -> StoredScopeQuota {
+        StoredScopeQuota {
+            scope_name: self.scope_name.clone(),
+            max_tokens: self.max_tokens,
+            period_secs: self.period_secs,
+            enforcement: self.enforcement.as_str().to_string(),
+            warning_threshold: self.warning_threshold,
+        }
+    }
+
+    /// Rebuild from its persisted form.
+    pub fn from_stored(stored: StoredScopeQuota) -> crate::Result<Self> {
+        Ok(Self {
+            scope_name: stored.scope_name,
+            max_tokens: stored.max_tokens,
+            period_secs: stored.period_secs,
+            enforcement: QuotaEnforcement::parse(&stored.enforcement)?,
+            warning_threshold: stored.warning_threshold,
+        })
+    }
+}
+
 /// Quota status for a user/org.
 #[derive(Debug, Clone)]
 pub struct QuotaStatus {
@@ -80,6 +137,12 @@ pub struct QuotaManager {
     dropped_usage_entries: AtomicU64,
     /// Ensures the capacity warning is logged once, not once per dropped call.
     warned_capacity: AtomicBool,
+    /// Catalog backing the `quotas` map, when this manager owns one.
+    ///
+    /// Definitions are admin-authored catalog objects; without persistence
+    /// every restart would silently lift every cap. Consumption (`usage`)
+    /// deliberately does NOT live here — see [`Self::record_usage`].
+    catalog: Option<SystemCatalog>,
 }
 
 impl QuotaManager {
@@ -96,19 +159,57 @@ impl QuotaManager {
             max_tracked_grantees,
             dropped_usage_entries: AtomicU64::new(0),
             warned_capacity: AtomicBool::new(false),
+            catalog: None,
         }
     }
 
-    /// Define or update a quota for a scope.
-    pub fn define_quota(&self, quota: QuotaDefinition) {
-        let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
-        quotas.insert(quota.scope_name.clone(), quota);
+    /// Construct a catalog-backed manager and populate it from that catalog.
+    pub fn open(max_tracked_grantees: usize, catalog: &SystemCatalog) -> crate::Result<Self> {
+        let mut manager = Self::with_bounds(max_tracked_grantees);
+        manager.catalog = Some(catalog.clone());
+        manager.load_from(catalog)?;
+        Ok(manager)
     }
 
-    /// Remove a quota definition.
-    pub fn remove_quota(&self, scope_name: &str) -> bool {
+    /// Replace the in-memory definitions with everything stored in `catalog`.
+    pub fn load_from(&self, catalog: &SystemCatalog) -> crate::Result<()> {
+        let stored = catalog.load_all_scope_quotas()?;
         let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
-        quotas.remove(scope_name).is_some()
+        quotas.clear();
+        for record in stored {
+            let definition = QuotaDefinition::from_stored(record)?;
+            quotas.insert(definition.scope_name.clone(), definition);
+        }
+        if !quotas.is_empty() {
+            info!(count = quotas.len(), "scope quotas loaded from catalog");
+        }
+        Ok(())
+    }
+
+    /// Define or update a quota for a scope.
+    ///
+    /// Persistence happens first: a definition cached but not stored would
+    /// report a cap the next restart does not have.
+    pub fn define_quota(&self, quota: QuotaDefinition) -> crate::Result<()> {
+        if let Some(ref catalog) = self.catalog {
+            catalog.put_scope_quota(&quota.to_stored())?;
+        }
+        let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
+        quotas.insert(quota.scope_name.clone(), quota);
+        Ok(())
+    }
+
+    /// Remove a quota definition, reporting whether one was present.
+    ///
+    /// As with [`Self::define_quota`], a catalog failure is fatal to the whole
+    /// removal rather than leaving the cache and the catalog disagreeing about
+    /// whether a cap still applies.
+    pub fn remove_quota(&self, scope_name: &str) -> crate::Result<bool> {
+        if let Some(ref catalog) = self.catalog {
+            catalog.delete_scope_quota(scope_name)?;
+        }
+        let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
+        Ok(quotas.remove(scope_name).is_some())
     }
 
     /// Record token usage against a quota.
@@ -272,10 +373,14 @@ impl QuotaManager {
         })
     }
 
-    /// List all quota definitions.
+    /// List all quota definitions, ordered by scope name so `SHOW QUOTAS`
+    /// renders the same order on every call rather than a hash order that
+    /// shifts between runs.
     pub fn list_quotas(&self) -> Vec<QuotaDefinition> {
         let quotas = self.quotas.read().unwrap_or_else(|p| p.into_inner());
-        quotas.values().cloned().collect()
+        let mut all: Vec<_> = quotas.values().cloned().collect();
+        all.sort_by(|a, b| a.scope_name.cmp(&b.scope_name));
+        all
     }
 
     /// Reset usage counters for a new billing period.
@@ -350,7 +455,8 @@ mod tests {
             period_secs: 86400,
             enforcement: QuotaEnforcement::Hard,
             warning_threshold: 0.8,
-        });
+        })
+        .expect("define quota in test");
 
         // Use 90 tokens.
         mgr.record_usage("free", "u1", 90, 1_000);
@@ -369,7 +475,8 @@ mod tests {
             period_secs: 86400,
             enforcement: QuotaEnforcement::Soft,
             warning_threshold: 0.8,
-        });
+        })
+        .expect("define quota in test");
 
         mgr.record_usage("free", "u1", 200, 1_000);
         assert!(mgr.check_quota("free", "u1", 1, 1_000).is_ok()); // Soft = allow.
@@ -390,7 +497,8 @@ mod tests {
             period_secs: 86400,
             enforcement: QuotaEnforcement::Hard,
             warning_threshold: 0.8,
-        });
+        })
+        .expect("define quota in test");
         mgr.record_usage("pro", "u1", 500, 1_000);
 
         let status = mgr.get_status("pro", "u1", 1_000).unwrap();
@@ -428,7 +536,8 @@ mod tests {
             period_secs: 10,
             enforcement: QuotaEnforcement::Hard,
             warning_threshold: 0.8,
-        });
+        })
+        .expect("define quota in test");
 
         // First access establishes the period start — nothing has "elapsed"
         // yet (0 seconds), so usage is untouched.
@@ -456,7 +565,8 @@ mod tests {
             period_secs: 10,
             enforcement: QuotaEnforcement::Hard,
             warning_threshold: 0.8,
-        });
+        })
+        .expect("define quota in test");
 
         mgr.record_usage("free", "u1", 90, 1_000);
         // Past the period boundary — this write must land in a fresh period.

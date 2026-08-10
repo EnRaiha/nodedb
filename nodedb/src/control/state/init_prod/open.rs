@@ -148,6 +148,15 @@ impl SharedState {
         let scope_grants =
             crate::control::security::scope::grant::ScopeGrantStore::open(credentials.catalog())?;
 
+        // Quota definitions are catalog objects for the same reason grants
+        // are: a cap that lived only in memory would be lifted by every
+        // restart, and a rolling deploy would quietly forgive every ceiling
+        // the operator set.
+        let quota_manager = QuotaManager::open(
+            metering_config.max_tracked_quota_grantees,
+            credentials.catalog(),
+        )?;
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
@@ -332,7 +341,7 @@ impl SharedState {
                 metering_config.max_usage_events,
                 metering_config.max_tracked_scopes,
             )),
-            quota_manager: QuotaManager::with_bounds(metering_config.max_tracked_quota_grantees),
+            quota_manager,
             metering_config: metering_config.clone(),
             auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore::new(),
             impersonation: crate::control::security::impersonation::ImpersonationStore::default(),

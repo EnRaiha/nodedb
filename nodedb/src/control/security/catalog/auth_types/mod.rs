@@ -7,6 +7,7 @@ pub mod external_user;
 pub mod owner;
 pub mod permission;
 pub mod role;
+pub mod scope_quota;
 pub mod tenant;
 pub mod user;
 
@@ -17,5 +18,6 @@ pub use external_user::StoredAuthUser;
 pub use owner::{StoredOwner, object_type};
 pub use permission::StoredPermission;
 pub use role::StoredRole;
+pub use scope_quota::StoredScopeQuota;
 pub use tenant::StoredTenant;
 pub use user::StoredUser;

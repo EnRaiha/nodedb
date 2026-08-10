@@ -19,6 +19,7 @@ use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::{PlanKind, describe_plan};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::expander_stage::{
     ExpanderOutcome, route_in_tx_expander,
 };
@@ -91,6 +92,15 @@ pub(super) async fn run_dispatch_loop(
         // is not observable at this loop level.
         let plan_metering_info =
             metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_staged_response));
+
+        // A spent hard quota refuses the task before it runs; the charging
+        // call at the end of this loop is on the success path and so can
+        // never refuse anything itself.
+        if let Some(info) = &plan_metering_info
+            && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
+        {
+            return resp(NativeResponse::error(seq, "53400", e.to_string()));
+        }
 
         // In transaction: route through the protocol-neutral staging gate.
         // Reads (including in-transaction reads) come back as `Read` with

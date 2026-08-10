@@ -53,6 +53,7 @@ pub mod permission_tree;
 pub mod planning;
 pub mod procedure;
 pub mod query_functions;
+pub mod quota_ddl;
 pub mod rate_gate;
 pub mod read_gate;
 pub mod redaction;

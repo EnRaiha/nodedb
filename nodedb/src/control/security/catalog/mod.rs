@@ -50,6 +50,7 @@ pub mod redaction;
 pub mod retention_policy;
 pub mod rls;
 pub mod schedules;
+pub mod scope_quotas;
 pub mod scopes;
 pub mod security;
 pub mod sequence_types;

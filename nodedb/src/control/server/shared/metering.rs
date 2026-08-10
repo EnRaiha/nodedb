@@ -95,6 +95,19 @@ pub(crate) struct PlanMeteringInfo {
 }
 
 impl PlanMeteringInfo {
+    /// The collection this dispatch attributes to, if any.
+    ///
+    /// `None` for cluster/algo/meta plans with no user-facing collection —
+    /// there is nothing to bill or cap such a plan against.
+    pub(crate) fn collection(&self) -> Option<&str> {
+        self.collection.as_deref()
+    }
+
+    /// The [`Permission`] this dispatch required.
+    pub(crate) fn permission(&self) -> Permission {
+        self.permission
+    }
+
     /// Extract `plan`'s metering shape.
     ///
     /// Call this only when `state.metering_config.enabled` — it clones the
@@ -146,7 +159,7 @@ impl PlanMeteringInfo {
 /// — the same parser `GRANT`/catalog-grant code uses — rather than compared
 /// as raw strings, so `"select"`/`"insert"`/`"update"`/`"delete"` aliases
 /// resolve to the same [`Permission`] a `PhysicalPlan` requires.
-fn scope_covers_request(
+pub(crate) fn scope_covers_request(
     state: &SharedState,
     scope_name: &str,
     permission: Permission,
@@ -538,13 +551,16 @@ mod tests {
                 conditions: Vec::new(),
             })
             .expect("grant scope");
-        state.quota_manager.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        state
+            .quota_manager
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
@@ -665,13 +681,16 @@ mod tests {
                 conditions: Vec::new(),
             })
             .expect("grant scope");
-        state.quota_manager.define_quota(QuotaDefinition {
-            scope_name: "pro:all".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        state
+            .quota_manager
+            .define_quota(QuotaDefinition {
+                scope_name: "pro:all".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
@@ -732,13 +751,16 @@ mod tests {
                 conditions: Vec::new(),
             })
             .expect("grant scope");
-        state.quota_manager.define_quota(QuotaDefinition {
-            scope_name: "vector:heavy".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        state
+            .quota_manager
+            .define_quota(QuotaDefinition {
+                scope_name: "vector:heavy".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
@@ -791,13 +813,16 @@ mod tests {
                 conditions: Vec::new(),
             })
             .expect("grant scope");
-        state.quota_manager.define_quota(QuotaDefinition {
-            scope_name: "all:read".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        state
+            .quota_manager
+            .define_quota(QuotaDefinition {
+                scope_name: "all:read".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
@@ -851,13 +876,16 @@ mod tests {
                     conditions: Vec::new(),
                 })
                 .expect("grant scope");
-            state.quota_manager.define_quota(QuotaDefinition {
-                scope_name: scope_name.into(),
-                max_tokens: 1000,
-                period_secs: 86400,
-                enforcement: QuotaEnforcement::Hard,
-                warning_threshold: 0.8,
-            });
+            state
+                .quota_manager
+                .define_quota(QuotaDefinition {
+                    scope_name: scope_name.into(),
+                    max_tokens: 1000,
+                    period_secs: 86400,
+                    enforcement: QuotaEnforcement::Hard,
+                    warning_threshold: 0.8,
+                })
+                .expect("define quota in test");
         }
         let scope = scope_for(&identity, &state);
 
@@ -921,13 +949,16 @@ mod tests {
                 conditions: Vec::new(),
             })
             .expect("grant scope");
-        state.quota_manager.define_quota(QuotaDefinition {
-            scope_name: "write:only".into(),
-            max_tokens: 1000,
-            period_secs: 86400,
-            enforcement: QuotaEnforcement::Hard,
-            warning_threshold: 0.8,
-        });
+        state
+            .quota_manager
+            .define_quota(QuotaDefinition {
+                scope_name: "write:only".into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            })
+            .expect("define quota in test");
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
