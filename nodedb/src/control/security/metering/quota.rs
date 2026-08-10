@@ -140,8 +140,15 @@ pub struct QuotaManager {
     /// Catalog backing the `quotas` map, when this manager owns one.
     ///
     /// Definitions are admin-authored catalog objects; without persistence
-    /// every restart would silently lift every cap. Consumption (`usage`)
-    /// deliberately does NOT live here — see [`Self::record_usage`].
+    /// every restart would silently lift every cap.
+    ///
+    /// Consumption (`usage`) deliberately does NOT live here. A definition is
+    /// an operator's stated ceiling and has to outlive the process; the usage
+    /// counter is a rolling per-period tally that would put a catalog write on
+    /// every single dispatch. The accepted consequence is bounded and
+    /// explicit: a restart forgives whatever the current period had already
+    /// consumed. Closing that gap means periodically checkpointing the
+    /// counters, never a write-through on the request path.
     catalog: Option<SystemCatalog>,
 }
 
