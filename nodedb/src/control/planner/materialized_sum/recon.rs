@@ -31,8 +31,24 @@ use nodedb_types::{Surrogate, TenantId};
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TraceId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+
+/// What a plan-time reconnaissance read observed, and the version it observed
+/// it at.
+///
+/// The version travels with the rows because a delta settled from them is only
+/// as good as the images it was folded from: the caller stamps it onto a
+/// read-set entry so the Calvin OCC check aborts the statement if the source
+/// rows moved between this read and the apply. Rows without their version would
+/// be a silently stale total.
+pub(super) struct ReconRead<T> {
+    /// The decoded rows.
+    pub rows: T,
+    /// The source collection's write floor at read time — the comparand
+    /// cross-shard OCC validation checks the read against.
+    pub read_version_lsn: Lsn,
+}
 
 /// Scan `collection` for the rows `filters` matches, returning each row's full
 /// decoded document.
@@ -51,7 +67,7 @@ pub(super) async fn recon_scan_rows(
     database_id: DatabaseId,
     collection: &str,
     filters: Vec<u8>,
-) -> crate::Result<Vec<serde_json::Value>> {
+) -> crate::Result<ReconRead<Vec<serde_json::Value>>> {
     let scan_plan = PhysicalPlan::Document(DocumentOp::Scan {
         collection: collection.to_owned(),
         filters,
@@ -67,12 +83,15 @@ pub(super) async fn recon_scan_rows(
         prefilter: None,
     });
 
-    let payloads = execute_read(state, tenant_id, database_id, collection, scan_plan).await?;
+    let read = execute_read(state, tenant_id, database_id, collection, scan_plan).await?;
     let mut rows = Vec::new();
-    for payload in &payloads {
+    for payload in &read.rows {
         rows.extend(decode_rows(payload.as_slice()));
     }
-    Ok(rows)
+    Ok(ReconRead {
+        rows,
+        read_version_lsn: read.read_version_lsn,
+    })
 }
 
 /// Read the ONE stored row `surrogate` addresses, or `None` when no such row
@@ -96,7 +115,7 @@ pub(super) async fn recon_point_row(
     collection: &str,
     document_id: &str,
     surrogate: Surrogate,
-) -> crate::Result<Option<serde_json::Value>> {
+) -> crate::Result<ReconRead<Option<serde_json::Value>>> {
     let get_plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
@@ -111,13 +130,17 @@ pub(super) async fn recon_point_row(
         valid_at_ms: None,
     });
 
-    let payloads = execute_read(state, tenant_id, database_id, collection, get_plan).await?;
+    let read = execute_read(state, tenant_id, database_id, collection, get_plan).await?;
     // A point get answers with the row's normalized MessagePack body, and with
     // an EMPTY payload when the row is absent.
-    Ok(payloads
-        .iter()
-        .find(|payload| !payload.is_empty())
-        .and_then(|payload| nodedb_types::json_from_msgpack(payload.as_slice()).ok()))
+    Ok(ReconRead {
+        rows: read
+            .rows
+            .iter()
+            .find(|payload| !payload.is_empty())
+            .and_then(|payload| nodedb_types::json_from_msgpack(payload.as_slice()).ok()),
+        read_version_lsn: read.read_version_lsn,
+    })
 }
 
 /// Run one read plan against `collection`, through the gateway when one is
@@ -133,7 +156,7 @@ async fn execute_read(
     database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
-) -> crate::Result<Vec<Vec<u8>>> {
+) -> crate::Result<ReconRead<Vec<Vec<u8>>>> {
     if let Some(gateway) = state.gateway.get() {
         let gw_ctx = crate::control::gateway::core::QueryContext {
             tenant_id,
@@ -141,13 +164,17 @@ async fn execute_read(
             database_id,
             txn_id: None,
         };
-        return gateway
-            .execute_internal(&gw_ctx, plan)
+        let (payloads, _watermarks, read_version_lsn) = gateway
+            .execute_internal_with_watermarks(&gw_ctx, plan)
             .await
             .map_err(|e| crate::Error::Storage {
                 engine: "materialized-sum-recon".into(),
                 detail: format!("reconnaissance read failed: {e}"),
-            });
+            })?;
+        return Ok(ReconRead {
+            rows: payloads,
+            read_version_lsn,
+        });
     }
 
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
@@ -166,7 +193,10 @@ async fn execute_read(
             detail: format!("reconnaissance read failed: {:?}", response.error_code),
         });
     }
-    Ok(vec![response.payload.to_vec()])
+    Ok(ReconRead {
+        read_version_lsn: response.read_version_lsn,
+        rows: vec![response.payload.to_vec()],
+    })
 }
 
 /// Decode a document-scan payload into one document per row.

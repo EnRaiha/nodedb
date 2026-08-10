@@ -30,21 +30,33 @@ use crate::types::{DatabaseId, TenantId};
 const DB: u64 = 0;
 const TID: u64 = 1;
 /// The collection that DRIVES the binding — the one every path below writes.
-const SOURCE: &str = "ms_entries";
-/// The collection whose `balance` column the binding maintains.
-const TARGET: &str = "ms_accounts";
+const SOURCE: &str = "local_charges";
+/// The collection whose `balance` column the binding maintains, sharing
+/// `SOURCE`'s vShard.
+///
+/// Co-residency is not decoration here. Every test in this file drives the
+/// INLINE fold and then reads the target row back out of the SOURCE core's own
+/// document store — and each core opens its own store, so that read only sees
+/// the write when one core owns both rows. The pair is asserted by
+/// [`the_local_fixture_is_co_resident`] rather than assumed, so a change to the
+/// collection hash reports itself by name instead of quietly turning this file
+/// into a test of the deferred path.
+const TARGET: &str = "local_balances";
+/// A target that does NOT share `SOURCE`'s vShard, for the tests that pin the
+/// deferred rule.
+const REMOTE_TARGET: &str = "remote_balances";
 /// A third collection, read-only, standing in as the FROM side of a joined
 /// update.
-const JOIN_SOURCE: &str = "ms_rates";
+const JOIN_SOURCE: &str = "local_rates";
 
 const ACCOUNT_A: &str = "a1";
 const ACCOUNT_B: &str = "a2";
 const SURROGATE_A: Surrogate = Surrogate(4242);
 const SURROGATE_B: Surrogate = Surrogate(4343);
 
-fn binding() -> MaterializedSumBinding {
+fn binding_onto(target: &str) -> MaterializedSumBinding {
     MaterializedSumBinding {
-        target_collection: TARGET.to_string(),
+        target_collection: target.to_string(),
         target_column: "balance".to_string(),
         join_column: "account_id".to_string(),
         value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
@@ -62,22 +74,53 @@ fn config_key(collection: &str) -> (DatabaseId, TenantId, String) {
 /// Register the three collections: the binding-driving source, its target, and
 /// the read-only join side.
 fn register_collections(core: &mut CoreLoop) {
+    register_collections_onto(core, TARGET);
+}
+
+/// Register the three collections with the source's binding pointed at
+/// `target`.
+fn register_collections_onto(core: &mut CoreLoop, target: &str) {
     let mut source = CollectionConfig::new(SOURCE);
-    source.enforcement.materialized_sum_sources = vec![binding()];
+    source.enforcement.materialized_sum_sources = vec![binding_onto(target)];
     core.doc_configs.insert(config_key(SOURCE), source);
     core.doc_configs
-        .insert(config_key(TARGET), CollectionConfig::new(TARGET));
+        .insert(config_key(target), CollectionConfig::new(target));
     core.doc_configs
         .insert(config_key(JOIN_SOURCE), CollectionConfig::new(JOIN_SOURCE));
 }
 
+/// The premise every other test in this file rests on.
+#[test]
+fn the_local_fixture_is_co_resident() {
+    assert!(
+        crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+        "'{SOURCE}' and '{TARGET}' must share a vShard: the inline fold writes the target \
+         inside the source's transaction, on the source's core, and each core opens its own \
+         document store"
+    );
+    assert!(
+        !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+        "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred rule"
+    );
+}
+
 fn seed_target(core: &mut CoreLoop, surrogate: Surrogate, id: &str, balance: &str) {
+    seed_target_in(core, TARGET, surrogate, id, balance);
+}
+
+fn seed_target_in(
+    core: &mut CoreLoop,
+    collection: &str,
+    surrogate: Surrogate,
+    id: &str,
+    balance: &str,
+) {
     let row = serde_json::json!({"id": id, "balance": balance});
     core.sparse
         .put(
             DB,
             TID,
-            TARGET,
+            collection,
             &surrogate_to_doc_id(surrogate),
             &doc_format::encode_to_msgpack(&row),
         )
@@ -98,9 +141,13 @@ fn seed_source(core: &mut CoreLoop, surrogate: Surrogate, account: &str, amount:
 }
 
 fn balance_of(core: &CoreLoop, surrogate: Surrogate) -> String {
+    balance_in(core, TARGET, surrogate)
+}
+
+fn balance_in(core: &CoreLoop, collection: &str, surrogate: Surrogate) -> String {
     let stored = core
         .sparse
-        .get(DB, TID, TARGET, &surrogate_to_doc_id(surrogate))
+        .get(DB, TID, collection, &surrogate_to_doc_id(surrogate))
         .expect("read target row")
         .expect("target row must still exist");
     doc_format::decode_document(&stored)
@@ -320,6 +367,13 @@ fn insert_select_page_credits_its_targets() {
 /// still counts rows the statement deleted. The leader answers
 /// `OllpRetryRequired` instead, having removed nothing, and the coordinator
 /// re-resolves.
+///
+/// CO-RESIDENT, and that is what makes an uncovered value a defect here: this
+/// core applies the binding itself, so nothing ever removes a join value from
+/// the resolution and a missing one can only mean the plan no longer covers the
+/// rows. The cross-shard half of the rule, where a missing value is the
+/// deliberate deferral signal, is
+/// [`an_uncovered_cross_shard_join_value_is_deferred_rather_than_retried`].
 #[test]
 fn an_uncovered_join_value_retries_instead_of_writing_a_wrong_total() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -368,6 +422,85 @@ fn an_uncovered_join_value_retries_instead_of_writing_a_wrong_total() {
             .expect("read source row")
             .is_some(),
         "no source row may be removed on a refused statement"
+    );
+}
+
+/// The MIRROR of the retry test, and the rule that keeps the guard honest: for a
+/// CROSS-SHARD binding an uncovered join value is not drift at all.
+///
+/// The Control Plane settles such a binding at plan time and REMOVES its join
+/// values from the resolution — that removal is how this core is told to stand
+/// down. Demanding coverage for them anyway would report a divergence on every
+/// single cross-shard predicate write, and the coordinator would re-recon,
+/// resolve, remove them again and resubmit: a livelock, not a retry, on a
+/// dataset nobody else is touching.
+///
+/// Residency is the discriminator, and it is total. A co-resident binding is
+/// never omitted, so an uncovered value there is a genuine shortfall and
+/// `an_uncovered_join_value_retries_instead_of_writing_a_wrong_total` still
+/// demands the retry. A cross-shard binding is always omitted once settled, so
+/// an uncovered value there is the deferral. Drift on the cross-shard side is
+/// caught by the settlement's own read-set entry over the images the shipped
+/// deltas were folded from, which the Calvin OCC check validates on this core
+/// before any mutation — a different guard, not a missing one.
+///
+/// The balance assertion is what makes "stood down" mean something: the
+/// statement must proceed AND leave the total alone, because the sibling task
+/// owns it.
+#[test]
+fn an_uncovered_cross_shard_join_value_is_deferred_rather_than_retried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+    register_collections_onto(&mut core, REMOTE_TARGET);
+    seed_target_in(&mut core, REMOTE_TARGET, SURROGATE_A, ACCOUNT_A, "100");
+    seed_target_in(&mut core, REMOTE_TARGET, SURROGATE_B, ACCOUNT_B, "50");
+    seed_source(&mut core, Surrogate(1), ACCOUNT_A, 30);
+    seed_source(&mut core, Surrogate(2), ACCOUNT_B, 20);
+
+    // Empty, not partial: a settled cross-shard binding has every one of its
+    // join values removed, so this is the ORDINARY shape of the plan, not a
+    // damaged one.
+    let task = make_default_task();
+    let response = core.execute_bulk_delete(
+        &task,
+        TID,
+        BulkDeleteParams {
+            collection: SOURCE,
+            filter_bytes: &[],
+            returning: None,
+            rls_filters: &[],
+            rls_write_check: &[],
+            resolved_sum_targets: &[],
+            ollp: OllpPrediction {
+                surrogates: None,
+                edges: None,
+            },
+        },
+    );
+
+    assert_eq!(
+        response.status,
+        Status::Ok,
+        "a settled cross-shard binding must not be reported as drift: {:?}",
+        response.error_code
+    );
+    assert_ne!(
+        response.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired),
+        "demanding coverage for a deliberately-omitted join value livelocks the statement"
+    );
+    assert_eq!(
+        balance_in(&core, REMOTE_TARGET, SURROGATE_A),
+        "100",
+        "the balance travels on its own task; this core must not move it"
+    );
+    assert_eq!(balance_in(&core, REMOTE_TARGET, SURROGATE_B), "50");
+    assert!(
+        core.sparse
+            .get(DB, TID, SOURCE, &surrogate_to_doc_id(Surrogate(1)))
+            .expect("read source row")
+            .is_none(),
+        "the statement itself must have run: the matched source rows are gone"
     );
 }
 

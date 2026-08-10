@@ -9,6 +9,12 @@
 //! its difference, an UPDATE that moves a row from one target to another — are
 //! all testable without opening a database.
 //!
+//! The arithmetic itself lives in
+//! [`binding_image_deltas`](crate::query::binding_image_deltas), which the
+//! Control Plane calls too when it settles a CROSS-SHARD target's delta at plan
+//! time. This module's job is to map the executor's [`RowImages`] onto that one
+//! rule, so the two planes cannot total the same write differently.
+//!
 //! The defect this replaces derived ONE positive delta from ONE document. A
 //! total maintained that way only ever grows: a DELETE never subtracted, an
 //! UPDATE re-added the row's whole new value on top of its old contribution, and
@@ -57,95 +63,18 @@ pub(in crate::data::executor) fn fold_sum_deltas(
     binding: &MaterializedSumBinding,
     images: &RowImages<'_>,
 ) -> crate::Result<Vec<SumDelta>> {
-    match images {
-        RowImages::Insert { new_doc } => Ok(contribution(binding, new_doc, Sign::Plus)?
-            .into_iter()
-            .collect()),
-        RowImages::Delete { old_doc } => Ok(contribution(binding, old_doc, Sign::Minus)?
-            .into_iter()
-            .collect()),
-        RowImages::Update { old_doc, new_doc } => {
-            let old_target = join_value_of(binding, old_doc);
-            let new_target = join_value_of(binding, new_doc);
-            match (old_target, new_target) {
-                // Same target: only the DIFFERENCE moves. Re-adding the new
-                // value in full is the double-count the old code shipped.
-                (Some(old_target), Some(new_target)) if old_target == new_target => {
-                    let delta = amount_of(binding, new_doc)? - amount_of(binding, old_doc)?;
-                    Ok(vec![SumDelta {
-                        join_value: new_target,
-                        delta,
-                    }])
-                }
-                // The join-key move: two targets, two writes, opposite signs.
-                (Some(old_target), Some(new_target)) => Ok(vec![
-                    SumDelta {
-                        join_value: old_target,
-                        delta: -amount_of(binding, old_doc)?,
-                    },
-                    SumDelta {
-                        join_value: new_target,
-                        delta: amount_of(binding, new_doc)?,
-                    },
-                ]),
-                // The row left the binding (its join column was cleared) or
-                // joined it (the column was set). One side only.
-                (Some(old_target), None) => Ok(vec![SumDelta {
-                    join_value: old_target,
-                    delta: -amount_of(binding, old_doc)?,
-                }]),
-                (None, Some(new_target)) => Ok(vec![SumDelta {
-                    join_value: new_target,
-                    delta: amount_of(binding, new_doc)?,
-                }]),
-                (None, None) => Ok(Vec::new()),
-            }
-        }
-    }
-}
-
-/// Which way a single-image contribution points.
-enum Sign {
-    Plus,
-    Minus,
-}
-
-/// The one delta a single row image contributes, or `None` when the row does
-/// not participate in the binding.
-fn contribution(
-    binding: &MaterializedSumBinding,
-    doc: &serde_json::Value,
-    sign: Sign,
-) -> crate::Result<Option<SumDelta>> {
-    let Some(join_value) = join_value_of(binding, doc) else {
-        return Ok(None);
+    let (old, new) = match images {
+        RowImages::Insert { new_doc } => (None, Some(*new_doc)),
+        RowImages::Delete { old_doc } => (Some(*old_doc), None),
+        RowImages::Update { old_doc, new_doc } => (Some(*old_doc), Some(*new_doc)),
     };
-    let amount = amount_of(binding, doc)?;
-    Ok(Some(SumDelta {
-        join_value,
-        delta: match sign {
-            Sign::Plus => amount,
-            Sign::Minus => -amount,
-        },
-    }))
-}
-
-/// The source row's join-key value, or `None` when the row does not carry one.
-///
-/// Delegates to the plane-neutral rule so the Control-Plane fold — which
-/// settles a cross-shard target's delta at plan time — cannot disagree with
-/// this one about which rows participate.
-fn join_value_of(binding: &MaterializedSumBinding, doc: &serde_json::Value) -> Option<String> {
-    crate::query::binding_join_value(binding, doc)
-}
-
-/// Evaluate the binding's value expression against one row image.
-///
-/// Plane-neutral, for the same reason [`join_value_of`] is: an amount computed
-/// differently on the two planes is a stored total that disagrees with the
-/// `SUM(...)` over the source rows.
-fn amount_of(binding: &MaterializedSumBinding, doc: &serde_json::Value) -> crate::Result<Decimal> {
-    crate::query::binding_amount(binding, doc)
+    Ok(crate::query::binding_image_deltas(binding, old, new)?
+        .into_iter()
+        .map(|entry| SumDelta {
+            join_value: entry.join_value,
+            delta: entry.delta,
+        })
+        .collect())
 }
 
 /// Convert a JSON value to `rust_decimal::Decimal`.

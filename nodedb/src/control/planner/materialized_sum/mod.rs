@@ -21,6 +21,7 @@ pub mod index;
 pub mod predicate;
 pub mod recon;
 pub mod resolve;
+pub mod settle;
 pub mod stored;
 
 pub use cross_shard::append_cross_shard_balance_tasks;

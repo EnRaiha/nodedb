@@ -53,10 +53,16 @@ impl NodeDbPgHandler {
         self.dispatch_calvin_multishard(
             tasks.to_vec(),
             tenant_id,
-            identity,
-            session_id,
-            result_formats,
-            auth,
+            super::calvin_dispatch::CalvinDispatchSession {
+                identity,
+                session_id,
+                result_formats,
+                auth,
+            },
+            // The implicit-edge recon gate fires before any materialized-sum
+            // settlement is reachable on this path, so there is no settled
+            // image read to carry.
+            &[],
         )
         .await
         .map(Some)

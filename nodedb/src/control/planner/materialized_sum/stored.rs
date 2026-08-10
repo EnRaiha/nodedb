@@ -47,7 +47,26 @@ use nodedb_types::Surrogate;
 use super::recon::recon_point_row;
 use super::resolve::lookup_join_value;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
+
+/// How a point-shaped write's POST-image is formed.
+///
+/// The four shapes form it four different ways, and the difference decides what
+/// a cross-shard balance is settled from — so it is spelled out rather than
+/// inferred from whether a body or an assignment list happens to be empty. An
+/// `ON CONFLICT DO UPDATE` with no assignment and a whole-row `PUT` are
+/// indistinguishable by that test, and they produce different post-images.
+pub(super) enum PostImage<'a> {
+    /// The row is removed; there is no post-image.
+    Removed,
+    /// The stored row with the statement's assignments applied.
+    Assigned,
+    /// The submitted body, replacing the stored row wholesale.
+    Body(&'a [u8]),
+    /// The submitted body when no row is stored, the stored row with the
+    /// conflict assignments applied when one is.
+    BodyOrAssigned(&'a [u8]),
+}
 
 /// The one stored row a point-shaped write rewrites or removes.
 pub(super) struct StoredRowScope<'a> {
@@ -63,6 +82,21 @@ pub(super) struct StoredRowScope<'a> {
     /// off. Empty for the shapes that carry no assignments — a delete, and a put
     /// whose post-image is the submitted body.
     pub updates: &'a [(String, UpdateValue)],
+    /// How this shape's post-image is formed.
+    pub post_image: PostImage<'a>,
+}
+
+/// What reading the stored row produced: the write's pre-/post-image pairs and
+/// the version they were read at.
+///
+/// The images come back from the SAME read that resolved the join values. A
+/// caller that re-read them would fold a different snapshot, and two snapshots
+/// is two totals.
+pub(super) struct StoredImages {
+    /// One pair per row this write touches — at most one, for a point shape.
+    pub images: Vec<(Option<serde_json::Value>, Option<serde_json::Value>)>,
+    /// The source collection's write floor at read time.
+    pub read_version_lsn: Lsn,
 }
 
 /// The stored row an op rewrites or removes, or `None` for every op that
@@ -92,6 +126,7 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
             document_id: document_id.as_str(),
             surrogate: *surrogate,
             updates: updates.as_slice(),
+            post_image: PostImage::Assigned,
         }),
         // A delete assigns nothing: the row's pre-image join value is the whole
         // of what it owes.
@@ -105,6 +140,7 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
             document_id: document_id.as_str(),
             surrogate: *surrogate,
             updates: &[],
+            post_image: PostImage::Removed,
         }),
         // A put replaces the row wholesale, so its post-image is the submitted
         // body — already resolved from the body — and the stored row is needed
@@ -113,27 +149,32 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
             collection,
             document_id,
             surrogate,
+            value,
             ..
         } => Some(StoredRowScope {
             collection: collection.as_str(),
             document_id: document_id.as_str(),
             surrogate: *surrogate,
             updates: &[],
+            post_image: PostImage::Body(value.as_slice()),
         }),
         // On the conflict branch an upsert's post-image is the stored row with
         // `on_conflict_updates` applied, so those assignments decide the target
-        // the row moves ONTO exactly as an update's `SET` does.
+        // the row moves ONTO exactly as an update's `SET` does. With no stored
+        // row it inserts instead, and the submitted body is the post-image.
         DocumentOp::Upsert {
             collection,
             document_id,
             surrogate,
             on_conflict_updates,
+            value,
             ..
         } => Some(StoredRowScope {
             collection: collection.as_str(),
             document_id: document_id.as_str(),
             surrogate: *surrogate,
             updates: on_conflict_updates.as_slice(),
+            post_image: PostImage::BodyOrAssigned(value.as_slice()),
         }),
         DocumentOp::PointInsert { .. }
         | DocumentOp::BatchInsert { .. }
@@ -157,13 +198,16 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
     }
 }
 
-/// Add every target the stored row addresses to `resolved`, leaving entries the
-/// caller already resolved from a carried body untouched.
+/// Add every target the stored row addresses to `resolved`, and return the
+/// write's pre-/post-image pairs so a CROSS-SHARD target's delta can be settled
+/// from the SAME read.
 ///
-/// A row that is not there resolves nothing: an upsert that inserts, and an
-/// update or delete whose key matches no row, rewrite no stored row and so owe
+/// A row that is not there resolves nothing for the shapes that need one: an
+/// update or delete whose key matches no row rewrites no stored row and so owes
 /// no target anything. That is the ordinary answer, not a failure — the write
-/// path reaches the same conclusion about the same absent row.
+/// path reaches the same conclusion about the same absent row. A put or upsert
+/// with no stored row still writes: it INSERTS, and its post-image is the
+/// submitted body, so it still owes its target the row's whole value.
 pub(super) async fn extend_with_stored_row(
     state: &SharedState,
     bindings: &Arc<Vec<MaterializedSumBinding>>,
@@ -172,8 +216,8 @@ pub(super) async fn extend_with_stored_row(
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<()> {
-    let Some(row) = recon_point_row(
+) -> crate::Result<StoredImages> {
+    let read = recon_point_row(
         state,
         tenant_id,
         database_id,
@@ -181,9 +225,17 @@ pub(super) async fn extend_with_stored_row(
         scope.document_id,
         scope.surrogate,
     )
-    .await?
-    else {
-        return Ok(());
+    .await?;
+
+    let outcome = StoredImages {
+        images: images_of(scope, read.rows.as_ref())?,
+        read_version_lsn: read.read_version_lsn,
+    };
+
+    let Some(row) = read.rows else {
+        // Nothing stored: the body-driven resolution already covers the only
+        // target such a write can address.
+        return Ok(outcome);
     };
 
     let rows = [row];
@@ -208,7 +260,42 @@ pub(super) async fn extend_with_stored_row(
             resolved.push((join_value, surrogate));
         }
     }
-    Ok(())
+    Ok(outcome)
+}
+
+/// The pre-/post-image pairs `scope` produces against `stored`.
+///
+/// One pair at most: a point write touches one row. An empty result is a write
+/// that rewrites nothing at all — an update or delete whose key matched no row.
+fn images_of(
+    scope: &StoredRowScope<'_>,
+    stored: Option<&serde_json::Value>,
+) -> crate::Result<Vec<(Option<serde_json::Value>, Option<serde_json::Value>)>> {
+    let assigned =
+        |old: &serde_json::Value| crate::query::apply_update_assignments(old, scope.updates);
+    Ok(match (&scope.post_image, stored) {
+        (PostImage::Removed, Some(old)) => vec![(Some(old.clone()), None)],
+        (PostImage::Assigned, Some(old)) => vec![(Some(old.clone()), Some(assigned(old)?))],
+        (PostImage::Body(body), Some(old)) => {
+            vec![(Some(old.clone()), decode_body(body))]
+        }
+        (PostImage::Body(body), None) => vec![(None, decode_body(body))],
+        (PostImage::BodyOrAssigned(_), Some(old)) => {
+            vec![(Some(old.clone()), Some(assigned(old)?))]
+        }
+        (PostImage::BodyOrAssigned(body), None) => vec![(None, decode_body(body))],
+        // Nothing stored and nothing submitted: the write rewrites no row.
+        (PostImage::Removed | PostImage::Assigned, None) => Vec::new(),
+    })
+}
+
+/// Decode a submitted MessagePack body.
+///
+/// A body that will not decode carries no column any binding can read, so it
+/// contributes no delta — the same conclusion the Data-Plane hook reaches for a
+/// submitted body it cannot decode.
+fn decode_body(body: &[u8]) -> Option<serde_json::Value> {
+    nodedb_types::json_from_msgpack(body).ok()
 }
 
 #[cfg(test)]

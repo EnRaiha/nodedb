@@ -51,6 +51,18 @@ fn meter_calvin_task(
     meter_dispatch(state, &scope, &info, None);
 }
 
+/// Who issued the statement and how its rows must be encoded back.
+///
+/// Bundled because these four are the connection's identity, not parameters of
+/// the dispatch: they are looked up together at the call site and travel
+/// unchanged through every branch below.
+pub(super) struct CalvinDispatchSession<'a> {
+    pub identity: &'a AuthenticatedIdentity,
+    pub session_id: SessionId,
+    pub result_formats: &'a [pgwire::api::results::FieldFormat],
+    pub auth: &'a crate::control::security::auth_context::AuthContext,
+}
+
 impl NodeDbPgHandler {
     /// Drive Calvin strict multi-shard dispatch for the given task set.
     ///
@@ -61,11 +73,15 @@ impl NodeDbPgHandler {
         &self,
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
-        identity: &AuthenticatedIdentity,
-        session_id: SessionId,
-        result_formats: &[pgwire::api::results::FieldFormat],
-        auth: &crate::control::security::auth_context::AuthContext,
+        session: CalvinDispatchSession<'_>,
+        reads: &[crate::control::server::shared::session::read_set::ReadSetEntry],
     ) -> PgWireResult<Vec<Response>> {
+        let CalvinDispatchSession {
+            identity,
+            session_id,
+            result_formats,
+            auth,
+        } = session;
         let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
         let tx_state = self.sessions.transaction_state(session_id);
         let database_id = self
@@ -137,7 +153,7 @@ impl NodeDbPgHandler {
                 tenant_id,
                 cross_shard_mode,
                 position,
-                &[],
+                reads,
                 None,
             )
             .await

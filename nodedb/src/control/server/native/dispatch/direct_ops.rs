@@ -266,17 +266,23 @@ pub(crate) async fn handle_direct_op(
             return error_to_native(seq, &e);
         }
 
-        if let Err(e) = crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
-            ctx.state,
-            &mut tasks,
-            tenant_id,
-            ctx.database_id(),
-            TraceId::ZERO,
-        )
-        .await
-        {
-            return error_to_native(seq, &e);
-        }
+        // The entries cover the row images every cross-shard balance this pass
+        // settled was folded from; they travel on the dispatch read-set so
+        // Calvin's OCC check aborts rather than committing a total folded from
+        // an image that has since moved.
+        let sum_target_reads =
+            match crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+                ctx.state,
+                &mut tasks,
+                tenant_id,
+                ctx.database_id(),
+                TraceId::ZERO,
+            )
+            .await
+            {
+                Ok(reads) => reads,
+                Err(e) => return error_to_native(seq, &e),
+            };
 
         // Follows the resolution: it consumes the surrogates that pass bound,
         // and issues no lookup of its own.
@@ -329,8 +335,13 @@ pub(crate) async fn handle_direct_op(
         // returning the document task's response. Local WAL durability for the
         // single-shard path is handled inside `dispatch_single_task`.
         let _request = ctx.state.tenant_request_guard(tenant_id);
-        // Autocommit direct-ops dispatch: no session read-set to widen with.
-        match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
+        // Autocommit direct-ops dispatch: the only reads to widen with are the
+        // ones the materialized-sum settlement stamped on the source rows its
+        // shipped balances were folded from.
+        match classify_dispatch(
+            &tasks,
+            &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
+        ) {
             DispatchClass::MultiShard { .. } => {
                 match dispatch_authorized_tasks_to_calvin(
                     ctx.state,
@@ -338,7 +349,7 @@ pub(crate) async fn handle_direct_op(
                     tenant_id,
                     CrossShardTxnMode::Strict,
                     TxnDispatchPosition::Autocommit,
-                    &[],
+                    &sum_target_reads,
                     None,
                 )
                 .await

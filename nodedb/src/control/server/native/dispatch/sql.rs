@@ -270,6 +270,10 @@ async fn execute_planned(
     let output_schema = admission.output_schema;
     let mut authorized_tasks = admission.authorized_tasks;
     let mut lease_scope = Some(admission.lease_scope);
+    // Covers the images every cross-shard materialized-sum balance in `tasks`
+    // was settled from, so Calvin's OCC check aborts rather than committing a
+    // total folded from an image that has since moved.
+    let sum_target_reads = admission.sum_target_reads;
 
     if tasks.is_empty() {
         return resp(NativeResponse::status_row(seq, "OK"));
@@ -294,7 +298,10 @@ async fn execute_planned(
     // sequencer so it commits atomically. Single-shard (and best-effort) keep
     // the existing per-task gateway/SPSC dispatch loop below unchanged.
     // Autocommit single-statement dispatch: no session read-set to widen with.
-    match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
+    match classify_dispatch(
+        &tasks,
+        &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
+    ) {
         DispatchClass::SingleShard { .. } => {}
         DispatchClass::MultiShard { .. } => {
             // Reject a cross-shard write inside an explicit transaction block,
@@ -320,7 +327,7 @@ async fn execute_planned(
                     ctx.tenant_id(),
                     cross_shard_mode,
                     TxnDispatchPosition::Autocommit,
-                    &[],
+                    &sum_target_reads,
                     None,
                 )
                 .await

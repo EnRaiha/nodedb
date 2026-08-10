@@ -163,15 +163,20 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     .await
     .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
-    crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
-        state,
-        &mut tasks,
-        tenant_id,
-        database_id,
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|error| ddl_err("XX000", error.to_string()))?;
+    // The entries cover the row images every cross-shard balance this pass
+    // settled was folded from. They travel on the dispatch read-set so the
+    // Calvin OCC check aborts, before any row moves, if those images have been
+    // written since.
+    let sum_target_reads =
+        crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+            state,
+            &mut tasks,
+            tenant_id,
+            database_id,
+            TraceId::ZERO,
+        )
+        .await
+        .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
     crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
         state,
@@ -195,7 +200,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         && matches!(
             crate::control::planner::calvin::classify_dispatch(
                 &tasks,
-                &std::collections::BTreeSet::new(),
+                &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
             ),
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
         )
@@ -206,7 +211,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             tenant_id,
             crate::control::planner::calvin::CrossShardTxnMode::Strict,
             crate::control::planner::calvin::TxnDispatchPosition::Autocommit,
-            &[],
+            &sum_target_reads,
             None,
         )
         .await

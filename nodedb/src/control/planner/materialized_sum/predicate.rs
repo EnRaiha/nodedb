@@ -32,11 +32,23 @@ use std::sync::Arc;
 
 use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, UpdateValue};
 use nodedb_types::Surrogate;
+use nodedb_types::id::TxnId;
 
 use super::recon::recon_scan_rows;
 use super::resolve::{lookup_join_value, source_drives_bindings};
+use super::settle::{
+    SettleInput, Settlement, co_resident_join_values, omit_shipped, settle_cross_shard_images,
+};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
+
+/// What a predicate-driven statement does to each row it matches.
+enum PredicateEffect {
+    /// The rows are rewritten by the statement's assignments.
+    Assign,
+    /// The rows are removed.
+    Remove,
+}
 
 /// Everything the recon scan and the fold need from a predicate-driven plan.
 struct PredicateScope {
@@ -48,50 +60,96 @@ struct PredicateScope {
     /// column resolves the target it moves rows ONTO as well as the one it
     /// moves them off. Empty for the delete-shaped plans.
     updates: Vec<(String, UpdateValue)>,
+    /// What the statement does to each matched row, which decides the
+    /// post-image a cross-shard delta is folded against.
+    effect: PredicateEffect,
 }
 
-/// Resolve `op`'s materialized-sum targets when it is a predicate-driven write.
+/// Resolve `op`'s materialized-sum targets, and settle its cross-shard
+/// balances, when it is a predicate-driven write.
 ///
-/// Returns `Ok(true)` when `op` is one of those plans — whether or not its
+/// Returns `Ok(Some(..))` when `op` is one of those plans — whether or not its
 /// collection drives a binding — so the caller knows the op is accounted for and
-/// does not also run the body-driven pass over it. `Ok(false)` means `op` is not
+/// does not also run the body-driven pass over it. `Ok(None)` means `op` is not
 /// predicate-driven and the caller still owns it.
 pub(super) async fn resolve_predicate_sum_targets(
     state: &SharedState,
     op: &mut DocumentOp,
+    txn_id: Option<TxnId>,
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<bool> {
+) -> crate::Result<Option<Settlement>> {
     let Some(scope) = predicate_scope(op) else {
-        return Ok(false);
+        return Ok(None);
     };
     // The gate, before any scan: a collection driving nothing pays nothing.
     let Some(bindings) = source_drives_bindings(state, &scope.collection, tenant_id, database_id)?
     else {
-        return Ok(true);
+        return Ok(Some(Settlement::empty()));
     };
 
-    let rows = recon_scan_rows(
+    let read = recon_scan_rows(
         state,
         tenant_id,
         database_id,
         &scope.collection,
-        scope.filters,
+        // Cloned rather than moved: `scope` is still needed below to fold the
+        // images from this same scan, and a filter blob is negligible beside the
+        // scan it drives.
+        scope.filters.clone(),
     )
     .await?;
-    let resolved = resolve_scanned_rows(
+    let mut resolved = resolve_scanned_rows(
         state,
         &bindings,
         &scope.updates,
-        &rows,
+        &read.rows,
         tenant_id,
         database_id,
         trace_id,
     )
     .await?;
+
+    // Folded from the SAME scan the resolution came from: a second scan would
+    // see a different snapshot, and two snapshots is two totals.
+    let images = predicate_images(&scope, &read.rows)?;
+    let input = SettleInput {
+        source_collection: &scope.collection,
+        images: &images,
+        // A predicate names its rows by content, not by identity, so the
+        // observation this settlement rests on is the whole collection: a row
+        // that JOINS the match set after the scan has to invalidate it too.
+        source_row: None,
+        read_version_lsn: read.read_version_lsn,
+    };
+    let settlement =
+        settle_cross_shard_images(&bindings, &input, &resolved, txn_id, tenant_id, database_id)?;
+    omit_shipped(
+        &mut resolved,
+        &settlement.shipped,
+        &co_resident_join_values(&bindings, &input, database_id)?,
+    );
     set_predicate_resolution(op, resolved);
-    Ok(true)
+    Ok(Some(settlement))
+}
+
+/// The pre-/post-image pair each matched row produces.
+fn predicate_images(
+    scope: &PredicateScope,
+    rows: &[serde_json::Value],
+) -> crate::Result<Vec<(Option<serde_json::Value>, Option<serde_json::Value>)>> {
+    let mut images = Vec::with_capacity(rows.len());
+    for row in rows {
+        images.push(match scope.effect {
+            PredicateEffect::Remove => (Some(row.clone()), None),
+            PredicateEffect::Assign => (
+                Some(row.clone()),
+                Some(crate::query::apply_update_assignments(row, &scope.updates)?),
+            ),
+        });
+    }
+    Ok(images)
 }
 
 /// Resolve every join value the scanned rows need into its target row's
@@ -149,6 +207,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
             collection: collection.clone(),
             filters: filters.clone(),
             updates: updates.clone(),
+            effect: PredicateEffect::Assign,
         }),
         DocumentOp::BulkDelete {
             collection,
@@ -158,6 +217,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
             collection: collection.clone(),
             filters: filters.clone(),
             updates: Vec::new(),
+            effect: PredicateEffect::Remove,
         }),
         // TRUNCATE removes every row, so it carries no filter — the empty
         // filter set is exactly "every row" to the recon scan.
@@ -165,6 +225,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
             collection: collection.clone(),
             filters: Vec::new(),
             updates: Vec::new(),
+            effect: PredicateEffect::Remove,
         }),
         DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }

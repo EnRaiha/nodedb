@@ -10,7 +10,11 @@ use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::Surrogate;
 
 use super::extract::join_value_from_body;
+use super::settle::{
+    SettleInput, co_resident_join_values, omit_shipped, settle_cross_shard_images,
+};
 use super::stored::stored_row_scope;
+use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::server::surrogate_exchange::lookup_surrogate_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
@@ -38,37 +42,60 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 ///
 /// A collection that drives no binding — nearly all of them — costs one cached
 /// index probe and nothing else: no catalog read, no surrogate lookup.
+///
+/// # What this pass also appends
+///
+/// A binding whose TARGET does not share the source's vShard cannot be applied
+/// inside the source write's transaction — that transaction belongs to the
+/// source's core, which owns none of the target's rows. For the shapes whose
+/// delta is a difference between two images, this pass folds the images it just
+/// read and appends an
+/// [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)
+/// task per settled balance, homed on the target. See [`super::settle`] for why
+/// the deferral is recorded by REMOVING the join value from the source op's
+/// resolution rather than by a marker of its own.
+///
+/// The returned [`ReadSetEntry`]s cover the images those deltas were folded
+/// from. The caller must union them into the dispatch read-set: they are what
+/// makes the Calvin OCC check abort the statement, before any row moves, when
+/// the source rows have been written since the fold.
 pub async fn resolve_materialized_sum_targets(
     state: &SharedState,
-    tasks: &mut [PhysicalTask],
+    tasks: &mut Vec<PhysicalTask>,
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<ReadSetEntry>> {
     let schema_version = state.schema_version.current();
     let catalog = state.credentials.catalog();
+    let mut appended: Vec<PhysicalTask> = Vec::new();
+    let mut reads: Vec<ReadSetEntry> = Vec::new();
 
     for task in tasks.iter_mut() {
+        let txn_id = task.txn_id;
         let PhysicalPlan::Document(op) = &mut task.plan else {
             continue;
         };
-        // Predicate-driven plans resolve from their own recon scan and are
-        // accounted for by that call; the body-driven path below never sees
+        // Predicate-driven plans resolve from their own recon scan and settle
+        // their own cross-shard balances; the body-driven path below never sees
         // them.
-        if super::predicate::resolve_predicate_sum_targets(
+        if let Some(settlement) = super::predicate::resolve_predicate_sum_targets(
             state,
             op,
+            txn_id,
             tenant_id,
             database_id,
             trace_id,
         )
         .await?
         {
+            appended.extend(settlement.tasks);
+            reads.extend(settlement.reads);
             continue;
         }
         // The read of `op` is scoped so the borrows the two classifications hold
         // end before the resolution is written back through `&mut op`.
-        let resolved = {
+        let outcome = {
             let carried = value_carrying(op);
             let stored = stored_row_scope(op);
             // The two classifications name the same collection when both apply;
@@ -102,24 +129,60 @@ pub async fn resolve_materialized_sum_targets(
                 }
                 None => Vec::new(),
             };
-            if let Some(scope) = &stored {
-                super::stored::extend_with_stored_row(
-                    state,
-                    &bindings,
-                    scope,
-                    &mut resolved,
-                    tenant_id,
-                    database_id,
-                    trace_id,
-                )
-                .await?;
+            // A point write that rewrites a stored row reads it here — for the
+            // join values it addresses AND for the pre-image a cross-shard
+            // delta is folded from. One read, one snapshot: settling from a
+            // second read would total a different one.
+            match &stored {
+                None => (resolved, None),
+                Some(scope) => {
+                    let images = super::stored::extend_with_stored_row(
+                        state,
+                        &bindings,
+                        scope,
+                        &mut resolved,
+                        tenant_id,
+                        database_id,
+                        trace_id,
+                    )
+                    .await?;
+                    let input = SettleInput {
+                        source_collection: collection,
+                        images: &images.images,
+                        source_row: Some(scope.surrogate),
+                        read_version_lsn: images.read_version_lsn,
+                    };
+                    let settlement = settle_cross_shard_images(
+                        &bindings,
+                        &input,
+                        &resolved,
+                        txn_id,
+                        tenant_id,
+                        database_id,
+                    )?;
+                    // The resolution the source op keeps is the one the source
+                    // core may still apply. Removing the shipped values IS the
+                    // deferral: what is left resolved is exactly what no
+                    // sibling task carries.
+                    omit_shipped(
+                        &mut resolved,
+                        &settlement.shipped,
+                        &co_resident_join_values(&bindings, &input, database_id)?,
+                    );
+                    (resolved, Some(settlement))
+                }
             }
-            resolved
         };
+        let (resolved, settlement) = outcome;
         set_resolved(op, resolved);
+        if let Some(settlement) = settlement {
+            appended.extend(settlement.tasks);
+            reads.extend(settlement.reads);
+        }
     }
 
-    Ok(())
+    tasks.extend(appended);
+    Ok(reads)
 }
 
 /// The `(collection, bodies)` of a write op that carries row bodies, or `None`

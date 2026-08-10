@@ -45,7 +45,7 @@ impl NodeDbPgHandler {
             .sessions
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        let (tasks, output_schema, auth_ctx, plan_lease_scope) =
+        let (tasks, output_schema, auth_ctx, plan_lease_scope, sum_target_reads) =
             retry_on_schema_change(move || async move {
                 let (mut tasks, output_schema, versions, auth_ctx) = self
                     .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
@@ -75,15 +75,20 @@ impl NodeDbPgHandler {
                 // Materialized-sum target rows are resolved here for the same
                 // reason: the PK→surrogate map lives in the catalog redb, which
                 // is Control-Plane state.
-                crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
-                    &self.state,
-                    &mut tasks,
-                    tenant_id,
-                    edge_database_id,
-                    crate::types::TraceId::ZERO,
-                )
-                .await
-                .map_err(StatementSetupError::from)?;
+                // The entries cover the row images every cross-shard balance
+                // this pass settled was folded from; they travel on the
+                // dispatch read-set so Calvin's OCC check aborts rather than
+                // committing a total folded from an image that has moved.
+                let sum_target_reads =
+                    crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+                        &self.state,
+                        &mut tasks,
+                        tenant_id,
+                        edge_database_id,
+                        crate::types::TraceId::ZERO,
+                    )
+                    .await
+                    .map_err(StatementSetupError::from)?;
 
                 // A target that does not share the source's vShard cannot ride
                 // the source write's transaction, so its balance is appended as
@@ -109,7 +114,13 @@ impl NodeDbPgHandler {
                     .acquire_plan_lease_scope(&versions)
                     .map_err(StatementSetupError::from)?;
 
-                Ok::<_, StatementSetupError>((tasks, output_schema, auth_ctx, plan_lease_scope))
+                Ok::<_, StatementSetupError>((
+                    tasks,
+                    output_schema,
+                    auth_ctx,
+                    plan_lease_scope,
+                    sum_target_reads,
+                ))
             })
             .await
             .map_err(PgWireError::from)?;
@@ -179,8 +190,11 @@ impl NodeDbPgHandler {
         }
 
         let tx_state = self.sessions.transaction_state(session_id);
-        // Autocommit statement routing: no session read-set to widen with.
-        match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
+        // Autocommit statement routing: the only reads to widen with are the
+        // ones the materialized-sum settlement stamped on the source rows its
+        // shipped balances were folded from.
+        let sum_read_vshards = crate::control::planner::calvin::read_vshards_of(&sum_target_reads);
+        match classify_dispatch(&tasks, &sum_read_vshards) {
             DispatchClass::SingleShard { .. } => {
                 // A single-shard dependent-predicate write (e.g. `DELETE ...
                 // WHERE <non-pk>`) doesn't need OLLP/Calvin: one shard is one
@@ -208,10 +222,13 @@ impl NodeDbPgHandler {
                         .dispatch_calvin_multishard(
                             tasks,
                             tenant_id,
-                            identity,
-                            session_id,
-                            shaping.formats,
-                            &auth_ctx,
+                            super::calvin_dispatch::CalvinDispatchSession {
+                                identity,
+                                session_id,
+                                result_formats: shaping.formats,
+                                auth: &auth_ctx,
+                            },
+                            &sum_target_reads,
                         )
                         .await;
                 }

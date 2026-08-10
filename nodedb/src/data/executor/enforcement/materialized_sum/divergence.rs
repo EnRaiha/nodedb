@@ -31,6 +31,18 @@
 //! the guard is coverage — every join value the matched rows require must be
 //! present — which fires on exactly the drift that corrupts a total and never on
 //! drift that cannot.
+//!
+//! # Coverage is demanded only of the bindings THIS core applies
+//!
+//! A binding whose target does not share the source's vShard is applied by a
+//! sibling `ApplyBalanceDelta` task, and the Control Plane records that by
+//! REMOVING its join values from the resolution. Those values are missing on
+//! purpose, so checking them would report a divergence every single time and
+//! the coordinator would re-recon, resolve, remove them again, and resubmit
+//! forever. They are covered instead by the settlement's own read-set entry,
+//! which this core validates through the ordinary Calvin OCC path — same
+//! "abort before any mutation" contract, on the images the shipped deltas were
+//! actually folded from.
 
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::Surrogate;
@@ -79,6 +91,24 @@ impl CoreLoop {
             return false;
         };
         for binding in &config.enforcement.materialized_sum_sources {
+            // A CROSS-SHARD binding's join values are deliberately ABSENT from
+            // the resolution: the Control Plane settled their deltas at plan
+            // time and removed them, which is how this core knows not to apply
+            // them itself. Demanding coverage for them would report every such
+            // statement as diverged, and the coordinator would re-recon and
+            // resubmit a plan that omits them again — a livelock, not a retry.
+            //
+            // Their drift is caught by the settlement's own OCC read-set entry
+            // instead: the images the shipped deltas were folded from are
+            // stamped as a read, and this core votes ABORT before any mutation
+            // if they have moved.
+            if !crate::query::sum_target_is_co_resident(
+                DatabaseId::new(check.database_id),
+                check.collection,
+                &binding.target_collection,
+            ) {
+                continue;
+            }
             // An assignment that will not evaluate fails the statement in the
             // write path, on the same row and with the same typed error. It is
             // not a prediction drift, so it must not be reported as one — a

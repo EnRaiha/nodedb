@@ -26,11 +26,27 @@
 //! Control Plane can settle such a binding's delta at plan time it appends an
 //! [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)
 //! task homed on the target's vShard, dual-homed with the source write through
-//! Calvin, and names that binding on the plan's deferral list. A named binding
-//! is skipped here, so the delta is applied exactly once. The list is read, not
-//! re-derived: a second derivation of "did the Control Plane defer this?" is
-//! free to disagree with the first, and disagreement is a double-counted or a
-//! dropped balance.
+//! Calvin. Two things say so here, and between them the delta is applied
+//! exactly once:
+//!
+//! * an INSERT-shaped write names the binding on the plan's deferral list, and
+//!   a named binding is skipped;
+//! * every other shape's balance is settled from row IMAGES, and the settlement
+//!   REMOVES the join value from the plan's resolution — so a cross-shard
+//!   target with no resolved surrogate is one somebody else is applying.
+//!
+//! Neither is re-derived: a second derivation of "did the Control Plane defer
+//! this?" is free to disagree with the first, and disagreement is a
+//! double-counted or a dropped balance. Only the co-residency question is asked
+//! on both planes, and it is asked through the one plane-neutral function
+//! ([`sum_target_is_co_resident`](crate::query::sum_target_is_co_resident))
+//! that exists so the two answers cannot differ.
+//!
+//! A cross-shard target the plan DOES resolve is still applied here: the
+//! Control-Plane orchestrators (`MERGE`, `UPDATE ... FROM`, `INSERT ... SELECT`,
+//! and the staged-transaction expanders) resolve their rows and dispatch their
+//! own concrete work without appending a sibling balance task, so for them the
+//! resolution still means "this transaction owns it".
 //!
 //! # Identity comes from the plan, never from a store probe
 //!
@@ -60,6 +76,7 @@ use super::rmw::BalanceRmw;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::images::{EnforcementCtx, RowImages};
 use crate::data::executor::handlers::point::apply_put::PointPutOutcome;
+use crate::types::DatabaseId;
 
 /// A target row this write updated, captured so a transactional caller can
 /// reverse it.
@@ -109,6 +126,16 @@ impl CoreLoop {
     ) -> crate::Result<Vec<TargetWrite>> {
         let mut writes: Vec<TargetWrite> = Vec::new();
         for binding in bindings {
+            // Whether one core owns both rows. The Control Plane asked the SAME
+            // question, from the same plane-neutral function, when it decided
+            // whether the balance could ride this transaction — so the two
+            // cannot disagree about which bindings this core is responsible
+            // for.
+            let co_resident = crate::query::sum_target_is_co_resident(
+                DatabaseId::new(ctx.database_id),
+                ctx.collection,
+                &binding.target_collection,
+            );
             // A binding the plan DEFERRED is applied by its own
             // `ApplyBalanceDelta` task on the target's core. Applying it here as
             // well would double-count it — and this transaction belongs to the
@@ -130,6 +157,23 @@ impl CoreLoop {
                 // read-modify-write would rewrite the row byte-for-byte. An
                 // UPDATE that touched no amount produces exactly this.
                 if delta == Decimal::ZERO {
+                    continue;
+                }
+                // A cross-shard target the plan carries NO resolution for was
+                // settled at plan time and travels on its own
+                // `ApplyBalanceDelta` task, homed where the target's rows
+                // actually live. Applying it here would count it twice — and
+                // this transaction belongs to the source's core, so the row it
+                // wrote would land in a store no reader of the target
+                // collection consults.
+                //
+                // The absence of the resolution IS the instruction; nothing is
+                // re-derived. A cross-shard target the plan DID resolve was
+                // resolved by a Control-Plane orchestrator that ships no
+                // sibling task — `MERGE`, `UPDATE ... FROM`, `INSERT ... SELECT`
+                // and the staged-transaction expanders all dispatch their own
+                // concrete work — so it is still this transaction's to apply.
+                if !co_resident && resolved_target(ctx, &join_value).is_none() {
                     continue;
                 }
                 match self.apply_one_delta(txn, ctx, binding, &join_value, delta) {
@@ -244,15 +288,24 @@ mod tests {
     };
     use crate::data::executor::strict_format;
     use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
-    use crate::types::{DatabaseId, TenantId};
+    use crate::types::TenantId;
     use nodedb_physical::physical_plan::StorageMode;
     use nodedb_types::Value;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
 
     const DB: u64 = 0;
     const TID: u64 = 1;
-    const SOURCE: &str = "ms_entries";
-    const TARGET: &str = "ms_accounts";
+    /// The source collection. Every test below drives the INLINE fold, whose
+    /// entire premise is that one core owns both rows: the target is seeded into
+    /// and read back out of THIS core's own store, which is only a meaningful
+    /// assertion when the two collections are co-resident.
+    const SOURCE: &str = "local_charges";
+    /// A target that shares `SOURCE`'s vShard — asserted by
+    /// [`the_local_fixture_is_co_resident`], not assumed.
+    const TARGET: &str = "local_balances";
+    /// A target that does NOT share `SOURCE`'s vShard, for the one test that
+    /// pins the opposite rule.
+    const REMOTE_TARGET: &str = "remote_balances";
     const ACCOUNT: &str = "a1";
     const TARGET_SURROGATE: Surrogate = Surrogate(4242);
 
@@ -267,9 +320,9 @@ mod tests {
         .expect("schema")
     }
 
-    fn binding() -> MaterializedSumBinding {
+    fn binding_onto(target: &str) -> MaterializedSumBinding {
         MaterializedSumBinding {
-            target_collection: TARGET.to_string(),
+            target_collection: target.to_string(),
             target_column: "balance".to_string(),
             join_column: "account_id".to_string(),
             value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
@@ -278,11 +331,37 @@ mod tests {
 
     /// Register the source collection so the funnel finds the binding on it.
     fn register_source(core: &mut CoreLoop) {
+        register_source_onto(core, TARGET);
+    }
+
+    /// Register the source collection with a binding onto `target`.
+    fn register_source_onto(core: &mut CoreLoop, target: &str) {
         let mut config = CollectionConfig::new(SOURCE);
-        config.enforcement.materialized_sum_sources = vec![binding()];
+        config.enforcement.materialized_sum_sources = vec![binding_onto(target)];
         core.doc_configs.insert(
             (DatabaseId::DEFAULT, TenantId::new(TID), SOURCE.to_string()),
             config,
+        );
+    }
+
+    /// The premise every other test in this module rests on.
+    ///
+    /// The inline fold writes the target row inside the SOURCE write's
+    /// transaction, on the source's core — and each core opens its own document
+    /// store, so that write is only visible to a reader of the target collection
+    /// when both collections home to the same vShard. Asserted rather than
+    /// assumed: a change to the collection hash that silently made this pair
+    /// cross-shard would otherwise turn every assertion below into a test of the
+    /// DEFERRED path wearing the inline path's name.
+    #[test]
+    fn the_local_fixture_is_co_resident() {
+        assert!(
+            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            "'{SOURCE}' and '{TARGET}' must share a vShard for the inline fold to be observable"
+        );
+        assert!(
+            !crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, REMOTE_TARGET),
+            "'{REMOTE_TARGET}' must NOT share '{SOURCE}'s vShard; it pins the deferred path"
         );
     }
 
@@ -480,6 +559,12 @@ mod tests {
     /// A join value the plan carries no resolution for fails the write with the
     /// INTERNAL error, not the user-facing "target not found".
     ///
+    /// CO-RESIDENT, and that is load-bearing: a co-resident binding is one this
+    /// core applies itself, so nothing ever removes its join values from the
+    /// resolution and an absent one can only mean the plan is short. The
+    /// cross-shard half of the rule is
+    /// [`an_unresolved_cross_shard_target_is_deferred_rather_than_refused`].
+    ///
     /// Nothing here says the target row is missing — the plan simply never
     /// carried its identity. A replica re-executing a write the leader accepted
     /// hits exactly this shape when the resolution fails to reach it, and
@@ -529,5 +614,85 @@ mod tests {
                  got {other:?}"
             ),
         }
+    }
+
+    /// The MIRROR of the test above, and the rule that makes it precise: for a
+    /// CROSS-SHARD binding an absent resolution is not a shortfall at all — it
+    /// is how the Control Plane says "this one travels on its own task".
+    ///
+    /// Residency is what separates the two, and it separates them totally. A
+    /// co-resident binding is never omitted from the resolution, so absent means
+    /// the plan is short and the write must refuse. A cross-shard binding is
+    /// always omitted once it has been settled, so absent means somebody else is
+    /// applying it and this core must stand down. There is no third state for
+    /// the check to guess at.
+    ///
+    /// Standing down has to be silent AND total: refusing would fail a write the
+    /// Control Plane deliberately split, and applying would put the balance in
+    /// this core's store — which no reader of the target collection opens — and
+    /// then count it a second time when the sibling task ran.
+    #[test]
+    fn an_unresolved_cross_shard_target_is_deferred_rather_than_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        core.doc_configs.insert(
+            (
+                DatabaseId::DEFAULT,
+                TenantId::new(TID),
+                REMOTE_TARGET.to_string(),
+            ),
+            CollectionConfig::new(REMOTE_TARGET),
+        );
+        register_source_onto(&mut core, REMOTE_TARGET);
+
+        // Seeded so that an accidental apply would be VISIBLE as a moved total
+        // rather than failing on an absent row and looking like a refusal.
+        let target_key = surrogate_to_doc_id(TARGET_SURROGATE);
+        let seed = serde_json::json!({"id": ACCOUNT, "balance": "100"});
+        core.sparse
+            .put(
+                DB,
+                TID,
+                REMOTE_TARGET,
+                &target_key,
+                &doc_format::encode_to_msgpack(&seed),
+            )
+            .expect("seed target row");
+
+        let new_doc = serde_json::json!({"account_id": ACCOUNT, "amount": 5});
+        let txn = core.sparse.begin_write().expect("begin write");
+        let outcome: WriteEnforcementOutcome = run_write_enforcement(
+            &mut core,
+            &txn,
+            EnforcementCtx {
+                database_id: DB,
+                tid: TID,
+                collection: SOURCE,
+                // Empty: the Control Plane settled this binding and removed the
+                // join value when it appended the sibling balance task.
+                resolved_targets: &[],
+                deferred_sum_targets: &[],
+                wal_lsn: None,
+            },
+            RowImages::Insert { new_doc: &new_doc },
+        )
+        .expect("a settled cross-shard binding must not fail the source write");
+        assert!(
+            outcome.target_writes.is_empty(),
+            "the balance travels on its own task; this core must write no target row"
+        );
+        txn.commit().expect("commit");
+
+        let stored = core
+            .sparse
+            .get(DB, TID, REMOTE_TARGET, &target_key)
+            .expect("read back")
+            .expect("row must still exist");
+        let decoded = doc_format::decode_document(&stored).expect("decode");
+        assert_eq!(
+            decoded.get("balance").and_then(|v| v.as_str()),
+            Some("100"),
+            "the total must be untouched here — the sibling task owns it"
+        );
     }
 }

@@ -29,14 +29,34 @@ use nodedb_types::Surrogate;
 
 const DB: u64 = 0;
 const TID: u64 = 1;
-const SOURCE: &str = "entries";
-const TARGET: &str = "accounts";
+/// The collection that drives the binding.
+const SOURCE: &str = "point_txns";
+/// The collection whose `balance` the binding maintains, sharing `SOURCE`'s
+/// vShard.
+///
+/// Every test here asserts the INLINE fold: the target row is seeded into, and
+/// read back out of, the SOURCE core's own document store. Each core opens its
+/// own store, so that assertion only means anything when one core owns both
+/// rows — and a cross-shard binding is deliberately not applied inline at all.
+/// [`the_fixture_is_co_resident`] asserts the pair rather than trusting the
+/// collection hash to keep producing it.
+const TARGET: &str = "point_holders";
 const A1: &str = "a1";
 const A2: &str = "a2";
 const T1: Surrogate = Surrogate(4001);
 const T2: Surrogate = Surrogate(4002);
 
-/// `SUM(amount)` per `account_id`, materialized onto `accounts.balance`.
+/// The premise every test below rests on.
+#[test]
+fn the_fixture_is_co_resident() {
+    assert!(
+        crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+        "'{SOURCE}' and '{TARGET}' must share a vShard: a cross-shard binding's balance \
+         travels on its own task and is never folded into the source write's transaction"
+    );
+}
+
+/// `SUM(amount)` per `account_id`, materialized onto the target's `balance`.
 fn binding() -> MaterializedSumBinding {
     MaterializedSumBinding {
         target_collection: TARGET.to_string(),

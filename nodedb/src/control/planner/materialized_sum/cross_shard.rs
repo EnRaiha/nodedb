@@ -40,13 +40,12 @@
 
 use rust_decimal::Decimal;
 
-use nodedb_physical::physical_plan::{DocumentOp, MaterializedSumBinding, PhysicalPlan};
-use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::Surrogate;
 
 use crate::control::state::SharedState;
-use crate::engine::document::store::surrogate_to_doc_id;
-use crate::query::{db_qualified, sum_target_is_co_resident, sum_target_vshard};
+use crate::query::sum_target_is_co_resident;
 use crate::types::{DatabaseId, TenantId};
 
 /// One balance write this pass decided to ship on its own task.
@@ -120,15 +119,15 @@ pub fn append_cross_shard_balance_tasks(
                 })?;
                 for_task.push(AppendedDelta {
                     binding_target: binding.target_collection.clone(),
-                    task: balance_task(
-                        task,
+                    task: super::settle::balance_task(super::settle::BalanceTaskSpec {
+                        txn_id: task.txn_id,
                         database_id,
                         tenant_id,
                         binding,
                         surrogate,
                         join_value,
                         delta,
-                    ),
+                    }),
                 });
             }
         }
@@ -148,40 +147,6 @@ pub fn append_cross_shard_balance_tasks(
     }
 
     Ok(())
-}
-
-/// Build the balance task, homed on the TARGET collection's vShard.
-///
-/// `txn_id` is inherited from the source task: the balance belongs to the same
-/// statement, and a task that lost the transaction would commit on its own.
-fn balance_task(
-    source: &PhysicalTask,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
-    binding: &MaterializedSumBinding,
-    surrogate: Surrogate,
-    join_value: String,
-    delta: Decimal,
-) -> PhysicalTask {
-    PhysicalTask {
-        tenant_id,
-        vshard_id: sum_target_vshard(database_id, &binding.target_collection),
-        database_id,
-        plan: PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
-            collection: db_qualified(database_id, &binding.target_collection),
-            document_id: surrogate_to_doc_id(surrogate),
-            surrogate,
-            column: binding.target_column.clone(),
-            // The exact decimal, as a string: the balance is stored as one for
-            // the same reason, and `f64` loses precision past 15 significant
-            // digits.
-            delta: delta.to_string(),
-            join_column: binding.join_column.clone(),
-            join_value,
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: source.txn_id,
-    }
 }
 
 /// A write whose materialized-sum delta the PLAN already determines: its source

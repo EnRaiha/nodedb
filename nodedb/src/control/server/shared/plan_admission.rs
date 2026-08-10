@@ -42,6 +42,15 @@ pub struct PlanAdmission {
     pub authorized_tasks: AuthorizedTaskSet,
     /// Descriptor lease holds; must stay alive for the whole execution.
     pub lease_scope: crate::control::lease::QueryLeaseScope,
+    /// Read-set entries covering the row images every CROSS-SHARD
+    /// materialized-sum balance in `tasks` was settled from.
+    ///
+    /// The caller must union these into the read-set it dispatches with. They
+    /// are what makes the Calvin OCC check abort the statement — before any row
+    /// moves — when the images a shipped balance was folded from have been
+    /// written since. Empty for every statement that settled no cross-shard
+    /// balance, which is every statement on a collection with no binding.
+    pub sum_target_reads: Vec<crate::control::server::shared::session::read_set::ReadSetEntry>,
 }
 
 /// Inputs for [`plan_authorize_and_admit`].
@@ -116,14 +125,15 @@ async fn plan_authorize_and_admit_once(
     )
     .await?;
 
-    crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
-        state,
-        &mut tasks,
-        tenant_id,
-        database_id,
-        trace_id,
-    )
-    .await?;
+    let sum_target_reads =
+        crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
+            state,
+            &mut tasks,
+            tenant_id,
+            database_id,
+            trace_id,
+        )
+        .await?;
 
     // Follows the resolution: it consumes the surrogates that pass bound, and
     // issues no lookup of its own.
@@ -147,5 +157,6 @@ async fn plan_authorize_and_admit_once(
         versions,
         authorized_tasks,
         lease_scope,
+        sum_target_reads,
     })
 }
