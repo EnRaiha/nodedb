@@ -6,7 +6,9 @@ use nodedb_types::Value;
 use nodedb_types::conversion::json_to_value_ref;
 use nodedb_types::protocol::NativeResponse;
 
+use crate::bridge::envelope::Response;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::ddl::{DdlError, DdlResult};
 
 /// Convert a crate-level error into a NativeResponse.
@@ -42,8 +44,50 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
 
 /// Convert a `NodeDbError` produced while shaping a response into a
 /// NativeResponse error frame.
+///
+/// The numeric code travels alongside the SQLSTATE: the error is already
+/// classified here, and rendering only `XX000` would make the client rebuild
+/// it as a generic internal failure.
 pub(crate) fn shape_error_to_native(seq: u64, e: &nodedb_types::NodeDbError) -> NativeResponse {
-    NativeResponse::error(seq, "XX000", e.message().to_string())
+    NativeResponse::error_with_code(seq, "XX000", e.message().to_string(), e.code().0)
+}
+
+/// Render an error [`Response`] from the Data Plane as a native error frame.
+///
+/// The Data Plane already classified the failure into a deterministic
+/// `ErrorCode`; both the SQLSTATE and the message come from the same
+/// protocol-neutral mapping pgwire uses (`error_code_to_sqlstate`), and the
+/// stable numeric code comes from the one `ErrorCode` → `NodeDbError`
+/// conversion the crate owns. Formatting the code with `{:?}` and stamping
+/// `XX000` — which is what this path used to do — discarded that
+/// classification, leaving a native client unable to tell a duplicate key
+/// from a crashed database.
+pub(crate) fn error_response_to_native(seq: u64, response: &Response) -> NativeResponse {
+    let mut native = error_code_to_native(seq, response.error_code.as_deref());
+    // A non-empty payload on an error response is a handler-rendered message
+    // and is more specific than the mapping's generic rendering.
+    if !response.payload.is_empty()
+        && let Some(payload) = native.error.as_mut()
+    {
+        payload.message = String::from_utf8_lossy(&response.payload).into_owned();
+    }
+    native
+}
+
+/// Render a bare Data-Plane `ErrorCode` as a native error frame, for the
+/// paths that carry the code without a full [`Response`] (a staging-gate
+/// rejection). `None` means the Data Plane refused without classifying, which
+/// is the only case that legitimately reaches the client as `XX000`.
+pub(crate) fn error_code_to_native(
+    seq: u64,
+    code: Option<&crate::bridge::envelope::ErrorCode>,
+) -> NativeResponse {
+    let Some(code) = code else {
+        return NativeResponse::error(seq, "XX000", "unknown data plane error");
+    };
+    let (_, sqlstate, message) = error_code_to_sqlstate(code);
+    let public = nodedb_types::NodeDbError::from(crate::Error::DataPlane(code.clone()));
+    NativeResponse::error_with_code(seq, sqlstate, message, public.code().0)
 }
 
 /// Encode a protocol-neutral DDL dispatch result into a single

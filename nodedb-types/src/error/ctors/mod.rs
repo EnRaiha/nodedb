@@ -8,7 +8,10 @@
 //! - [`read_query_auth`] — 1100 read path, 1200 query, 2000 auth.
 //! - [`sync_infra`] — 3000 sync, 4000 storage, 4200 serialization, 5000 config,
 //!   6000 cluster, 7000 memory, 8000 encryption, 9000 internal/bridge/dispatch.
+//! - [`from_wire`] — rebuilds a typed error from a numeric code decoded off
+//!   the wire, for the receiving side that no longer holds the context.
 
+pub mod from_wire;
 pub mod mirror;
 pub mod move_tenant;
 pub mod read_query_auth;

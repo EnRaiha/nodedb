@@ -458,23 +458,38 @@ fn io_err(e: std::io::Error) -> NodeDbError {
 /// reads an empty result — indistinguishable from "no such row".
 pub(crate) fn check_error(resp: &NativeResponse) -> NodeDbResult<()> {
     if resp.status == ResponseStatus::Error {
-        let msg = resp
-            .error
-            .as_ref()
-            .map(|e| e.message.clone())
-            .unwrap_or_else(|| "unknown error".into());
-        return Err(NodeDbError::internal(msg));
+        return Err(error_frame_to_typed(resp.error.as_ref(), "unknown error"));
     }
     Ok(())
 }
 
+/// Rebuild the server's typed error from an error frame.
+///
+/// The numeric NodeDB code is the authoritative classification: SQLSTATE is
+/// many-to-one, so reconstructing from it would collapse a duplicate key and
+/// a duplicate idempotency key into one condition and everything unclassified
+/// into `XX000`. A `0` code means the peer predates that field, and guessing
+/// is worse than reporting a generic internal failure — so only then does the
+/// error become `internal`.
+fn error_frame_to_typed(
+    payload: Option<&nodedb_types::protocol::ErrorPayload>,
+    fallback: &str,
+) -> NodeDbError {
+    let Some(payload) = payload else {
+        return NodeDbError::internal(fallback);
+    };
+    if payload.ndb_code == 0 {
+        return NodeDbError::internal(payload.message.clone());
+    }
+    NodeDbError::from_wire(
+        nodedb_types::error::ErrorCode(payload.ndb_code),
+        payload.message.clone(),
+    )
+}
+
 fn response_to_query_result(resp: NativeResponse) -> NodeDbResult<QueryResult> {
     if resp.status == ResponseStatus::Error {
-        let msg = resp
-            .error
-            .map(|e| e.message)
-            .unwrap_or_else(|| "query failed".into());
-        return Err(NodeDbError::internal(msg));
+        return Err(error_frame_to_typed(resp.error.as_ref(), "query failed"));
     }
     Ok(QueryResult {
         columns: resp.columns.unwrap_or_default(),

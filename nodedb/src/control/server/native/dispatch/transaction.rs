@@ -119,32 +119,54 @@ pub(crate) async fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeRe
 /// before extraction (batch/dispatch failures collapse to `40001`, batch
 /// rejections carry the Data-Plane SQLSTATE).
 fn commit_abort_to_native(seq: u64, reason: &AbortReason) -> NativeResponse {
-    let (code, message): (&'static str, String) = match reason {
+    // The numeric NodeDB code rides alongside the SQLSTATE wherever the abort
+    // was classified: a UNIQUE violation that only surfaces at COMMIT is the
+    // same condition as one caught at the statement, and must reach the client
+    // as the same typed error rather than as an opaque `23505` string.
+    let (code, message, ndb_code): (&'static str, String, u16) = match reason {
         AbortReason::Serialization => (
             "40001",
             "could not serialize access due to concurrent update".to_owned(),
+            nodedb_types::error::ErrorCode::WRITE_CONFLICT.0,
         ),
         AbortReason::NoTransaction => (
             "25000",
             "current transaction is aborted, commands ignored until end of transaction block"
                 .to_owned(),
+            nodedb_types::error::ErrorCode::BAD_REQUEST.0,
         ),
         AbortReason::BatchRejected { code } => {
             let code = code.clone().unwrap_or(ErrorCode::RejectedPrevalidation {
                 reason: "transaction commit failed".to_owned(),
             });
             let (_severity, sqlstate, message) = error_code_to_sqlstate(&code);
-            (sqlstate, format!("transaction commit failed: {message}"))
+            let public = nodedb_types::NodeDbError::from(crate::Error::DataPlane(code));
+            (
+                sqlstate,
+                format!("transaction commit failed: {message}"),
+                public.code().0,
+            )
         }
         AbortReason::CalvinCancelled => (
             "57014",
             "Calvin coordinator cancelled (deadline exceeded)".to_owned(),
+            nodedb_types::error::ErrorCode::DEADLINE_EXCEEDED.0,
         ),
-        AbortReason::CalvinTimeout => {
-            ("57014", "timed out waiting for Calvin sequencer".to_owned())
-        }
-        AbortReason::Dispatch(e) => ("40001", format!("transaction commit failed: {e}")),
-        AbortReason::DdlPropose(e) => ("XX000", format!("{e}")),
+        AbortReason::CalvinTimeout => (
+            "57014",
+            "timed out waiting for Calvin sequencer".to_owned(),
+            nodedb_types::error::ErrorCode::DEADLINE_EXCEEDED.0,
+        ),
+        AbortReason::Dispatch(e) => (
+            "40001",
+            format!("transaction commit failed: {e}"),
+            nodedb_types::error::ErrorCode::WRITE_CONFLICT.0,
+        ),
+        AbortReason::DdlPropose(e) => (
+            "XX000",
+            format!("{e}"),
+            nodedb_types::error::ErrorCode::INTERNAL.0,
+        ),
     };
-    NativeResponse::error(seq, code, message)
+    NativeResponse::error_with_code(seq, code, message, ndb_code)
 }

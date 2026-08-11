@@ -379,24 +379,12 @@ impl From<Error> for NodeDbError {
             Error::OidcNoDefaultDatabase { sub } => NodeDbError::bad_request(format!(
                 "OIDC: no default database resolved for sub '{sub}'"
             )),
-            // Preserve typed Data-Plane failures; unknown codes stay internal.
-            Error::DataPlane(code) => {
-                use crate::bridge::envelope::ErrorCode as Ec;
-                match code {
-                    Ec::RejectedConstraint { constraint, detail } => {
-                        NodeDbError::constraint_violation(constraint, detail)
-                    }
-                    // `resource` says what refused the request and why — an RLS
-                    // policy on a named collection, a missing grant. It lands in
-                    // `ErrorDetails::AuthorizationDenied { resource }`, so a
-                    // client can match on it instead of parsing prose; the empty
-                    // string this used to pass made every denial identical.
-                    Ec::RejectedAuthz { resource } => NodeDbError::authorization_denied(resource),
-                    Ec::DeadlineExceeded => NodeDbError::deadline_exceeded(),
-                    Ec::ConflictRetry => NodeDbError::write_conflict("", ""),
-                    other => NodeDbError::internal(format!("{other:?}")),
-                }
-            }
+            // Preserve typed Data-Plane failures. Exhaustive by construction:
+            // a code that falls through to `internal` reaches the client as
+            // NDB-9000, which is indistinguishable from a crashed database, so
+            // the compiler is made to name every new variant here rather than
+            // letting a catch-all silently degrade it.
+            Error::DataPlane(code) => crate::error_from_data_plane::data_plane_code_to_public(code),
         }
     }
 }

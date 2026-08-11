@@ -7,7 +7,6 @@
 use nodedb_types::protocol::NativeResponse;
 
 use crate::bridge::envelope::{Payload, Response, Status};
-use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::staging_gate::{
@@ -17,7 +16,7 @@ use crate::types::{Lsn, RequestId};
 
 use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_code_to_native, error_to_native};
 
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
 /// converting the Data-Plane response into a `NativeResponse`.
@@ -120,11 +119,7 @@ pub(super) async fn dispatch_single_task(
         }
         Err(StagingGateError::Dispatch(e)) => return error_to_native(seq, &e),
         Err(StagingGateError::Rejected { code }) => {
-            let (_, sqlstate, message) = match code {
-                Some(code) => error_code_to_sqlstate(&code),
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
-            return NativeResponse::error(seq, sqlstate, message);
+            return error_code_to_native(seq, code.as_ref());
         }
     };
 

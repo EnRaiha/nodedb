@@ -17,7 +17,6 @@ use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::{PlanKind, describe_plan};
-use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::expander_stage::{
@@ -31,7 +30,10 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::sql_dispatch_task::dispatch_task;
 use super::streaming::SqlOutcome;
-use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
+use super::{
+    DispatchCtx, error_code_to_native, error_response_to_native, error_to_native,
+    shape_error_to_native, to_native_columns_rows,
+};
 
 /// Wrap a materialized response as a non-streaming [`SqlOutcome`].
 #[inline]
@@ -228,11 +230,7 @@ pub(super) async fn run_dispatch_loop(
             }
             Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
             Err(StagingGateError::Rejected { code }) => {
-                let (_, sqlstate, message) = match code {
-                    Some(code) => error_code_to_sqlstate(&code),
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-                };
-                return resp(NativeResponse::error(seq, sqlstate, message));
+                return resp(error_code_to_native(seq, code.as_ref()));
             }
         };
 
@@ -280,16 +278,7 @@ pub(super) async fn run_dispatch_loop(
         }
 
         if task_resp.status == Status::Error {
-            let msg = if task_resp.payload.is_empty() {
-                task_resp
-                    .error_code
-                    .as_ref()
-                    .map(|c| format!("{c:?}"))
-                    .unwrap_or_else(|| "unknown error".into())
-            } else {
-                String::from_utf8_lossy(&task_resp.payload).into_owned()
-            };
-            return resp(NativeResponse::error(seq, "XX000", msg));
+            return resp(error_response_to_native(seq, &task_resp));
         }
 
         last_lsn = task_resp.watermark_lsn.as_u64();

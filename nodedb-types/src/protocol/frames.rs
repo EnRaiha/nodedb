@@ -90,14 +90,41 @@ pub struct NativeResponse {
 }
 
 /// Error details in a response.
+///
+/// Encoded as a MessagePack map rather than an array so that fields can be
+/// added without invalidating the frames older peers already understand —
+/// the same reason [`NativeResponse`] is a map. An array representation has
+/// no field names, so a decoder cannot tell a missing optional field from a
+/// truncated frame and every addition is a breaking change.
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
+#[msgpack(map)]
 pub struct ErrorPayload {
     /// SQLSTATE-style error code (e.g., "42P01" for undefined table).
     pub code: String,
     /// Human-readable error message.
     pub message: String,
+    /// Stable numeric NodeDB error code (`nodedb_types::ErrorCode`'s inner
+    /// value, e.g. 1000 for a constraint violation).
+    ///
+    /// SQLSTATE is many-to-one — a unique violation and a duplicate
+    /// idempotency key both render as `23505`, and everything unclassified
+    /// renders as `XX000` — so it cannot carry the classification a client
+    /// needs to reconstruct a typed error. This field is the authoritative
+    /// one for that. `0` means the sending server predates this field, and a
+    /// client must fall back to a generic error rather than guess.
+    /// `#[serde(default)]` + `#[msgpack(default)]` keep it additive and
+    /// backward-compatible with peers that never send it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[msgpack(default)]
+    pub ndb_code: u16,
+}
+
+/// `skip_serializing_if` predicate for [`ErrorPayload::ndb_code`]: zero is the
+/// "not carried" sentinel, so it is omitted rather than sent as a real code.
+fn is_zero(code: &u16) -> bool {
+    *code == 0
 }
 
 impl NativeResponse {
@@ -131,8 +158,24 @@ impl NativeResponse {
         }
     }
 
-    /// Create an error response.
+    /// Create an error response that carries only a SQLSTATE.
+    ///
+    /// Use [`Self::error_with_code`] wherever the numeric NodeDB code is
+    /// known: a frame built here reaches the client with `ndb_code == 0` and
+    /// collapses to a generic internal error on the far side.
     pub fn error(seq: u64, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::error_with_code(seq, code, message, 0)
+    }
+
+    /// Create an error response carrying both the SQLSTATE and the stable
+    /// numeric NodeDB code, so the client can rebuild the typed error rather
+    /// than inferring one from a many-to-one SQLSTATE.
+    pub fn error_with_code(
+        seq: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        ndb_code: u16,
+    ) -> Self {
         Self {
             seq,
             status: ResponseStatus::Error,
@@ -143,6 +186,7 @@ impl NativeResponse {
             error: Some(ErrorPayload {
                 code: code.into(),
                 message: message.into(),
+                ndb_code,
             }),
             auth: None,
             warnings: Vec::new(),
@@ -180,5 +224,41 @@ impl NativeResponse {
             auth: None,
             warnings: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_payload_round_trips_the_numeric_code() {
+        let frame = NativeResponse::error_with_code(7, "23505", "duplicate key", 1000);
+        let bytes = zerompk::to_msgpack_vec(&frame).expect("encode");
+        let decoded: NativeResponse = zerompk::from_msgpack(&bytes).expect("decode");
+        let payload = decoded.error.expect("error payload survives the wire");
+        assert_eq!(payload.code, "23505");
+        assert_eq!(payload.ndb_code, 1000);
+    }
+
+    #[test]
+    fn error_payload_without_numeric_code_still_decodes() {
+        // Hand-rolled 2-key map: exactly what a peer built before the numeric
+        // code was added sends. It must decode with `ndb_code == 0` rather
+        // than fail, which is what makes the field additive.
+        let mut legacy = vec![0x82u8];
+        for (key, value) in [("code", "42P01"), ("message", "boom")] {
+            legacy.push(0xA0 | key.len() as u8);
+            legacy.extend_from_slice(key.as_bytes());
+            legacy.push(0xA0 | value.len() as u8);
+            legacy.extend_from_slice(value.as_bytes());
+        }
+        let decoded: ErrorPayload = zerompk::from_msgpack(&legacy).expect("legacy frame decodes");
+        assert_eq!(decoded.code, "42P01");
+        assert_eq!(decoded.message, "boom");
+        assert_eq!(
+            decoded.ndb_code, 0,
+            "an absent numeric code must read as the 'not carried' sentinel"
+        );
     }
 }

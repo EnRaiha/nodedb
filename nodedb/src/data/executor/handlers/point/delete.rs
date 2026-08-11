@@ -78,14 +78,7 @@ impl CoreLoop {
         // (the txn is dropped un-committed on every early return).
         let txn = match self.sparse.begin_write() {
             Ok(txn) => txn,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
         let outcome = match self.apply_point_delete(
             &txn,
@@ -100,14 +93,7 @@ impl CoreLoop {
             },
         ) {
             Ok(outcome) => outcome,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
         // Image-folding enforcement, inside the SAME transaction the removal was
         // staged in: a materialized-sum target write is itself a document write,

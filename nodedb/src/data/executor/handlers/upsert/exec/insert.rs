@@ -82,12 +82,7 @@ impl CoreLoop {
             Ok(t) => t,
             Err(e) => {
                 chain.restore(self);
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, e);
             }
         };
 
@@ -113,12 +108,7 @@ impl CoreLoop {
             Ok(p) => p,
             Err(e) => {
                 chain_guard::abort_after_apply(self, &chain, database_id, tid, collection, row_key);
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, e);
             }
         };
 

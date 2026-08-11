@@ -10,7 +10,7 @@ use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::describe_plan;
 
-use super::{DispatchCtx, shape_error_to_native, to_native_columns_rows};
+use super::{DispatchCtx, error_response_to_native, shape_error_to_native, to_native_columns_rows};
 
 pub(crate) fn data_plane_response_to_native(
     ctx: &DispatchCtx<'_>,
@@ -19,16 +19,7 @@ pub(crate) fn data_plane_response_to_native(
     response: &Response,
 ) -> NativeResponse {
     if response.status == Status::Error {
-        let message = if response.payload.is_empty() {
-            response
-                .error_code
-                .as_ref()
-                .map(|code| format!("{code:?}"))
-                .unwrap_or_else(|| "unknown error".into())
-        } else {
-            String::from_utf8_lossy(&response.payload).into_owned()
-        };
-        return NativeResponse::error(seq, "XX000", message);
+        return error_response_to_native(seq, response);
     }
     if response.payload.is_empty() {
         let mut native = NativeResponse::ok(seq);

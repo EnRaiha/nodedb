@@ -284,12 +284,7 @@ impl CoreLoop {
                         response.write_set.extend(target_write_set);
                         response
                     }
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, e),
                 }
             }
             Ok(None) => {
@@ -298,12 +293,7 @@ impl CoreLoop {
                 nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", 0);
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, e),
         }
     }
 }
