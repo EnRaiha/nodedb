@@ -146,7 +146,8 @@ pub(super) async fn try_typed(
             },
         )),
 
-        // CREATE [UNIQUE] INDEX [name] ON <collection> (<field>) [WHERE ...].
+        // CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection>
+        // (<field>) [WHERE ...].
         // Migrated from the pgwire typed-AST async router (`async_ops`). The
         // two-phase Building→Ready backfill, peer fan-out, Register refresh,
         // and owner-ledger propose are preserved verbatim in `collection::index`.
@@ -157,6 +158,7 @@ pub(super) async fn try_typed(
             field,
             case_insensitive,
             where_condition,
+            if_not_exists,
         }) => Some(
             collection::create_index(
                 state,
@@ -169,6 +171,7 @@ pub(super) async fn try_typed(
                     case_insensitive: *case_insensitive,
                     where_condition: where_condition.as_deref(),
                     database_id,
+                    if_not_exists: *if_not_exists,
                 },
             )
             .await,

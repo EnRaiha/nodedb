@@ -13,10 +13,10 @@ pub(super) fn try_parse(
 ) -> Option<Result<NodedbStatement, SqlError>> {
     (|| -> Result<Option<NodedbStatement>, SqlError> {
         if upper.starts_with("CREATE UNIQUE INDEX ") || upper.starts_with("CREATE UNIQUE IND") {
-            return Ok(Some(parse_create_index(true, upper, parts, trimmed)));
+            return Ok(Some(parse_create_index(true, upper, parts, trimmed)?));
         }
         if upper.starts_with("CREATE INDEX ") {
-            return Ok(Some(parse_create_index(false, upper, parts, trimmed)));
+            return Ok(Some(parse_create_index(false, upper, parts, trimmed)?));
         }
         if upper.starts_with("DROP INDEX ") {
             let if_exists = upper.contains("IF EXISTS");
@@ -105,16 +105,37 @@ pub(super) fn try_parse(
     .transpose()
 }
 
-/// Parse `CREATE [UNIQUE] INDEX [name] ON collection (field) [WHERE cond]
-///         [COLLATE NOCASE]` into a typed `CreateIndex` variant.
+/// Keywords that belong to the `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`
+/// prefix. None of them can be an index name: accepting one as a name turns
+/// an unsupported spelling into a different, valid-looking statement that
+/// targets an object the user never mentioned.
+const INDEX_CLAUSE_KEYWORDS: [&str; 5] = ["IF", "NOT", "EXISTS", "ON", "UNIQUE"];
+
+/// Parse `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON collection (field)
+///         [WHERE cond] [COLLATE NOCASE]` into a typed `CreateIndex` variant.
+///
+/// `IF NOT EXISTS` is also accepted with the anonymous form
+/// (`CREATE INDEX IF NOT EXISTS ON users (email)`): the flag then applies to
+/// the name the executor derives from the collection and field, which is
+/// deterministic, so a repeated statement is still a no-op.
 fn parse_create_index(
     unique: bool,
     upper: &str,
     parts: &[&str],
     _trimmed: &str,
-) -> NodedbStatement {
+) -> Result<NodedbStatement, SqlError> {
     // Skip "CREATE [UNIQUE] INDEX" prefix.
-    let idx_offset: usize = if unique { 3 } else { 2 };
+    let mut idx_offset: usize = if unique { 3 } else { 2 };
+
+    // Optional `IF NOT EXISTS`, matched token-wise so any amount of internal
+    // whitespace and any casing works (`parts` is whitespace-split).
+    let if_not_exists = parts.len() > idx_offset + 2
+        && parts[idx_offset].eq_ignore_ascii_case("IF")
+        && parts[idx_offset + 1].eq_ignore_ascii_case("NOT")
+        && parts[idx_offset + 2].eq_ignore_ascii_case("EXISTS");
+    if if_not_exists {
+        idx_offset += 3;
+    }
 
     // Detect whether an explicit name is present: if parts[idx_offset] is "ON",
     // the name was omitted; otherwise it is the index name.
@@ -125,14 +146,28 @@ fn parse_create_index(
     {
         (None, idx_offset)
     } else {
-        let name = parts
-            .get(idx_offset)
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        (
-            if name.is_empty() { None } else { Some(name) },
-            idx_offset + 1,
-        )
+        match parts.get(idx_offset) {
+            None => (None, idx_offset + 1),
+            Some(token) => {
+                if INDEX_CLAUSE_KEYWORDS
+                    .iter()
+                    .any(|kw| token.eq_ignore_ascii_case(kw))
+                {
+                    return Err(SqlError::Parse {
+                        detail: format!(
+                            "CREATE INDEX: '{token}' is a keyword of this clause and cannot be \
+                             an index name; expected \
+                             CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection> (<field>)"
+                        ),
+                    });
+                }
+                let name = token.to_lowercase();
+                (
+                    if name.is_empty() { None } else { Some(name) },
+                    idx_offset + 1,
+                )
+            }
+        }
     };
 
     // parts[on_offset] should be "ON"; collection follows.
@@ -178,12 +213,144 @@ fn parse_create_index(
 
     let case_insensitive = upper.contains("COLLATE NOCASE") || upper.contains("COLLATE CI");
 
-    NodedbStatement::Collection(CollectionStmt::CreateIndex {
+    Ok(NodedbStatement::Collection(CollectionStmt::CreateIndex {
         unique,
         index_name,
         collection,
         field,
         case_insensitive,
         where_condition,
-    })
+        if_not_exists,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape of a parsed `CREATE [UNIQUE] INDEX` statement, flattened for
+    /// assertions.
+    struct ParsedIndex {
+        unique: bool,
+        index_name: Option<String>,
+        collection: String,
+        field: String,
+        if_not_exists: bool,
+    }
+
+    fn parse(sql: &str) -> Result<NodedbStatement, SqlError> {
+        let upper = sql.to_uppercase();
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        try_parse(&upper, &parts, sql).expect("index family should claim this statement")
+    }
+
+    fn parse_index(sql: &str) -> ParsedIndex {
+        match parse(sql).expect("parse should succeed") {
+            NodedbStatement::Collection(CollectionStmt::CreateIndex {
+                unique,
+                index_name,
+                collection,
+                field,
+                if_not_exists,
+                ..
+            }) => ParsedIndex {
+                unique,
+                index_name,
+                collection,
+                field,
+                if_not_exists,
+            },
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_index_if_not_exists() {
+        // Regression: the `IF NOT EXISTS` keywords used to be consumed as the
+        // index name, shifting every later token — the index was named `if`
+        // and the target collection read as `exists`.
+        let parsed = parse_index("CREATE INDEX IF NOT EXISTS idx ON users (email)");
+        assert!(parsed.if_not_exists);
+        assert!(!parsed.unique);
+        assert_eq!(parsed.index_name.as_deref(), Some("idx"));
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn create_unique_index_if_not_exists() {
+        let parsed = parse_index("CREATE UNIQUE INDEX IF NOT EXISTS idx ON users (email)");
+        assert!(parsed.if_not_exists);
+        assert!(parsed.unique);
+        assert_eq!(parsed.index_name.as_deref(), Some("idx"));
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn create_index_without_if_not_exists_unchanged() {
+        let parsed = parse_index("CREATE INDEX idx ON users (email)");
+        assert!(!parsed.if_not_exists);
+        assert!(!parsed.unique);
+        assert_eq!(parsed.index_name.as_deref(), Some("idx"));
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+
+        let parsed = parse_index("CREATE UNIQUE INDEX idx ON users (email)");
+        assert!(!parsed.if_not_exists);
+        assert!(parsed.unique);
+        assert_eq!(parsed.index_name.as_deref(), Some("idx"));
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn anonymous_index_has_no_name() {
+        let parsed = parse_index("CREATE INDEX ON users (email)");
+        assert!(parsed.index_name.is_none());
+        assert!(!parsed.if_not_exists);
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn if_not_exists_with_anonymous_index() {
+        // Both clauses are optional and independent: with no name given the
+        // executor derives one from the collection and field, and the flag
+        // makes a repeat of the same statement a no-op on that derived name.
+        let parsed = parse_index("CREATE INDEX IF NOT EXISTS ON users (email)");
+        assert!(parsed.if_not_exists);
+        assert!(parsed.index_name.is_none());
+        assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn clause_keyword_is_not_an_index_name() {
+        // An unsupported spelling must be a syntax error, never a statement
+        // aimed at a different object.
+        for sql in [
+            "CREATE INDEX IF EXISTS idx ON users (email)",
+            "CREATE INDEX NOT EXISTS idx ON users (email)",
+            "CREATE INDEX EXISTS ON users (email)",
+            "CREATE INDEX UNIQUE idx ON users (email)",
+        ] {
+            let err = parse(sql).expect_err(sql);
+            assert!(matches!(err, SqlError::Parse { .. }), "{sql}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn if_not_exists_is_case_insensitive() {
+        for sql in [
+            "CREATE INDEX if not exists idx ON users (email)",
+            "CREATE INDEX If Not Exists idx ON users (email)",
+        ] {
+            let parsed = parse_index(sql);
+            assert!(parsed.if_not_exists, "{sql}");
+            assert_eq!(parsed.index_name.as_deref(), Some("idx"), "{sql}");
+            assert_eq!(parsed.collection, "users", "{sql}");
+            assert_eq!(parsed.field, "email", "{sql}");
+        }
+    }
 }

@@ -64,6 +64,9 @@ pub enum CollectionStmt {
         field: String,
         case_insensitive: bool,
         where_condition: Option<String>,
+        /// `IF NOT EXISTS` — creating an index that already exists is a
+        /// successful no-op instead of an error.
+        if_not_exists: bool,
     },
     DropIndex {
         name: String,

@@ -50,9 +50,24 @@ pub struct CreateIndexRequest<'a> {
     pub case_insensitive: bool,
     pub where_condition: Option<&'a str>,
     pub database_id: DatabaseId,
+    /// `IF NOT EXISTS` — an index of this name that already exists makes the
+    /// statement a successful no-op instead of SQLSTATE 42710. Only the
+    /// name-already-taken checks are relaxed; every other failure (missing
+    /// collection, permission denied, catalog read fault, backfill error)
+    /// still surfaces.
+    pub if_not_exists: bool,
 }
 
-/// CREATE [UNIQUE] INDEX [name] ON <collection> (<field>) [WHERE condition]
+/// Successful completion tag for `CREATE INDEX`, shared by the real create
+/// path and the `IF NOT EXISTS` no-op so a client cannot tell them apart.
+fn create_index_ok() -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: "CREATE INDEX".to_string(),
+        rows_affected: None,
+    }]
+}
+
+/// CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection> (<field>) [WHERE condition]
 ///
 /// Creates an index by appending a [`StoredIndex`] to the collection's
 /// `indexes` vector and committing the mutation through `PutCollection`.
@@ -73,6 +88,7 @@ pub async fn create_index(
         case_insensitive,
         where_condition,
         database_id,
+        if_not_exists,
     } = *req;
     if collection.is_empty() {
         return Err(err(
@@ -113,8 +129,12 @@ pub async fn create_index(
         ));
     }
 
-    // Reject duplicates within this collection.
+    // Reject duplicates within this collection. `IF NOT EXISTS` turns this
+    // into a no-op, matching CREATE COLLECTION IF NOT EXISTS.
     if coll.indexes.iter().any(|i| i.name == index_name) {
+        if if_not_exists {
+            return Ok(create_index_ok());
+        }
         return Err(err(
             "42710",
             format!("index '{index_name}' already exists on '{collection}'"),
@@ -123,11 +143,15 @@ pub async fn create_index(
 
     // Reject a name already taken by an index of any kind in this database:
     // the registry is keyed by name, so two kinds sharing one name would make
-    // exactly one of them droppable.
+    // exactly one of them droppable. The registry read itself must still fail
+    // loudly — only a genuine name collision is absorbed by `IF NOT EXISTS`.
     if let Some(existing) = catalog
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
         .map_err(|e| err("XX000", e.to_string()))?
     {
+        if if_not_exists {
+            return Ok(create_index_ok());
+        }
         return Err(err(
             "42710",
             format!(
@@ -286,8 +310,5 @@ pub async fn create_index(
         &format!("created {kind} '{index_name}' on '{collection}' ({canonical_field}){ci}{cond}"),
     );
 
-    Ok(vec![DdlResult::Status {
-        command: "CREATE INDEX".to_string(),
-        rows_affected: None,
-    }])
+    Ok(create_index_ok())
 }
