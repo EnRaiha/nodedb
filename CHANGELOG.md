@@ -11,27 +11,19 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### ⚠️ Breaking changes
 
-- **JWT `metadata` claims keep their JSON type.** Previously every value in the
-  `metadata` claim object was coerced to a string, and any value that was not
-  already a JSON string — a number, a boolean, a nested object or array — was
-  dropped silently, with no error and no log line. A policy keyed on such a
-  claim failed open and gave no indication why. Values of every type now
-  survive with their type intact.
+- Native-protocol `SELECT` returns nested objects and arrays as structured values, not JSON text. `nodedb_types::conversion::json_to_value_display` is replaced by `json_to_value_ref`.
+- JWT `metadata` claims keep their JSON type instead of being coerced to strings.
+- `document_get` for a missing id returns `Ok(None)` instead of a serialization error.
 
-  This changes RLS comparison semantics for providers that issue typed claims.
-  A policy written as `$auth.metadata.seats = 5` compared text before and
-  compares numerically now, if the provider sends `"seats": 5` as a JSON
-  number. Providers already sending `"seats": "5"` as a string are unaffected
-  and still compare as text. The same applies to booleans.
+### Added
 
-  Scope- and quota-derived metadata (`quota_remaining.*`, `quota_pct.*`,
-  `scope_expires_at.*`) is likewise numeric rather than stringified, so a
-  predicate comparing it against a numeric literal now matches where it
-  previously required a string literal.
+- `CREATE [UNIQUE] INDEX IF NOT EXISTS`.
 
-  Boolean metadata flags (`device_trusted`, `mfa_verified`) accept both a real
-  JSON boolean and the legacy string `"true"`, so a provider can adopt typed
-  claims without a coordinated cutover.
+### Fixed
+
+- JWT bearer authentication over the HTTP API panicked the handler and dropped the connection. Cluster credential fetch on a token-authenticated join and JWKS setup at startup blocked the same way.
+- Refused native `document_put`, `document_delete`, `graph_insert_edge`, `graph_delete_edge` and CRDT movable-list operations returned success; `graph_traverse` and `vector_search` read an error reply as an empty result.
+- `CREATE INDEX IF NOT EXISTS` was misparsed as an index named `if` on a collection named `exists`.
 
 ---
 
