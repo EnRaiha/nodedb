@@ -176,6 +176,9 @@ pub trait NodeDb: NodeDbMarker {
 
     /// Get a document by ID from `collection`.
     ///
+    /// A document that does not exist is `Ok(None)` — absence is an answer,
+    /// never an error. An error means the read itself failed.
+    ///
     /// On Lite: direct Loro state read. Sub-millisecond.
     /// On Remote: `SELECT * FROM collection WHERE id = $1`.
     async fn document_get(&self, collection: &str, id: &str) -> NodeDbResult<Option<Document>>;

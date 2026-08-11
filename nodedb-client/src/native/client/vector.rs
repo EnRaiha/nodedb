@@ -10,6 +10,7 @@ use nodedb_types::result::SearchResult;
 
 use super::super::response_parse::parse_search_results;
 use super::core::NativeClient;
+use crate::native::connection::check_error;
 use crate::sql_escape::{quote_identifier, quote_string_literal};
 
 impl NativeClient {
@@ -23,6 +24,9 @@ impl NativeClient {
         let request = build_vector_search_request(collection, query, k, filter)?;
         let mut conn = self.pool.acquire().await?;
         let resp = conn.send(OpCode::VectorSearch, request).await?;
+        // An error frame carries no rows; parsed unchecked it would read as
+        // "the search matched nothing".
+        check_error(&resp)?;
         parse_search_results(&resp)
     }
 

@@ -12,6 +12,7 @@ use nodedb_types::result::SubGraph;
 
 use super::super::response_parse::parse_subgraph_response;
 use super::core::NativeClient;
+use crate::native::connection::check_error;
 use crate::sql_escape::quote_string_literal;
 
 impl NativeClient {
@@ -35,6 +36,9 @@ impl NativeClient {
                 },
             )
             .await?;
+        // An error frame carries no rows; parsed unchecked it would read as
+        // "the traversal found nothing".
+        check_error(&resp)?;
         parse_subgraph_response(&resp)
     }
 
@@ -59,18 +63,23 @@ impl NativeClient {
             )
         });
         let mut conn = self.pool.acquire().await?;
-        conn.send(
-            OpCode::EdgePut,
-            TextFields {
-                collection: Some(collection.to_string()),
-                from_node: Some(from.as_str().to_string()),
-                to_node: Some(to.as_str().to_string()),
-                edge_type: Some(edge_type.to_string()),
-                properties: props_json,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let resp = conn
+            .send(
+                OpCode::EdgePut,
+                TextFields {
+                    collection: Some(collection.to_string()),
+                    from_node: Some(from.as_str().to_string()),
+                    to_node: Some(to.as_str().to_string()),
+                    edge_type: Some(edge_type.to_string()),
+                    properties: props_json,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        // A refused write must not be reported as an inserted edge: the id
+        // below is derived from the caller's own arguments and would look
+        // identical whether or not the server stored anything.
+        check_error(&resp)?;
         EdgeId::try_first(from.clone(), to.clone(), edge_type)
             .map_err(|e| NodeDbError::storage(format!("invalid edge label: {e}")))
     }
@@ -81,18 +90,19 @@ impl NativeClient {
         edge_id: &EdgeId,
     ) -> NodeDbResult<()> {
         let mut conn = self.pool.acquire().await?;
-        conn.send(
-            OpCode::EdgeDelete,
-            TextFields {
-                collection: Some(collection.to_string()),
-                from_node: Some(edge_id.src.as_str().to_string()),
-                to_node: Some(edge_id.dst.as_str().to_string()),
-                edge_type: Some(edge_id.label.clone()),
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok(())
+        let resp = conn
+            .send(
+                OpCode::EdgeDelete,
+                TextFields {
+                    collection: Some(collection.to_string()),
+                    from_node: Some(edge_id.src.as_str().to_string()),
+                    to_node: Some(edge_id.dst.as_str().to_string()),
+                    edge_type: Some(edge_id.label.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        check_error(&resp)
     }
 
     pub(super) async fn graph_stats_impl(

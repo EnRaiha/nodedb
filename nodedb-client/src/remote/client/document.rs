@@ -19,37 +19,57 @@ impl NodeDbRemote {
         collection: &str,
         id: &str,
     ) -> NodeDbResult<Option<Document>> {
-        let collection = quote_identifier(collection);
-        let sql = format!("SELECT id, data FROM {collection} WHERE id = $1");
+        let quoted = quote_identifier(collection);
+        let sql = format!("SELECT id, data FROM {quoted} WHERE id = $1");
         let (_, rows) = self.query_raw(&sql, &[&id]).await?;
 
-        if let Some(row) = rows.first() {
-            let doc_id = row
-                .first()
-                .and_then(|v| v.as_str())
-                .unwrap_or(id)
-                .to_string();
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
 
-            let mut doc = Document::new(doc_id);
+        let doc_id = row
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or(id)
+            .to_string();
+        let mut doc = Document::new(doc_id);
 
-            // If the second column is JSON, parse it into fields.
-            if let Some(Value::Object(fields)) = row.get(1) {
+        // The `data` column arrives either already structured (native-typed
+        // cell) or as JSON text (pgwire renders composite values textually).
+        // Anything else is a shape this client cannot map, and is reported as
+        // such: silently yielding a field-less document would be
+        // indistinguishable from a document that genuinely stores no fields.
+        match row.get(1) {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(fields)) => {
                 for (k, v) in fields {
                     doc.set(k.clone(), v.clone());
                 }
-            } else if let Some(Value::String(json_str)) = row.get(1)
-                && let Ok(parsed) =
-                    sonic_rs::from_str::<HashMap<String, serde_json::Value>>(json_str)
-            {
+            }
+            Some(Value::String(json_str)) => {
+                let parsed: HashMap<String, serde_json::Value> = sonic_rs::from_str(json_str)
+                    .map_err(|e| {
+                        NodeDbError::serialization(
+                            "json",
+                            format!("document_get data column for '{collection}'/'{id}': {e}"),
+                        )
+                    })?;
                 for (k, v) in &parsed {
                     doc.set(k.clone(), json_to_value(v));
                 }
             }
-
-            Ok(Some(doc))
-        } else {
-            Ok(None)
+            Some(other) => {
+                return Err(NodeDbError::serialization(
+                    "json",
+                    format!(
+                        "document_get data column for '{collection}'/'{id}': \
+                         expected an object or JSON text, got {other:?}"
+                    ),
+                ));
+            }
         }
+
+        Ok(Some(doc))
     }
 
     pub(super) async fn document_put_impl(

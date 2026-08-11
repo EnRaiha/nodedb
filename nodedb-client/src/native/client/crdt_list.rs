@@ -14,6 +14,7 @@ use nodedb_types::protocol::{OpCode, TextFields};
 use nodedb_types::value::Value;
 
 use super::core::NativeClient;
+use crate::native::connection::check_error;
 
 /// Narrow a `usize` index to the wire's `u64` representation.
 ///
@@ -115,8 +116,8 @@ impl NativeClient {
     ) -> NodeDbResult<()> {
         let request = build_list_insert_fields(collection, document_id, list_path, index, fields)?;
         let mut conn = self.pool.acquire().await?;
-        conn.send(OpCode::CrdtListInsert, request).await?;
-        Ok(())
+        let resp = conn.send(OpCode::CrdtListInsert, request).await?;
+        check_error(&resp)
     }
 
     pub(super) async fn list_delete_impl(
@@ -128,8 +129,8 @@ impl NativeClient {
     ) -> NodeDbResult<()> {
         let request = build_list_delete_fields(collection, document_id, list_path, index)?;
         let mut conn = self.pool.acquire().await?;
-        conn.send(OpCode::CrdtListDelete, request).await?;
-        Ok(())
+        let resp = conn.send(OpCode::CrdtListDelete, request).await?;
+        check_error(&resp)
     }
 
     pub(super) async fn list_move_impl(
@@ -143,8 +144,8 @@ impl NativeClient {
         let request =
             build_list_move_fields(collection, document_id, list_path, from_index, to_index)?;
         let mut conn = self.pool.acquire().await?;
-        conn.send(OpCode::CrdtListMove, request).await?;
-        Ok(())
+        let resp = conn.send(OpCode::CrdtListMove, request).await?;
+        check_error(&resp)
     }
 }
 

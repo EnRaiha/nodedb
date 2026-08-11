@@ -289,19 +289,19 @@ impl NativeConnection {
     /// Begin a transaction.
     pub async fn begin(&mut self) -> NodeDbResult<()> {
         let resp = self.send(OpCode::Begin, TextFields::default()).await?;
-        check_error(resp)
+        check_error(&resp)
     }
 
     /// Commit the current transaction.
     pub async fn commit(&mut self) -> NodeDbResult<()> {
         let resp = self.send(OpCode::Commit, TextFields::default()).await?;
-        check_error(resp)
+        check_error(&resp)
     }
 
     /// Rollback the current transaction.
     pub async fn rollback(&mut self) -> NodeDbResult<()> {
         let resp = self.send(OpCode::Rollback, TextFields::default()).await?;
-        check_error(resp)
+        check_error(&resp)
     }
 
     /// Set a session parameter.
@@ -316,7 +316,7 @@ impl NativeConnection {
                 },
             )
             .await?;
-        check_error(resp)
+        check_error(&resp)
     }
 
     /// Show a session parameter.
@@ -449,11 +449,19 @@ fn io_err(e: std::io::Error) -> NodeDbError {
     NodeDbError::sync_connection_failed(format!("I/O: {e}"))
 }
 
-fn check_error(resp: NativeResponse) -> NodeDbResult<()> {
+/// Surface an error frame as a typed error.
+///
+/// Every operation that reads a response must call this before interpreting
+/// it: `send` returns an error frame as `Ok(resp)` (the frame arrived; it is
+/// the *server* that refused), so an operation that ignores `status` reports
+/// success for work the server rejected, and one that reads `rows` from it
+/// reads an empty result — indistinguishable from "no such row".
+pub(crate) fn check_error(resp: &NativeResponse) -> NodeDbResult<()> {
     if resp.status == ResponseStatus::Error {
         let msg = resp
             .error
-            .map(|e| e.message)
+            .as_ref()
+            .map(|e| e.message.clone())
             .unwrap_or_else(|| "unknown error".into());
         return Err(NodeDbError::internal(msg));
     }
@@ -508,13 +516,13 @@ mod tests {
     #[test]
     fn check_error_ok() {
         let resp = NativeResponse::ok(1);
-        assert!(check_error(resp).is_ok());
+        assert!(check_error(&resp).is_ok());
     }
 
     #[test]
     fn check_error_fail() {
         let resp = NativeResponse::error(1, "XX000", "boom");
-        assert!(check_error(resp).is_err());
+        assert!(check_error(&resp).is_err());
     }
 
     #[tokio::test]
