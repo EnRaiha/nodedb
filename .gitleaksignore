@@ -3,3 +3,9 @@
 
 # Historical ILP fixture value, not an API credential.
 8bcdfa07bdfceb0ee7e7947f28476b7628f1ee99:nodedb/src/engine/timeseries/ilp_ingest.rs:generic-api-key:295
+
+# Historical synthetic handshake test token, not a credential. The live lines
+# now carry a `gitleaks:allow` marker; these fingerprints cover the commit that
+# introduced them, which the full-history scan still replays.
+65f68ed14eb9d84cf8fb6d5ff75d7afdebb84c5e:nodedb/src/control/server/sync/session/handshake.rs:generic-api-key:486
+65f68ed14eb9d84cf8fb6d5ff75d7afdebb84c5e:nodedb/src/control/server/sync/session/handshake.rs:generic-api-key:509

@@ -483,7 +483,8 @@ mod tests {
         );
         let mut session = SyncSession::new("test-session".into());
         let mut msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
-        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into();
+        // Synthetic fixture token, not a credential.
+        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into(); // gitleaks:allow
 
         let frame = session
             .handle_handshake(&msg, HashMap::new(), Some(&state))
@@ -506,7 +507,8 @@ mod tests {
     async fn presented_token_without_shared_state_is_refused() {
         let mut session = SyncSession::new("test-session".into());
         let mut msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
-        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into();
+        // Synthetic fixture token, not a credential.
+        msg.jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln".into(); // gitleaks:allow
 
         let frame = session
             .handle_handshake(&msg, HashMap::new(), None)

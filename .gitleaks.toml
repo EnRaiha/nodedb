@@ -1,0 +1,27 @@
+# Gitleaks configuration for the secret scan (.github/workflows/secrets.yml).
+#
+# Extends the upstream default ruleset — rules are never weakened here. The
+# allowlist below encodes the single exemption class this repository needs:
+# credential-shaped literals that exist only to drive tests.
+#
+# Test code that lives *inline* (Rust `#[cfg(test)]` modules in a src file)
+# cannot be exempted by path, because the file also holds production code.
+# Mark those literals with a trailing `// gitleaks:allow` comment instead —
+# the marker travels with the line, so the daily full-history scan honours it
+# for every commit that carries it.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test-only sources: credential-shaped literals there are fixtures, not secrets."
+paths = [
+  '''(^|/)tests?/''',
+  '''(^|/)benches/''',
+  '''(^|/)fuzz/''',
+  '''(^|/)examples/''',
+  '''(^|/)testdata/''',
+  '''(^|/)fixtures/''',
+  '''_test\.rs$''',
+  '''(^|/)tests\.rs$''',
+]
