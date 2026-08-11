@@ -27,7 +27,12 @@ pub struct SharedStateComponents {
 /// This includes: startup gate, cluster handles, JWKS, cold storage, snapshot
 /// storage, quarantine storage, memory governor, backup KEK, OTLP exporter,
 /// gateway, and bitemporal retention registry.
-pub fn wire_state(
+///
+/// Async because JWKS provider discovery fetches each provider's key set over
+/// the network. Bootstrap already runs inside the server's Tokio runtime, so
+/// that fetch must be awaited — driving it with a nested `block_on` aborts
+/// startup outright.
+pub async fn wire_state(
     shared: &mut Arc<SharedState>,
     config: &ServerConfig,
     startup_gate: &Arc<StartupGate>,
@@ -96,9 +101,9 @@ pub fn wire_state(
         && !jwt_config.providers.is_empty()
         && let Some(state) = Arc::get_mut(shared)
     {
-        let registry = tokio::runtime::Handle::current().block_on(
-            crate::control::security::jwks::registry::JwksRegistry::init(jwt_config.clone()),
-        )?;
+        let registry =
+            crate::control::security::jwks::registry::JwksRegistry::init(jwt_config.clone())
+                .await?;
         state.jwks_registry = Some(Arc::new(registry));
         info!(
             "JWKS registry initialised with {} providers",

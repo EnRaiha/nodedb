@@ -46,7 +46,7 @@ pub async fn query_ndjson(
     use axum::response::Response;
 
     let (identity, verified_jwt) =
-        match resolve_auth_parts(&headers, &state, peer.as_str(), transport.security()) {
+        match resolve_auth_parts(&headers, &state, peer.as_str(), transport.security()).await {
             Ok(auth) => auth,
             Err(e) => return e.into_response(),
         };

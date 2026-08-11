@@ -169,7 +169,8 @@ async fn server_main() -> anyhow::Result<()> {
             startup_gate: &startup_gate,
             root_span: &root_span,
         },
-    )?;
+    )
+    .await?;
 
     post_open::run(
         &shared,

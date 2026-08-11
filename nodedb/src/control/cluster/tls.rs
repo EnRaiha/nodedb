@@ -98,7 +98,11 @@ pub(crate) fn load_bootstrap_issuer_material(
 
 /// Resolve [`TransportCredentials`] for this node from operator settings
 /// and on-disk state. See module docs for resolution order.
-pub fn resolve_credentials(
+///
+/// Async because the token-authenticated join path fetches the credential
+/// bundle from a seed node over the network, and cluster init already runs
+/// inside the server's Tokio runtime.
+pub async fn resolve_credentials(
     settings: &ClusterSettings,
     data_dir: &Path,
 ) -> crate::Result<TransportCredentials> {
@@ -159,7 +163,7 @@ pub fn resolve_credentials(
         std::env::var("NODEDB_JOIN_SEED"),
     ) && let Ok(seed) = seed_str.parse::<std::net::SocketAddr>()
     {
-        let creds = fetch_creds_via_bootstrap(settings, &tls_dir, &token, seed)?;
+        let creds = fetch_creds_via_bootstrap(settings, &tls_dir, &token, seed).await?;
         info!(
             node_id = settings.node_id,
             seed = %seed,
@@ -303,9 +307,7 @@ pub fn remove_trusted_ca(tls_dir: &Path, fp: &[u8; 32]) -> crate::Result<()> {
 /// L.4 joiner-side helper: connect to `seed`'s bootstrap listener with
 /// `token`, receive `(ca_cert, node_cert, node_key, cluster_secret)`,
 /// write the files to `tls_dir/`, and return the loaded credentials.
-/// Blocks the calling thread on a short-lived tokio runtime so the
-/// helper composes with the synchronous resolve path.
-fn fetch_creds_via_bootstrap(
+async fn fetch_creds_via_bootstrap(
     settings: &ClusterSettings,
     tls_dir: &Path,
     token_hex: &str,
@@ -315,22 +317,16 @@ fn fetch_creds_via_bootstrap(
         detail: format!("create tls dir {}: {e}", tls_dir.display()),
     })?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| crate::Error::Config {
-            detail: format!("build bootstrap runtime: {e}"),
-        })?;
-    let resp = rt
-        .block_on(nodedb_cluster::bootstrap_listener::fetch_creds(
-            seed,
-            token_hex,
-            settings.node_id,
-            std::time::Duration::from_secs(30),
-        ))
-        .map_err(|e| crate::Error::Config {
-            detail: format!("bootstrap fetch_creds: {e}"),
-        })?;
+    let resp = nodedb_cluster::bootstrap_listener::fetch_creds(
+        seed,
+        token_hex,
+        settings.node_id,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|e| crate::Error::Config {
+        detail: format!("bootstrap fetch_creds: {e}"),
+    })?;
 
     // Persist to disk so a restart takes the normal data-dir path
     // without needing the token a second time.
@@ -533,37 +529,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn insecure_flag_short_circuits() {
+    #[tokio::test]
+    async fn insecure_flag_short_circuits() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = settings(1, "127.0.0.1:9400".parse().unwrap(), vec![]);
         s.insecure_transport = true;
-        let creds = resolve_credentials(&s, dir.path()).unwrap();
+        let creds = resolve_credentials(&s, dir.path()).await.unwrap();
         assert!(creds.is_insecure());
     }
 
-    #[test]
-    fn bootstraps_first_seed_when_no_creds_provided() {
+    #[tokio::test]
+    async fn bootstraps_first_seed_when_no_creds_provided() {
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(1, addr, vec![addr]);
-        let creds = resolve_credentials(&s, dir.path()).unwrap();
+        let creds = resolve_credentials(&s, dir.path()).await.unwrap();
         assert!(!creds.is_insecure());
         assert!(dir.path().join(TLS_SUBDIR).join(CA_CERT_FILE).exists());
         assert!(dir.path().join(TLS_SUBDIR).join(NODE_CERT_FILE).exists());
         assert!(dir.path().join(TLS_SUBDIR).join(NODE_KEY_FILE).exists());
     }
 
-    #[test]
-    fn reloads_credentials_on_restart() {
+    #[tokio::test]
+    async fn reloads_credentials_on_restart() {
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(1, addr, vec![addr]);
         // First run bootstraps.
-        let _ = resolve_credentials(&s, dir.path()).unwrap();
+        let _ = resolve_credentials(&s, dir.path()).await.unwrap();
         // Second run loads from disk without re-generating.
         let ca_before = fs::read(dir.path().join(TLS_SUBDIR).join(CA_CERT_FILE)).unwrap();
-        let creds2 = resolve_credentials(&s, dir.path()).unwrap();
+        let creds2 = resolve_credentials(&s, dir.path()).await.unwrap();
         assert!(!creds2.is_insecure());
         let ca_after = fs::read(dir.path().join(TLS_SUBDIR).join(CA_CERT_FILE)).unwrap();
         assert_eq!(
@@ -572,13 +568,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn joining_node_without_creds_errors() {
+    #[tokio::test]
+    async fn joining_node_without_creds_errors() {
         let dir = tempfile::tempdir().unwrap();
         let self_addr: SocketAddr = "10.0.0.2:9400".parse().unwrap();
         let first_seed: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(2, self_addr, vec![first_seed, self_addr]);
-        let err = resolve_credentials(&s, dir.path()).unwrap_err();
+        let err = resolve_credentials(&s, dir.path()).await.unwrap_err();
         assert!(
             err.to_string().contains("TLS credentials not found"),
             "expected missing-creds error, got: {err}"
@@ -586,13 +582,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn bootstrapped_key_is_mode_0600() {
+    #[tokio::test]
+    async fn bootstrapped_key_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(1, addr, vec![addr]);
-        let _ = resolve_credentials(&s, dir.path()).unwrap();
+        let _ = resolve_credentials(&s, dir.path()).await.unwrap();
         let key_path = dir.path().join(TLS_SUBDIR).join(NODE_KEY_FILE);
         let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be 0600, got {:o}", mode);
@@ -606,19 +602,19 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn refuses_to_load_world_readable_key() {
+    #[tokio::test]
+    async fn refuses_to_load_world_readable_key() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(1, addr, vec![addr]);
         // First run bootstraps with tight perms.
-        let _ = resolve_credentials(&s, dir.path()).unwrap();
+        let _ = resolve_credentials(&s, dir.path()).await.unwrap();
         // Simulate an operator (or a careless tarball) loosening perms.
         let key_path = dir.path().join(TLS_SUBDIR).join(NODE_KEY_FILE);
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
         // Second run must refuse to load.
-        let err = resolve_credentials(&s, dir.path()).unwrap_err();
+        let err = resolve_credentials(&s, dir.path()).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("refusing to start") && msg.contains("0644"),
@@ -627,16 +623,16 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn refuses_to_load_group_readable_cluster_secret() {
+    #[tokio::test]
+    async fn refuses_to_load_group_readable_cluster_secret() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "10.0.0.1:9400".parse().unwrap();
         let s = settings(1, addr, vec![addr]);
-        let _ = resolve_credentials(&s, dir.path()).unwrap();
+        let _ = resolve_credentials(&s, dir.path()).await.unwrap();
         let secret_path = dir.path().join(TLS_SUBDIR).join(CLUSTER_SECRET_FILE);
         fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o640)).unwrap();
-        let err = resolve_credentials(&s, dir.path()).unwrap_err();
+        let err = resolve_credentials(&s, dir.path()).await.unwrap_err();
         assert!(err.to_string().contains("refusing to start"));
     }
 }

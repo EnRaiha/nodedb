@@ -44,7 +44,8 @@ pub async fn create_session(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let peer_str = peer.to_string();
-    let (identity, auth_ctx) = resolve_auth(&headers, &state, &peer_str, transport.security())?;
+    let (identity, auth_ctx) =
+        resolve_auth(&headers, &state, &peer_str, transport.security()).await?;
 
     // Creating server-side session state on the caller's behalf runs behind
     // the full gate — a blacklisted IP or suspended/banned account must not be
@@ -94,7 +95,8 @@ pub async fn delete_session(
         &state,
         &peer_str,
         transport.security(),
-    )?;
+    )
+    .await?;
     let rate_limit_headers = admit(
         &state,
         &identity,

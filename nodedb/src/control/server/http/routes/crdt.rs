@@ -57,7 +57,7 @@ pub async fn crdt_apply(
     Path(collection): Path<String>,
     raw_body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security()).await?;
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, risk, then rate limit — run first, before the body is parsed or

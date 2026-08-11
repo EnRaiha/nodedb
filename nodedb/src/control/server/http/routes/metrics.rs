@@ -20,7 +20,7 @@ pub async fn metrics(
     transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security()).await?;
 
     // Blacklist + account status, no rate limit: a Prometheus scrape runs on a
     // fixed interval and is not the per-query traffic the rate limiter's cost

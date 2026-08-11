@@ -30,7 +30,7 @@ pub async fn exchange_key(
     axum::Json(body): axum::Json<HttpExchangeKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, _auth_ctx) =
-        resolve_auth(&headers, &state, peer.as_str(), transport.security())?;
+        resolve_auth(&headers, &state, peer.as_str(), transport.security()).await?;
 
     // Minting a long-lived credential is work done on the caller's behalf, so
     // it runs behind the full gate: a blacklisted IP or a suspended/banned

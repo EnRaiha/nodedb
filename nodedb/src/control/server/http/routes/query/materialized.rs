@@ -46,7 +46,7 @@ pub async fn query(
     axum::Json(body): axum::Json<HttpQueryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, verified_jwt) =
-        resolve_auth_parts(&headers, &state, peer.as_str(), transport.security())?;
+        resolve_auth_parts(&headers, &state, peer.as_str(), transport.security()).await?;
     let database_id = resolve_database_id(&headers, &db_param, &state)?;
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));

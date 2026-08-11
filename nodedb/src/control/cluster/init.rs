@@ -35,7 +35,7 @@ pub async fn init_cluster(
     transport_tuning: &ClusterTransportTuning,
 ) -> crate::Result<ClusterHandle> {
     // 1a. Resolve TLS credentials (mandatory mTLS unless explicitly opted out).
-    let credentials = crate::control::cluster::tls::resolve_credentials(config, data_dir)?;
+    let credentials = crate::control::cluster::tls::resolve_credentials(config, data_dir).await?;
 
     // 1b. Create QUIC transport, configured from ClusterTransportTuning.
     let transport = Arc::new(

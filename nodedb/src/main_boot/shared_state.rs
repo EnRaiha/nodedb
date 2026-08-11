@@ -34,7 +34,7 @@ pub(crate) struct SharedStateInputs<'a> {
 /// the global quota ceiling and login rate-limit capacities. Pure
 /// relocation of what used to be inline in `main()` between Data Plane
 /// bootstrap and the post-open catalog steps.
-pub(crate) fn open_and_wire_state(
+pub(crate) async fn open_and_wire_state(
     config: &ServerConfig,
     inputs: SharedStateInputs<'_>,
 ) -> anyhow::Result<Arc<SharedState>> {
@@ -77,7 +77,8 @@ pub(crate) fn open_and_wire_state(
             maintenance_budget: Arc::clone(&maintenance_budget),
         },
         root_span,
-    )?;
+    )
+    .await?;
 
     // Wire global quota ceiling from server config so `ALTER DATABASE SET QUOTA`
     // can validate the sum-of-database-quotas against the cluster's physical

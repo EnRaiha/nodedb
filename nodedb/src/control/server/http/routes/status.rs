@@ -35,7 +35,7 @@ pub async fn status(
     transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security()).await?;
 
     // Request-admission gate before any state is read: this endpoint reports
     // user, tenant, and cluster counts on behalf of the caller, so a

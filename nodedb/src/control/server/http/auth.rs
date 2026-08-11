@@ -41,10 +41,13 @@ pub struct AppState {
 /// ([`authenticate_bearer_jwt`](session_auth::authenticate_bearer_jwt)) rather
 /// than being folded into it: API keys (`ndb_...`) never have 2 dots, so this
 /// keeps every non-JWT bearer token out of JWKS validation entirely instead of
-/// paying for (and logging) a doomed verification attempt on each one. This
-/// handler's caller is sync, so the shared async validator is driven via
-/// `block_on`; the surrounding request-handling stays synchronous.
-fn try_validate_jwt(
+/// paying for (and logging) a doomed verification attempt on each one.
+///
+/// Validation is awaited, never blocked on: a JWKS cache miss fetches the
+/// provider's key set over the network, and the whole HTTP request path runs on
+/// Tokio worker threads, so blocking here would stall a worker at best and
+/// abort the request at worst.
+async fn try_validate_jwt(
     state: &AppState,
     token: &str,
 ) -> Option<(
@@ -54,8 +57,7 @@ fn try_validate_jwt(
     if token.matches('.').count() != 2 {
         return None;
     }
-    tokio::runtime::Handle::current()
-        .block_on(session_auth::authenticate_bearer_jwt(&state.shared, token))
+    session_auth::authenticate_bearer_jwt(&state.shared, token).await
 }
 
 /// Enforce the TLS policy for a resolved HTTP identity.
@@ -82,13 +84,13 @@ fn enforce_transport_policy(
 /// 1. `Authorization: Bearer eyJ...` — JWT (if JwksRegistry configured)
 /// 2. `Authorization: Bearer ndb_...` — API key
 /// 3. Trust mode (no header required) — if configured
-pub fn resolve_identity(
+pub async fn resolve_identity(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
     transport: crate::control::security::tls_policy::TransportSecurity,
 ) -> Result<AuthenticatedIdentity, ApiError> {
-    let identity = resolve_identity_unchecked(headers, state, peer_addr)?;
+    let identity = resolve_identity_unchecked(headers, state, peer_addr).await?;
     enforce_transport_policy(state, &identity, transport, peer_addr)?;
     Ok(identity)
 }
@@ -97,7 +99,7 @@ pub fn resolve_identity(
 ///
 /// Private on purpose: an identity that has not been through
 /// [`enforce_transport_policy`] must not leave this module.
-fn resolve_identity_unchecked(
+async fn resolve_identity_unchecked(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -111,7 +113,7 @@ fn resolve_identity_unchecked(
             let token = token.trim();
 
             // Try JWT first (token has 2 dots = JWT format).
-            if let Some((identity, _)) = try_validate_jwt(state, token) {
+            if let Some((identity, _)) = try_validate_jwt(state, token).await {
                 return Ok(identity);
             }
 
@@ -167,7 +169,7 @@ pub fn require_tenant_admin_for_database(
 /// Uses `AuthContext::from_verified_jwt()` for JWTs so rich claims are retained
 /// while authorization fields remain bound to the verified identity. Falls back
 /// to `build_auth_context()` for API key / password auth.
-pub fn resolve_auth(
+pub async fn resolve_auth(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -181,7 +183,7 @@ pub fn resolve_auth(
 > {
     use crate::control::security::auth_context::{AuthContext, generate_session_id};
 
-    let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr, transport)?;
+    let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr, transport).await?;
     let auth_ctx = match &verified_jwt {
         Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()),
         None => session_auth::build_auth_context(&identity),
@@ -197,7 +199,7 @@ pub fn resolve_auth(
 /// `RequestAuthScope::builder().with_verified_jwt()` reproduces the exact
 /// claim-derived enrichment `resolve_auth` gives `AuthContext::from_verified_jwt`),
 /// or `None` for API key / trust / password auth.
-pub(crate) fn resolve_auth_parts(
+pub(crate) async fn resolve_auth_parts(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -214,7 +216,7 @@ pub(crate) fn resolve_auth_parts(
         && let Some(token) = auth_str.strip_prefix("Bearer ")
     {
         let token = token.trim();
-        if let Some((identity, verified_claims)) = try_validate_jwt(state, token) {
+        if let Some((identity, verified_claims)) = try_validate_jwt(state, token).await {
             // The JWT path returns before `resolve_identity`, so it enforces
             // the transport policy itself rather than inheriting it.
             enforce_transport_policy(state, &identity, transport, peer_addr)?;
@@ -222,7 +224,7 @@ pub(crate) fn resolve_auth_parts(
         }
     }
 
-    let identity = resolve_identity(headers, state, peer_addr, transport)?;
+    let identity = resolve_identity(headers, state, peer_addr, transport).await?;
     Ok((identity, None))
 }
 
@@ -374,7 +376,7 @@ impl FromRequestParts<AppState> for ResolvedIdentity {
     ) -> Result<Self, Self::Rejection> {
         let peer = super::peer::peer_addr_from_parts(parts)?;
         let transport = super::transport::transport_from_parts(parts)?;
-        let identity = resolve_identity(&parts.headers, state, &peer, transport)?;
+        let identity = resolve_identity(&parts.headers, state, &peer, transport).await?;
         Ok(ResolvedIdentity(identity))
     }
 }
@@ -401,7 +403,7 @@ impl FromRequestParts<AppState> for ResolvedAuth {
     ) -> Result<Self, Self::Rejection> {
         let peer = super::peer::peer_addr_from_parts(parts)?;
         let transport = super::transport::transport_from_parts(parts)?;
-        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer, transport)?;
+        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer, transport).await?;
         Ok(ResolvedAuth(identity, auth_ctx))
     }
 }
