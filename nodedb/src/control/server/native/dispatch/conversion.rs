@@ -3,7 +3,7 @@
 //! Shared conversion helpers for native protocol dispatch.
 
 use nodedb_types::Value;
-use nodedb_types::conversion::json_to_value_display;
+use nodedb_types::conversion::json_to_value_ref;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::control::server::response_shape::types::ShapedRows;
@@ -179,9 +179,19 @@ pub(crate) fn calvin_native_response(
 
 /// Convert protocol-neutral `ShapedRows` (produced by
 /// `response_shape::compose::shape_response_materialized`) into native wire
-/// columns/rows: each JSON scalar cell becomes a typed `Value` via
-/// `json_to_value_display`; a column absent from a given row's map becomes
-/// `Value::Null`.
+/// columns/rows: each JSON cell becomes a typed `Value` via `json_to_value_ref`;
+/// a column absent from a given row's map becomes `Value::Null`.
+///
+/// Structure is preserved all the way down, including nested objects and
+/// arrays. The native protocol is MessagePack and `Value` has `Object` and
+/// `Array` variants, so there is no format-level reason to render a nested
+/// value as text — and doing so is lossy in a way the client cannot undo
+/// reliably: a document field holding an object comes back as a `String` of
+/// its JSON, so deserializing the row into the struct it was written from
+/// fails with a type error, while a field that genuinely holds a JSON string
+/// is indistinguishable from one that was flattened. Text rendering belongs
+/// to pgwire, whose wire format is textual and which has its own
+/// `json_value_to_text` for exactly that.
 pub(crate) fn to_native_columns_rows(shaped: &ShapedRows) -> (Vec<String>, Vec<Vec<Value>>) {
     // Cells live in the row maps under per-column keys (display names may
     // repeat across columns, e.g. `SELECT w.id, b.id`), so read through the
@@ -195,7 +205,7 @@ pub(crate) fn to_native_columns_rows(shaped: &ShapedRows) -> (Vec<String>, Vec<V
                 .iter()
                 .map(|key| {
                     row.get(key.as_str())
-                        .map(json_to_value_display)
+                        .map(json_to_value_ref)
                         .unwrap_or(Value::Null)
                 })
                 .collect()

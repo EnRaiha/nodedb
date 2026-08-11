@@ -30,10 +30,23 @@ pub fn json_to_value(v: serde_json::Value) -> Value {
     }
 }
 
-/// Convert a `&serde_json::Value` to a `Value` by reference (cloning).
+/// Convert a `&serde_json::Value` to a `Value`, borrowing the input and
+/// cloning only the leaves it must own.
 ///
-/// Nested objects are serialized to JSON strings for tabular display.
-pub fn json_to_value_display(v: &serde_json::Value) -> Value {
+/// Structure-preserving all the way down, exactly like [`json_to_value`];
+/// this variant exists only so a caller holding a reference does not have to
+/// clone a whole subtree just to convert it.
+///
+/// Nested objects and arrays MUST stay nested. An earlier version of this
+/// function rendered objects as their JSON text for "tabular display", which
+/// silently made every nested field of a row unreadable: a client
+/// deserializing the row back into the struct it was written from got a
+/// string where an object belonged, and a field that genuinely held a JSON
+/// string was indistinguishable from one that had been flattened. Rendering
+/// a value as text is a property of a textual wire protocol, so it belongs to
+/// that protocol's encoder — never to a shared conversion every caller reaches
+/// for.
+pub fn json_to_value_ref(v: &serde_json::Value) -> Value {
     match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -45,10 +58,12 @@ pub fn json_to_value_display(v: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(json_to_value_display).collect())
-        }
-        serde_json::Value::Object(_) => Value::String(sonic_rs::to_string(v).unwrap_or_default()),
+        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value_ref).collect()),
+        serde_json::Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value_ref(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -69,11 +84,23 @@ mod tests {
         }
     }
 
+    /// The by-reference conversion must agree with the owned one all the way
+    /// down. It once flattened objects into JSON text, which made every
+    /// nested field of a row unreadable to a client deserializing it back
+    /// into the struct it was written from.
     #[test]
-    fn display_flattens_nested_objects() {
-        let v = serde_json::json!({"nested": true});
-        let val = json_to_value_display(&v);
-        assert!(matches!(val, Value::String(_)));
+    fn by_reference_preserves_nested_objects_and_arrays() {
+        let v = serde_json::json!({"a": 1, "b": {"nested": true}, "c": [{"deep": "x"}]});
+        assert_eq!(json_to_value_ref(&v), json_to_value(v.clone()));
+
+        let Value::Object(map) = json_to_value_ref(&v) else {
+            panic!("expected Object");
+        };
+        assert!(matches!(map.get("b"), Some(Value::Object(_))));
+        let Some(Value::Array(items)) = map.get("c") else {
+            panic!("expected Array");
+        };
+        assert!(matches!(items.first(), Some(Value::Object(_))));
     }
 
     #[test]
