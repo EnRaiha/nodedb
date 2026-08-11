@@ -19,6 +19,7 @@ pub mod data;
 pub mod diag;
 pub mod engine;
 pub mod error;
+mod error_classify;
 mod error_from;
 mod error_from_data_plane;
 pub mod event;

@@ -11,7 +11,16 @@ use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::ddl::{DdlError, DdlResult};
 
-/// Convert a crate-level error into a NativeResponse.
+/// Convert a Control-Plane error into a native error frame.
+///
+/// The stable numeric NodeDB code travels alongside the SQLSTATE, taken from
+/// the one internal-to-public mapping table the crate owns. Without it the
+/// frame reaches the client with `ndb_code == 0`, which the client can only
+/// rebuild as a generic internal failure — so a planner's "collection does not
+/// exist", an authorization refusal and a rate-limit rejection would all
+/// answer `false` to `is_not_found()` / `is_auth_denied()` / `is_rate_exceeded()`.
+/// The SQLSTATE is chosen here because it is a protocol-level rendering, while
+/// the numeric code is the classification itself.
 pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
     let (code, message) = match e {
         crate::Error::BadRequest { detail } => ("42601", detail.clone()),
@@ -39,7 +48,8 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
         ),
         other => ("XX000", format!("{other}")),
     };
-    NativeResponse::error(seq, code, message)
+    let ndb_code = crate::error_classify::classify(e).code().0;
+    NativeResponse::error_with_code(seq, code, message, ndb_code)
 }
 
 /// Convert a `NodeDbError` produced while shaping a response into a
@@ -277,5 +287,52 @@ mod tests {
             .error
             .expect("error responses must carry a payload");
         assert_eq!(error.code, "28000");
+    }
+
+    /// A Control-Plane classification must ride the frame as the numeric code,
+    /// not just as a SQLSTATE: the client rebuilds the typed error from the
+    /// number, and a zero there collapses every planner / catalog refusal into
+    /// a generic internal failure.
+    #[test]
+    fn control_plane_errors_carry_their_numeric_code() {
+        let response = error_to_native(
+            1,
+            &crate::Error::CollectionNotFound {
+                tenant_id: crate::types::TenantId::new(0),
+                collection: "missing".to_owned(),
+            },
+        );
+
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, "42P01");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
+        );
+    }
+
+    /// The numeric code is populated for every variant, including the ones
+    /// whose SQLSTATE falls through to `XX000` — otherwise the fix would be a
+    /// per-variant special case rather than one classification.
+    #[test]
+    fn errors_without_a_dedicated_sqlstate_still_carry_a_code() {
+        let response = error_to_native(
+            1,
+            &crate::Error::PlanError {
+                detail: "no such column".to_owned(),
+            },
+        );
+
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, "XX000");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::PLAN_ERROR.0,
+            "an unmapped SQLSTATE must not also erase the numeric classification"
+        );
     }
 }

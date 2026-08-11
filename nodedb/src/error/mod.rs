@@ -7,11 +7,13 @@
 //! infrastructure) — plus the `Result<T>` alias built on it. `conversions`
 //! owns `From` impls that turn external-crate error types into `Error`.
 //!
-//! Conversions into the crate's *public* error type (`NodeDbError`), the
-//! SQLSTATE/`ErrorCode` mapping, and cluster wire-error conversions live in
-//! `crate::error_from` rather than here — that module already isolates the
-//! "how does an internal `Error` present at the API boundary" concern from
-//! "what does an internal `Error` look like".
+//! Conversions into the crate's *public* error type (`NodeDbError`) and
+//! cluster wire-error conversions live in `crate::error_from` rather than
+//! here — that module already isolates the "how does an internal `Error`
+//! present at the API boundary" concern from "what does an internal `Error`
+//! look like" — with the `Error` to `NodeDbError` mapping table itself in
+//! `crate::error_classify`, which borrows so the wire paths that only hold a
+//! `&Error` classify through the same table.
 
 mod conversions;
 mod types;

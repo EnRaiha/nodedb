@@ -19,12 +19,24 @@
 //! Both a UNIQUE-index violation and a not-found read are covered: one
 //! condition alone would not distinguish a general fix from a
 //! constraint-shaped special case.
+//!
+//! Control-Plane refusals are covered alongside them. They never reach a
+//! Data-Plane `ErrorCode` at all — a statement naming a collection the
+//! catalog does not have, or one the caller may not read, is decided while
+//! planning — so they travel a different rendering path and were the last
+//! place a typed classification was still being flattened to NDB-9000.
 
 mod common;
 
-use common::native_harness::{do_handshake, send_request, send_sql};
+use common::native_harness::{
+    NativeTestServer, do_handshake, send_api_key_auth, send_request, send_sql,
+};
 use common::pgwire_harness::TestServer;
 
+use nodedb::control::security::apikey::CreateKeyParams;
+use nodedb::control::security::identity::Role;
+use nodedb::control::state::SharedState;
+use nodedb::types::{DatabaseId, TenantId};
 use nodedb_types::error::{ErrorCode, sqlstate};
 use nodedb_types::protocol::opcodes::{OpCode, ResponseStatus};
 use nodedb_types::protocol::{HelloFrame, TextFields};
@@ -37,6 +49,47 @@ async fn native_session(srv: &TestServer) -> TcpStream {
     let (stream, _ack) = do_handshake(addr, &HelloFrame::current())
         .await
         .expect("native handshake");
+    stream
+}
+
+/// Mint an API key for `username`, creating the service account first unless
+/// it is the harness superuser (which already exists).
+fn create_api_key(shared: &SharedState, username: &str, roles: Vec<Role>) -> String {
+    let user_id = if username == "nodedb" {
+        shared
+            .credentials
+            .get_user(username)
+            .expect("harness superuser")
+            .user_id
+    } else {
+        shared
+            .credentials
+            .create_service_account(username, TenantId::new(1), roles, vec![DatabaseId::DEFAULT])
+            .expect("create native service account")
+    };
+
+    shared
+        .api_keys
+        .create_key(
+            CreateKeyParams {
+                username,
+                user_id,
+                tenant_id: TenantId::new(1),
+                expires_secs: 0,
+                scope: vec![],
+                accessible_databases: vec![DatabaseId::DEFAULT],
+            },
+            Some(shared.credentials.catalog()),
+        )
+        .expect("create native API key")
+}
+
+async fn authenticated_stream(server: &NativeTestServer, token: String) -> TcpStream {
+    let (mut stream, _) = do_handshake(server.addr, &HelloFrame::current())
+        .await
+        .expect("native handshake");
+    let auth = send_api_key_auth(&mut stream, 1, token).await;
+    assert_eq!(auth.status, ResponseStatus::Ok, "native API key auth");
     stream
 }
 
@@ -169,6 +222,84 @@ async fn native_absent_key_read_carries_not_found_code() {
         err.ndb_code,
         ErrorCode::DOCUMENT_NOT_FOUND.0,
         "the frame must carry the numeric not-found code, got {} ({})",
+        err.ndb_code,
+        err.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_unknown_collection_carries_collection_not_found_code() {
+    let server = TestServer::start().await;
+
+    let mut stream = native_session(&server).await;
+    // The catalog lookup fails during planning, so nothing is ever dispatched
+    // and no Data-Plane code exists to classify the failure. The refusal is
+    // rendered from the Control Plane's own error, which is the half that
+    // still reported NDB-9000 after the Data-Plane path was fixed.
+    let resp = send_sql(&mut stream, 1, "SELECT * FROM native_err_absent_collection").await;
+
+    assert_eq!(
+        resp.status,
+        ResponseStatus::Error,
+        "a query naming an absent collection must be refused"
+    );
+    let err = resp.error.expect("error payload expected");
+    assert_eq!(
+        err.code,
+        sqlstate::UNDEFINED_TABLE,
+        "an absent collection must map to its own SQLSTATE, got {}: {}",
+        err.code,
+        err.message
+    );
+    assert_eq!(
+        err.ndb_code,
+        ErrorCode::COLLECTION_NOT_FOUND.0,
+        "the frame must carry the numeric collection-not-found code, got {} ({})",
+        err.ndb_code,
+        err.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_permission_denial_carries_authorization_code() {
+    let server = NativeTestServer::start_authenticated().await;
+
+    let admin_token = create_api_key(&server.shared, "nodedb", vec![Role::Superuser]);
+    let mut admin = authenticated_stream(&server, admin_token).await;
+    let create = send_sql(&mut admin, 2, "CREATE COLLECTION native_err_private").await;
+    assert_eq!(create.status, ResponseStatus::Ok, "create the target");
+
+    // A second Control-Plane condition, deliberately unrelated to the catalog:
+    // authorization is decided before dispatch too, so a fix that only rescued
+    // not-found would be another special case rather than one classification.
+    let token = create_api_key(
+        &server.shared,
+        "native_err_reader",
+        vec![Role::Custom("native_err_reader_role".into())],
+    );
+    let mut stream = authenticated_stream(&server, token).await;
+    let resp = send_sql(&mut stream, 2, "SELECT * FROM native_err_private").await;
+    drop(stream);
+    drop(admin);
+    server.shutdown().await;
+
+    assert_eq!(
+        resp.status,
+        ResponseStatus::Error,
+        "a role without a grant must not read the collection"
+    );
+    let err = resp.error.expect("error payload expected");
+    assert_eq!(
+        err.code,
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "a denial must map to its own SQLSTATE, got {}: {}",
+        err.code,
+        err.message
+    );
+    assert_eq!(
+        err.ndb_code,
+        ErrorCode::AUTHORIZATION_DENIED.0,
+        "the frame must carry the numeric authorization-denied code, got {} ({})",
         err.ndb_code,
         err.message
     );

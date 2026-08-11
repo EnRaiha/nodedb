@@ -16,6 +16,11 @@
 //! rescued constraint violations would be a constraint-shaped special case;
 //! not-found travelling the sibling response path proves the whole pipeline
 //! preserves classification.
+//!
+//! A Control-Plane refusal is asserted alongside them. It is decided before
+//! anything is dispatched, so it never has a Data-Plane code to be rendered
+//! from and is rendered from the internal error instead — the last path that
+//! was still shipping a bare SQLSTATE and collapsing to `internal` here.
 
 use nodedb_client::native::pool::PoolConfig;
 use nodedb_client::{NativeClient, NodeDb};
@@ -105,6 +110,39 @@ async fn absent_index_read_is_not_found_on_the_client() {
     assert!(
         !err.is_internal(),
         "a not-found must never present as an internal failure: {err}"
+    );
+
+    server.graceful_shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_collection_is_not_found_on_the_client() {
+    let server = TestServer::start().await;
+
+    let native = native_client(&server);
+    // Nothing is ever dispatched: the catalog lookup fails while planning, so
+    // this failure is classified entirely on the Control Plane. That path
+    // carried no numeric code on the frame even after the Data-Plane one was
+    // fixed, so a planner's "no such collection" arrived here as NDB-9000 and
+    // `is_not_found()` answered `false`.
+    let err = native
+        .execute_sql("SELECT * FROM client_err_absent_collection", &[])
+        .await
+        .expect_err("a query naming an absent collection must be refused");
+
+    assert!(
+        err.is_not_found(),
+        "the client must rebuild the planner's not-found classification, got {} ({:?})",
+        err,
+        err.details()
+    );
+    assert_eq!(
+        err.code(),
+        nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND
+    );
+    assert!(
+        !err.is_internal(),
+        "a planning refusal must never present as an internal failure: {err}"
     );
 
     server.graceful_shutdown().await;
