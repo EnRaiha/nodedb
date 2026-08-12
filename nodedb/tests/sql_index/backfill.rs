@@ -116,6 +116,19 @@ async fn create_index_backfills_existing_strict_rows() {
         vec!["a".to_string(), "c".to_string()],
         "the backfill must have populated the index from the Binary Tuple rows, got: {rows:?}"
     );
+
+    // The ascending assertion above also passes when the sort is dropped and
+    // the index happens to hand back its entries in key order. DESC cannot be
+    // satisfied by accident.
+    let rows = server
+        .query_text("SELECT id FROM bf_strict WHERE region = 'us' ORDER BY id DESC")
+        .await
+        .expect("indexed SELECT with a descending sort must succeed");
+    assert_eq!(
+        rows,
+        vec!["c".to_string(), "a".to_string()],
+        "an equality on the indexed column must not cost the query its ORDER BY, got: {rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

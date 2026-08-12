@@ -100,6 +100,20 @@ pub(super) fn validate_catalog_exprs(
             }
             validate_catalog_exprs(outer, catalog, database_id, tenant_id)?;
         }
+        // The post-processing tail's body keeps its own expressions; stopping
+        // the walk at the wrapper skips validating all of them.
+        SqlPlan::Subquery {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            ..
+        } => {
+            validate_catalog_exprs(input, catalog, database_id, tenant_id)?;
+            validate_filters(filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+            validate_sort_keys(sort_keys, catalog, database_id, tenant_id)?;
+        }
         SqlPlan::Join {
             left,
             right,

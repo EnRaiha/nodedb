@@ -69,6 +69,12 @@ pub(in crate::data::executor) struct DocFetchParams<'a> {
     pub offset: usize,
     pub filter_predicates: &'a [ScanFilter],
     pub strict_schema: Option<&'a StrictSchema>,
+    /// The fetch may not stop at `limit`: a downstream ORDER BY or DISTINCT
+    /// decides which rows survive, so the first `limit` rows the store happens
+    /// to return are not the first `limit` rows of the answer. The fetch is
+    /// bounded by the memory budget instead, and the caller surfaces
+    /// `ResourcesExhausted` rather than truncating silently.
+    pub full_fetch: bool,
 }
 
 /// Raw rows plus the schema the downstream should decode them with.
@@ -87,10 +93,10 @@ impl CoreLoop {
         params: DocFetchParams<'_>,
     ) -> crate::Result<FetchedRows> {
         let collection = params.collection;
-        let limit = params.limit;
         let offset = params.offset;
         let filter_predicates = params.filter_predicates;
         let strict_schema = params.strict_schema;
+        let scan_limit = self.effective_fetch_limit(params.limit, offset, params.full_fetch);
 
         match params.mode {
             DocScanMode::Current => self.fetch_current(task, tid, &params),
@@ -121,7 +127,6 @@ impl CoreLoop {
                         false
                     }
                 };
-                let scan_limit = offset.saturating_add(limit);
                 let raw = self.sparse.versioned_scan_as_of(
                     crate::engine::sparse::btree_versioned::VersionedScanParams {
                         database_id: task.request.database_id.as_u64(),
@@ -175,7 +180,6 @@ impl CoreLoop {
                         false
                     }
                 };
-                let scan_limit = offset.saturating_add(limit);
                 let raw = self.sparse.versioned_scan_all(
                     task.request.database_id.as_u64(),
                     tid,
@@ -209,6 +213,20 @@ impl CoreLoop {
         }
     }
 
+    /// The row ceiling the storage scan is allowed to stop at.
+    ///
+    /// A `full_fetch` scan is treated as unbounded here — its rows are
+    /// reordered or deduplicated downstream, so stopping at `limit` would cut
+    /// the wrong ones — and is bounded by the memory budget instead.
+    fn effective_fetch_limit(&self, limit: usize, offset: usize, full_fetch: bool) -> usize {
+        let requested = if full_fetch { usize::MAX } else { limit };
+        crate::data::executor::handlers::scan_budget::fetch_limit_for(
+            requested,
+            offset,
+            self.query_tuning.max_scan_result_bytes,
+        )
+    }
+
     /// Newest live version per document (current-time read). Bitemporal
     /// collections read current state from the versioned store; plain
     /// collections from the live table with a `scan_collection` fallback.
@@ -219,17 +237,11 @@ impl CoreLoop {
         params: &DocFetchParams<'_>,
     ) -> crate::Result<FetchedRows> {
         let collection = params.collection;
-        let limit = params.limit;
-        let offset = params.offset;
         let filter_predicates = params.filter_predicates;
         let strict_schema = params.strict_schema;
 
-        let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
-        let fetch_limit = crate::data::executor::handlers::scan_budget::fetch_limit_for(
-            limit,
-            offset,
-            scan_budget_bytes,
-        );
+        let fetch_limit =
+            self.effective_fetch_limit(params.limit, params.offset, params.full_fetch);
         let database_id = task.request.database_id.as_u64();
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
         // Resolved from the collection's registered kind, never from the bytes:

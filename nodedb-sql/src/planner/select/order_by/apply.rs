@@ -13,6 +13,7 @@ use super::triggers::try_extract_sort_search;
 use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
+use crate::planner::select::post_process::post_process;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -192,6 +193,11 @@ pub(in crate::planner::select) fn apply_order_by(
             definitions: definitions.clone(),
             outer: Box::new(apply_order_by(outer, order_by, functions, select_items)?),
         }),
-        _ => Ok(plan.clone()),
+        // The clause is non-empty here (`exprs` was checked above), so these
+        // keys were asked for. A variant with no slot to hold them must not
+        // pass through unchanged — that answers the query in whatever order
+        // the engine happened to produce. Sort its rows in a post-processing
+        // tail instead.
+        other => post_process(other.clone(), sort_keys, None, 0),
     }
 }

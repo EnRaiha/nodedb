@@ -103,6 +103,36 @@ fn walk_plan(
             outer: Box::new(walk_plan(*outer, catalog, database_id, tenant_id)),
         },
 
+        // The post-processing tail wraps a body that keeps its own filters. A
+        // wrapper that stopped the walk left every catalog cast inside the body
+        // unfolded (`attrelid = 'x'::regclass` stays an unevaluated cast), and
+        // an unfolded cast matches no row — the query then succeeds with zero
+        // rows instead of failing.
+        SqlPlan::Subquery {
+            input,
+            mut filters,
+            mut projection,
+            mut sort_keys,
+            offset,
+            distinct,
+            limit,
+        } => {
+            for f in &mut filters {
+                fold_filter(f, catalog, database_id, tenant_id);
+            }
+            fold_projection(&mut projection, catalog, database_id, tenant_id);
+            fold_sort_keys(&mut sort_keys, catalog, database_id, tenant_id);
+            SqlPlan::Subquery {
+                input: Box::new(walk_plan(*input, catalog, database_id, tenant_id)),
+                filters,
+                projection,
+                sort_keys,
+                offset,
+                distinct,
+                limit,
+            }
+        }
+
         SqlPlan::Join {
             left,
             right,

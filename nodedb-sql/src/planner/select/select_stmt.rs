@@ -5,7 +5,9 @@
 use nodedb_types::DatabaseId;
 use sqlparser::ast::{self, Select};
 
+use super::derived_from::try_plan_derived_from;
 use super::helpers::{convert_projection, convert_where_to_filters};
+use super::query_tail::QueryTail;
 use super::where_search::try_extract_where_search;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
@@ -18,14 +20,17 @@ use crate::resolver::columns::TableScope;
 use crate::temporal::TemporalScope;
 use crate::types::*;
 
-use super::entry::{CteCatalog, plan_query};
-
 /// Plan a single SELECT statement (no UNION, no CTE wrapper).
+///
+/// `tail` carries the enclosing query's ORDER BY / LIMIT so the base scan can
+/// be built with them in place — see [`QueryTail`] for why the engine rules
+/// need them before `plan_scan` runs.
 pub(super) fn plan_select(
     select: &Select,
     catalog: &dyn SqlCatalog,
     functions: &FunctionRegistry,
     temporal: TemporalScope,
+    tail: &QueryTail<'_>,
 ) -> Result<SqlPlan> {
     // 0. Intercept array table-valued functions before catalog resolution
     //    so a name like `ARRAY_SLICE` is not looked up as a collection.
@@ -44,7 +49,7 @@ pub(super) fn plan_select(
     // dropped non-LATERAL derived factors silently, the scope ended
     // up empty, and the planner errored with "multi-table FROM
     // without JOIN".
-    if let Some(plan) = try_plan_derived_from(select, catalog, functions, temporal)? {
+    if let Some(plan) = try_plan_derived_from(select, catalog, functions, temporal, tail)? {
         return Ok(plan);
     }
 
@@ -271,15 +276,33 @@ pub(super) fn plan_select(
         Vec::new()
     };
 
+    // The enclosing query's ORDER BY / LIMIT are resolved here, before
+    // `plan_scan`, because the engine rules decide the access path from them:
+    // the document index-lookup rewrite must decline when a sort is requested,
+    // and must carry the real row bound rather than a default. `apply_order_by`
+    // and `apply_limit` re-derive the same values on the finished plan and
+    // overwrite these fields with an identical result.
+    //
+    // A scan that is about to be wrapped in subquery joins takes neither:
+    // ordering and bounding the join's input instead of its output would
+    // answer the query from the wrong rows. Those clauses land on the join
+    // itself downstream — the same reason `scan_projection` is empty here.
+    let (sort_keys, limit, offset) = if subquery_joins.is_empty() {
+        let (limit, offset) = tail.limit_offset();
+        (tail.sort_keys()?, limit, offset)
+    } else {
+        (Vec::new(), None, 0)
+    };
+
     let rules = crate::engine_rules::resolve_engine_rules(table.info.engine);
     let mut plan = rules.plan_scan(crate::engine_rules::ScanParams {
         collection: table.name.clone(),
         alias: table.alias.clone(),
         filters,
         projection: scan_projection,
-        sort_keys: Vec::new(),
-        limit: None,
-        offset: 0,
+        sort_keys,
+        limit,
+        offset,
         distinct: select.distinct.is_some(),
         window_functions,
         indexes: table.info.indexes.clone(),
@@ -389,73 +412,6 @@ fn has_aggregation(select: &Select, functions: &FunctionRegistry) -> bool {
         }
     }
     false
-}
-
-/// Desugar `FROM (SELECT ...) AS alias` into a synthetic single-CTE plan.
-///
-/// Recognises the single-source, non-LATERAL derived-table pattern. The
-/// inner subquery is planned with the original catalog; the outer
-/// SELECT is replanned with a `CteCatalog` that resolves the alias to
-/// a schemaless source. The result is wrapped as `SqlPlan::Cte` so the
-/// `convert_cte` lowering takes care of execution.
-///
-/// Returns `Ok(None)` when the FROM clause is not a single derived
-/// table, so the caller falls through to the regular planning path.
-fn try_plan_derived_from(
-    select: &Select,
-    catalog: &dyn SqlCatalog,
-    functions: &FunctionRegistry,
-    temporal: TemporalScope,
-) -> Result<Option<SqlPlan>> {
-    if select.from.len() != 1 {
-        return Ok(None);
-    }
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return Ok(None);
-    }
-    let (subquery, alias_ident) = match &from.relation {
-        ast::TableFactor::Derived {
-            lateral: false,
-            subquery,
-            alias: Some(alias),
-            ..
-        } => (subquery, alias),
-        _ => return Ok(None),
-    };
-
-    let alias_name = crate::reserved::check_ast_identifier(&alias_ident.name)?;
-    let inner_plan = plan_query(subquery, catalog, functions, temporal)?;
-
-    // Replan the outer SELECT against a catalog that resolves the alias
-    // as a schemaless source. The outer can reference `alias.col`
-    // qualified or unqualified — the resolver treats CTE rows as a
-    // schemaless document so any projected column flows through.
-    let derived_catalog = CteCatalog {
-        inner: catalog,
-        cte_names: vec![alias_name.clone()],
-    };
-    let mut outer_select = select.clone();
-    outer_select.from[0].relation = ast::TableFactor::Table {
-        name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(
-            alias_ident.name.clone(),
-        )]),
-        alias: None,
-        args: None,
-        with_hints: Vec::new(),
-        version: None,
-        with_ordinality: false,
-        partitions: Vec::new(),
-        json_path: None,
-        sample: None,
-        index_hints: Vec::new(),
-    };
-    let outer_plan = plan_select(&outer_select, &derived_catalog, functions, temporal)?;
-
-    Ok(Some(SqlPlan::Cte {
-        definitions: vec![(alias_name, inner_plan)],
-        outer: Box::new(outer_plan),
-    }))
 }
 
 /// Dispatch to the JOIN planner if the FROM contains joins.

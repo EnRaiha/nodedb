@@ -5,6 +5,7 @@
 mod cacheability;
 mod merge_types;
 mod row_types;
+mod variant_name;
 mod variants;
 mod vector_opts;
 

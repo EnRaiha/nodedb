@@ -6,10 +6,14 @@
 //! search patterns (vector, text, hybrid, spatial) directly from the AST
 //! instead of reverse-engineering an optimizer's output.
 
+mod derived_from;
 mod entry;
 mod entry_ann;
 pub mod helpers;
+mod limit;
 mod order_by;
+mod post_process;
+mod query_tail;
 mod select_stmt;
 mod where_search;
 

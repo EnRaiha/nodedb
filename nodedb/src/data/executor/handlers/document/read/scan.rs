@@ -131,6 +131,10 @@ impl CoreLoop {
                 offset,
                 filter_predicates: &filter_predicates,
                 strict_schema: strict_schema.as_ref(),
+                // A sort reorders the rows and DISTINCT removes some, so the
+                // first `limit` rows the store returns are not the first
+                // `limit` rows of the answer — the fetch cannot stop there.
+                full_fetch: !sort_keys.is_empty() || distinct,
             },
         );
 
@@ -195,12 +199,14 @@ impl CoreLoop {
                     }
                 }
 
-                // Bound an unbounded (no-LIMIT) scan by the memory budget. If
-                // the materialized result exceeds `max_scan_result_bytes`,
-                // surface a deterministic error instead of silently dropping
-                // rows. Only enforced for unbounded scans — an explicit
-                // `LIMIT n` is already row-bounded by the planner.
-                if limit == usize::MAX
+                // Bound an unbounded fetch by the memory budget. If the
+                // materialized result exceeds `max_scan_result_bytes`, surface
+                // a deterministic error instead of silently dropping rows. A
+                // scan with a `LIMIT n` the fetch could stop at is already
+                // row-bounded; one whose rows are reordered or deduplicated
+                // downstream had to gather the whole collection and is bounded
+                // here instead.
+                if (limit == usize::MAX || !sort_keys.is_empty() || distinct)
                     && crate::data::executor::handlers::scan_budget::scan_bytes_exceeded(
                         &filtered,
                         scan_budget_bytes,

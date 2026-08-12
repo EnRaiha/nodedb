@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Top-level query entry: CTE handling, UNION dispatch, and LIMIT
-//! application. ORDER BY and search-trigger detection live in `order_by.rs`.
+//! Top-level query entry: CTE handling and UNION dispatch. ORDER BY and
+//! search-trigger detection live in `order_by.rs`; LIMIT / OFFSET application
+//! lives in `limit.rs`.
 
 use nodedb_types::DatabaseId;
-use sqlparser::ast::{self, Query, SetExpr};
+use sqlparser::ast::{Query, SetExpr};
 
+use super::limit::apply_limit;
 use super::order_by::{apply_order_by, try_hybrid_from_projection};
+use super::query_tail::QueryTail;
 use super::select_stmt::plan_select;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::reserved::check_ast_identifier;
 use crate::temporal::TemporalScope;
 use crate::types::{Projection, SqlExpr, *};
-
-/// Default `ef_search` multiplier applied when LIMIT is the only signal
-/// available for sizing the HNSW beam (e.g. on a fused VectorSearch that
-/// inherited LIMIT after `apply_order_by`). Wider beams trade extra distance
-/// computations for higher recall; `2 * top_k` is a standard heuristic.
-const DEFAULT_EF_SEARCH_MULTIPLIER: usize = 2;
 
 /// Returns `true` when every projection item is either:
 /// - a plain column reference to the surrogate/PK column (`id` or `document_id`), or
@@ -114,7 +111,14 @@ pub fn plan_query(
     // Handle UNION.
     match &*query.body {
         SetExpr::Select(select) => {
-            let mut plan = plan_select(select, catalog, functions, temporal)?;
+            // ORDER BY / LIMIT belong to the query, not to its SELECT body,
+            // but the scan planner needs them to pick an access path that can
+            // honour them — so they travel down with the SELECT.
+            let tail = QueryTail {
+                order_by: query.order_by.as_ref(),
+                limit_clause: &query.limit_clause,
+            };
+            let mut plan = plan_select(select, catalog, functions, temporal, &tail)?;
             // Snapshot the projection before ORDER BY transforms the plan,
             // in case `apply_order_by` converts a Scan into VectorSearch.
             let pre_order_by_projection: Option<Vec<Projection>> = match &plan {
@@ -139,11 +143,43 @@ pub fn plan_query(
             // WHERE `text_match(...)` path) and the SELECT list additionally
             // contains `bm25_score(...)` — in that case we attach the
             // `score_alias` so the executor knows to inject the score column.
-            if matches!(plan, SqlPlan::Scan { .. } | SqlPlan::TextSearch { .. })
-                && let Some(upgraded_plan) =
-                    try_hybrid_from_projection(&plan, &select.projection, functions)?
-            {
-                plan = upgraded_plan;
+            //
+            // `apply_order_by` may have wrapped a search plan in a
+            // post-processing tail to carry the sort, so the upgrade inspects
+            // the body and is re-wrapped in place — otherwise the score column
+            // the SELECT list asked for would never be attached.
+            let upgrade = {
+                let leaf = match &plan {
+                    SqlPlan::Subquery { input, .. } => input.as_ref(),
+                    other => other,
+                };
+                if matches!(leaf, SqlPlan::Scan { .. } | SqlPlan::TextSearch { .. }) {
+                    try_hybrid_from_projection(leaf, &select.projection, functions)?
+                } else {
+                    None
+                }
+            };
+            if let Some(upgraded_leaf) = upgrade {
+                plan = match plan {
+                    SqlPlan::Subquery {
+                        filters,
+                        projection,
+                        sort_keys,
+                        offset,
+                        distinct,
+                        limit,
+                        ..
+                    } => SqlPlan::Subquery {
+                        input: Box::new(upgraded_leaf),
+                        filters,
+                        projection,
+                        sort_keys,
+                        offset,
+                        distinct,
+                        limit,
+                    },
+                    _ => upgraded_leaf,
+                };
             }
             // After ORDER BY: if we now have a VectorSearch, check whether
             // the collection is vector-primary and the projection is
@@ -312,8 +348,7 @@ pub fn plan_query(
                     }
                 }
             }
-            plan = apply_limit(plan, &query.limit_clause);
-            Ok(plan)
+            apply_limit(plan, &tail)
         }
         SetExpr::SetOperation {
             op,
@@ -333,94 +368,6 @@ pub fn plan_query(
             detail: format!("query body type: {}", query.body),
         }),
     }
-}
-
-/// Apply LIMIT and OFFSET to a plan.
-fn apply_limit(mut plan: SqlPlan, limit_clause: &Option<ast::LimitClause>) -> SqlPlan {
-    let (limit_val, offset_val) = match limit_clause {
-        None => (None, 0usize),
-        Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => {
-            let lv = limit
-                .as_ref()
-                .and_then(crate::coerce::expr_as_usize_literal);
-            let ov = offset
-                .as_ref()
-                .and_then(|o| crate::coerce::expr_as_usize_literal(&o.value))
-                .unwrap_or(0);
-            (lv, ov)
-        }
-        Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-            let lv = crate::coerce::expr_as_usize_literal(limit);
-            let ov = crate::coerce::expr_as_usize_literal(offset).unwrap_or(0);
-            (lv, ov)
-        }
-    };
-
-    // The LIMIT belongs to the query reading the CTE, not to the CTE body, so
-    // it lands on the outer plan — without this a derived table like
-    // `FROM (...) s LIMIT n` comes back unbounded.
-    if let SqlPlan::Cte { definitions, outer } = plan {
-        return SqlPlan::Cte {
-            definitions,
-            outer: Box::new(apply_limit(*outer, limit_clause)),
-        };
-    }
-
-    match plan {
-        SqlPlan::Scan {
-            ref mut limit,
-            ref mut offset,
-            ..
-        } => {
-            *limit = limit_val;
-            *offset = offset_val;
-        }
-        SqlPlan::Aggregate {
-            limit: ref mut l, ..
-        } => {
-            if let Some(lv) = limit_val {
-                *l = lv;
-            }
-        }
-        SqlPlan::VectorSearch {
-            top_k: ref mut k,
-            ef_search: ref mut ef,
-            ann_options: ref opts,
-            ..
-        } => {
-            // Fused VectorSearch (e.g. ORDER BY vector_distance + JOIN
-            // ARRAY_SLICE) inherits its outer LIMIT here. Without this,
-            // a join-derived VectorSearch carries the join's default
-            // 10000 limit instead of the user's `LIMIT N`.
-            if let Some(lv) = limit_val {
-                *k = lv;
-                *ef = opts
-                    .ef_search_override
-                    .unwrap_or(lv * DEFAULT_EF_SEARCH_MULTIPLIER);
-            }
-        }
-        SqlPlan::Join {
-            limit: ref mut l, ..
-        } => {
-            // Record the LIMIT clause verbatim: `Some(n)` for an explicit
-            // `LIMIT n`, `None` for no clause. A no-LIMIT join is bounded
-            // downstream by the memory byte budget rather than silently
-            // truncated, so we must NOT substitute a default row cap here.
-            *l = limit_val;
-        }
-        SqlPlan::SparseSearch {
-            top_k: ref mut k, ..
-        } => {
-            // `SparseSearch` returns the highest-scoring `top_k` documents, so
-            // the query's `LIMIT N` is the top-k bound. Without this the plan
-            // carries the trigger's fallback default instead of the user's N.
-            if let Some(lv) = limit_val {
-                *k = lv;
-            }
-        }
-        _ => {}
-    }
-    plan
 }
 
 /// Catalog wrapper that resolves CTE names as schemaless document collections.
@@ -451,75 +398,5 @@ impl SqlCatalog for CteCatalog<'_> {
             }));
         }
         self.inner.get_collection(database_id, name)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::temporal::TemporalScope;
-    use crate::types::plan::SqlPlan;
-    use crate::types::query::{EngineType, JoinType};
-
-    fn minimal_scan() -> SqlPlan {
-        SqlPlan::Scan {
-            collection: "t".into(),
-            alias: None,
-            engine: EngineType::DocumentSchemaless,
-            filters: vec![],
-            projection: vec![],
-            sort_keys: vec![],
-            limit: None,
-            offset: 0,
-            distinct: false,
-            window_functions: vec![],
-            temporal: TemporalScope::default(),
-        }
-    }
-
-    fn join_plan_with_limit(limit: Option<usize>) -> SqlPlan {
-        SqlPlan::Join {
-            left: Box::new(minimal_scan()),
-            right: Box::new(minimal_scan()),
-            on: vec![],
-            join_type: JoinType::Inner,
-            condition: None,
-            limit,
-            projection: vec![],
-            filters: vec![],
-        }
-    }
-
-    fn limit_clause(n: usize) -> Option<ast::LimitClause> {
-        Some(ast::LimitClause::LimitOffset {
-            limit: Some(ast::Expr::Value(
-                ast::Value::Number(n.to_string(), false).into(),
-            )),
-            offset: None,
-            limit_by: vec![],
-        })
-    }
-
-    #[test]
-    fn apply_limit_sets_join_limit() {
-        // An explicit `LIMIT 5` clause is recorded as `Some(5)`.
-        let plan = join_plan_with_limit(None);
-        let result = apply_limit(plan, &limit_clause(5));
-        match result {
-            SqlPlan::Join { limit, .. } => assert_eq!(limit, Some(5)),
-            other => panic!("expected SqlPlan::Join, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn apply_limit_none_leaves_join_limit_none() {
-        // No LIMIT clause stays `None` — the join is bounded by the memory
-        // budget downstream, never by a default row cap.
-        let plan = join_plan_with_limit(None);
-        let result = apply_limit(plan, &None);
-        match result {
-            SqlPlan::Join { limit, .. } => assert_eq!(limit, None),
-            other => panic!("expected SqlPlan::Join, got {other:?}"),
-        }
     }
 }

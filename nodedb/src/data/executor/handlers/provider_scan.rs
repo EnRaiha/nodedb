@@ -146,6 +146,11 @@ impl CoreLoop {
     }
 }
 
+/// A row key with its table qualifier removed (`a.attname` → `attname`).
+fn bare_column(key: &str) -> &str {
+    key.rsplit('.').next().unwrap_or(key)
+}
+
 /// Decode a flat msgpack row array (the `encode_binary_rows` format) into
 /// individual row byte vectors. Each element is a flat column map; its bytes are
 /// returned verbatim so subsequent steps operate per-row without re-encoding.
@@ -179,6 +184,12 @@ fn decode_flat_row_array(bytes: &[u8]) -> Vec<Vec<u8>> {
 /// decode). If a projection column is not present in the row it is silently
 /// omitted. If `projection` is empty this function must not be called (the
 /// caller is expected to skip projection for the empty case).
+///
+/// A row key matches a projection entry outright or once its table qualifier is
+/// dropped — a join body emits one merged document per row whose columns keep
+/// their `alias.column` prefix, so an exact-only match would project every
+/// merged row down to nothing. This mirrors the qualified-then-bare lookup the
+/// response shaper performs on the same rows.
 fn project_row_by_names(row: &[u8], projection: &[String]) -> Vec<u8> {
     let Some((count, mut pos)) = msgpack_scan::map_header(row, 0) else {
         return row.to_vec();
@@ -200,7 +211,9 @@ fn project_row_by_names(row: &[u8], projection: &[String]) -> Vec<u8> {
             None => break,
         };
         if let Some(k) = key
-            && projection.iter().any(|p| p == k)
+            && projection
+                .iter()
+                .any(|p| p == k || p.as_str() == bare_column(k))
         {
             entries.push((k, val_start, val_end));
         }

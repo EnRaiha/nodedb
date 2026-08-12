@@ -256,6 +256,23 @@ pub(super) fn convert_subquery(
     }
     let mut child = body_tasks.pop().expect("checked len == 1").plan;
 
+    // A join / lateral body emits ONE merged document per output row whose
+    // columns keep their table prefix (`a.attnum`), which is why the response
+    // shaper looks those rows up by the qualified name. The tail's sort keys
+    // must address the same shape — an unqualified key resolves to NULL on
+    // every merged row, and a sort where every key is NULL is a no-op that
+    // silently answers an ordered query in the body's own order.
+    let merged_doc_body = matches!(
+        child,
+        PhysicalPlan::Query(
+            QueryOp::HashJoin { .. }
+                | QueryOp::NestedLoopJoin { .. }
+                | QueryOp::SortMergeJoin { .. }
+                | QueryOp::LateralTopK { .. }
+                | QueryOp::LateralLoop { .. }
+        )
+    );
+
     // A sharded body must be gathered before the relational tail runs, so the
     // sort/distinct/offset/limit observe the FULL union exactly once.
     // PostProcess is itself coordinator-local (`is_sharded_source() == false`),
@@ -282,7 +299,7 @@ pub(super) fn convert_subquery(
             input: Box::new(child),
             filters: super::filter::serialize_filters(filters)?,
             projection: lower_subquery_projection(projection)?,
-            sort_keys: lower_subquery_sort_keys(sort_keys),
+            sort_keys: lower_subquery_sort_keys(sort_keys, merged_doc_body),
             limit,
             offset,
             distinct,
@@ -292,12 +309,17 @@ pub(super) fn convert_subquery(
     }])
 }
 
-/// Lower outer projection items to plain column names for the relational tail.
+/// Lower outer projection items to the row keys the relational tail matches.
 ///
-/// A bare column keeps its unqualified name (the flattened row's column key). A
-/// star selects every column, so no column pruning is applied (empty = all). A
-/// computed projection has no slot in the row-post-processing tail — it is
-/// projected in an outer SELECT, not here.
+/// A bare column keeps its unqualified name (the flattened row's column key); a
+/// star selects every column, so no column pruning is applied (empty = all).
+///
+/// A computed item is projected under its alias: the body evaluates the
+/// expression and emits the value under that name before the tail runs, which
+/// is the same key the response shaper reads it back by. Erroring here instead
+/// would reject `SELECT a, f(b) … ORDER BY c` outright, since the wrapper
+/// carries the original SELECT list whenever the body had to be widened to keep
+/// the sort column.
 fn lower_subquery_projection(projection: &[Projection]) -> crate::Result<Vec<String>> {
     let mut names = Vec::with_capacity(projection.len());
     for p in projection {
@@ -306,14 +328,7 @@ fn lower_subquery_projection(projection: &[Projection]) -> crate::Result<Vec<Str
                 names.push(qname.rsplit('.').next().unwrap_or(qname).to_string());
             }
             Projection::Star | Projection::QualifiedStar(_) => return Ok(Vec::new()),
-            Projection::Computed { .. } => {
-                return Err(crate::Error::PlanError {
-                    detail: "a computed projection over an ORDER BY / OFFSET / DISTINCT subquery \
-                             is not supported; select the base columns in the subquery and \
-                             compute them in an outer SELECT"
-                        .into(),
-                });
-            }
+            Projection::Computed { alias, .. } => names.push(alias.clone()),
         }
     }
     Ok(names)
@@ -324,7 +339,22 @@ fn lower_subquery_projection(projection: &[Projection]) -> crate::Result<Vec<Str
 /// The tail evaluates each key against the gathered rows, so a computed key
 /// (`ORDER BY 100 / weight`) sorts by its value rather than having to be
 /// projected in the subquery first.
-fn lower_subquery_sort_keys(keys: &[SortKey]) -> Vec<SortKeySpec> {
+///
+/// `merged_doc_body` selects the column-naming convention of the rows the tail
+/// will see: a join / lateral body prefixes every column with its table alias,
+/// so its keys must be qualified to resolve. Column references that carry no
+/// table qualifier lower identically either way.
+fn lower_subquery_sort_keys(keys: &[SortKey], merged_doc_body: bool) -> Vec<SortKeySpec> {
+    if merged_doc_body {
+        return keys
+            .iter()
+            .map(|k| SortKeySpec {
+                expr: super::expr::sql_expr_to_bridge_expr_qualified(&k.expr),
+                ascending: k.ascending,
+                nulls_first: k.nulls_first,
+            })
+            .collect();
+    }
     super::expr::convert_sort_keys(keys)
 }
 
