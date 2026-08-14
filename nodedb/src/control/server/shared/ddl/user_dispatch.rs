@@ -167,7 +167,7 @@ fn authorize_for_identity(
                 &request,
                 operation_for_plan(&plan),
             )?;
-            request.into_scope()
+            request.into_resolved_scope()
         }
     };
 
@@ -234,7 +234,7 @@ fn resolve_dispatch_scope<'a>(
     match admission {
         RequestAdmission::AlreadyAdmitted => builder.build(),
         RequestAdmission::NotYetAdmitted { peer_addr } => {
-            builder.build_for_client(peer_addr).into_scope()
+            builder.build_for_client(peer_addr).into_resolved_scope()
         }
     }
 }

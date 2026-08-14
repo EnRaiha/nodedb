@@ -82,7 +82,7 @@ pub async fn query(
         &request,
         "sql",
     )?;
-    let scope = request.into_scope();
+    let scope = request.into_resolved_scope();
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 

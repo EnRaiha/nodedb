@@ -231,7 +231,7 @@ fn authorize_resp_task(
     // call covers the whole protocol, including the IP-blacklist half via
     // `session.peer_addr` (set at connection accept).
     crate::control::server::session_auth::check_request_admission(state, &request, operation)?;
-    let scope = request.into_scope();
+    let scope = request.into_resolved_scope();
 
     // Row-level security is injected here, before the capability is minted, for
     // the same reason the native path injects before dispatch: the plan the

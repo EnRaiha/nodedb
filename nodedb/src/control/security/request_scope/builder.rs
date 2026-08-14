@@ -542,7 +542,7 @@ mod tests {
 
         let inside = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
-            .into_scope();
+            .into_resolved_scope();
         assert_eq!(
             inside.auth().metadata.get("scope_status.pro:all"),
             Some(&nodedb_types::Value::String("active".into()))
@@ -550,7 +550,7 @@ mod tests {
 
         let outside = RequestAuthScope::builder(&identity, stores)
             .build_for_client("203.0.113.9:5432")
-            .into_scope();
+            .into_resolved_scope();
         assert!(
             !outside.auth().metadata.contains_key("scope_status.pro:all"),
             "a request from outside the permitted network must not get the scope"
@@ -624,7 +624,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
-            .into_scope();
+            .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);
     }
@@ -639,7 +639,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
-            .into_scope();
+            .into_resolved_scope();
 
         let score = scope
             .auth()
@@ -668,7 +668,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
-            .into_scope();
+            .into_resolved_scope();
 
         let refusal = scorer
             .refusal_for(scope.auth())
@@ -689,7 +689,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("http")
-            .into_scope();
+            .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);
         assert!(scorer.refusal_for(scope.auth()).is_some());
@@ -713,7 +713,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
-            .into_scope();
+            .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);
     }
