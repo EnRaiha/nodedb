@@ -8,6 +8,7 @@ use nodedb_types::protocol::{AuthMethod, NativeResponse, OpCode, RequestFields, 
 use super::NativeSession;
 use super::dispatch::{self, DispatchCtx};
 use crate::config::auth::AuthMode;
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 impl NativeSession {
     /// Route a decoded request to the appropriate handler.
@@ -62,7 +63,7 @@ impl NativeSession {
                 let Some(trust_id) =
                     super::super::super::session_auth::configured_trust_identity(&self.state)
                 else {
-                    return SqlOutcome::Response(Box::new(NativeResponse::error(
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
                         seq,
                         "28000",
                         "configured trust identity is unavailable",
@@ -88,7 +89,7 @@ impl NativeSession {
                     return SqlOutcome::Response(Box::new(auth_response));
                 }
             } else {
-                return SqlOutcome::Response(Box::new(NativeResponse::error(
+                return SqlOutcome::Response(Box::new(sqlstate_error(
                     seq,
                     "28000",
                     "not authenticated. Send Auth request first.",
@@ -99,7 +100,7 @@ impl NativeSession {
         let identity = match self.identity.as_ref() {
             Some(id) => id,
             None => {
-                return SqlOutcome::Response(Box::new(NativeResponse::error(
+                return SqlOutcome::Response(Box::new(sqlstate_error(
                     seq,
                     "28000",
                     "not authenticated",
@@ -199,7 +200,7 @@ impl NativeSession {
         let fields = match &req.fields {
             RequestFields::Text(f) => f,
             _ => {
-                return SqlOutcome::Response(Box::new(NativeResponse::error(
+                return SqlOutcome::Response(Box::new(sqlstate_error(
                     seq,
                     "0A000",
                     "unsupported request field format for this server version",
@@ -213,7 +214,7 @@ impl NativeSession {
             let sql = match &fields.sql {
                 Some(s) => s.as_str(),
                 None => {
-                    return SqlOutcome::Response(Box::new(NativeResponse::error(
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
                         seq,
                         "42601",
                         "missing 'sql' field",
@@ -239,7 +240,7 @@ impl NativeSession {
                                 dispatch::handle_sql(&ctx, seq, sql, None).await,
                             ));
                         }
-                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        return SqlOutcome::Response(Box::new(sqlstate_error(
                             seq,
                             "42601",
                             "missing 'key' field",
@@ -258,7 +259,7 @@ impl NativeSession {
                                 dispatch::handle_sql(&ctx, seq, sql, None).await,
                             ));
                         }
-                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        return SqlOutcome::Response(Box::new(sqlstate_error(
                             seq,
                             "42601",
                             "missing 'key' field",
@@ -271,7 +272,7 @@ impl NativeSession {
                 let key = match &fields.key {
                     Some(k) => k.as_str(),
                     None => {
-                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        return SqlOutcome::Response(Box::new(sqlstate_error(
                             seq,
                             "42601",
                             "missing 'key' field",
@@ -291,7 +292,7 @@ impl NativeSession {
                 let sql = match &fields.sql {
                     Some(s) => s.as_str(),
                     None => {
-                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        return SqlOutcome::Response(Box::new(sqlstate_error(
                             seq,
                             "42601",
                             "missing 'sql' field",
@@ -380,7 +381,7 @@ impl NativeSession {
                 let sql = match &fields.sql {
                     Some(s) => s.as_str(),
                     None => {
-                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        return SqlOutcome::Response(Box::new(sqlstate_error(
                             seq,
                             "42601",
                             "missing 'sql' field",
@@ -394,7 +395,7 @@ impl NativeSession {
             OpCode::Auth | OpCode::Ping | OpCode::Status => unreachable!(),
             // OpCode is #[non_exhaustive]; future opcodes that reach this
             // handler before session.rs is updated return a typed error.
-            _ => NativeResponse::error(seq, "0A000", "opcode not supported by this server version"),
+            _ => sqlstate_error(seq, "0A000", "opcode not supported by this server version"),
         };
 
         SqlOutcome::Response(Box::new(response))

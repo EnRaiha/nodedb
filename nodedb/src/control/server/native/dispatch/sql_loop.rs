@@ -32,8 +32,9 @@ use super::sql_dispatch_task::dispatch_task;
 use super::streaming::SqlOutcome;
 use super::{
     DispatchCtx, error_code_to_native, error_response_to_native, error_to_native,
-    shape_error_to_native, to_native_columns_rows,
+    error_to_native_with_sqlstate, shape_error_to_native, to_native_columns_rows,
 };
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Wrap a materialized response as a non-streaming [`SqlOutcome`].
 #[inline]
@@ -69,11 +70,7 @@ pub(super) async fn run_dispatch_loop(
 
     for task in tasks {
         if task.tenant_id != ctx.tenant_id() {
-            return resp(NativeResponse::error(
-                seq,
-                "42501",
-                "tenant isolation violation",
-            ));
+            return resp(sqlstate_error(seq, "42501", "tenant isolation violation"));
         }
 
         // Cloned before `route_in_tx_write` consumes `task`, so a staged
@@ -101,7 +98,7 @@ pub(super) async fn run_dispatch_loop(
         if let Some(info) = &plan_metering_info
             && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
         {
-            return resp(NativeResponse::error(seq, "53400", e.to_string()));
+            return resp(error_to_native_with_sqlstate(seq, "53400", &e));
         }
 
         // In transaction: route through the protocol-neutral staging gate.
@@ -154,7 +151,7 @@ pub(super) async fn run_dispatch_loop(
                 Arc::clone(&plan_lease_scope),
             )
         {
-            return resp(NativeResponse::error(
+            return resp(sqlstate_error(
                 seq,
                 "XX000",
                 "internal error: failed to retain descriptor leases for buffered transaction tasks",

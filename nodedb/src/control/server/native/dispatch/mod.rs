@@ -28,7 +28,7 @@ pub(crate) use admission_op::admission_operation;
 pub(crate) use auth::{NativeAuthOutcome, handle_auth, handle_ping};
 pub(crate) use conversion::{
     ddl_result_to_native, error_code_to_native, error_response_to_native, error_to_native,
-    shape_error_to_native, to_native_columns_rows,
+    error_to_native_with_sqlstate, shape_error_to_native, to_native_columns_rows,
 };
 pub(crate) use ctx::DispatchCtx;
 pub(crate) use direct_ops::handle_direct_op;

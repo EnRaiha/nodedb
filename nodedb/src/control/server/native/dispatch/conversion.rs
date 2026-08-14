@@ -7,6 +7,7 @@ use nodedb_types::conversion::json_to_value_ref;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::bridge::envelope::Response;
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::ddl::{DdlError, DdlResult};
@@ -52,6 +53,29 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
     NativeResponse::error_with_code(seq, code, message, ndb_code)
 }
 
+/// Convert a Control-Plane error into a native error frame under a SQLSTATE
+/// the call site chooses.
+///
+/// Same classification as [`error_to_native`] — the numeric code comes from
+/// the one `Error` mapping table — but for the guards that render a more
+/// specific SQLSTATE than the error's own variant implies: a plan that cannot
+/// be built is `42601` to a SQL client whatever its internal cause, and an
+/// RLS injection failure is `42501`. Those sites still hold the classified
+/// error, so the code must come from it rather than be inferred back out of
+/// the SQLSTATE they just chose.
+pub(crate) fn error_to_native_with_sqlstate(
+    seq: u64,
+    sqlstate: impl Into<String>,
+    e: &crate::Error,
+) -> NativeResponse {
+    NativeResponse::error_with_code(
+        seq,
+        sqlstate,
+        e.to_string(),
+        crate::error_classify::classify(e).code().0,
+    )
+}
+
 /// Convert a `NodeDbError` produced while shaping a response into a
 /// NativeResponse error frame.
 ///
@@ -93,7 +117,7 @@ pub(crate) fn error_code_to_native(
     code: Option<&crate::bridge::envelope::ErrorCode>,
 ) -> NativeResponse {
     let Some(code) = code else {
-        return NativeResponse::error(seq, "XX000", "unknown data plane error");
+        return sqlstate_error(seq, "XX000", "unknown data plane error");
     };
     let (_, sqlstate, message) = error_code_to_sqlstate(code);
     let public = nodedb_types::NodeDbError::from(crate::Error::DataPlane(code.clone()));
@@ -108,12 +132,18 @@ pub(crate) fn error_code_to_native(
 /// row-returning / status / empty result determines the response (a status tag
 /// becomes a single-column status row, a row result becomes a columns+rows
 /// frame, an empty result or an empty vec becomes a bare OK).
+///
+/// `DdlError` is authored as a SQLSTATE and a message and never holds a
+/// classified `Error`, so the numeric code the client rebuilds its typed error
+/// from comes from `sqlstate_code`. Without it every DDL refusal — a `DROP
+/// TABLE` naming a collection that does not exist, a denied `GRANT` — reaches
+/// the client as a generic internal failure.
 pub(crate) fn ddl_result_to_native(
     seq: u64,
     result: Result<Vec<DdlResult>, DdlError>,
 ) -> NativeResponse {
     match result {
-        Err(DdlError { sqlstate, message }) => NativeResponse::error(seq, sqlstate, message),
+        Err(DdlError { sqlstate, message }) => sqlstate_error(seq, sqlstate, message),
         // Unknown pgwire response variants are dropped during translation, so
         // the first element is the first meaningful result — mirroring the
         // previous bridge, which returned on the first known variant.
@@ -310,6 +340,57 @@ mod tests {
         assert_eq!(
             error.ndb_code,
             nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
+        );
+    }
+
+    /// A DDL refusal is authored as a SQLSTATE with no `Error` behind it, so
+    /// its numeric code comes from the SQLSTATE table. Without it the frame
+    /// ships `ndb_code == 0` and a `DROP TABLE` naming an absent collection
+    /// arrives as a generic internal failure while the identical `SELECT`
+    /// arrives typed.
+    #[test]
+    fn ddl_refusals_carry_their_numeric_code() {
+        let response = ddl_result_to_native(
+            1,
+            Err(DdlError {
+                sqlstate: "42P01".to_owned(),
+                message: "collection 'missing' does not exist".to_owned(),
+            }),
+        );
+
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, "42P01");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
+        );
+        assert_eq!(error.message, "collection 'missing' does not exist");
+    }
+
+    /// A site that renders a more specific SQLSTATE than the error implies
+    /// must still take the classification from the error rather than from the
+    /// SQLSTATE it just chose: `42601` is shared by several conditions, while
+    /// the error in hand names exactly one.
+    #[test]
+    fn a_site_chosen_sqlstate_keeps_the_errors_classification() {
+        let response = error_to_native_with_sqlstate(
+            1,
+            "42601",
+            &crate::Error::PlanError {
+                detail: "no such column".to_owned(),
+            },
+        );
+
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, "42601");
+        assert_eq!(
+            error.ndb_code,
+            nodedb_types::error::ErrorCode::PLAN_ERROR.0,
+            "the classification must come from the error, not from the SQLSTATE"
         );
     }
 

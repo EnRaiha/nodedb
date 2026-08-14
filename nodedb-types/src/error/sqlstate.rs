@@ -90,6 +90,11 @@ pub const TYPE_GUARD_VIOLATION: &str = "23608";
 /// `28000` — `invalid_authorization_specification` (no valid credentials)
 pub const INVALID_AUTHORIZATION: &str = "28000";
 
+// ── Class 3D — Invalid Catalog Name ──────────────────────────────────────────
+
+/// `3D000` — `invalid_catalog_name` (the selected database does not exist)
+pub const INVALID_CATALOG_NAME: &str = "3D000";
+
 // ── Class 40 — Transaction Rollback ──────────────────────────────────────────
 
 /// `40001` — `serialization_failure` (write conflict; client should retry)

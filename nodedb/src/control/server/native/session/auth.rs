@@ -12,6 +12,8 @@ use crate::control::server::shared::authorization::authorize_database;
 
 use super::NativeSession;
 use super::dispatch;
+use crate::control::server::native::dispatch::error_to_native_with_sqlstate;
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 impl NativeSession {
     /// Handle authentication request.
@@ -22,7 +24,7 @@ impl NativeSession {
         // a client silently swap to a different (database, tenant) scope while
         // still holding the original scope's connection slots.
         if self.identity.is_some() || self.connection_permit.is_some() {
-            return NativeResponse::error(
+            return sqlstate_error(
                 seq,
                 "0A000",
                 "already authenticated; reconnect to switch identity",
@@ -33,11 +35,11 @@ impl NativeSession {
             RequestFields::Text(f) => match &f.auth {
                 Some(a) => a,
                 None => {
-                    return NativeResponse::error(seq, "28000", "missing 'auth' field");
+                    return sqlstate_error(seq, "28000", "missing 'auth' field");
                 }
             },
             _ => {
-                return NativeResponse::error(seq, "0A000", "unsupported request fields variant");
+                return sqlstate_error(seq, "0A000", "unsupported request fields variant");
             }
         };
 
@@ -65,7 +67,7 @@ impl NativeSession {
                     self.transport,
                     &self.peer_addr.to_string(),
                 ) {
-                    return NativeResponse::error(seq, "28000", format!("{e}"));
+                    return error_to_native_with_sqlstate(seq, "28000", &e);
                 }
 
                 // Bind the requested database before acquiring any scoped
@@ -80,18 +82,14 @@ impl NativeSession {
                     Some(name) => match catalog.get_database_id_by_name(name) {
                         Ok(Some(db_id)) => db_id,
                         Ok(None) => {
-                            return NativeResponse::error(
+                            return sqlstate_error(
                                 seq,
                                 "3D000",
                                 "selected database does not exist",
                             );
                         }
                         Err(_) => {
-                            return NativeResponse::error(
-                                seq,
-                                "XX000",
-                                "database catalog lookup failed",
-                            );
+                            return sqlstate_error(seq, "XX000", "database catalog lookup failed");
                         }
                     },
                     None => identity
@@ -105,18 +103,10 @@ impl NativeSession {
                 match catalog.get_database(db_id) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        return NativeResponse::error(
-                            seq,
-                            "3D000",
-                            "selected database does not exist",
-                        );
+                        return sqlstate_error(seq, "3D000", "selected database does not exist");
                     }
                     Err(_) => {
-                        return NativeResponse::error(
-                            seq,
-                            "XX000",
-                            "database catalog lookup failed",
-                        );
+                        return sqlstate_error(seq, "XX000", "database catalog lookup failed");
                     }
                 }
 
@@ -124,7 +114,7 @@ impl NativeSession {
                 // database- or tenant-scoped capacity or mutate session state.
                 let audit = ArcAuditEmitter(std::sync::Arc::clone(&self.state.audit));
                 if authorize_database(&identity, db_id, &audit).is_err() {
-                    return NativeResponse::error(seq, "42501", "permission denied for database");
+                    return sqlstate_error(seq, "42501", "permission denied for database");
                 }
 
                 // Phase 2 admission: acquire per-database and per-tenant permits
@@ -134,10 +124,11 @@ impl NativeSession {
                 let db_permit = match self.admission_registry.try_acquire_database(db_id) {
                     Ok(p) => p,
                     Err(e) => {
-                        return NativeResponse::error(
+                        return NativeResponse::error_with_code(
                             seq,
                             nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
                             format!("{e}"),
+                            nodedb_types::error::ErrorCode::DATABASE_QUOTA_EXCEEDED.0,
                         );
                     }
                 };
@@ -147,10 +138,11 @@ impl NativeSession {
                         Err(e) => {
                             // db_permit is dropped here, releasing the DB slot.
                             drop(db_permit);
-                            return NativeResponse::error(
+                            return NativeResponse::error_with_code(
                                 seq,
                                 nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
                                 format!("{e}"),
+                                nodedb_types::error::ErrorCode::TENANT_QUOTA_EXCEEDED.0,
                             );
                         }
                     };
@@ -165,7 +157,7 @@ impl NativeSession {
                     // don't leak slots into the per-DB / per-tenant pools.
                     drop(tenant_permit);
                     drop(db_permit);
-                    return NativeResponse::error(
+                    return sqlstate_error(
                         seq,
                         "XX000",
                         "internal error: global admission permit missing during auth assembly",
@@ -229,12 +221,12 @@ impl NativeSession {
             // other auth error (wrong password, lockout, unknown user) stays
             // collapsed into the generic invalid-password 28P01 so none can be
             // distinguished from the others.
-            Err(e @ crate::Error::RateExceeded { .. }) => NativeResponse::error(
+            Err(e @ crate::Error::RateExceeded { .. }) => error_to_native_with_sqlstate(
                 seq,
                 nodedb_types::error::sqlstate::TOO_MANY_CONNECTIONS,
-                format!("{e}"),
+                &e,
             ),
-            Err(e) => NativeResponse::error(seq, "28P01", format!("{e}")),
+            Err(e) => sqlstate_error(seq, "28P01", format!("{e}")),
         }
     }
 }

@@ -47,7 +47,7 @@ impl SqlOutcome {
     pub(crate) fn into_response(self) -> NativeResponse {
         match self {
             SqlOutcome::Response(r) => *r,
-            SqlOutcome::Stream(s) => NativeResponse::error(
+            SqlOutcome::Stream(s) => crate::control::server::native::sqlstate_code::sqlstate_error(
                 s.seq,
                 "XX000",
                 "internal error: SQL stream produced on a non-streaming path",

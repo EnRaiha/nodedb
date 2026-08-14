@@ -304,3 +304,71 @@ async fn native_permission_denial_carries_authorization_code() {
         err.message
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_ddl_refusal_carries_collection_not_found_code() {
+    let server = TestServer::start().await;
+
+    let mut stream = native_session(&server).await;
+    // DDL is refused by the DDL router, whose neutral error is authored as a
+    // SQLSTATE and a message and never holds a classified `Error` — so this
+    // frame reached the client with `ndb_code == 0` after the SQL and
+    // direct-op paths above were already carrying their codes. The same
+    // statement over the SQL path (`SELECT * FROM ...`) types correctly, so
+    // only a client that happened to run DDL saw the flattening.
+    let resp = send_sql(&mut stream, 1, "DROP TABLE native_err_absent_ddl").await;
+
+    assert_eq!(
+        resp.status,
+        ResponseStatus::Error,
+        "dropping an absent collection must be refused"
+    );
+    let err = resp.error.expect("error payload expected");
+    assert_eq!(
+        err.code,
+        sqlstate::UNDEFINED_TABLE,
+        "an absent collection must map to its own SQLSTATE, got {}: {}",
+        err.code,
+        err.message
+    );
+    assert_eq!(
+        err.ndb_code,
+        ErrorCode::COLLECTION_NOT_FOUND.0,
+        "a DDL refusal must carry the numeric code too, got {} ({})",
+        err.ndb_code,
+        err.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_duplicate_ddl_keeps_its_sqlstate_and_message() {
+    let server = TestServer::start().await;
+
+    let mut stream = native_session(&server).await;
+    let create = send_sql(&mut stream, 1, "CREATE COLLECTION native_err_dup").await;
+    assert_eq!(create.status, ResponseStatus::Ok, "create the target");
+
+    // `42P07` has no `ErrorDetails` variant to map onto, so it stays
+    // unclassified rather than being forced onto an approximate one. This
+    // pins that the fallback is still exactly what shipped before — same
+    // SQLSTATE, same message, `ndb_code == 0` — so an unmapped SQLSTATE is
+    // never made worse by the table that classifies the mapped ones.
+    let resp = send_sql(&mut stream, 2, "CREATE COLLECTION native_err_dup").await;
+
+    assert_eq!(
+        resp.status,
+        ResponseStatus::Error,
+        "creating an existing collection must be refused"
+    );
+    let err = resp.error.expect("error payload expected");
+    assert_eq!(err.code, "42P07", "duplicate object keeps its own SQLSTATE");
+    assert!(
+        err.message.contains("native_err_dup"),
+        "the server's message must survive verbatim, got {}",
+        err.message
+    );
+    assert_eq!(
+        err.ndb_code, 0,
+        "a SQLSTATE with no NodeDB variant must stay unclassified, not be guessed at"
+    );
+}

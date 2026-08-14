@@ -9,6 +9,7 @@ use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
 
 use super::{DispatchCtx, error_to_native};
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 // ─── SET / SHOW / RESET (SQL form) ─────────────────────────────────
 
@@ -36,7 +37,7 @@ pub(super) fn handle_set_sql(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -> Nati
                 .to_string(),
         )
     } else {
-        return NativeResponse::error(seq, "42601", "invalid SET syntax");
+        return sqlstate_error(seq, "42601", "invalid SET syntax");
     };
 
     ctx.sessions.set_parameter(ctx.peer_addr, key, value);
