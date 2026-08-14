@@ -39,7 +39,7 @@ PATH_CANONICAL_HELPERS = {
         "json_value_to_sql_literal",
     },
     "control/event_trigger.rs": {"canonical_trigger_template_sql"},
-    "control/scatter_gather.rs": {
+    "control/scatter_gather/remote_sql.rs": {
         "canonical_direction_sql",
         "canonical_label_sql",
     },
