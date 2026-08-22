@@ -50,7 +50,7 @@ fn optimize_chain(chain: &mut PatternChain, csr: &CsrIndex) {
     }
 
     let mut placed: Vec<PatternTriple> = Vec::with_capacity(n);
-    let mut remaining: Vec<PatternTriple> = chain.triples.drain(..).collect();
+    let mut remaining: Vec<PatternTriple> = std::mem::take(&mut chain.triples);
     let mut bound_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for _ in 0..n {
