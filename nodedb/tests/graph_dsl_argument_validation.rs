@@ -126,8 +126,7 @@ async fn traverse_without_in_clause_names_the_missing_clause() {
     let error = server
         .query_text("GRAPH TRAVERSE FROM 'b' DEPTH 1")
         .await
-        .err()
-        .expect("a GRAPH TRAVERSE with no IN clause must fail");
+        .expect_err("a GRAPH TRAVERSE with no IN clause must fail");
 
     assert!(
         !error.contains("an SQL statement"),
@@ -148,8 +147,7 @@ async fn neighbors_without_in_clause_names_the_missing_clause() {
     let error = server
         .query_text("GRAPH NEIGHBORS OF 'b'")
         .await
-        .err()
-        .expect("a GRAPH NEIGHBORS with no IN clause must fail");
+        .expect_err("a GRAPH NEIGHBORS with no IN clause must fail");
 
     assert!(
         !error.contains("an SQL statement"),
@@ -166,8 +164,7 @@ async fn path_without_in_clause_names_the_missing_clause() {
     let error = server
         .query_text("GRAPH PATH FROM 'a' TO 'b'")
         .await
-        .err()
-        .expect("a GRAPH PATH with no IN clause must fail");
+        .expect_err("a GRAPH PATH with no IN clause must fail");
 
     assert!(
         !error.contains("an SQL statement"),

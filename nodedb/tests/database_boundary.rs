@@ -439,8 +439,7 @@ async fn startup_with_unknown_database_reports_3d000() {
     let error = server
         .connect_as_database("nodedb", "nodedb", "totally_bogus_name")
         .await
-        .err()
-        .expect("connecting to a nonexistent database must fail");
+        .expect_err("connecting to a nonexistent database must fail");
 
     assert!(
         error.contains("3D000") || error.contains("does not exist"),
