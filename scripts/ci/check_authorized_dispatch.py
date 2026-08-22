@@ -103,7 +103,7 @@ ALLOWED_REFERENCES = {
     ("control/array_sync/inbound.rs", "into_scope"),
     ("control/array_sync/inbound_propose.rs", "into_scope"),
     ("control/array_sync/snapshot_assembly.rs", "into_scope"),
-    ("control/server/native/dispatch/sql_loop.rs", "into_physical_task"),
+    ("control/server/native/dispatch/sql_dispatch_task.rs", "into_physical_task"),
     ("control/server/sync/raft_dispatch/response.rs", "propose_sync_write"),
     ("control/server/sync/raft_dispatch/write.rs", "propose_sync_write"),
     (
@@ -265,6 +265,35 @@ def public_raw_api_violations(rel: str, source: str) -> list[tuple[int, str]]:
     return found
 
 
+def stale_exemptions() -> list[str]:
+    """Report exemptions that no longer name a live occurrence.
+
+    An exemption is keyed on (path, symbol). Move the file or rename the
+    symbol and the entry stops matching anything — it does not fail, it
+    silently stops being an exemption, and the next occurrence added to
+    that path is waved through instead of being caught. Both halves of
+    this gate have already been disarmed that way by an ordinary file
+    move, so a dead entry is treated as a gate failure, not as tidiness.
+
+    The symbol is looked for in masked source, so an entry kept alive only
+    by a comment or a string literal still reports as dead.
+    """
+    stale: list[str] = []
+    for label, exemptions in (
+        ("ALLOWED_DEFINITIONS", ALLOWED_DEFINITIONS),
+        ("ALLOWED_REFERENCES", ALLOWED_REFERENCES),
+    ):
+        for rel, name in sorted(exemptions):
+            path = SRC / rel
+            if not path.is_file():
+                stale.append(f"{label}: ({rel!r}, {name!r}) names a file that does not exist")
+                continue
+            masked = mask_rust(path.read_text(encoding="utf-8"))
+            if not re.search(rf"\b{re.escape(name)}\b", masked):
+                stale.append(f"{label}: ({rel!r}, {name!r}) matches no occurrence in that file")
+    return stale
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
@@ -272,6 +301,17 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
+
+    stale = stale_exemptions()
+    if stale:
+        print("ERROR: stale exemptions — the gate is disarmed where they point:", file=sys.stderr)
+        for entry in stale:
+            print(f"  {entry}", file=sys.stderr)
+        print(
+            "Repoint each entry at the code's current location, or drop it if the seam is gone.",
+            file=sys.stderr,
+        )
+        return 1
 
     errors: list[str] = []
     for path in SRC.rglob("*.rs"):

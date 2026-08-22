@@ -190,7 +190,7 @@ impl NativeSession {
         let ctx = DispatchCtx {
             state: &self.state,
             identity,
-            scope: request_scope.into_scope(),
+            scope: request_scope.into_resolved_scope(),
             query_ctx: &self.query_ctx,
             sessions: &self.sessions,
             peer_addr: &self.peer_addr,

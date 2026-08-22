@@ -110,7 +110,13 @@ impl<'a, 'p> ClientRequestScope<'a, 'p> {
     }
 
     /// Consume the binding once admission has run, keeping the scope.
-    pub fn into_scope(self) -> RequestAuthScope<'a> {
+    ///
+    /// Named apart from `AuthorizedCapability::into_scope`: that one consumes a
+    /// granted capability, while this only unwraps the address it was resolved
+    /// against. The authorized-dispatch gate forbids the capability API by
+    /// name in external transports, so a second `into_scope` here would read as
+    /// every transport bypassing authorization.
+    pub fn into_resolved_scope(self) -> RequestAuthScope<'a> {
         self.scope
     }
 }
@@ -173,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn into_scope_keeps_the_resolved_scope() {
+    fn into_resolved_scope_keeps_the_resolved_scope() {
         let identity = identity();
         let grants = ScopeGrantStore::new();
         let quotas = QuotaManager::new();
@@ -186,7 +192,7 @@ mod tests {
             DatabaseId::new(9),
             "10.0.0.1:5432",
         )
-        .into_scope();
+        .into_resolved_scope();
 
         assert_eq!(scope.database_id(), DatabaseId::new(9));
     }

@@ -114,7 +114,7 @@ pub async fn query_ndjson(
         Ok(result) => result,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let scope = request.into_scope();
+    let scope = request.into_resolved_scope();
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 

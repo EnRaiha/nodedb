@@ -183,7 +183,7 @@ impl NodeDbPgHandler {
         // immediately.
         let scope = scope_builder
             .build_for_client(&peer_addr.to_string())
-            .into_scope();
+            .into_resolved_scope();
 
         // Request-admission already ran once for this statement in
         // `execute_single_sql`, before it branched to `shared::ddl::dispatch`
