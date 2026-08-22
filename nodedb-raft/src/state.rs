@@ -158,6 +158,10 @@ pub struct LeaderState {
     /// Per-observer send state. Observers are tracked separately from voters
     /// and learners so quorum math never accidentally includes them.
     pub observer_states: Vec<(u64, ObserverState)>,
+    /// Per peer: AppendEntries responses carrying this term. Counted, not
+    /// timed: leadership is confirmed by a quorum of these rising after a
+    /// heartbeat round.
+    pub ack_count: Vec<(u64, u64)>,
 }
 
 impl LeaderState {
@@ -166,6 +170,7 @@ impl LeaderState {
         Self {
             next_index: peers.iter().map(|&id| (id, last_log_index + 1)).collect(),
             match_index: peers.iter().map(|&id| (id, 0)).collect(),
+            ack_count: peers.iter().map(|&id| (id, 0)).collect(),
             observer_states: observers
                 .iter()
                 .map(|&id| {
@@ -215,6 +220,7 @@ impl LeaderState {
         if !self.next_index.iter().any(|&(id, _)| id == peer) {
             self.next_index.push((peer, last_log_index + 1));
             self.match_index.push((peer, 0));
+            self.ack_count.push((peer, 0));
         }
     }
 
@@ -222,6 +228,26 @@ impl LeaderState {
     pub fn remove_peer(&mut self, peer: u64) {
         self.next_index.retain(|&(id, _)| id != peer);
         self.match_index.retain(|&(id, _)| id != peer);
+        self.ack_count.retain(|&(id, _)| id != peer);
+    }
+
+    /// Responses received from `peer` in this term.
+    pub fn ack_count_for(&self, peer: u64) -> u64 {
+        self.ack_count
+            .iter()
+            .find(|&&(id, _)| id == peer)
+            .map(|&(_, n)| n)
+            .unwrap_or(0)
+    }
+
+    /// Record one response from `peer`. Called for every response carrying
+    /// the current term, including a rejection: a peer that rejects on log
+    /// mismatch still recognises this leader's term, which is what a
+    /// leadership check needs.
+    pub fn record_ack(&mut self, peer: u64) {
+        if let Some(entry) = self.ack_count.iter_mut().find(|e| e.0 == peer) {
+            entry.1 = entry.1.saturating_add(1);
+        }
     }
 
     /// Current voter/learner peer list tracked by this leader state.

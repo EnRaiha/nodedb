@@ -127,6 +127,10 @@ impl<S: LogStorage> RaftNode<S> {
             None => return,
         };
 
+        // Before the success/failure split: a rejection still proves the peer
+        // recognises this term, which is all a leadership check needs.
+        leader.record_ack(peer);
+
         if resp.success {
             let new_match = resp.last_log_index;
             if new_match > leader.match_index_for(peer) {
