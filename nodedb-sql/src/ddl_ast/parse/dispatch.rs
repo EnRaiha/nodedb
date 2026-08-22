@@ -43,7 +43,10 @@ pub fn parse(sql: &str) -> Option<Result<NodedbStatement, SqlError>> {
         _ => false,
     };
     if is_graph {
-        return graph_parse::try_parse(trimmed).map(Ok);
+        // `try_parse` reports its own errors. Mapping a malformed graph
+        // statement to `None` here would fall through to the SQL parser,
+        // which can only say `GRAPH` is not an SQL statement.
+        return graph_parse::try_parse(trimmed);
     }
 
     // Dispatch by family. Order matters only where prefixes overlap

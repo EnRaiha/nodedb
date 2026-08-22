@@ -4,6 +4,7 @@ use super::{
     super::statement::{GraphDirection, GraphProperties},
     tokenizer::Tok,
 };
+use crate::error::SqlError;
 
 pub(super) fn find_keyword(toks: &[Tok<'_>], keyword: &str) -> Option<usize> {
     toks.iter()
@@ -101,15 +102,45 @@ pub(super) fn float_triple_after(toks: &[Tok<'_>], keyword: &str) -> Option<(f64
     Some((k1, k2, k3))
 }
 
-pub(super) fn direction_after(toks: &[Tok<'_>]) -> GraphDirection {
-    match word_after(toks, "DIRECTION")
-        .as_deref()
-        .map(str::to_ascii_uppercase)
-        .as_deref()
-    {
-        Some("IN") => GraphDirection::In,
-        Some("BOTH") => GraphDirection::Both,
-        _ => GraphDirection::Out,
+/// Read a `DIRECTION` clause.
+///
+/// An omitted clause defaults to `out`. A value outside the vocabulary is
+/// refused by name — defaulting it would answer a question the caller did
+/// not ask, and `DIRECTION INBOUND` is indistinguishable from `DIRECTION
+/// BANANA` once both have become `out`.
+pub(super) fn direction_after(toks: &[Tok<'_>]) -> Result<GraphDirection, SqlError> {
+    let Some(word) = word_after(toks, "DIRECTION") else {
+        return Ok(GraphDirection::Out);
+    };
+    match word.to_ascii_uppercase().as_str() {
+        "IN" => Ok(GraphDirection::In),
+        "OUT" => Ok(GraphDirection::Out),
+        "BOTH" => Ok(GraphDirection::Both),
+        _ => Err(SqlError::Parse {
+            detail: format!("DIRECTION must be one of in, out, both — found '{word}'"),
+        }),
+    }
+}
+
+/// Read an optional numeric clause, refusing a value that is present but
+/// not a number. `Ok(None)` means the clause was omitted, so the caller
+/// applies its own default; it never means "the value was unreadable".
+pub(super) fn usize_after_checked(
+    toks: &[Tok<'_>],
+    keyword: &str,
+) -> Result<Option<usize>, SqlError> {
+    let Some(word) = word_after(toks, keyword) else {
+        return Ok(None);
+    };
+    word.parse().map(Some).map_err(|_| SqlError::Parse {
+        detail: format!("{keyword} must be a non-negative integer — found '{word}'"),
+    })
+}
+
+/// A required clause was absent.
+pub(super) fn missing_clause(statement: &str, clause: &str) -> SqlError {
+    SqlError::Parse {
+        detail: format!("{statement} requires {clause}"),
     }
 }
 
