@@ -136,7 +136,7 @@ fn try_eval_scalar_function(s: &str) -> Option<nodedb_types::Value> {
         _ => return None,
     };
     let sql_expr = nodedb_sql::resolver::expr::convert_expr(&ast_expr).ok()?;
-    let folded = nodedb_sql::planner::const_fold::fold_constant_default(&sql_expr)?;
+    let folded = nodedb_sql::planner::const_fold::fold_constant_default(&sql_expr).ok()??;
     Some(sql_value_to_ndb_value(folded))
 }
 

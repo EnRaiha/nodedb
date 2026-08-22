@@ -11,24 +11,21 @@
 //! well-formed expression — the error can only be known once the divisor
 //! value is evaluated.
 //!
-//! ## Why every test here uses `FROM <collection>` with a column divisor
+//! ## Two paths, covered separately
 //!
-//! A bare `SELECT <expr>` with NO `FROM` clause never reaches the runtime
-//! evaluator this unit fixes: `nodedb-sql`'s planner special-cases a
-//! from-less SELECT into a plan-time `SqlPlan::ConstantResult`
-//! (`nodedb-sql/src/planner/select/select_stmt.rs`), computed via
-//! `eval_constant_expr` (`nodedb-sql/src/planner/select/helpers.rs`), which
-//! is `const_fold::fold_constant(expr, ..).unwrap_or(SqlValue::Null)` — ANY
-//! expression the plan-time constant folder can't fully fold (not just
-//! division-by-zero; integer overflow and every `CASE` expression hit the
-//! exact same `unwrap_or(Null)`, see `sql_arithmetic_overflow.rs`'s hedged
-//! assertions for the pre-existing overflow case) silently becomes NULL
-//! there, before any row-scope `SqlExpr::eval` call exists. That is a
-//! separate, pre-existing, general fold-coverage gap in `nodedb-sql`,
-//! architecturally isolated from the `nodedb-query` row-scope evaluator this
-//! unit modifies — out of scope here (fixing it would mean also changing
-//! integer-overflow and `CASE` behavior for from-less SELECTs, well beyond
-//! "division/modulo-by-zero only").
+//! Tests with `FROM <collection>` and a column divisor exercise the row-scope
+//! evaluator: a column reference never folds, so the expression reaches it.
+//!
+//! A bare `SELECT <expr>` with no `FROM` never reaches that evaluator. The
+//! planner turns it into a plan-time `SqlPlan::ConstantResult` computed by
+//! `eval_constant_expr`, which is
+//! `const_fold::fold_constant(expr, ..).unwrap_or(SqlValue::Null)`. That
+//! `None` means both "not a constant, defer to runtime" and "constant, and it
+//! errored", and a from-less SELECT has no runtime to defer to — so both
+//! become NULL. Integer division and modulo have no fold arm at all, so even
+//! a well-defined `6/3` lands there. The constant-fold tests below pin that
+//! path; `sql_arithmetic_overflow.rs` still hedges on the overflow case,
+//! which is the same swallow.
 //!
 //! A column reference is never constant-foldable (`fold_constant` has no
 //! arm for `SqlExpr::Column`), so `FROM <collection>` with the divisor read
@@ -142,6 +139,93 @@ async fn where_clause_division_by_zero_errors_22012() {
         "22012",
     )
     .await;
+}
+
+/// An aggregate over an erroring predicate must fail, not report zero rows.
+/// `COUNT(*)` returns exactly one row for any predicate that evaluates, so
+/// an empty result set is indistinguishable from "nothing matched" and hides
+/// the error behind a success tag.
+#[tokio::test]
+async fn count_over_erroring_predicate_errors_22012() {
+    let srv = TestServer::start().await;
+    seed(&srv, "divzero_count_where").await;
+
+    srv.expect_error(
+        "SELECT COUNT(*) FROM divzero_count_where WHERE 10 / denom = 10",
+        "22012",
+    )
+    .await;
+}
+
+// ── Constant-folded arithmetic (no FROM clause) ─────────────────────
+//
+// A from-less SELECT is planned as a constant result, so these never reach
+// the row-scope evaluator. `fold_constant` returns `Option`, and its `None`
+// means both "not a constant, defer to runtime" and "constant, and it
+// errored" — the caller renders both as NULL. There is no runtime to defer
+// to here, so the error becomes a NULL row and the statement reports success.
+
+/// `SELECT 1/0` must raise, not return a NULL row.
+#[tokio::test]
+async fn constant_integer_division_by_zero_errors_22012() {
+    let srv = TestServer::start().await;
+
+    srv.expect_error("SELECT 1/0", "22012").await;
+}
+
+/// `SELECT 1%0` must raise. Modulo has its own runtime zero guard, which the
+/// constant path does not reach.
+#[tokio::test]
+async fn constant_modulo_by_zero_errors_22012() {
+    let srv = TestServer::start().await;
+
+    srv.expect_error("SELECT 1%0", "22012").await;
+}
+
+/// `SELECT 1.0/0` must raise on the decimal path too.
+#[tokio::test]
+async fn constant_decimal_division_by_zero_errors_22012() {
+    let srv = TestServer::start().await;
+
+    srv.expect_error("SELECT 1.0/0", "22012").await;
+}
+
+/// Guards the specific failure mode: whatever else changes, a constant
+/// division by zero must never come back as a NULL row with a success tag.
+#[tokio::test]
+async fn constant_division_by_zero_is_never_a_null_row() {
+    let srv = TestServer::start().await;
+
+    if let Ok(rows) = srv.query_text("SELECT 1/0").await {
+        panic!("SELECT 1/0 must not succeed; returned {rows:?}");
+    }
+}
+
+/// A well-defined constant division must produce its value. The folder has
+/// no integer-division arm, so it returns "not foldable" and the caller
+/// renders that as NULL — a correct expression answered with NULL, which is
+/// the same swallow as the zero-divisor case and not limited to it.
+#[tokio::test]
+async fn valid_constant_division_still_folds() {
+    let srv = TestServer::start().await;
+
+    let rows = srv
+        .query_text("SELECT 6/3")
+        .await
+        .expect("a well-defined constant division must still fold");
+    assert_eq!(rows.first().map(String::as_str), Some("2"));
+}
+
+/// The same hole for modulo, which has no fold arm for any operand pair.
+#[tokio::test]
+async fn valid_constant_modulo_still_folds() {
+    let srv = TestServer::start().await;
+
+    let rows = srv
+        .query_text("SELECT 7%3")
+        .await
+        .expect("a well-defined constant modulo must still fold");
+    assert_eq!(rows.first().map(String::as_str), Some("1"));
 }
 
 /// CASE laziness end-to-end: an untaken CASE branch containing a

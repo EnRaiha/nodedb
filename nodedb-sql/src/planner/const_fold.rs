@@ -24,8 +24,18 @@ use std::sync::LazyLock;
 use nodedb_types::Value;
 use sonic_rs;
 
+use crate::error::SqlError;
 use crate::functions::registry::{FunctionCategory, FunctionRegistry};
 use crate::types::{BinaryOp, SqlExpr, SqlValue, UnaryOp};
+
+/// Outcome of folding a constant expression.
+///
+/// Three states, kept apart on purpose: `Ok(Some)` folded, `Ok(None)` is not
+/// a constant and belongs to the row-scope evaluator, `Err` was a constant
+/// whose evaluation failed. Collapsing the last two loses the difference
+/// between "ask again at runtime" and "this can never succeed" — and a
+/// from-less SELECT has no runtime to ask.
+pub type FoldResult = Result<Option<SqlValue>, SqlError>;
 
 /// Process-wide default registry. Used by call sites that don't already
 /// thread a `FunctionRegistry` through (e.g. the DML `VALUES` path).
@@ -37,38 +47,50 @@ pub fn default_registry() -> &'static FunctionRegistry {
 }
 
 /// Convenience wrapper around [`fold_constant`] using the default registry.
-pub fn fold_constant_default(expr: &SqlExpr) -> Option<SqlValue> {
+pub fn fold_constant_default(expr: &SqlExpr) -> FoldResult {
     fold_constant(expr, default_registry())
 }
 
-/// Fold a `SqlExpr` to a literal `SqlValue` at plan time, or return
-/// `None` if the expression depends on row/runtime state (column refs,
-/// subqueries, unknown functions, etc.).
-pub fn fold_constant(expr: &SqlExpr, registry: &FunctionRegistry) -> Option<SqlValue> {
+/// Fold a `SqlExpr` to a literal `SqlValue` at plan time. See [`FoldResult`]
+/// for what each outcome means.
+pub fn fold_constant(expr: &SqlExpr, registry: &FunctionRegistry) -> FoldResult {
     match expr {
-        SqlExpr::Literal(v) => Some(v.clone()),
-        SqlExpr::ArrayLiteral(items) => items
-            .iter()
-            .map(|item| fold_constant(item, registry))
-            .collect::<Option<Vec<_>>>()
-            .map(SqlValue::Array),
+        SqlExpr::Literal(v) => Ok(Some(v.clone())),
+        SqlExpr::ArrayLiteral(items) => {
+            let mut folded = Vec::with_capacity(items.len());
+            for item in items {
+                match fold_constant(item, registry)? {
+                    Some(v) => folded.push(v),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(SqlValue::Array(folded)))
+        }
         SqlExpr::UnaryOp {
             op: UnaryOp::Neg,
             expr,
-        } => match fold_constant(expr, registry)? {
-            SqlValue::Int(i) => Some(SqlValue::Int(-i)),
-            SqlValue::Float(f) => Some(SqlValue::Float(-f)),
-            SqlValue::Decimal(d) => Some(SqlValue::Decimal(-d)),
+        } => Ok(match fold_constant(expr, registry)? {
+            // `checked_neg` so negating `i64::MIN` declines to fold rather
+            // than wrapping (release) or panicking (debug).
+            Some(SqlValue::Int(i)) => i.checked_neg().map(SqlValue::Int),
+            Some(SqlValue::Float(f)) => Some(SqlValue::Float(-f)),
+            Some(SqlValue::Decimal(d)) => Some(SqlValue::Decimal(-d)),
             _ => None,
-        },
+        }),
         SqlExpr::BinaryOp { left, op, right } => {
-            let l = fold_constant(left, registry)?;
-            let r = fold_constant(right, registry)?;
+            let (Some(l), Some(r)) = (
+                fold_constant(left, registry)?,
+                fold_constant(right, registry)?,
+            ) else {
+                return Ok(None);
+            };
             fold_binary(l, *op, r)
         }
         SqlExpr::Function { name, args, .. } => fold_function_call(name, args, registry),
-        SqlExpr::Cast { expr, to_type } => fold_cast(fold_constant(expr, registry)?, to_type),
-        _ => None,
+        SqlExpr::Cast { expr, to_type } => {
+            Ok(fold_constant(expr, registry)?.and_then(|inner| fold_cast(inner, to_type)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -158,60 +180,130 @@ fn fold_cast(inner: SqlValue, to_type: &str) -> Option<SqlValue> {
     }
 }
 
-fn fold_binary(l: SqlValue, op: BinaryOp, r: SqlValue) -> Option<SqlValue> {
-    Some(match (l, op, r) {
+/// Whether a value is a zero divisor. Applied before any `checked_div` /
+/// `checked_rem`, which return `None` for a zero divisor and for genuine
+/// overflow alike — folding those together is what let a division by zero
+/// pass as "not foldable".
+fn is_zero(v: &SqlValue) -> bool {
+    match v {
+        SqlValue::Int(0) => true,
+        SqlValue::Float(f) => *f == 0.0,
+        SqlValue::Decimal(d) => d.is_zero(),
+        _ => false,
+    }
+}
+
+fn overflowed(detail: &str) -> SqlError {
+    SqlError::ConstantOverflow {
+        detail: detail.to_owned(),
+    }
+}
+
+fn fold_binary(l: SqlValue, op: BinaryOp, r: SqlValue) -> FoldResult {
+    if matches!(op, BinaryOp::Div | BinaryOp::Mod) && is_zero(&r) {
+        return Err(SqlError::DivisionByZero);
+    }
+    Ok(Some(match (l, op, r) {
         // Int × Int arithmetic.
-        (SqlValue::Int(a), BinaryOp::Add, SqlValue::Int(b)) => SqlValue::Int(a.checked_add(b)?),
-        (SqlValue::Int(a), BinaryOp::Sub, SqlValue::Int(b)) => SqlValue::Int(a.checked_sub(b)?),
-        (SqlValue::Int(a), BinaryOp::Mul, SqlValue::Int(b)) => SqlValue::Int(a.checked_mul(b)?),
+        (SqlValue::Int(a), BinaryOp::Add, SqlValue::Int(b)) => {
+            SqlValue::Int(a.checked_add(b).ok_or_else(|| overflowed("integer add"))?)
+        }
+        (SqlValue::Int(a), BinaryOp::Sub, SqlValue::Int(b)) => SqlValue::Int(
+            a.checked_sub(b)
+                .ok_or_else(|| overflowed("integer subtract"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Mul, SqlValue::Int(b)) => SqlValue::Int(
+            a.checked_mul(b)
+                .ok_or_else(|| overflowed("integer multiply"))?,
+        ),
+        // Int division and modulo. The zero divisor is already refused above,
+        // so `None` here is `i64::MIN / -1`, which overflows.
+        (SqlValue::Int(a), BinaryOp::Div, SqlValue::Int(b)) => SqlValue::Int(
+            a.checked_div(b)
+                .ok_or_else(|| overflowed("integer divide"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Mod, SqlValue::Int(b)) => SqlValue::Int(
+            a.checked_rem(b)
+                .ok_or_else(|| overflowed("integer modulo"))?,
+        ),
         // Float × Float arithmetic.
         (SqlValue::Float(a), BinaryOp::Add, SqlValue::Float(b)) => SqlValue::Float(a + b),
         (SqlValue::Float(a), BinaryOp::Sub, SqlValue::Float(b)) => SqlValue::Float(a - b),
         (SqlValue::Float(a), BinaryOp::Mul, SqlValue::Float(b)) => SqlValue::Float(a * b),
+        (SqlValue::Float(a), BinaryOp::Div, SqlValue::Float(b)) => SqlValue::Float(a / b),
+        (SqlValue::Float(a), BinaryOp::Mod, SqlValue::Float(b)) => SqlValue::Float(a % b),
         // Decimal × Decimal arithmetic.
         (SqlValue::Decimal(a), BinaryOp::Add, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(a.checked_add(b)?)
+            SqlValue::Decimal(a.checked_add(b).ok_or_else(|| overflowed("decimal add"))?)
         }
-        (SqlValue::Decimal(a), BinaryOp::Sub, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(a.checked_sub(b)?)
-        }
-        (SqlValue::Decimal(a), BinaryOp::Mul, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(a.checked_mul(b)?)
-        }
-        (SqlValue::Decimal(a), BinaryOp::Div, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(a.checked_div(b)?)
-        }
+        (SqlValue::Decimal(a), BinaryOp::Sub, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            a.checked_sub(b)
+                .ok_or_else(|| overflowed("decimal subtract"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Mul, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            a.checked_mul(b)
+                .ok_or_else(|| overflowed("decimal multiply"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Div, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            a.checked_div(b)
+                .ok_or_else(|| overflowed("decimal divide"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Mod, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            a.checked_rem(b)
+                .ok_or_else(|| overflowed("decimal modulo"))?,
+        ),
         // Decimal × Int widening (Int promotes to Decimal).
-        (SqlValue::Decimal(a), BinaryOp::Add, SqlValue::Int(b)) => {
-            SqlValue::Decimal(a.checked_add(rust_decimal::Decimal::from(b))?)
-        }
-        (SqlValue::Int(a), BinaryOp::Add, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(rust_decimal::Decimal::from(a).checked_add(b)?)
-        }
-        (SqlValue::Decimal(a), BinaryOp::Sub, SqlValue::Int(b)) => {
-            SqlValue::Decimal(a.checked_sub(rust_decimal::Decimal::from(b))?)
-        }
-        (SqlValue::Int(a), BinaryOp::Sub, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(rust_decimal::Decimal::from(a).checked_sub(b)?)
-        }
-        (SqlValue::Decimal(a), BinaryOp::Mul, SqlValue::Int(b)) => {
-            SqlValue::Decimal(a.checked_mul(rust_decimal::Decimal::from(b))?)
-        }
-        (SqlValue::Int(a), BinaryOp::Mul, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(rust_decimal::Decimal::from(a).checked_mul(b)?)
-        }
-        (SqlValue::Decimal(a), BinaryOp::Div, SqlValue::Int(b)) => {
-            SqlValue::Decimal(a.checked_div(rust_decimal::Decimal::from(b))?)
-        }
-        (SqlValue::Int(a), BinaryOp::Div, SqlValue::Decimal(b)) => {
-            SqlValue::Decimal(rust_decimal::Decimal::from(a).checked_div(b)?)
-        }
+        (SqlValue::Decimal(a), BinaryOp::Add, SqlValue::Int(b)) => SqlValue::Decimal(
+            a.checked_add(rust_decimal::Decimal::from(b))
+                .ok_or_else(|| overflowed("decimal add"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Add, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            rust_decimal::Decimal::from(a)
+                .checked_add(b)
+                .ok_or_else(|| overflowed("decimal add"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Sub, SqlValue::Int(b)) => SqlValue::Decimal(
+            a.checked_sub(rust_decimal::Decimal::from(b))
+                .ok_or_else(|| overflowed("decimal subtract"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Sub, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            rust_decimal::Decimal::from(a)
+                .checked_sub(b)
+                .ok_or_else(|| overflowed("decimal subtract"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Mul, SqlValue::Int(b)) => SqlValue::Decimal(
+            a.checked_mul(rust_decimal::Decimal::from(b))
+                .ok_or_else(|| overflowed("decimal multiply"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Mul, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            rust_decimal::Decimal::from(a)
+                .checked_mul(b)
+                .ok_or_else(|| overflowed("decimal multiply"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Div, SqlValue::Int(b)) => SqlValue::Decimal(
+            a.checked_div(rust_decimal::Decimal::from(b))
+                .ok_or_else(|| overflowed("decimal divide"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Div, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            rust_decimal::Decimal::from(a)
+                .checked_div(b)
+                .ok_or_else(|| overflowed("decimal divide"))?,
+        ),
+        (SqlValue::Decimal(a), BinaryOp::Mod, SqlValue::Int(b)) => SqlValue::Decimal(
+            a.checked_rem(rust_decimal::Decimal::from(b))
+                .ok_or_else(|| overflowed("decimal modulo"))?,
+        ),
+        (SqlValue::Int(a), BinaryOp::Mod, SqlValue::Decimal(b)) => SqlValue::Decimal(
+            rust_decimal::Decimal::from(a)
+                .checked_rem(b)
+                .ok_or_else(|| overflowed("decimal modulo"))?,
+        ),
         // String concat.
         (SqlValue::String(a), BinaryOp::Concat, SqlValue::String(b)) => {
             SqlValue::String(format!("{a}{b}"))
         }
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 /// Fold a function call by recursively folding its arguments, dispatching
@@ -219,36 +311,38 @@ fn fold_binary(l: SqlValue, op: BinaryOp, r: SqlValue) -> Option<SqlValue> {
 /// `SqlValue`. Only folds functions that are present in `registry`, so
 /// callers can distinguish "unknown function" from "known function, all
 /// args folded".
-pub fn fold_function_call(
-    name: &str,
-    args: &[SqlExpr],
-    registry: &FunctionRegistry,
-) -> Option<SqlValue> {
+pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegistry) -> FoldResult {
     // Gate on registry so unknown-function paths keep their existing
     // fallbacks instead of collapsing to SqlValue::Null. Aggregates and
     // window functions aren't foldable — they need a row stream.
-    let meta = registry.lookup(name)?;
+    let Some(meta) = registry.lookup(name) else {
+        return Ok(None);
+    };
     if matches!(
         meta.category,
         FunctionCategory::Aggregate | FunctionCategory::Window
     ) {
-        return None;
+        return Ok(None);
     }
 
-    let folded_args: Vec<Value> = args
-        .iter()
-        .map(|a| fold_constant(a, registry).map(sql_to_ndb_value))
-        .collect::<Option<_>>()?;
+    let mut folded_args = Vec::with_capacity(args.len());
+    for arg in args {
+        match fold_constant(arg, registry)? {
+            Some(v) => folded_args.push(sql_to_ndb_value(v)),
+            None => return Ok(None),
+        }
+    }
 
-    // A call that can fail at plan-time constant-fold (e.g. `mod(5, 0)`
-    // with literal args) is treated the same as any other
-    // unfoldable expression — `None` here leaves the `SqlExpr::Function`
-    // node in place so it flows to the row-scope evaluator, which raises
-    // the real `22012` error at execution time. This mirrors how
-    // `fold_binary`'s `checked_div`/`checked_rem` already decline to fold
-    // (via `?`) rather than baking a bad result into the plan.
-    let result = nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args).ok()?;
-    Some(ndb_to_sql_value(result))
+    // A registered function whose arguments all folded is fully determined
+    // here, so a failure is the answer — not a reason to defer. Deferring it
+    // reached the row-scope evaluator only when the statement had a FROM
+    // clause; `SELECT mod(5, 0)` has no row scope and became NULL.
+    // Exhaustive on purpose: a new `EvalError` variant must be classified
+    // here rather than defaulting to "defer to a runtime that may not exist".
+    match nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args) {
+        Ok(result) => Ok(Some(ndb_to_sql_value(result))),
+        Err(nodedb_query::EvalError::DivisionByZero) => Err(SqlError::DivisionByZero),
+    }
 }
 
 fn sql_to_ndb_value(v: SqlValue) -> Value {
@@ -315,7 +409,9 @@ mod tests {
             args: vec![],
             distinct: false,
         };
-        let val = fold_constant(&expr, &registry).expect("now() should fold");
+        let val = fold_constant(&expr, &registry)
+            .expect("fold must not error")
+            .expect("now() should fold");
         match val {
             SqlValue::Timestamptz(dt) => {
                 // Sanity: must not be epoch (year 1970).
@@ -335,7 +431,7 @@ mod tests {
         };
         assert!(matches!(
             fold_constant(&expr, &registry),
-            Some(SqlValue::Timestamptz(_))
+            Ok(Some(SqlValue::Timestamptz(_)))
         ));
     }
 
@@ -347,7 +443,11 @@ mod tests {
             args: vec![],
             distinct: false,
         };
-        assert!(fold_constant(&expr, &registry).is_none());
+        assert!(
+            fold_constant(&expr, &registry)
+                .expect("fold must not error")
+                .is_none()
+        );
     }
 
     #[test]
@@ -359,10 +459,10 @@ mod tests {
         ]);
         assert_eq!(
             fold_constant(&expr, &registry),
-            Some(SqlValue::Array(vec![
+            Ok(Some(SqlValue::Array(vec![
                 SqlValue::String("public".into()),
                 SqlValue::Int(42),
-            ]))
+            ])))
         );
     }
 
@@ -374,7 +474,7 @@ mod tests {
             op: BinaryOp::Add,
             right: Box::new(SqlExpr::Literal(SqlValue::Int(3))),
         };
-        assert_eq!(fold_constant(&expr, &registry), Some(SqlValue::Int(5)));
+        assert_eq!(fold_constant(&expr, &registry), Ok(Some(SqlValue::Int(5))));
     }
 
     #[test]
@@ -384,7 +484,11 @@ mod tests {
             table: None,
             name: "name".into(),
         };
-        assert!(fold_constant(&expr, &registry).is_none());
+        assert!(
+            fold_constant(&expr, &registry)
+                .expect("fold must not error")
+                .is_none()
+        );
     }
 
     #[test]
@@ -392,7 +496,10 @@ mod tests {
         let registry = FunctionRegistry::new();
         let d = rust_decimal::Decimal::new(12345, 2); // 123.45
         let expr = SqlExpr::Literal(SqlValue::Decimal(d));
-        assert_eq!(fold_constant(&expr, &registry), Some(SqlValue::Decimal(d)));
+        assert_eq!(
+            fold_constant(&expr, &registry),
+            Ok(Some(SqlValue::Decimal(d)))
+        );
     }
 
     #[test]
@@ -409,7 +516,7 @@ mod tests {
         let expected = Decimal::new(58023, 2); // 580.23
         assert_eq!(
             fold_constant(&expr, &registry),
-            Some(SqlValue::Decimal(expected))
+            Ok(Some(SqlValue::Decimal(expected)))
         );
     }
 
@@ -422,7 +529,10 @@ mod tests {
             op: crate::types::UnaryOp::Neg,
             expr: Box::new(SqlExpr::Literal(SqlValue::Decimal(d))),
         };
-        assert_eq!(fold_constant(&expr, &registry), Some(SqlValue::Decimal(-d)));
+        assert_eq!(
+            fold_constant(&expr, &registry),
+            Ok(Some(SqlValue::Decimal(-d)))
+        );
     }
 
     #[test]
@@ -440,7 +550,7 @@ mod tests {
             ],
             distinct: false,
         };
-        let v = fold_constant(&expr, &registry);
+        let v = fold_constant(&expr, &registry).expect("fold must not error");
         match v {
             Some(SqlValue::String(ref s)) if !s.is_empty() => {}
             other => panic!("expected non-empty SqlValue::String, got {other:?}"),
@@ -463,7 +573,7 @@ mod tests {
             args: vec![make_point(-122.4, 37.8), make_point(-87.6, 41.8)],
             distinct: false,
         };
-        let v = fold_constant(&expr, &registry);
+        let v = fold_constant(&expr, &registry).expect("fold must not error");
         match v {
             Some(SqlValue::Float(d)) => {
                 assert!(d > 0.0, "distance should be positive, got {d}");
@@ -485,7 +595,7 @@ mod tests {
         let expected = Decimal::new(150, 0);
         assert_eq!(
             fold_constant(&expr, &registry),
-            Some(SqlValue::Decimal(expected))
+            Ok(Some(SqlValue::Decimal(expected)))
         );
     }
 }

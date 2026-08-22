@@ -29,7 +29,7 @@ pub(super) fn eval_catalog_constant(
             })?;
         return Ok(SqlValue::String(normalized));
     }
-    Ok(super::select::helpers::eval_constant_expr(expr, functions))
+    super::select::helpers::eval_constant_expr(expr, functions)
 }
 
 pub(super) fn validate_expr(

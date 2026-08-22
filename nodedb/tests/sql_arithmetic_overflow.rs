@@ -14,67 +14,45 @@ use common::pgwire_harness::TestServer;
 // Const-folder overflow (nodedb-sql planner)
 // ---------------------------------------------------------------------------
 
-/// `i64::MAX + 1` in a constant expression must not panic (debug) or wrap
-/// to a negative number (release). An error or null are both acceptable.
+/// `i64::MAX + 1` in a constant expression must raise. It once folded to
+/// `None` and rendered as NULL, which is the same swallow a zero divisor had:
+/// a constant that cannot be evaluated is not a constant with no value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn const_fold_addition_overflow_does_not_wrap() {
+async fn const_fold_addition_overflow_errors() {
     let server = TestServer::start().await;
 
     let result = server.query_text("SELECT 9223372036854775807 + 1").await;
 
-    match result {
-        Err(_) => { /* error is acceptable */ }
-        Ok(rows) => {
-            if let Some(val) = rows.first() {
-                assert!(
-                    !val.contains("-9223372036854775808"),
-                    "i64::MAX + 1 must not silently wrap to i64::MIN: got {val}"
-                );
-            }
-        }
-    }
+    assert!(
+        result.is_err(),
+        "i64::MAX + 1 must raise, not return a row: got {result:?}"
+    );
 }
 
-/// `i64::MAX * 2` must not panic or wrap.
+/// `i64::MAX * 2` must raise rather than wrap to -2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn const_fold_multiplication_overflow_does_not_wrap() {
+async fn const_fold_multiplication_overflow_errors() {
     let server = TestServer::start().await;
 
     let result = server.query_text("SELECT 9223372036854775807 * 2").await;
 
-    match result {
-        Err(_) => { /* error is acceptable */ }
-        Ok(rows) => {
-            if let Some(val) = rows.first() {
-                // Wrapped value would be -2.
-                assert!(
-                    !val.contains("\"-2\""),
-                    "i64::MAX * 2 must not silently wrap: got {val}"
-                );
-            }
-        }
-    }
+    assert!(
+        result.is_err(),
+        "i64::MAX * 2 must raise, not return a row: got {result:?}"
+    );
 }
 
-/// `i64::MIN - 1` must not panic or wrap.
+/// `i64::MIN - 1` must raise rather than wrap to `i64::MAX`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn const_fold_subtraction_overflow_does_not_wrap() {
+async fn const_fold_subtraction_overflow_errors() {
     let server = TestServer::start().await;
 
     let result = server.query_text("SELECT -9223372036854775808 - 1").await;
 
-    match result {
-        Err(_) => { /* error is acceptable */ }
-        Ok(rows) => {
-            if let Some(val) = rows.first() {
-                // Wrapped value would be i64::MAX = 9223372036854775807.
-                assert!(
-                    !val.contains("9223372036854775807"),
-                    "i64::MIN - 1 must not silently wrap to i64::MAX: got {val}"
-                );
-            }
-        }
-    }
+    assert!(
+        result.is_err(),
+        "i64::MIN - 1 must raise, not return a row: got {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

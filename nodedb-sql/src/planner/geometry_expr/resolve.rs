@@ -64,7 +64,7 @@ pub(crate) fn resolve_geometry_expr(expr: &ast::Expr) -> Result<Geometry> {
 /// be folded at plan time at all.
 fn resolve(expr: &ast::Expr) -> Result<Option<Geometry>> {
     let sql_expr = crate::resolver::expr::convert_expr(expr)?;
-    let Some(value) = crate::planner::const_fold::fold_constant_default(&sql_expr) else {
+    let Some(value) = crate::planner::const_fold::fold_constant_default(&sql_expr)? else {
         return Ok(None);
     };
     Ok(geometry_from_value(&value))

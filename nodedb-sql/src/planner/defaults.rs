@@ -99,7 +99,7 @@ fn parse_parametric_or_literal(
 /// Attempt to parse the DEFAULT expression as SQL, then const-fold it.
 fn try_const_fold_default(expr: &str) -> Option<nodedb_types::Value> {
     let sql_expr = crate::parse_expr_string(expr).ok()?;
-    let folded = crate::planner::const_fold::fold_constant_default(&sql_expr)?;
+    let folded = crate::planner::const_fold::fold_constant_default(&sql_expr).ok()??;
     Some(sql_value_to_ndb(folded))
 }
 

@@ -28,6 +28,17 @@ pub enum SqlError {
     #[error("type mismatch: {detail}")]
     TypeMismatch { detail: String },
 
+    /// A constant expression divided by zero at plan time. Distinct from the
+    /// folder declining to fold: the expression *was* constant and evaluating
+    /// it failed, so the statement must raise rather than yield NULL.
+    #[error("division by zero")]
+    DivisionByZero,
+
+    /// A constant expression overflowed at plan time. Same distinction as
+    /// [`SqlError::DivisionByZero`].
+    #[error("arithmetic overflow evaluating a constant expression: {detail}")]
+    ConstantOverflow { detail: String },
+
     /// A write supplied an integer wider than the column's declared type.
     ///
     /// nodedb stores every integer as an `i64`, so this is not a storage

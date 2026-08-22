@@ -14,6 +14,43 @@ use crate::control::planner::context::security::PlanSecurityContext;
 use crate::control::planner::sql_plan_convert::PlanningPurpose;
 use crate::control::server::response_shape::schema::OutputSchema;
 
+/// Map a planner error onto its Control-Plane equivalent.
+///
+/// One mapping for every `plan_sql*` call site. Four copies of this match
+/// existed and had already drifted — only one of them mapped
+/// `RetryableSchemaChanged`, so the same condition was retryable on one path
+/// and a flat plan error on the others. A new variant added to `SqlError`
+/// reaches every site through here or none.
+fn map_plan_error(error: nodedb_sql::SqlError, tenant_id: crate::types::TenantId) -> crate::Error {
+    match error {
+        nodedb_sql::SqlError::RetryableSchemaChanged { descriptor } => {
+            crate::Error::RetryableSchemaChanged { descriptor }
+        }
+        nodedb_sql::SqlError::CollectionDeactivated {
+            name,
+            retention_expires_at_ns,
+            ..
+        } => crate::Error::CollectionDeactivated {
+            tenant_id,
+            collection: name,
+            retention_expires_at_ns,
+        },
+        nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
+            tenant_id,
+            collection: name,
+        },
+        nodedb_sql::SqlError::UndefinedFunction { name } => {
+            crate::Error::UndefinedFunction { name }
+        }
+        // A constant expression that divides by zero is the same condition the
+        // row-scope evaluator raises, so it carries the same code.
+        nodedb_sql::SqlError::DivisionByZero => crate::Error::DivisionByZero,
+        other => crate::Error::PlanError {
+            detail: other.to_string(),
+        },
+    }
+}
+
 /// Bundled arguments for [`QueryContext::plan_sql_with_rls`].
 pub struct PlanSqlWithRlsParams<'a> {
     pub sql: &'a str,
@@ -79,30 +116,8 @@ impl QueryContext {
         } else {
             inputs.build_adapter(tenant_id.as_u64(), database_id)
         };
-        let plans = nodedb_sql::plan_sql(sql, &catalog).map_err(|e| match e {
-            nodedb_sql::SqlError::RetryableSchemaChanged { descriptor } => {
-                crate::Error::RetryableSchemaChanged { descriptor }
-            }
-            nodedb_sql::SqlError::CollectionDeactivated {
-                name,
-                retention_expires_at_ns,
-                ..
-            } => crate::Error::CollectionDeactivated {
-                tenant_id,
-                collection: name,
-                retention_expires_at_ns,
-            },
-            nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
-                tenant_id,
-                collection: name,
-            },
-            nodedb_sql::SqlError::UndefinedFunction { name } => {
-                crate::Error::UndefinedFunction { name }
-            }
-            other => crate::Error::PlanError {
-                detail: format!("{other}"),
-            },
-        })?;
+        let plans =
+            nodedb_sql::plan_sql(sql, &catalog).map_err(|e| map_plan_error(e, tenant_id))?;
         // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
         // constant OID literals at plan time, before crossing the bridge.
         // The data-plane evaluator is pure and has no catalog access.
@@ -117,18 +132,7 @@ impl QueryContext {
                 )
             })
             .collect::<nodedb_sql::Result<_>>()
-            .map_err(|error| match error {
-                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
-                    tenant_id,
-                    collection: name,
-                },
-                nodedb_sql::SqlError::UndefinedFunction { name } => {
-                    crate::Error::UndefinedFunction { name }
-                }
-                other => crate::Error::PlanError {
-                    detail: other.to_string(),
-                },
-            })?;
+            .map_err(|error| map_plan_error(error, tenant_id))?;
         let version_set = catalog.take_recorded_versions();
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
             purpose,
@@ -365,20 +369,8 @@ impl QueryContext {
         // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(
-            |error| match error {
-                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
-                    tenant_id,
-                    collection: name,
-                },
-                nodedb_sql::SqlError::UndefinedFunction { name } => {
-                    crate::Error::UndefinedFunction { name }
-                }
-                other => crate::Error::PlanError {
-                    detail: other.to_string(),
-                },
-            },
-        )?;
+        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog)
+            .map_err(|error| map_plan_error(error, tenant_id))?;
         let plans: Vec<_> = raw_plans
             .into_iter()
             .map(|p| {
@@ -390,18 +382,7 @@ impl QueryContext {
                 )
             })
             .collect::<nodedb_sql::Result<_>>()
-            .map_err(|error| match error {
-                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
-                    tenant_id,
-                    collection: name,
-                },
-                nodedb_sql::SqlError::UndefinedFunction { name } => {
-                    crate::Error::UndefinedFunction { name }
-                }
-                other => crate::Error::PlanError {
-                    detail: other.to_string(),
-                },
-            })?;
+            .map_err(|error| map_plan_error(error, tenant_id))?;
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
             purpose: PlanningPurpose::Execute,
             retention_registry: self.retention_registry.clone(),
