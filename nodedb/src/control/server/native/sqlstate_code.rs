@@ -44,6 +44,15 @@
 //!   with one message, precisely so a caller cannot tell a wrong password from
 //!   an unknown user. Typing them would rebuild the oracle that collapsing
 //!   removed.
+//! - **SQLSTATEs that mean different things to different emitters.** `57014`
+//!   is `query_canceled`, which this server sends both for a deadline and for
+//!   a cancellation that is not one — `COPY restore aborted` renders as `57014`
+//!   with no deadline anywhere near it. Mapping it to `DEADLINE_EXCEEDED` would
+//!   be the one entry here that fails the rule above, and it fails it in the
+//!   expensive direction: `DeadlineExceeded` is retriable, so a cancelled
+//!   operation would come back classified as worth retrying. A site that
+//!   cancels for a deadline holds the error and passes the code explicitly, as
+//!   the Calvin abort paths already do.
 
 use nodedb_types::error::{ErrorCode, sqlstate};
 use nodedb_types::protocol::NativeResponse;
@@ -66,7 +75,6 @@ pub(crate) fn ndb_code_for_sqlstate(sqlstate_str: &str) -> u16 {
         // applied, retry the whole thing" — the same contract `WriteConflict`
         // states, and the classification a retry loop reads.
         sqlstate::SERIALIZATION_FAILURE => ErrorCode::WRITE_CONFLICT,
-        sqlstate::QUERY_CANCELED => ErrorCode::DEADLINE_EXCEEDED,
         sqlstate::TOO_MANY_CONNECTIONS => ErrorCode::RATE_EXCEEDED,
         sqlstate::INTERNAL_ERROR => ErrorCode::INTERNAL,
         _ => return 0,
@@ -140,6 +148,11 @@ mod tests {
         // Deliberately undistinguished so credential failures stay opaque.
         assert_eq!(ndb_code_for_sqlstate("28P01"), 0);
         assert_eq!(ndb_code_for_sqlstate("28000"), 0);
+        // Sent both for a deadline and for a cancellation that is not one, so
+        // it cannot be typed here. `DeadlineExceeded` is retriable, and a
+        // cancelled operation classified as retriable is one this table told a
+        // client to run again.
+        assert_eq!(ndb_code_for_sqlstate("57014"), 0);
         // Not a SQLSTATE this server emits.
         assert_eq!(ndb_code_for_sqlstate("99999"), 0);
     }

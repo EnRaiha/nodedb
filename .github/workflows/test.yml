@@ -74,6 +74,10 @@ jobs:
         run: |
           python3 scripts/ci/check_authorized_dispatch.py --self-test
           python3 scripts/ci/check_authorized_dispatch.py
+      - name: Native-error-frame gate
+        run: |
+          python3 scripts/ci/check_native_error_frames.py --self-test
+          python3 scripts/ci/check_native_error_frames.py
       - name: Robust-parsing gate
         run: |
           python3 scripts/ci/check_robust_parsing.py --self-test
