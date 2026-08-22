@@ -563,7 +563,7 @@ async fn apply_fenced(
 }
 
 fn timeout_ms(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).map_or(u64::MAX, |milliseconds| milliseconds)
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn response_error(response: &crate::bridge::envelope::Response) -> crate::Error {
