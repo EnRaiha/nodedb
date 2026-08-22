@@ -3,9 +3,7 @@
 //! Gateway-based dispatch: routes tasks through `Gateway::execute` instead of
 //! the old SQL-string `ForwardRequest` forwarding path.
 //!
-//! `should_forward_via_gateway` mirrors the old `remote_leader_for_tasks`
-//! detection logic but returns a bool rather than the leader node id, because
-//! the gateway handles the node selection internally.
+//! Where a task set runs is decided in `placement`; this file carries it out.
 //!
 //! `dispatch_tasks_via_gateway` replaces `forward_sql`: each task is dispatched
 //! via `gateway.execute(ctx, plan)` which ships pre-planned `PhysicalPlan` bytes
@@ -21,7 +19,7 @@ use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
-use crate::types::{ReadConsistency, TenantId, TraceId};
+use crate::types::{TenantId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::sqlstate_error;
@@ -72,61 +70,6 @@ pub(super) struct GatewayDispatchParams<'a> {
 }
 
 impl NodeDbPgHandler {
-    /// Returns `true` when every task targets a single remote leader and the
-    /// gateway is available to forward them. This replaces the old
-    /// `remote_leader_for_tasks` helper which returned the leader node id.
-    pub(super) fn should_forward_via_gateway(
-        &self,
-        tasks: &[PhysicalTask],
-        consistency: ReadConsistency,
-    ) -> bool {
-        if self.state.gateway.get().is_none() {
-            return false;
-        }
-        let routing = match self.state.cluster_routing.as_ref() {
-            Some(r) => r,
-            None => return false,
-        };
-        let routing = routing.read().unwrap_or_else(|p| p.into_inner());
-        let my_node = self.state.node_id;
-
-        let mut remote_leader: Option<u64> = None;
-        for task in tasks {
-            let vshard_id = task.vshard_id.as_u32();
-            let group_id = match routing.group_for_vshard(vshard_id) {
-                Ok(g) => g,
-                Err(_) => return false,
-            };
-            let info = match routing.group_info(group_id) {
-                Some(i) => i,
-                None => return false,
-            };
-            let leader = info.leader;
-
-            // Task is local — don't forward.
-            if leader == my_node {
-                return false;
-            }
-            // Local replica acceptable for non-strong reads — don't forward.
-            if !consistency.requires_leader() && info.members.contains(&my_node) {
-                return false;
-            }
-            // No known leader — can't forward.
-            if leader == 0 {
-                return false;
-            }
-
-            match remote_leader {
-                None => remote_leader = Some(leader),
-                // Tasks fan out across multiple leaders — don't use gateway forward.
-                Some(prev) if prev != leader => return false,
-                _ => {}
-            }
-        }
-
-        remote_leader.is_some()
-    }
-
     /// Execute all tasks via the gateway. Each task's plan is dispatched
     /// through `gateway.execute()` which ships the pre-planned physical
     /// plan to the target node via `ExecuteRequest`.

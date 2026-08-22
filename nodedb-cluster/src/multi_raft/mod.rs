@@ -14,10 +14,12 @@
 //!   proper voter / learner / promotion semantics.
 //! - [`membership`]: learner catch-up / promotion helpers
 //!   (`commit_index_for`, `ready_learners`, etc.) driven by the tick loop.
+//! - [`read_index`]: leadership confirmation for linearizable reads.
 
 pub mod conf_change;
 pub mod core;
 pub mod membership;
+pub mod read_index;
 pub mod rpc_dispatch;
 
 pub use core::{GroupStatus, MultiRaft, MultiRaftReady};

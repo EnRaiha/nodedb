@@ -371,9 +371,9 @@ impl NodeDbPgHandler {
     }
 }
 
-/// Determine read consistency for a set of tasks.
-pub(super) fn consistency_for_tasks(tasks: &[PhysicalTask]) -> crate::types::ReadConsistency {
-    let has_writes = tasks.iter().any(|t| {
+/// Whether any task in the set replicates through Raft.
+pub(super) fn has_replicated_writes(tasks: &[PhysicalTask]) -> bool {
+    tasks.iter().any(|t| {
         crate::control::wal_replication::to_replicated_entry(
             t.tenant_id,
             t.database_id,
@@ -381,11 +381,21 @@ pub(super) fn consistency_for_tasks(tasks: &[PhysicalTask]) -> crate::types::Rea
             &t.plan,
         )
         .is_some()
-    });
+    })
+}
 
-    if has_writes {
-        crate::types::ReadConsistency::Strong
-    } else {
-        crate::types::ReadConsistency::BoundedStaleness(std::time::Duration::from_secs(5))
+/// Determine read consistency for a set of tasks.
+///
+/// A write always goes to the leader, whatever the session asked for. A read
+/// takes the session's `default_read_consistency`, which is `Strong` until a
+/// client sets otherwise.
+pub(super) fn consistency_for_tasks(
+    sessions: &crate::control::server::shared::session::SessionStore,
+    tasks: &[PhysicalTask],
+    session_id: crate::control::server::shared::session::SessionId,
+) -> crate::types::ReadConsistency {
+    if has_replicated_writes(tasks) {
+        return crate::types::ReadConsistency::Strong;
     }
+    sessions.read_consistency(session_id)
 }

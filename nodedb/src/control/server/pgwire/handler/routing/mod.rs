@@ -20,6 +20,7 @@ pub(in crate::control::server::pgwire::handler) mod execute;
 mod execute_dml_hooks;
 mod execute_entry;
 mod gateway_dispatch;
+mod placement;
 mod planning;
 mod pre_dispatch;
 pub(in crate::control::server::pgwire::handler) mod result_shaping;

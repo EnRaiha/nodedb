@@ -12,13 +12,58 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 
-use super::planning::consistency_for_tasks;
+use super::placement::TaskPlacement;
+use super::planning::{consistency_for_tasks, has_replicated_writes};
 use super::result_shaping::ResultShaping;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 
+/// How long a linearizable read waits for a quorum to confirm this node still
+/// leads the group. Several election timeouts (150-300ms), so an ordinary
+/// round trip always fits and a partition is reported rather than hung on.
+const LEADERSHIP_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// No leader is known for a group whose read requires one.
+fn no_serving_leader() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
+        "no leader is currently serving this range; retry".to_owned(),
+    )))
+}
+
 impl NodeDbPgHandler {
+    /// Prove against a quorum that this node still leads `group_id`.
+    ///
+    /// The routing table said so, but it is a cached view: a partitioned
+    /// leader keeps its entry long after the rest of the cluster has elected
+    /// a successor. Reads served on that entry alone return state the new
+    /// leader has already moved past.
+    async fn confirm_local_leadership(&self, group_id: u64) -> PgWireResult<()> {
+        let Some(confirmer) = self.state.read_index_confirmer.get() else {
+            // Reached only if a clustered node routed here before `start_raft`
+            // published the confirmer. Refusing is retriable; serving would be
+            // the unproven read this exists to prevent.
+            return Err(no_serving_leader());
+        };
+        use crate::control::cluster::read_index::ReadIndexRefusal;
+        match confirmer
+            .confirm(group_id, LEADERSHIP_CONFIRM_TIMEOUT)
+            .await
+        {
+            Ok(_read_index) => Ok(()),
+            Err(ReadIndexRefusal::NotLeader) => Err(no_serving_leader()),
+            Err(ReadIndexRefusal::Timeout { waited_ms }) => {
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
+                    format!("no quorum confirmed leadership within {waited_ms}ms; retry"),
+                ))))
+            }
+        }
+    }
+
     /// Route an implicit-edge dependent predicate through OLLP/Calvin when its
     /// catalog and session prerequisites require atomic edge maintenance.
     pub(super) async fn maybe_dispatch_implicit_edge_recon(
@@ -85,9 +130,19 @@ impl NodeDbPgHandler {
             projection,
             formats: result_formats,
         } = shaping;
-        let consistency = consistency_for_tasks(tasks);
-        if has_orchestrated_dml(tasks) || !self.should_forward_via_gateway(tasks, consistency) {
+        if has_orchestrated_dml(tasks) {
             return Ok(None);
+        }
+        let consistency = consistency_for_tasks(&self.sessions, tasks, session_id);
+        let needs_confirmed_leader = consistency.requires_leader() && !has_replicated_writes(tasks);
+        match self.placement_for_tasks(tasks, consistency, needs_confirmed_leader) {
+            TaskPlacement::Local => return Ok(None),
+            TaskPlacement::LocalLeader { group_id } => {
+                self.confirm_local_leadership(group_id).await?;
+                return Ok(None);
+            }
+            TaskPlacement::NoLeader => return Err(no_serving_leader()),
+            TaskPlacement::Gateway => {}
         }
 
         let database_id = self

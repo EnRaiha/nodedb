@@ -116,6 +116,12 @@ pub enum ClusterError {
     #[error("conf change commit timeout on group {group_id} (waited for index {log_index})")]
     JoinCommitTimeout { group_id: u64, log_index: u64 },
 
+    #[error("not the leader for raft group {group_id}; cannot serve a linearizable read")]
+    ReadIndexNotLeader { group_id: u64 },
+
+    #[error("leadership confirmation for raft group {group_id} timed out after {waited_ms}ms")]
+    ReadIndexTimeout { group_id: u64, waited_ms: u64 },
+
     #[error("invalid cluster configuration: {detail}")]
     Config { detail: String },
 

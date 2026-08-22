@@ -15,6 +15,21 @@ use crate::storage::LogStorage;
 ///
 /// Opaque on purpose: the ack counts inside are meaningful only to the node
 /// that issued them, in the term that issued them.
+/// How far a [`ReadIndexProbe`] has got.
+///
+/// `Pending` and `LeadershipLost` are kept apart because the caller acts on
+/// them differently: one waits for the next round of responses, the other
+/// stops immediately and reports that this node cannot serve the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndexStatus {
+    /// A quorum has answered — the read may be served.
+    Confirmed,
+    /// Still leading, still waiting for responses.
+    Pending,
+    /// No longer leader in the probe's term. The read can never confirm.
+    LeadershipLost,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReadIndexProbe {
     /// Index the read may be served at once confirmed.
@@ -26,12 +41,17 @@ pub struct ReadIndexProbe {
 impl<S: LogStorage> RaftNode<S> {
     /// Begin a linearizable read, or return `None` if this node is not the
     /// leader. Confirm with [`Self::read_index_confirmed`] before serving.
-    pub fn start_read_index(&self) -> Option<ReadIndexProbe> {
+    ///
+    /// Starting the read sends its own round of `AppendEntries`, so the
+    /// answer arrives within a round trip. Waiting for the next scheduled
+    /// heartbeat instead would add up to a full heartbeat interval to every
+    /// linearizable read.
+    pub fn start_read_index(&mut self) -> Option<ReadIndexProbe> {
         if self.role != NodeRole::Leader {
             return None;
         }
         let leader = self.leader_state.as_ref()?;
-        Some(ReadIndexProbe {
+        let probe = ReadIndexProbe {
             read_index: self.volatile.commit_index,
             term: self.hard_state.current_term,
             acks: self
@@ -40,21 +60,21 @@ impl<S: LogStorage> RaftNode<S> {
                 .iter()
                 .map(|&id| (id, leader.ack_count_for(id)))
                 .collect(),
-        })
+        };
+        self.replicate_to_all();
+        Some(probe)
     }
 
-    /// Whether a quorum has responded since `probe` was taken.
+    /// How far `probe` has got.
     ///
-    /// Every voter counted answered at least once after the probe, so a
-    /// quorum still recognised this node as leader after the read index was
-    /// chosen. False once the term moves or leadership is lost.
-    pub fn read_index_confirmed(&self, probe: &ReadIndexProbe) -> bool {
+    /// A quorum counted here answered at least once after the probe, so it
+    /// still recognised this node as leader when the read index was chosen.
+    pub fn read_index_status(&self, probe: &ReadIndexProbe) -> ReadIndexStatus {
         if self.role != NodeRole::Leader || self.hard_state.current_term != probe.term {
-            return false;
+            return ReadIndexStatus::LeadershipLost;
         }
-        let leader = match self.leader_state.as_ref() {
-            Some(ls) => ls,
-            None => return false,
+        let Some(leader) = self.leader_state.as_ref() else {
+            return ReadIndexStatus::LeadershipLost;
         };
         let mut count = 1u64; // self counts.
         for &(peer, seen) in &probe.acks {
@@ -62,7 +82,17 @@ impl<S: LogStorage> RaftNode<S> {
                 count += 1;
             }
         }
-        count as usize >= self.config.quorum()
+        if count as usize >= self.config.quorum() {
+            ReadIndexStatus::Confirmed
+        } else {
+            ReadIndexStatus::Pending
+        }
+    }
+
+    /// Whether `probe` is confirmed. Prefer [`Self::read_index_status`] when
+    /// the caller can act on the difference between waiting and losing.
+    pub fn read_index_confirmed(&self, probe: &ReadIndexProbe) -> bool {
+        self.read_index_status(probe) == ReadIndexStatus::Confirmed
     }
 }
 
@@ -124,14 +154,14 @@ mod tests {
 
     #[test]
     fn a_follower_cannot_start_a_read() {
-        let node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+        let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
         assert!(node.start_read_index().is_none());
     }
 
     /// The whole point: holding a probe is not permission to serve it.
     #[test]
     fn a_fresh_probe_is_not_confirmed() {
-        let node = leader();
+        let mut node = leader();
         let probe = node.start_read_index().expect("leader starts a read");
         assert!(
             !node.read_index_confirmed(&probe),
@@ -213,8 +243,23 @@ mod tests {
     /// has reached since.
     #[test]
     fn the_probe_pins_the_commit_index_it_was_taken_at() {
-        let node = leader();
+        let mut node = leader();
         let probe = node.start_read_index().expect("leader starts a read");
         assert_eq!(probe.read_index, node.commit_index());
+    }
+
+    /// Without this round the probe waits for the next scheduled heartbeat,
+    /// so every linearizable read pays up to a heartbeat interval.
+    #[test]
+    fn starting_a_read_sends_its_own_append_round() {
+        let mut node = leader();
+        let _probe = node.start_read_index().expect("leader starts a read");
+        let ready = node.take_ready();
+        assert_eq!(
+            ready.messages.len(),
+            2,
+            "both peers must be asked, got {:?}",
+            ready.messages
+        );
     }
 }

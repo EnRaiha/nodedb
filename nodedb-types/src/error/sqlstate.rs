@@ -205,12 +205,15 @@ pub const CLONE_DEPENDENCY: &str = "55006";
 /// specific clone.
 pub const CLONE_PREDATES_QUERY_TIME: &str = "22023";
 
-/// `55P03` — NodeDB extension: a strong or bounded-staleness read was requested
-/// on a mirror database that cannot satisfy the requested consistency level.
+/// `55P03` — NodeDB extension: this node cannot satisfy the requested
+/// consistency level, because it is not the Raft leader for the data and
+/// cannot prove that it is.
 ///
-/// Uses Class 55 "Object Not In Prerequisite State" because the mirror is a
-/// valid database but is not in the state (Raft leader) required to serve the
-/// requested consistency level. The client should redirect to the source cluster.
+/// Uses Class 55 "Object Not In Prerequisite State": the target is valid but
+/// is not in the state (Raft leader) the requested consistency needs. Raised
+/// for a mirror database, which should be redirected to the source cluster,
+/// and for a linearizable read whose leadership no quorum confirms. Retriable
+/// in both cases.
 pub const STALE_READ_NOT_LEADER: &str = "55P03";
 
 // ── Move Tenant DDL (Class 55 / 57) ─────────────────────────────────────────

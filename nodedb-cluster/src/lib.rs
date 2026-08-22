@@ -60,6 +60,7 @@ pub mod raft_loop;
 pub mod raft_storage;
 pub mod rdma_transport;
 pub mod reachability;
+pub mod read_index_wait;
 pub mod readiness;
 pub mod rebalance;
 pub mod rebalance_scheduler;
@@ -122,6 +123,7 @@ pub use raft_loop::{
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,
 };
+pub use read_index_wait::confirm_read_index;
 pub use rebalance::{RebalancePlan, compute_plan, plan_to_requests};
 pub use rebalancer::{
     AlwaysReadyGate, ElectionGate, LoadMetrics, LoadMetricsProvider, LoadWeights,

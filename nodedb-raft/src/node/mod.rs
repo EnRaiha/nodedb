@@ -24,4 +24,4 @@ pub mod rpc;
 
 pub use self::config::RaftConfig;
 pub use self::core::{RaftNode, Ready};
-pub use self::read_index::ReadIndexProbe;
+pub use self::read_index::{ReadIndexProbe, ReadIndexStatus};
