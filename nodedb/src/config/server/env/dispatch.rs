@@ -15,6 +15,7 @@ use crate::config::server::ServerConfig;
 ///
 /// Handled variables:
 /// - `NODEDB_HOST`             — overrides `config.host` (bind address, e.g., `0.0.0.0`)
+/// - `NODEDB_SYNC_HOST`        — overrides `config.sync_host` (sync listener only; loopback-only)
 /// - `NODEDB_PORT_NATIVE`      — overrides `config.ports.native` (default 6433)
 /// - `NODEDB_PORT_PGWIRE`      — overrides `config.ports.pgwire` (default 6432)
 /// - `NODEDB_PORT_HTTP`        — overrides `config.ports.http` (default 6480)

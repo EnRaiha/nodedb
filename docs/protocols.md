@@ -9,9 +9,12 @@ NodeDB speaks six wire protocols. All SQL-capable protocols share the same query
 | **pgwire** | 6432         | On      | SQL text                          | `psql`, ORMs, BI tools, JDBC |
 | **NDB**    | 6433         | On      | SQL (user) / native opcodes (SDK) | `ndb` CLI, Rust SDK, FFI     |
 | **HTTP**   | 6480         | On      | SQL via JSON                      | REST clients, browsers       |
-| **Sync**   | 9090         | On      | CRDT deltas                       | NodeDB-Lite (mobile, WASM)   |
+| **Sync**   | 9090¹        | On      | CRDT deltas                       | NodeDB-Lite (mobile, WASM)   |
 | **RESP**   | configurable | Off     | Redis commands                    | Cache layer, Redis clients   |
 | **ILP**    | configurable | Off     | InfluxDB Line Protocol            | Metrics/telemetry ingest     |
+
+¹ Sync binds to loopback only and does not follow `[server] host`. See
+[Sync](#sync).
 
 ## pgwire (PostgreSQL Protocol)
 
@@ -225,6 +228,12 @@ CRDT sync protocol for NodeDB-Lite clients (mobile, WASM, desktop). Bidirectiona
 
 **Port:** 9090 (default). Configurable via `[server.ports] sync` or `NODEDB_PORT_SYNC`.
 
+**Bind address:** loopback only. This listener speaks plaintext `ws://` and
+terminates no TLS, so a routable bind is refused at startup. It does not follow
+`[server] host`. Use `[server] sync_host` (or `NODEDB_SYNC_HOST`) to pick a
+different loopback, such as `::1`. To serve clients over a network, front it
+with a TLS-terminating proxy.
+
 **Flow:**
 
 1. Client connects and sends `Handshake` with JWT + vector clock
@@ -245,18 +254,20 @@ This protocol is used by NodeDB-Lite for offline-first sync. See [NodeDB-Lite](l
 
 ## Configuration
 
-All protocols share one bind address. Only the port differs.
+pgwire, native, HTTP, RESP and ILP share one bind address; only the port
+differs. Sync stays on loopback whatever `host` says — see [Sync](#sync).
 
 ```toml
 # nodedb.toml
 [server]
 host = "127.0.0.1"
+# sync_host = "::1"  # sync only; must be loopback
 
 [server.ports]
 pgwire = 6432       # Always on
 native = 6433       # Always on
 http = 6480         # Always on
-sync = 9090         # Always on
+sync = 9090         # Always on (loopback only)
 resp = 6381         # Set to enable (omit to disable)
 ilp = 8086          # Set to enable (omit to disable)
 

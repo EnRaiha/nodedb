@@ -2,7 +2,7 @@
 
 //! Root configuration for the NodeDB server.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use nodedb_types::config::TuningConfig;
@@ -163,8 +163,21 @@ impl ServerConfig {
     }
 
     /// Sync WebSocket listen address (NodeDB-Lite clients).
+    ///
+    /// Does not follow a routable `server.host`: `bind_sync_listener` refuses
+    /// a non-loopback bind, so deriving it from `0.0.0.0` could not boot. A
+    /// loopback `server.host` passes through unchanged; an explicit
+    /// `sync_host` passes through even when it will be refused.
     pub fn sync_addr(&self) -> SocketAddr {
-        self.addr(self.server.ports.sync)
+        let host = self
+            .server
+            .sync_host
+            .unwrap_or(if self.server.host.is_loopback() {
+                self.server.host
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            });
+        SocketAddr::new(host, self.server.ports.sync)
     }
 
     /// RESP listen address (None if disabled).
@@ -249,6 +262,54 @@ mod tests {
         let raw = config_toml_with_log_format("\"yaml\"");
         let result: Result<ServerConfig, _> = toml::from_str(&raw);
         assert!(result.is_err(), "unknown log_format value must be rejected");
+    }
+
+    /// The image ships `NODEDB_HOST=0.0.0.0`; sync took it and refused to
+    /// bind, so `docker run` exited 1 before serving anything.
+    #[test]
+    fn routable_host_keeps_sync_on_loopback() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+        assert!(
+            cfg.sync_addr().ip().is_loopback(),
+            "routable server.host must not move sync off loopback: {}",
+            cfg.sync_addr()
+        );
+        // The others must still bind it, or port mapping breaks instead.
+        assert_eq!(cfg.pgwire_addr().ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.http_addr().ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.native_addr().ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// A config that booted before keeps its exact address: a client reaching
+    /// sync at `[::1]:9090` must not be moved to `127.0.0.1`.
+    #[test]
+    fn loopback_host_is_passed_through_unchanged() {
+        for host in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+        ] {
+            let mut cfg = ServerConfig::default();
+            cfg.server.host = host;
+            assert_eq!(
+                cfg.sync_addr().ip(),
+                host,
+                "a loopback server.host must reach sync unchanged"
+            );
+        }
+    }
+
+    /// An explicit routable `sync_host` must fail at bind, not be rewritten
+    /// to loopback and appear to work.
+    #[test]
+    fn explicit_sync_host_is_not_rewritten() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        cfg.server.sync_host = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(cfg.sync_addr().ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
     }
 
     #[test]

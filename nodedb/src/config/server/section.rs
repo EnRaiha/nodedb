@@ -23,10 +23,18 @@ use super::tls::TlsSettings;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
-    /// Bind address shared by all protocol listeners.
+    /// Bind address for the native, pgwire, HTTP, RESP and ILP listeners.
     /// Default: 127.0.0.1 (localhost only). Use 0.0.0.0 for all interfaces.
+    /// Does not move the sync listener — see [`Self::sync_host`].
     #[serde(default = "default_host")]
     pub host: IpAddr,
+
+    /// Bind address for the sync listener alone, which must be loopback:
+    /// it serves plaintext `ws://` and terminates no TLS of its own.
+    /// `None` follows [`Self::host`] when that is loopback, else IPv4
+    /// loopback. A routable value here is refused at bind, not rewritten.
+    #[serde(default)]
+    pub sync_host: Option<IpAddr>,
 
     /// Per-protocol port numbers.
     #[serde(default)]
@@ -111,6 +119,7 @@ impl Default for ServerSection {
     fn default() -> Self {
         Self {
             host: default_host(),
+            sync_host: None,
             ports: PortsConfig::default(),
             data_dir: default_data_dir(),
             data_plane_cores: default_data_plane_cores(),

@@ -541,6 +541,39 @@ mod tests {
         assert!(error.to_string().contains("TLS-terminating proxy"));
     }
 
+    /// Boot binds `ServerConfig::sync_addr`, never `SyncListenerConfig`'s
+    /// default — so asserting that default is loopback proved nothing. Runs
+    /// the derivation and the guard together, which is what catches it.
+    #[tokio::test]
+    async fn config_derived_sync_addr_binds_under_a_routable_host() {
+        let mut config = crate::config::server::ServerConfig::default();
+        config.server.host = std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        // Ephemeral: test the guard, not whether 9090 is free.
+        config.server.ports.sync = 0;
+
+        let addr = config.sync_addr();
+        assert!(
+            addr.ip().is_loopback(),
+            "sync_addr must stay on loopback under a routable host: {addr}"
+        );
+        bind_sync_listener(addr)
+            .await
+            .expect("boot must derive an address this guard accepts");
+    }
+
+    /// An explicit routable sync bind is refused, not silently rewritten.
+    #[tokio::test]
+    async fn explicit_routable_sync_host_is_still_refused() {
+        let mut config = crate::config::server::ServerConfig::default();
+        config.server.sync_host = Some(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.server.ports.sync = 0;
+
+        let error = bind_sync_listener(config.sync_addr())
+            .await
+            .expect_err("an explicit routable sync_host must be refused");
+        assert!(error.to_string().contains("TLS-terminating proxy"));
+    }
+
     #[tokio::test]
     async fn shutdown_critical_barrier_stops_admitted_sync_tasks() {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))

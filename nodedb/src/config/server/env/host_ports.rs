@@ -26,6 +26,24 @@ pub(super) fn apply_host_and_ports(config: &mut ServerConfig) {
         }
     }
 
+    // Separate from `NODEDB_HOST`: sync is loopback-only, so this selects a
+    // different loopback (`::1`, 127.0.0.2), not a shared routable address.
+    if let Ok(val) = std::env::var("NODEDB_SYNC_HOST") {
+        match val.trim().parse::<IpAddr>() {
+            Ok(ip) => {
+                tracing::info!(env_var = "NODEDB_SYNC_HOST", value = %val, "environment variable override applied");
+                config.server.sync_host = Some(ip);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_var = "NODEDB_SYNC_HOST",
+                    value = %val,
+                    "ignoring malformed environment variable (expected IP address), using config value"
+                );
+            }
+        }
+    }
+
     apply_port_env("NODEDB_PORT_NATIVE", &mut config.server.ports.native);
     apply_port_env("NODEDB_PORT_PGWIRE", &mut config.server.ports.pgwire);
     apply_port_env("NODEDB_PORT_HTTP", &mut config.server.ports.http);

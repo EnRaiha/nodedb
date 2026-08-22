@@ -18,9 +18,12 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `CREATE [UNIQUE] INDEX IF NOT EXISTS`.
+- `[server] sync_host` / `NODEDB_SYNC_HOST` — loopback bind address for the sync listener alone.
 
 ### Fixed
 
+- The published container image could not start: it ships `NODEDB_HOST=0.0.0.0` and the sync listener refuses a non-loopback bind. Sync no longer follows a routable `server.host`, and its port is no longer published from the image or compose file.
+- Native error frames authored as a bare SQLSTATE carried no numeric code, so DDL refusals arrived as generic internal errors and `is_retriable()` answered wrongly.
 - JWT bearer authentication over the HTTP API panicked the handler and dropped the connection. Cluster credential fetch on a token-authenticated join and JWKS setup at startup blocked the same way.
 - Refused native `document_put`, `document_delete`, `graph_insert_edge`, `graph_delete_edge` and CRDT movable-list operations returned success; `graph_traverse` and `vector_search` read an error reply as an empty result.
 - `CREATE INDEX IF NOT EXISTS` was misparsed as an index named `if` on a collection named `exists`.

@@ -43,10 +43,12 @@ docker run -d --name nodedb \
   -p 6432:6432 \
   -p 6433:6433 \
   -p 6480:6480 \
-  -p 9090:9090 \
   -v nodedb-data:/var/lib/nodedb \
   farhansyah/nodedb
 ```
+
+Sync (9090) is omitted: it binds to loopback, so a mapping cannot reach it.
+See [Protocols](protocols.md).
 
 The container entrypoint runs as root just long enough to fix ownership on the data volume, then drops privileges to the `nodedb` user (uid 10001). To skip the root step, pass `--user 10001:10001` and pre-create the volume with matching ownership.
 
@@ -55,7 +57,7 @@ The container entrypoint runs as root just long enough to fix ownership on the d
 - **6432** — PostgreSQL wire protocol (pgwire)
 - **6433** — Native MessagePack protocol
 - **6480** — HTTP API (REST, SSE, WebSocket)
-- **9090** — WebSocket sync (NodeDB-Lite clients)
+- **9090** — WebSocket sync (NodeDB-Lite clients). Loopback only.
 
 ### Verify it's running
 
@@ -196,7 +198,7 @@ By default, NodeDB listens on:
 - **6432** — PostgreSQL wire protocol (pgwire)
 - **6433** — Native MessagePack protocol
 - **6480** — HTTP API (REST, SSE, WebSocket)
-- **9090** — WebSocket sync (NodeDB-Lite clients)
+- **9090** — WebSocket sync (NodeDB-Lite clients). Loopback only.
 
 Two additional protocols are available but **disabled by default**:
 

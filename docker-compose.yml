@@ -6,7 +6,8 @@ services:
       - "6432:6432"   # PostgreSQL wire protocol (psql, ORMs)
       - "6433:6433"   # Native MessagePack protocol (ndb CLI, nodedb-client)
       - "6480:6480"   # HTTP API (REST, SSE, WebSocket)
-      - "9090:9090"   # WebSocket sync (NodeDB-Lite edge clients)
+      # Sync (9090) is omitted: it binds to loopback, so a mapping cannot
+      # reach it. Front it with a TLS proxy in this network namespace.
     volumes:
       - nodedb-data:/var/lib/nodedb
     environment:

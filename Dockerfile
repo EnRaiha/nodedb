@@ -58,15 +58,17 @@ USER nonroot:nonroot
 
 COPY --from=binary --chown=nonroot:nonroot /nodedb /usr/local/bin/nodedb
 
-# Bind to all interfaces (required for Docker port mapping)
+# Bind to all interfaces (required for Docker port mapping). Does not move the
+# sync listener, which is loopback-only.
 # Point data dir at the declared volume
 ENV NODEDB_HOST=0.0.0.0 \
     NODEDB_DATA_DIR=/var/lib/nodedb
 
 WORKDIR /var/lib/nodedb
 
-# pgwire | native protocol | HTTP API | WebSocket sync | OTLP gRPC | OTLP HTTP
-EXPOSE 6432 6433 6480 9090 4317 4318
+# pgwire | native protocol | HTTP API | OTLP gRPC | OTLP HTTP
+# Sync (9090) is omitted: it binds to loopback, so a mapping cannot reach it.
+EXPOSE 6432 6433 6480 4317 4318
 
 VOLUME ["/var/lib/nodedb"]
 
