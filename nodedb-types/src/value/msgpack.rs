@@ -193,7 +193,9 @@ impl<'a> zerompk::FromMessagePack<'a> for Value {
                 // the byte order produced by bytemuck::cast_slice on the
                 // encode side (native endian = little-endian on x86/ARM).
                 let floats: Arc<[f32]> = cow
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
                         f32::from_ne_bytes(arr)

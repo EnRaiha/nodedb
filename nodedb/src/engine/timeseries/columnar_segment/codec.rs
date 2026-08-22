@@ -118,8 +118,10 @@ pub(super) fn decode_column(
             let raw = nodedb_codec::decode_bytes_pipeline(data, codec.into_column_codec())
                 .map_err(map_err)?;
             let ids: Vec<u32> = raw
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             Ok(ColumnData::Symbol(ids))
         }

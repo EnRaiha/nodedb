@@ -72,9 +72,9 @@ pub(in crate::data::executor) fn unhex_key(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
+    for &[hi_byte, lo_byte] in bytes.as_chunks::<2>().0 {
+        let hi = (hi_byte as char).to_digit(16)?;
+        let lo = (lo_byte as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
     }
     Some(out)

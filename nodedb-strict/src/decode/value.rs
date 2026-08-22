@@ -70,7 +70,7 @@ pub(super) fn decode_fixed_value(col_type: &ColumnType, raw: &[u8]) -> Value {
                 return Value::Null;
             };
             let mut floats = Vec::with_capacity(floats_capacity);
-            for chunk in raw.chunks_exact(4).take(d) {
+            for chunk in raw.as_chunks::<4>().0.iter().take(d) {
                 let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 floats.push(Value::Float(f32::from_le_bytes(bytes) as f64));
             }

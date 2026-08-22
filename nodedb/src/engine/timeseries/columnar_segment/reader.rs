@@ -293,18 +293,15 @@ impl ColumnarSegmentReader {
     /// Returning owned values is portable across mmap and decrypted `Vec<u8>`
     /// backing stores, neither of which guarantees i64 alignment.
     pub fn mmap_as_i64(bytes: &[u8]) -> Result<Vec<i64>, SegmentError> {
-        let chunks = bytes.chunks_exact(8);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        if !remainder.is_empty() {
             return Err(SegmentError::Corrupt(
                 "i64 byte length is not a multiple of 8".into(),
             ));
         }
         Ok(chunks
-            .map(|chunk| {
-                i64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ])
-            })
+            .iter()
+            .map(|chunk| i64::from_le_bytes(*chunk))
             .collect())
     }
 
@@ -313,14 +310,15 @@ impl ColumnarSegmentReader {
     /// Returning owned values is portable across mmap and decrypted `Vec<u8>`
     /// backing stores, neither of which guarantees u32 alignment.
     pub fn mmap_as_u32(bytes: &[u8]) -> Result<Vec<u32>, SegmentError> {
-        let chunks = bytes.chunks_exact(4);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = bytes.as_chunks::<4>();
+        if !remainder.is_empty() {
             return Err(SegmentError::Corrupt(
                 "u32 byte length is not a multiple of 4".into(),
             ));
         }
         Ok(chunks
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect())
     }
 

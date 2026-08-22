@@ -52,8 +52,10 @@ fn decode_payload(payload: &[u8], dim: usize) -> Result<(f32, Vec<f32>), RerankE
             .expect("slice of 4 bytes always converts to [u8;4]"),
     );
     let centered: Vec<f32> = payload[4..]
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4) always 4 bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     Ok((query_norm, centered))
 }

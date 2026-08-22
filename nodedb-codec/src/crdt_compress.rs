@@ -186,16 +186,14 @@ pub fn decode(data: &[u8]) -> Result<Vec<CrdtOp>, CodecError> {
     pos = checked_add(pos, 2, "CRDT actor cursor")?;
     let actor_bytes = checked_mul(actor_count, 8, "CRDT actor dictionary")?;
     let actor_data = checked_range(data, pos, actor_bytes, "CRDT actor dictionary")?;
+    // `as_chunks` yields fixed-size arrays, so the length is proven by the
+    // type and the previous fallible `try_into` has nothing left to reject.
     let actor_dict: Vec<u64> = actor_data
-        .chunks_exact(8)
-        .map(|c| {
-            Ok(u64::from_le_bytes(c.try_into().map_err(|_| {
-                CodecError::Corrupt {
-                    detail: "invalid CRDT actor".into(),
-                }
-            })?))
-        })
-        .collect::<Result<_, _>>()?;
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
     let unique_actors: HashSet<u64> = actor_dict.iter().copied().collect();
     if unique_actors.len() != actor_dict.len() {
         return Err(CodecError::Corrupt {
@@ -256,8 +254,10 @@ pub fn decode(data: &[u8]) -> Result<Vec<CrdtOp>, CodecError> {
         index_data.iter().map(|&index| usize::from(index)).collect()
     } else {
         index_data
-            .chunks_exact(2)
-            .map(|chunk| usize::from(u16::from_le_bytes([chunk[0], chunk[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| usize::from(u16::from_le_bytes(*chunk)))
             .collect()
     };
     if actor_indices.iter().any(|&index| index >= actor_count) {

@@ -107,8 +107,10 @@ pub fn encode_bytes_pipeline(raw: &[u8], codec: ColumnCodec) -> Result<Vec<u8>, 
             // Symbol IDs are u32 — convert to i64, FastLanes pack, lz4.
             if raw.len().is_multiple_of(4) {
                 let i64_vals: Vec<i64> = raw
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c) as i64)
                     .collect();
                 encode_fastlanes_lz4_i64(&i64_vals)
             } else {
@@ -344,8 +346,10 @@ fn raw_to_i64(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         });
     }
     Ok(data
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect())
 }
 
@@ -356,8 +360,10 @@ fn raw_to_f64(data: &[u8]) -> Result<Vec<f64>, CodecError> {
         });
     }
     Ok(data
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes(*c))
         .collect())
 }
 

@@ -172,11 +172,8 @@ fn read_header(data: &[u8]) -> Result<Lz4Header, CodecError> {
     )?;
     let mut block_lengths = Vec::with_capacity(block_length_capacity);
     let mut total_compressed = 0usize;
-    for bytes in table.chunks_exact(4) {
-        let len = u32_to_usize(
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            "LZ4 block length",
-        )?;
+    for bytes in table.as_chunks::<4>().0 {
+        let len = u32_to_usize(u32::from_le_bytes(*bytes), "LZ4 block length")?;
         total_compressed = checked_add(total_compressed, len, "LZ4 compressed payload")?;
         block_lengths.push(len);
     }
