@@ -27,6 +27,7 @@ use super::transaction_savepoint::{
     handle_release_savepoint, handle_rollback_to_savepoint, handle_savepoint,
 };
 use super::{DispatchCtx, error_to_native};
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Handle a SQL statement: transaction control, SET/SHOW, DDL, or DataFusion.
 ///
@@ -110,7 +111,7 @@ async fn handle_sql_inner(
     }
 
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::Failed {
-        return resp(NativeResponse::error(
+        return resp(sqlstate_error(
             seq,
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
@@ -361,7 +362,7 @@ async fn execute_planned(
         match try_open_sql_stream(ctx, seq, &tasks, database_id, Some(&output_schema)).await {
             Ok(Some(mut stream)) => {
                 let Some(scope) = lease_scope.take() else {
-                    return resp(NativeResponse::error(
+                    return resp(sqlstate_error(
                         seq,
                         "XX000",
                         "internal error: query lease scope missing before SQL stream dispatch",
@@ -382,7 +383,7 @@ async fn execute_planned(
     // after this local owner is dropped. Lazy streams above retain the raw
     // scope directly in their stream owner.
     let Some(lease_scope) = lease_scope.take() else {
-        return resp(NativeResponse::error(
+        return resp(sqlstate_error(
             seq,
             "XX000",
             "internal error: query lease scope missing before materialized SQL dispatch",

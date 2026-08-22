@@ -10,7 +10,7 @@ use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 
 use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_to_native, error_to_native_with_sqlstate};
 
 /// Dispatch a native `GraphMatch` op, unwrapping the DP `{rows, frontier}`
 /// envelope into a bare rows array before native conversion.
@@ -36,7 +36,7 @@ pub(crate) async fn handle_graph_match(
     let tenant_id = ctx.tenant_id();
 
     if let Err(error) = super::limits::check_op_limits(ctx.state, fields) {
-        return NativeResponse::error(seq, "0A000", error.to_string());
+        return error_to_native_with_sqlstate(seq, "0A000", &error);
     }
     if let Err(error) = ctx.state.check_tenant_quota(tenant_id) {
         return error_to_native(seq, &error);
@@ -45,7 +45,7 @@ pub(crate) async fn handle_graph_match(
     let mut plan =
         match super::plan_builder::build_plan(ctx, OpCode::GraphMatch, fields, &collection) {
             Ok(plan) => plan,
-            Err(error) => return NativeResponse::error(seq, "42601", error.to_string()),
+            Err(error) => return error_to_native_with_sqlstate(seq, "42601", &error),
         };
     if let Err(error) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
@@ -53,7 +53,7 @@ pub(crate) async fn handle_graph_match(
         &ctx.state.rls,
         ctx.auth_context(),
     ) {
-        return NativeResponse::error(seq, "42501", error.to_string());
+        return error_to_native_with_sqlstate(seq, "42501", &error);
     }
     // Refuse what column redaction cannot cover: a MATCH returns graph
     // topology, which the result-path masking hook has no columns to rewrite.
@@ -63,7 +63,7 @@ pub(crate) async fn handle_graph_match(
         ctx.auth_context(),
         &ctx.state.redaction,
     ) {
-        return NativeResponse::error(seq, "0A000", error.to_string());
+        return error_to_native_with_sqlstate(seq, "0A000", &error);
     }
 
     // Stamp the active transaction id so MATCH reads resolve this connection's
@@ -84,7 +84,7 @@ pub(crate) async fn handle_graph_match(
     if let Some(info) = &plan_metering_info
         && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
     {
-        return NativeResponse::error(seq, "53400", e.to_string());
+        return error_to_native_with_sqlstate(seq, "53400", &e);
     }
     let _request = ctx.state.tenant_request_guard(tenant_id);
     let raw = dispatch_authorized_single_task(ctx, tenant_id, vshard_id, plan, txn_id).await;

@@ -16,7 +16,8 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::response::data_plane_response_to_native;
 use super::single_task::dispatch_single_task;
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_to_native, error_to_native_with_sqlstate};
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Dispatch a direct Data Plane operation by opcode.
 pub(crate) async fn handle_direct_op(
@@ -55,7 +56,7 @@ pub(crate) async fn handle_direct_op(
 
     // Per-operation cap enforcement (vector dim, top_k, batch size, etc.).
     if let Err(e) = super::limits::check_op_limits(ctx.state, fields) {
-        return NativeResponse::error(seq, "0A000", e.to_string());
+        return error_to_native_with_sqlstate(seq, "0A000", &e);
     }
 
     // Quota enforcement — reject before planning or dispatch.
@@ -65,7 +66,7 @@ pub(crate) async fn handle_direct_op(
 
     let mut plan = match super::plan_builder::build_plan(ctx, op, fields, &collection) {
         Ok(p) => p,
-        Err(e) => return NativeResponse::error(seq, "42601", e.to_string()),
+        Err(e) => return error_to_native_with_sqlstate(seq, "42601", &e),
     };
 
     // Apply RLS before any special Control-Plane orchestration can observe the plan.
@@ -75,7 +76,7 @@ pub(crate) async fn handle_direct_op(
         &ctx.state.rls,
         ctx.auth_context(),
     ) {
-        return NativeResponse::error(seq, "42501", e.to_string());
+        return error_to_native_with_sqlstate(seq, "42501", &e);
     }
 
     // Refuse what column redaction cannot cover (an aggregate over a redacted
@@ -86,7 +87,7 @@ pub(crate) async fn handle_direct_op(
         ctx.auth_context(),
         &ctx.state.redaction,
     ) {
-        return NativeResponse::error(seq, "0A000", e.to_string());
+        return error_to_native_with_sqlstate(seq, "0A000", &e);
     }
 
     // Extracted before `plan` is moved/cloned into any of the branches below
@@ -107,7 +108,7 @@ pub(crate) async fn handle_direct_op(
     if let Some(info) = &plan_metering_info
         && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
     {
-        return NativeResponse::error(seq, "53400", e.to_string());
+        return error_to_native_with_sqlstate(seq, "53400", &e);
     }
 
     // Whether the blanket metering call below (after the block) still needs
@@ -328,7 +329,7 @@ pub(crate) async fn handle_direct_op(
             let task = match authorized_tasks.into_tasks().into_iter().next() {
                 Some(task) => task,
                 None => {
-                    return NativeResponse::error(
+                    return sqlstate_error(
                         seq,
                         "XX000",
                         "authorization returned no task capability",

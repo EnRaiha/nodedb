@@ -16,7 +16,7 @@ use crate::types::{Lsn, RequestId};
 
 use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
-use super::{DispatchCtx, error_code_to_native, error_to_native};
+use super::{DispatchCtx, error_code_to_native, error_to_native, error_to_native_with_sqlstate};
 
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
 /// converting the Data-Plane response into a `NativeResponse`.
@@ -76,7 +76,7 @@ pub(super) async fn dispatch_single_task(
     if let Some(info) = &plan_metering_info
         && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
     {
-        return NativeResponse::error(seq, "53400", e.to_string());
+        return error_to_native_with_sqlstate(seq, "53400", &e);
     }
 
     let task = match route_in_tx_write(

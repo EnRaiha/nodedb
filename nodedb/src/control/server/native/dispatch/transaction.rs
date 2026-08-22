@@ -81,7 +81,12 @@ pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
                 crate::Error::BadRequest { detail } => detail.clone(),
                 other => other.to_string(),
             };
-            NativeResponse::error(seq, "25P02", message)
+            NativeResponse::error_with_code(
+                seq,
+                "25P02",
+                message,
+                crate::error_classify::classify(&e).code().0,
+            )
         }
     }
 }

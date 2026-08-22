@@ -18,6 +18,7 @@ use super::NativeSession;
 use super::codec::{self, FrameFormat};
 use super::dispatch;
 use super::session_chunk::chunk_large_response;
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Rollback dependencies retained independently from the connection future.
 ///
@@ -187,11 +188,8 @@ impl NativeSession {
                     "session absolute timeout ({}s), closing connection",
                     absolute_timeout_secs
                 );
-                let shutdown_resp = NativeResponse::error(
-                    0,
-                    "57P01",
-                    "session timeout: absolute lifetime exceeded",
-                );
+                let shutdown_resp =
+                    sqlstate_error(0, "57P01", "session timeout: absolute lifetime exceeded");
                 if let Ok(bytes) = super::codec::encode_response(
                     &shutdown_resp,
                     self.format.unwrap_or(FrameFormat::MessagePack),
@@ -224,8 +222,12 @@ impl NativeSession {
                 Ok(None) => return Ok(()), // clean EOF
                 Err(crate::Error::BadRequest { detail }) => {
                     // Send a typed error before closing so the client knows why.
-                    let err_resp =
-                        NativeResponse::error(0, "54000", format!("frame rejected: {detail}"));
+                    let err_resp = NativeResponse::error_with_code(
+                        0,
+                        "54000",
+                        format!("frame rejected: {detail}"),
+                        nodedb_types::error::ErrorCode::BAD_REQUEST.0,
+                    );
                     let format = self.format.unwrap_or(FrameFormat::MessagePack);
                     if let Ok(bytes) = codec::encode_response(&err_resp, format) {
                         let _ = codec::write_frame(&mut self.stream, &bytes).await;
@@ -248,7 +250,7 @@ impl NativeSession {
             // Decode and handle.
             let outcome = match codec::decode_request(&payload, format) {
                 Ok(req) => self.handle_request(req).await,
-                Err(e) => dispatch::SqlOutcome::Response(Box::new(NativeResponse::error(
+                Err(e) => dispatch::SqlOutcome::Response(Box::new(sqlstate_error(
                     0,
                     "42601",
                     format!("{e}"),

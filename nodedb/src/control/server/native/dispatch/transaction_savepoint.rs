@@ -15,18 +15,17 @@ use crate::control::server::shared::session::savepoint_ops::{self, SavepointErro
 
 use super::DispatchCtx;
 use super::transaction::NativeTxnDp;
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Map a neutral savepoint error to a native error frame.
 fn savepoint_error_to_native(seq: u64, e: &SavepointError) -> NativeResponse {
     match e {
-        SavepointError::NoActiveTransaction => NativeResponse::error(
+        SavepointError::NoActiveTransaction => sqlstate_error(
             seq,
             "25P01",
             "SAVEPOINT can only be used in transaction blocks",
         ),
-        SavepointError::NotFound { message } => {
-            NativeResponse::error(seq, "3B001", message.clone())
-        }
+        SavepointError::NotFound { message } => sqlstate_error(seq, "3B001", message.clone()),
     }
 }
 
