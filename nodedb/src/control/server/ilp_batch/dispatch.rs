@@ -190,7 +190,7 @@ async fn flush_ilp_batch_inner(
     // read differently on this transport than it does on a planned `INSERT`.
     let scope =
         ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)
-            .into_scope();
+            .into_resolved_scope();
     crate::control::planner::rls_injection::inject_rls(&mut tasks, &state.rls, scope.auth())?;
 
     // A spent hard quota refuses the batch before any of it is staged. The

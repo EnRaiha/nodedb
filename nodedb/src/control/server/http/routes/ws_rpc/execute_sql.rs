@@ -53,8 +53,10 @@ pub async fn execute_sql(
     // success; a denial still fails the request closed via `?`.
     crate::control::server::session_auth::check_request_admission(shared, &request, "sql")?;
 
-    let (clean_sql, scope) =
-        crate::control::server::session_auth::apply_per_query_on_deny(sql, request.into_scope());
+    let (clean_sql, scope) = crate::control::server::session_auth::apply_per_query_on_deny(
+        sql,
+        request.into_resolved_scope(),
+    );
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. The scope
     // is retained through every orchestrated or Data-Plane execution and
