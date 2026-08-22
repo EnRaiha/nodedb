@@ -871,12 +871,43 @@ def self_test() -> int:
     return 1 if failed else 0
 
 
+def stale_canonical_helpers() -> list[str]:
+    """Report PATH_CANONICAL_HELPERS entries that no longer name live code.
+
+    Each entry widens the gate for one file: the named helpers are read as
+    canonical there, so a bare call to one stops counting as unquoted
+    interpolation. The key is a path. Move the file and the entry keeps
+    widening nothing, while the helpers at their new home silently lose
+    their canonical status and the file starts reporting false violations —
+    which is how this gate came to fail on every pull request. A dead entry
+    is therefore a gate failure, not tidiness.
+    """
+    stale: list[str] = []
+    for rel, helpers in sorted(PATH_CANONICAL_HELPERS.items()):
+        path = RUST_ROOT / rel
+        if not path.is_file():
+            stale.append(f"{rel!r} names a file that does not exist")
+            continue
+        source = path.read_text(encoding="utf-8")
+        for helper in sorted(helpers):
+            if not re.search(rf"\b{re.escape(helper)}\b", source):
+                stale.append(f"{rel!r} exempts {helper!r}, which does not appear in that file")
+    return stale
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    stale = stale_canonical_helpers()
+    if stale:
+        print("FAIL: stale canonical-helper exemptions — the gate is misaimed where they point:")
+        for entry in stale:
+            print(f"  {entry}")
+        print("\nRepoint each entry at the code's current location, or drop it if the helper is gone.")
+        return 1
     findings = scan_paths(path for root in SCAN_ROOTS for path in root.rglob("*.rs"))
     if findings:
         print(f"FAIL: {len(findings)} reconstructed-SQL gate violation(s):")
