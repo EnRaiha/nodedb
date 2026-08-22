@@ -145,7 +145,7 @@ async fn open_client(
     node: &TestClusterNode,
 ) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         node.pg_addr.port()
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)

@@ -378,7 +378,7 @@ impl CrashHarness {
 
     pub fn pgwire_conn_str(&self) -> String {
         format!(
-            "host=127.0.0.1 port={} dbname=nodedb user=nodedb password=nodedb",
+            "host=127.0.0.1 port={} dbname=default user=nodedb password=nodedb",
             self.pgwire_port
         )
     }

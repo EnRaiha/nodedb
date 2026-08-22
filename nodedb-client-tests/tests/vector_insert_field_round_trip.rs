@@ -16,7 +16,7 @@ use nodedb_test_support::pgwire_harness::TestServer;
 async fn vector_insert_field_must_not_silently_delegate_to_unfielded() {
     let server = TestServer::start().await;
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         server.pg_port
     );
     let remote = NodeDbRemote::connect(&conn_str)

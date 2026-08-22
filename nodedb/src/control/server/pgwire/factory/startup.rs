@@ -19,6 +19,7 @@ use crate::control::security::escalation::{
 use crate::control::state::SharedState;
 
 use super::super::handler::NodeDbPgHandler;
+use super::super::types::sqlstate_error;
 use super::provider::NodeDbParameterProvider;
 
 /// Enum dispatch for startup handler — avoids dyn trait object issues.
@@ -37,38 +38,38 @@ pub(crate) enum AuthStartup {
 /// and bind it to the session store for this connection.
 ///
 /// The key `"database"` is set by clients via `dbname=` or `psql -d <name>`.
-/// An absent or empty value is silently ignored — the session will use the
-/// server default (DatabaseId::DEFAULT / `"default"`).
-/// An unrecognised name is also silently ignored here; the first DDL/DML
-/// statement will surface the missing-database error at query time, which
-/// matches PostgreSQL behaviour for `psql -d nonexistent` (it succeeds at
-/// connect; errors on the first query that requires the db).
+/// An absent or empty value leaves `current_database` unset, and the session
+/// falls back to the caller's default — the one legitimate meaning of `None`.
+///
+/// A name that does not resolve is refused here with `3D000`, matching
+/// `USE DATABASE`, the native protocol, the HTTP path, and PostgreSQL
+/// (`FATAL: database "x" does not exist`). It must not be encoded as `None`:
+/// consumers read `None` as "no database selected" and fall back to
+/// `DatabaseId::DEFAULT`, so an unresolved name would silently read and write
+/// `default` while the client believes it named something else.
+///
+/// A catalog read failure is refused for the same reason — it says nothing
+/// about whether the database exists, so it cannot become a fallback.
 fn bind_startup_database<C: pgwire::api::ClientInfo>(
     client: &C,
     session_id: crate::control::server::shared::session::SessionId,
     handler: &NodeDbPgHandler,
-) {
+) -> PgWireResult<()> {
     let db_name = match client.metadata().get("database") {
         Some(n) if !n.is_empty() => n.clone(),
-        _ => return,
+        _ => return Ok(()),
     };
-
-    let _ = session_id;
 
     let db_id = handler
         .state
         .credentials
         .catalog()
         .get_database_id_by_name(&db_name)
-        .ok()
-        .flatten();
+        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
+        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{db_name}' does not exist")))?;
 
-    if let Some(id) = db_id {
-        handler.sessions.set_current_database(session_id, id);
-    }
-    // If the name is not found we leave current_database unset (None).
-    // The first query that actually needs a database context will produce
-    // the appropriate DATABASE_NOT_FOUND error.
+    handler.sessions.set_current_database(session_id, db_id);
+    Ok(())
 }
 
 #[async_trait]
@@ -100,6 +101,12 @@ impl StartupHandler for AuthStartup {
                     // empty-store bootstrap identity.
                     let identity = handler.resolve_trust_user(client)?;
                     handler.sessions.set_identity(handler.session_id, identity);
+                    // Before AuthenticationOk, for the same reason the trust
+                    // user is: once `finish_authentication` announces
+                    // ReadyForQuery the client treats the connection as
+                    // established, and a refusal after that point arrives too
+                    // late to stop it being used.
+                    bind_startup_database(client, handler.session_id, handler)?;
                     pgwire::api::auth::finish_authentication(
                         client,
                         &super::provider::nodedb_parameter_provider(),
@@ -119,12 +126,6 @@ impl StartupHandler for AuthStartup {
                     &source,
                     &format!("trust auth: {username}"),
                 );
-
-                // Bind the `database` startup parameter to the session store.
-                // `psql -d <name>` sets this key in the pgwire StartupMessage;
-                // we resolve it once at handshake time so every query on this
-                // connection executes in the declared database context.
-                bind_startup_database(client, handler.session_id, handler);
 
                 Ok(())
             }
@@ -164,7 +165,17 @@ impl StartupHandler for AuthStartup {
                             &format!("SCRAM-SHA-256 auth: {username}"),
                         );
                         // Bind the `database` startup parameter to the session.
-                        bind_startup_database(client, handler.session_id, handler);
+                        //
+                        // This lands after AuthenticationOk, unlike the trust
+                        // path, and deliberately so: the SASL handler owns the
+                        // whole exchange through ReadyForQuery, so the only
+                        // earlier hook is the Startup message — before the
+                        // client has authenticated. Refusing there would tell
+                        // an unauthenticated caller which database names
+                        // exist. The session is instead torn down by this
+                        // error before it can execute anything, so an
+                        // unresolved name still never reaches `default`.
+                        bind_startup_database(client, handler.session_id, handler)?;
                     }
                     Err(_) if was_in_auth => {
                         // SCRAM failed. This is the single place the lockout

@@ -346,11 +346,11 @@ impl TestServer {
         let (client, conn_handle) = if provision_superuser {
             let conn_str = match auth_mode {
                 AuthMode::Password | AuthMode::Certificate => format!(
-                    "host=127.0.0.1 port={} user=nodedb password=nodedb dbname=nodedb",
+                    "host=127.0.0.1 port={} user=nodedb password=nodedb dbname=default",
                     pg_addr.port()
                 ),
                 AuthMode::Trust => format!(
-                    "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+                    "host=127.0.0.1 port={} user=nodedb dbname=default",
                     pg_addr.port()
                 ),
             };

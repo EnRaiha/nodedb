@@ -198,7 +198,7 @@ async fn reindex_vector_concurrent_p99() {
     let lats_writer = Arc::clone(&rebuild_latencies);
     let stop_reader = Arc::clone(&stop_flag);
     let query_handle = tokio::spawn(async move {
-        let conn_str = format!("host=127.0.0.1 port={pg_port} user=nodedb dbname=nodedb");
+        let conn_str = format!("host=127.0.0.1 port={pg_port} user=nodedb dbname=default");
         let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
             .await
             .expect("query-task connect failed");

@@ -165,7 +165,7 @@ async fn pgwire_accept_blocked_until_gateway_enable() {
     });
 
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb connect_timeout=10",
+        "host=127.0.0.1 port={} user=nodedb dbname=default connect_timeout=10",
         pg_addr.port()
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)

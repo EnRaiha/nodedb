@@ -27,7 +27,7 @@ struct ListenerConn {
 
 impl ListenerConn {
     async fn connect(port: u16) -> Self {
-        let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=nodedb");
+        let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=default");
         let (client, mut connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .expect("listener connect");
@@ -100,7 +100,7 @@ impl ListenerConn {
 
 /// Simple second client for NOTIFY only (no need to receive).
 async fn notifier(port: u16) -> tokio_postgres::Client {
-    let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=nodedb");
+    let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=default");
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("notifier connect");

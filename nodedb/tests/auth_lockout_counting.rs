@@ -229,7 +229,7 @@ async fn pgwire_scram_correct_password_with_pending_change_does_not_count() {
         .unwrap();
 
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb password=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb password=nodedb dbname=default",
         server.pg_port
     );
     for _ in 0..MAX_FAILED {
@@ -257,7 +257,7 @@ async fn pgwire_locked_account_rejection_does_not_advertise_lockout() {
 
     // Lock the account with five genuine wrong-password SCRAM attempts.
     let wrong = format!(
-        "host=127.0.0.1 port={} user=nodedb password=wrong-pw dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb password=wrong-pw dbname=default",
         server.pg_port
     );
     for _ in 0..MAX_FAILED {

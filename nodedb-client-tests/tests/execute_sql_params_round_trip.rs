@@ -15,7 +15,7 @@ use nodedb_test_support::pgwire_harness::TestServer;
 async fn execute_sql_with_bound_params_round_trips_through_pgwire() {
     let server = TestServer::start().await;
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         server.pg_port
     );
     let remote = NodeDbRemote::connect(&conn_str)

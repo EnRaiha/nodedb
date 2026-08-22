@@ -19,7 +19,7 @@ async fn vector_search_with_metadata_filter_round_trips_through_pgwire() {
     let server = TestServer::start().await;
 
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         server.pg_port
     );
     let remote = NodeDbRemote::connect(&conn_str)

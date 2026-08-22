@@ -124,7 +124,7 @@ impl TestServer {
         user: &str,
         password: &str,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), String> {
-        self.connect_as_database(user, password, "nodedb").await
+        self.connect_as_database(user, password, "default").await
     }
 
     /// Open a second pgwire connection under a user-selected database.

@@ -66,7 +66,7 @@ async fn pgwire_idle_in_transaction_overlay_reclaimed_by_watchdog() {
     // in a spawned task; keep both the client and its JoinHandle alive so the
     // connection stays genuinely idle-open (not dropped) for the whole test.
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         server.pg_port
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)

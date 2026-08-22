@@ -110,7 +110,7 @@ async fn pgwire_ddl_roundtrip() {
 
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-    let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=nodedb");
+    let conn_str = format!("host=127.0.0.1 port={port} user=nodedb dbname=default");
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
         .await
         .unwrap();

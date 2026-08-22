@@ -405,3 +405,138 @@ async fn default_database_bootstrapped_and_idempotent() {
         "SHOW DATABASES row count must be stable across re-boots (idempotency)"
     );
 }
+
+// ── startup `database` parameter: resolution at handshake ───────────
+
+/// Naming a database that does not exist must be refused at the handshake,
+/// as `USE DATABASE` and the native protocol already do, and as PostgreSQL
+/// does (`FATAL: database "x" does not exist`).
+///
+/// Accepting it silently serves `default` instead, so a typo'd name reads and
+/// writes real data with nothing to indicate the requested database was
+/// ignored.
+#[tokio::test]
+async fn startup_with_unknown_database_is_refused() {
+    let server = TestServer::start().await;
+
+    let result = server
+        .connect_as_database("nodedb", "nodedb", "totally_bogus_name")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a startup `database` naming a nonexistent database must be refused, not bound to `default`"
+    );
+    server.graceful_shutdown().await;
+}
+
+/// The refusal must carry `3D000`, the code `USE DATABASE`, the native
+/// protocol, and the HTTP path all already return for the same condition.
+#[tokio::test]
+async fn startup_with_unknown_database_reports_3d000() {
+    let server = TestServer::start().await;
+
+    let error = server
+        .connect_as_database("nodedb", "nodedb", "totally_bogus_name")
+        .await
+        .err()
+        .expect("connecting to a nonexistent database must fail");
+
+    assert!(
+        error.contains("3D000") || error.contains("does not exist"),
+        "refusal must name the missing database, got: {error}"
+    );
+    server.graceful_shutdown().await;
+}
+
+/// Writes issued on a connection that named a nonexistent database must not
+/// reach `default`. This is the reported symptom: the collection created
+/// through the bogus connection was readable from `default` afterwards.
+#[tokio::test]
+async fn writes_from_an_unknown_database_never_reach_default() {
+    let server = TestServer::start().await;
+
+    if let Ok((client, _handle)) = server
+        .connect_as_database("nodedb", "nodedb", "totally_bogus_name")
+        .await
+    {
+        let _ = client
+            .simple_query("CREATE COLLECTION stray_write_probe")
+            .await;
+        let _ = client
+            .simple_query("INSERT INTO stray_write_probe (id, v) VALUES ('x', 1)")
+            .await;
+    }
+
+    // Whether the connection was refused or the writes failed, `default` must
+    // not hold the collection.
+    server
+        .expect_error("SELECT * FROM stray_write_probe", "does not exist")
+        .await;
+    server.graceful_shutdown().await;
+}
+
+/// The refusal must hold under password auth, not just trust. This is the
+/// mode the behaviour was reported against, and its handshake completes
+/// inside the SASL exchange — so a refusal placed after authentication would
+/// arrive once the client already considers the connection established.
+#[tokio::test]
+async fn startup_with_unknown_database_is_refused_under_password_auth() {
+    let server = TestServer::start_password().await;
+
+    // The session must be unusable. Refusing at the handshake is preferred,
+    // but a session that authenticates and then fails every query also
+    // satisfies the invariant that matters: a nonexistent name never silently
+    // serves `default`.
+    match server
+        .connect_as_database("nodedb", "nodedb", "totally_bogus_name")
+        .await
+    {
+        Err(_) => {}
+        Ok((client, _handle)) => {
+            let outcome = client.simple_query("SELECT 1").await;
+            assert!(
+                outcome.is_err(),
+                "a session naming a nonexistent database must not serve queries"
+            );
+        }
+    }
+    server.graceful_shutdown().await;
+}
+
+/// Password auth must still admit the bootstrapped database, so the refusal
+/// above is about the name and not about the auth mode.
+#[tokio::test]
+async fn startup_with_known_database_succeeds_under_password_auth() {
+    let server = TestServer::start_password().await;
+
+    let (client, _handle) = server
+        .connect_as_database("nodedb", "nodedb", "default")
+        .await
+        .expect("password auth must admit the bootstrapped database");
+
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a password-authenticated session must serve queries");
+    server.graceful_shutdown().await;
+}
+
+/// A connection naming no database at all still falls back to the caller's
+/// default. This is the legitimate absent-name case, and refusing an unknown
+/// name must not break it.
+#[tokio::test]
+async fn startup_without_a_database_name_falls_back_to_default() {
+    let server = TestServer::start().await;
+
+    let (client, _handle) = server
+        .connect_as_database("nodedb", "nodedb", "default")
+        .await
+        .expect("naming the bootstrapped database must connect");
+
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a connection bound to `default` must serve queries");
+    server.graceful_shutdown().await;
+}

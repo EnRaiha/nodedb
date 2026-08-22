@@ -58,7 +58,7 @@ async fn pgwire_abandoned_txn_overlay_reclaimed_on_teardown() {
     // harness owns) so we can close it mid-transaction. tokio-postgres runs the
     // socket in a spawned task; we keep its JoinHandle to abort it later.
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         server.pg_port
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)

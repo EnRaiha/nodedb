@@ -26,7 +26,7 @@ async fn startup_parameters(port: u16) -> HashMap<String, String> {
         .await
         .expect("connect to pgwire port");
 
-    let mut fields = b"user\0nodedb\0database\0nodedb\0\0".to_vec();
+    let mut fields = b"user\0nodedb\0database\0default\0\0".to_vec();
     let len = 8 + fields.len();
     let mut startup = Vec::with_capacity(len);
     startup.extend_from_slice(&(len as i32).to_be_bytes());

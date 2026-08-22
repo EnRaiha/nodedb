@@ -55,7 +55,7 @@ async fn connect_from(
         .unwrap();
 
     let mut cfg = tokio_postgres::Config::new();
-    cfg.user("nodedb").dbname("nodedb");
+    cfg.user("nodedb").dbname("default");
     let (client, conn) = cfg
         .connect_raw(stream, tokio_postgres::NoTls)
         .await

@@ -107,7 +107,7 @@ async fn pgwire_connect_and_query() {
 
     // Connect using tokio-postgres (a real PostgreSQL client).
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+        "host=127.0.0.1 port={} user=nodedb dbname=default",
         pg_addr.port()
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
@@ -198,7 +198,7 @@ async fn pgwire_connect_and_query() {
         .await
         .expect("create non-superuser connection viewer");
     let viewer_conn_str = format!(
-        "host=127.0.0.1 port={} user=connection_viewer dbname=nodedb",
+        "host=127.0.0.1 port={} user=connection_viewer dbname=default",
         pg_addr.port()
     );
     let (viewer, viewer_connection) =

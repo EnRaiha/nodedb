@@ -59,7 +59,7 @@ async fn concurrent_same_key_writes_survive_wal_replay_consistently() {
     let mut handles = Vec::with_capacity(WRITERS);
     for i in 0..WRITERS {
         let conn_str = format!(
-            "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+            "host=127.0.0.1 port={} user=nodedb dbname=default",
             server.pg_port
         );
         handles.push(tokio::spawn(async move {

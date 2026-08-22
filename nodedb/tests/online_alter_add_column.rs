@@ -133,7 +133,7 @@ async fn alter_add_column_does_not_stall_writes() {
 
     let writer_task = tokio::spawn(async move {
         let conn_str = format!(
-            "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
+            "host=127.0.0.1 port={} user=nodedb dbname=default",
             writer_port
         );
         let (writer_client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)

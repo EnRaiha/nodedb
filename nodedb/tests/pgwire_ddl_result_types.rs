@@ -90,9 +90,9 @@ async fn raw_simple_query(port: u16, sql: &str) -> RawResult {
         .await
         .expect("connect to pgwire port");
 
-    // ── StartupMessage: protocol 3.0, user=nodedb, database=nodedb ──
+    // ── StartupMessage: protocol 3.0, user=nodedb, database=default ──
     let mut params = Vec::new();
-    params.extend_from_slice(b"user\0nodedb\0database\0nodedb\0\0");
+    params.extend_from_slice(b"user\0nodedb\0database\0default\0\0");
     let total = 4 + 4 + params.len();
     let mut startup = Vec::new();
     startup.extend_from_slice(&(total as i32).to_be_bytes());
