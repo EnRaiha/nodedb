@@ -29,6 +29,7 @@ use crate::error::Error;
 
 pub mod drain;
 pub mod drain_propose;
+pub mod gc;
 pub mod propose;
 pub mod refcount;
 pub mod release;

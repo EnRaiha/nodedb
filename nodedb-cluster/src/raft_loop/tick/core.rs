@@ -58,6 +58,12 @@ const PLACEMENT_RECONCILE_TICK_INTERVAL: u64 = 100;
 /// sweeps proportionally more often (harmless).
 const ORPHAN_PARTIAL_GC_TICK_INTERVAL: u64 = 6000;
 
+/// Lease GC for nodes that left the topology: every 200 ticks (~2s at the
+/// 10ms default tick). Cheaper than placement reconcile (single map scan),
+/// and the Leave apply hook usually beats it to the release — this sweep
+/// only catches cases the hook missed.
+const LEASE_GC_TICK_INTERVAL: u64 = 200;
+
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Execute a single tick: drive Raft, dispatch outbound messages,
     /// apply commits, promote caught-up learners.
@@ -169,6 +175,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     tracing::warn!(error = %e, "periodic gc: failed to sweep partial snapshot directory");
                 }
             }
+        }
+        if tick.is_multiple_of(LEASE_GC_TICK_INTERVAL) {
+            self.gc_stale_node_leases();
         }
     }
 

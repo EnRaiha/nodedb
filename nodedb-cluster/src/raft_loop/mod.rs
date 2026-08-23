@@ -22,6 +22,7 @@ pub mod in_flight_snapshots;
 pub mod join;
 mod leadership_transfer;
 pub mod loop_core;
+mod lease_gc;
 mod membership_convergence;
 mod placement_reconcile;
 pub mod proposals;
