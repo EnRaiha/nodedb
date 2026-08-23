@@ -22,16 +22,14 @@ use nodedb_cluster::forward::{ChunkSink, PlanExecutor};
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::gateway::version_check::{DescriptorCheckError, check_descriptor_versions};
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::wire as plan_wire;
 
-use super::support::{
-    PLAN_DECODE_FAILED, SinkOutcome, plan_contains_exchange, stream_error_to_typed,
-};
+use super::plan_decode::decode_plan;
+use super::request_validation::validate_request;
+use super::support::{PLAN_DECODE_FAILED, SinkOutcome, stream_error_to_typed};
 
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), TypedClusterError> {
     if matches!(
@@ -127,98 +125,8 @@ impl LocalPlanExecutor {
         ),
         TypedClusterError,
     > {
-        // ── 1. Deadline check ─────────────────────────────────────────────────
-        if req.deadline_remaining_ms == 0 {
-            return Err(TypedClusterError::DeadlineExceeded { elapsed_ms: 0 });
-        }
-
-        let deadline = Duration::from_millis(req.deadline_remaining_ms).min(Duration::from_secs(
-            self.state.tuning.network.default_deadline_secs,
-        ));
-
-        let database_id = DatabaseId::from(req.database_id);
-
-        // ── 2. Descriptor version validation ──────────────────────────────────
-        let catalog_ref = self.state.credentials.catalog();
-        check_descriptor_versions(
-            catalog_ref,
-            database_id,
-            req.tenant_id,
-            req.descriptor_versions
-                .iter()
-                .map(|entry| (entry.collection.as_str(), entry.version)),
-        )
-        .map_err(|e| match e {
-            DescriptorCheckError::VersionMismatch {
-                collection,
-                expected_version,
-                actual_version,
-            } => TypedClusterError::DescriptorMismatch {
-                collection,
-                expected_version,
-                actual_version,
-            },
-            DescriptorCheckError::CatalogLookup { detail, .. } => TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: format!("catalog lookup failed: {detail}"),
-            },
-        })?;
-
-        // ── 3. Decode the PhysicalPlan ────────────────────────────────────────
-        let mut plan = match plan_wire::decode(&req.plan_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: format!("plan decode failed: {e}"),
-                });
-            }
-        };
-
-        // ── 3a. Re-resolve an unresolved PK point-get surrogate ───────────────
-        //
-        // The query coordinator resolves `WHERE pk = <v>` → surrogate against
-        // ITS OWN local catalog. The surrogate↔PK map is sharded to the
-        // collection's data-group members, so a coordinator that is NOT a
-        // member of that group misses the binding and ships `Surrogate::ZERO`.
-        // We (the owner) ARE a group member, so our local catalog HAS the
-        // binding — re-resolve here before the plan reaches the Data Plane.
-        //
-        // Scope is intentionally tight: only `DocumentOp::PointGet` reads, only
-        // when the carried surrogate is ZERO and `pk_bytes` is non-empty. A
-        // non-ZERO carried surrogate is authoritative (immutable first-wins
-        // bind) and is left untouched; a genuinely-absent PK stays ZERO and
-        // correctly resolves to not-found.
-        if let nodedb_physical::physical_plan::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::PointGet {
-                surrogate,
-                pk_bytes,
-                collection,
-                ..
-            },
-        ) = &mut plan
-            && *surrogate == nodedb_types::Surrogate::ZERO
-            && !pk_bytes.is_empty()
-            && let Ok(Some(resolved)) = catalog_ref.get_surrogate_for_pk(
-                database_id,
-                crate::types::TenantId::new(req.tenant_id),
-                collection,
-                pk_bytes,
-            )
-        {
-            *surrogate = resolved;
-        }
-
-        // ── 3b. Reject unresolved Exchange nodes ──────────────────────────────
-        if plan_contains_exchange(&plan) {
-            return Err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: "received plan with unresolved Exchange node; coordinator must resolve \
-                          data movement before cross-node dispatch"
-                    .into(),
-            });
-        }
-
+        let (deadline, database_id) = validate_request(&self.state, req)?;
+        let plan = decode_plan(&self.state, database_id, req.tenant_id, &req.plan_bytes)?;
         Ok((plan, database_id, deadline))
     }
 
