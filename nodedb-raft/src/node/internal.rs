@@ -133,6 +133,8 @@ impl<S: LogStorage> RaftNode<S> {
         // Any in-progress leadership transfer is moot once we step down.
         self.leadership_transfer = None;
         self.pre_vote = None;
+        // Quorum-contact clock is meaningless outside the leader role.
+        self.last_quorum_contact = None;
         self.persist_hard_state();
         self.reset_election_timeout();
 
@@ -149,6 +151,9 @@ impl<S: LogStorage> RaftNode<S> {
     pub(super) fn become_leader(&mut self) {
         self.role = NodeRole::Leader;
         self.leader_id = self.config.node_id;
+        // Quorum contact resets on election win; the first heartbeat
+        // round-trip (or single-voter commit below) establishes it.
+        self.last_quorum_contact = None;
 
         // Leader tracks voter peers, learner peers, and observer peers for
         // replication. Only voters count toward the commit quorum (see
@@ -380,6 +385,19 @@ impl<S: LogStorage> RaftNode<S> {
         };
 
         let last = self.log.last_index();
+        // Check-quorum: any voter whose match_index is at (or one behind) the
+        // leader's last index counts as quorum contact. Self counts.
+        let mut contact_count = 1u64;
+        let contact_floor = last.saturating_sub(1);
+        for &peer in &self.config.peers {
+            if leader.match_index_for(peer) >= contact_floor {
+                contact_count += 1;
+            }
+        }
+        if contact_count as usize >= self.config.quorum() {
+            self.last_quorum_contact = Some(std::time::Instant::now());
+        }
+
         for n in (self.volatile.commit_index + 1..=last).rev() {
             let term_at_n = match self.log.term_at(n) {
                 Some(t) => t,

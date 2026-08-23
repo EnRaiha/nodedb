@@ -17,6 +17,7 @@ use crate::state::{
     HardState, LeaderState, LeadershipTransfer, NodeRole, PreVoteRound, VolatileState,
 };
 use crate::storage::LogStorage;
+use tracing::info;
 
 use super::config::RaftConfig;
 
@@ -101,6 +102,17 @@ pub struct RaftNode<S: LogStorage> {
     /// that measure, and a fully caught-up follower in an idle cluster looks
     /// stale. Heartbeats refresh this even when nothing is being written.
     pub(super) leader_contact: Option<LeaderContact>,
+    /// Last time a quorum of voters acknowledged this leader (heartbeat or
+    /// AppendEntries response reflected in `match_index`). `None` while not
+    /// the leader, or immediately after becoming leader before the first
+    /// heartbeat round-trip completes.
+    ///
+    /// When the gap since the last quorum contact exceeds
+    /// `election_timeout_max`, the leader steps down: it has lost contact
+    /// with a majority and may have been deposed by a new election it cannot
+    /// see (Raft check-quorum). Prevents a partitioned leader from serving
+    /// stale linearizable reads or accepting doomed proposals forever.
+    pub(super) last_quorum_contact: Option<Instant>,
 }
 
 /// A leader's commit index as of its last contact with this node.
@@ -142,6 +154,7 @@ impl<S: LogStorage> RaftNode<S> {
             pre_vote: None,
             durable_applied: 0,
             leader_contact: None,
+            last_quorum_contact: None,
             config,
         }
     }
@@ -438,6 +451,34 @@ impl<S: LogStorage> RaftNode<S> {
                 if transfer_expired {
                     self.leadership_transfer = None;
                 }
+
+                // Check-quorum: if we have not heard from a quorum of voters
+                // within the election timeout, we may have been partitioned
+                // away and deposed by a new leader we cannot see. Step down
+                // proactively so we stop serving stale reads and accepting
+                // doomed proposals. `last_quorum_contact` is refreshed by
+                // `try_advance_commit_index` whenever a quorum of voters has
+                // acknowledged recent entries.
+                match self.last_quorum_contact {
+                    Some(last) if now.duration_since(last) >= self.config.election_timeout_max => {
+                        info!(
+                            node = self.config.node_id,
+                            group = self.config.group_id,
+                            term = self.hard_state.current_term,
+                            "leader lost quorum contact; stepping down"
+                        );
+                        self.become_follower(self.hard_state.current_term);
+                        return;
+                    }
+                    // Fresh leader before the first quorum round-trip:
+                    // initialize the clock now so we do not step down
+                    // immediately after an election win.
+                    Some(_) => {}
+                    None => {
+                        self.last_quorum_contact = Some(now);
+                    }
+                }
+
                 if now >= self.heartbeat_deadline {
                     self.replicate_to_all();
                     self.heartbeat_deadline = now + self.config.heartbeat_interval;
@@ -832,5 +873,52 @@ mod tests {
         node.tick();
         assert_eq!(node.role(), NodeRole::Learner);
         assert_eq!(node.current_term(), 0);
+    }
+
+    /// A leader that has lost contact with a quorum of voters must step
+    /// down: it may have been deposed by an election it cannot see, and
+    /// continuing to serve reads/proposals violates linearizability.
+    /// (Raft check-quorum; etcd/CockroachDB/TiKV all do this.)
+    #[test]
+    fn leader_steps_down_after_losing_quorum_contact() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        node.become_leader();
+
+        // Leader with NO recorded quorum contact (fresh) must not step down
+        // immediately — allow the first heartbeat round-trip.
+        node.last_quorum_contact = None;
+        node.tick();
+        assert_eq!(node.role(), NodeRole::Leader);
+
+        // Now simulate quorum loss: last contact was long ago.
+        node.last_quorum_contact =
+            Some(Instant::now() - Duration::from_millis(1000));
+        node.tick();
+        assert_eq!(
+            node.role(),
+            NodeRole::Follower,
+            "leader must step down after election_timeout_max without quorum contact"
+        );
+    }
+
+    /// Quorum contact is refreshed whenever a quorum of voters has
+    /// acknowledged recent entries (via match_index), so an active leader
+    /// with healthy quorum never steps down.
+    #[test]
+    fn leader_with_recent_quorum_contact_stays_leader() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        node.become_leader();
+
+        // Simulate quorum acks: both peers at the leader's last index.
+        let last = node.log.last_index();
+        if let Some(ls) = node.leader_state.as_mut() {
+            ls.set_match_index(2, last);
+            ls.set_match_index(3, last);
+        }
+        node.try_advance_commit_index();
+
+        // Contact was just refreshed; a tick must NOT step down.
+        node.tick();
+        assert_eq!(node.role(), NodeRole::Leader);
     }
 }
