@@ -239,6 +239,26 @@ async fn try_join_once(
     }))
 }
 
+/// Observed cluster wire-version window derived from a successful
+/// `JoinResponse`. Falls back to the local build when the node list is
+/// empty (defensive; a success always carries nodes).
+pub(crate) fn window_from_join_response(resp: &JoinResponse) -> (u16, u16) {
+    let mut min = u16::MAX;
+    let mut max = 0u16;
+    for n in &resp.nodes {
+        min = min.min(n.wire_version);
+        max = max.max(n.wire_version);
+    }
+    if min == u16::MAX {
+        (
+            crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+        )
+    } else {
+        (min, max)
+    }
+}
+
 /// Apply a JoinResponse: reconstruct topology, routing, and MultiRaft
 /// from wire data.
 ///
@@ -260,6 +280,15 @@ fn apply_join_response(
     transport: &NexarTransport,
     resp: &JoinResponse,
 ) -> Result<ClusterState> {
+    let (window_min, window_max) = window_from_join_response(resp);
+    info!(
+        node_id = config.node_id,
+        cluster_min = window_min,
+        cluster_max = window_max,
+        mixed = window_min != window_max,
+        "join response window"
+    );
+
     // 1. Reconstruct topology.
     let mut topology = ClusterTopology::new();
     for node in &resp.nodes {
@@ -449,6 +478,44 @@ mod tests {
     }
 
     #[test]
+    fn window_from_join_response_empty_falls_back_to_local() {
+        let resp = JoinResponse {
+            success: true,
+            error: String::new(),
+            cluster_id: 7,
+            nodes: vec![],
+            vshard_to_group: vec![],
+            groups: vec![],
+        };
+        let (min, max) = window_from_join_response(&resp);
+        assert_eq!(min, crate::topology::CLUSTER_WIRE_FORMAT_VERSION);
+        assert_eq!(max, crate::topology::CLUSTER_WIRE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn window_from_join_response_spans_n_minus_1() {
+        let node = |id: u64, v: u16| crate::rpc_codec::JoinNodeInfo {
+            node_id: id,
+            addr: format!("10.0.0.{id}:9400"),
+            state: crate::topology::NodeState::Active.as_u8(),
+            raft_groups: vec![],
+            wire_version: v,
+            spiffe_id: None,
+            spki_pin: None,
+        };
+        let resp = JoinResponse {
+            success: true,
+            error: String::new(),
+            cluster_id: 7,
+            nodes: vec![node(1, 2), node(2, 1)],
+            vshard_to_group: vec![],
+            groups: vec![],
+        };
+        let (min, max) = window_from_join_response(&resp);
+        assert_eq!((min, max), (1, 2));
+    }
+
+    #[test]
     fn join_retry_policy_default_schedule() {
         // Production default: 8 attempts, ceiling 32 s. Each delay is
         // `32 s >> (8 - attempt)`, so the schedule halves down from
@@ -551,7 +618,7 @@ mod tests {
                     RaftRpc::JoinRequest(req) => {
                         let mut topo = self.topology.write().unwrap();
                         let routing = self.routing.read().unwrap();
-                        let resp = handle_join_request(&req, &mut topo, &routing, 99);
+                        let resp = handle_join_request(&req, &mut topo, &routing, 99, 1);
                         Ok(RaftRpc::JoinResponse(resp))
                     }
                     other => Err(ClusterError::Transport {

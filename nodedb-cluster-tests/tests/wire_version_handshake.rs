@@ -627,7 +627,7 @@ fn handle_join_request_rejects_incompatible_wire_version() {
         spki_pin: None,
     };
 
-    let resp = handle_join_request(&req, &mut topology, &routing, 42);
+    let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
 
     assert!(
         !resp.success,
@@ -647,6 +647,79 @@ fn handle_join_request_rejects_incompatible_wire_version() {
         resp.error
     );
     // Topology must not be mutated.
+    assert_eq!(topology.node_count(), 1);
+}
+
+/// With the window open (`MIN=1, WIRE=2`), a joiner one version behind
+/// (N-1) is admitted — that is the whole point of the rolling-upgrade
+/// window.
+#[test]
+fn handle_join_request_accepts_n_minus_1() {
+    use nodedb_cluster::bootstrap::handle_join_request;
+    use nodedb_cluster::rpc_codec::JoinRequest;
+    use nodedb_cluster::topology::{ClusterTopology, NodeState};
+    use nodedb_cluster::{NodeInfo, routing::RoutingTable};
+
+    let mut topology = ClusterTopology::new();
+    topology.add_node(NodeInfo::new(
+        1,
+        "10.0.0.1:9400".parse().unwrap(),
+        NodeState::Active,
+    ));
+    let routing = RoutingTable::uniform(1, &[1], 1);
+
+    let req = JoinRequest {
+        node_id: 2,
+        listen_addr: "10.0.0.2:9400".into(),
+        wire_version: 1,
+        spiffe_id: None,
+        spki_pin: None,
+    };
+
+    let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
+
+    assert!(
+        resp.success,
+        "N-1 joiner must be accepted inside the window: {}",
+        resp.error
+    );
+    assert_eq!(topology.node_count(), 2);
+    assert_eq!(topology.get_node(2).unwrap().wire_version, 1);
+}
+
+/// A joiner newer than this build (beyond the window ceiling) is
+/// rejected.
+#[test]
+fn handle_join_request_rejects_newer() {
+    use nodedb_cluster::bootstrap::handle_join_request;
+    use nodedb_cluster::rpc_codec::JoinRequest;
+    use nodedb_cluster::topology::{CLUSTER_WIRE_FORMAT_VERSION, ClusterTopology, NodeState};
+    use nodedb_cluster::{NodeInfo, routing::RoutingTable};
+
+    let mut topology = ClusterTopology::new();
+    topology.add_node(NodeInfo::new(
+        1,
+        "10.0.0.1:9400".parse().unwrap(),
+        NodeState::Active,
+    ));
+    let routing = RoutingTable::uniform(1, &[1], 1);
+
+    let req = JoinRequest {
+        node_id: 2,
+        listen_addr: "10.0.0.2:9400".into(),
+        wire_version: CLUSTER_WIRE_FORMAT_VERSION + 1,
+        spiffe_id: None,
+        spki_pin: None,
+    };
+
+    let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
+
+    assert!(!resp.success, "newer joiner must be rejected");
+    assert!(
+        resp.error.contains("outside accepted window"),
+        "error should mention the window: {}",
+        resp.error
+    );
     assert_eq!(topology.node_count(), 1);
 }
 

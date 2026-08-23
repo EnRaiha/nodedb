@@ -25,7 +25,9 @@ pub const RUST_VERSION: &str = env!("NODEDB_RUST_VERSION");
 /// which is the single source of truth shared with `nodedb-cluster`
 /// and any other crate that stamps or interprets the value.
 ///
-/// Readers MUST reject messages with wire_version != their own.
+/// Readers accept wire_version in
+/// `[MIN_WIRE_FORMAT_VERSION, WIRE_FORMAT_VERSION]`
+/// (see [`check_wire_compatibility`]).
 pub use nodedb_types::wire_version::{MIN_WIRE_FORMAT_VERSION, WIRE_FORMAT_VERSION};
 
 /// Returns a comma-separated list of always-on observability capabilities
@@ -120,6 +122,20 @@ mod tests {
     #[test]
     fn newer_version_rejected() {
         assert!(check_wire_compatibility(WIRE_FORMAT_VERSION + 1).is_err());
+    }
+
+    /// With the window open (MIN < WIRE), a peer at the floor is accepted.
+    #[test]
+    fn older_in_window_accepted() {
+        if WIRE_FORMAT_VERSION > MIN_WIRE_FORMAT_VERSION {
+            assert!(check_wire_compatibility(MIN_WIRE_FORMAT_VERSION).is_ok());
+        }
+    }
+
+    /// A peer below the floor is rejected.
+    #[test]
+    fn older_than_floor_rejected() {
+        assert!(check_wire_compatibility(0).is_err());
     }
 
     #[test]

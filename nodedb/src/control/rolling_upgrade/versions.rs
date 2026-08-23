@@ -7,26 +7,19 @@
 
 use super::view::ClusterVersionView;
 #[cfg(test)]
-use crate::version::WIRE_FORMAT_VERSION;
+use crate::version::{MIN_WIRE_FORMAT_VERSION, WIRE_FORMAT_VERSION};
 
-// PRE-1.0: every gate below is pinned to 1, the value of
-// `WIRE_FORMAT_VERSION`, so each feature is unconditionally active.
+// The join window is open: `MIN_WIRE_FORMAT_VERSION < WIRE_FORMAT_VERSION`
+// (1..=2), so mixed-version clusters can form during an N-1 rolling
+// upgrade and these gates are live — `min_version >= V` now discriminates
+// inside the window instead of being constant-true.
 //
-// `MIN_WIRE_FORMAT_VERSION == WIRE_FORMAT_VERSION` (floor == ceiling), so a
-// node rejects any peer whose version differs and a mixed-version cluster can
-// never form. Inside a cluster that exists, every node is therefore on this
-// exact version, which makes `min_version >= V` constant-true for any
-// `V <= WIRE_FORMAT_VERSION` and constant-false above it. These gates cannot
-// discriminate, so a value above 1 does not protect a rolling upgrade — it just
-// switches the feature OFF permanently and silently routes to a legacy
-// fallback.
-//
-// Do NOT raise these while `WIRE_FORMAT_VERSION` is 1 (see
-// `nodedb_types::wire_version` for why it stays there until 1.0). The gate
-// machinery is kept, not deleted, because it becomes meaningful the moment a
-// real support window (`MIN_WIRE_FORMAT_VERSION < WIRE_FORMAT_VERSION`) is
-// introduced post-1.0 — at which point these regain their original meanings,
-// recorded below.
+// Every gate below is pinned to `1` — the value each feature shipped
+// under. Keep them there and follow one rule: *bump a gate to the new
+// WIRE value in the same PR that lands its wire-shape change.* Raising a
+// gate without a wire-shape change just switches the feature OFF
+// permanently and silently routes to a legacy fallback; lowering one
+// below its original value lets pre-feature nodes activate it.
 
 /// Wire-format version that introduced the replicated catalog DDL
 /// path (`CatalogEntry` proposed via the metadata raft group).
@@ -64,8 +57,9 @@ pub const DESCRIPTOR_DRAIN_VERSION: u16 = 1;
 
 /// Check if a message from a remote node should be accepted.
 ///
-/// Accepts only messages with the exact current wire format version.
-/// Any other version is rejected (floor == ceiling; no rolling-upgrade window).
+/// Accepts versions in the rolling-upgrade window
+/// `[MIN_WIRE_FORMAT_VERSION, WIRE_FORMAT_VERSION]`; anything newer or
+/// older than the window is rejected.
 pub fn accept_message(remote_version: u16) -> crate::Result<()> {
     crate::version::check_wire_compatibility(remote_version)
 }
@@ -93,10 +87,18 @@ mod tests {
         assert!(accept_message(WIRE_FORMAT_VERSION + 1).is_err());
     }
 
+    /// With the window open, a message from an N-1 node (at the floor)
+    /// is accepted.
     #[test]
-    fn reject_older() {
-        if WIRE_FORMAT_VERSION > 0 {
-            assert!(accept_message(WIRE_FORMAT_VERSION - 1).is_err());
+    fn older_in_window_accepted() {
+        if WIRE_FORMAT_VERSION > MIN_WIRE_FORMAT_VERSION {
+            assert!(accept_message(MIN_WIRE_FORMAT_VERSION).is_ok());
         }
+    }
+
+    /// A version below the floor is rejected.
+    #[test]
+    fn older_than_floor_rejected() {
+        assert!(accept_message(0).is_err());
     }
 }
