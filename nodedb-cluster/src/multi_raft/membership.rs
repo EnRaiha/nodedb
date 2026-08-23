@@ -70,6 +70,20 @@ impl MultiRaft {
             .unwrap_or(false)
     }
 
+    /// Whether this node holds a valid leader lease for `group_id`.
+    ///
+    /// True only while the node is leader AND it has heard from a quorum of
+    /// voters within `election_timeout_min` (see `RaftNode::quorum_lease_valid`).
+    /// Strong reads may be served locally while the lease holds — no
+    /// competing leader can have been elected inside the window. Outside the
+    /// lease, reads must be forwarded or retried.
+    pub fn group_quorum_lease_valid(&self, group_id: u64) -> bool {
+        self.groups
+            .get(&group_id)
+            .map(|n| n.quorum_lease_valid())
+            .unwrap_or(false)
+    }
+
     /// Initiate a leadership transfer for `group_id` to `target`.
     ///
     /// Delegates to `RaftNode::transfer_leadership`. Returns

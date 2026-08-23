@@ -206,6 +206,27 @@ impl<S: LogStorage> RaftNode<S> {
         self.log.last_index()
     }
 
+    /// Whether this node holds a valid leader lease for the group.
+    ///
+    /// The lease is the `election_timeout_min` window following the last
+    /// quorum contact (see `last_quorum_contact`). A leader inside the
+    /// lease has recent proof that a quorum of voters acknowledged it, so a
+    /// read served locally is linearizable with respect to the Raft log:
+    /// no competing leader can have been elected within the lease window
+    /// (a candidate needs at least `election_timeout_min` to win, and a
+    /// voter that acknowledged us cannot vote for it). Outside the lease,
+    /// Strong reads must be forwarded or retried — the leader may have been
+    /// deposed without seeing it.
+    pub fn quorum_lease_valid(&self) -> bool {
+        if self.role != NodeRole::Leader {
+            return false;
+        }
+        match self.last_quorum_contact {
+            Some(last) => last.elapsed() < self.config.election_timeout_min,
+            None => false,
+        }
+    }
+
     /// Override election deadline (for testing).
     pub fn election_deadline_override(&mut self, deadline: Instant) {
         self.election_deadline = deadline;
@@ -920,5 +941,33 @@ mod tests {
         // Contact was just refreshed; a tick must NOT step down.
         node.tick();
         assert_eq!(node.role(), NodeRole::Leader);
+    }
+
+    /// The leader lease follows last_quorum_contact: valid inside
+    /// election_timeout_min, expired after it.
+    #[test]
+    fn quorum_lease_tracks_recent_contact() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+
+        // Not a leader: no lease.
+        assert!(!node.quorum_lease_valid());
+
+        node.become_leader();
+        // Fresh leader with no contact yet: no lease until quorum acks.
+        assert!(!node.quorum_lease_valid());
+
+        // Quorum acks arrive → lease valid.
+        let last = node.log.last_index();
+        if let Some(ls) = node.leader_state.as_mut() {
+            ls.set_match_index(2, last);
+            ls.set_match_index(3, last);
+        }
+        node.try_advance_commit_index();
+        assert!(node.quorum_lease_valid(), "lease must be valid after quorum contact");
+
+        // Contact ages beyond election_timeout_min (150ms) → lease expired.
+        node.last_quorum_contact =
+            Some(Instant::now() - Duration::from_millis(200));
+        assert!(!node.quorum_lease_valid(), "lease must expire after election_timeout_min");
     }
 }
