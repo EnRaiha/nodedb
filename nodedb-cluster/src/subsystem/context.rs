@@ -8,6 +8,8 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use tokio::sync::watch;
+
 use crate::multi_raft::MultiRaft;
 use crate::routing::RoutingTable;
 use crate::topology::ClusterTopology;
@@ -46,6 +48,13 @@ pub struct BootstrapCtx {
     /// Shared health aggregator — subsystems write their own health state
     /// here so the registry and monitoring layer can observe it.
     pub health: ClusterHealth,
+
+    /// Cluster-boundary decommission signal. `DecommissionSubsystem`
+    /// sends `true` on this exactly once, when this node's own
+    /// decommission completes. `SubsystemRegistry::start_all` derives
+    /// the receiver exposed on `RunningCluster::decommission_signal`
+    /// from this sender via `subscribe()`.
+    pub decommission_signal: watch::Sender<bool>,
 }
 
 impl BootstrapCtx {
@@ -56,6 +65,7 @@ impl BootstrapCtx {
         transport: Arc<NexarTransport>,
         multi_raft: Arc<Mutex<MultiRaft>>,
         health: ClusterHealth,
+        decommission_signal: watch::Sender<bool>,
     ) -> Self {
         Self {
             topology,
@@ -63,6 +73,7 @@ impl BootstrapCtx {
             transport,
             multi_raft,
             health,
+            decommission_signal,
         }
     }
 }

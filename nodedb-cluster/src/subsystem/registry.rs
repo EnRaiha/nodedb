@@ -6,6 +6,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use super::context::BootstrapCtx;
 use super::errors::{BootstrapError, ShutdownError};
 use super::health::ClusterHealth;
@@ -102,6 +104,7 @@ impl SubsystemRegistry {
         Ok(RunningCluster {
             handles,
             health: ctx.health.clone(),
+            decommission_signal: ctx.decommission_signal.subscribe(),
         })
     }
 }
@@ -116,9 +119,26 @@ pub struct RunningCluster {
     pub handles: Vec<SubsystemHandle>,
     /// Health aggregator shared with all subsystems.
     pub health: ClusterHealth,
+    /// Fires `true` exactly once this node's own decommission
+    /// completes. Scoped per-process: `DecommissionSubsystem` sends on
+    /// this only for the local node's own decommission, never for a
+    /// peer's. The host process subscribes to drive its own graceful
+    /// shutdown (`ShutdownWatch::signal`) — `nodedb-cluster` has no
+    /// process-shutdown primitive of its own, so this is the boundary
+    /// the host bridges from.
+    decommission_signal: watch::Receiver<bool>,
 }
 
 impl RunningCluster {
+    /// Returns a receiver for the per-node decommission signal.
+    ///
+    /// Cloned from the internal sender each call, so multiple callers
+    /// (or a caller re-subscribing after a clone) each get an
+    /// independent cursor over the same underlying state.
+    pub fn decommission_signal(&self) -> watch::Receiver<bool> {
+        self.decommission_signal.clone()
+    }
+
     /// Shut down all running subsystems in reverse start order.
     ///
     /// Each subsystem is given `per_subsystem_deadline` to stop cleanly.

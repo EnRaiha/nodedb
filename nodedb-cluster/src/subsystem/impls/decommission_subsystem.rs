@@ -9,12 +9,16 @@
 //! # Shutdown integration
 //!
 //! The observer emits its own `watch<bool>` when the local node reaches
-//! `Decommissioned` state. That signal is the cooperative shutdown trigger
-//! for all background tasks (SWIM detector, Raft loops, transport accept
-//! loops). The wiring point for propagating this signal to the wider
-//! cluster shutdown (`ShutdownWatch`) is declared here with a
-//! `tracing::warn!` placeholder until the cluster-level `ShutdownWatch`
-//! integration lands as a dedicated initiative.
+//! `Decommissioned` state (scoped to `local_node_id` — it never fires for a
+//! peer's decommission). `start()` bridges that single signal two ways:
+//! into this subsystem's own `shutdown_tx`, which cancels the observer's
+//! poll loop, and into `BootstrapCtx::decommission_signal`, the
+//! cluster-boundary watch exposed via `RunningCluster::decommission_signal`.
+//! `nodedb-cluster` has no process-shutdown primitive of its own — the host
+//! process (`nodedb`) subscribes to that watch and drives its own
+//! `ShutdownWatch::signal`, so the node exits through the ordinary graceful
+//! shutdown path rather than continuing to run after losing its Raft
+//! membership.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,27 +70,11 @@ impl ClusterSubsystem for DecommissionSubsystem {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // When the observer fires (local node decommissioned), it flips its
-        // own watch channel. We bridge that signal to the subsystem's
-        // shutdown watch so the registry sees a cooperative exit.
-        //
-        // TODO: also trigger cluster-wide ShutdownWatch here once that
-        // integration initiative lands.
-        let mut decommission_rx_clone = decommission_rx.clone();
-        let shutdown_tx_clone = shutdown_tx.clone();
-        tokio::spawn(async move {
-            while decommission_rx_clone.changed().await.is_ok() {
-                if *decommission_rx_clone.borrow() {
-                    warn!("decommission observer fired: local node is leaving cluster");
-                    let _ = shutdown_tx_clone.send(true);
-                    // Wiring point for cluster-wide ShutdownWatch:
-                    //   cluster_shutdown_tx.send(true);
-                    // This is left as a `warn!` until the ShutdownWatch
-                    // integration initiative is scoped and landed.
-                    return;
-                }
-            }
-        });
+        bridge_decommission_signal(
+            decommission_rx.clone(),
+            shutdown_tx.clone(),
+            ctx.decommission_signal.clone(),
+        );
 
         let task = tokio::spawn(async move { observer.run(shutdown_rx).await });
 
@@ -103,6 +91,29 @@ impl ClusterSubsystem for DecommissionSubsystem {
     }
 }
 
+/// Bridges the observer's fired signal into `shutdown_tx` (cancels this
+/// subsystem's own poll loop) and `cluster_signal` (the cluster-boundary
+/// watch the host process bridges into its own graceful shutdown).
+///
+/// Fires at most once: after the first `true` observation both sends
+/// happen and the task exits, since decommission is a one-way transition.
+fn bridge_decommission_signal(
+    mut decommission_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
+    cluster_signal: watch::Sender<bool>,
+) {
+    tokio::spawn(async move {
+        while decommission_rx.changed().await.is_ok() {
+            if *decommission_rx.borrow() {
+                warn!("decommission observer fired: local node is leaving cluster");
+                let _ = shutdown_tx.send(true);
+                let _ = cluster_signal.send(true);
+                return;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +123,32 @@ mod tests {
         let s = DecommissionSubsystem::new(1, Duration::from_secs(5));
         assert_eq!(s.name(), "decommission");
         assert_eq!(s.dependencies(), &["swim"]);
+    }
+
+    /// The observer's fired signal must reach the cluster-boundary watch,
+    /// not merely this subsystem's own internal poll-loop watch.
+    #[tokio::test]
+    async fn observer_fired_signal_reaches_cluster_boundary_watch() {
+        let (decommission_tx, decommission_rx) = watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (cluster_tx, mut cluster_rx) = watch::channel(false);
+
+        bridge_decommission_signal(decommission_rx, shutdown_tx, cluster_tx);
+
+        decommission_tx
+            .send(true)
+            .expect("receiver still held by bridge task");
+
+        shutdown_rx
+            .changed()
+            .await
+            .expect("local shutdown watch must observe the fired signal");
+        assert!(*shutdown_rx.borrow());
+
+        cluster_rx
+            .changed()
+            .await
+            .expect("cluster-boundary watch must observe the fired signal");
+        assert!(*cluster_rx.borrow());
     }
 }

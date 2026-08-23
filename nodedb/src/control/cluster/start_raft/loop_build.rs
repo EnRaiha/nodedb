@@ -176,6 +176,17 @@ pub(super) fn build_raft_loop(
     .map_err(|e| crate::Error::Config {
         detail: format!("cluster subsystem start: {e}"),
     })?;
+
+    // Bridge this node's own decommission into the process's graceful
+    // shutdown path before handing `running` off — `nodedb-cluster` has no
+    // process-shutdown primitive of its own, so this is where the two sides
+    // meet. See `crate::control::cluster::decommission_bridge`.
+    crate::control::cluster::spawn_decommission_shutdown_bridge(
+        &shared.loop_registry,
+        &shared.shutdown,
+        running.decommission_signal(),
+    );
+
     *handle
         .running_cluster
         .lock()

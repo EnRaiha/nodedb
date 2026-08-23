@@ -188,12 +188,14 @@ pub async fn start_cluster_subsystems(
     raft_multi_raft: Arc<std::sync::Mutex<crate::multi_raft::MultiRaft>>,
 ) -> Result<RunningCluster> {
     let health = ClusterHealth::new();
+    let (decommission_signal, _) = tokio::sync::watch::channel(false);
     let ctx = BootstrapCtx::new(
         Arc::clone(&topology),
         Arc::clone(&routing),
         Arc::clone(&transport),
         Arc::clone(&raft_multi_raft),
         health,
+        decommission_signal,
     );
 
     let executor = Arc::new(MigrationExecutor::new(
