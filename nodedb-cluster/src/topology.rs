@@ -2,6 +2,8 @@
 
 //! Cluster topology — tracks which nodes exist and their state.
 
+pub mod version_view;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -9,9 +11,13 @@ use std::net::SocketAddr;
 /// `nodedb_types::wire_version`, which is the single source of truth
 /// shared with `nodedb::version` and any other crate that needs to
 /// stamp or interpret the value. See
-/// `control::rolling_upgrade::view::ClusterVersionView` for the
+/// [`crate::topology::version_view::ClusterVersionView`] for the
 /// consumer.
 pub use nodedb_types::wire_version::WIRE_FORMAT_VERSION as CLUSTER_WIRE_FORMAT_VERSION;
+
+/// Minimum accepted cluster wire version (floor of the join window).
+/// Re-exported from `nodedb_types::wire_version`.
+pub use nodedb_types::wire_version::MIN_WIRE_FORMAT_VERSION as MIN_CLUSTER_WIRE_FORMAT_VERSION;
 
 fn default_spiffe_id() -> Option<String> {
     None
@@ -111,9 +117,9 @@ pub struct NodeInfo {
     /// Wire format version this node is running. Stamped by the
     /// node itself on self-registration (bootstrap / join) and by
     /// `handle_join` when learning about a remote joiner. Read by
-    /// `control::rolling_upgrade::view::compute` to derive the
-    /// cluster-wide min/max/mixed view on demand from the live
-    /// topology.
+    /// [`crate::topology::version_view::compute_from_topology`] to
+    /// derive the cluster-wide min/max/mixed view on demand from
+    /// the live topology.
     #[serde(default = "default_wire_version")]
     pub wire_version: u16,
     /// SPIFFE URI SAN (e.g. `spiffe://cluster.local/node/1`) extracted from

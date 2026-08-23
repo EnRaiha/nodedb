@@ -59,7 +59,9 @@ pub struct ClusterSettings {
     pub vshard_count: u32,
     /// Number of replicas per Raft group.
     pub replication_factor: u32,
-    /// Minimum wire-protocol version that peers must speak.
+    /// Minimum wire-protocol version peers must speak. Enforced by the leader
+    /// at join (`handle_join_request`); raise only after every node has
+    /// upgraded.
     pub min_wire_version: u16,
 }
 

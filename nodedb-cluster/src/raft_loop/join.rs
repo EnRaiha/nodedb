@@ -68,6 +68,7 @@ use crate::health;
 use crate::multi_raft::{GroupStatus, MultiRaft};
 use crate::routing::RoutingTable;
 use crate::rpc_codec::{JoinGroupInfo, JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX};
+use crate::topology::MIN_CLUSTER_WIRE_FORMAT_VERSION;
 
 use super::handle_rpc::{JoinDecision, TOPOLOGY_GROUP_ID, decide_join};
 use super::loop_core::{CommitApplier, RaftLoop};
@@ -93,6 +94,16 @@ fn groups_requiring_admission(multi_raft: &MultiRaft, node_id: u64) -> Vec<u64> 
 }
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
+    /// Effective join floor: max(compile-time MIN, persisted operator floor).
+    fn effective_min_wire_version(&self) -> u16 {
+        self.catalog
+            .as_ref()
+            .and_then(|c| c.load_cluster_settings().ok().flatten())
+            .map(|s| s.min_wire_version)
+            .unwrap_or(MIN_CLUSTER_WIRE_FORMAT_VERSION)
+            .max(MIN_CLUSTER_WIRE_FORMAT_VERSION)
+    }
+
     /// Full server-side `JoinRequest` handler. See module docs for the
     /// phase-by-phase description.
     pub(super) async fn join_flow(&self, req: JoinRequest) -> JoinResponse {
@@ -212,7 +223,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // 5. Admit into topology.
         {
             let mut topo = self.topology.write().unwrap_or_else(|p| p.into_inner());
-            let initial_resp = handle_join_request(&req, &mut topo, &routing, cluster_id);
+            let initial_resp = handle_join_request(
+                &req,
+                &mut topo,
+                &routing,
+                cluster_id,
+                self.effective_min_wire_version(),
+            );
             if !initial_resp.success {
                 // Reject bubbled up from the shared function (e.g., the
                 // collision check we just did, repeated under the write
@@ -442,7 +459,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // contains the new node, so this call only rebuilds the
         // wire response.
         let mut topo = topology_clone;
-        let mut response = handle_join_request(req, &mut topo, &routing_clone, cluster_id);
+        let mut response = handle_join_request(
+            req,
+            &mut topo,
+            &routing_clone,
+            cluster_id,
+            self.effective_min_wire_version(),
+        );
         response.groups = raft_groups;
         response
     }

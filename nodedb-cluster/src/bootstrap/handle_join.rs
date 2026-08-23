@@ -25,6 +25,16 @@ use crate::routing::RoutingTable;
 use crate::rpc_codec::{JoinGroupInfo, JoinNodeInfo, JoinRequest, JoinResponse};
 use crate::topology::{CLUSTER_WIRE_FORMAT_VERSION, ClusterTopology, NodeInfo, NodeState};
 
+/// Accept any joiner whose cluster wire version lies within
+/// `[min_wire_version, CLUSTER_WIRE_FORMAT_VERSION]`.
+///
+/// Pure so tests can inject synthetic windows (a raised operator floor,
+/// or a version beyond CURRENT simulating a future build) without
+/// compiling a second binary.
+pub fn wire_version_in_window(v: u16, min_wire_version: u16) -> bool {
+    v >= min_wire_version && v <= CLUSTER_WIRE_FORMAT_VERSION
+}
+
 /// Build a `JoinResponse` for an incoming `JoinRequest`.
 ///
 /// See module docs for semantics. Mutates `topology` only when the node is
@@ -36,29 +46,32 @@ use crate::topology::{CLUSTER_WIRE_FORMAT_VERSION, ClusterTopology, NodeInfo, No
 /// subsequent boot. Zero is a valid placeholder when the server's
 /// catalog has not yet been populated; rejection responses also carry
 /// zero.
+///
+/// `min_wire_version` is the effective cluster floor — max(compile-time
+/// MIN, operator's persisted `ClusterSettings.min_wire_version`).
 pub fn handle_join_request(
     req: &JoinRequest,
     topology: &mut ClusterTopology,
     routing: &RoutingTable,
     cluster_id: u64,
+    min_wire_version: u16,
 ) -> JoinResponse {
-    // Validate the wire version carried in the JOIN payload (belt-and-suspenders
-    // check; the transport-level handshake already negotiated a compatible version
-    // before this RPC was dispatched). The `wire_version` field here is the
-    // cluster-wide schema version (`CLUSTER_WIRE_FORMAT_VERSION`), distinct from
-    // the transport-level RPC frame version. We require an exact match because
-    // this build uses floor == ceiling (no backward-compat window in the schema).
-    if req.wire_version != CLUSTER_WIRE_FORMAT_VERSION {
+    // Range gate: accept any joiner inside [min_wire_version, CURRENT].
+    // `min_wire_version` is the effective cluster floor — max(compile-time
+    // MIN, operator's persisted ClusterSettings.min_wire_version).
+    // (The transport handshake already negotiated frame compatibility;
+    // this is the cluster-schema-level check.)
+    if !wire_version_in_window(req.wire_version, min_wire_version) {
         warn!(
             node_id = req.node_id,
             joiner_wire_version = req.wire_version,
-            expected_wire_version = CLUSTER_WIRE_FORMAT_VERSION,
-            "join request rejected: joiner cluster wire_version mismatch"
+            accepted_window = format!("{min_wire_version}..={CLUSTER_WIRE_FORMAT_VERSION}"),
+            "join request rejected: joiner cluster wire_version outside accepted window"
         );
         return reject(format!(
-            "joiner wire_version {} does not match this cluster's wire_version {} — \
-             rolling upgrade is required before this node can join",
-            req.wire_version, CLUSTER_WIRE_FORMAT_VERSION
+            "joiner wire_version {} outside accepted window {}..={} — \
+             rolling upgrade (or downgrade) is required before this node can join",
+            req.wire_version, min_wire_version, CLUSTER_WIRE_FORMAT_VERSION
         ));
     }
 
@@ -209,7 +222,7 @@ mod tests {
             spki_pin: None,
         };
 
-        let resp = handle_join_request(&req, &mut topology, &routing, 42);
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
 
         assert!(resp.success);
         assert_eq!(resp.nodes.len(), 2);
@@ -234,8 +247,8 @@ mod tests {
             spki_pin: None,
         };
 
-        let _ = handle_join_request(&req, &mut topology, &routing, 42);
-        let resp = handle_join_request(&req, &mut topology, &routing, 42);
+        let _ = handle_join_request(&req, &mut topology, &routing, 42, 1);
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
 
         assert!(resp.success);
         assert_eq!(resp.nodes.len(), 2); // Still 2, not 3.
@@ -258,11 +271,11 @@ mod tests {
             spki_pin: None,
         };
 
-        let resp1 = handle_join_request(&req, &mut topology, &routing, 7);
+        let resp1 = handle_join_request(&req, &mut topology, &routing, 7, 1);
         let ids_before: Vec<u64> = topology.all_nodes().map(|n| n.node_id).collect();
         let count_before = topology.node_count();
 
-        let resp2 = handle_join_request(&req, &mut topology, &routing, 7);
+        let resp2 = handle_join_request(&req, &mut topology, &routing, 7, 1);
         assert_eq!(resp1.cluster_id, 7);
         assert_eq!(resp2.cluster_id, 7);
         let ids_after: Vec<u64> = topology.all_nodes().map(|n| n.node_id).collect();
@@ -290,7 +303,7 @@ mod tests {
             spiffe_id: None,
             spki_pin: None,
         };
-        let resp1 = handle_join_request(&req1, &mut topology, &routing, 11);
+        let resp1 = handle_join_request(&req1, &mut topology, &routing, 11, 1);
         assert!(resp1.success);
 
         // Second join: same id, different address — must be rejected.
@@ -301,7 +314,7 @@ mod tests {
             spiffe_id: None,
             spki_pin: None,
         };
-        let resp2 = handle_join_request(&req2, &mut topology, &routing, 11);
+        let resp2 = handle_join_request(&req2, &mut topology, &routing, 11, 1);
 
         assert!(!resp2.success);
         assert!(
@@ -329,7 +342,7 @@ mod tests {
             spki_pin: Some(pin.to_vec()),
         };
 
-        let response = handle_join_request(&request, &mut topology, &routing, 11);
+        let response = handle_join_request(&request, &mut topology, &routing, 11, 1);
         assert!(!response.success);
         assert!(response.error.contains("already registered to node_id 1"));
         assert!(!topology.contains(2));
@@ -348,8 +361,116 @@ mod tests {
             spki_pin: None,
         };
 
-        let resp = handle_join_request(&req, &mut topology, &routing, 42);
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
         assert!(!resp.success);
         assert!(!resp.error.is_empty());
+    }
+
+    // ── Window-gate tests (N-1 rolling upgrade) ────────────────────
+
+    #[test]
+    fn wire_version_in_window_boundaries() {
+        // (version, floor) → accepted?
+        assert!(wire_version_in_window(1, 1));
+        assert!(wire_version_in_window(2, 1));
+        assert!(!wire_version_in_window(0, 1));
+        assert!(!wire_version_in_window(3, 1));
+    }
+
+    /// With the window open (floor = 1), a joiner at the floor is
+    /// admitted and its real N-1 version is stamped on its NodeInfo.
+    #[test]
+    fn accepts_joiner_at_floor_in_mixed_window() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let req = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: 1,
+            spiffe_id: None,
+            spki_pin: None,
+        };
+
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
+
+        assert!(resp.success);
+        assert_eq!(topology.get_node(2).unwrap().wire_version, 1);
+    }
+
+    /// A raised operator floor (persisted `ClusterSettings.min_wire_version`)
+    /// rejects a joiner below it even though the compile-time window opens
+    /// at 1.
+    #[test]
+    fn rejects_joiner_below_effective_floor() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let req = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: 1,
+            spiffe_id: None,
+            spki_pin: None,
+        };
+
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 2);
+
+        assert!(!resp.success);
+        assert!(
+            resp.error.contains("outside accepted window"),
+            "error should mention the window: {}",
+            resp.error
+        );
+        assert!(
+            resp.error.contains("2..=2"),
+            "error should carry the effective window: {}",
+            resp.error
+        );
+        assert_eq!(topology.node_count(), 1);
+    }
+
+    /// A joiner newer than this build (beyond the window ceiling) is
+    /// rejected — it simulates a future build talking to this one.
+    #[test]
+    fn rejects_joiner_above_current() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let req = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: CLUSTER_WIRE_FORMAT_VERSION + 1,
+            spiffe_id: None,
+            spki_pin: None,
+        };
+
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("outside accepted window"));
+        assert_eq!(topology.node_count(), 1);
+    }
+
+    /// wire_version = 0 is below every floor and must be rejected
+    /// (preserves the pre-window integration behavior).
+    #[test]
+    fn rejects_zero_wire_version() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let req = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: 0,
+            spiffe_id: None,
+            spki_pin: None,
+        };
+
+        let resp = handle_join_request(&req, &mut topology, &routing, 42, 1);
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("wire_version"));
+        assert_eq!(topology.node_count(), 1);
     }
 }
