@@ -153,3 +153,112 @@ fn snap_path_for(partial: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
     parent.join(format!("{}.snap", stem.to_string_lossy()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::RoutingTable;
+
+    /// Recording applier: proves the state machine saw the snapshot bytes
+    /// (i.e. the DATA is applied), and can be told to fail.
+    #[derive(Default)]
+    struct RecordingApplier {
+        applied: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotApplier for RecordingApplier {
+        async fn apply_snapshot(
+            &self,
+            group_id: u64,
+            snapshot_bytes: &[u8],
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("injected applier failure".into());
+            }
+            self.applied
+                .lock()
+                .unwrap()
+                .push((group_id, snapshot_bytes.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn partial_state(dir: &std::path::Path, data: &[u8], index: u64) -> PartialSnapshotState {
+        // Write the assembled snapshot bytes into a .partial file and compute
+        // the CRC exactly as the chunk receiver would.
+        let partial_path = dir.join("7.partial");
+        std::fs::write(&partial_path, data).unwrap();
+        PartialSnapshotState {
+            group_id: 7,
+            leader_id: 2,
+            term: 1,
+            last_included_index: index,
+            last_included_term: 1,
+            next_expected_offset: data.len() as u64,
+            running_crc: crc32c::crc32c(data),
+            running_crc_initialized: true,
+            partial_file: None,
+            partial_path,
+        }
+    }
+
+    fn multi_raft() -> (Arc<Mutex<MultiRaft>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let mut mr = MultiRaft::new(1, rt, dir.path().to_path_buf());
+        mr.add_group(7, vec![]).unwrap();
+        (Arc::new(Mutex::new(mr)), dir)
+    }
+
+    /// REPLICATE #162: the DATA must be applied to the state machine BEFORE
+    /// the Raft log boundary advances. A snapshot whose data is applied must
+    /// advance the group's snapshot boundary; one whose apply FAILS must
+    /// leave Raft untouched (follower retries; no silent divergence).
+    #[tokio::test]
+    async fn snapshot_data_applied_before_raft_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RecordingApplier::default());
+        let applier: Arc<dyn SnapshotApplier> = inner.clone();
+        let (mr, _keep) = multi_raft();
+
+        let state = partial_state(dir.path(), b"snapshot-payload", 42);
+        let resp = commit(state, &mr, Some(&applier)).await.unwrap();
+
+        // Data reached the state machine exactly once, with the payload.
+        let applied = inner.applied.lock().unwrap();
+        assert_eq!(applied.len(), 1, "snapshot data must be applied");
+        assert_eq!(applied[0].0, 7);
+        assert_eq!(applied[0].1, b"snapshot-payload");
+
+        // Raft boundary advanced to the snapshot index.
+        let mut mr = mr.lock().unwrap();
+        let node = mr.groups_mut().get(&7).unwrap();
+        assert_eq!(node.log_snapshot_index(), 42);
+        assert_eq!(node.commit_index(), 42);
+        assert_eq!(resp.term, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_apply_failure_does_not_advance_raft() {
+        let dir = tempfile::tempdir().unwrap();
+        let applier: Arc<dyn SnapshotApplier> =
+            Arc::new(RecordingApplier { fail: true, ..Default::default() });
+        let (mr, _keep) = multi_raft();
+
+        let state = partial_state(dir.path(), b"corrupt-in-applier", 42);
+        let res = commit(state, &mr, Some(&applier)).await;
+        assert!(
+            res.is_err(),
+            "apply failure must surface as an error, not silent partial success"
+        );
+
+        // Raft MUST NOT advance: the follower retries the install. Advancing
+        // here without the data is exactly the #162 divergence.
+        let mut mr = mr.lock().unwrap();
+        let node = mr.groups_mut().get(&7).unwrap();
+        assert_eq!(node.log_snapshot_index(), 0, "raft must not advance on apply failure");
+        assert_eq!(node.commit_index(), 0, "commit index must not advance on apply failure");
+    }
+}

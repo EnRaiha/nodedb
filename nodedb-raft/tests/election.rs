@@ -288,6 +288,54 @@ fn candidate_steps_down_on_higher_term_vote_response() {
     assert_eq!(node.current_term(), 9);
 }
 
+/// REPLICATE #161: a node that voted for candidate A in term N, then
+/// crashes and restarts, must NOT grant a vote to candidate B in the
+/// same term N. If HardState (current_term/voted_for) is lost across the
+/// restart, the restarted node double-votes — two leaders in one term,
+/// divergent committed entries.
+#[test]
+fn restart_does_not_double_vote_in_same_term() {
+    let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+
+    // Node 1 votes for candidate 2 in term 1.
+    let vote_for_a = RequestVoteRequest {
+        term: 1,
+        candidate_id: 2,
+        last_log_index: 0,
+        last_log_term: 0,
+        group_id: 1,
+    };
+    assert!(node.handle_request_vote(&vote_for_a).vote_granted);
+    assert_eq!(node.current_term(), 1);
+    // Persist HardState durably (as the RPC path does via
+    // persist_group_hard_state before replying).
+    node.persist_hard_state_if_dirty().unwrap();
+
+    // "Restart": reload state from storage, exactly what boot does.
+    node.restore().unwrap();
+
+    // Restarted node must remember term 1 AND the vote for candidate 2.
+    assert_eq!(
+        node.current_term(),
+        1,
+        "current_term must survive restart (HardState persistence)"
+    );
+
+    // Candidate 3 requests a vote in the SAME term 1 — must be refused.
+    let vote_for_b = RequestVoteRequest {
+        term: 1,
+        candidate_id: 3,
+        last_log_index: 0,
+        last_log_term: 0,
+        group_id: 1,
+    };
+    let resp = node.handle_request_vote(&vote_for_b);
+    assert!(
+        !resp.vote_granted,
+        "restarted node must not grant a second candidate in the same term"
+    );
+}
+
 /// Vote responses arriving after the candidate has already won (and
 /// become leader) must not cause role regressions or term drift.
 #[test]
