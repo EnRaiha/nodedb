@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{RaftError, Result};
 use crate::message::TimeoutNowRequest;
@@ -139,10 +139,17 @@ impl<S: LogStorage> RaftNode<S> {
 
     /// Promote an existing learner to a full voter.
     ///
-    /// Called on the leader after observing the learner has caught up
-    /// (its `match_index` >= the group's `commit_index`). The `LeaderState`
-    /// entry is left in place — it already tracks the peer's next/match
-    /// index — but the peer now counts toward the commit quorum.
+    /// Called from the conf-change apply path (committed entry) — the
+    /// catch-up precondition is enforced by the PROPOSE side (see
+    /// `nodedb-cluster` `propose_conf_change`), not here: at apply time the
+    /// group's commit_index has already advanced past the promote entry
+    /// itself, so checking `match_index >= commit_index` here would
+    /// spuriously reject promotions that were valid when proposed. This
+    /// function is therefore unconditional and idempotent.
+    ///
+    /// The `LeaderState` entry is left in place — it already tracks the
+    /// peer's next/match index — but the peer now counts toward the commit
+    /// quorum.
     ///
     /// Returns `true` if the promotion happened, `false` if `peer` was not
     /// a learner.
@@ -365,5 +372,45 @@ mod tests {
         assert_eq!(node.role(), NodeRole::Learner);
         node.promote_self_to_voter();
         assert_eq!(node.role(), NodeRole::Follower);
+    }
+
+    /// `promote_learner` is the apply-path function: unconditional and
+    /// idempotent, because at apply time the commit index has already
+    /// advanced past the promote entry itself. The catch-up precondition is
+    /// enforced on the PROPOSE side (cluster `propose_conf_change`), so a
+    /// not-yet-caught-up learner can still be promoted here when the entry
+    /// is applied — this test pins the apply-path contract.
+    #[test]
+    fn promote_learner_apply_path_is_unconditional() {
+        // Single-voter cluster so the no-op commits immediately.
+        let mut node = RaftNode::new(cfg(1, vec![]), MemStorage::new());
+        force_leader(&mut node);
+        assert_eq!(node.role(), NodeRole::Leader);
+        assert!(node.commit_index() > 0, "no-op must commit in single-voter cluster");
+
+        node.add_learner(3);
+        // Learner 3 has match_index 0 — below commit index. Apply path must
+        // still promote (idempotent, authoritative conf change).
+        let promoted = node.promote_learner(3);
+        assert!(promoted, "apply-path promotion must be unconditional");
+        assert!(node.voters().contains(&3));
+        assert!(!node.learners().contains(&3));
+    }
+
+    #[test]
+    fn promote_learner_allows_caught_up() {
+        let mut node = RaftNode::new(cfg(1, vec![]), MemStorage::new());
+        force_leader(&mut node);
+        assert!(node.commit_index() > 0);
+
+        node.add_learner(3);
+        // Learner catches up fully.
+        if let Some(ls) = node.leader_state.as_mut() {
+            ls.set_match_index(3, node.log.last_index());
+        }
+
+        let promoted = node.promote_learner(3);
+        assert!(promoted, "caught-up learner must be promotable");
+        assert!(node.voters().contains(&3));
     }
 }

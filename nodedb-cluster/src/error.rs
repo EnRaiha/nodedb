@@ -65,6 +65,14 @@ pub enum ClusterError {
     #[error("raft group {group_id} not found on this node")]
     GroupNotFound { group_id: u64 },
 
+    #[error("learner {node_id} in group {group_id} not caught up (match_index={match_index}, commit_index={commit_index}); refusing to promote")]
+    LearnerNotCaughtUp {
+        group_id: u64,
+        node_id: u64,
+        match_index: u64,
+        commit_index: u64,
+    },
+
     #[error("migration in progress for vshard {vshard_id}")]
     MigrationInProgress { vshard_id: u32 },
 

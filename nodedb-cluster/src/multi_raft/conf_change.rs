@@ -67,6 +67,30 @@ impl MultiRaft {
                 .groups
                 .get_mut(&group_id)
                 .ok_or(ClusterError::GroupNotFound { group_id })?;
+
+            // PromoteLearner safety gate (propose side): a learner must have
+            // caught up to the group's commit index BEFORE the promote entry
+            // enters the log. Promoting an un-caught-up learner grows the
+            // voter set while it cannot yet ack anything, shrinking the
+            // effective quorum (e.g. 3 voters + 1 stale learner -> no
+            // majority) and risking cluster unavailability. The check cannot
+            // live in `apply_conf_change` — at apply time the commit index
+            // has already advanced past the promote entry itself, so it
+            // would spuriously reject promotions that were valid when
+            // proposed.
+            if change.change_type == ConfChangeType::PromoteLearner
+                && node.role() == nodedb_raft::NodeRole::Leader
+                && node.match_index_for(change.node_id).unwrap_or(0)
+                    < node.commit_index()
+            {
+                return Err(ClusterError::LearnerNotCaughtUp {
+                    group_id,
+                    node_id: change.node_id,
+                    match_index: node.match_index_for(change.node_id).unwrap_or(0),
+                    commit_index: node.commit_index(),
+                });
+            }
+
             let data = change.to_entry_data()?;
             let log_index = node.propose(data)?;
             // A single-voter group self-commits inside `propose`:
@@ -186,6 +210,7 @@ impl MultiRaft {
 mod tests {
     use super::*;
     use crate::routing::RoutingTable;
+    use nodedb_raft::message::AppendEntriesResponse;
     use nodedb_raft::NodeRole;
 
     use super::super::core::MultiRaft;
@@ -252,6 +277,96 @@ mod tests {
         let info = rt.group_info(0).unwrap();
         assert_eq!(info.learners, Vec::<u64>::new());
         assert!(info.members.contains(&2));
+    }
+
+    /// PROPOSE-side guard: promoting a learner that has not caught up to the
+    /// group's commit index must be rejected BEFORE the entry enters the log.
+    /// At apply time the commit index has already advanced past the promote
+    /// entry, so the check cannot live in `apply_conf_change` — it belongs
+    /// here, on the leader's propose path.
+    #[test]
+    fn propose_promote_requires_learner_caught_up() {
+        let mut mr = new_mr(1, &[0]);
+        // Force election: single-voter group becomes leader on first tick,
+        // and its no-op commits immediately.
+        for node in mr.groups.values_mut() {
+            node.election_deadline_override(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        }
+        mr.tick().unwrap();
+        let node = mr.groups.get(&0).unwrap();
+        assert_eq!(node.role(), nodedb_raft::NodeRole::Leader);
+        assert!(node.commit_index() > 0, "no-op must commit in single-voter group");
+
+        // Add learner 2, which has match_index 0 — below commit_index.
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::AddLearner,
+                node_id: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(mr.groups.get(&0).unwrap().match_index_for(2), Some(0));
+        let commit = mr.groups.get(&0).unwrap().commit_index();
+        assert!(commit > 0, "warmup entry must commit in single-voter group");
+
+        // Promote must be refused: learner has not caught up.
+        let res = mr.propose_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::PromoteLearner,
+                node_id: 2,
+            },
+        );
+        assert!(
+            res.is_err(),
+            "promoting an un-caught-up learner must be rejected at propose time"
+        );
+
+        // Learner must still be a learner.
+        let node = mr.groups.get(&0).unwrap();
+        assert!(node.learners().contains(&2));
+        assert!(!node.voters().contains(&2));
+    }
+
+    /// Once the learner has caught up (match_index >= commit_index), the
+    /// same propose succeeds.
+    #[test]
+    fn propose_promote_allows_caught_up_learner() {
+        let mut mr = new_mr(1, &[0]);
+        for node in mr.groups.values_mut() {
+            node.election_deadline_override(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        }
+        mr.tick().unwrap();
+
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::AddLearner,
+                node_id: 2,
+            },
+        )
+        .unwrap();
+
+        // Learner catches up to the leader's last index via a successful
+        // AppendEntries ack (the real replication path).
+        let last = mr.groups.get(&0).unwrap().last_log_index();
+        let resp = AppendEntriesResponse {
+            term: mr.groups.get(&0).unwrap().current_term(),
+            success: true,
+            last_log_index: last,
+        };
+        mr.handle_append_entries_response(0, 2, &resp).unwrap();
+        assert_eq!(mr.match_index_for(0, 2), Some(last));
+
+        let res = mr.propose_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::PromoteLearner,
+                node_id: 2,
+            },
+        );
+        assert!(res.is_ok(), "caught-up learner propose must succeed");
     }
 
     #[test]
