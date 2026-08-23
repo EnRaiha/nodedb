@@ -151,9 +151,11 @@ impl<S: LogStorage> RaftNode<S> {
     pub(super) fn become_leader(&mut self) {
         self.role = NodeRole::Leader;
         self.leader_id = self.config.node_id;
-        // Quorum contact resets on election win; the first heartbeat
-        // round-trip (or single-voter commit below) establishes it.
-        self.last_quorum_contact = None;
+        // Election win IS quorum contact: this node just received votes
+        // from a quorum of voters, so the leader lease is valid from win
+        // time. Subsequent quorum acks refresh it (see
+        // `try_advance_commit_index`).
+        self.last_quorum_contact = Some(std::time::Instant::now());
 
         // Leader tracks voter peers, learner peers, and observer peers for
         // replication. Only voters count toward the commit quorum (see

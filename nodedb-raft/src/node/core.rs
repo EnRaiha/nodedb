@@ -104,8 +104,8 @@ pub struct RaftNode<S: LogStorage> {
     pub(super) leader_contact: Option<LeaderContact>,
     /// Last time a quorum of voters acknowledged this leader (heartbeat or
     /// AppendEntries response reflected in `match_index`). `None` while not
-    /// the leader, or immediately after becoming leader before the first
-    /// heartbeat round-trip completes.
+    /// the leader. Initialized at election win (the winning votes are
+    /// themselves quorum contact); refreshed by `try_advance_commit_index`.
     ///
     /// When the gap since the last quorum contact exceeds
     /// `election_timeout_max`, the leader steps down: it has lost contact
@@ -480,24 +480,17 @@ impl<S: LogStorage> RaftNode<S> {
                 // doomed proposals. `last_quorum_contact` is refreshed by
                 // `try_advance_commit_index` whenever a quorum of voters has
                 // acknowledged recent entries.
-                match self.last_quorum_contact {
-                    Some(last) if now.duration_since(last) >= self.config.election_timeout_max => {
-                        info!(
-                            node = self.config.node_id,
-                            group = self.config.group_id,
-                            term = self.hard_state.current_term,
-                            "leader lost quorum contact; stepping down"
-                        );
-                        self.become_follower(self.hard_state.current_term);
-                        return;
-                    }
-                    // Fresh leader before the first quorum round-trip:
-                    // initialize the clock now so we do not step down
-                    // immediately after an election win.
-                    Some(_) => {}
-                    None => {
-                        self.last_quorum_contact = Some(now);
-                    }
+                if let Some(last) = self.last_quorum_contact
+                    && now.duration_since(last) >= self.config.election_timeout_max
+                {
+                    info!(
+                        node = self.config.node_id,
+                        group = self.config.group_id,
+                        term = self.hard_state.current_term,
+                        "leader lost quorum contact; stepping down"
+                    );
+                    self.become_follower(self.hard_state.current_term);
+                    return;
                 }
 
                 if now >= self.heartbeat_deadline {
@@ -912,8 +905,7 @@ mod tests {
         assert_eq!(node.role(), NodeRole::Leader);
 
         // Now simulate quorum loss: last contact was long ago.
-        node.last_quorum_contact =
-            Some(Instant::now() - Duration::from_millis(1000));
+        node.last_quorum_contact = Some(Instant::now() - Duration::from_millis(1000));
         node.tick();
         assert_eq!(
             node.role(),
@@ -953,8 +945,11 @@ mod tests {
         assert!(!node.quorum_lease_valid());
 
         node.become_leader();
-        // Fresh leader with no contact yet: no lease until quorum acks.
-        assert!(!node.quorum_lease_valid());
+        // Election win = quorum contact: lease is valid from win time.
+        assert!(
+            node.quorum_lease_valid(),
+            "lease must be valid right after election win"
+        );
 
         // Quorum acks arrive → lease valid.
         let last = node.log.last_index();
@@ -963,11 +958,131 @@ mod tests {
             ls.set_match_index(3, last);
         }
         node.try_advance_commit_index();
-        assert!(node.quorum_lease_valid(), "lease must be valid after quorum contact");
+        assert!(
+            node.quorum_lease_valid(),
+            "lease must be valid after quorum contact"
+        );
 
         // Contact ages beyond election_timeout_min (150ms) → lease expired.
-        node.last_quorum_contact =
-            Some(Instant::now() - Duration::from_millis(200));
-        assert!(!node.quorum_lease_valid(), "lease must expire after election_timeout_min");
+        node.last_quorum_contact = Some(Instant::now() - Duration::from_millis(200));
+        assert!(
+            !node.quorum_lease_valid(),
+            "lease must expire after election_timeout_min"
+        );
+    }
+
+    /// Crash recovery (reviewer R5): a leader that steps down on quorum
+    /// loss must be able to rejoin as a follower — quorum contact clock is
+    /// reset, and AppendEntries from the new leader in a higher term is
+    /// accepted, with entries replicated and applied normally.
+    #[test]
+    fn leader_steps_down_then_catches_up_as_follower() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        node.become_leader();
+        assert_eq!(node.role(), NodeRole::Leader);
+
+        // Quorum lost long ago → step down.
+        node.last_quorum_contact = Some(Instant::now() - Duration::from_millis(1000));
+        node.tick();
+        assert_eq!(node.role(), NodeRole::Follower);
+        assert!(
+            node.last_quorum_contact.is_none(),
+            "quorum-contact clock must reset on step down"
+        );
+
+        // New leader (node 2) contacts us in a higher term.
+        let req = AppendEntriesRequest {
+            term: node.current_term() + 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: node.current_term() + 1,
+                index: 1,
+                data: b"catch-up".to_vec(),
+            }],
+            leader_commit: 0,
+            group_id: 1,
+        };
+        let resp = node.handle_append_entries(&req);
+        assert!(resp.success, "rejoined follower must accept AppendEntries");
+        assert_eq!(node.role(), NodeRole::Follower);
+        assert_eq!(node.leader_id(), 2);
+        assert_eq!(node.current_term(), req.term);
+        assert_eq!(node.last_log_index(), 1);
+
+        // Follow-up heartbeat with the committed entry → apply normally.
+        let hb = AppendEntriesRequest {
+            term: node.current_term(),
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: node.current_term(),
+            entries: vec![],
+            leader_commit: 1,
+            group_id: 1,
+        };
+        let resp = node.handle_append_entries(&hb);
+        assert!(resp.success);
+        let ready = node.take_ready();
+        assert_eq!(ready.committed_entries.len(), 1);
+        assert_eq!(ready.committed_entries[0].data, b"catch-up");
+    }
+
+    /// Crash recovery (reviewer R5): crash right after proposing a
+    /// conf-change entry, BEFORE it commits. On restore, the uncommitted
+    /// entry must NOT be delivered as committed (commit_index is seeded
+    /// from the durable applied floor), and a later commit delivers it
+    /// exactly once — no double apply.
+    #[test]
+    fn crash_before_commit_no_double_apply() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        node.become_leader();
+
+        // Propose a conf-change entry; no peer acks, so it stays uncommitted.
+        // (become_leader already appended a no-op at index 1.)
+        let index = node.propose(b"cfg-change".to_vec()).unwrap();
+        assert_eq!(index, 2);
+        assert_eq!(node.commit_index(), 0, "entry must be uncommitted");
+
+        // Durable floor: nothing applied yet.
+        node.save_durable_applied_index(0).unwrap();
+
+        // "Crash + restart": rebuild volatile state from storage.
+        node.restore().unwrap();
+        assert_eq!(
+            node.commit_index(),
+            0,
+            "commit_index must seed from durable floor"
+        );
+        let ready = node.take_ready();
+        assert!(
+            ready.committed_entries.is_empty(),
+            "uncommitted entry must not be re-delivered after restore"
+        );
+
+        // Quorum comes back: peers ack the full log → commit → deliver ONCE.
+        node.become_leader();
+        let last = node.log.last_index();
+        if let Some(ls) = node.leader_state.as_mut() {
+            ls.set_match_index(2, last);
+            ls.set_match_index(3, last);
+        }
+        node.try_advance_commit_index();
+
+        let ready = node.take_ready();
+        assert_eq!(
+            ready.committed_entries.len(),
+            3,
+            "no-op + conf-change + no-op must commit"
+        );
+        assert_eq!(ready.committed_entries[1].index, 2);
+        assert_eq!(ready.committed_entries[1].data, b"cfg-change");
+
+        // Taking Ready again must not re-deliver anything.
+        let ready = node.take_ready();
+        assert!(
+            ready.committed_entries.is_empty(),
+            "committed entries must not be delivered twice"
+        );
     }
 }

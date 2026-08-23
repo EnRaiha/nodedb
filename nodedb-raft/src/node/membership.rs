@@ -386,7 +386,10 @@ mod tests {
         let mut node = RaftNode::new(cfg(1, vec![]), MemStorage::new());
         force_leader(&mut node);
         assert_eq!(node.role(), NodeRole::Leader);
-        assert!(node.commit_index() > 0, "no-op must commit in single-voter cluster");
+        assert!(
+            node.commit_index() > 0,
+            "no-op must commit in single-voter cluster"
+        );
 
         node.add_learner(3);
         // Learner 3 has match_index 0 — below commit index. Apply path must
