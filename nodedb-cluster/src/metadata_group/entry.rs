@@ -120,10 +120,14 @@ pub enum MetadataEntry {
     /// `version <= up_to_version` must be rejected cluster-wide so
     /// the in-flight DDL that bumps the version can make progress.
     ///
-    /// `expires_at` is the HLC at which this drain entry is
-    /// considered stale and ignored by `is_draining` checks on
-    /// read. Acts as a TTL that prevents a crashed proposer from
-    /// leaving an orphaned drain that blocks the cluster forever.
+    /// `expires_at` is the HLC the proposer computed when it
+    /// started the drain. `is_draining` never compares it against
+    /// a checking node's own wall clock — a node must not judge
+    /// another node's deadline by its own clock. The liveness
+    /// backstop for a crashed proposer is the wait loop in
+    /// `drain_propose.rs`, which bounds its own wait with a
+    /// same-node deadline and proposes `DescriptorDrainEnd`
+    /// explicitly on timeout.
     DescriptorDrainStart {
         descriptor_id: DescriptorId,
         up_to_version: u64,

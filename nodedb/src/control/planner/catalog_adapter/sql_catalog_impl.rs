@@ -115,13 +115,12 @@ impl SqlCatalog for OriginCatalog {
         // refcounts, performs a single raft acquire per
         // descriptor (on first-holder), and returns a
         // `QueryLeaseScope` the handler holds through execute.
-        if let Some(drain) = &self.drain_tracker {
-            let now_wall_ns = crate::control::lease::wall_now_ns();
-            if drain.is_draining(&descriptor_id, version, now_wall_ns) {
-                return Err(SqlCatalogError::RetryableSchemaChanged {
-                    descriptor: format!("collection {name}"),
-                });
-            }
+        if let Some(drain) = &self.drain_tracker
+            && drain.is_draining(&descriptor_id, version)
+        {
+            return Err(SqlCatalogError::RetryableSchemaChanged {
+                descriptor: format!("collection {name}"),
+            });
         }
 
         let (engine, columns, primary_key) = convert_collection_type(&stored);

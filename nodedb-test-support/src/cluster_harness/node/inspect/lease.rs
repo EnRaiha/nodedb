@@ -6,21 +6,17 @@ use crate::cluster_harness::node::lifecycle::TestClusterNode;
 
 impl TestClusterNode {
     /// Whether this node's `lease_drain` tracker currently holds
-    /// an ACTIVE drain entry (not expired) for the given
-    /// `(descriptor_id, min_version)`. Used by the drain tests
-    /// to assert replicated drain state.
+    /// an active drain entry (installed and not yet explicitly
+    /// ended) for the given `(descriptor_id, min_version)`. Used
+    /// by the drain tests to assert replicated drain state.
     pub fn has_drain_for(
         &self,
         descriptor_id: &nodedb_cluster::DescriptorId,
         min_version: u64,
     ) -> bool {
-        let now_wall_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
         self.shared
             .lease_drain
-            .is_draining(descriptor_id, min_version, now_wall_ns)
+            .is_draining(descriptor_id, min_version)
     }
 
     /// Total number of leases (across all descriptors and node_ids)

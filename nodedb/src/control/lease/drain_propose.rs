@@ -50,8 +50,10 @@ use crate::error::Error;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Grace period added on top of the configured lease duration
-/// when computing a drain entry's TTL. Prevents a drain entry
-/// from expiring before the leases it's waiting on.
+/// when computing the `expires_at` stamped onto a drain entry.
+/// `is_draining` does not read this value (see `lease::drain`) —
+/// it is retained on the entry for observability only, so this
+/// grace period has no effect on when a drain actually clears.
 const DRAIN_TTL_GRACE: Duration = Duration::from_secs(30);
 
 /// Orchestrate a full drain for a `Put*` DDL on the descriptor
@@ -116,9 +118,11 @@ pub fn drain_for_ddl(
         Err(e) => {
             // Timeout or other failure: emit DrainEnd explicitly
             // so the cluster isn't stuck rejecting acquires at
-            // this version. Log and ignore errors from the
-            // cleanup propose — the TTL on the drain entry is
-            // the last line of defence.
+            // this version. `is_draining` has no wall-clock
+            // expiry backstop (see `lease::drain`), so this
+            // explicit propose is the only way the drain clears
+            // if the wait above timed out — log and ignore
+            // errors from the cleanup propose itself.
             if let Err(cleanup_err) = propose_drain(
                 shared,
                 MetadataEntry::DescriptorDrainEnd {

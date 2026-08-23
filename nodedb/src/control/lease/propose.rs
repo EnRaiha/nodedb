@@ -122,11 +122,7 @@ pub(crate) fn ensure_not_draining(
     descriptor_id: &DescriptorId,
     version: u64,
 ) -> Result<(), Error> {
-    let now_wall_ns = super::wall_now_ns();
-    if shared
-        .lease_drain
-        .is_draining(descriptor_id, version, now_wall_ns)
-    {
+    if shared.lease_drain.is_draining(descriptor_id, version) {
         return Err(drain_in_progress_error(descriptor_id, version));
     }
     Ok(())

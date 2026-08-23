@@ -25,10 +25,12 @@ impl MetadataCommitApplier {
     /// clear it.
     ///
     /// Missing one of those paths does not fail loudly: the drain simply
-    /// survives, and `is_draining` then rejects every plan for that descriptor
-    /// as a retryable schema change until the TTL (`max_wait +
-    /// DRAIN_TTL_GRACE`) lapses — the collection reads as broken for a minute
-    /// with no error explaining why.
+    /// survives, and `is_draining` then rejects every plan for that
+    /// descriptor as a retryable schema change with no error explaining
+    /// why. The drain has no self-healing wall-clock expiry (see
+    /// `lease::drain`) — the only backstop is the proposer's own wait
+    /// loop timing out and proposing `DescriptorDrainEnd` explicitly, so
+    /// every code path here must clear the drain it opened.
     fn clear_implicit_drain(&self, stamped: &catalog_entry::CatalogEntry) {
         if let Some(weak) = self.shared.get()
             && let Some(shared) = weak.upgrade()
@@ -98,7 +100,8 @@ impl MetadataCommitApplier {
             );
             // The DDL that installed the drain is over even though this entry
             // changed nothing — release it, or every read of the descriptor
-            // stays rejected until the drain TTL lapses.
+            // stays rejected indefinitely (no wall-clock expiry backstops
+            // this path; see `lease::drain`).
             self.clear_implicit_drain(&stamped);
             return Ok(());
         }

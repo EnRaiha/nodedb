@@ -20,14 +20,21 @@
 //! lives in `drain_propose.rs`.
 //!
 //! **TTL semantics**: every drain entry carries an `expires_at`
-//! HLC. A crashed proposer would otherwise leave an orphaned
-//! drain entry that blocks the cluster forever. `is_draining`
-//! filters expired entries at read time; we do NOT run a
-//! periodic GC task (same lazy-cleanup approach the lease store
-//! uses). If nothing ever re-writes the key, the expired entry
-//! sits in the map until the next `install_end` on the same id
-//! or until process restart (drain state is not persisted to
-//! redb — it's raft-log-derived and rebuilds on replay).
+//! HLC, but `is_draining` never compares it against a local
+//! wall clock — a node never judges another node's deadline by
+//! its own clock, since nothing bounds clock skew across nodes.
+//! A drain is active on every node until an explicit
+//! `DescriptorDrainEnd` clears it (`install_end`). The liveness
+//! backstop for a crashed proposer lives in `drain_propose.rs`:
+//! `wait_for_lease_drain` bounds its own wait with a same-node
+//! `Instant` deadline and, on timeout, proposes
+//! `DescriptorDrainEnd` explicitly — that replicated entry, not
+//! `expires_at`, is what clears a stale drain everywhere. We do
+//! NOT run a periodic GC task. If nothing ever re-writes the
+//! key, the entry sits in the map until the next `install_end`
+//! on the same id or until process restart (drain state is not
+//! persisted to redb — it's raft-log-derived and rebuilds on
+//! replay).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -36,10 +43,16 @@ use nodedb_cluster::DescriptorId;
 use nodedb_types::Hlc;
 
 /// One drain entry: "this descriptor is draining leases at
-/// versions <= `up_to_version` until `expires_at`".
+/// versions <= `up_to_version`, active until an explicit
+/// `DescriptorDrainEnd`".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainEntry {
     pub up_to_version: u64,
+    /// HLC the proposer stamped when it started the drain.
+    /// Observability only — `is_draining` never reads this field,
+    /// so it does not bound how long the drain stays active. See
+    /// the module doc for why a wall-clock comparison is unsafe
+    /// here.
     pub expires_at: Hlc,
 }
 
@@ -59,8 +72,9 @@ impl DescriptorDrainTracker {
         Self::default()
     }
 
-    /// Record the start of a drain for `id` at `up_to_version`
-    /// with a TTL of `expires_at`. Overwrites any prior entry
+    /// Record the start of a drain for `id` at `up_to_version`,
+    /// stamped with `expires_at` for observability (see
+    /// [`DrainEntry::expires_at`]). Overwrites any prior entry
     /// for the same key — a subsequent start with a higher
     /// `up_to_version` extends the drain rather than creating a
     /// conflicting record.
@@ -99,44 +113,37 @@ impl DescriptorDrainTracker {
     /// version.
     ///
     /// Returns `true` iff an entry exists for `id` with
-    /// `expires_at > now_wall_ns` (i.e. not stale) AND
     /// `requested_version <= entry.up_to_version` (i.e. the
-    /// requested version is inside the drain range).
-    ///
-    /// `now_wall_ns` is a real wall-clock timestamp — pass the
-    /// same nanosecond count the lease module uses for expiry
-    /// checks so both comparisons land in the same reference
-    /// frame. See the wall-clock rationale in
-    /// `lease::renewal::tick`.
-    pub fn is_draining(&self, id: &DescriptorId, requested_version: u64, now_wall_ns: u64) -> bool {
+    /// requested version is inside the drain range). Drain state
+    /// is raft-replicated, so presence of an entry is authoritative
+    /// on every node — a node never judges another node's deadline
+    /// (`expires_at`, stamped by whichever node proposed the drain)
+    /// against its own wall clock, since nothing bounds clock skew
+    /// between nodes. An entry stays active until an explicit
+    /// `DescriptorDrainEnd` clears it via `install_end`.
+    pub fn is_draining(&self, id: &DescriptorId, requested_version: u64) -> bool {
         let map = self.active.read().unwrap_or_else(|p| p.into_inner());
         match map.get(id) {
-            Some(entry) => {
-                entry.expires_at.wall_ns > now_wall_ns && requested_version <= entry.up_to_version
-            }
+            Some(entry) => requested_version <= entry.up_to_version,
             None => false,
         }
     }
 
-    /// Snapshot the full (id, entry) set for diagnostics and
-    /// tests. Returns all entries including expired ones — the
-    /// caller is responsible for filtering by `now_wall_ns` if
-    /// it wants the live set.
+    /// Snapshot the full (id, entry) set for diagnostics and tests.
     pub fn snapshot(&self) -> Vec<(DescriptorId, DrainEntry)> {
         let map = self.active.read().unwrap_or_else(|p| p.into_inner());
         map.iter().map(|(id, e)| (id.clone(), *e)).collect()
     }
 
-    /// Count of active (non-expired) drain entries at the given
-    /// wall-clock time. Used by the cluster harness test helpers.
-    pub fn count_active(&self, now_wall_ns: u64) -> usize {
-        let map = self.active.read().unwrap_or_else(|p| p.into_inner());
-        map.values()
-            .filter(|e| e.expires_at.wall_ns > now_wall_ns)
-            .count()
+    /// Count of active drain entries. Every installed entry is
+    /// active until `install_end` clears it (see `is_draining`),
+    /// so this is equivalent to [`Self::total_count`]; kept as a
+    /// distinct name for callers that mean "active" semantically.
+    pub fn count_active(&self) -> usize {
+        self.total_count()
     }
 
-    /// Total count including expired entries. Mainly for
+    /// Total count of installed drain entries. Mainly for
     /// debugging.
     pub fn total_count(&self) -> usize {
         let map = self.active.read().unwrap_or_else(|p| p.into_inner());
@@ -162,13 +169,13 @@ mod tests {
         let tracker = DescriptorDrainTracker::new();
         let d = id("orders");
         tracker.install_start(d.clone(), 5, hlc(1_000_000));
-        // Now wall is before expiry. Versions 1..=5 are inside
-        // the drain range; version 6 is outside.
-        assert!(tracker.is_draining(&d, 1, 500_000));
-        assert!(tracker.is_draining(&d, 3, 500_000));
-        assert!(tracker.is_draining(&d, 5, 500_000));
-        assert!(!tracker.is_draining(&d, 6, 500_000));
-        assert!(!tracker.is_draining(&d, 100, 500_000));
+        // Versions 1..=5 are inside the drain range; version 6 is
+        // outside.
+        assert!(tracker.is_draining(&d, 1));
+        assert!(tracker.is_draining(&d, 3));
+        assert!(tracker.is_draining(&d, 5));
+        assert!(!tracker.is_draining(&d, 6));
+        assert!(!tracker.is_draining(&d, 100));
     }
 
     #[test]
@@ -176,25 +183,31 @@ mod tests {
         let tracker = DescriptorDrainTracker::new();
         let d = id("orders");
         tracker.install_start(d.clone(), 5, hlc(1_000_000));
-        assert!(tracker.is_draining(&d, 5, 500_000));
+        assert!(tracker.is_draining(&d, 5));
 
         tracker.install_end(&d);
-        assert!(!tracker.is_draining(&d, 5, 500_000));
+        assert!(!tracker.is_draining(&d, 5));
         assert_eq!(tracker.total_count(), 0);
     }
 
+    /// Pins the fix for the cross-node clock-skew bug: a node must
+    /// never judge another node's drain deadline by its own wall
+    /// clock. An entry whose `expires_at` is far in the local past
+    /// stays active — only an explicit `install_end` clears it.
     #[test]
-    fn is_draining_filters_expired_entries() {
+    fn is_draining_stays_active_past_local_wall_clock_expiry() {
         let tracker = DescriptorDrainTracker::new();
-        let d = id("stale");
-        // Entry expired at wall_ns = 1000.
+        let d = id("stale-clock");
+        // expires_at is stamped far in the past relative to any
+        // wall clock a checking node could plausibly read.
         tracker.install_start(d.clone(), 5, hlc(1_000));
-        // Wall now is 2000 — past expiry. Must be treated as
-        // not draining even though the entry is still in the map.
-        assert!(!tracker.is_draining(&d, 1, 2_000));
-        assert!(!tracker.is_draining(&d, 5, 2_000));
-        // But if wall now is before expiry it IS draining.
-        assert!(tracker.is_draining(&d, 5, 500));
+        assert!(tracker.is_draining(&d, 1));
+        assert!(tracker.is_draining(&d, 5));
+        assert!(!tracker.is_draining(&d, 6));
+
+        // Only an explicit end clears it.
+        tracker.install_end(&d);
+        assert!(!tracker.is_draining(&d, 1));
     }
 
     #[test]
@@ -205,11 +218,11 @@ mod tests {
         tracker.install_start(a.clone(), 1, hlc(1_000_000));
         tracker.install_start(b.clone(), 10, hlc(1_000_000));
 
-        assert!(tracker.is_draining(&a, 1, 500_000));
-        assert!(!tracker.is_draining(&a, 2, 500_000));
-        assert!(tracker.is_draining(&b, 5, 500_000));
-        assert!(tracker.is_draining(&b, 10, 500_000));
-        assert!(!tracker.is_draining(&b, 11, 500_000));
+        assert!(tracker.is_draining(&a, 1));
+        assert!(!tracker.is_draining(&a, 2));
+        assert!(tracker.is_draining(&b, 5));
+        assert!(tracker.is_draining(&b, 10));
+        assert!(!tracker.is_draining(&b, 11));
     }
 
     #[test]
@@ -221,23 +234,29 @@ mod tests {
         // entry extends the drain range.
         tracker.install_start(d.clone(), 10, hlc(2_000_000));
 
-        assert!(tracker.is_draining(&d, 10, 500_000));
+        assert!(tracker.is_draining(&d, 10));
         assert_eq!(tracker.total_count(), 1);
         let snap = tracker.snapshot();
         assert_eq!(snap[0].1.up_to_version, 10);
         assert_eq!(snap[0].1.expires_at.wall_ns, 2_000_000);
     }
 
+    /// `count_active` no longer filters by wall-clock expiry, so it
+    /// pins to the same value as `total_count` for any installed
+    /// set, regardless of how far in the past `expires_at` is.
     #[test]
-    fn count_active_filters_expired() {
+    fn count_active_matches_total_count_regardless_of_expiry() {
         let tracker = DescriptorDrainTracker::new();
         let a = id("live");
-        let b = id("dead");
+        let b = id("expired-by-wall-clock");
         tracker.install_start(a, 1, hlc(10_000_000));
         tracker.install_start(b, 1, hlc(100));
 
         assert_eq!(tracker.total_count(), 2);
-        assert_eq!(tracker.count_active(1_000), 1);
-        assert_eq!(tracker.count_active(20_000_000), 0);
+        assert_eq!(tracker.count_active(), 2);
+
+        tracker.install_end(&id("live"));
+        assert_eq!(tracker.count_active(), 1);
+        assert_eq!(tracker.count_active(), tracker.total_count());
     }
 }
