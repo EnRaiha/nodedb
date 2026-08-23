@@ -196,8 +196,10 @@ mod tests {
                 }
             };
             let encoded_floats: Vec<f32> = encoded
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             if query.len() != encoded_floats.len() {
                 return Err(RerankError::BadInput("dimension mismatch".into()));
