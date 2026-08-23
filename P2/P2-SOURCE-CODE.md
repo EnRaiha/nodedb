@@ -1,3 +1,12 @@
+> **SNAPSHOT NOTE (2026-08-24):** Ini adalah dump source @ `461c3ad` (07-08) — **PRE-FIX, PRE-REFACTOR**.
+> Main telah advance selepas snapshot ini. Antara perubahan utama yang TIDAK kelihatan di sini:
+>
+> - ReadIndex quorum confirmation (`f9910444b`, `b1f52e9a4` — 23-08): `nodedb-raft/src/node/read_index.rs`, `nodedb-cluster/src/read_index_wait.rs`
+> - Persist-before-reply HardState (`9469296c2`): `consensus.rs`, `dispatch_outbound.rs`, `snapshot_dispatch.rs`
+> - Bounded-staleness refactor (`b1f52e9a4`): `closed_timestamp.rs` → `multi_raft/read_index.rs` + `nodedb-raft/src/node/staleness.rs` (lag-vs-leader)
+> - Scatter-gather guard (`b037bab06`), pre-vote (`dd91eed70`), leadership transfer (`ae45049bf`), decommission (`7056676cc`)
+>   Fix P2 kita (seed commit_index, check-quorum, learner gate, lease) TIDAK dalam snapshot ini — rujuk branch `p2-rebased-v2`.
+>   Untuk audit semasa guna tree terkini (main HEAD), bukan dump ini.
 ========== FILE: nodedb-cluster/src/raft_loop/handle_rpc/consensus.rs ==========
 // SPDX-License-Identifier: BUSL-1.1
 

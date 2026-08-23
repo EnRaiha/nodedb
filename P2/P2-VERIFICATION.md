@@ -3,6 +3,15 @@
 Repo: NodeDB-Lab/nodedb @ 461c3ad (main, local `~/projects/nodedb`).
 Tarikh: 2026-08-23. Semua rujukan baris dari tree TEMPATAN (bukan GitHub GLM).
 
+> **POST-AUDIT UPDATE (2026-08-24) — verdict dibawah adalah rekod SEJARAH @ 461c3ad (07-08).**
+> Main telah advance selepas audit; claim-claim yang ditanda SALAH/TIADA mungkin kini WUJUD:
+>
+> - **ReadIndex (item #3, GAP-1, baris 39, 63):** ReadIndex quorum confirmation MASUK main 23-08 — `f9910444b` "confirm quorum leadership before serving strong reads" + `b1f52e9a4` "serve bounded-staleness reads". Kini wujud: `nodedb-raft/src/node/read_index.rs`, `nodedb-cluster/src/read_index_wait.rs` (confirm_read_index), caller `nodedb/src/control/cluster/read_index.rs:66`. Verdict "hallucination" TIDAK LAGI SAH untuk main terkini — GLM silap untuk tree 461c3ad, tapi main kemudiannya implement apa yang GLM claim.
+> - **Check-quorum (GAP-1):** MASIH SAH — fix kita (P2, `052f2fa64`) + lease `cf2cd5c24`, bukan main.
+> - **GAP-4 commit_index:** fix kita `dca42ac89` (seed dari durable floor).
+> - **GAP-3 promote_learner:** fix kita `b215d4bba` (propose-side guard).
+>   Rujuk `P2-FULL-PLAN.md` untuk status terkini (2026-08-24).
+
 ---
 
 ## Bahagian 1 — "Sudah Ada" claims (GLM tarik balik cadangan awal)
@@ -71,15 +80,15 @@ Repo docs: `~/projects/nodedb-docs` (Oxidoc .rdx, 107 files, nodedb.dev). Semak 
 
 ## Status penuh P2 (2026-08-23 lewat malam)
 
-| Item                                 | Status                                                                             | Commit    |
-| ------------------------------------ | ---------------------------------------------------------------------------------- | --------- |
-| GAP-4 commit_index restore           | ✅ fixed + test                                                                    | `bebf346` |
-| GAP-1 check-quorum                   | ✅ fixed + 2 test                                                                  | `f88624a` |
-| GAP-3 promote guard (propose side)   | ✅ fixed + 2 test                                                                  | `56985e8` |
-| GAP-2 membership via log             | ✅ REFUTED (cluster dah ada conf_change)                                           | —         |
-| #161 regression test                 | ✅ test pass (code dah fixed)                                                      | `78da27f` |
-| #162 proof test                      | ✅ 2 test pass (code dah fixed)                                                    | `78da27f` |
-| Leader lease (linearizable Strong)   | ✅ fixed + test                                                                    | `d430cfa` |
-| fsync audit nodedb-wal | ✅ **DONE** — raft log + HardState = redb `commit()` (raft_storage.rs:122,350) — redb transaction commit = fsync (durability default); nodedb-wal segmented (`append` buffered + `sync()` explicit) adalah data-plane WAL, bukan raft — di luar P2 | — |
-| Docs update (consistency/multi-raft) | ⏳ proposed | — |
-| Full workspace test                  | ⚠️ 1 flaky: corrupt_vector_checkpoint_fails_boot (crash harness, sedang re-verify) | —         |
+| Item                                 | Status                                                                                                                                                                                                                                             | Commit    |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| GAP-4 commit_index restore           | ✅ fixed + test                                                                                                                                                                                                                                    | `bebf346` |
+| GAP-1 check-quorum                   | ✅ fixed + 2 test                                                                                                                                                                                                                                  | `f88624a` |
+| GAP-3 promote guard (propose side)   | ✅ fixed + 2 test                                                                                                                                                                                                                                  | `56985e8` |
+| GAP-2 membership via log             | ✅ REFUTED (cluster dah ada conf_change)                                                                                                                                                                                                           | —         |
+| #161 regression test                 | ✅ test pass (code dah fixed)                                                                                                                                                                                                                      | `78da27f` |
+| #162 proof test                      | ✅ 2 test pass (code dah fixed)                                                                                                                                                                                                                    | `78da27f` |
+| Leader lease (linearizable Strong)   | ✅ fixed + test                                                                                                                                                                                                                                    | `d430cfa` |
+| fsync audit nodedb-wal               | ✅ **DONE** — raft log + HardState = redb `commit()` (raft_storage.rs:122,350) — redb transaction commit = fsync (durability default); nodedb-wal segmented (`append` buffered + `sync()` explicit) adalah data-plane WAL, bukan raft — di luar P2 | —         |
+| Docs update (consistency/multi-raft) | ⏳ proposed                                                                                                                                                                                                                                        | —         |
+| Full workspace test                  | ⚠️ 1 flaky: corrupt_vector_checkpoint_fails_boot (crash harness, sedang re-verify)                                                                                                                                                                 | —         |
