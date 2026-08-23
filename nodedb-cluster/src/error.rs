@@ -188,4 +188,7 @@ pub enum ClusterError {
 
     #[error("mirror error: {0}")]
     Mirror(#[from] crate::mirror::MirrorError),
+
+    #[error("bsp barrier error: {0}")]
+    BspBarrier(#[from] crate::distributed_graph::BspBarrierError),
 }

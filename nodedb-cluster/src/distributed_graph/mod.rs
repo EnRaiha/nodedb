@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod barrier;
 pub mod coordinator;
 pub mod pagerank;
 pub mod pattern_match;
 pub mod types;
 pub mod wcc;
 
+pub use barrier::{BspBarrierError, SuperstepTotals};
 pub use coordinator::BspCoordinator;
 pub use pagerank::ShardPageRankState;
 pub use pattern_match::{

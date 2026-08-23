@@ -8,7 +8,7 @@
 //! then fanned across that node's cores below. The coordinator OWNS all durable
 //! state — the per-node rank vectors and the routed cross-shard contributions;
 //! [`BspCoordinator`] is used ONLY for convergence bookkeeping (`record_ack` /
-//! `all_acked` / `global_delta` / `advance`).
+//! `all_acked` / `totals` / `advance`).
 //!
 //! Each shard is one distinct owner node (the local node + each distinct
 //! non-local data-group leader), carrying that node's FULL set of owned vShards.
@@ -299,13 +299,14 @@ pub async fn run_bsp_pagerank(
             }
         }
 
-        // Convergence bookkeeping. All shards always ACK (one result each).
-        if !bsp.all_acked() {
-            return Err(crate::Error::Internal {
-                detail: "bsp pagerank: not all shards acked after superstep dispatch".into(),
-            });
-        }
-        if !bsp.advance() {
+        // Convergence bookkeeping. Every shard ACKs exactly once per dispatch, so
+        // `advance` should never see a partial barrier — but it now REFUSES one
+        // instead of summing a subset, which a `debug_assert` could not do in a
+        // release build.
+        let keep_going = bsp.advance().map_err(|e| crate::Error::Internal {
+            detail: format!("bsp pagerank: not all shards acked after superstep dispatch ({e})"),
+        })?;
+        if !keep_going {
             break;
         }
         superstep += 1;
