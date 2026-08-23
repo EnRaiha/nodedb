@@ -95,8 +95,16 @@ pub(super) fn finalize_agg_partials(
 }
 
 pub(super) fn cluster_err(e: nodedb_cluster::error::ClusterError) -> Error {
-    Error::Internal {
-        detail: format!("array cluster: {e}"),
+    match e {
+        // A shard did not answer within its timeout: surface as a deterministic
+        // deadline rather than an opaque internal error, matching the
+        // `TypedClusterError::DeadlineExceeded` mapping used elsewhere.
+        nodedb_cluster::error::ClusterError::ShardTimeout { .. } => Error::DeadlineExceeded {
+            request_id: crate::types::RequestId::new(0),
+        },
+        other => Error::Internal {
+            detail: format!("array cluster: {other}"),
+        },
     }
 }
 

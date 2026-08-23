@@ -80,6 +80,14 @@ pub enum ClusterError {
     #[error("transport error: {detail}")]
     Transport { detail: String },
 
+    /// A shard RPC did not answer within its allotted timeout.
+    ///
+    /// Distinct from `Transport`: a timeout means the peer may still be
+    /// alive but slow (retriable after backoff), whereas `Transport` covers
+    /// connection-level failures suggesting the peer is gone.
+    #[error("shard {vshard_id} RPC timed out after {elapsed_ms}ms")]
+    ShardTimeout { vshard_id: u32, elapsed_ms: u64 },
+
     /// Terminal error carried by a streaming `ExecuteStreamEnd` frame.
     ///
     /// Preserves the typed shape end-to-end so the coordinator can map a

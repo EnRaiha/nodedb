@@ -48,11 +48,9 @@ async fn call_with_wrong_owner_retry(
         }
         Ok(Err(e)) => return Err(e),
         Err(_elapsed) => {
-            return Err(ClusterError::Transport {
-                detail: format!(
-                    "array shard {}: RPC timed out after {timeout_ms}ms",
-                    env.vshard_id
-                ),
+            return Err(ClusterError::ShardTimeout {
+                vshard_id: env.vshard_id,
+                elapsed_ms: timeout_ms,
             });
         }
     }
@@ -67,11 +65,9 @@ async fn call_with_wrong_owner_retry(
     match result {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e),
-        Err(_elapsed) => Err(ClusterError::Transport {
-            detail: format!(
-                "array shard {}: RPC timed out after {timeout_ms}ms (retry)",
-                env.vshard_id
-            ),
+        Err(_elapsed) => Err(ClusterError::ShardTimeout {
+            vshard_id: env.vshard_id,
+            elapsed_ms: timeout_ms,
         }),
     }
 }
@@ -89,7 +85,13 @@ use super::rpc::ShardRpcDispatch;
 /// `WrongOwner` is excluded — every genuine transport/timeout/unreachable error
 /// still counts, mirroring `RetryPolicy::is_retryable`'s conservative policy.
 fn counts_against_breaker(err: &ClusterError) -> bool {
-    !matches!(err, ClusterError::WrongOwner { .. })
+    match err {
+        ClusterError::WrongOwner { .. } => false,
+        // An unresponsive peer is exactly what the breaker exists to shed
+        // load from, so a shard timeout counts like any other liveness failure.
+        ClusterError::ShardTimeout { .. } => true,
+        _ => true,
+    }
 }
 
 /// Parameters governing a single fan-out round.
@@ -299,6 +301,17 @@ mod tests {
             Err(ClusterError::Transport {
                 detail: "injected failure".into(),
             })
+        }
+    }
+
+    /// Mock that never resolves, exercising the real `tokio::time::timeout`
+    /// expiry path (as opposed to `FailDispatch`, which errors immediately).
+    struct HangDispatch;
+
+    #[async_trait]
+    impl ShardRpcDispatch for HangDispatch {
+        async fn call(&self, _req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+            std::future::pending().await
         }
     }
 
@@ -580,6 +593,43 @@ mod tests {
             cb.state(0),
             CircuitState::Closed,
             "WrongOwner must leave the breaker Closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_call_expiry_produces_shard_timeout() {
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(HangDispatch);
+        let cb = cb();
+        let params = FanOutParams {
+            shard_ids: vec![0],
+            timeout_ms: 20,
+            source_node: 1,
+        };
+        let err = fan_out(
+            &params,
+            super::super::opcodes::ARRAY_SHARD_SLICE_REQ,
+            b"payload",
+            &dispatch,
+            &cb,
+        )
+        .await
+        .expect_err("fan_out should surface a timeout once the shard call never resolves");
+
+        match err {
+            ClusterError::ShardTimeout {
+                vshard_id,
+                elapsed_ms,
+            } => {
+                assert_eq!(vshard_id, 0);
+                assert_eq!(elapsed_ms, 20);
+            }
+            other => panic!("expected ShardTimeout, got {other:?}"),
+        }
+        // A timeout is a liveness failure and must count against the breaker.
+        assert_eq!(
+            cb.failure_count(0),
+            1,
+            "shard timeout must increment the breaker failure count"
         );
     }
 }
