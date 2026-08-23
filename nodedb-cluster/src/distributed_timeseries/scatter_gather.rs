@@ -10,7 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::merge::{PartialAgg, PartialAggMerger};
+use super::coordinator::TsCoordinator;
+use super::gather::MergedPartials;
+use super::merge::PartialAgg;
+use crate::error::Result;
 
 /// A scatter-gather plan for a timeseries aggregation query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,13 +42,20 @@ pub struct ShardResult {
 
 /// Merge results from multiple shards into a final result.
 ///
-/// This is the coordinator-side merge called after all shard responses arrive.
-pub fn merge_shard_results(shard_results: &[ShardResult]) -> Vec<PartialAgg> {
-    let mut merger = PartialAggMerger::new();
+/// This is the coordinator-side merge called after all shard responses
+/// arrive. `expected_shard_ids` names every shard the query was scattered
+/// to; the merge refuses through [`TsCoordinator::merge_results`] unless
+/// `shard_results` covers every one of them, so a caller cannot merge a
+/// partial gather by simply omitting a shard from `shard_results`.
+pub fn merge_shard_results(
+    expected_shard_ids: &[u32],
+    shard_results: &[ShardResult],
+) -> Result<MergedPartials> {
+    let mut coord = TsCoordinator::new(0, expected_shard_ids.to_vec());
     for result in shard_results {
-        merger.add_shard_results(&result.partials);
+        coord.record_response(result.shard_id, result.partials.clone())?;
     }
-    merger.finalize()
+    coord.merge_results()
 }
 
 /// Determine which shards own data for a given collection.
@@ -73,8 +83,11 @@ pub fn shards_for_collection(_collection: &str, total_shards: u32) -> Vec<u32> {
 ///
 /// This is the same merge path as raw scatter-gather — continuous
 /// aggregates just have fewer rows (pre-bucketed), so it's faster.
-pub fn consolidate_aggregate_results(shard_results: &[ShardResult]) -> Vec<PartialAgg> {
-    merge_shard_results(shard_results)
+pub fn consolidate_aggregate_results(
+    expected_shard_ids: &[u32],
+    shard_results: &[ShardResult],
+) -> Result<MergedPartials> {
+    merge_shard_results(expected_shard_ids, shard_results)
 }
 
 /// Estimate the cost of a scatter-gather query (for query planning).
@@ -91,6 +104,8 @@ pub fn estimate_scatter_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distributed_timeseries::TsGatherError;
+    use crate::error::ClusterError;
 
     #[test]
     fn merge_two_shards() {
@@ -125,11 +140,27 @@ mod tests {
             ],
         };
 
-        let merged = merge_shard_results(&[shard_a, shard_b]);
+        let merged = merge_shard_results(&[0, 1], &[shard_a, shard_b])
+            .expect("both scattered shards answered");
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].count, 180);
-        assert_eq!(merged[0].sum, 9000.0);
-        assert_eq!(merged[1].count, 180);
+        assert_eq!(merged.partials()[0].count, 180);
+        assert_eq!(merged.partials()[0].sum, 9000.0);
+        assert_eq!(merged.partials()[1].count, 180);
+    }
+
+    #[test]
+    fn merge_refused_when_a_scattered_shard_is_missing() {
+        let shard_a = ShardResult {
+            shard_id: 0,
+            partials: vec![PartialAgg::from_single(0, 1, 50.0)],
+        };
+
+        match merge_shard_results(&[0, 1], &[shard_a]) {
+            Err(ClusterError::TsGather(TsGatherError::Incomplete { missing, .. })) => {
+                assert_eq!(missing, vec![1]);
+            }
+            other => panic!("expected an incomplete-gather error, got {other:?}"),
+        }
     }
 
     #[test]

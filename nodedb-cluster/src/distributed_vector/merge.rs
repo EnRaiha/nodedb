@@ -74,7 +74,12 @@ impl VectorMerger {
     ///
     /// Sorts by distance ascending (nearest first) and truncates to `top_k`.
     /// Ties are broken by shard_id for deterministic ordering.
-    pub fn top_k(&mut self, top_k: usize) -> Vec<VectorHit> {
+    ///
+    /// Module-private: the merged ranking leaves this module only through
+    /// `VectorScatterGather::merge_top_k`, which checks shard completeness
+    /// first. A merge short of one shard is a wrong ranking that reads as a
+    /// correct one.
+    pub(super) fn top_k(&mut self, top_k: usize) -> Vec<VectorHit> {
         self.all_hits.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)

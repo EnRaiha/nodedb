@@ -157,7 +157,12 @@ impl PartialAggMerger {
     }
 
     /// Get the merged results, sorted by bucket timestamp.
-    pub fn finalize(&self) -> Vec<PartialAgg> {
+    ///
+    /// Module-private: the merged aggregates leave this module only through
+    /// [`crate::distributed_timeseries::TsCoordinator::merge_results`], which
+    /// checks shard completeness first. A merge short of one shard is a wrong
+    /// SUM or COUNT that is type-identical to a correct one.
+    pub(super) fn finalize(&self) -> Vec<PartialAgg> {
         self.buckets.values().cloned().collect()
     }
 

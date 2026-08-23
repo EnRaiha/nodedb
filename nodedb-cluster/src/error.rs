@@ -191,4 +191,16 @@ pub enum ClusterError {
 
     #[error("bsp barrier error: {0}")]
     BspBarrier(#[from] crate::distributed_graph::BspBarrierError),
+
+    #[error("vector gather error: {0}")]
+    VectorGather(#[from] crate::distributed_vector::VectorGatherError),
+
+    #[error("spatial gather error: {0}")]
+    SpatialGather(#[from] crate::distributed_spatial::SpatialGatherError),
+
+    #[error("bm25 gather error: {0}")]
+    Bm25Gather(#[from] crate::distributed_document::Bm25GatherError),
+
+    #[error("timeseries gather error: {0}")]
+    TsGather(#[from] crate::distributed_timeseries::TsGatherError),
 }

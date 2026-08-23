@@ -65,7 +65,12 @@ impl SpatialResultMerger {
     ///
     /// For ST_DWithin, results are sorted by distance (nearest first).
     /// For boolean predicates, order is arbitrary. Truncates to `limit`.
-    pub fn merge(&mut self, limit: usize, sort_by_distance: bool) -> Vec<SpatialHit> {
+    ///
+    /// Module-private: the merged hit set leaves this module only through
+    /// `SpatialScatterGather::merge_results`, which checks shard completeness
+    /// first. A merge short of one shard silently drops a region of the query
+    /// extent.
+    pub(super) fn merge(&mut self, limit: usize, sort_by_distance: bool) -> Vec<SpatialHit> {
         // Deduplicate by doc_id (a document can only appear on one shard,
         // but defensive in case of ghost stubs or migration overlap).
         let mut seen = std::collections::HashSet::new();
