@@ -93,6 +93,7 @@ pub(super) fn build_raft_loop(
         )
         .with_plan_executor(plan_executor)
         .with_metadata_applier(metadata_applier)
+        .with_metadata_cache(shared.metadata_cache.clone())
         .with_vshard_handler(vshard_handler)
         .with_tick_interval(tick_interval)
         .with_group_watchers(handle.group_watchers.clone())
