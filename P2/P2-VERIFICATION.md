@@ -80,6 +80,6 @@ Repo docs: `~/projects/nodedb-docs` (Oxidoc .rdx, 107 files, nodedb.dev). Semak 
 | #161 regression test                 | ✅ test pass (code dah fixed)                                                      | `78da27f` |
 | #162 proof test                      | ✅ 2 test pass (code dah fixed)                                                    | `78da27f` |
 | Leader lease (linearizable Strong)   | ✅ fixed + test                                                                    | `d430cfa` |
-| fsync audit nodedb-wal               | ⏳ open                                                                            | —         |
-| Docs update (consistency/multi-raft) | ⏳ proposed                                                                        | —         |
+| fsync audit nodedb-wal | ✅ **DONE** — raft log + HardState = redb `commit()` (raft_storage.rs:122,350) — redb transaction commit = fsync (durability default); nodedb-wal segmented (`append` buffered + `sync()` explicit) adalah data-plane WAL, bukan raft — di luar P2 | — |
+| Docs update (consistency/multi-raft) | ⏳ proposed | — |
 | Full workspace test                  | ⚠️ 1 flaky: corrupt_vector_checkpoint_fails_boot (crash harness, sedang re-verify) | —         |
