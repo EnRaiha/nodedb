@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{RaftError, Result};
 use crate::message::TimeoutNowRequest;
