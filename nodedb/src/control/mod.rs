@@ -17,6 +17,7 @@ pub mod custom_type;
 pub mod database;
 pub mod distributed_applier;
 pub mod event_trigger;
+pub mod event_trigger_dispatch;
 pub mod exec_receiver;
 pub mod gateway;
 pub mod insert_select;

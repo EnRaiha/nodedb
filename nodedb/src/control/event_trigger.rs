@@ -9,12 +9,14 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
+use crate::control::event_trigger_dispatch::{
+    TriggerActionError, TriggerRenderError, dispatch_action_tasks,
+};
 use crate::control::planner::context::QueryContext;
 use crate::control::state::SharedState;
 use crate::event::types::{WriteEvent, WriteOp};
-use crate::types::TraceId;
 
 /// Process one WAL-derived data event against matching EventDefinitions.
 ///
@@ -63,7 +65,7 @@ pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
             "event trigger fired"
         );
 
-        execute_then_action(
+        let outcome = execute_then_action(
             Arc::clone(&shared),
             event,
             &event_def.then_action,
@@ -71,15 +73,40 @@ pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
         )
         .await;
 
+        // The audit record is this path's durable account of what the trigger
+        // did, so a failed action is recorded as failed rather than as a fired
+        // action. A failure ends this action; the remaining event definitions
+        // are independent triggers and plan against fresh catalog state.
+        let (source, detail) = match &outcome {
+            Ok(()) => (
+                "event_trigger",
+                format!(
+                    "event '{}' on '{}': doc={}, op={}, action={}",
+                    event_def.name, event.collection, event.row_id, op_str, event_def.then_action
+                ),
+            ),
+            Err(error) => (
+                "event_trigger_failed",
+                format!(
+                    "event '{}' on '{}': doc={}, op={}, action={}, error={error}",
+                    event_def.name, event.collection, event.row_id, op_str, event_def.then_action
+                ),
+            ),
+        };
         shared.audit_record(
             crate::control::security::audit::AuditEvent::AdminAction,
             Some(event.tenant_id),
-            "event_trigger",
-            &format!(
-                "event '{}' on '{}': doc={}, op={}, action={}",
-                event_def.name, event.collection, event.row_id, op_str, event_def.then_action
-            ),
+            source,
+            &detail,
         );
+        if let Err(error) = outcome {
+            error!(
+                trigger = event_def.name,
+                collection = %event.collection,
+                error = %error,
+                "event trigger action failed"
+            );
+        }
     }
 }
 
@@ -137,7 +164,7 @@ fn canonical_trigger_template_sql(fragment: &str) -> &str {
     fragment
 }
 
-fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, &'static str> {
+fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, TriggerRenderError> {
     let mut rendered = String::with_capacity(action.len());
     let mut cursor = 0;
     while cursor < action.len() {
@@ -166,7 +193,7 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, &'
                 }
             }
             if depth != 0 {
-                return Err("unterminated block comment in event trigger action");
+                return Err(TriggerRenderError::UnterminatedBlockComment);
             }
             rendered.push_str(canonical_trigger_template_sql(&action[cursor..end]));
             cursor = end;
@@ -183,9 +210,9 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, &'
                         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$'
                     ));
             let end = quoted_region_end(action, cursor, quote, backslash_escapes)
-                .ok_or("unterminated quoted region in event trigger action")?;
+                .ok_or(TriggerRenderError::UnterminatedQuote)?;
             if contains_trigger_placeholder(&action[cursor..end]) {
-                return Err("event trigger placeholders must not be manually quoted");
+                return Err(TriggerRenderError::QuotedPlaceholder);
             }
             rendered.push_str(canonical_trigger_template_sql(&action[cursor..end]));
             cursor = end;
@@ -195,10 +222,10 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, &'
             let body_start = cursor + delimiter.len();
             let relative_end = action[body_start..]
                 .find(delimiter)
-                .ok_or("unterminated dollar quote in event trigger action")?;
+                .ok_or(TriggerRenderError::UnterminatedDollarQuote)?;
             let end = body_start + relative_end + delimiter.len();
             if contains_trigger_placeholder(&action[cursor..end]) {
-                return Err("event trigger placeholders must not be manually quoted");
+                return Err(TriggerRenderError::QuotedPlaceholder);
             }
             rendered.push_str(canonical_trigger_template_sql(&action[cursor..end]));
             cursor = end;
@@ -218,7 +245,7 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, &'
             let ch = rest
                 .chars()
                 .next()
-                .ok_or("invalid UTF-8 boundary in event trigger action")?;
+                .ok_or(TriggerRenderError::InvalidUtf8Boundary)?;
             rendered.push(ch);
             cursor += ch.len_utf8();
         }
@@ -238,18 +265,9 @@ async fn execute_then_action(
     event: &WriteEvent,
     action: &str,
     trigger_name: &str,
-) {
-    let sql = match render_then_action_sql(action, event) {
-        Ok(sql) => sql,
-        Err(detail) => {
-            warn!(
-                trigger = trigger_name,
-                error = detail,
-                "event trigger action rejected"
-            );
-            return;
-        }
-    };
+) -> Result<(), TriggerActionError> {
+    let sql = render_then_action_sql(action, event)
+        .map_err(|source| TriggerActionError::Rejected { source })?;
 
     let query_ctx = QueryContext::for_state(&shared);
     // A trigger action is database-defined code with no external requester, so
@@ -260,7 +278,7 @@ async fn execute_then_action(
         "_system_event_trigger",
     );
 
-    match query_ctx
+    let (tasks, _output_schema, versions, _) = query_ctx
         .plan_sql_with_rls_and_versions(
             &sql,
             event.tenant_id,
@@ -269,67 +287,36 @@ async fn execute_then_action(
             false,
         )
         .await
-    {
-        Ok((tasks, _output_schema, versions, _)) => {
-            // Keep the Arc and lease scope alive through every trigger action
-            // dispatch. Admission is fail-closed while a descriptor drains.
-            let _lease_scope = match Arc::clone(&shared).acquire_plan_lease_scope(&versions) {
-                Ok(scope) => scope,
-                Err(error) => {
-                    warn!(
-                        trigger = trigger_name,
-                        sql = sql,
-                        error = %error,
-                        "event trigger action rejected by descriptor lease admission"
-                    );
-                    return;
-                }
-            };
-            for task in tasks {
-                match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-                    &shared,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
-                    TraceId::ZERO,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        info!(
-                            trigger = trigger_name,
-                            sql = sql,
-                            "event trigger action executed"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            trigger = trigger_name,
-                            sql = sql,
-                            error = %e,
-                            "event trigger action dispatch failed"
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                trigger = trigger_name,
-                sql = sql,
-                error = %e,
-                "event trigger action plan failed"
-            );
-        }
-    }
+        .map_err(|source| TriggerActionError::Plan { source })?;
+
+    // Keep the Arc and lease scope alive through every trigger action
+    // dispatch. Admission is fail-closed while a descriptor drains.
+    let _lease_scope = Arc::clone(&shared)
+        .acquire_plan_lease_scope(&versions)
+        .map_err(|source| TriggerActionError::LeaseAdmission { source })?;
+
+    dispatch_action_tasks(
+        &shared,
+        tasks,
+        &versions,
+        event.database_id,
+        event.tenant_id,
+    )
+    .await?;
+
+    info!(
+        trigger = trigger_name,
+        sql = sql,
+        "event trigger action executed"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{event_operation, render_then_action_sql};
+    use super::{TriggerRenderError, event_operation, render_then_action_sql};
     use crate::event::types::{EventSource, RowId, WriteEvent, WriteOp};
     use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
@@ -394,7 +381,7 @@ mod tests {
         );
         assert_eq!(
             render_then_action_sql(r"SELECT e'escaped \' $document_id'", &hostile_event()),
-            Err("event trigger placeholders must not be manually quoted")
+            Err(TriggerRenderError::QuotedPlaceholder)
         );
     }
 }
