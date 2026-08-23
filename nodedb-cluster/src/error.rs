@@ -115,6 +115,19 @@ pub enum ClusterError {
         supported_max: u8,
     },
 
+    /// A peer sent a frame stamped with a cluster epoch strictly older than
+    /// the local high-water mark. The peer missed a topology transition and is
+    /// fenced out: its frames are dropped at decode until it rejoins the
+    /// cluster (join handshake and ping/pong frames are exempt).
+    #[error(
+        "stale cluster epoch: peer stamp {peer_epoch} < local {local_epoch} \
+         (peer missed a topology transition and must rejoin)"
+    )]
+    StalePeerEpoch {
+        peer_epoch: u64,
+        local_epoch: u64,
+    },
+
     #[error("circuit open for node {node_id}: peer has {failures} consecutive failures")]
     CircuitOpen { node_id: u64, failures: u32 },
 

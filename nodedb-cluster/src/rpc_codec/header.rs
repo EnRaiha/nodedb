@@ -14,7 +14,9 @@
 //! Every frame is emitted with `RPC_FRAME_VERSION` in the version byte.
 //! Frames with any other version byte are rejected immediately.
 
-use crate::cluster_epoch::{current_local_cluster_epoch, observe_peer_cluster_epoch};
+use crate::cluster_epoch::{
+    current_local_cluster_epoch, observe_peer_cluster_epoch, validate_peer_cluster_epoch,
+};
 use crate::error::{ClusterError, Result};
 
 /// Header size in bytes: version(1) + rpc_type(1) + payload_len(4) + crc32c(4) + cluster_epoch(8).
@@ -82,6 +84,11 @@ pub fn parse_frame(data: &[u8]) -> Result<(u8, &[u8])> {
     let peer_epoch = u64::from_le_bytes([
         data[10], data[11], data[12], data[13], data[14], data[15], data[16], data[17],
     ]);
+
+    // Enforce the cluster-epoch fence. Join handshake + ping/pong frames are
+    // exempt (see cluster_epoch::EPOCH_EXEMPT_RPC_TYPES); everything else from
+    // a peer on a strictly older epoch is dropped here, before any dispatch.
+    validate_peer_cluster_epoch(rpc_type, peer_epoch)?;
 
     if payload_len > MAX_RPC_PAYLOAD_SIZE {
         return Err(ClusterError::Codec {
@@ -152,12 +159,12 @@ mod tests {
     }
 
     /// Build a correct current-version frame (18-byte header).
-    fn make_frame(payload: &[u8], epoch: u64) -> Vec<u8> {
+    fn make_frame(rpc_type: u8, payload: &[u8], epoch: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
         let payload_len = payload.len() as u32;
         let crc = crc32c::crc32c(payload);
         out.push(RPC_FRAME_VERSION);
-        out.push(0xAB);
+        out.push(rpc_type);
         out.extend_from_slice(&payload_len.to_le_bytes());
         out.extend_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&epoch.to_le_bytes());
@@ -167,8 +174,14 @@ mod tests {
 
     #[test]
     fn parse_frame_accepts_current_version() {
+        use crate::cluster_epoch::set_local_cluster_epoch;
+        let _g = crate::cluster_epoch::EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Local epoch 0: any stamp (including 0) passes the fence.
+        set_local_cluster_epoch(0);
         let payload = b"world";
-        let frame = make_frame(payload, 0);
+        let frame = make_frame(0xAB, payload, 0);
         let (_t, body) = parse_frame(&frame).expect("current version must be accepted");
         assert_eq!(body, payload);
     }
@@ -222,6 +235,9 @@ mod tests {
     #[test]
     fn v3_frame_round_trips_with_epoch() {
         use crate::cluster_epoch::set_local_cluster_epoch;
+        let _g = crate::cluster_epoch::EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         set_local_cluster_epoch(0);
         set_local_cluster_epoch(7);
         let payload = b"epoch-bound";
@@ -237,9 +253,62 @@ mod tests {
 
     #[test]
     fn frame_size_current_version() {
-        let frame = make_frame(b"abcde", 1);
+        let frame = make_frame(0xAB, b"abcde", 1);
         let mut hdr = [0u8; HEADER_SIZE];
         hdr.copy_from_slice(&frame[..HEADER_SIZE]);
         assert_eq!(frame_size(&hdr).unwrap(), HEADER_SIZE + 5);
+    }
+
+    #[test]
+    fn parse_frame_rejects_stale_epoch() {
+        use crate::cluster_epoch::set_local_cluster_epoch;
+        // Serialise against the cluster_epoch tests on the shared global.
+        let _g = crate::cluster_epoch::EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        set_local_cluster_epoch(7);
+        let frame = make_frame(0xAB, b"stale", 5);
+        let err = parse_frame(&frame).expect_err("stale epoch must be rejected");
+        assert!(matches!(
+            err,
+            ClusterError::StalePeerEpoch {
+                peer_epoch: 5,
+                local_epoch: 7,
+            }
+        ));
+        // Rejection happens before observe, so the local mark is untouched.
+        assert_eq!(crate::cluster_epoch::current_local_cluster_epoch(), 7);
+        set_local_cluster_epoch(0);
+    }
+
+    #[test]
+    fn parse_frame_accepts_newer_epoch_and_observes() {
+        use crate::cluster_epoch::set_local_cluster_epoch;
+        let _g = crate::cluster_epoch::EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        set_local_cluster_epoch(3);
+        let frame = make_frame(0xAB, b"newer", 9);
+        let (rpc_type, body) = parse_frame(&frame).expect("newer epoch must be accepted");
+        assert_eq!(rpc_type, 0xAB);
+        assert_eq!(body, b"newer");
+        assert_eq!(crate::cluster_epoch::current_local_cluster_epoch(), 9);
+        set_local_cluster_epoch(0);
+    }
+
+    #[test]
+    fn parse_frame_join_and_ping_exempt() {
+        use crate::cluster_epoch::set_local_cluster_epoch;
+        use crate::rpc_codec::discriminants::{RPC_JOIN_REQ, RPC_PING};
+        let _g = crate::cluster_epoch::EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        set_local_cluster_epoch(9);
+        let join = make_frame(RPC_JOIN_REQ, b"join", 0);
+        parse_frame(&join).expect("join req must be exempt from the epoch fence");
+        let ping = make_frame(RPC_PING, b"ping", 0);
+        parse_frame(&ping).expect("ping must be exempt from the epoch fence");
+        assert_eq!(crate::cluster_epoch::current_local_cluster_epoch(), 9);
+        set_local_cluster_epoch(0);
     }
 }

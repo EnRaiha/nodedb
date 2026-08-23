@@ -42,7 +42,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::ClusterCatalog;
-use crate::error::Result;
+use crate::error::{ClusterError, Result};
+use crate::rpc_codec::discriminants::{RPC_JOIN_REQ, RPC_JOIN_RESP, RPC_PING, RPC_PONG};
 
 /// Process-global cluster epoch high-water mark.
 ///
@@ -73,6 +74,48 @@ pub fn observe_peer_cluster_epoch(peer_epoch: u64) -> u64 {
     prev.max(peer_epoch)
 }
 
+/// RPC types exempt from the cluster-epoch fence.
+///
+/// * Join handshake (`RPC_JOIN_REQ` / `RPC_JOIN_RESP`): a joining or rejoining
+///   node legitimately carries a zero or stale epoch — the join response is the
+///   mechanism by which it learns (observes) the cluster's current epoch.
+/// * Ping/pong (`RPC_PING` / `RPC_PONG`): the pre-join bootstrap probe
+///   (`bootstrap/probe.rs`) pings the elected bootstrapper before joining, and
+///   ping is the side-effect-free liveness channel a fenced peer needs in order
+///   to be discovered and told to rejoin.
+///
+/// Everything else (raft consensus, topology, execute, shuffle, calvin,
+/// surrogate, data/metadata propose, vshard envelopes) is fenced.
+pub(crate) const EPOCH_EXEMPT_RPC_TYPES: &[u8] =
+    &[RPC_JOIN_REQ, RPC_JOIN_RESP, RPC_PING, RPC_PONG];
+
+/// Enforce the cluster-epoch fence on one inbound frame.
+///
+/// Rejects `peer_epoch < local` unless the RPC type is exempt. Called from
+/// the decode path ([`crate::rpc_codec::header::parse_frame`]) for every
+/// inbound rpc_codec frame, in both directions (server-side requests and
+/// client-side responses).
+///
+/// `peer_epoch == 0` is *not* special-cased: against a local epoch of 0
+/// (genesis / pre-init startup) it passes; against a local epoch > 0 it is
+/// rejected exactly like any other stale stamp. The epoch check runs on
+/// MAC-authenticated header bytes (the envelope MAC is verified before
+/// decode in `transport/server.rs` and `transport/client/send.rs`), so a
+/// spoofed stamp cannot trigger spurious rejections.
+pub fn validate_peer_cluster_epoch(rpc_type: u8, peer_epoch: u64) -> Result<()> {
+    if EPOCH_EXEMPT_RPC_TYPES.contains(&rpc_type) {
+        return Ok(());
+    }
+    let local_epoch = LOCAL_CLUSTER_EPOCH.load(Ordering::Acquire);
+    if peer_epoch < local_epoch {
+        return Err(ClusterError::StalePeerEpoch {
+            peer_epoch,
+            local_epoch,
+        });
+    }
+    Ok(())
+}
+
 /// Increment the local epoch by 1 and persist the new value to the
 /// cluster catalog. Called by the metadata-group leader on a leadership
 /// transition.
@@ -96,17 +139,22 @@ pub fn init_local_cluster_epoch_from_catalog(catalog: &Arc<ClusterCatalog>) -> R
     Ok(prev.max(persisted))
 }
 
+/// Serialises every test that mutates the shared `LOCAL_CLUSTER_EPOCH`
+/// global — including the header decode-path tests in `rpc_codec::header`,
+/// which set the epoch from outside this module. `pub(crate)` so both test
+/// suites take the SAME lock (two locks would not exclude each other).
+#[cfg(test)]
+pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// All tests in this module mutate the same global atomic, so they
-    /// must be serialised. The lock is taken at the top of each test.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset() -> std::sync::MutexGuard<'static, ()> {
-        let g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The shared crate-wide epoch test lock also serialises against
+        // the decode-path tests in `rpc_codec::header`, which set the
+        // global from outside this module.
+        let g = EPOCH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         LOCAL_CLUSTER_EPOCH.store(0, Ordering::Release);
         g
     }
@@ -170,5 +218,65 @@ mod tests {
         let v = init_local_cluster_epoch_from_catalog(&catalog).unwrap();
         assert_eq!(v, 0);
         assert_eq!(current_local_cluster_epoch(), 0);
+    }
+
+    #[test]
+    fn validate_rejects_stale_non_exempt() {
+        let _g = reset();
+        use crate::rpc_codec::discriminants::RPC_APPEND_ENTRIES_REQ;
+        set_local_cluster_epoch(5);
+        assert!(matches!(
+            validate_peer_cluster_epoch(RPC_APPEND_ENTRIES_REQ, 3),
+            Err(ClusterError::StalePeerEpoch {
+                peer_epoch: 3,
+                local_epoch: 5,
+            })
+        ));
+        // Rejection must not touch the local mark.
+        assert_eq!(current_local_cluster_epoch(), 5);
+    }
+
+    #[test]
+    fn validate_accepts_equal_and_newer() {
+        let _g = reset();
+        use crate::rpc_codec::discriminants::RPC_EXECUTE_REQ;
+        set_local_cluster_epoch(5);
+        assert!(validate_peer_cluster_epoch(RPC_EXECUTE_REQ, 5).is_ok());
+        assert!(validate_peer_cluster_epoch(RPC_EXECUTE_REQ, 6).is_ok());
+        assert_eq!(current_local_cluster_epoch(), 5);
+    }
+
+    #[test]
+    fn validate_genesis_zero_zero_ok() {
+        let _g = reset();
+        use crate::rpc_codec::discriminants::RPC_APPEND_ENTRIES_REQ;
+        // Pre-init startup: local 0 must not reject a peer stamp of 0.
+        assert!(validate_peer_cluster_epoch(RPC_APPEND_ENTRIES_REQ, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_exempts_join_and_ping() {
+        let _g = reset();
+        set_local_cluster_epoch(9);
+        assert!(validate_peer_cluster_epoch(RPC_JOIN_REQ, 0).is_ok());
+        assert!(validate_peer_cluster_epoch(RPC_JOIN_RESP, 0).is_ok());
+        assert!(validate_peer_cluster_epoch(RPC_PING, 0).is_ok());
+        assert!(validate_peer_cluster_epoch(RPC_PONG, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_stale_for_other_mgmt_types() {
+        let _g = reset();
+        use crate::rpc_codec::discriminants::{RPC_REQUEST_VOTE_RESP, RPC_TOPOLOGY_ACK};
+        set_local_cluster_epoch(5);
+        assert!(matches!(
+            validate_peer_cluster_epoch(RPC_TOPOLOGY_ACK, 4),
+            Err(ClusterError::StalePeerEpoch { .. })
+        ));
+        // Elections are fenced too.
+        assert!(matches!(
+            validate_peer_cluster_epoch(RPC_REQUEST_VOTE_RESP, 4),
+            Err(ClusterError::StalePeerEpoch { .. })
+        ));
     }
 }

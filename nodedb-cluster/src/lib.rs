@@ -87,7 +87,7 @@ pub use catalog::ClusterCatalog;
 pub use circuit_breaker::BreakerSnapshot;
 pub use cluster_epoch::{
     bump_local_cluster_epoch, current_local_cluster_epoch, init_local_cluster_epoch_from_catalog,
-    observe_peer_cluster_epoch, set_local_cluster_epoch,
+    observe_peer_cluster_epoch, set_local_cluster_epoch, validate_peer_cluster_epoch,
 };
 pub use cluster_info::{
     ClusterInfoSnapshot, ClusterObserver, GroupSnapshot, GroupStatusProvider, PeerSnapshot,
