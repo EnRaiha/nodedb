@@ -17,8 +17,8 @@ use crate::error::Result;
 use super::migration::migrate_if_needed;
 use super::schema::{
     CATALOG_FORMAT_VERSION, GHOST_TABLE, KEY_CA_CERT, KEY_CLUSTER_EPOCH, KEY_CLUSTER_ID,
-    KEY_FORMAT_VERSION, METADATA_TABLE, MIGRATION_STATE_TABLE, ROUTING_TABLE, TOPOLOGY_TABLE,
-    catalog_err,
+    KEY_FORMAT_VERSION, KEY_SWIM_INCARNATION, METADATA_TABLE, MIGRATION_STATE_TABLE, ROUTING_TABLE,
+    TOPOLOGY_TABLE, catalog_err,
 };
 
 /// Persistent cluster catalog backed by redb.
@@ -132,6 +132,42 @@ impl ClusterCatalog {
         let txn = self.db.begin_read().map_err(catalog_err)?;
         let table = txn.open_table(METADATA_TABLE).map_err(catalog_err)?;
         match table.get(KEY_CLUSTER_EPOCH).map_err(catalog_err)? {
+            Some(guard) => {
+                let bytes = guard.value();
+                if bytes.len() == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    Ok(Some(u64::from_le_bytes(arr)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the local SWIM incarnation (u64 LE). Written on every
+    /// self-refutation bump so a fast restart can resume at the stored
+    /// value instead of 0. See `crate::swim::incarnation_store`.
+    pub fn save_swim_incarnation(&self, incarnation: u64) -> Result<()> {
+        let bytes = incarnation.to_le_bytes();
+        let txn = self.db.begin_write().map_err(catalog_err)?;
+        {
+            let mut table = txn.open_table(METADATA_TABLE).map_err(catalog_err)?;
+            table
+                .insert(KEY_SWIM_INCARNATION, bytes.as_slice())
+                .map_err(catalog_err)?;
+        }
+        txn.commit().map_err(catalog_err)?;
+        Ok(())
+    }
+
+    /// Load the persisted SWIM incarnation. Returns `None` on a catalog
+    /// that has never written one (callers treat that as `ZERO`).
+    pub fn load_swim_incarnation(&self) -> Result<Option<u64>> {
+        let txn = self.db.begin_read().map_err(catalog_err)?;
+        let table = txn.open_table(METADATA_TABLE).map_err(catalog_err)?;
+        match table.get(KEY_SWIM_INCARNATION).map_err(catalog_err)? {
             Some(guard) => {
                 let bytes = guard.value();
                 if bytes.len() == 8 {

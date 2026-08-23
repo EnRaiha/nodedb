@@ -34,6 +34,9 @@ use crate::subsystem::{
     DecommissionSubsystem, ReachabilitySubsystem, RebalancerSubsystem, RunningCluster,
     SubsystemRegistry, SwimSubsystem, SwimSubsystemConfig,
 };
+use crate::swim::config::SwimConfig;
+use crate::swim::incarnation::Incarnation;
+use crate::swim::incarnation_store::CatalogIncarnationStore;
 use crate::transport::NexarTransport;
 
 use super::bootstrap_fn::bootstrap;
@@ -69,9 +72,24 @@ pub fn register_default_subsystems(
     config: &ClusterConfig,
     ctx: &BootstrapCtx,
     executor: Arc<MigrationExecutor>,
+    catalog: &Arc<ClusterCatalog>,
 ) -> crate::error::Result<()> {
+    // Fast-restart rejoin safety: resume SWIM above the last persisted
+    // incarnation. A node that crashed while peers held `Dead(A, N)`
+    // restarts at `N + 1`, so its very first `Alive` announcement
+    // dominates every lingering rumour — no probabilistic refutation
+    // round-trip required.
+    let persisted_inc = catalog.load_swim_incarnation().unwrap_or(None);
+    let initial_incarnation = match persisted_inc {
+        Some(v) => Incarnation::new(v).bump(),
+        None => Incarnation::ZERO,
+    };
+
     let swim_cfg = SwimSubsystemConfig {
-        swim: crate::swim::config::SwimConfig::default(),
+        swim: SwimConfig {
+            initial_incarnation,
+            ..SwimConfig::default()
+        },
         local_id: NodeId::try_new(config.node_id.to_string()).map_err(|e| {
             crate::error::ClusterError::Config {
                 detail: format!("node_id is not a valid ID: {e}"),
@@ -85,6 +103,7 @@ pub fn register_default_subsystems(
             a
         }),
         seeds: config.seed_nodes.clone(),
+        incarnation_store: Some(Arc::new(CatalogIncarnationStore::new(Arc::clone(catalog)))),
     };
 
     registry.register(Arc::new(SwimSubsystem::new(
@@ -186,6 +205,7 @@ pub async fn start_cluster_subsystems(
     routing: Arc<std::sync::RwLock<crate::routing::RoutingTable>>,
     transport: Arc<NexarTransport>,
     raft_multi_raft: Arc<std::sync::Mutex<crate::multi_raft::MultiRaft>>,
+    catalog: &Arc<ClusterCatalog>,
 ) -> Result<RunningCluster> {
     let health = ClusterHealth::new();
     let (decommission_signal, _) = tokio::sync::watch::channel(false);
@@ -206,7 +226,7 @@ pub async fn start_cluster_subsystems(
     ));
 
     let mut registry = SubsystemRegistry::new();
-    register_default_subsystems(&mut registry, config, &ctx, executor)?;
+    register_default_subsystems(&mut registry, config, &ctx, executor, catalog)?;
 
     registry
         .start_all(&ctx)

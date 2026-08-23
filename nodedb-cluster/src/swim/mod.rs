@@ -25,6 +25,7 @@ pub mod detector;
 pub mod dissemination;
 pub mod error;
 pub mod incarnation;
+pub mod incarnation_store;
 pub mod member;
 pub mod membership;
 pub mod subscriber;
