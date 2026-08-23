@@ -22,6 +22,7 @@ use nodedb_cluster::forward::{ChunkSink, PlanExecutor};
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::gateway::version_check::{DescriptorCheckError, check_descriptor_versions};
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
@@ -139,48 +140,29 @@ impl LocalPlanExecutor {
 
         // ── 2. Descriptor version validation ──────────────────────────────────
         let catalog_ref = self.state.credentials.catalog();
-        {
-            let catalog = catalog_ref;
-            for entry in &req.descriptor_versions {
-                match catalog.get_collection(database_id, req.tenant_id, &entry.collection) {
-                    Ok(Some(stored)) => {
-                        let actual = if stored.descriptor_version == 0 {
-                            1
-                        } else {
-                            stored.descriptor_version
-                        };
-                        if actual != entry.version {
-                            tracing::debug!(
-                                collection = %entry.collection,
-                                expected_version = entry.version,
-                                actual_version = actual,
-                                "exec receiver: descriptor version mismatch"
-                            );
-                            return Err(TypedClusterError::DescriptorMismatch {
-                                collection: entry.collection.clone(),
-                                expected_version: entry.version,
-                                actual_version: actual,
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        if entry.version != 0 {
-                            return Err(TypedClusterError::DescriptorMismatch {
-                                collection: entry.collection.clone(),
-                                expected_version: entry.version,
-                                actual_version: 0,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        return Err(TypedClusterError::Internal {
-                            code: PLAN_DECODE_FAILED,
-                            message: format!("catalog lookup failed: {e}"),
-                        });
-                    }
-                }
-            }
-        }
+        check_descriptor_versions(
+            catalog_ref,
+            database_id,
+            req.tenant_id,
+            req.descriptor_versions
+                .iter()
+                .map(|entry| (entry.collection.as_str(), entry.version)),
+        )
+        .map_err(|e| match e {
+            DescriptorCheckError::VersionMismatch {
+                collection,
+                expected_version,
+                actual_version,
+            } => TypedClusterError::DescriptorMismatch {
+                collection,
+                expected_version,
+                actual_version,
+            },
+            DescriptorCheckError::CatalogLookup { detail, .. } => TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: format!("catalog lookup failed: {detail}"),
+            },
+        })?;
 
         // ── 3. Decode the PhysicalPlan ────────────────────────────────────────
         let mut plan = match plan_wire::decode(&req.plan_bytes) {

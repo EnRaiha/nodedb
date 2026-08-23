@@ -29,6 +29,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 
 use super::dispatch_remote::{RemoteDispatchArgs, dispatch_remote, dispatch_remote_stream};
 use super::route::{RouteDecision, TaskRoute};
+use super::version_check::check_descriptor_versions;
 use super::version_set::GatewayVersionSet;
 
 /// Result of dispatching a single route: the raw payload bytes plus the
@@ -89,7 +90,16 @@ pub(crate) async fn dispatch_route(
     reject_unadmitted_crdt_apply(&route.plan)?;
     match route.decision {
         RouteDecision::Local => {
-            dispatch_local(route, shared, tenant_id, database_id, trace_id, txn_id).await
+            dispatch_local(
+                route,
+                shared,
+                tenant_id,
+                database_id,
+                trace_id,
+                txn_id,
+                version_set,
+            )
+            .await
         }
         RouteDecision::Remote { node_id, vshard_id } => {
             dispatch_remote(RemoteDispatchArgs {
@@ -179,14 +189,19 @@ pub(crate) async fn dispatch_route_stream(
         // Cluster gateway route dispatch: no session-transaction context
         // crosses this boundary yet, so `None`. TRACKED: cross-node
         // in-transaction reads are a known gap (see resolve/exchange.rs).
-        RouteDecision::Local => crate::control::server::exchange::gather::gather_all_cores_stream(
-            shared,
-            tenant_id,
-            database_id,
-            route.plan,
-            trace_id,
-            None,
-        ),
+        RouteDecision::Local => {
+            // Same fence as the one-shot local path: a streaming read planned
+            // against a superseded descriptor must not reach the cores.
+            check_local_descriptor_versions(shared, tenant_id, database_id, version_set)?;
+            crate::control::server::exchange::gather::gather_all_cores_stream(
+                shared,
+                tenant_id,
+                database_id,
+                route.plan,
+                trace_id,
+                None,
+            )
+        }
         RouteDecision::Remote { node_id, vshard_id } => {
             dispatch_remote_stream(RemoteDispatchArgs {
                 plan: route.plan,
@@ -216,6 +231,26 @@ pub(crate) async fn dispatch_route_stream(
     }
 }
 
+/// Re-compare a plan's stamped descriptor versions against this node's own
+/// catalog. A mismatch surfaces as [`Error::RetryableSchemaChanged`], which the
+/// gateway's cache-miss retry absorbs by re-planning against fresh state.
+fn check_local_descriptor_versions(
+    shared: &Arc<SharedState>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    version_set: &GatewayVersionSet,
+) -> Result<(), Error> {
+    check_descriptor_versions(
+        shared.credentials.catalog(),
+        database_id,
+        tenant_id.as_u64(),
+        version_set
+            .iter()
+            .map(|(collection, version)| (collection.as_str(), *version)),
+    )?;
+    Ok(())
+}
+
 /// Local dispatch via SPSC bridge.
 ///
 /// Carries `txn_id` so the Data Plane can resolve this session transaction's
@@ -227,7 +262,14 @@ async fn dispatch_local(
     database_id: DatabaseId,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
+    version_set: &GatewayVersionSet,
 ) -> Result<DispatchOutcome, Error> {
+    // Staying on this node does not make the plan fresh: a DDL can bump a
+    // descriptor between planning and dispatch, and a drain that times out is
+    // force-ended. Fence the local plan against this node's catalog exactly as
+    // the leaseholder fences a forwarded one.
+    check_local_descriptor_versions(shared, tenant_id, database_id, version_set)?;
+
     let vshard_id = VShardId::new(route.vshard_id);
 
     if txn_id.is_some()
