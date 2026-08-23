@@ -3,11 +3,13 @@
 //! Descriptor-version fence shared by local and cross-node dispatch.
 //!
 //! A plan is stamped at plan time with the descriptor versions it was built
-//! against (`GatewayVersionSet`). A DDL that bumps a version drains the
-//! outstanding leases, but a drain that times out is force-ended and the DDL
-//! proceeds — so a node that stalled can wake up holding a plan built against
-//! a superseded descriptor. Every dispatch path re-compares the stamped
-//! versions against the executing node's own catalog before the plan runs.
+//! against (`GatewayVersionSet`). Holding a descriptor lease does not make
+//! that stamp current: a lease grant never compares the requested version
+//! against the catalog, so a plan stamped just before a DDL committed still
+//! acquires its lease afterwards, at the superseded version. A mixed-version
+//! cluster skips the lease drain outright. Every dispatch path therefore
+//! re-compares the stamped versions against the executing node's own catalog
+//! before the plan runs.
 
 use crate::control::security::catalog::SystemCatalog;
 use crate::types::DatabaseId;

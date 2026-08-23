@@ -48,6 +48,10 @@ pub enum AbortReason {
     /// unavailable, WAL append/serialize failure, or an unexpected Calvin
     /// outcome). Adapters map the carried error per their existing rules.
     Dispatch(crate::Error),
+    /// A collection this transaction's buffered writes were planned against
+    /// has been altered since the statement that buffered them. The
+    /// transaction is retryable as a whole. → `40001`.
+    SchemaChanged { detail: String },
     /// Proposing the buffered DDL batch to the metadata Raft group failed.
     /// → `XX000`.
     DdlPropose(crate::Error),

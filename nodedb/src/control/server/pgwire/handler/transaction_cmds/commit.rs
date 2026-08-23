@@ -86,6 +86,11 @@ fn commit_abort_to_pgerror(reason: &AbortReason) -> PgWireError {
             "57014",
             "timed out waiting for Calvin sequencer".to_owned(),
         ),
+        AbortReason::SchemaChanged { detail } => (
+            "ERROR",
+            "40001",
+            format!("could not serialize access due to concurrent schema change: {detail}"),
+        ),
         AbortReason::Dispatch(e) | AbortReason::DdlPropose(e) => error_to_sqlstate(e),
     };
     PgWireError::UserError(Box::new(ErrorInfo::new(

@@ -162,6 +162,11 @@ fn commit_abort_to_native(seq: u64, reason: &AbortReason) -> NativeResponse {
             "timed out waiting for Calvin sequencer".to_owned(),
             nodedb_types::error::ErrorCode::DEADLINE_EXCEEDED.0,
         ),
+        AbortReason::SchemaChanged { detail } => (
+            "40001",
+            format!("could not serialize access due to concurrent schema change: {detail}"),
+            nodedb_types::error::ErrorCode::WRITE_CONFLICT.0,
+        ),
         AbortReason::Dispatch(e) => (
             "40001",
             format!("transaction commit failed: {e}"),

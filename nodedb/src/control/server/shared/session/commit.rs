@@ -74,6 +74,19 @@ pub async fn run_commit(
             return outcome;
         }
     } else {
+        // Every buffered write was planned at STATEMENT time and is dispatched
+        // only now, so the catalog has had the whole open block to move on.
+        // Re-compare the descriptor versions the statements were planned
+        // against before anything durable is written — an abort here leaves no
+        // side effect and the client retries the transaction.
+        if let Some(reason) = super::commit_fence::check_buffered_descriptors(
+            state.credentials.catalog(),
+            sessions,
+            session_id,
+        ) {
+            super::reservation_release::release_and_rollback(state, sessions, session_id).await;
+            return CommitOutcome::Aborted { reason };
+        }
         match classify_dispatch(&buffered, &read_vshards) {
             DispatchClass::MultiShard { .. } => {
                 // Flush the buffered cross-shard batch through Calvin's durable

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nodedb_cluster::DescriptorId;
 use nodedb_cluster::calvin::types::TxnIdWire;
 
 use crate::control::lease::QueryLeaseScope;
@@ -291,6 +292,29 @@ impl SessionStore {
             session.tx_buffer.len()
         })
         .unwrap_or(0)
+    }
+
+    /// Every distinct `(descriptor, version)` pair this transaction's
+    /// buffered tasks were planned against.
+    ///
+    /// Scopes are deduplicated by identity: one statement attaches the same
+    /// `Arc<QueryLeaseScope>` to every task it buffered, so walking the
+    /// holders without deduplicating repeats one statement's holds once per
+    /// task it produced.
+    pub fn tx_descriptor_versions(&self, addr: impl Into<SessionId>) -> Vec<(DescriptorId, u64)> {
+        self.read_session(addr, |session| {
+            let mut scopes: Vec<&Arc<QueryLeaseScope>> = Vec::new();
+            for scope in session.tx_lease_scopes.iter().flatten() {
+                if !scopes.iter().any(|seen| Arc::ptr_eq(seen, scope)) {
+                    scopes.push(scope);
+                }
+            }
+            scopes
+                .into_iter()
+                .flat_map(|scope| scope.descriptor_versions().iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     /// Retain a statement's descriptor lease scope for every task buffered

@@ -3,6 +3,7 @@
 pub mod audit_context;
 pub mod commit;
 mod commit_calvin;
+mod commit_fence;
 pub mod connection;
 pub mod cross_shard_mode;
 mod cursor;

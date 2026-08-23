@@ -144,6 +144,16 @@ impl QueryLeaseScope {
         }
     }
 
+    /// The exact `(descriptor, version)` holds this scope carries.
+    ///
+    /// A lease grant never compares the requested version against the
+    /// catalog, so holding a scope proves only that this node reserved those
+    /// versions — not that the catalog still agrees with them. Callers that
+    /// replay a plan later re-compare these pairs against the catalog.
+    pub fn descriptor_versions(&self) -> &[(DescriptorId, u64)] {
+        &self.descriptor_versions
+    }
+
     /// Number of descriptors held in this scope.
     pub fn len(&self) -> usize {
         self.descriptor_versions.len()

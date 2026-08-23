@@ -4,11 +4,12 @@
 //!
 //! One trigger action plans once and can expand into several physical tasks,
 //! each dispatched over an awaited WAL append plus an SPSC round trip. Holding
-//! a descriptor lease does not freeze the catalog: a DDL that bumps a version
-//! drains the outstanding leases, and a drain that times out is force-ended so
-//! the DDL proceeds anyway. The action's tasks are therefore re-compared
-//! against the executing node's own catalog — the same fence the gateway
-//! applies to local and cross-node dispatch.
+//! a descriptor lease does not prove the plan is current: the action acquires
+//! its lease after planning, and a lease grant never compares the requested
+//! version against the catalog, so a DDL that committed in between is granted
+//! a lease at the version it superseded. The action's tasks are therefore
+//! re-compared against the executing node's own catalog — the same fence the
+//! gateway applies to local and cross-node dispatch.
 
 use std::future::Future;
 
@@ -163,10 +164,10 @@ where
     // exactly `i` tasks have applied.
     for (dispatched, task) in tasks.into_iter().enumerate() {
         // The fence sits inside the loop, not once before it: every dispatch
-        // awaits a WAL append and an SPSC round trip, and a DDL whose lease
-        // drain is force-ended moves the catalog on during that await. A
-        // single check before the loop would clear task 0 and let a later
-        // task run against a descriptor version the catalog has left behind.
+        // awaits a WAL append and an SPSC round trip, and the catalog can move
+        // on during that await. A single check before the loop would clear
+        // task 0 and let a later task run against a descriptor version the
+        // catalog has left behind.
         if let Err(error) = check_descriptor_versions(
             catalog,
             database_id,
