@@ -41,15 +41,15 @@ impl NodeDbPgHandler {
     /// a successor. Reads served on that entry alone return state the new
     /// leader has already moved past.
     async fn confirm_local_leadership(&self, group_id: u64) -> PgWireResult<()> {
-        let Some(confirmer) = self.state.read_index_confirmer.get() else {
+        let Some(gate) = self.state.raft_read_gate.get() else {
             // Reached only if a clustered node routed here before `start_raft`
-            // published the confirmer. Refusing is retriable; serving would be
+            // published the gate. Refusing is retriable; serving would be
             // the unproven read this exists to prevent.
             return Err(no_serving_leader());
         };
         use crate::control::cluster::read_index::ReadIndexRefusal;
-        match confirmer
-            .confirm(group_id, LEADERSHIP_CONFIRM_TIMEOUT)
+        match gate
+            .confirm_leader(group_id, LEADERSHIP_CONFIRM_TIMEOUT)
             .await
         {
             Ok(_read_index) => Ok(()),

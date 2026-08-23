@@ -42,19 +42,6 @@ impl ReadConsistency {
     }
 }
 
-/// Map this crate's `ReadConsistency` onto `nodedb-cluster`'s `ReadLevel`.
-/// Kept as a free function (not `From`) because `nodedb-cluster` does not
-/// depend on `nodedb` and we don't want to invert that direction.
-impl From<ReadConsistency> for nodedb_cluster::follower_read::ReadLevel {
-    fn from(rc: ReadConsistency) -> Self {
-        match rc {
-            ReadConsistency::Strong => Self::Strong,
-            ReadConsistency::BoundedStaleness(d) => Self::BoundedStaleness(d),
-            ReadConsistency::Eventual => Self::Eventual,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

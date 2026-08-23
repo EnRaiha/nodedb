@@ -24,7 +24,7 @@ pub use message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     LogEntry, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
-pub use node::{RaftNode, ReadIndexProbe, ReadIndexStatus, Ready};
+pub use node::{RaftNode, ReadIndexProbe, ReadIndexStatus, Ready, StalenessVerdict};
 pub use snapshot_framing::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC, SnapshotEngineId, SnapshotFramingError,
     decode_snapshot_chunk, encode_snapshot_chunk,

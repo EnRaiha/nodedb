@@ -101,11 +101,11 @@ pub(super) fn finish_observability(
     // Publish the leadership confirmer so a linearizable read served on this
     // node proves against a quorum that it is still the leader. Holds the
     // same coordinator mutex the loop ticks, not the loop itself.
-    let confirmer: Arc<dyn crate::control::cluster::read_index::ReadIndexConfirmer> = Arc::new(
-        crate::control::cluster::read_index::MultiRaftReadIndex::new(raft_loop.multi_raft_handle()),
+    let gate: Arc<dyn crate::control::cluster::read_index::RaftReadGate> = Arc::new(
+        crate::control::cluster::read_index::MultiRaftReadGate::new(raft_loop.multi_raft_handle()),
     );
-    if shared.read_index_confirmer.set(confirmer).is_err() {
-        tracing::warn!("read_index_confirmer already set — start_raft appears to have run twice");
+    if shared.raft_read_gate.set(gate).is_err() {
+        tracing::warn!("raft_read_gate already set — start_raft appears to have run twice");
     }
 
     // Publish the raft loop handle into SharedState so the metadata

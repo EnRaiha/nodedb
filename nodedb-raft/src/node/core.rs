@@ -85,6 +85,24 @@ pub struct RaftNode<S: LogStorage> {
     /// things `last_applied` cannot be: the floor a restart resumes delivery
     /// from, and the ceiling compaction may discard up to.
     pub(super) durable_applied: u64,
+    /// What the leader had committed when it last reached this node, and
+    /// when that was. `None` until a leader makes contact.
+    ///
+    /// This is the follower's only honest measure of how far behind it is.
+    /// Time since the last local apply cannot answer it: a follower that
+    /// applies steadily while thousands of entries behind looks fresh by
+    /// that measure, and a fully caught-up follower in an idle cluster looks
+    /// stale. Heartbeats refresh this even when nothing is being written.
+    pub(super) leader_contact: Option<LeaderContact>,
+}
+
+/// A leader's commit index as of its last contact with this node.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaderContact {
+    /// The leader's `commit_index` at that moment.
+    pub leader_commit: u64,
+    /// When the contact arrived.
+    pub at: Instant,
 }
 
 impl<S: LogStorage> RaftNode<S> {
@@ -115,6 +133,7 @@ impl<S: LogStorage> RaftNode<S> {
             leader_id: 0,
             leadership_transfer: None,
             durable_applied: 0,
+            leader_contact: None,
             config,
         }
     }
@@ -169,6 +188,13 @@ impl<S: LogStorage> RaftNode<S> {
     /// Override election deadline (for testing).
     pub fn election_deadline_override(&mut self, deadline: Instant) {
         self.election_deadline = deadline;
+    }
+
+    /// Backdate the last leader contact (for testing staleness bounds).
+    pub fn leader_contact_at_override(&mut self, at: Instant) {
+        if let Some(contact) = self.leader_contact.as_mut() {
+            contact.at = at;
+        }
     }
 
     /// Whether a leadership transfer is currently in progress.

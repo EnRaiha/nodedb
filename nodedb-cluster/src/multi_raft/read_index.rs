@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Linearizable reads against a group hosted on this node.
+//! Read placement questions answered from a group hosted on this node.
 //!
-//! Both calls are non-blocking. The probe is taken under the coordinator
-//! lock and confirmed under a later one, so the caller polls between ticks
-//! instead of holding the lock while a quorum answers.
+//! Every call is non-blocking. The read-index probe is taken under the
+//! coordinator lock and confirmed under a later one, so the caller polls
+//! between ticks instead of holding the lock while a quorum answers.
+
+use std::time::Duration;
 
 use nodedb_raft::{ReadIndexProbe, ReadIndexStatus};
 
@@ -14,7 +16,7 @@ impl MultiRaft {
     /// Begin a linearizable read on `group_id`.
     ///
     /// `None` when the group is not hosted here or this node does not lead
-    /// it. Confirm with [`Self::read_index_confirmed`] before serving.
+    /// it. Confirm with [`Self::read_index_status`] before serving.
     pub fn start_read_index(&mut self, group_id: u64) -> Option<ReadIndexProbe> {
         self.groups.get_mut(&group_id)?.start_read_index()
     }
@@ -26,6 +28,14 @@ impl MultiRaft {
             Some(node) => node.read_index_status(probe),
             None => ReadIndexStatus::LeadershipLost,
         }
+    }
+
+    /// Whether this node's replica of `group_id` is within `max_staleness`
+    /// of the leader. False for a group not hosted here.
+    pub fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool {
+        self.groups
+            .get(&group_id)
+            .is_some_and(|node| node.within_staleness_bound(max_staleness))
     }
 }
 

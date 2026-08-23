@@ -238,7 +238,7 @@ impl SharedState {
             ),
             raft_compactor: std::sync::OnceLock::new(),
             raft_applied_index_sink: std::sync::OnceLock::new(),
-            read_index_confirmer: std::sync::OnceLock::new(),
+            raft_read_gate: std::sync::OnceLock::new(),
             raft_status_fn: std::sync::OnceLock::new(),
             cluster_observer: std::sync::OnceLock::new(),
             loop_metrics_registry: nodedb_cluster::LoopMetricsRegistry::new(),

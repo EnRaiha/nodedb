@@ -147,10 +147,10 @@ pub struct SharedState {
     /// Durable post-WAL apply index; never Raft's in-memory enqueue watermark.
     pub raft_applied_index_sink:
         OnceLock<Arc<crate::control::wal_replication::RaftAppliedIndexSink>>,
-    /// Confirms leadership before a linearizable read is served locally.
-    /// Unset in single-node mode, where there is no quorum to ask.
-    pub read_index_confirmer:
-        OnceLock<Arc<dyn crate::control::cluster::read_index::ReadIndexConfirmer>>,
+    /// Answers whether a read can be served here: leadership confirmed for a
+    /// linearizable read, replica freshness for a bounded-staleness one.
+    /// Unset in single-node mode, where neither question arises.
+    pub raft_read_gate: OnceLock<Arc<dyn crate::control::cluster::read_index::RaftReadGate>>,
     /// Query Raft group statuses for observability (unset in single-node mode).
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,

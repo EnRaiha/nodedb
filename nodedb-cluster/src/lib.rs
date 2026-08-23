@@ -23,7 +23,6 @@ pub mod calvin;
 pub mod catalog;
 #[doc(hidden)]
 pub mod circuit_breaker;
-pub mod closed_timestamp;
 pub mod cluster_epoch;
 pub mod cluster_info;
 pub mod conf_change;
@@ -38,7 +37,6 @@ pub mod distributed_spatial;
 pub mod distributed_timeseries;
 pub mod distributed_vector;
 pub mod error;
-pub mod follower_read;
 pub mod forward;
 #[doc(hidden)]
 pub mod ghost;
@@ -87,7 +85,6 @@ pub use calvin::{EngineKeySet, EpochBatch, ReadWriteSet, SequencedTxn, SortedVec
 pub use catalog::ClusterCatalog;
 #[doc(hidden)]
 pub use circuit_breaker::BreakerSnapshot;
-pub use closed_timestamp::ClosedTimestampTracker;
 pub use cluster_epoch::{
     bump_local_cluster_epoch, current_local_cluster_epoch, init_local_cluster_epoch_from_catalog,
     observe_peer_cluster_epoch, set_local_cluster_epoch,
@@ -103,7 +100,6 @@ pub use decommission::{
 pub use error::{
     CalvinError, ClusterError, MigrationCheckpointError, MigrationRecoveryError, Result,
 };
-pub use follower_read::{FollowerReadGate, ReadLevel};
 pub use forward::{ChunkSink, NoopPlanExecutor, PlanExecutor};
 pub use ghost::{GhostStub, GhostTable};
 pub use health::{HealthConfig, HealthMonitor};

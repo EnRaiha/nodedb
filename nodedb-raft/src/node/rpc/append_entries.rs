@@ -33,6 +33,14 @@ impl<S: LogStorage> RaftNode<S> {
 
         self.leader_id = req.leader_id;
         self.reset_election_timeout();
+        // Recorded before the log checks: contact happened and the leader's
+        // commit index is authoritative whether or not our log matches. A
+        // mismatched follower is behind, which is exactly what the staleness
+        // bound must notice.
+        self.leader_contact = Some(crate::node::core::LeaderContact {
+            leader_commit: req.leader_commit,
+            at: std::time::Instant::now(),
+        });
 
         // Check prev_log consistency.
         if req.prev_log_index > 0 {
