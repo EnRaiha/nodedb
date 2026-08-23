@@ -4,7 +4,7 @@
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 use super::discriminants::*;
@@ -50,6 +50,12 @@ pub(super) fn encode_request_vote_req(msg: &RequestVoteRequest, out: &mut Vec<u8
 pub(super) fn encode_request_vote_resp(msg: &RequestVoteResponse, out: &mut Vec<u8>) -> Result<()> {
     write_frame(RPC_REQUEST_VOTE_RESP, &rkyv_to_bytes!(msg)?, out)
 }
+pub(super) fn encode_pre_vote_req(msg: &PreVoteRequest, out: &mut Vec<u8>) -> Result<()> {
+    write_frame(RPC_PRE_VOTE_REQ, &rkyv_to_bytes!(msg)?, out)
+}
+pub(super) fn encode_pre_vote_resp(msg: &PreVoteResponse, out: &mut Vec<u8>) -> Result<()> {
+    write_frame(RPC_PRE_VOTE_RESP, &rkyv_to_bytes!(msg)?, out)
+}
 pub(super) fn encode_install_snapshot_req(
     msg: &InstallSnapshotRequest,
     out: &mut Vec<u8>,
@@ -89,6 +95,20 @@ pub(super) fn decode_request_vote_resp(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         RequestVoteResponse,
         "RequestVoteResponse"
+    )?))
+}
+pub(super) fn decode_pre_vote_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::PreVoteRequest(rkyv_from_bytes!(
+        payload,
+        PreVoteRequest,
+        "PreVoteRequest"
+    )?))
+}
+pub(super) fn decode_pre_vote_resp(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::PreVoteResponse(rkyv_from_bytes!(
+        payload,
+        PreVoteResponse,
+        "PreVoteResponse"
     )?))
 }
 pub(super) fn decode_install_snapshot_req(payload: &[u8]) -> Result<RaftRpc> {
@@ -226,6 +246,39 @@ mod tests {
                 assert!(d.vote_granted);
             }
             other => panic!("expected RequestVoteResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_pre_vote_request() {
+        let req = nodedb_raft::message::PreVoteRequest {
+            term: 11,
+            candidate_id: 3,
+            last_log_index: 200,
+            last_log_term: 9,
+            group_id: 42,
+        };
+        match roundtrip(RaftRpc::PreVoteRequest(req)) {
+            RaftRpc::PreVoteRequest(d) => {
+                assert_eq!(d.term, 11);
+                assert_eq!(d.group_id, 42);
+            }
+            other => panic!("expected PreVoteRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_pre_vote_response() {
+        let resp = nodedb_raft::message::PreVoteResponse {
+            term: 10,
+            vote_granted: true,
+        };
+        match roundtrip(RaftRpc::PreVoteResponse(resp)) {
+            RaftRpc::PreVoteResponse(d) => {
+                assert_eq!(d.term, 10);
+                assert!(d.vote_granted);
+            }
+            other => panic!("expected PreVoteResponse, got {other:?}"),
         }
     }
 

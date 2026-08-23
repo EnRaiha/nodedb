@@ -12,8 +12,9 @@
 //!   add/remove/promote learners.
 //! - [`read_index`]: Confirming leadership against a quorum before serving a
 //!   linearizable read.
-//! - [`rpc`]: Incoming RPC handlers (`AppendEntries`, `RequestVote`,
-//!   `InstallSnapshot`, and their response handlers).
+//! - [`rpc`]: Incoming RPC handlers (`AppendEntries`, `PreVote`,
+//!   `RequestVote`, `InstallSnapshot`, `TimeoutNow`, and their response
+//!   handlers).
 //! - [`staleness`]: How far behind the leader a replica is, for
 //!   bounded-staleness reads.
 

@@ -14,8 +14,11 @@
 use std::time::{Duration, Instant};
 
 use nodedb_raft::{
-    AppendEntriesResponse, RaftNode, message::RequestVoteResponse, node::config::RaftConfig,
-    state::NodeRole, storage::MemStorage,
+    AppendEntriesResponse, RaftNode,
+    message::{PreVoteResponse, RequestVoteResponse},
+    node::config::RaftConfig,
+    state::NodeRole,
+    storage::MemStorage,
 };
 
 fn config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
@@ -34,9 +37,25 @@ fn config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
     }
 }
 
-fn become_leader_3node(node: &mut RaftNode<MemStorage>) {
+/// Push the node past its election timeout and grant the resulting pre-vote
+/// round from every peer, so it reaches the real election.
+fn force_election(node: &mut RaftNode<MemStorage>) {
     node.election_deadline_override(Instant::now() - Duration::from_millis(1));
     node.tick();
+    let term = node.current_term();
+    for peer in node.peers().to_vec() {
+        node.handle_pre_vote_response(
+            peer,
+            &PreVoteResponse {
+                term,
+                vote_granted: true,
+            },
+        );
+    }
+}
+
+fn become_leader_3node(node: &mut RaftNode<MemStorage>) {
+    force_election(node);
     let _ = node.take_ready();
     let yes = RequestVoteResponse {
         term: 1,
@@ -139,8 +158,7 @@ fn remove_peer_drops_voter_from_replication_targets() {
 fn learner_catchup_then_promotion_lifecycle() {
     let mut node = RaftNode::new(config(1, vec![2]), MemStorage::new());
     // 2-voter cluster: self + peer 2, quorum 2.
-    node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-    node.tick();
+    force_election(&mut node);
     let _ = node.take_ready();
     let yes = RequestVoteResponse {
         term: 1,

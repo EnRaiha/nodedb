@@ -123,6 +123,22 @@ pub struct LeadershipTransfer {
     pub deadline: std::time::Instant,
 }
 
+/// An in-flight pre-vote round.
+///
+/// A pre-voting node stays a `Follower` for every other purpose: it answers
+/// `RequestVote` and `AppendEntries` exactly as a follower does, so a distinct
+/// role would only force every exhaustive match to duplicate follower
+/// behaviour. Never persisted — a crash mid-round simply retries on timeout.
+#[derive(Debug, Clone)]
+pub struct PreVoteRound {
+    /// The hypothetical term this round probes for (`current_term + 1`).
+    /// Held so a round whose base term has since moved is abandoned rather
+    /// than promoted into an election for a term that is no longer next.
+    pub term: u64,
+    /// Peers that answered "would vote". Self is counted separately.
+    pub granted: std::collections::HashSet<u64>,
+}
+
 /// Per-observer send state tracked by the leader.
 ///
 /// Observers have an independent bounded send queue. When the queue is full

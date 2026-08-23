@@ -124,6 +124,54 @@ pub struct RequestVoteResponse {
     pub vote_granted: bool,
 }
 
+/// PreVote RPC.
+///
+/// Sent before a candidate bumps its term, to ask whether peers WOULD vote
+/// for it. A node partitioned from the cluster otherwise inflates its term on
+/// every failed election and forces the healthy leader to step down on heal.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct PreVoteRequest {
+    /// The HYPOTHETICAL term the candidate would campaign in
+    /// (`current_term + 1`). No node ever adopts it.
+    pub term: u64,
+    /// Candidate probing for support.
+    pub candidate_id: u64,
+    /// Index of candidate's last log entry.
+    pub last_log_index: u64,
+    /// Term of candidate's last log entry.
+    pub last_log_term: u64,
+    /// Raft group ID for Multi-Raft routing.
+    pub group_id: u64,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct PreVoteResponse {
+    /// The responder's REAL current term — not the hypothetical one probed.
+    pub term: u64,
+    /// True means the responder would vote for the candidate.
+    pub vote_granted: bool,
+}
+
 /// TimeoutNow RPC (Raft thesis — leadership transfer).
 ///
 /// Sent by a leader to a caught-up target voter to make it immediately start
@@ -233,6 +281,33 @@ mod tests {
             group_id: 0,
         };
         assert!(req.entries.is_empty());
+    }
+
+    #[test]
+    fn pre_vote_serde_roundtrip() {
+        let req = PreVoteRequest {
+            term: 8,
+            candidate_id: 3,
+            last_log_index: 120,
+            last_log_term: 7,
+            group_id: 5,
+        };
+        let json = sonic_rs::to_string(&req).unwrap();
+        let decoded: PreVoteRequest = sonic_rs::from_str(&json).unwrap();
+        assert_eq!(req.term, decoded.term);
+        assert_eq!(req.candidate_id, decoded.candidate_id);
+        assert_eq!(req.last_log_index, decoded.last_log_index);
+        assert_eq!(req.last_log_term, decoded.last_log_term);
+        assert_eq!(req.group_id, decoded.group_id);
+
+        let resp = PreVoteResponse {
+            term: 7,
+            vote_granted: true,
+        };
+        let json = sonic_rs::to_string(&resp).unwrap();
+        let decoded: PreVoteResponse = sonic_rs::from_str(&json).unwrap();
+        assert_eq!(resp.term, decoded.term);
+        assert!(decoded.vote_granted);
     }
 
     #[test]

@@ -7,7 +7,8 @@ use crate::error::Result;
 use crate::forward::PlanExecutor;
 use crate::rpc_codec::RaftRpc;
 use nodedb_raft::message::{
-    AppendEntriesRequest, InstallSnapshotRequest, RequestVoteRequest, TimeoutNowRequest,
+    AppendEntriesRequest, InstallSnapshotRequest, PreVoteRequest, RequestVoteRequest,
+    TimeoutNowRequest,
 };
 
 use super::super::loop_core::{CommitApplier, RaftLoop};
@@ -30,6 +31,15 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // grant leaves this node, so a restart cannot double-vote.
         mr.persist_group_hard_state(req.group_id)?;
         Ok(RaftRpc::RequestVoteResponse(resp))
+    }
+
+    /// Handle a PreVote probe. Deliberately mutates neither `current_term`
+    /// nor `voted_for` — a pre-vote never adopts the hypothetical term it
+    /// probes — so there is nothing to persist here, unlike RequestVote.
+    pub(super) fn handle_pre_vote_rpc(&self, req: PreVoteRequest) -> Result<RaftRpc> {
+        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+        let resp = mr.handle_pre_vote(&req)?;
+        Ok(RaftRpc::PreVoteResponse(resp))
     }
 
     /// Apply snapshot bytes only after the cluster transport has authenticated

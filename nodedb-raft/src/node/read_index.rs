@@ -11,10 +11,6 @@ use crate::node::core::RaftNode;
 use crate::state::NodeRole;
 use crate::storage::LogStorage;
 
-/// An in-flight linearizable read, taken by [`RaftNode::start_read_index`].
-///
-/// Opaque on purpose: the ack counts inside are meaningful only to the node
-/// that issued them, in the term that issued them.
 /// How far a [`ReadIndexProbe`] has got.
 ///
 /// `Pending` and `LeadershipLost` are kept apart because the caller acts on
@@ -30,6 +26,10 @@ pub enum ReadIndexStatus {
     LeadershipLost,
 }
 
+/// An in-flight linearizable read, taken by [`RaftNode::start_read_index`].
+///
+/// Opaque on purpose: the ack counts inside are meaningful only to the node
+/// that issued them, in the term that issued them.
 #[derive(Debug, Clone)]
 pub struct ReadIndexProbe {
     /// Index the read may be served at once confirmed.
@@ -105,6 +105,7 @@ mod tests {
     use crate::node::core::RaftNode;
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
+    use crate::test_support::force_election;
 
     fn config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
         RaftConfig {
@@ -126,8 +127,7 @@ mod tests {
     /// peer response confirms.
     fn leader() -> RaftNode<MemStorage> {
         let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
-        node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-        node.tick();
+        force_election(&mut node);
         let _ = node.take_ready();
         node.handle_request_vote_response(
             2,

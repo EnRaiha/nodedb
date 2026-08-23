@@ -8,7 +8,7 @@
 
 use nodedb_raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 use crate::error::{ClusterError, Result};
@@ -39,6 +39,17 @@ impl MultiRaft {
                 group_id: req.group_id,
             })?;
         Ok(node.handle_request_vote(req))
+    }
+
+    /// Route a PreVote RPC to the correct group.
+    pub fn handle_pre_vote(&mut self, req: &PreVoteRequest) -> Result<PreVoteResponse> {
+        let node = self
+            .groups
+            .get_mut(&req.group_id)
+            .ok_or(ClusterError::GroupNotFound {
+                group_id: req.group_id,
+            })?;
+        Ok(node.handle_pre_vote(req))
     }
 
     /// Route an InstallSnapshot RPC to the correct group.
@@ -121,6 +132,21 @@ impl MultiRaft {
             .get_mut(&group_id)
             .ok_or(ClusterError::GroupNotFound { group_id })?;
         node.handle_request_vote_response(peer, resp);
+        Ok(())
+    }
+
+    /// Handle PreVote response for a specific group.
+    pub fn handle_pre_vote_response(
+        &mut self,
+        group_id: u64,
+        peer: u64,
+        resp: &PreVoteResponse,
+    ) -> Result<()> {
+        let node = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        node.handle_pre_vote_response(peer, resp);
         Ok(())
     }
 

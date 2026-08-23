@@ -26,6 +26,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
             // Raft consensus RPCs — lock MultiRaft (sync, never across await).
             RaftRpc::AppendEntriesRequest(req) => self.handle_append_entries_rpc(req),
             RaftRpc::RequestVoteRequest(req) => self.handle_request_vote_rpc(req),
+            RaftRpc::PreVoteRequest(req) => self.handle_pre_vote_rpc(req),
             RaftRpc::InstallSnapshotRequest(req) => self.handle_install_snapshot_rpc(req).await,
             // Cluster join — full orchestration in `super::join`.
             RaftRpc::JoinRequest(req) => Ok(RaftRpc::JoinResponse(self.join_flow(req).await)),

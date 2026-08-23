@@ -17,6 +17,10 @@ impl<S: LogStorage> RaftNode<S> {
     /// via the normal `RequestVote` path). All other cases — non-follower,
     /// stale/future term, or a different leader — are ignored. The trigger
     /// grants no vote and does not change the term itself.
+    ///
+    /// Deliberately calls `start_election` rather than `start_pre_election`:
+    /// a transfer needs an immediate, guaranteed term bump, and the outgoing
+    /// leader has already confirmed the target is caught up.
     pub fn handle_timeout_now(&mut self, req: &TimeoutNowRequest) {
         if self.role == NodeRole::Follower
             && req.term == self.hard_state.current_term
@@ -39,6 +43,7 @@ mod tests {
     use crate::node::core::RaftNode;
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
+    use crate::test_support::force_election;
 
     fn cfg(node_id: u64, peers: Vec<u64>, learners: Vec<u64>) -> RaftConfig {
         RaftConfig {
@@ -59,8 +64,7 @@ mod tests {
     /// Elect node 1 leader in a 3-voter group (peers 2,3) and drain its ready.
     fn leader_3voter() -> RaftNode<MemStorage> {
         let mut node = RaftNode::new(cfg(1, vec![2, 3], vec![]), MemStorage::new());
-        node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-        node.tick();
+        force_election(&mut node);
         let _ = node.take_ready();
         node.handle_request_vote_response(
             2,
@@ -228,8 +232,7 @@ mod tests {
     #[test]
     fn transfer_rejected_for_invalid_targets() {
         let mut node = RaftNode::new(cfg(1, vec![2], vec![3]), MemStorage::new());
-        node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-        node.tick();
+        force_election(&mut node);
         let _ = node.take_ready();
         node.handle_request_vote_response(
             2,

@@ -5,12 +5,14 @@
 //! Split by RPC family — each submodule adds its own `impl<S: LogStorage>
 //! RaftNode<S>` block:
 //! - [`append_entries`]:   `AppendEntries`   request + response handlers.
+//! - [`pre_vote`]:         `PreVote`         request + response handlers.
 //! - [`request_vote`]:     `RequestVote`     request + response handlers.
 //! - [`install_snapshot`]: `InstallSnapshot` request handler.
 //! - [`timeout_now`]:      `TimeoutNow`      request handler (leadership transfer).
 
 pub mod append_entries;
 pub mod install_snapshot;
+pub mod pre_vote;
 pub mod request_vote;
 pub mod timeout_now;
 

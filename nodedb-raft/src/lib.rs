@@ -18,11 +18,15 @@ pub mod state;
 pub mod storage;
 pub mod transport;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use error::{RaftError, Result};
 pub use log::RaftLog;
 pub use message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    LogEntry, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    LogEntry, PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse,
+    TimeoutNowRequest,
 };
 pub use node::{RaftNode, ReadIndexProbe, ReadIndexStatus, Ready, StalenessVerdict};
 pub use snapshot_framing::{

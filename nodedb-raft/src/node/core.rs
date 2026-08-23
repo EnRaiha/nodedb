@@ -12,8 +12,10 @@ use std::time::Instant;
 
 use crate::error::{RaftError, Result};
 use crate::log::RaftLog;
-use crate::message::{AppendEntriesRequest, LogEntry, TimeoutNowRequest};
-use crate::state::{HardState, LeaderState, LeadershipTransfer, NodeRole, VolatileState};
+use crate::message::{AppendEntriesRequest, LogEntry, PreVoteRequest, TimeoutNowRequest};
+use crate::state::{
+    HardState, LeaderState, LeadershipTransfer, NodeRole, PreVoteRound, VolatileState,
+};
 use crate::storage::LogStorage;
 
 use super::config::RaftConfig;
@@ -30,6 +32,8 @@ pub struct Ready {
     pub messages: Vec<(u64, AppendEntriesRequest)>,
     /// Vote requests to send (peer_id, request).
     pub vote_requests: Vec<(u64, crate::message::RequestVoteRequest)>,
+    /// Pre-vote probes to send (peer_id, request).
+    pub pre_vote_requests: Vec<(u64, PreVoteRequest)>,
     /// `TimeoutNow` triggers to send to leadership-transfer targets
     /// (dest_node_id, request). Drained and dispatched by the caller; until a
     /// caller wires the transport this field is simply ignored.
@@ -46,6 +50,7 @@ impl Ready {
         self.hard_state.is_none()
             && self.messages.is_empty()
             && self.vote_requests.is_empty()
+            && self.pre_vote_requests.is_empty()
             && self.timeout_now.is_empty()
             && self.committed_entries.is_empty()
             && self.snapshots_needed.is_empty()
@@ -76,6 +81,8 @@ pub struct RaftNode<S: LogStorage> {
     pub(super) leader_id: u64,
     /// In-progress leadership transfer, if any (leader-side, volatile).
     pub(super) leadership_transfer: Option<LeadershipTransfer>,
+    /// In-flight pre-vote round, if any. `None` outside a round.
+    pub(super) pre_vote: Option<PreVoteRound>,
     /// Highest log index whose apply is durable on this node, mirroring
     /// `LogStorage::save_applied_index`.
     ///
@@ -132,6 +139,7 @@ impl<S: LogStorage> RaftNode<S> {
             ready: Ready::default(),
             leader_id: 0,
             leadership_transfer: None,
+            pre_vote: None,
             durable_applied: 0,
             leader_contact: None,
             config,
@@ -416,7 +424,7 @@ impl<S: LogStorage> RaftNode<S> {
         match self.role {
             NodeRole::Follower | NodeRole::Candidate => {
                 if now >= self.election_deadline {
-                    self.start_election();
+                    self.start_pre_election();
                 }
             }
             NodeRole::Leader => {
@@ -490,6 +498,7 @@ impl<S: LogStorage> RaftNode<S> {
 mod tests {
     use super::*;
     use crate::storage::MemStorage;
+    use crate::test_support::force_election;
     use std::time::Duration;
 
     fn test_config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
@@ -576,8 +585,7 @@ mod tests {
         let config = test_config(1, vec![2, 3]);
         let mut node = RaftNode::new(config, MemStorage::new());
 
-        node.election_deadline = Instant::now() - Duration::from_millis(1);
-        node.tick();
+        force_election(&mut node);
         let _ready = node.take_ready();
         let resp = crate::message::RequestVoteResponse {
             term: 1,

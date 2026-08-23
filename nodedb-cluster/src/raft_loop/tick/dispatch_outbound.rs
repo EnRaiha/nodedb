@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Batch and dispatch outbound Raft messages produced by a tick's `Ready`
-//! output: AppendEntries, RequestVote, and TimeoutNow. One background task
-//! per destination peer; batches all messages targeting the same peer
-//! across every group.
+//! output: AppendEntries, RequestVote, PreVote, and TimeoutNow. One
+//! background task per destination peer; batches all messages targeting the
+//! same peer across every group.
 
 use std::collections::HashMap as BatchMap;
 
@@ -23,6 +23,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             BatchMap::new();
         let mut vote_batches: BatchMap<u64, Vec<(u64, nodedb_raft::RequestVoteRequest)>> =
             BatchMap::new();
+        let mut pre_vote_batches: BatchMap<u64, Vec<(u64, nodedb_raft::PreVoteRequest)>> =
+            BatchMap::new();
         let mut timeout_now_msgs: Vec<(u64, nodedb_raft::TimeoutNowRequest)> = Vec::new();
 
         for (group_id, group_ready) in groups {
@@ -34,6 +36,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
             for (peer, req) in &group_ready.vote_requests {
                 vote_batches
+                    .entry(*peer)
+                    .or_default()
+                    .push((*group_id, req.clone()));
+            }
+            for (peer, req) in &group_ready.pre_vote_requests {
+                pre_vote_batches
                     .entry(*peer)
                     .or_default()
                     .push((*group_id, req.clone()));
@@ -125,6 +133,55 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                 Err(e) => {
                                     warn!(group_id, peer, error = %e, "request_vote RPC failed");
                                     break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Dispatch batched PreVote — one task per peer. No hard-state persist
+        // after handling a response: a pre-vote never mutates `current_term`
+        // or `voted_for`, so there is nothing to make durable, and persisting
+        // here would add an fsync to every probe.
+        for (peer, probes) in pre_vote_batches {
+            let transport = self.transport.clone();
+            let mr = self.multi_raft.clone();
+            let mut shutdown_rx = self.shutdown_watch.subscribe();
+            tokio::spawn(async move {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                for (group_id, req) in probes {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => return,
+                        rpc = transport.pre_vote(peer, req) => {
+                            match rpc {
+                                Ok(resp) => {
+                                    let mut mr =
+                                        mr.lock().unwrap_or_else(|p| p.into_inner());
+                                    if let Err(e) = mr
+                                        .handle_pre_vote_response(group_id, peer, &resp)
+                                    {
+                                        debug!(group_id, peer, error = %e, "handle pre-vote response");
+                                    }
+                                    // A pre-vote grants nothing and persists
+                                    // nothing, but a higher-term response
+                                    // still steps this node down — that term
+                                    // bump must be durable before it acts on
+                                    // it. Cheap otherwise: the persist is
+                                    // skipped when nothing changed.
+                                    if let Err(e) = mr.persist_group_hard_state(group_id) {
+                                        error!(group_id, peer, error = %e, "persist hard state after pre-vote response");
+                                    }
+                                }
+                                Err(e) => {
+                                    // Treat as "no grant" and move on — a failed
+                                    // peer must not abort the round for the rest.
+                                    warn!(group_id, peer, error = %e, "pre_vote RPC failed");
+                                    break; // Peer is down — skip remaining groups.
                                 }
                             }
                         }

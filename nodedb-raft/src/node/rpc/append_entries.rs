@@ -168,7 +168,7 @@ impl<S: LogStorage> RaftNode<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use crate::message::{
         AppendEntriesRequest, AppendEntriesResponse, LogEntry, RequestVoteResponse,
@@ -178,6 +178,7 @@ mod tests {
     use crate::node::rpc::test_helpers::{setup_leader_with_observer, test_config};
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
+    use crate::test_support::force_election;
 
     #[test]
     fn follower_rejects_old_term() {
@@ -266,8 +267,7 @@ mod tests {
         let config = test_config(1, vec![2, 3]);
         let mut node = RaftNode::new(config, MemStorage::new());
 
-        node.election_deadline = Instant::now() - Duration::from_millis(1);
-        node.tick();
+        force_election(&mut node);
         let _ready = node.take_ready();
         let resp = RequestVoteResponse {
             term: 1,
@@ -296,8 +296,7 @@ mod tests {
         let config = test_config(1, vec![2, 3]);
         let mut node = RaftNode::new(config, MemStorage::new());
 
-        node.election_deadline = Instant::now() - Duration::from_millis(1);
-        node.tick();
+        force_election(&mut node);
         node.handle_request_vote_response(
             2,
             &RequestVoteResponse {
@@ -335,8 +334,7 @@ mod tests {
         let mut node = RaftNode::new(config, MemStorage::new());
 
         // Force leader.
-        node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-        node.tick();
+        force_election(&mut node);
         // Grant self-vote via two voter responses.
         let yes = RequestVoteResponse {
             term: 1,
@@ -381,8 +379,7 @@ mod tests {
         let mut node1 = RaftNode::new(config1, MemStorage::new());
         let mut node2 = RaftNode::new(config2, MemStorage::new());
 
-        node1.election_deadline = Instant::now() - Duration::from_millis(1);
-        node1.tick();
+        force_election(&mut node1);
         let ready = node1.take_ready();
         let resp2 = node2.handle_request_vote(&ready.vote_requests[0].1);
         node1.handle_request_vote_response(2, &resp2);
@@ -490,8 +487,7 @@ mod tests {
             MemStorage::new(),
         );
         // Elect node 1.
-        node1.election_deadline = Instant::now() - Duration::from_millis(1);
-        node1.tick();
+        force_election(&mut node1);
         let _ = node1.take_ready();
         for v in [2u64, 3] {
             node1.handle_request_vote_response(

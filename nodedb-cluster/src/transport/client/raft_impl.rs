@@ -7,7 +7,7 @@
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use nodedb_raft::transport::RaftTransport;
 
@@ -53,6 +53,23 @@ impl RaftTransport for NexarTransport {
             RaftRpc::RequestVoteResponse(r) => Ok(r),
             other => Err(nodedb_raft::RaftError::Transport {
                 detail: format!("expected RequestVoteResponse, got {other:?}"),
+            }),
+        }
+    }
+
+    async fn pre_vote(
+        &self,
+        target: u64,
+        req: PreVoteRequest,
+    ) -> nodedb_raft::Result<PreVoteResponse> {
+        let resp = self
+            .send_rpc(target, RaftRpc::PreVoteRequest(req))
+            .await
+            .map_err(to_raft_err)?;
+        match resp {
+            RaftRpc::PreVoteResponse(r) => Ok(r),
+            other => Err(nodedb_raft::RaftError::Transport {
+                detail: format!("expected PreVoteResponse, got {other:?}"),
             }),
         }
     }

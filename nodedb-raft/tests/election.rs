@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use nodedb_raft::{
     AppendEntriesRequest, LogEntry, RaftNode,
-    message::{RequestVoteRequest, RequestVoteResponse},
+    message::{PreVoteResponse, RequestVoteRequest, RequestVoteResponse},
     node::config::RaftConfig,
     state::NodeRole,
     storage::MemStorage,
@@ -37,9 +37,21 @@ fn config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
     }
 }
 
+/// Push the node past its election timeout and grant the resulting pre-vote
+/// round from every peer, so it reaches the real election.
 fn force_election(node: &mut RaftNode<MemStorage>) {
     node.election_deadline_override(Instant::now() - Duration::from_millis(1));
     node.tick();
+    let term = node.current_term();
+    for peer in node.peers().to_vec() {
+        node.handle_pre_vote_response(
+            peer,
+            &PreVoteResponse {
+                term,
+                vote_granted: true,
+            },
+        );
+    }
 }
 
 /// Re-delivering a RequestVote from the same candidate in the same term

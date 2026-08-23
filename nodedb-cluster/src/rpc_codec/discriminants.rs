@@ -128,6 +128,12 @@ pub const RPC_RESERVE_READ_RESP: u8 = 42;
 pub const RPC_RELEASE_RESERVATION_REQ: u8 = 43;
 pub const RPC_RELEASE_RESERVATION_RESP: u8 = 44;
 
+/// PreVote (Raft pre-vote extension). Request/response, like RequestVote —
+/// a candidate probes whether peers WOULD grant a vote at a hypothetical
+/// term before bumping its own term and running a real election.
+pub const RPC_PRE_VOTE_REQ: u8 = 45;
+pub const RPC_PRE_VOTE_RESP: u8 = 46;
+
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.

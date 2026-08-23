@@ -109,6 +109,7 @@ mod tests {
     use crate::node::rpc::test_helpers::{observer_self_config, test_config};
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
+    use crate::test_support::force_election;
 
     #[test]
     fn vote_grant_and_reject() {
@@ -164,15 +165,13 @@ mod tests {
     fn stale_vote_grant_does_not_win_newer_election() {
         let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
 
-        node.election_deadline = Instant::now() - Duration::from_millis(1);
-        node.tick();
+        force_election(&mut node);
         assert_eq!(node.current_term(), 1);
         assert_eq!(node.role(), NodeRole::Candidate);
 
         // Let the first election time out and start term 2 before term 1's
         // delayed grant arrives.
-        node.election_deadline = Instant::now() - Duration::from_millis(1);
-        node.tick();
+        force_election(&mut node);
         assert_eq!(node.current_term(), 2);
 
         node.handle_request_vote_response(
@@ -195,8 +194,7 @@ mod tests {
         let mut node2 = RaftNode::new(config2, MemStorage::new());
         let mut node3 = RaftNode::new(config3, MemStorage::new());
 
-        node1.election_deadline = Instant::now() - Duration::from_millis(1);
-        node1.tick();
+        force_election(&mut node1);
         assert_eq!(node1.role(), NodeRole::Candidate);
 
         let ready = node1.take_ready();

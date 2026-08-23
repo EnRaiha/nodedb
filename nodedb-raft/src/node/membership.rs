@@ -268,7 +268,7 @@ mod tests {
     use crate::node::core::RaftNode;
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn cfg(node_id: u64, peers: Vec<u64>) -> RaftConfig {
         RaftConfig {
@@ -287,8 +287,7 @@ mod tests {
     }
 
     fn force_leader(node: &mut RaftNode<MemStorage>) {
-        node.election_deadline_override(Instant::now() - Duration::from_millis(1));
-        node.tick();
+        crate::test_support::force_election(node);
         // Drain vote messages.
         let _ = node.take_ready();
         // Reply to own candidacy (for multi-voter configs, skip).

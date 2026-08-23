@@ -2,13 +2,14 @@
 
 //! Shared test fixtures for the RPC handler test suites.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::message::RequestVoteResponse;
 use crate::node::config::RaftConfig;
 use crate::node::core::RaftNode;
 use crate::state::NodeRole;
 use crate::storage::MemStorage;
+use crate::test_support::force_election;
 
 /// Standard 3-voter (or N-voter) test config with no learners/observers.
 pub(super) fn test_config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
@@ -67,8 +68,7 @@ pub(super) fn setup_leader_with_observer() -> (RaftNode<MemStorage>, RaftNode<Me
     let observer = RaftNode::new(observer_self_config(5), MemStorage::new());
 
     // Force node 1 into candidate.
-    node1.election_deadline = Instant::now() - Duration::from_millis(1);
-    node1.tick();
+    force_election(&mut node1);
     let _ = node1.take_ready();
     // Voter 2 grants its vote.
     node1.handle_request_vote_response(

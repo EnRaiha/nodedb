@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 /// Trait for Raft network transport.
@@ -26,6 +26,16 @@ pub trait RaftTransport: Send + Sync {
         target: u64,
         req: RequestVoteRequest,
     ) -> impl std::future::Future<Output = Result<RequestVoteResponse>> + Send;
+
+    /// Send a PreVote RPC to a peer and await response.
+    ///
+    /// The probe asks whether the peer WOULD vote for the sender at the
+    /// hypothetical term in `req`. Neither side adopts that term.
+    fn pre_vote(
+        &self,
+        target: u64,
+        req: PreVoteRequest,
+    ) -> impl std::future::Future<Output = Result<PreVoteResponse>> + Send;
 
     /// Send InstallSnapshot RPC to a peer and await response.
     fn install_snapshot(
