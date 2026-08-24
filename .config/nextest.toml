@@ -83,8 +83,17 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 # heavy cases; this preserves real request deadlines rather than weakening them.
 # The crash-recovery label test is included because its child server otherwise
 # competes with the same in-process graph fan-out during the full suite.
+#
+# Both `crash_resp_kv_write` tests are here for that same reason, and their
+# symptom is startup rather than dispatch: the child server fails the harness's
+# 20s readiness poll. Each passes in ~5s in isolation — a 4x margin — so the
+# server is not slow, it is starved of cores by the surrounding fan-out. The
+# `server-process` group below caps these at 2 concurrent server tests, which
+# does not help, because the competition is the unit-test fan-out and not the
+# other server tests. Settings resolve per-key by first match, so this block's
+# `test-group` wins over that one for these two tests.
 [[profile.default.overrides]]
-filter = 'binary(graph_cross_core_bfs) | test(query_stream_returns_all_rows_across_chunks) | test(streaming_select_returns_all_rows_across_chunks) | test(graph_node_labels_survive_kill_9) | test(spatial_document_geometry_survives_kill_9) | test(many_calvin_writes_survive_immediate_kill_9) | test(wal_replay_restart_keeps_governor_accounting_sane) | test(alter_add_column_does_not_stall_writes) | test(reindex_vector_concurrent_p99) | test(count_star_sees_flushed_partitions) | test(timeseries_flush_does_not_over_release_engine_budget) | test(timeseries_governor_reflects_resident_memtable_after_flush)'
+filter = 'binary(graph_cross_core_bfs) | test(query_stream_returns_all_rows_across_chunks) | test(streaming_select_returns_all_rows_across_chunks) | test(graph_node_labels_survive_kill_9) | test(spatial_document_geometry_survives_kill_9) | test(many_calvin_writes_survive_immediate_kill_9) | test(wal_replay_restart_keeps_governor_accounting_sane) | test(alter_add_column_does_not_stall_writes) | test(reindex_vector_concurrent_p99) | test(count_star_sees_flushed_partitions) | test(timeseries_flush_does_not_over_release_engine_budget) | test(timeseries_governor_reflects_resident_memtable_after_flush) | test(resp_kv_set_survives_kill_9) | test(http_query_kv_write_survives_kill_9)'
 test-group = 'load-sensitive'
 threads-required = 'num-test-threads'
 
