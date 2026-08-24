@@ -139,6 +139,16 @@ impl<S: LogStorage> RaftNode<S> {
         // recognises this term, which is all a leadership check needs.
         leader.record_ack(peer);
 
+        // Same signal drives check-quorum: this peer has answered, so a
+        // majority may now have answered inside the current contact window.
+        if peer_is_voter {
+            self.refresh_quorum_contact(std::time::Instant::now());
+        }
+        let leader = match self.leader_state.as_mut() {
+            Some(ls) => ls,
+            None => return,
+        };
+
         if resp.success {
             let new_match = resp.last_log_index;
             if new_match > leader.match_index_for(peer) {

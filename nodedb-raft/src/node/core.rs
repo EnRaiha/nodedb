@@ -3,7 +3,8 @@
 //! `RaftNode` struct, constructors, simple accessors, `tick`, and `propose`.
 //!
 //! Applied-index durability and log compaction live in
-//! [`super::durability`]. Membership mutation (add/remove voter,
+//! [`super::durability`]. Check-quorum contact tracking lives in
+//! [`super::quorum_contact`]. Membership mutation (add/remove voter,
 //! add/remove/promote learner) lives in [`super::membership`]. State transitions (election, `become_leader`,
 //! replication) live in [`super::internal`]. RPC handlers live in
 //! [`super::rpc`].
@@ -20,6 +21,7 @@ use crate::state::{
 use crate::storage::LogStorage;
 
 use super::config::RaftConfig;
+use tracing::info;
 
 /// Output actions produced by a tick or RPC handler.
 ///
@@ -102,6 +104,14 @@ pub struct RaftNode<S: LogStorage> {
     /// that measure, and a fully caught-up follower in an idle cluster looks
     /// stale. Heartbeats refresh this even when nothing is being written.
     pub(super) leader_contact: Option<LeaderContact>,
+    /// When a quorum of voters last answered this leader. `None` off the
+    /// leader path. Drives check-quorum step-down (see
+    /// [`super::quorum_contact`]).
+    pub(super) last_quorum_contact: Option<Instant>,
+    /// Per-voter `ack_count` readings taken when the current contact window
+    /// opened. A voter whose count has risen above its reading has answered
+    /// inside the window.
+    pub(super) quorum_window: Vec<(u64, u64)>,
 }
 
 /// A leader's commit index as of its last contact with this node.
@@ -143,6 +153,8 @@ impl<S: LogStorage> RaftNode<S> {
             pre_vote: None,
             durable_applied: 0,
             leader_contact: None,
+            last_quorum_contact: None,
+            quorum_window: Vec::new(),
             config,
         }
     }
@@ -312,6 +324,21 @@ impl<S: LogStorage> RaftNode<S> {
                     .is_some_and(|t| now >= t.deadline);
                 if transfer_expired {
                     self.leadership_transfer = None;
+                }
+
+                // Check-quorum. Refresh first so a single-voter group, which
+                // has no peers to answer and never reaches the response path,
+                // renews on its own quorum of one.
+                self.refresh_quorum_contact(now);
+                if self.quorum_contact_lost(now) {
+                    info!(
+                        node = self.config.node_id,
+                        group = self.config.group_id,
+                        term = self.hard_state.current_term,
+                        "no quorum contact within the election timeout; stepping down"
+                    );
+                    self.become_follower(self.hard_state.current_term);
+                    return;
                 }
 
                 if now >= self.heartbeat_deadline {

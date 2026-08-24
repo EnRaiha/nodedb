@@ -11,6 +11,8 @@
 //!   commit advancement) and timeout math.
 //! - [`membership`]: Dynamic configuration changes — add/remove voters,
 //!   add/remove/promote learners.
+//! - [`quorum_contact`]: Check-quorum — tracking when a majority last
+//!   answered the leader, and stepping down when none has.
 //! - [`read_index`]: Confirming leadership against a quorum before serving a
 //!   linearizable read.
 //! - [`rpc`]: Incoming RPC handlers (`AppendEntries`, `PreVote`,
@@ -24,6 +26,7 @@ pub mod core;
 pub mod durability;
 mod internal;
 pub mod membership;
+pub mod quorum_contact;
 pub mod read_index;
 pub mod rpc;
 pub mod staleness;

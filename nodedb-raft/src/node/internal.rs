@@ -133,6 +133,9 @@ impl<S: LogStorage> RaftNode<S> {
         // Any in-progress leadership transfer is moot once we step down.
         self.leadership_transfer = None;
         self.pre_vote = None;
+        // The contact window belongs to a leader term; it means nothing here.
+        self.last_quorum_contact = None;
+        self.quorum_window.clear();
         self.persist_hard_state();
         self.reset_election_timeout();
 
@@ -164,6 +167,9 @@ impl<S: LogStorage> RaftNode<S> {
             ls.add_peer(learner, self.log.last_index());
         }
         self.leader_state = Some(ls);
+        // Winning the election required a quorum of votes, so the contact
+        // window opens proven rather than empty.
+        self.arm_quorum_window(std::time::Instant::now());
 
         info!(
             node = self.config.node_id,
