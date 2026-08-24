@@ -35,7 +35,7 @@ use std::time::Duration;
 use nodedb::types::{DatabaseId, VShardId};
 use tokio_postgres::SimpleQueryMessage;
 
-use common::cluster_harness::{TestClusterNode, wait_for};
+use common::cluster_harness::{TestClusterNode, read_once_a_leader_exists, wait_for};
 
 /// Observed sequencer-group leader id from a node's local Raft status, or `0`
 /// if no leader is known yet. Same shape as the sibling `single_node_calvin_*`
@@ -83,15 +83,22 @@ fn distinct_vshard_bitemporal_collections() -> (String, String) {
 
 /// Current `value` for `id` in a bitemporal document collection, or `None` if
 /// not visible.
-async fn current_value(client: &tokio_postgres::Client, coll: &str, id: &str) -> Option<String> {
+///
+/// Returns the driver error rather than panicking so the caller can absorb the
+/// retriable no-leader refusal a read gets while a range is still electing —
+/// which is the normal state for the first moments after a restart.
+async fn current_value(
+    client: &tokio_postgres::Client,
+    coll: &str,
+    id: &str,
+) -> Result<Option<String>, tokio_postgres::Error> {
     let msgs = client
         .simple_query(&format!("SELECT value FROM {coll} WHERE id = '{id}'"))
-        .await
-        .expect("SELECT current value by id");
-    msgs.iter().find_map(|m| match m {
+        .await?;
+    Ok(msgs.iter().find_map(|m| match m {
         SimpleQueryMessage::Row(r) => r.get("value").map(str::to_owned),
         _ => None,
-    })
+    }))
 }
 
 /// Sorted `_ts_system` stamps of every audit-log version (`AS OF SYSTEM TIME
@@ -99,13 +106,18 @@ async fn current_value(client: &tokio_postgres::Client, coll: &str, id: &str) ->
 /// SQL — `AS OF SYSTEM TIME NULL` combined with `WHERE` is not exercised
 /// elsewhere in the suite, so this avoids depending on unverified parser
 /// support. Exactly one element means exactly one system-time version.
-async fn audit_system_stamps(client: &tokio_postgres::Client, coll: &str, id: &str) -> Vec<String> {
+///
+/// Propagates the driver error for the same reason as [`current_value`].
+async fn audit_system_stamps(
+    client: &tokio_postgres::Client,
+    coll: &str,
+    id: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
     let msgs = client
         .simple_query(&format!(
             "SELECT id, _ts_system FROM {coll} AS OF SYSTEM TIME NULL"
         ))
-        .await
-        .expect("SELECT audit log (all versions)");
+        .await?;
     let mut stamps: Vec<String> = msgs
         .iter()
         .filter_map(|m| match m {
@@ -120,7 +132,7 @@ async fn audit_system_stamps(client: &tokio_postgres::Client, coll: &str, id: &s
         })
         .collect();
     stamps.sort();
-    stamps
+    Ok(stamps)
 }
 
 /// A best-effort Calvin cross-shard COMMIT into two `bitemporal=true` document
@@ -213,10 +225,34 @@ async fn calvin_multi_shard_bitemporal_best_effort_commit_survives_wal_only_rest
     let (stamp_a, stamp_b);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let val_a = current_value(&node.client, &coll_a, "a1").await;
-        let val_b = current_value(&node.client, &coll_b, "b1").await;
-        let stamps_a = audit_system_stamps(&node.client, &coll_a, "a1").await;
-        let stamps_b = audit_system_stamps(&node.client, &coll_b, "b1").await;
+        let val_a = read_once_a_leader_exists(
+            "current value of a1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || current_value(&node.client, &coll_a, "a1"),
+        )
+        .await;
+        let val_b = read_once_a_leader_exists(
+            "current value of b1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || current_value(&node.client, &coll_b, "b1"),
+        )
+        .await;
+        let stamps_a = read_once_a_leader_exists(
+            "audit stamps of a1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || audit_system_stamps(&node.client, &coll_a, "a1"),
+        )
+        .await;
+        let stamps_b = read_once_a_leader_exists(
+            "audit stamps of b1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || audit_system_stamps(&node.client, &coll_b, "b1"),
+        )
+        .await;
         if val_a.as_deref() == Some("va")
             && val_b.as_deref() == Some("vb")
             && stamps_a.len() == 1
@@ -257,10 +293,34 @@ async fn calvin_multi_shard_bitemporal_best_effort_commit_survives_wal_only_rest
     // re-deriving one from the replay-time clock and appending a second version.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let val_a = current_value(&node.client, &coll_a, "a1").await;
-        let val_b = current_value(&node.client, &coll_b, "b1").await;
-        let stamps_a = audit_system_stamps(&node.client, &coll_a, "a1").await;
-        let stamps_b = audit_system_stamps(&node.client, &coll_b, "b1").await;
+        let val_a = read_once_a_leader_exists(
+            "current value of a1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || current_value(&node.client, &coll_a, "a1"),
+        )
+        .await;
+        let val_b = read_once_a_leader_exists(
+            "current value of b1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || current_value(&node.client, &coll_b, "b1"),
+        )
+        .await;
+        let stamps_a = read_once_a_leader_exists(
+            "audit stamps of a1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || audit_system_stamps(&node.client, &coll_a, "a1"),
+        )
+        .await;
+        let stamps_b = read_once_a_leader_exists(
+            "audit stamps of b1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || audit_system_stamps(&node.client, &coll_b, "b1"),
+        )
+        .await;
         if val_a.as_deref() == Some("va")
             && val_b.as_deref() == Some("vb")
             && stamps_a == [stamp_a.as_str()]

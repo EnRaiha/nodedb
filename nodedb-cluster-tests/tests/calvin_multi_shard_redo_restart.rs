@@ -28,7 +28,7 @@ use std::time::Duration;
 use nodedb::types::{DatabaseId, VShardId};
 use tokio_postgres::SimpleQueryMessage;
 
-use common::cluster_harness::{TestClusterNode, wait_for};
+use common::cluster_harness::{TestClusterNode, read_once_a_leader_exists, wait_for};
 
 /// Observed sequencer-group leader id from a node's local Raft status, or `0`
 /// if no leader is known yet. Same shape as the sibling `single_node_calvin_*`
@@ -76,37 +76,44 @@ fn distinct_vshard_collections() -> (String, String) {
 
 /// Single-row `col` value for `id` in a KV/document collection, or `None` if
 /// not visible.
+///
+/// Returns the driver error rather than panicking so the caller can absorb the
+/// retriable no-leader refusal a read gets while a range is still electing —
+/// which is the normal state for the first moments after a restart.
 async fn value_of(
     client: &tokio_postgres::Client,
     coll: &str,
     col: &str,
     id: &str,
-) -> Option<String> {
+) -> Result<Option<String>, tokio_postgres::Error> {
     let msgs = client
         .simple_query(&format!("SELECT {col} FROM {coll} WHERE id = '{id}'"))
-        .await
-        .expect("SELECT by id");
-    msgs.iter().find_map(|m| match m {
+        .await?;
+    Ok(msgs.iter().find_map(|m| match m {
         SimpleQueryMessage::Row(r) => r.get(col).map(str::to_owned),
         _ => None,
-    })
+    }))
 }
 
 /// Nearest-neighbour `id` to `axis` on the collection's vector index (`None`
 /// when the index has no reachable rows).
-async fn nearest_id(client: &tokio_postgres::Client, coll: &str, axis: [f32; 3]) -> Option<String> {
+/// Propagates the driver error for the same reason as [`value_of`].
+async fn nearest_id(
+    client: &tokio_postgres::Client,
+    coll: &str,
+    axis: [f32; 3],
+) -> Result<Option<String>, tokio_postgres::Error> {
     let msgs = client
         .simple_query(&format!(
             "SELECT id FROM {coll} \
              ORDER BY vector_distance(embedding, ARRAY[{},{},{}]) LIMIT 1",
             axis[0], axis[1], axis[2]
         ))
-        .await
-        .expect("vector search");
-    msgs.iter().find_map(|m| match m {
+        .await?;
+    Ok(msgs.iter().find_map(|m| match m {
         SimpleQueryMessage::Row(r) => r.get("id").map(str::to_owned),
         _ => None,
-    })
+    }))
 }
 
 /// A multi-shard write (KV row + vector-indexed document row) buffered inside
@@ -196,8 +203,20 @@ async fn calvin_multi_shard_write_in_explicit_block_commits_and_survives_restart
     // The Calvin flush lands asynchronously after the completion ack, so poll.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let kv_v = value_of(&node.client, &kv, "v", "k1").await;
-        let near = nearest_id(&node.client, &vecdocs, [0.1, 0.2, 0.3]).await;
+        let kv_v = read_once_a_leader_exists(
+            "kv value of k1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || value_of(&node.client, &kv, "v", "k1"),
+        )
+        .await;
+        let near = read_once_a_leader_exists(
+            "nearest vector to the inserted embedding",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || nearest_id(&node.client, &vecdocs, [0.1, 0.2, 0.3]),
+        )
+        .await;
         if kv_v.as_deref() == Some("42") && near.as_deref() == Some("d1") {
             break;
         }
@@ -229,9 +248,27 @@ async fn calvin_multi_shard_write_in_explicit_block_commits_and_survives_restart
     // transaction's redo records on replay.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let kv_v = value_of(&node.client, &kv, "v", "k1").await;
-        let doc_v = value_of(&node.client, &vecdocs, "body", "d1").await;
-        let near = nearest_id(&node.client, &vecdocs, [0.1, 0.2, 0.3]).await;
+        let kv_v = read_once_a_leader_exists(
+            "kv value of k1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || value_of(&node.client, &kv, "v", "k1"),
+        )
+        .await;
+        let doc_v = read_once_a_leader_exists(
+            "document body of d1",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || value_of(&node.client, &vecdocs, "body", "d1"),
+        )
+        .await;
+        let near = read_once_a_leader_exists(
+            "nearest vector to the inserted embedding",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || nearest_id(&node.client, &vecdocs, [0.1, 0.2, 0.3]),
+        )
+        .await;
         if kv_v.as_deref() == Some("42")
             && doc_v.as_deref() == Some("hello")
             && near.as_deref() == Some("d1")

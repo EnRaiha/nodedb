@@ -19,8 +19,10 @@
 
 pub mod cluster;
 pub mod node;
+pub mod retriable;
 pub mod wait;
 
 pub use cluster::TestCluster;
 pub use node::TestClusterNode;
+pub use retriable::{is_no_serving_leader, read_once_a_leader_exists};
 pub use wait::{wait_for, wait_for_async};
