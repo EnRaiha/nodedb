@@ -134,8 +134,15 @@ mod tests {
 
     fn roundtrip_req(req: AssignSurrogateRequest) -> AssignSurrogateRequest {
         let rpc = RaftRpc::AssignSurrogateRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::AssignSurrogateRequest(r) => r,
             other => panic!("expected AssignSurrogateRequest, got {other:?}"),
         }
@@ -143,8 +150,15 @@ mod tests {
 
     fn roundtrip_resp(resp: AssignSurrogateResponse) -> AssignSurrogateResponse {
         let rpc = RaftRpc::AssignSurrogateResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::AssignSurrogateResponse(r) => r,
             other => panic!("expected AssignSurrogateResponse, got {other:?}"),
         }

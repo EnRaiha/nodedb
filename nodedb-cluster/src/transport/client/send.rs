@@ -168,7 +168,7 @@ impl NexarTransport {
         // Encode the inner RPC once (codec errors are not retryable).
         // Each retry wraps it in a fresh envelope so the seq advances
         // per attempt — a retry is a new frame, not a replayed frame.
-        let inner = rpc_codec::encode(&rpc)?;
+        let inner = rpc_codec::encode(&rpc, &self.auth.epoch)?;
 
         let mut last_err = None;
         for attempt in 0..self.retry_policy.max_attempts {
@@ -294,7 +294,7 @@ impl NexarTransport {
                 if fields.from_node_id != local_node_id {
                     auth.peer_seq_in.accept(fields.from_node_id, fields.seq)?;
                 }
-                match rpc_codec::decode(inner_frame)? {
+                match rpc_codec::decode(inner_frame, &auth.epoch)? {
                     RaftRpc::ExecuteStreamChunk(chunk) => {
                         yield (chunk.payload, chunk.watermark_lsn);
                     }
@@ -404,7 +404,7 @@ impl NexarTransport {
 
     /// Encode and wrap an RPC in an authenticated envelope.
     fn wrap_outbound(&self, rpc: &RaftRpc) -> Result<Vec<u8>> {
-        let inner = rpc_codec::encode(rpc)?;
+        let inner = rpc_codec::encode(rpc, &self.auth.epoch)?;
         self.wrap_inner(&inner)
     }
 
@@ -483,7 +483,7 @@ impl NexarTransport {
                 .peer_seq_in
                 .accept(fields.from_node_id, fields.seq)?;
         }
-        rpc_codec::decode(inner_frame)
+        rpc_codec::decode(inner_frame, &self.auth.epoch)
     }
 }
 
@@ -571,7 +571,7 @@ impl ShufflePushStream {
 /// `seq` — the standalone form of [`NexarTransport::wrap_outbound`] for the
 /// owned-[`AuthContext`] [`ShufflePushStream`].
 fn wrap_with_auth(auth: &AuthContext, rpc: &RaftRpc) -> Result<Vec<u8>> {
-    let inner = rpc_codec::encode(rpc)?;
+    let inner = rpc_codec::encode(rpc, &auth.epoch)?;
     let seq = auth.peer_seq_out.next();
     let mut out = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
     auth_envelope::write_envelope(auth.local_node_id, seq, &inner, &auth.mac_key, &mut out)?;

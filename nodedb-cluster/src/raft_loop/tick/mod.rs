@@ -12,4 +12,5 @@
 mod apply_committed;
 mod core;
 mod dispatch_outbound;
+mod epoch_bump;
 mod snapshot_dispatch;

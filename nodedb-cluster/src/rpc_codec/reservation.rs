@@ -173,8 +173,15 @@ mod tests {
 
     fn roundtrip_reserve_req(req: ReserveReadRequest) -> ReserveReadRequest {
         let rpc = RaftRpc::ReserveReadRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ReserveReadRequest(r) => r,
             other => panic!("expected ReserveReadRequest, got {other:?}"),
         }
@@ -182,8 +189,15 @@ mod tests {
 
     fn roundtrip_reserve_resp(resp: ReserveReadResponse) -> ReserveReadResponse {
         let rpc = RaftRpc::ReserveReadResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ReserveReadResponse(r) => r,
             other => panic!("expected ReserveReadResponse, got {other:?}"),
         }
@@ -191,8 +205,15 @@ mod tests {
 
     fn roundtrip_release_req(req: ReleaseReservationRequest) -> ReleaseReservationRequest {
         let rpc = RaftRpc::ReleaseReservationRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ReleaseReservationRequest(r) => r,
             other => panic!("expected ReleaseReservationRequest, got {other:?}"),
         }
@@ -200,8 +221,15 @@ mod tests {
 
     fn roundtrip_release_resp(resp: ReleaseReservationResponse) -> ReleaseReservationResponse {
         let rpc = RaftRpc::ReleaseReservationResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ReleaseReservationResponse(r) => r,
             other => panic!("expected ReleaseReservationResponse, got {other:?}"),
         }

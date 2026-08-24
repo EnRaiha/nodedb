@@ -174,8 +174,14 @@ mod tests {
     use super::*;
 
     fn roundtrip(rpc: RaftRpc) -> RaftRpc {
-        let encoded = super::super::encode(&rpc).unwrap();
-        super::super::decode(&encoded).unwrap()
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
     }
 
     #[test]

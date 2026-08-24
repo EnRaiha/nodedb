@@ -145,8 +145,11 @@ pub enum RaftRpc {
     DataProposeResponse(DataProposeResponse),
 }
 
-/// Encode a [`RaftRpc`] into a framed binary message.
-pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
+/// Encode a [`RaftRpc`] into a framed binary message stamped with `epoch`.
+///
+/// `epoch` is the sending node's own state; the frame carries the generation
+/// that node has applied.
+pub fn encode(rpc: &RaftRpc, epoch: &crate::cluster_epoch::ClusterEpochState) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(HEADER_SIZE + 64);
     match rpc {
         RaftRpc::AppendEntriesRequest(m) => raft_msgs::encode_append_entries_req(m, &mut out),
@@ -210,6 +213,7 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
+    super::header::stamp_epoch(&mut out, epoch)?;
     Ok(out)
 }
 
@@ -217,8 +221,11 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
 ///
 /// The outer envelope allows peers to detect and reject incompatible future
 /// wire versions rather than silently misinterpreting them.
-pub fn versioned_encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
-    let framed = encode(rpc)?;
+pub fn versioned_encode(
+    rpc: &RaftRpc,
+    epoch: &crate::cluster_epoch::ClusterEpochState,
+) -> Result<Vec<u8>> {
+    let framed = encode(rpc, epoch)?;
     wrap_bytes_versioned(&framed).map_err(|e| ClusterError::Codec {
         detail: format!("RaftRpc versioned encode: {e}"),
     })
@@ -232,16 +239,20 @@ pub fn versioned_encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
 /// The v1 fallback preserves wire compat with peers running pre-versioning
 /// cluster code: if the bytes do not match the `fixarray(2)` envelope shape,
 /// they are passed directly to [`decode`] as-is.
-pub fn versioned_decode(data: &[u8]) -> Result<RaftRpc> {
+pub fn versioned_decode(
+    data: &[u8],
+    epoch: &crate::cluster_epoch::ClusterEpochState,
+) -> Result<RaftRpc> {
     let inner = unwrap_bytes_versioned(data).map_err(|e| ClusterError::Codec {
         detail: format!("RaftRpc versioned decode: {e}"),
     })?;
-    decode(inner)
+    decode(inner, epoch)
 }
 
-/// Decode a framed binary message into a [`RaftRpc`].
-pub fn decode(data: &[u8]) -> Result<RaftRpc> {
-    let (rpc_type, payload) = super::header::parse_frame(data)?;
+/// Decode a framed binary message into a [`RaftRpc`], recording the sender's
+/// stamped epoch as an observation in `epoch`.
+pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> Result<RaftRpc> {
+    let (rpc_type, payload) = super::header::parse_frame(data, epoch)?;
     match rpc_type {
         RPC_APPEND_ENTRIES_REQ => raft_msgs::decode_append_entries_req(payload),
         RPC_APPEND_ENTRIES_RESP => raft_msgs::decode_append_entries_resp(payload),
@@ -318,11 +329,16 @@ mod tests {
             term: 1,
             vote_granted: false,
         });
-        let mut encoded = encode(&rpc).unwrap();
+        let mut encoded =
+            encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         if let Some(last) = encoded.last_mut() {
             *last ^= 0x01;
         }
-        let err = decode(&encoded).unwrap_err();
+        let err = decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("CRC32C mismatch"), "{err}");
     }
 
@@ -332,9 +348,14 @@ mod tests {
             term: 1,
             vote_granted: false,
         });
-        let mut encoded = encode(&rpc).unwrap();
+        let mut encoded =
+            encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         encoded[0] = 99;
-        let err = decode(&encoded).unwrap_err();
+        let err = decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("unsupported wire version"),
             "{err}"
@@ -345,7 +366,11 @@ mod tests {
     fn truncated_frame_rejected() {
         // Version byte 3 (RPC_FRAME_VERSION) passes version check; then header
         // size check fires because we only have 3 bytes total.
-        let err = decode(&[3, 2, 3]).unwrap_err();
+        let err = decode(
+            &[3, 2, 3],
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("frame too short"), "{err}");
     }
 
@@ -355,9 +380,14 @@ mod tests {
             term: 1,
             vote_granted: false,
         });
-        let mut encoded = encode(&rpc).unwrap();
+        let mut encoded =
+            encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         encoded[1] = 255;
-        let err = decode(&encoded).unwrap_err();
+        let err = decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown rpc_type"), "{err}");
     }
 
@@ -369,7 +399,7 @@ mod tests {
         frame[1] = RPC_APPEND_ENTRIES_REQ;
         let huge: u32 = MAX_RPC_PAYLOAD_SIZE + 1;
         frame[2..6].copy_from_slice(&huge.to_le_bytes());
-        let err = decode(&frame).unwrap_err();
+        let err = decode(&frame, &crate::cluster_epoch::ClusterEpochState::default()).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"), "{err}");
     }
 
@@ -380,7 +410,7 @@ mod tests {
             success: true,
             last_log_index: 5,
         });
-        let encoded = encode(&rpc).unwrap();
+        let encoded = encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         let header: [u8; HEADER_SIZE] = encoded[..HEADER_SIZE].try_into().unwrap();
         let size = frame_size(&header).unwrap();
         assert_eq!(size, encoded.len());

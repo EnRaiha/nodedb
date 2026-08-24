@@ -79,7 +79,7 @@ impl ChunkSink for QuicChunkSink<'_> {
             payload,
             watermark_lsn,
         });
-        let inner = rpc_codec::encode(&rpc)?;
+        let inner = rpc_codec::encode(&rpc, &self.auth.epoch)?;
         let seq = self.auth.peer_seq_out.next();
         let mut envelope = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
         auth_envelope::write_envelope(
@@ -273,7 +273,7 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
 
         // 3. Decode before the identity decision so an unknown, CA-verified
         // peer can be restricted to exactly one enrollment operation.
-        let request = rpc_codec::decode(inner_frame)?;
+        let request = rpc_codec::decode(inner_frame, &auth.epoch)?;
         validate_join_sender(&request, fields.from_node_id)?;
 
         // 3b. Bind the MAC-authenticated node id to the mTLS leaf identity.
@@ -332,7 +332,7 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
             };
 
             let end_rpc = RaftRpc::ExecuteStreamEnd(ExecuteStreamEnd { error: terminal });
-            let end_inner = rpc_codec::encode(&end_rpc)?;
+            let end_inner = rpc_codec::encode(&end_rpc, &auth.epoch)?;
             let end_seq = auth.peer_seq_out.next();
             let mut end_envelope =
                 Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + end_inner.len());
@@ -387,7 +387,7 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
                     auth.peer_seq_in
                         .accept(frame_fields.from_node_id, frame_fields.seq)?;
                 }
-                match rpc_codec::decode(frame_inner)? {
+                match rpc_codec::decode(frame_inner, &auth.epoch)? {
                     RaftRpc::ShufflePushChunk(chunk) => {
                         handler
                             .on_shuffle_chunk(shuffle_id, part, side, chunk.payload)
@@ -424,7 +424,7 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
 
         // 5. Wrap the response in its own envelope. `from = local_node_id`,
         //    `seq = next outbound seq scoped to the caller`.
-        let response_inner = rpc_codec::encode(&response)?;
+        let response_inner = rpc_codec::encode(&response, &auth.epoch)?;
         let response_seq = auth.peer_seq_out.next();
         let mut response_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + response_inner.len());

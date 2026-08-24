@@ -187,8 +187,15 @@ mod tests {
 
     fn roundtrip_req(req: SubmitCalvinTxnRequest) -> SubmitCalvinTxnRequest {
         let rpc = RaftRpc::SubmitCalvinTxnRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::SubmitCalvinTxnRequest(r) => r,
             other => panic!("expected SubmitCalvinTxnRequest, got {other:?}"),
         }
@@ -196,8 +203,15 @@ mod tests {
 
     fn roundtrip_resp(resp: SubmitCalvinTxnResponse) -> SubmitCalvinTxnResponse {
         let rpc = RaftRpc::SubmitCalvinTxnResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::SubmitCalvinTxnResponse(r) => r,
             other => panic!("expected SubmitCalvinTxnResponse, got {other:?}"),
         }
@@ -258,8 +272,15 @@ mod tests {
 
     fn roundtrip_inbox_req(req: SubmitCalvinInboxRequest) -> SubmitCalvinInboxRequest {
         let rpc = RaftRpc::SubmitCalvinInboxRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::SubmitCalvinInboxRequest(r) => r,
             other => panic!("expected SubmitCalvinInboxRequest, got {other:?}"),
         }
@@ -267,8 +288,15 @@ mod tests {
 
     fn roundtrip_inbox_resp(resp: SubmitCalvinInboxResponse) -> SubmitCalvinInboxResponse {
         let rpc = RaftRpc::SubmitCalvinInboxResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::SubmitCalvinInboxResponse(r) => r,
             other => panic!("expected SubmitCalvinInboxResponse, got {other:?}"),
         }

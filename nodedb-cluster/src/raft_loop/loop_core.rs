@@ -129,6 +129,10 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// per leadership acquisition. `AtomicBool` because [`super::tick::do_tick`]
     /// runs against `&self`.
     pub(super) prev_metadata_leader: std::sync::atomic::AtomicBool,
+    /// This node's cluster-epoch state, shared with the transport's
+    /// `AuthContext` so outbound frames stamp the generation this node has
+    /// applied. Advanced by the applier when a `ClusterEpochBump` commits.
+    pub(crate) cluster_epoch: std::sync::Arc<crate::cluster_epoch::ClusterEpochState>,
 
     /// Optional quarantine hook for the snapshot receive path.
     ///
@@ -290,6 +294,10 @@ impl<A: CommitApplier> RaftLoop<A> {
         applier: A,
     ) -> Self {
         let node_id = multi_raft.node_id();
+        // Share the transport's epoch state rather than making a second one:
+        // the generation this node applies and the generation it stamps must
+        // be the same fact.
+        let cluster_epoch = transport.cluster_epoch();
         let (shutdown_watch, _) = tokio::sync::watch::channel(false);
         let (ready_watch, _) = tokio::sync::watch::channel(false);
         Self {
@@ -308,6 +316,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             loop_metrics: LoopMetrics::new("raft_tick_loop"),
             group_watchers: Arc::new(GroupAppliedWatchers::new()),
             prev_metadata_leader: std::sync::atomic::AtomicBool::new(false),
+            cluster_epoch,
             snapshot_quarantine_hook: None,
             shuffle_receiver: None,
             shuffle_producer: None,

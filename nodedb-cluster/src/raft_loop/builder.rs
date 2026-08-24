@@ -42,6 +42,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             loop_metrics: self.loop_metrics,
             group_watchers: self.group_watchers,
             prev_metadata_leader: self.prev_metadata_leader,
+            cluster_epoch: self.cluster_epoch,
             snapshot_quarantine_hook: self.snapshot_quarantine_hook,
             shuffle_receiver: self.shuffle_receiver,
             shuffle_producer: self.shuffle_producer,
@@ -289,8 +290,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // failure to load is treated as a fresh catalog (epoch 0); a
         // genuine catalog read error would have surfaced from earlier
         // catalog operations on this same handle.
-        if let Err(e) = crate::cluster_epoch::init_local_cluster_epoch_from_catalog(&catalog) {
-            tracing::warn!(error = %e, "failed to load persisted cluster_epoch; defaulting to 0");
+        match crate::cluster_epoch::load_persisted_epoch(&catalog) {
+            Ok(epoch) => self.cluster_epoch.advance_applied(epoch),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not load the persisted cluster epoch; starting at 0")
+            }
         }
         self.catalog = Some(catalog);
         self

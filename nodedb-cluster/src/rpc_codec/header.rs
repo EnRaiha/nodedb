@@ -14,7 +14,7 @@
 //! Every frame is emitted with `RPC_FRAME_VERSION` in the version byte.
 //! Frames with any other version byte are rejected immediately.
 
-use crate::cluster_epoch::{current_local_cluster_epoch, observe_peer_cluster_epoch};
+use crate::cluster_epoch::ClusterEpochState;
 use crate::error::{ClusterError, Result};
 
 /// Header size in bytes: version(1) + rpc_type(1) + payload_len(4) + crc32c(4) + cluster_epoch(8).
@@ -31,20 +31,47 @@ pub const MAX_RPC_PAYLOAD_SIZE: u32 = 64 * 1024 * 1024;
 /// Write a framed v3 header + payload into `out`.
 ///
 /// `rpc_type` is the discriminant byte; `payload` is the already-serialized
-/// body. The current cluster epoch (read from
-/// [`current_local_cluster_epoch`]) is stamped into the header.
+/// body.
+///
+/// The epoch field is left at zero here and filled in by [`stamp_epoch`] once,
+/// at the point the message is encoded for a specific node. Per-message
+/// encoders have no node to speak for, and threading one through all of them
+/// to write a single fixed-offset field would put the same value in nineteen
+/// places instead of one.
 pub fn write_frame(rpc_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let payload_len: u32 = payload.len().try_into().map_err(|_| ClusterError::Codec {
         detail: format!("payload too large: {} bytes", payload.len()),
     })?;
     let crc = crc32c::crc32c(payload);
-    let epoch = current_local_cluster_epoch();
     out.push(RPC_FRAME_VERSION);
     out.push(rpc_type);
     out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&epoch.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Write the sender's APPLIED epoch into an already-framed message.
+///
+/// The applied epoch is the topology generation this node is actually
+/// operating on. A node must never stamp an epoch it has merely overheard
+/// from a peer: that would advertise a generation it has not reached, and
+/// every receiver would take it at face value.
+///
+/// The epoch occupies a fixed 8-byte field in the header, so this rewrites it
+/// in place rather than rebuilding the frame. The CRC covers the payload only,
+/// so stamping does not invalidate it.
+pub fn stamp_epoch(frame: &mut [u8], epoch: &ClusterEpochState) -> Result<()> {
+    if frame.len() < HEADER_SIZE {
+        return Err(ClusterError::Codec {
+            detail: format!(
+                "cannot stamp epoch: frame is {} bytes, need {HEADER_SIZE}",
+                frame.len()
+            ),
+        });
+    }
+    frame[10..18].copy_from_slice(&epoch.applied().to_le_bytes());
     Ok(())
 }
 
@@ -52,9 +79,10 @@ pub fn write_frame(rpc_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()
 ///
 /// `data` must start at byte 0 (version byte). Returns `(rpc_type, payload)`.
 ///
-/// Side effect: observes the peer's cluster epoch via
-/// [`observe_peer_cluster_epoch`] (monotonic max).
-pub fn parse_frame(data: &[u8]) -> Result<(u8, &[u8])> {
+/// Side effect: records the peer's stamped epoch as an OBSERVATION. It raises
+/// this node's observed mark only — a peer's stamp says where the peer is, and
+/// nothing about which generation this node has applied.
+pub fn parse_frame<'a>(data: &'a [u8], epoch: &ClusterEpochState) -> Result<(u8, &'a [u8])> {
     if data.is_empty() {
         return Err(ClusterError::Codec {
             detail: format!("frame too short: 0 bytes, need {HEADER_SIZE}"),
@@ -110,7 +138,7 @@ pub fn parse_frame(data: &[u8]) -> Result<(u8, &[u8])> {
     }
 
     if peer_epoch > 0 {
-        observe_peer_cluster_epoch(peer_epoch);
+        epoch.observe(peer_epoch);
     }
 
     Ok((rpc_type, payload))
@@ -169,7 +197,8 @@ mod tests {
     fn parse_frame_accepts_current_version() {
         let payload = b"world";
         let frame = make_frame(payload, 0);
-        let (_t, body) = parse_frame(&frame).expect("current version must be accepted");
+        let state = ClusterEpochState::default();
+        let (_t, body) = parse_frame(&frame, &state).expect("current version must be accepted");
         assert_eq!(body, payload);
     }
 
@@ -177,7 +206,8 @@ mod tests {
     fn parse_frame_rejects_n_plus_one() {
         let payload = b"future";
         let frame = make_short_frame(RPC_FRAME_VERSION.saturating_add(1), payload);
-        let err = parse_frame(&frame).expect_err("N+1 must be rejected");
+        let err =
+            parse_frame(&frame, &ClusterEpochState::default()).expect_err("N+1 must be rejected");
         match err {
             ClusterError::UnsupportedWireVersion {
                 got,
@@ -197,7 +227,8 @@ mod tests {
         for version in [1u8, 2u8] {
             let payload = b"old";
             let frame = make_short_frame(version, payload);
-            let err = parse_frame(&frame).expect_err(&format!("v{version} must be rejected"));
+            let err = parse_frame(&frame, &ClusterEpochState::default())
+                .expect_err(&format!("v{version} must be rejected"));
             assert!(
                 matches!(
                     err,
@@ -212,27 +243,72 @@ mod tests {
     fn parse_frame_rejects_version_zero() {
         let payload = b"zero";
         let frame = make_short_frame(0, payload);
-        let err = parse_frame(&frame).expect_err("version 0 must be rejected");
+        let err = parse_frame(&frame, &ClusterEpochState::default())
+            .expect_err("version 0 must be rejected");
         assert!(matches!(
             err,
             ClusterError::UnsupportedWireVersion { got: 0, .. }
         ));
     }
 
+    /// A frame carries the sender's applied generation, and the receiver
+    /// records it as an observation about the sender.
     #[test]
-    fn v3_frame_round_trips_with_epoch() {
-        use crate::cluster_epoch::set_local_cluster_epoch;
-        set_local_cluster_epoch(0);
-        set_local_cluster_epoch(7);
+    fn a_frame_carries_the_senders_applied_epoch() {
+        let sender = ClusterEpochState::new(7);
         let payload = b"epoch-bound";
         let mut buf = Vec::new();
         write_frame(0xAB, payload, &mut buf).unwrap();
-        set_local_cluster_epoch(0);
-        let (rpc_type, body) = parse_frame(&buf).unwrap();
+        stamp_epoch(&mut buf, &sender).unwrap();
+
+        let receiver = ClusterEpochState::new(0);
+        let (rpc_type, body) = parse_frame(&buf, &receiver).unwrap();
         assert_eq!(rpc_type, 0xAB);
         assert_eq!(body, payload);
-        assert_eq!(crate::cluster_epoch::current_local_cluster_epoch(), 7);
-        set_local_cluster_epoch(0);
+        assert_eq!(receiver.observed(), 7, "the sender's stamp is observed");
+        assert_eq!(
+            receiver.applied(),
+            0,
+            "and it does not promote the receiver's own generation"
+        );
+        assert!(receiver.is_behind());
+    }
+
+    /// A node that has only overheard a newer epoch keeps stamping the one it
+    /// applied. Advertising a generation it has not reached would make every
+    /// receiver believe it.
+    #[test]
+    fn a_node_that_is_behind_still_stamps_what_it_applied() {
+        let state = ClusterEpochState::new(2);
+        state.observe(9);
+
+        let mut buf = Vec::new();
+        write_frame(0xAB, b"body", &mut buf).unwrap();
+        stamp_epoch(&mut buf, &state).unwrap();
+
+        let stamped = u64::from_le_bytes(buf[10..18].try_into().unwrap());
+        assert_eq!(
+            stamped, 2,
+            "stamp the applied epoch, never the overheard one"
+        );
+    }
+
+    /// Stamping rewrites a fixed header field and must leave the payload CRC
+    /// intact.
+    #[test]
+    fn stamping_does_not_disturb_the_payload_check() {
+        let mut buf = Vec::new();
+        write_frame(0xAB, b"checked payload", &mut buf).unwrap();
+        stamp_epoch(&mut buf, &ClusterEpochState::new(4)).unwrap();
+        let receiver = ClusterEpochState::default();
+        let (_t, body) = parse_frame(&buf, &receiver).expect("CRC must still verify");
+        assert_eq!(body, b"checked payload");
+    }
+
+    #[test]
+    fn stamping_a_runt_frame_is_an_error() {
+        let mut too_short = vec![0u8; HEADER_SIZE - 1];
+        assert!(stamp_epoch(&mut too_short, &ClusterEpochState::new(1)).is_err());
     }
 
     #[test]

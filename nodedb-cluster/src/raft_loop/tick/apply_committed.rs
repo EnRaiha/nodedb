@@ -36,6 +36,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 .filter(|e| ConfChange::from_entry_data(&e.data).is_none())
                 .map(|e| (e.index, e.data.clone()))
                 .collect();
+            // The applied cluster epoch advances here, in the cluster crate,
+            // rather than inside whichever applier the host installed: the
+            // epoch is what this node stamps on its own frames, so it must
+            // move on every node that applies the entry, not only on nodes
+            // whose host applier happens to know about it.
+            self.adopt_committed_cluster_epochs(&pairs);
             self.metadata_applier.apply(&pairs)
         } else {
             self.applier
@@ -84,11 +90,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             let _ = self.ready_watch.send(true);
         }
 
-        // Detect false→true transitions on metadata-group
-        // leadership and bump the cluster epoch exactly once
-        // per acquisition. The fence token rides on every
-        // outbound RPC after this point (see
-        // `cluster_epoch.rs`).
+        // On acquiring metadata-group leadership, PROPOSE a new cluster
+        // generation rather than bumping a local counter. Going through the
+        // log is what makes the epoch an agreed fact: every node advances by
+        // applying the same committed entry, so no node has to infer the
+        // generation from stamps it overheard on the wire. This node's own
+        // applied epoch moves in the applier like everyone else's, not here.
         if group_id == crate::metadata_group::METADATA_GROUP_ID {
             let is_leader = self
                 .multi_raft
@@ -99,25 +106,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 .prev_metadata_leader
                 .swap(is_leader, std::sync::atomic::Ordering::AcqRel);
             if is_leader && !was_leader {
-                if let Some(catalog) = self.catalog.as_ref() {
-                    match crate::cluster_epoch::bump_local_cluster_epoch(catalog) {
-                        Ok(new_epoch) => tracing::info!(
-                            node = self.node_id,
-                            new_epoch,
-                            "bumped cluster epoch on metadata-group leadership acquisition"
-                        ),
-                        Err(e) => tracing::warn!(
-                            node = self.node_id,
-                            error = %e,
-                            "failed to persist bumped cluster epoch (in-memory value advanced anyway)"
-                        ),
-                    }
-                } else {
-                    // No catalog → in-memory only (test path).
-                    let _ = crate::cluster_epoch::observe_peer_cluster_epoch(
-                        crate::cluster_epoch::current_local_cluster_epoch() + 1,
-                    );
-                }
+                self.propose_cluster_epoch_bump();
             }
         }
     }

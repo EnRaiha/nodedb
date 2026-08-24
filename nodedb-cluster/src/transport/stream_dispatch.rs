@@ -49,7 +49,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::ShuffleProduceRequest(req) = request {
         let resp = handler.on_shuffle_produce(req).await;
         let resp_rpc = RaftRpc::ShuffleProduceResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -81,7 +81,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::ShuffleConsumeRequest(req) = request {
         let resp: ShuffleConsumeResponse = handler.on_shuffle_consume(req).await;
         let resp_rpc = RaftRpc::ShuffleConsumeResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -115,7 +115,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::ShuffleAggregateConsumeRequest(req) = request {
         let resp: ShuffleAggregateConsumeResponse = handler.on_shuffle_aggregate(req).await;
         let resp_rpc = RaftRpc::ShuffleAggregateConsumeResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -147,7 +147,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::AssignSurrogateRequest(req) = request {
         let resp: AssignSurrogateResponse = handler.on_assign_surrogate(req).await;
         let resp_rpc = RaftRpc::AssignSurrogateResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -179,7 +179,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::SubmitCalvinTxnRequest(req) = request {
         let resp: SubmitCalvinTxnResponse = handler.on_submit_calvin_txn(req).await;
         let resp_rpc = RaftRpc::SubmitCalvinTxnResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -212,7 +212,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::SubmitCalvinInboxRequest(req) = request {
         let resp: SubmitCalvinInboxResponse = handler.on_submit_calvin_inbox(req).await;
         let resp_rpc = RaftRpc::SubmitCalvinInboxResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -244,7 +244,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::ReserveReadRequest(req) = request {
         let resp: ReserveReadResponse = handler.on_reserve_read(req).await;
         let resp_rpc = RaftRpc::ReserveReadResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
@@ -277,7 +277,7 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     if let RaftRpc::ReleaseReservationRequest(req) = request {
         let resp: ReleaseReservationResponse = handler.on_release_reservation(req).await;
         let resp_rpc = RaftRpc::ReleaseReservationResponse(resp);
-        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_inner = rpc_codec::encode(&resp_rpc, &auth.epoch)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =
             Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());

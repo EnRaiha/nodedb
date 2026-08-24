@@ -69,6 +69,20 @@ pub enum MetadataEntry {
         sql_text: String,
     },
 
+    /// The cluster has advanced to a new topology generation.
+    ///
+    /// Proposed by the metadata-group leader on acquiring leadership. Going
+    /// through the log is the point: every node reaches the same generation by
+    /// applying the same committed entry, so the epoch is an agreed fact rather
+    /// than a number each node infers from whatever it happened to overhear on
+    /// the wire.
+    ///
+    /// Idempotent on apply — the applied epoch only ever moves forward, so a
+    /// replayed or out-of-order bump is a no-op.
+    ClusterEpochBump {
+        epoch: u64,
+    },
+
     /// Atomic batch of metadata entries proposed by a transactional
     /// DDL session (`BEGIN; CREATE ...; CREATE ...; COMMIT;`). The
     /// applier unpacks and applies each sub-entry in order at a

@@ -222,8 +222,15 @@ mod tests {
 
     fn roundtrip_req(req: ExecuteRequest) -> ExecuteRequest {
         let rpc = RaftRpc::ExecuteRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ExecuteRequest(r) => r,
             other => panic!("expected ExecuteRequest, got {other:?}"),
         }
@@ -231,8 +238,15 @@ mod tests {
 
     fn roundtrip_resp(resp: ExecuteResponse) -> ExecuteResponse {
         let rpc = RaftRpc::ExecuteResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ExecuteResponse(r) => r,
             other => panic!("expected ExecuteResponse, got {other:?}"),
         }
@@ -397,8 +411,15 @@ mod tests {
 
     fn roundtrip_stream_chunk(chunk: ExecuteStreamChunk) -> ExecuteStreamChunk {
         let rpc = RaftRpc::ExecuteStreamChunk(chunk);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ExecuteStreamChunk(c) => c,
             other => panic!("expected ExecuteStreamChunk, got {other:?}"),
         }
@@ -406,8 +427,15 @@ mod tests {
 
     fn roundtrip_stream_end(end: ExecuteStreamEnd) -> ExecuteStreamEnd {
         let rpc = RaftRpc::ExecuteStreamEnd(end);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ExecuteStreamEnd(e) => e,
             other => panic!("expected ExecuteStreamEnd, got {other:?}"),
         }
@@ -428,8 +456,15 @@ mod tests {
             txn_id: None,
         };
         let rpc = RaftRpc::ExecuteStreamRequest(req.clone());
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ExecuteStreamRequest(r) => {
                 assert_eq!(r.plan_bytes, req.plan_bytes);
                 assert_eq!(r.tenant_id, 11);

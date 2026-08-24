@@ -152,6 +152,9 @@ impl CacheApplier {
     /// `Batch` by recursing into each sub-entry.
     fn cascade_live_state(&self, entry: &MetadataEntry) {
         match entry {
+            // The applied epoch advances in the raft loop, on every node,
+            // regardless of which applier the host installed.
+            MetadataEntry::ClusterEpochBump { .. } => {}
             MetadataEntry::TopologyChange(change) => self.apply_topology_change(change),
             MetadataEntry::RoutingChange(change) => self.apply_routing_change(change),
             MetadataEntry::Batch { entries } => {

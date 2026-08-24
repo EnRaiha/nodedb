@@ -277,6 +277,16 @@ impl NexarTransport {
         self.node_id
     }
 
+    /// This node's cluster-epoch state.
+    ///
+    /// The transport owns it because it is the thing that stamps and reads the
+    /// field. The raft loop takes a handle to the same state so that applying a
+    /// committed bump and stamping the new generation outbound are the same
+    /// node's fact rather than two counters that drift.
+    pub fn cluster_epoch(&self) -> std::sync::Arc<crate::cluster_epoch::ClusterEpochState> {
+        std::sync::Arc::clone(&self.auth.epoch)
+    }
+
     /// The cluster MAC key carried by this transport. SWIM subsystem
     /// uses it to authenticate UDP datagrams on the same key material.
     pub fn mac_key(&self) -> crate::rpc_codec::MacKey {

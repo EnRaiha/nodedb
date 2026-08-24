@@ -90,6 +90,9 @@ impl MetadataCache {
                 // shapes contribute to `catalog_entries_applied`.
                 self.catalog_entries_applied += 1;
             }
+            // The applied-epoch mark lives on the node's epoch state, not in
+            // the cache history; nothing to record here.
+            MetadataEntry::ClusterEpochBump { .. } => {}
             MetadataEntry::TopologyChange(change) => self.topology_log.push(change.clone()),
             MetadataEntry::RoutingChange(change) => self.routing_log.push(change.clone()),
 

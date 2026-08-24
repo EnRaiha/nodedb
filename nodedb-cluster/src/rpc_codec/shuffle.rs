@@ -406,8 +406,15 @@ mod tests {
 
     fn roundtrip_req(req: ShufflePushRequest) -> ShufflePushRequest {
         let rpc = RaftRpc::ShufflePushRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShufflePushRequest(r) => r,
             other => panic!("expected ShufflePushRequest, got {other:?}"),
         }
@@ -415,8 +422,15 @@ mod tests {
 
     fn roundtrip_chunk(chunk: ShufflePushChunk) -> ShufflePushChunk {
         let rpc = RaftRpc::ShufflePushChunk(chunk);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShufflePushChunk(c) => c,
             other => panic!("expected ShufflePushChunk, got {other:?}"),
         }
@@ -424,8 +438,15 @@ mod tests {
 
     fn roundtrip_end(end: ShufflePushEnd) -> ShufflePushEnd {
         let rpc = RaftRpc::ShufflePushEnd(end);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShufflePushEnd(e) => e,
             other => panic!("expected ShufflePushEnd, got {other:?}"),
         }
@@ -503,8 +524,15 @@ mod tests {
 
     fn roundtrip_produce_req(req: ShuffleProduceRequest) -> ShuffleProduceRequest {
         let rpc = RaftRpc::ShuffleProduceRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleProduceRequest(r) => r,
             other => panic!("expected ShuffleProduceRequest, got {other:?}"),
         }
@@ -512,8 +540,15 @@ mod tests {
 
     fn roundtrip_produce_resp(resp: ShuffleProduceResponse) -> ShuffleProduceResponse {
         let rpc = RaftRpc::ShuffleProduceResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleProduceResponse(r) => r,
             other => panic!("expected ShuffleProduceResponse, got {other:?}"),
         }
@@ -633,8 +668,15 @@ mod tests {
 
     fn roundtrip_consume_req(req: ShuffleConsumeRequest) -> ShuffleConsumeRequest {
         let rpc = RaftRpc::ShuffleConsumeRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleConsumeRequest(r) => r,
             other => panic!("expected ShuffleConsumeRequest, got {other:?}"),
         }
@@ -642,8 +684,15 @@ mod tests {
 
     fn roundtrip_consume_resp(resp: ShuffleConsumeResponse) -> ShuffleConsumeResponse {
         let rpc = RaftRpc::ShuffleConsumeResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleConsumeResponse(r) => r,
             other => panic!("expected ShuffleConsumeResponse, got {other:?}"),
         }
@@ -741,8 +790,15 @@ mod tests {
         req: ShuffleAggregateConsumeRequest,
     ) -> ShuffleAggregateConsumeRequest {
         let rpc = RaftRpc::ShuffleAggregateConsumeRequest(req);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleAggregateConsumeRequest(r) => r,
             other => panic!("expected ShuffleAggregateConsumeRequest, got {other:?}"),
         }
@@ -752,8 +808,15 @@ mod tests {
         resp: ShuffleAggregateConsumeResponse,
     ) -> ShuffleAggregateConsumeResponse {
         let rpc = RaftRpc::ShuffleAggregateConsumeResponse(resp);
-        let encoded = super::super::encode(&rpc).unwrap();
-        match super::super::decode(&encoded).unwrap() {
+        let encoded =
+            super::super::encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default())
+                .unwrap();
+        match super::super::decode(
+            &encoded,
+            &crate::cluster_epoch::ClusterEpochState::default(),
+        )
+        .unwrap()
+        {
             RaftRpc::ShuffleAggregateConsumeResponse(r) => r,
             other => panic!("expected ShuffleAggregateConsumeResponse, got {other:?}"),
         }

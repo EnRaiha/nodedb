@@ -8,6 +8,9 @@
 //! tasks all operate on the same state. Wrapped in an `Arc` and cloned
 //! into every per-connection / per-stream task.
 
+use std::sync::Arc;
+
+use crate::cluster_epoch::ClusterEpochState;
 use crate::rpc_codec::{MacKey, PeerSeqSender, PeerSeqWindow};
 
 use super::credentials::TransportCredentials;
@@ -28,6 +31,13 @@ pub struct AuthContext {
     /// Inbound replay-detection windows, keyed by the `from_node_id`
     /// advertised in the envelope (and MAC-verified before consultation).
     pub peer_seq_in: PeerSeqWindow,
+    /// This node's cluster-epoch state. Outbound frames are stamped with the
+    /// generation it has applied; inbound stamps are recorded as observations.
+    ///
+    /// Per node, not per process: several nodes share a process in the test
+    /// harness and in embedded use, and one global counter would alias them
+    /// into a single epoch that can never disagree with itself.
+    pub epoch: Arc<ClusterEpochState>,
 }
 
 impl AuthContext {
@@ -43,6 +53,20 @@ impl AuthContext {
             mac_key,
             peer_seq_out: PeerSeqSender::new(),
             peer_seq_in: PeerSeqWindow::new(),
+            epoch: Arc::new(ClusterEpochState::default()),
+        }
+    }
+
+    /// Build an auth context whose epoch state is shared with the rest of the
+    /// node — the raft loop advances it as committed bumps apply.
+    pub fn with_epoch(
+        local_node_id: u64,
+        creds: &TransportCredentials,
+        epoch: Arc<ClusterEpochState>,
+    ) -> Self {
+        Self {
+            epoch,
+            ..Self::from_credentials(local_node_id, creds)
         }
     }
 }
