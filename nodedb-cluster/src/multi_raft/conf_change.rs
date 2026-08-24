@@ -138,6 +138,11 @@ impl MultiRaft {
                 }
             }
             ConfChangeType::RemoveNode => {
+                // Tell the departing node its removal committed while it is
+                // still a peer. After `remove_peer` the leader never sends to
+                // it again, so without this it holds the entry uncommitted
+                // and its routing view of this group stays stale forever.
+                node.notify_removed_peer(change.node_id);
                 node.remove_peer(change.node_id);
                 let mut rt = self.routing.write().unwrap_or_else(|p| p.into_inner());
                 if let Some(info) = rt.group_info(group_id) {

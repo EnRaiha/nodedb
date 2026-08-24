@@ -75,6 +75,26 @@ impl<S: LogStorage> RaftNode<S> {
     }
 
     /// Remove a voter peer from this group.
+    /// Send `peer` one last `AppendEntries` before it is dropped from the
+    /// configuration.
+    ///
+    /// A node learns an entry is committed only from a later `AppendEntries`
+    /// carrying an advanced `leader_commit`. The entry that removes a node is
+    /// no exception — but by the time it commits, the leader is about to stop
+    /// replicating to that node, so the ordinary path never delivers the news.
+    /// The removed node is then left holding its own removal uncommitted
+    /// forever: it never applies the change, and every view it derives from
+    /// that log stays stale for a group it has already left.
+    ///
+    /// Call this immediately BEFORE [`Self::remove_peer`], while `peer` is
+    /// still tracked. No-op unless this node leads and still tracks `peer`.
+    pub fn notify_removed_peer(&mut self, peer: u64) {
+        if self.role != NodeRole::Leader || !self.config.peers.contains(&peer) {
+            return;
+        }
+        self.send_append_entries(peer);
+    }
+
     pub fn remove_peer(&mut self, peer: u64) {
         if !self.config.peers.contains(&peer) {
             return;
@@ -293,6 +313,30 @@ mod tests {
         }
     }
 
+    /// Elect a leader in a multi-voter config: `force_leader` only carries a
+    /// single-voter group to leadership, so grant the votes a real election
+    /// needs.
+    fn elect_with_voters(peers: Vec<u64>) -> RaftNode<MemStorage> {
+        let mut node = RaftNode::new(cfg(1, peers.clone()), MemStorage::new());
+        crate::test_support::force_election(&mut node);
+        let term = node.current_term();
+        for peer in peers {
+            if node.role() == NodeRole::Leader {
+                break;
+            }
+            node.handle_request_vote_response(
+                peer,
+                &crate::message::RequestVoteResponse {
+                    term,
+                    vote_granted: true,
+                },
+            );
+        }
+        assert_eq!(node.role(), NodeRole::Leader);
+        let _ = node.take_ready();
+        node
+    }
+
     fn force_leader(node: &mut RaftNode<MemStorage>) {
         crate::test_support::force_election(node);
         // Drain vote messages.
@@ -415,5 +459,60 @@ mod tests {
         let promoted = node.promote_learner(3);
         assert!(promoted, "caught-up learner must be promotable");
         assert!(node.voters().contains(&3));
+    }
+
+    /// A departing voter must be told its own removal committed. Without the
+    /// final message it never applies the change, and anything it derives from
+    /// that log stays stale for a group it has already left.
+    #[test]
+    fn a_removed_peer_is_told_before_replication_stops() {
+        let mut node = elect_with_voters(vec![2, 3]);
+        node.volatile.commit_index = node.log.last_index();
+
+        node.notify_removed_peer(2);
+        node.remove_peer(2);
+
+        let ready = node.take_ready();
+        let to_departing: Vec<_> = ready.messages.iter().filter(|(p, _)| *p == 2).collect();
+        assert_eq!(
+            to_departing.len(),
+            1,
+            "the departing voter must get exactly one final AppendEntries"
+        );
+        assert_eq!(
+            to_departing[0].1.leader_commit,
+            node.commit_index(),
+            "the final message must carry the commit index that covers the removal"
+        );
+        assert!(!node.voters().contains(&2), "peer is removed afterwards");
+    }
+
+    /// Ordering matters: once the peer is gone from the configuration there is
+    /// no replication state to send from, so a late call must do nothing
+    /// rather than resurrect it.
+    #[test]
+    fn notifying_after_removal_is_a_no_op() {
+        let mut node = elect_with_voters(vec![2, 3]);
+
+        node.remove_peer(2);
+        node.notify_removed_peer(2);
+
+        let ready = node.take_ready();
+        assert!(
+            !ready.messages.iter().any(|(p, _)| *p == 2),
+            "a removed peer must not be sent to"
+        );
+    }
+
+    /// Only the leader replicates, so only the leader can deliver this news.
+    #[test]
+    fn a_follower_does_not_notify_a_removed_peer() {
+        let mut node = RaftNode::new(cfg(1, vec![2, 3]), MemStorage::new());
+        assert_eq!(node.role(), NodeRole::Follower);
+
+        node.notify_removed_peer(2);
+
+        let ready = node.take_ready();
+        assert!(ready.messages.is_empty(), "a follower sends nothing");
     }
 }
