@@ -89,12 +89,17 @@ impl VolatileState {
     /// Seeding `last_applied` stops the restarted node re-delivering entries
     /// whose state-machine effects are already durable. Re-applying an
     /// append-shaped entry (a spatial/columnar row insert, a memtable append)
-    /// duplicates it, so the floor must survive the restart even though
-    /// `commit_index` legitimately starts at 0 and is re-learned from the
-    /// leader.
+    /// duplicates it, so the floor must survive the restart.
+    ///
+    /// `commit_index` is also seeded from the floor, not reset to 0: entries
+    /// at or below the durable applied floor are provably committed (apply
+    /// only ever runs on committed entries, and the floor advances only after
+    /// a durable apply or snapshot install). Seeding keeps the commit index
+    /// monotonic across restarts and avoids re-scanning the whole retained log
+    /// on boot; the leader can still advance it above the floor normally.
     pub fn restored(applied_index: u64) -> Self {
         Self {
-            commit_index: 0,
+            commit_index: applied_index,
             last_applied: applied_index,
         }
     }

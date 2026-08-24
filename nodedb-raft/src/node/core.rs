@@ -773,6 +773,54 @@ mod tests {
         assert_eq!(ready.committed_entries[0].index, 3);
     }
 
+    /// A restart must NOT reset commit_index below the durable applied floor.
+    ///
+    /// Everything at or below `durable_applied` is provably committed (apply
+    /// only ever runs on committed entries, and the floor is only advanced
+    /// after durable apply or snapshot install). Seeding `commit_index` from
+    /// that floor is therefore safe, avoids re-scanning the whole log after a
+    /// restart, and keeps the commit index monotonic across restarts.
+    #[test]
+    fn restore_seeds_commit_index_from_durable_floor() {
+        let mut storage = MemStorage::new();
+        storage
+            .append(&[
+                LogEntry {
+                    term: 1,
+                    index: 1,
+                    data: b"a".to_vec(),
+                },
+                LogEntry {
+                    term: 1,
+                    index: 2,
+                    data: b"b".to_vec(),
+                },
+                LogEntry {
+                    term: 1,
+                    index: 3,
+                    data: b"c".to_vec(),
+                },
+            ])
+            .unwrap();
+        storage.save_applied_index(2).unwrap();
+
+        let mut node = RaftNode::new(test_config(1, vec![]), storage);
+        node.restore().unwrap();
+        assert_eq!(node.durable_applied_index(), 2);
+        assert!(
+            node.commit_index() >= 2,
+            "commit_index must be seeded from the durable floor, got {}",
+            node.commit_index()
+        );
+
+        // Advancing above the floor still works normally.
+        node.volatile.commit_index = 3;
+        node.collect_committed_entries();
+        let ready = node.take_ready();
+        assert_eq!(ready.committed_entries.len(), 1);
+        assert_eq!(ready.committed_entries[0].index, 3);
+    }
+
     #[test]
     fn learner_tick_does_not_start_election() {
         let mut cfg = test_config(2, vec![1]);
