@@ -209,7 +209,28 @@ fn wait_for_lease_drain(
 /// `version <= up_to_version`. `0` means the drain target has cleared. The
 /// exact nonzero diagnostic count is not significant, so saturate rather than
 /// risking arithmetic overflow.
+///
+/// Leases held by nodes that are no longer cluster members are ignored, as are
+/// leases past their `expires_at`: a crashed node can never release its leases
+/// (no SIGTERM path runs), so without this filter every DDL on those
+/// descriptors would wedge on the drain wait forever. The membership filter is
+/// fail-safe — a missing topology treats every holder as a member.
+///
+/// Dropping an expired lease is safe because a live holder never has one: the
+/// renewal loop re-acquires any lease approaching expiry, so an expired record
+/// means that node's renewal stopped. A live hold on THIS node is counted
+/// separately through `lease_refcount`, below, and is unaffected by expiry.
+///
+/// Expiry is compared against wall time, not [`HlcClock::peek`], for the same
+/// reason the renewal loop is (see `lease::renewal::tick`): `peek` returns the
+/// last HLC the clock observed, which on a quiet cluster stays frozen where the
+/// lease was stamped. Comparing against a frozen clock would find every lease
+/// unexpired and reinstate exactly the wedge this filter removes — and an
+/// idle cluster is precisely the case where a crashed node's leases are the
+/// only ones left. `expires_at.wall_ns` was computed from real wall time when
+/// the lease was stamped, so both sides of the comparison stay in one frame.
 fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version: u64) -> usize {
+    let now_wall_ns = super::wall_now_ns();
     let cache = shared
         .metadata_cache
         .read()
@@ -217,7 +238,12 @@ fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version:
     let metadata_holds = cache
         .leases
         .iter()
-        .filter(|((lid, _), l)| lid == id && l.version <= up_to_version)
+        .filter(|((lid, holder), l)| {
+            lid == id
+                && l.version <= up_to_version
+                && l.expires_at.wall_ns > now_wall_ns
+                && lease_holder_is_member(shared, *holder)
+        })
         .count();
     drop(cache);
 
@@ -225,6 +251,19 @@ fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version:
         metadata_holds
     } else {
         metadata_holds.saturating_add(1)
+    }
+}
+
+/// Whether `node_id` is a current cluster member. Missing topology
+/// (single-node / not yet wired) treats every holder as member —
+/// fail-safe: this filter only ever drops holds it is certain about.
+fn lease_holder_is_member(shared: &SharedState, node_id: u64) -> bool {
+    match &shared.cluster_topology {
+        Some(topo) => topo
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(node_id),
+        None => true,
     }
 }
 
@@ -544,6 +583,197 @@ mod tests {
         state.lease_refcount.increment(&descriptor, 2);
         assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
         state.lease_refcount.decrement(&descriptor, 2);
+    }
+
+    /// Build a topology containing exactly `ids` as active members.
+    fn topo_with(ids: &[u64]) -> nodedb_cluster::ClusterTopology {
+        let mut t = nodedb_cluster::ClusterTopology::new();
+        for (i, id) in ids.iter().enumerate() {
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            t.add_node(nodedb_cluster::NodeInfo::new(
+                *id,
+                addr,
+                nodedb_cluster::NodeState::Active,
+            ));
+        }
+        t
+    }
+
+    /// Insert a lease directly into the metadata cache (as if committed via a
+    /// `DescriptorLeaseGrant` entry).
+    fn insert_lease(
+        state: &SharedState,
+        id: &DescriptorId,
+        holder: u64,
+        version: u64,
+        expires_at: nodedb_types::Hlc,
+    ) {
+        state
+            .metadata_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .leases
+            .insert(
+                (id.clone(), holder),
+                nodedb_cluster::DescriptorLease {
+                    descriptor_id: id.clone(),
+                    version,
+                    node_id: holder,
+                    expires_at,
+                },
+            );
+    }
+
+    /// A lease expiry a minute into the future, in REAL wall time — the same
+    /// frame the grant path stamps in. Deriving these from `hlc_clock.peek()`
+    /// would put both the fixture and the code under test in one frozen frame
+    /// and the assertions would hold whatever the comparison did.
+    fn unexpired() -> nodedb_types::Hlc {
+        nodedb_types::Hlc::new(
+            super::super::wall_now_ns().saturating_add(60_000_000_000),
+            0,
+        )
+    }
+
+    /// A lease expiry a minute in the past, in REAL wall time.
+    fn expired() -> nodedb_types::Hlc {
+        nodedb_types::Hlc::new(
+            super::super::wall_now_ns().saturating_sub(60_000_000_000),
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn non_member_lease_does_not_block_drain_count() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Holder 99 is not in the topology (crashed node): its lease must not
+        // block the drain count.
+        insert_lease(&state, &descriptor, 99, 1, unexpired());
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_lease_does_not_block_drain_count() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Holder 1 is a member but its lease is already past expiry.
+        insert_lease(&state, &descriptor, 1, 1, expired());
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+    }
+
+    /// A lease whose expiry has passed in REAL time must stop blocking the
+    /// drain even when this node's HLC has not advanced.
+    ///
+    /// `HlcClock::peek` returns the last HLC the clock observed and never
+    /// advances on its own, so on a quiet node it sits far behind wall time —
+    /// at `Hlc::ZERO` if nothing has stamped it at all. Comparing expiry
+    /// against it finds every lease unexpired and reinstates the wedge. An idle
+    /// cluster is exactly the case that matters: a crashed node's leases are
+    /// then the only ones left, and nothing is generating HLC events.
+    #[tokio::test]
+    async fn expired_lease_stops_blocking_even_with_an_unadvanced_hlc() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // The HLC is untouched, so `peek()` is still at zero while wall time is
+        // decades ahead of it.
+        assert_eq!(
+            state.hlc_clock.peek().wall_ns,
+            0,
+            "this test is only meaningful while the HLC has not advanced"
+        );
+
+        insert_lease(&state, &descriptor, 1, 1, expired());
+        assert_eq!(
+            count_matching_leases(&state, &descriptor, 1),
+            0,
+            "an expired lease must not block the drain, however stale the HLC is"
+        );
+    }
+
+    /// The other direction: an HLC dragged ahead of wall time by a peer with a
+    /// skewed clock must not make a LIVE lease look expired. Dropping a live
+    /// hold would let the DDL proceed underneath a holder still using the
+    /// descriptor — trading a wedge for a correctness bug.
+    #[tokio::test]
+    async fn a_live_lease_still_blocks_when_the_hlc_runs_ahead_of_wall_time() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // A peer stamps an HLC an hour ahead of real time; the local clock
+        // folds it in and now reads far past every live lease's expiry.
+        let skewed = nodedb_types::Hlc::new(
+            super::super::wall_now_ns().saturating_add(3_600_000_000_000),
+            0,
+        );
+        state.hlc_clock.update(skewed);
+        assert!(state.hlc_clock.peek().wall_ns > super::super::wall_now_ns());
+
+        insert_lease(&state, &descriptor, 1, 1, unexpired());
+        assert_eq!(
+            count_matching_leases(&state, &descriptor, 1),
+            1,
+            "a lease that is live in wall time must keep blocking the drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_unexpired_lease_still_blocks_drain_count() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // A live member's unexpired lease still blocks the drain — the
+        // membership/expiry filters must never mask real holds.
+        insert_lease(&state, &descriptor, 1, 1, unexpired());
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 1);
     }
 
     fn function(database_id: DatabaseId) -> StoredFunction {
