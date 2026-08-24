@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use tracing::info;
 
 use crate::error::Result;
@@ -17,8 +17,8 @@ use crate::error::Result;
 use super::migration::migrate_if_needed;
 use super::schema::{
     CATALOG_FORMAT_VERSION, GHOST_TABLE, KEY_CA_CERT, KEY_CLUSTER_EPOCH, KEY_CLUSTER_ID,
-    KEY_FORMAT_VERSION, METADATA_TABLE, MIGRATION_STATE_TABLE, ROUTING_TABLE, TOPOLOGY_TABLE,
-    catalog_err,
+    KEY_FORMAT_VERSION, KEY_SWIM_INCARNATION, METADATA_TABLE, MIGRATION_STATE_TABLE, ROUTING_TABLE,
+    TOPOLOGY_TABLE, catalog_err,
 };
 
 /// Persistent cluster catalog backed by redb.
@@ -140,6 +140,64 @@ impl ClusterCatalog {
                     Ok(Some(u64::from_le_bytes(arr)))
                 } else {
                     Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the local SWIM incarnation (u64 LE). Written on every
+    /// self-refutation bump so a fast restart can resume at the stored
+    /// value instead of 0. See `crate::swim::incarnation_store`.
+    pub fn save_swim_incarnation(&self, incarnation: u64) -> Result<()> {
+        let txn = self.db.begin_write().map_err(catalog_err)?;
+        {
+            let mut table = txn.open_table(METADATA_TABLE).map_err(catalog_err)?;
+            // Monotonic: the stored value may only move forward. Callers
+            // persist off the probe path, so two bumps can reach this write
+            // out of order. A blind overwrite would then leave the LOWER of
+            // them on disk, and the node would restart at an incarnation it
+            // has already advertised — losing to a peer that still holds a
+            // Dead record at that same number, which is the exact stick this
+            // key exists to break.
+            let stored = table
+                .get(KEY_SWIM_INCARNATION)
+                .map_err(catalog_err)?
+                .and_then(|guard| guard.value().try_into().ok().map(u64::from_le_bytes));
+            if stored.is_some_and(|prev| prev >= incarnation) {
+                return Ok(());
+            }
+            let bytes = incarnation.to_le_bytes();
+            table
+                .insert(KEY_SWIM_INCARNATION, bytes.as_slice())
+                .map_err(catalog_err)?;
+        }
+        txn.commit().map_err(catalog_err)?;
+        Ok(())
+    }
+
+    /// Load the persisted SWIM incarnation. Returns `None` on a catalog
+    /// that has never written one (callers treat that as `ZERO`).
+    pub fn load_swim_incarnation(&self) -> Result<Option<u64>> {
+        let txn = self.db.begin_read().map_err(catalog_err)?;
+        let table = txn.open_table(METADATA_TABLE).map_err(catalog_err)?;
+        match table.get(KEY_SWIM_INCARNATION).map_err(catalog_err)? {
+            Some(guard) => {
+                let bytes = guard.value();
+                if bytes.len() == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    Ok(Some(u64::from_le_bytes(arr)))
+                } else {
+                    // Corrupted metadata: an unexpected length is NOT "no
+                    // value". Surface it so operators detect catalog
+                    // corruption early instead of silently restarting at
+                    // incarnation 0 (which would reintroduce the rejoin
+                    // stick the key exists to prevent).
+                    Err(catalog_err(format!(
+                        "metadata key {KEY_SWIM_INCARNATION} has unexpected length {} (expected 8)",
+                        bytes.len()
+                    )))
                 }
             }
             None => Ok(None),
@@ -289,5 +347,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The stored incarnation may only move forward.
+    ///
+    /// Bumps are persisted off the probe path and can therefore reach the
+    /// catalog out of order. A blind overwrite would leave the lower value on
+    /// disk, and the node would restart at an incarnation it has already
+    /// advertised — losing to a peer that still holds a Dead record at that
+    /// number, which is precisely what persisting the key is meant to prevent.
+    #[test]
+    fn swim_incarnation_never_moves_backwards() {
+        let (_dir, catalog) = temp_catalog();
+        assert_eq!(catalog.load_swim_incarnation().unwrap(), None);
+
+        catalog.save_swim_incarnation(6).unwrap();
+        assert_eq!(catalog.load_swim_incarnation().unwrap(), Some(6));
+
+        // A late write carrying an earlier bump must not win.
+        catalog.save_swim_incarnation(5).unwrap();
+        assert_eq!(
+            catalog.load_swim_incarnation().unwrap(),
+            Some(6),
+            "an out-of-order write must not lower the stored incarnation"
+        );
+
+        // Re-persisting the same value is a no-op, not a regression.
+        catalog.save_swim_incarnation(6).unwrap();
+        assert_eq!(catalog.load_swim_incarnation().unwrap(), Some(6));
+
+        // Genuine forward progress still lands.
+        catalog.save_swim_incarnation(7).unwrap();
+        assert_eq!(catalog.load_swim_incarnation().unwrap(), Some(7));
     }
 }
