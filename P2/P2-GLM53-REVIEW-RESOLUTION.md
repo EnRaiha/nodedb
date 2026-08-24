@@ -1,5 +1,12 @@
 # P2 — GLM 5.3 Review Resolution (2026-08-24)
 
+> ## ✅ RESOLVED (24-08-2026) — SEMUA 4 FIX TELAH DIIMPLEMENT
+>
+> Fix 1 `888684628` (PR #243), Fix 2 `e60a853ae` (PR #244), Fix 3 `4f929593c`
+> (PR #245), Fix 4 `16d99164a` (PR #246). 4 improved solutions (IncarnationTracker,
+> VersionWindow, EpochFence, LeaseManager) + PersistentState kekal sebagai
+> refactor post-merge — code penuh dalam `P2-REPORT.md` §4.
+
 Review GLM 5.3 terhadap `P2-UNSOLVED-ISSUES.md` + `P2-FIX-PLAN.md`. Semua point diselesaikan di sini. Setiap point: verdict (accept/reject) + tindakan.
 
 ## 0. Document Completeness Correction

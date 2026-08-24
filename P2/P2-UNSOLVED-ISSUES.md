@@ -4,9 +4,27 @@ Main terkini: `origin/main` @ `54fe575c0` (23-08). Method: 5 parallel drill (rea
 
 Epic #165 checklist: 11 item → **7 solved oleh main + P2 branch, 4 masih perlu kerja** (2 open penuh, 2 enforcement gap). Fail ini = rekod penuh isu yang BELUM selesai, dengan evidence, fix design, effort, dan refactor suggestion.
 
+> ## ⚠️ RESOLUTION STATUS (24-08-2026) — SEMUA 4 ISU TELAH DIFIX
+>
+> Drill di bawah adalah rekod asal (pre-fix). Kesemua 4 isu kini RESOLVED dalam
+> branch fix masing-masing (daripada fork EnRaiha, PR ke NodeDB-Lab/nodedb):
+>
+> | Isu                              | Status      | Fix                                                                      | Commit      | PR   |
+> | -------------------------------- | ----------- | ------------------------------------------------------------------------ | ----------- | ---- |
+> | 1. SWIM Fast-Restart Rejoin      | ✅ RESOLVED | persist incarnation + echo refutation + ping=liveness + suspicion cancel | `888684628` | #243 |
+> | 2. Wire Version Rolling Upgrade  | ✅ RESOLVED | window [1,2] + range gate + ClusterVersionView move + restart re-stamp   | `e60a853ae` | #244 |
+> | 3. cluster_epoch Enforcement Gap | ✅ RESOLVED | validate di parse_frame + exemptions JOIN/PING/PONG + StalePeerEpoch     | `4f929593c` | #245 |
+> | 4. Descriptor-Lease Crash-Wedge  | ✅ RESOLVED | drain filter + Leave hook + periodic sweep                               | `16d99164a` | #246 |
+>
+> Verification: build workspace 0, raft 122/122, cluster all-features 1044,
+> nodedb lib 6218, clippy -D warnings 0, maya-gate L1 clean, heavy-test loop
+> hijau. Gabungan integrasi: branch `phase2-fixes` (4 merge, tiada conflict).
+> Report penuh: `P2-REPORT.md`. Rujukan fix plan per-isu tetap di bawah
+> (kekal sebagai rekod design + rationale).
+
 ---
 
-## 1. SWIM Fast-Restart Rejoin Stick — OPEN (bug real)
+## 1. SWIM Fast-Restart Rejoin Stick — ✅ RESOLVED (`888684628`, PR #243)
 
 **Verdict: OPEN** — bug boleh demo pada main; tiada fix berkesan (config knob = test plumbing sahaja).
 

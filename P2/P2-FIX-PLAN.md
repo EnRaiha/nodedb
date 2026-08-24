@@ -1,5 +1,12 @@
 # P2 — Fix Plans (untuk review GLM 5.3)
 
+> ## ✅ IMPLEMENTED (24-08-2026) — SEMUA 4 PLAN TELAH DILAKSANAKAN
+>
+> Fix 1 `888684628` (PR #243), Fix 2 `e60a853ae` (PR #244), Fix 3 `4f929593c`
+> (PR #245), Fix 4 `16d99164a` (PR #246) — semua hijau (build 0, raft 122,
+> cluster 1044, nodedb 6218, clippy 0, maya-gate clean). Fix Plan 5
+> (combined integration test) dan rest ini kekal sebagai rekod design.
+
 Base: `origin/main` @ `54fe575c0` (repo `/home/maya/projects/nodedb-rebase`).
 Tarikh: 2026-08-24. Semua line numbers + insert points diverifikasi terhadap `git show origin/main:<path>` oleh 4 subagents read-only.
 
