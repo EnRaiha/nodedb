@@ -111,6 +111,35 @@ fn data_group_ids(cluster: &TestCluster) -> Vec<u64> {
 /// subset of the live node set, and the group's voter set is EXACTLY `P`
 /// (entering learners promoted, every leaving voter — leader included via
 /// step-aside — removed).
+/// The `(leader, term)` a group is currently known to have, or `None` while no
+/// leader has been observed yet. Read fresh on every use: a snapshot taken once
+/// goes stale the moment the group re-elects.
+fn leader_and_term(
+    cluster: &common::cluster_harness::TestCluster,
+    group_id: u64,
+) -> Option<(u64, u64)> {
+    let leader = cluster
+        .nodes
+        .first()?
+        .all_group_leaders()
+        .into_iter()
+        .find(|(g, _)| *g == group_id)
+        .map(|(_, l)| l)
+        .unwrap_or(0);
+    let term = cluster.nodes.iter().find_map(|node| {
+        node.shared.cluster_observer.get().and_then(|obs| {
+            obs.group_status
+                .upgrade()
+                .map(|gs| gs.group_statuses())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|s| s.group_id == group_id && s.leader_id != 0)
+                .map(|s| s.term)
+        })
+    })?;
+    (leader != 0 && term != 0).then_some((leader, term))
+}
+
 fn group_converged(
     node: &common::cluster_harness::TestClusterNode,
     gid: u64,
@@ -318,36 +347,11 @@ async fn placement_converges_when_excluded_voter_leads_group() {
     // a real (leader_id, term) to drive the leadership transfer.
     let lead_deadline = Instant::now() + Duration::from_secs(10);
     let (current_leader, current_term) = loop {
-        let probe = &cluster.nodes[0];
-        let leader = probe
-            .all_group_leaders()
-            .into_iter()
-            .find(|(g, _)| *g == target_gid)
-            .map(|(_, l)| l)
-            .unwrap_or(0);
-        let term = cluster
-            .nodes
-            .iter()
-            .find_map(|node| {
-                node.shared.cluster_observer.get().and_then(|obs| {
-                    obs.group_status
-                        .upgrade()
-                        .map(|gs| gs.group_statuses())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|s| s.group_id == target_gid && s.leader_id != 0)
-                        .map(|s| s.term)
-                })
-            })
-            .unwrap_or(0);
-        if leader != 0 && term != 0 {
+        if let Some((leader, term)) = leader_and_term(&cluster, target_gid) {
             break (leader, term);
         }
         if Instant::now() >= lead_deadline {
-            panic!(
-                "group {target_gid} never elected a stable leader before transfer; \
-                 leader={leader}, term={term}"
-            );
+            panic!("group {target_gid} never elected a stable leader before transfer");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
@@ -355,26 +359,15 @@ async fn placement_converges_when_excluded_voter_leads_group() {
     // Force X to lead the target group via a legitimate raft leadership
     // transfer (TimeoutNow), unless X already leads it. This puts G in the
     // led-by-soon-to-be-evicted-voter state that triggered the bug.
-    if current_leader != excluded_x {
-        let transport = cluster.nodes[0]
-            .shared
-            .cluster_transport
-            .as_ref()
-            .expect("cluster_transport");
-        transport
-            .send_rpc_oneway(
-                excluded_x,
-                nodedb_cluster::RaftRpc::TimeoutNowRequest(nodedb_raft::TimeoutNowRequest {
-                    term: current_term,
-                    leader_id: current_leader,
-                    group_id: target_gid,
-                }),
-            )
-            .await
-            .expect("send TimeoutNow to excluded voter");
-    }
-
+    //
+    // `TimeoutNow` is accepted only while the target is a follower whose term
+    // and known leader both match the request, and the transport delivers it
+    // one-way with no acknowledgement. A single send taken from one snapshot
+    // is therefore silently dropped whenever the target's view has moved on,
+    // so re-send from a freshly read snapshot until leadership actually lands.
+    // The production transfer path re-emits on the same principle.
     let transfer_deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_seen = (current_leader, current_term);
     loop {
         let leads = cluster.nodes.iter().any(|node| {
             node.all_group_leaders()
@@ -385,11 +378,35 @@ async fn placement_converges_when_excluded_voter_leads_group() {
             break;
         }
         if Instant::now() >= transfer_deadline {
+            let (leader, term) = last_seen;
             panic!(
                 "group {target_gid} leadership did not transfer to X={excluded_x} \
-                 within deadline (started at leader={current_leader}, term={current_term})"
+                 within deadline (last seen leader={leader}, term={term})"
             );
         }
+
+        if let Some((leader, term)) = leader_and_term(&cluster, target_gid)
+            && leader != excluded_x
+        {
+            last_seen = (leader, term);
+            let transport = cluster.nodes[0]
+                .shared
+                .cluster_transport
+                .as_ref()
+                .expect("cluster_transport");
+            transport
+                .send_rpc_oneway(
+                    excluded_x,
+                    nodedb_cluster::RaftRpc::TimeoutNowRequest(nodedb_raft::TimeoutNowRequest {
+                        term,
+                        leader_id: leader,
+                        group_id: target_gid,
+                    }),
+                )
+                .await
+                .expect("send TimeoutNow to excluded voter");
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
