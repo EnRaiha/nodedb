@@ -60,6 +60,18 @@ pub struct ClusterSettings {
     /// Number of replicas per Raft group.
     pub replication_factor: u32,
     /// Minimum wire-protocol version that peers must speak.
+    ///
+    /// RESERVED AND INERT. Nothing reads this today: the join gate compares a
+    /// peer's version for exact equality against `WIRE_FORMAT_VERSION`, and
+    /// `MIN_WIRE_FORMAT_VERSION == WIRE_FORMAT_VERSION`, so there is no window
+    /// for a floor to sit inside and no version this could admit or refuse
+    /// that the equality check has not already settled.
+    ///
+    /// It becomes meaningful when a real compatibility window opens after 1.0
+    /// (see `nodedb_types::wire_version`), at which point the effective floor
+    /// is the higher of this value and the compile-time minimum. Until then,
+    /// setting it changes nothing — treat a non-default value as a statement
+    /// of intent for a future release, not as an enforced policy.
     pub min_wire_version: u16,
 }
 
