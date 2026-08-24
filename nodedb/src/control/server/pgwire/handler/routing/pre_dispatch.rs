@@ -24,6 +24,19 @@ use super::super::core::NodeDbPgHandler;
 /// round trip always fits and a partition is reported rather than hung on.
 const LEADERSHIP_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// This node has missed a topology transition and must not coordinate work
+/// until it catches up.
+fn superseded_topology_view(behind: u64) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
+        format!(
+            "this node is {behind} cluster generation(s) behind and is not \
+             coordinating queries until it catches up; retry"
+        ),
+    )))
+}
+
 /// No leader is known for a group whose read requires one.
 fn no_serving_leader() -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -40,6 +53,33 @@ impl NodeDbPgHandler {
     /// leader keeps its entry long after the rest of the cluster has elected
     /// a successor. Reads served on that entry alone return state the new
     /// leader has already moved past.
+    /// Refuse to coordinate work while this node is known to be behind the
+    /// cluster's topology generation.
+    ///
+    /// A peer's frame carried an epoch this node has not applied, so some
+    /// topology transition has committed that this node has not processed.
+    /// Its routing table, placement, and group membership are all derived from
+    /// the older generation, and any work planned against them is planned
+    /// against a superseded view of the cluster.
+    ///
+    /// A node judges only itself here. It knows exactly which generation it
+    /// has applied, and only ever guesses at where its peers are, so the sound
+    /// move is to stand down rather than to start rejecting others on the
+    /// strength of a number overheard on the wire.
+    ///
+    /// Self-clearing: the metadata group delivers the bump, the applied mark
+    /// catches up, and the next attempt proceeds. Raft traffic is never gated
+    /// this way — it is how the node catches up in the first place.
+    fn refuse_if_topology_view_superseded(&self) -> PgWireResult<()> {
+        let Some(epoch) = self.state.cluster_epoch.get() else {
+            return Ok(());
+        };
+        if epoch.is_behind() {
+            return Err(superseded_topology_view(epoch.generations_behind()));
+        }
+        Ok(())
+    }
+
     async fn confirm_local_leadership(&self, group_id: u64) -> PgWireResult<()> {
         let Some(gate) = self.state.raft_read_gate.get() else {
             // Reached only if a clustered node routed here before `start_raft`
@@ -133,6 +173,7 @@ impl NodeDbPgHandler {
         if has_orchestrated_dml(tasks) {
             return Ok(None);
         }
+        self.refuse_if_topology_view_superseded()?;
         let consistency = consistency_for_tasks(&self.sessions, tasks, session_id);
         let needs_confirmed_leader = consistency.requires_leader() && !has_replicated_writes(tasks);
         match self.placement_for_tasks(tasks, consistency, needs_confirmed_leader) {

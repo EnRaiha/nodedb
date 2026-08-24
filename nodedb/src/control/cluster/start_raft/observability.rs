@@ -108,6 +108,17 @@ pub(super) fn finish_observability(
         tracing::warn!("raft_read_gate already set — start_raft appears to have run twice");
     }
 
+    // Publish this node's cluster-epoch state so the routing gate can tell
+    // whether this node has missed a topology transition before it coordinates
+    // work on a view of the cluster that may already be superseded.
+    if shared
+        .cluster_epoch
+        .set(raft_loop.cluster_epoch_handle())
+        .is_err()
+    {
+        tracing::warn!("cluster_epoch already set — start_raft appears to have run twice");
+    }
+
     // Publish the raft loop handle into SharedState so the metadata
     // proposer can reach it. The handle is type-erased behind a
     // trait object to keep the SharedState field concrete.

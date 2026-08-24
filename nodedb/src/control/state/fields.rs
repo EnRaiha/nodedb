@@ -151,6 +151,9 @@ pub struct SharedState {
     /// linearizable read, replica freshness for a bounded-staleness one.
     /// Unset in single-node mode, where neither question arises.
     pub raft_read_gate: OnceLock<Arc<dyn crate::control::cluster::read_index::RaftReadGate>>,
+    /// This node's cluster-epoch state. Set once by `start_raft`; unset in
+    /// single-node mode, where there is no topology generation to miss.
+    pub cluster_epoch: OnceLock<Arc<nodedb_cluster::ClusterEpochState>>,
     /// Query Raft group statuses for observability (unset in single-node mode).
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
