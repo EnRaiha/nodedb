@@ -78,8 +78,10 @@ pub fn register_default_subsystems(
     // incarnation. A node that crashed while peers held `Dead(A, N)`
     // restarts at `N + 1`, so its very first `Alive` announcement
     // dominates every lingering rumour — no probabilistic refutation
-    // round-trip required.
-    let persisted_inc = catalog.load_swim_incarnation().unwrap_or(None);
+    // round-trip required. A read error (or corrupted metadata) FAILS
+    // bootstrap rather than silently restarting at incarnation 0, which
+    // would reintroduce the stick the persisted key exists to prevent.
+    let persisted_inc = catalog.load_swim_incarnation()?;
     let initial_incarnation = match persisted_inc {
         Some(v) => Incarnation::new(v).bump(),
         None => Incarnation::ZERO,
