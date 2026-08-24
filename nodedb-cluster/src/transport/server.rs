@@ -273,7 +273,24 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
 
         // 3. Decode before the identity decision so an unknown, CA-verified
         // peer can be restricted to exactly one enrollment operation.
-        let request = rpc_codec::decode(inner_frame)?;
+        let request = match rpc_codec::decode(inner_frame) {
+            Ok(r) => r,
+            Err(ClusterError::StalePeerEpoch { peer_epoch, local_epoch }) => {
+                // A fenced peer's frame is dropped, NOT a transport failure:
+                // ending this stream task without an encoded response lets
+                // the sender's raft retry path converge (its next inbound
+                // frame re-observes our epoch via fetch_max). The connection
+                // stays open for join/ping exempt traffic.
+                warn!(
+                    node_id = fields.from_node_id,
+                    peer_epoch,
+                    local_epoch,
+                    "dropped frame from peer on a stale cluster epoch (fenced until rejoin)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         validate_join_sender(&request, fields.from_node_id)?;
 
         // 3b. Bind the MAC-authenticated node id to the mTLS leaf identity.
