@@ -175,7 +175,15 @@ impl ClusterCatalog {
                     arr.copy_from_slice(bytes);
                     Ok(Some(u64::from_le_bytes(arr)))
                 } else {
-                    Ok(None)
+                    // Corrupted metadata: an unexpected length is NOT "no
+                    // value". Surface it so operators detect catalog
+                    // corruption early instead of silently restarting at
+                    // incarnation 0 (which would reintroduce the rejoin
+                    // stick the key exists to prevent).
+                    Err(catalog_err(format!(
+                        "metadata key {KEY_SWIM_INCARNATION} has unexpected length {} (expected 8)",
+                        bytes.len()
+                    )))
                 }
             }
             None => Ok(None),

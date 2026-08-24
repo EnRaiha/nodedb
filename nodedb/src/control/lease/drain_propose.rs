@@ -243,8 +243,8 @@ fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version:
 }
 
 /// Whether `node_id` is a current cluster member. Missing topology
-/// (single-node / belum di-wire) treats every holder as member —
-/// fail-safe: filter ini hanya PERNAH membuang hold yang ia pasti.
+/// (single-node / not yet wired) treats every holder as member —
+/// fail-safe: this filter only ever drops holds it is certain about.
 fn lease_holder_is_member(shared: &SharedState, node_id: u64) -> bool {
     match &shared.cluster_topology {
         Some(topo) => topo
