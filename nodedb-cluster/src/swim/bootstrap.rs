@@ -28,6 +28,7 @@ use super::detector::{FailureDetector, ProbeScheduler, Transport};
 use super::dissemination::DisseminationQueue;
 use super::error::SwimError;
 use super::incarnation::Incarnation;
+use super::incarnation_store::IncarnationStore;
 use super::member::MemberState;
 use super::member::record::MemberUpdate;
 use super::membership::MembershipList;
@@ -92,12 +93,24 @@ pub async fn spawn(
     seeds: Vec<SocketAddr>,
     transport: Arc<dyn Transport>,
 ) -> Result<SwimHandle, SwimError> {
-    spawn_with_subscribers(cfg, local_id, local_addr, seeds, transport, Vec::new()).await
+    spawn_with_subscribers(
+        cfg,
+        local_id,
+        local_addr,
+        seeds,
+        transport,
+        Vec::new(),
+        None,
+    )
+    .await
 }
 
 /// Same as [`spawn`] but installs the given [`MembershipSubscriber`]s
 /// on the detector before its run loop starts, so every state
 /// transition is observed from the very first probe round.
+///
+/// `incarnation_store` persists self-refutation bumps across restarts.
+/// Production passes a catalog-backed store; tests pass `None`.
 pub async fn spawn_with_subscribers(
     cfg: SwimConfig,
     local_id: NodeId,
@@ -105,6 +118,7 @@ pub async fn spawn_with_subscribers(
     seeds: Vec<SocketAddr>,
     transport: Arc<dyn Transport>,
     subscribers: Vec<Arc<dyn MembershipSubscriber>>,
+    incarnation_store: Option<Arc<dyn IncarnationStore>>,
 ) -> Result<SwimHandle, SwimError> {
     cfg.validate()?;
 
@@ -130,13 +144,17 @@ pub async fn spawn_with_subscribers(
     }
 
     let initial_inc = cfg.initial_incarnation;
-    let detector = Arc::new(FailureDetector::with_subscribers(
+    let mut detector = FailureDetector::with_subscribers(
         cfg,
         Arc::clone(&membership),
         transport,
         ProbeScheduler::new(),
         subscribers,
-    ));
+    );
+    if let Some(store) = incarnation_store {
+        detector.set_incarnation_store(store);
+    }
+    let detector = Arc::new(detector);
 
     // Prime the dissemination queue with our own Alive record so the
     // first outgoing probes advertise our canonical NodeId + addr to

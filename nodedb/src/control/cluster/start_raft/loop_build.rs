@@ -172,6 +172,7 @@ pub(super) fn build_raft_loop(
             Arc::clone(&handle.routing),
             Arc::clone(&handle.transport),
             raft_loop_handle,
+            &handle.catalog,
         ))
     })
     .map_err(|e| crate::Error::Config {

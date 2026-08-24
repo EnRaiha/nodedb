@@ -30,6 +30,7 @@ use crate::routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 use crate::swim::bootstrap::{SwimHandle, spawn_with_subscribers};
 use crate::swim::config::SwimConfig;
 use crate::swim::detector::UdpTransport;
+use crate::swim::incarnation_store::IncarnationStore;
 use crate::swim::subscriber::MembershipSubscriber;
 use crate::topology::ClusterTopology;
 
@@ -49,6 +50,9 @@ pub struct SwimSubsystemConfig {
     pub swim_addr: SocketAddr,
     /// Initial seed peers for the membership list.
     pub seeds: Vec<SocketAddr>,
+    /// Persists self-refutation incarnation bumps across restarts.
+    /// Production passes a catalog-backed store.
+    pub incarnation_store: Option<Arc<dyn IncarnationStore>>,
 }
 
 /// Owns the SWIM failure detector lifetime.
@@ -132,6 +136,7 @@ impl ClusterSubsystem for SwimSubsystem {
             self.cfg.seeds.clone(),
             Arc::new(transport),
             subscribers,
+            self.cfg.incarnation_store.clone(),
         )
         .await
         .map_err(|e| BootstrapError::SubsystemStart {
@@ -209,6 +214,7 @@ mod tests {
             local_id: NodeId::try_new("1").expect("test fixture"),
             swim_addr: "127.0.0.1:0".parse().unwrap(),
             seeds: vec![],
+            incarnation_store: None,
         };
         let routing = Arc::new(RwLock::new(RoutingTable::uniform(1, &[1], 1)));
         let topology = Arc::new(RwLock::new(ClusterTopology::new()));
@@ -233,6 +239,7 @@ mod tests {
             local_id: NodeId::try_new("1").expect("test fixture"),
             swim_addr: "127.0.0.1:0".parse().unwrap(),
             seeds: vec![],
+            incarnation_store: None,
         };
         let routing = Arc::new(RwLock::new(RoutingTable::uniform(1, &[1], 1)));
         let topology = Arc::new(RwLock::new(ClusterTopology::new()));

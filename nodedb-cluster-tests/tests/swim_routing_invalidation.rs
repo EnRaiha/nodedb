@@ -88,6 +88,9 @@ async fn swim_dead_leader_clears_routing_hint() {
         vec![addr_b, addr_c],
         t_a.clone() as Arc<dyn Transport>,
         vec![hook],
+        // No incarnation persistence: this test restarts nothing, and the
+        // fast-restart path it would exercise is covered by unit tests.
+        None,
     )
     .await
     .expect("spawn a");
