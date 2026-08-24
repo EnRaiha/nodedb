@@ -31,10 +31,10 @@ use nodedb_bridge::backpressure::PressureState;
 use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
+use super::action::ActionRetryQueue;
 use super::bus::EventConsumerRx;
 use super::metrics::CoreMetrics;
 use super::trigger::dlq::TriggerDlq;
-use super::trigger::retry::TriggerRetryQueue;
 use super::watermark::WatermarkStore;
 use crate::control::state::SharedState;
 use crate::types::Lsn;
@@ -166,7 +166,7 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     let mut last_lsn = Lsn::ZERO;
     let mut dirty_watermark = false;
     let mut last_watermark_flush = tokio::time::Instant::now();
-    let mut retry_queue = TriggerRetryQueue::new();
+    let mut retry_queue = ActionRetryQueue::for_core(&shared_state.data_dir, core_id);
     let mut last_retry_poll = tokio::time::Instant::now();
 
     // Load persisted watermark.
@@ -522,7 +522,7 @@ fn fail_stop_wal_catchup(
 async fn process_normal_batch(
     events: &[super::types::WriteEvent],
     shared_state: &Arc<SharedState>,
-    retry_queue: &mut TriggerRetryQueue,
+    retry_queue: &mut ActionRetryQueue,
     cdc_router: &Arc<super::cdc::CdcRouter>,
 ) {
     for event in events {
@@ -547,31 +547,42 @@ async fn process_normal_batch(
 
 /// Process the retry queue: DLQ exhausted entries and retry ready ones.
 async fn process_retry_queue(
-    retry_queue: &mut TriggerRetryQueue,
+    retry_queue: &mut ActionRetryQueue,
     trigger_dlq: &Arc<std::sync::Mutex<TriggerDlq>>,
     shared_state: &Arc<SharedState>,
 ) {
     let (ready, exhausted) = retry_queue.drain_due();
     if !exhausted.is_empty() {
         let mut dlq = trigger_dlq.lock().unwrap_or_else(|p| p.into_inner());
-        for entry in &exhausted {
+        for action in &exhausted {
             let _ = dlq.enqueue(super::trigger::dlq::DlqEnqueueParams {
-                tenant_id: entry.tenant_id,
-                source_collection: entry.collection.clone(),
-                row_id: entry.row_id.clone(),
-                operation: entry.operation.clone(),
-                trigger_name: entry.trigger_name.clone(),
-                error: entry.last_error.clone(),
-                retry_count: entry.attempts,
-                source_lsn: entry.source_lsn,
-                source_sequence: entry.source_sequence,
+                tenant_id: action.context.tenant_id,
+                source_collection: action.context.collection.clone(),
+                row_id: action.context.row_id.clone(),
+                operation: action_operation(action).to_owned(),
+                trigger_name: action.owner().to_owned(),
+                error: action.last_error.clone(),
+                retry_count: action.attempts,
+                source_lsn: action.key.source_lsn,
+                source_sequence: action.key.source_sequence,
             });
         }
         // dlq MutexGuard dropped before any await.
     }
 
-    for entry in ready {
-        super::trigger::dispatcher::retry_single(&entry, shared_state, retry_queue).await;
+    for action in ready {
+        super::trigger::dispatcher::retry_action(&action, shared_state, retry_queue).await;
+    }
+}
+
+/// The DML operation a queued action came from, for its DLQ row. An event
+/// action carries SQL rather than a row operation, so it reports the action
+/// kind instead of inventing one.
+fn action_operation(action: &super::action::FailedAction) -> &str {
+    match &action.payload {
+        super::action::ActionPayload::TriggerRow { operation, .. }
+        | super::action::ActionPayload::TriggerStatement { operation } => operation,
+        super::action::ActionPayload::EventAction { .. } => "EVENT",
     }
 }
 

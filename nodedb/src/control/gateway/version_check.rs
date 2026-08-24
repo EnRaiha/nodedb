@@ -11,6 +11,10 @@
 //! re-compares the stamped versions against the executing node's own catalog
 //! before the plan runs.
 
+use std::collections::BTreeMap;
+
+use nodedb_cluster::{DescriptorId, DescriptorKind};
+
 use crate::control::security::catalog::SystemCatalog;
 use crate::types::DatabaseId;
 
@@ -102,6 +106,34 @@ where
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Compare a set of held `(descriptor, version)` pairs against the local
+/// catalog.
+///
+/// The pairs come from the descriptor leases a plan took, which name their own
+/// database and tenant, so they are grouped by that scope rather than compared
+/// against a single assumed one. Only collection descriptors carry a catalog
+/// version; other kinds are not collections and are skipped.
+pub fn check_descriptor_holds(
+    catalog: &SystemCatalog,
+    holds: &[(DescriptorId, u64)],
+) -> Result<(), DescriptorCheckError> {
+    let mut by_scope: BTreeMap<(u64, u64), Vec<(&str, u64)>> = BTreeMap::new();
+    for (id, version) in holds {
+        if id.kind != DescriptorKind::Collection {
+            continue;
+        }
+        by_scope
+            .entry((id.database_id, id.tenant_id))
+            .or_default()
+            .push((id.name.as_str(), *version));
+    }
+
+    for ((database_id, tenant_id), entries) in by_scope {
+        check_descriptor_versions(catalog, DatabaseId::new(database_id), tenant_id, entries)?;
     }
     Ok(())
 }

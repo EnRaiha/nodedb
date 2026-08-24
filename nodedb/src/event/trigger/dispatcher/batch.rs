@@ -20,13 +20,15 @@ use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::super::retry::{RetryEntry, TriggerRetryQueue};
 use super::identity::trigger_identity;
+use crate::event::action::{
+    ActionContext, ActionId, ActionKey, ActionPayload, ActionRetryQueue, FailedAction,
+};
 
 pub async fn dispatch_trigger_batch(
     batch: &crate::control::trigger::batch::collector::TriggerBatch,
     state: &Arc<SharedState>,
-    retry_queue: &mut TriggerRetryQueue,
+    retry_queue: &mut ActionRetryQueue,
 ) {
     use crate::control::security::catalog::trigger_types::{TriggerGranularity, TriggerTiming};
     use crate::control::trigger::batch::when_filter;
@@ -98,7 +100,7 @@ pub async fn dispatch_trigger_batch(
             let bindings =
                 when_filter::build_row_bindings(row, &batch.collection, &batch.operation);
 
-            let result = fire_common::fire_triggers(fire_common::FireTriggersParams {
+            let report = fire_common::fire_triggers(fire_common::FireTriggersParams {
                 state,
                 identity: &identity,
                 tenant_id,
@@ -112,10 +114,11 @@ pub async fn dispatch_trigger_batch(
                 // consumer loop. Cross-shard origination is therefore not
                 // available here; see the tracked follow-up.
                 cross_shard_origin: None,
+                on_error: fire_common::FireErrorPolicy::Abort,
             })
             .await;
 
-            if let Err(e) = result {
+            if let Err(e) = report.into_result() {
                 warn!(
                     trigger = %trigger.name,
                     collection = %batch.collection,
@@ -123,25 +126,33 @@ pub async fn dispatch_trigger_batch(
                     error = %e,
                     "batch trigger fire failed, enqueuing row for retry"
                 );
-                retry_queue.enqueue(RetryEntry {
-                    database_id: batch.database_id,
-                    tenant_id: batch.tenant_id,
-                    collection: batch.collection.clone(),
-                    row_id: row.row_id.clone(),
-                    operation: batch.operation.clone(),
-                    trigger_name: trigger.name.clone(),
-                    new_fields: row.new_fields().cloned(),
-                    old_fields: row.old_fields().cloned(),
+                retry_queue.enqueue(FailedAction {
+                    key: ActionKey {
+                        // The batch path does not carry per-row source
+                        // LSN/sequence/vShard (see cross_shard_origin note
+                        // above); it is not wired into the production consumer
+                        // loop.
+                        source_lsn: 0,
+                        source_sequence: 0,
+                        source_vshard: 0,
+                        action: ActionId::TriggerRow {
+                            trigger_name: trigger.name.clone(),
+                        },
+                    },
+                    payload: ActionPayload::TriggerRow {
+                        operation: batch.operation.clone(),
+                        new_fields: row.new_fields().cloned(),
+                        old_fields: row.old_fields().cloned(),
+                    },
+                    context: ActionContext {
+                        database_id: batch.database_id,
+                        tenant_id: batch.tenant_id,
+                        collection: batch.collection.clone(),
+                        row_id: row.row_id.clone(),
+                        cascade_depth: 0,
+                    },
                     attempts: 0,
                     last_error: e.to_string(),
-                    next_retry_at: std::time::Instant::now(),
-                    // The batch path does not carry per-row source
-                    // LSN/sequence/vShard (see cross_shard_origin note above);
-                    // it is not wired into the production consumer loop.
-                    source_lsn: 0,
-                    source_sequence: 0,
-                    source_vshard: 0,
-                    cascade_depth: 0,
                 });
             }
         }

@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use tracing::{trace, warn};
 
+use super::action::ActionRetryQueue;
 use super::bus::EventConsumerRx;
 use super::metrics::CoreMetrics;
-use super::trigger::retry::TriggerRetryQueue;
 use super::types::WriteEvent;
 use super::watermark::WatermarkStore;
 use crate::control::state::SharedState;
@@ -216,7 +216,7 @@ pub fn drain_and_skip_stale(rx: &mut EventConsumerRx, last_lsn: Lsn) -> Option<W
 pub async fn dispatch_event(
     event: &WriteEvent,
     shared_state: &Arc<SharedState>,
-    retry_queue: &mut TriggerRetryQueue,
+    retry_queue: &mut ActionRetryQueue,
     cdc_router: &Arc<super::cdc::CdcRouter>,
 ) {
     dispatch_event_actions(event, shared_state, retry_queue).await;
@@ -233,14 +233,19 @@ pub async fn dispatch_event(
 pub async fn dispatch_event_actions(
     event: &WriteEvent,
     shared_state: &Arc<SharedState>,
-    retry_queue: &mut TriggerRetryQueue,
+    retry_queue: &mut ActionRetryQueue,
 ) {
     if !event_actions_required(event) {
         return;
     }
 
     super::trigger::dispatcher::dispatch_triggers(event, shared_state, retry_queue).await;
-    crate::control::event_trigger::process_write_event(Arc::clone(shared_state), event).await;
+    crate::control::event_trigger::process_write_event(
+        Arc::clone(shared_state),
+        event,
+        retry_queue,
+    )
+    .await;
 }
 
 fn event_actions_required(event: &WriteEvent) -> bool {

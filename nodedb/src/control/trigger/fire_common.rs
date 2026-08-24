@@ -50,6 +50,81 @@ pub struct FireTriggersParams<'a> {
     /// otherwise). Propagated into each trigger body's executor so that DML
     /// against a remote-homed collection is dispatched to the owning node.
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// What a failing trigger does to the triggers queued behind it.
+    pub on_error: FireErrorPolicy,
+}
+
+/// What happens to the remaining triggers when one of them fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireErrorPolicy {
+    /// Stop at the first failure. The in-transaction fire paths (BEFORE,
+    /// INSTEAD OF, and AFTER in SYNC or DEFERRED mode) use this: their
+    /// caller's transaction is already doomed, so running the triggers behind
+    /// the failure only adds writes to a statement that will not stand.
+    Abort,
+    /// Run every trigger and report each outcome. The Event Plane uses this:
+    /// its triggers share no transaction, so one failing must not silently
+    /// cancel its siblings — they would never run at all, since a retry
+    /// re-fires only the trigger that failed.
+    Continue,
+}
+
+/// One trigger's outcome within a single fire pass.
+pub struct TriggerOutcome {
+    /// The trigger that ran, named so a failure can be retried on its own.
+    pub trigger_name: String,
+    /// The failure, when the body did not execute to completion.
+    pub error: Option<crate::Error>,
+}
+
+/// Per-trigger outcomes of one fire pass, in registration order.
+///
+/// Triggers skipped by a WHEN clause or an unparsable body are absent: they
+/// did not run and there is nothing to retry.
+#[derive(Default)]
+pub struct FireReport {
+    refusal: Option<crate::Error>,
+    outcomes: Vec<TriggerOutcome>,
+}
+
+impl FireReport {
+    /// A pass that refused before any trigger ran — currently only a cascade
+    /// depth stop.
+    ///
+    /// The failure belongs to the pass rather than to any one trigger, and
+    /// re-running it would hit the same depth again, so a refusal is terminal:
+    /// it is reported, never retried.
+    pub fn from_precondition(error: crate::Error) -> Self {
+        Self {
+            refusal: Some(error),
+            outcomes: Vec::new(),
+        }
+    }
+
+    /// The whole-pass refusal, when the pass never reached its triggers.
+    pub fn refusal(&self) -> Option<&crate::Error> {
+        self.refusal.as_ref()
+    }
+
+    /// Every trigger that failed, in registration order. A refused pass
+    /// yields nothing — no individual trigger ran.
+    pub fn into_failures(self) -> impl Iterator<Item = TriggerOutcome> {
+        self.outcomes
+            .into_iter()
+            .filter(|outcome| outcome.error.is_some())
+    }
+
+    /// Collapse to the first failure — the all-or-nothing contract every
+    /// in-transaction caller needs.
+    pub fn into_result(self) -> crate::Result<()> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
+        match self.outcomes.into_iter().find_map(|outcome| outcome.error) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Execute a list of triggers with the given bindings.
@@ -60,7 +135,7 @@ pub struct FireTriggersParams<'a> {
 /// Handles SECURITY DEFINER: when a trigger has `security = Definer`,
 /// the executor runs with the trigger owner's identity instead of the caller's.
 /// Tenant boundary is enforced — DEFINER identity always uses the trigger's tenant.
-pub async fn fire_triggers(params: FireTriggersParams<'_>) -> crate::Result<()> {
+pub async fn fire_triggers(params: FireTriggersParams<'_>) -> FireReport {
     let FireTriggersParams {
         state,
         identity,
@@ -70,8 +145,10 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> crate::Result<()> 
         bindings,
         cascade_depth,
         cross_shard_origin,
+        on_error,
     } = params;
 
+    let mut report = FireReport::default();
     for trigger in triggers {
         if let Some(ref when_cond) = trigger.when_condition {
             let bound_cond = bindings.substitute(when_cond);
@@ -119,17 +196,27 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> crate::Result<()> 
             executor = executor.with_cross_shard_origin(origin.clone());
         }
 
-        if let Err(e) = executor.execute_block(&block, bindings).await {
-            return Err(crate::Error::BadRequest {
+        let error = executor
+            .execute_block(&block, bindings)
+            .await
+            .err()
+            .map(|e| crate::Error::BadRequest {
                 detail: format!(
                     "trigger '{}' on '{}' failed: {}",
                     trigger.name, collection, e
                 ),
             });
+        let failed = error.is_some();
+        report.outcomes.push(TriggerOutcome {
+            trigger_name: trigger.name.clone(),
+            error,
+        });
+        if failed && on_error == FireErrorPolicy::Abort {
+            break;
         }
     }
 
-    Ok(())
+    report
 }
 
 /// Resolve the effective identity for a trigger execution.

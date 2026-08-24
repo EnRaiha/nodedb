@@ -20,7 +20,7 @@ use crate::types::{DatabaseId, TenantId};
 
 use super::TriggerScope;
 use super::fire_common::{
-    BeforeTriggersMutationParams, FireTriggersParams, check_cascade_depth,
+    BeforeTriggersMutationParams, FireErrorPolicy, FireTriggersParams, check_cascade_depth,
     fire_before_triggers_with_mutation, fire_triggers,
 };
 use super::registry::DmlEvent;
@@ -173,6 +173,8 @@ pub async fn fire_before_delete(
         // BEFORE triggers run in the caller's write context, not the
         // Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
+        on_error: FireErrorPolicy::Abort,
     })
     .await
+    .into_result()
 }

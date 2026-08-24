@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod action;
 pub mod alert;
 pub mod audit_dml;
 pub mod bitemporal_extract;

@@ -11,13 +11,8 @@
 //! catalog immediately before the durable dispatch is what closes that
 //! window.
 
-use std::collections::BTreeMap;
-
-use nodedb_cluster::{DescriptorId, DescriptorKind};
-
-use crate::control::gateway::version_check::check_descriptor_versions;
+use crate::control::gateway::version_check::check_descriptor_holds;
 use crate::control::security::catalog::SystemCatalog;
-use crate::types::DatabaseId;
 
 use super::connection::SessionId;
 use super::outcome::AbortReason;
@@ -34,49 +29,20 @@ pub(super) fn check_buffered_descriptors(
     session_id: SessionId,
 ) -> Option<AbortReason> {
     let holds = sessions.tx_descriptor_versions(session_id);
-    check_holds(catalog, &holds)
-}
-
-/// The comparison itself, over an explicit hold list.
-///
-/// Only collection descriptors carry a catalog version to compare; other
-/// kinds are not collections and are skipped. Holds are grouped by the
-/// database and tenant they name so each group is compared against its own
-/// catalog scope rather than the session's assumed one.
-pub(super) fn check_holds(
-    catalog: &SystemCatalog,
-    holds: &[(DescriptorId, u64)],
-) -> Option<AbortReason> {
-    let mut by_scope: BTreeMap<(u64, u64), Vec<(&str, u64)>> = BTreeMap::new();
-    for (id, version) in holds {
-        if id.kind != DescriptorKind::Collection {
-            continue;
-        }
-        by_scope
-            .entry((id.database_id, id.tenant_id))
-            .or_default()
-            .push((id.name.as_str(), *version));
-    }
-
-    for ((database_id, tenant_id), entries) in by_scope {
-        if let Err(error) = check_descriptor_versions(
-            catalog,
-            DatabaseId::new(database_id),
-            tenant_id,
-            entries,
-        ) {
-            return Some(AbortReason::SchemaChanged {
-                detail: error.to_string(),
-            });
-        }
-    }
-    None
+    check_descriptor_holds(catalog, &holds)
+        .err()
+        .map(|error| AbortReason::SchemaChanged {
+            detail: error.to_string(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    use nodedb_cluster::{DescriptorId, DescriptorKind};
+
     use super::*;
     use crate::control::security::catalog::StoredCollection;
+    use crate::types::DatabaseId;
 
     const TENANT: u64 = 11;
 
@@ -99,16 +65,24 @@ mod tests {
         )
     }
 
+    fn check(catalog: &SystemCatalog, holds: &[(DescriptorId, u64)]) -> Option<AbortReason> {
+        check_descriptor_holds(catalog, holds)
+            .err()
+            .map(|error| AbortReason::SchemaChanged {
+                detail: error.to_string(),
+            })
+    }
+
     #[test]
     fn unchanged_versions_pass() {
         let catalog = catalog_with(&[("orders", 3)]);
-        assert!(check_holds(&catalog, &[hold(DescriptorKind::Collection, "orders", 3)]).is_none());
+        assert!(check(&catalog, &[hold(DescriptorKind::Collection, "orders", 3)]).is_none());
     }
 
     #[test]
     fn a_version_bump_since_the_statement_aborts_the_commit() {
         let catalog = catalog_with(&[("orders", 4)]);
-        match check_holds(&catalog, &[hold(DescriptorKind::Collection, "orders", 3)]) {
+        match check(&catalog, &[hold(DescriptorKind::Collection, "orders", 3)]) {
             Some(AbortReason::SchemaChanged { detail }) => {
                 assert!(
                     detail.contains("orders"),
@@ -122,7 +96,7 @@ mod tests {
     #[test]
     fn non_collection_holds_are_skipped() {
         let catalog = catalog_with(&[]);
-        assert!(check_holds(&catalog, &[hold(DescriptorKind::Index, "orders_by_id", 9)]).is_none());
+        assert!(check(&catalog, &[hold(DescriptorKind::Index, "orders_by_id", 9)]).is_none());
     }
 
     #[test]
@@ -140,8 +114,17 @@ mod tests {
         // The same name at the same version in a tenant that has no such
         // collection must not be satisfied by this tenant's row.
         assert!(matches!(
-            check_holds(&catalog, &[other]),
+            check(&catalog, &[other]),
             Some(AbortReason::SchemaChanged { .. })
         ));
+    }
+
+    #[test]
+    fn a_session_with_no_buffered_writes_has_nothing_to_fence() {
+        let catalog = catalog_with(&[("orders", 3)]);
+        let sessions = SessionStore::new();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 4001));
+        sessions.ensure_session(addr);
+        assert!(check_buffered_descriptors(&catalog, &sessions, SessionId::from(addr)).is_none());
     }
 }

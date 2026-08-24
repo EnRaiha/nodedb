@@ -12,6 +12,7 @@ use crate::types::{DatabaseId, TenantId};
 use super::dml_hook::DmlWriteInfo;
 use super::fire_after;
 use super::fire_before;
+use super::fire_common::FireErrorPolicy;
 use super::fire_instead::InsteadOfResult;
 use super::fire_statement;
 use super::registry::DmlEvent;
@@ -230,8 +231,11 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                     // path (no source-write LSN/HWM identity); cross-shard
                     // origination for this path is a tracked follow-up.
                     cross_shard_origin: None,
+                    on_error: FireErrorPolicy::Abort,
+                    only_trigger: None,
                 })
-                .await?;
+                .await
+                .into_result()?;
             }
         }
         DmlEvent::Update => {
@@ -248,8 +252,11 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Sync),
                 cross_shard_origin: None,
+                on_error: FireErrorPolicy::Abort,
+                only_trigger: None,
             })
-            .await?;
+            .await
+            .into_result()?;
         }
         DmlEvent::Delete => {
             let old_fields = old_row.as_ref().unwrap_or(&empty);
@@ -263,25 +270,31 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Sync),
                 cross_shard_origin: None,
+                on_error: FireErrorPolicy::Abort,
+                only_trigger: None,
             })
-            .await?;
+            .await
+            .into_result()?;
         }
     }
 
     // Fire SYNC AFTER STATEMENT triggers (once per DML statement, not per row).
-    fire_statement::fire_after_statement(
+    fire_statement::fire_after_statement(fire_statement::FireAfterStatementParams {
         state,
         identity,
-        super::TriggerScope {
+        scope: super::TriggerScope {
             database_id,
             tenant_id,
         },
-        &info.collection,
-        info.event,
+        collection: &info.collection,
+        event: info.event,
         cascade_depth,
-        Some(TriggerExecutionMode::Sync),
-    )
-    .await?;
+        mode_filter: Some(TriggerExecutionMode::Sync),
+        on_error: FireErrorPolicy::Abort,
+        only_trigger: None,
+    })
+    .await
+    .into_result()?;
 
     Ok(())
 }

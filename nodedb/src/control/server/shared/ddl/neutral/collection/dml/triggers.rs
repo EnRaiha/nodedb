@@ -35,9 +35,12 @@ pub(super) async fn fire_sync_after_triggers(
             // has no source-write LSN/HWM identity; cross-shard origination for
             // this path is a tracked follow-up.
             cross_shard_origin: None,
+            on_error: crate::control::trigger::fire_common::FireErrorPolicy::Abort,
+            only_trigger: None,
         },
     )
     .await
+    .into_result()
     {
         return Some(Err(ddl_err("XX000", &format!("trigger error: {e}"))));
     }
@@ -74,9 +77,12 @@ pub(super) async fn fire_sync_after_update_triggers(
             // source-write LSN/HWM identity); cross-shard origination here is a
             // tracked follow-up.
             cross_shard_origin: None,
+            on_error: crate::control::trigger::fire_common::FireErrorPolicy::Abort,
+            only_trigger: None,
         },
     )
     .await
+    .into_result()
     {
         return Some(Err(ddl_err("XX000", &format!("trigger error: {e}"))));
     }

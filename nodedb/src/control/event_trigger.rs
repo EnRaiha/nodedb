@@ -9,22 +9,41 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
-use crate::control::event_trigger_dispatch::{
-    TriggerActionError, TriggerRenderError, dispatch_action_tasks,
-};
+use crate::control::event_action_error::{TriggerActionError, TriggerRenderError};
 use crate::control::planner::context::QueryContext;
 use crate::control::state::SharedState;
-use crate::event::types::{WriteEvent, WriteOp};
+use crate::event::action::{
+    ActionContext, ActionId, ActionKey, ActionPayload, ActionRetryQueue, FailedAction,
+};
+use crate::event::types::{EventSource, WriteEvent, WriteOp};
+use crate::types::{DatabaseId, TenantId};
 
 /// Process one WAL-derived data event against matching EventDefinitions.
 ///
 /// The caller awaits this before advancing its durable consumer watermark, so
 /// DEFINE EVENT actions share the Event Plane's normal/replay delivery and
 /// recovery guarantees. Heartbeats are intentionally not trigger input.
-pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
+pub async fn process_write_event(
+    shared: Arc<SharedState>,
+    event: &WriteEvent,
+    queue: &mut ActionRetryQueue,
+) {
     if !event.op.is_data_event() {
+        return;
+    }
+
+    // An action's own writes come back through the Event Plane. Firing event
+    // definitions on them lets an action that writes to the collection it
+    // watches re-trigger itself without bound, so only the same sources that
+    // fire triggers fire event definitions.
+    if !matches!(event.source, EventSource::User | EventSource::Deferred) {
+        trace!(
+            source = %event.source,
+            collection = %event.collection,
+            "skipping event definitions for a non-triggerable event source"
+        );
         return;
     }
 
@@ -43,7 +62,7 @@ pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
     }
 
     let op_str = event_operation(event.op);
-    for event_def in &coll.event_defs {
+    for (index, event_def) in coll.event_defs.iter().enumerate() {
         let when_upper = event_def.when_condition.to_uppercase();
         let matches = match when_upper.as_str() {
             "INSERT" => matches!(event.op, WriteOp::Insert | WriteOp::BulkInsert { .. }),
@@ -65,13 +84,22 @@ pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
             "event trigger fired"
         );
 
-        let outcome = execute_then_action(
-            Arc::clone(&shared),
-            event,
-            &event_def.then_action,
-            &event_def.name,
-        )
-        .await;
+        let rendered = render_then_action_sql(&event_def.then_action, event);
+        let outcome = match &rendered {
+            Ok(sql) => {
+                run_event_action_sql(
+                    Arc::clone(&shared),
+                    event.database_id,
+                    event.tenant_id,
+                    sql,
+                    &event_def.name,
+                )
+                .await
+            }
+            Err(source) => Err(TriggerActionError::Rejected {
+                source: source.clone(),
+            }),
+        };
 
         // The audit record is this path's durable account of what the trigger
         // did, so a failed action is recorded as failed rather than as a fired
@@ -103,9 +131,36 @@ pub async fn process_write_event(shared: Arc<SharedState>, event: &WriteEvent) {
             error!(
                 trigger = event_def.name,
                 collection = %event.collection,
+                retryable = error.is_retryable(),
                 error = %error,
                 "event trigger action failed"
             );
+            // Only an action that applied nothing can be re-run. A malformed
+            // template will never render, and a part-applied action would
+            // duplicate the tasks that already landed.
+            if let (true, Ok(sql)) = (error.is_retryable(), &rendered) {
+                queue.enqueue(FailedAction {
+                    key: ActionKey {
+                        source_lsn: event.lsn.as_u64(),
+                        source_sequence: event.sequence,
+                        source_vshard: event.vshard_id.as_u32(),
+                        action: ActionId::EventAction {
+                            event_name: event_def.name.clone(),
+                            index,
+                        },
+                    },
+                    payload: ActionPayload::EventAction { sql: sql.clone() },
+                    context: ActionContext {
+                        database_id: event.database_id,
+                        tenant_id: event.tenant_id.as_u64(),
+                        collection: event.collection.to_string(),
+                        row_id: event.row_id.as_str().to_owned(),
+                        cascade_depth: 0,
+                    },
+                    attempts: 0,
+                    last_error: error.to_string(),
+                });
+            }
         }
     }
 }
@@ -253,56 +308,65 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, Tr
     Ok(rendered)
 }
 
-/// Execute a THEN action string as SQL.
+/// Plan and run one already-rendered THEN action.
 ///
-/// Template variables are substituted as complete canonical SQL tokens before
-/// execution and therefore must not be manually quoted:
+/// Takes rendered SQL rather than a template because a retry runs long after
+/// its event is gone: the record stores the substituted statement, and this
+/// re-plans it against the catalog as it stands now. Template variables are
+/// substituted as complete canonical SQL tokens before execution and
+/// therefore must not be manually quoted:
 /// - `$document_id` → a string literal containing the affected document ID
 /// - `$collection` → a quoted collection identifier
 /// - `$operation` → an `INSERT`, `UPDATE`, or `DELETE` string literal
-async fn execute_then_action(
+pub async fn run_event_action_sql(
     shared: Arc<SharedState>,
-    event: &WriteEvent,
-    action: &str,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    sql: &str,
     trigger_name: &str,
 ) -> Result<(), TriggerActionError> {
-    let sql = render_then_action_sql(action, event)
-        .map_err(|source| TriggerActionError::Rejected { source })?;
-
     let query_ctx = QueryContext::for_state(&shared);
     // A trigger action is database-defined code with no external requester, so
     // it plans as the system — the same SECURITY DEFINER model the trigger
     // dispatcher already uses for the identity it executes under.
     let security = crate::control::planner::context::SystemPlanSecurity::new(
-        event.tenant_id,
+        tenant_id,
         "_system_event_trigger",
     );
 
     let (tasks, _output_schema, versions, _) = query_ctx
         .plan_sql_with_rls_and_versions(
-            &sql,
-            event.tenant_id,
-            event.database_id,
+            sql,
+            tenant_id,
+            database_id,
             &security.context(&shared),
             false,
         )
         .await
         .map_err(|source| TriggerActionError::Plan { source })?;
 
-    // Keep the Arc and lease scope alive through every trigger action
-    // dispatch. Admission is fail-closed while a descriptor drains.
-    let _lease_scope = Arc::clone(&shared)
-        .acquire_plan_lease_scope(&versions)
-        .map_err(|source| TriggerActionError::LeaseAdmission { source })?;
+    // Keep the Arc and lease scope alive through the whole action. Admission
+    // is fail-closed while a descriptor drains.
+    let lease_scope = Arc::new(
+        Arc::clone(&shared)
+            .acquire_plan_lease_scope(&versions)
+            .map_err(|source| TriggerActionError::LeaseAdmission { source })?,
+    );
 
-    dispatch_action_tasks(
+    // The action's tasks commit as one transaction. An action that dispatched
+    // its tasks one by one could stop half-applied, and re-running a
+    // half-applied action repeats the tasks that already landed — which is
+    // what makes a retry queue unsafe to point at it.
+    let identity = event_action_identity(tenant_id);
+    crate::control::system_txn::run_tasks_atomically(
         &shared,
+        &identity,
         tasks,
-        &versions,
-        event.database_id,
-        event.tenant_id,
+        lease_scope,
+        crate::event::EventSource::Trigger,
     )
-    .await?;
+    .await
+    .map_err(|source| TriggerActionError::Transaction { source })?;
 
     info!(
         trigger = trigger_name,
@@ -310,6 +374,26 @@ async fn execute_then_action(
         "event trigger action executed"
     );
     Ok(())
+}
+
+/// Identity a DEFINE EVENT action executes under.
+///
+/// A THEN action is database-defined code with no external requester, so it
+/// runs as the system — the same SECURITY DEFINER model the trigger
+/// dispatcher applies to trigger bodies.
+fn event_action_identity(
+    tenant_id: TenantId,
+) -> crate::control::security::identity::AuthenticatedIdentity {
+    use crate::control::security::identity::{AuthenticatedIdentity, DatabaseSet, Role};
+    AuthenticatedIdentity::new_internal_service(
+        0,
+        "_system_event_trigger",
+        tenant_id,
+        vec![Role::Superuser],
+        true,
+        None,
+        DatabaseSet::All,
+    )
 }
 
 #[cfg(test)]

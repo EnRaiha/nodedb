@@ -21,7 +21,9 @@ use crate::types::{DatabaseId, TenantId};
 
 use std::collections::HashMap;
 
-use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
+use super::fire_common::{
+    FireErrorPolicy, FireReport, FireTriggersParams, check_cascade_depth, fire_triggers,
+};
 use super::registry::DmlEvent;
 
 /// Parameters for [`fire_after_insert`].
@@ -44,6 +46,13 @@ pub struct FireAfterInsertParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// What a failing trigger does to the triggers queued behind it.
+    pub on_error: FireErrorPolicy,
+    /// Restricts firing to the one named trigger; `None` fires every match.
+    ///
+    /// A retry sets this. Without it a retry re-fires every trigger matching
+    /// the operation, re-running the siblings that already succeeded.
+    pub only_trigger: Option<&'a str>,
 }
 
 /// Fire AFTER ROW triggers for an INSERT operation.
@@ -56,7 +65,7 @@ pub struct FireAfterInsertParams<'a> {
 /// - `Some(Sync)`: only fire SYNC triggers (called from write path)
 /// - `Some(Async)`: only fire ASYNC triggers (called from Event Plane)
 /// - `None`: fire all AFTER triggers regardless of mode (legacy behavior)
-pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Result<()> {
+pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport {
     let FireAfterInsertParams {
         state,
         identity,
@@ -67,6 +76,8 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Resu
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        on_error,
+        only_trigger,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -80,13 +91,16 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Resu
         .into_iter()
         .filter(|t| t.timing == TriggerTiming::After)
         .filter(|t| mode_filter.is_none() || Some(t.execution_mode) == mode_filter)
+        .filter(|t| only_trigger.is_none_or(|name| t.name == name))
         .collect();
 
     if after_triggers.is_empty() {
-        return Ok(());
+        return FireReport::default();
     }
 
-    check_cascade_depth(cascade_depth, collection)?;
+    if let Err(error) = check_cascade_depth(cascade_depth, collection) {
+        return FireReport::from_precondition(error);
+    }
 
     let bindings = RowBindings::after_insert(collection, new_fields.clone());
 
@@ -99,6 +113,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Resu
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        on_error,
     })
     .await
 }
@@ -125,13 +140,20 @@ pub struct FireAfterUpdateParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// What a failing trigger does to the triggers queued behind it.
+    pub on_error: FireErrorPolicy,
+    /// Restricts firing to the one named trigger; `None` fires every match.
+    ///
+    /// A retry sets this. Without it a retry re-fires every trigger matching
+    /// the operation, re-running the siblings that already succeeded.
+    pub only_trigger: Option<&'a str>,
 }
 
 /// Fire AFTER ROW triggers for an UPDATE operation.
 ///
 /// `old_fields` is the row before the update, `new_fields` is after.
 /// Both are available as OLD.field and NEW.field in the trigger body.
-pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Result<()> {
+pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> FireReport {
     let FireAfterUpdateParams {
         state,
         identity,
@@ -143,6 +165,8 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        on_error,
+        only_trigger,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -156,13 +180,16 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
         .into_iter()
         .filter(|t| t.timing == TriggerTiming::After)
         .filter(|t| mode_filter.is_none() || Some(t.execution_mode) == mode_filter)
+        .filter(|t| only_trigger.is_none_or(|name| t.name == name))
         .collect();
 
     if after_triggers.is_empty() {
-        return Ok(());
+        return FireReport::default();
     }
 
-    check_cascade_depth(cascade_depth, collection)?;
+    if let Err(error) = check_cascade_depth(cascade_depth, collection) {
+        return FireReport::from_precondition(error);
+    }
 
     let bindings = RowBindings::after_update(collection, old_fields.clone(), new_fields.clone());
 
@@ -175,6 +202,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        on_error,
     })
     .await
 }
@@ -199,12 +227,19 @@ pub struct FireAfterDeleteParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// What a failing trigger does to the triggers queued behind it.
+    pub on_error: FireErrorPolicy,
+    /// Restricts firing to the one named trigger; `None` fires every match.
+    ///
+    /// A retry sets this. Without it a retry re-fires every trigger matching
+    /// the operation, re-running the siblings that already succeeded.
+    pub only_trigger: Option<&'a str>,
 }
 
 /// Fire AFTER ROW triggers for a DELETE operation.
 ///
 /// `old_fields` is the deleted row. Available as OLD.field in the trigger body.
-pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Result<()> {
+pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> FireReport {
     let FireAfterDeleteParams {
         state,
         identity,
@@ -215,6 +250,8 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Resu
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        on_error,
+        only_trigger,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -228,13 +265,16 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Resu
         .into_iter()
         .filter(|t| t.timing == TriggerTiming::After)
         .filter(|t| mode_filter.is_none() || Some(t.execution_mode) == mode_filter)
+        .filter(|t| only_trigger.is_none_or(|name| t.name == name))
         .collect();
 
     if after_triggers.is_empty() {
-        return Ok(());
+        return FireReport::default();
     }
 
-    check_cascade_depth(cascade_depth, collection)?;
+    if let Err(error) = check_cascade_depth(cascade_depth, collection) {
+        return FireReport::from_precondition(error);
+    }
 
     let bindings = RowBindings::after_delete(collection, old_fields.clone());
 
@@ -247,6 +287,7 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Resu
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        on_error,
     })
     .await
 }

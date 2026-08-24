@@ -19,7 +19,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
-use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
+use super::fire_common::{FireErrorPolicy, FireTriggersParams, check_cascade_depth, fire_triggers};
 use super::registry::DmlEvent;
 
 /// Result of checking for INSTEAD OF triggers.
@@ -75,8 +75,10 @@ pub async fn fire_instead_of_insert(
         // INSTEAD OF triggers replace the base DML in the caller's context;
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
+        on_error: FireErrorPolicy::Abort,
     })
-    .await?;
+    .await
+    .into_result()?;
 
     Ok(InsteadOfResult::Handled)
 }
@@ -147,8 +149,10 @@ pub async fn fire_instead_of_update(
         // INSTEAD OF triggers replace the base DML in the caller's context;
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
+        on_error: FireErrorPolicy::Abort,
     })
-    .await?;
+    .await
+    .into_result()?;
 
     Ok(InsteadOfResult::Handled)
 }
@@ -194,8 +198,10 @@ pub async fn fire_instead_of_delete(
         // INSTEAD OF triggers replace the base DML in the caller's context;
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
+        on_error: FireErrorPolicy::Abort,
     })
-    .await?;
+    .await
+    .into_result()?;
 
     Ok(InsteadOfResult::Handled)
 }

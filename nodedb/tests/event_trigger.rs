@@ -12,8 +12,10 @@ use nodedb::control::security::catalog::trigger_types::{
     StoredTrigger, TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerTiming,
 };
 use nodedb::control::trigger::{DmlEvent, TriggerRegistry};
+use nodedb::event::action::{
+    ActionContext, ActionId, ActionKey, ActionPayload, ActionRetryQueue, FailedAction,
+};
 use nodedb::event::trigger::dlq::{DlqEnqueueParams, TriggerDlq};
-use nodedb::event::trigger::retry::{RetryEntry, TriggerRetryQueue};
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 
@@ -410,62 +412,72 @@ fn cascade_depth_constant_is_16() {
 // Retry queue mechanics
 // ---------------------------------------------------------------------------
 
-#[test]
-fn retry_queue_exponential_backoff() {
-    let mut queue = TriggerRetryQueue::new();
-
-    let entry = RetryEntry {
-        database_id: DatabaseId::new(7),
-        tenant_id: 1,
-        collection: "orders".into(),
-        row_id: "r1".into(),
-        operation: "INSERT".into(),
-        trigger_name: "audit_trigger".into(),
-        new_fields: None,
-        old_fields: None,
+/// One failed ROW trigger of the write at `source_lsn`.
+fn failed_trigger(trigger: &str, source_lsn: u64) -> FailedAction {
+    FailedAction {
+        key: ActionKey {
+            source_lsn,
+            source_sequence: 1,
+            source_vshard: 0,
+            action: ActionId::TriggerRow {
+                trigger_name: trigger.into(),
+            },
+        },
+        payload: ActionPayload::TriggerRow {
+            operation: "INSERT".into(),
+            new_fields: None,
+            old_fields: None,
+        },
+        context: ActionContext {
+            database_id: DatabaseId::new(7),
+            tenant_id: 1,
+            collection: "orders".into(),
+            row_id: "r1".into(),
+            cascade_depth: 0,
+        },
         attempts: 0,
         last_error: "timeout".into(),
-        next_retry_at: std::time::Instant::now(),
-        source_lsn: 100,
-        source_sequence: 1,
-        source_vshard: 0,
-        cascade_depth: 0,
-    };
+    }
+}
 
-    queue.enqueue(entry);
+#[test]
+fn a_queued_action_waits_out_its_backoff() {
+    let mut queue = ActionRetryQueue::in_memory();
+    queue.enqueue(failed_trigger("audit_trigger", 100));
     assert_eq!(queue.len(), 1);
 
     let (ready, exhausted) = queue.drain_due();
     assert!(exhausted.is_empty());
-    let total = ready.len() + queue.len();
-    assert_eq!(total, 1);
+    assert_eq!(
+        ready.len() + queue.len(),
+        1,
+        "the action is either due now or still waiting, never both or neither"
+    );
 }
 
 #[test]
-fn retry_queue_multiple_entries_fifo() {
-    let mut queue = TriggerRetryQueue::new();
-    let now = std::time::Instant::now();
-
+fn each_failed_trigger_of_one_write_queues_on_its_own() {
+    let mut queue = ActionRetryQueue::in_memory();
     for i in 0..3 {
-        queue.enqueue(RetryEntry {
-            database_id: DatabaseId::new(7),
-            tenant_id: 1,
-            collection: "orders".into(),
-            row_id: format!("r-{i}"),
-            operation: "INSERT".into(),
-            trigger_name: format!("t-{i}"),
-            new_fields: None,
-            old_fields: None,
-            attempts: 0,
-            last_error: "err".into(),
-            next_retry_at: now,
-            source_lsn: i as u64,
-            source_sequence: i as u64,
-            source_vshard: 0,
-            cascade_depth: 0,
-        });
+        queue.enqueue(failed_trigger(&format!("t-{i}"), 100));
     }
-    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.len(),
+        3,
+        "three triggers failed on one write, so three actions retry"
+    );
+}
+
+#[test]
+fn re_queueing_one_trigger_does_not_duplicate_it() {
+    let mut queue = ActionRetryQueue::in_memory();
+    queue.enqueue(failed_trigger("audit_trigger", 100));
+    queue.enqueue(failed_trigger("audit_trigger", 100));
+    assert_eq!(
+        queue.len(),
+        1,
+        "a duplicate entry would re-run the same trigger twice per round"
+    );
 }
 
 // ---------------------------------------------------------------------------
