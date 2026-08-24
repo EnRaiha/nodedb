@@ -31,7 +31,23 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use nodedb::types::{DatabaseId, VShardId};
+use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use tokio_postgres::SimpleQueryMessage;
+
+use common::cluster_harness::{TestClusterNode, wait_for};
+
+/// Observed sequencer-group leader id from a node's local Raft status, or `0`
+/// if no leader is known yet.
+fn sequencer_leader(node: &TestClusterNode) -> u64 {
+    let Some(status_fn) = node.shared.raft_status_fn.get() else {
+        return 0;
+    };
+    status_fn()
+        .into_iter()
+        .find(|g| g.group_id == SEQUENCER_GROUP_ID)
+        .map(|g| g.leader_id)
+        .unwrap_or(0)
+}
 
 /// Fetch the single-row `v` value for `id` in `coll`, or `None` if not visible.
 async fn value_of(client: &tokio_postgres::Client, coll: &str, id: &str) -> Option<String> {
@@ -67,7 +83,8 @@ fn two_distinct_vshard_collections() -> (String, String) {
 ///
 /// Steps:
 /// 1. Spin up a single-node cluster (Raft + Calvin sequencer wired by `start_raft`).
-/// 2. Wait until `sequencer_metrics` is set (sequencer ready).
+/// 2. Wait until `sequencer_metrics` is set and the sequencer group has
+///    elected a leader (a submit before that is refused outright).
 /// 3. Create two collections on different vShards.
 /// 4. Enable strict cross-shard mode.
 /// 5. Via one `simple_query` call, send BEGIN + two point INSERTs + COMMIT.
@@ -84,20 +101,28 @@ async fn calvin_multishard_write_in_explicit_block_commits() {
         .await
         .expect("single-node cluster spawn");
 
-    // Allow Raft to elect and the sequencer to start ticking.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Gate on sequencer_metrics being set (wired by start_raft via
+    // SequencerService).
+    wait_for(
+        "sequencer metrics wired by start_raft",
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || node.shared.sequencer_metrics.get().is_some(),
+    )
+    .await;
 
-    // Gate on sequencer_metrics being set (wired by start_raft via SequencerService).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if node.shared.sequencer_metrics.get().is_some() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("sequencer_metrics not set within 10s — start_raft may not have wired it");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Then gate on an actual election. The metrics handle only proves the
+    // sequencer service was wired; submitting before a leader exists is
+    // refused outright ("no sequencer leader elected yet"). The submit path
+    // waits out its own short backoff, which a loaded machine outlasts, so the
+    // test waits on the condition rather than racing it.
+    wait_for(
+        "sequencer leader elected",
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || sequencer_leader(&node) != 0,
+    )
+    .await;
 
     let (col_a, col_b) = two_distinct_vshard_collections();
 
