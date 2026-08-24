@@ -7,8 +7,10 @@
 mod grants;
 mod support;
 mod tenants;
+mod trigger_dlq;
 mod users;
 
 pub use grants::{show_grants, show_permissions};
 pub use tenants::{show_tenant_by_identifier, show_tenants, show_tenants_filtered_by_name};
+pub use trigger_dlq::{requeue_trigger_dlq, show_trigger_dlq};
 pub use users::{show_roles, show_session, show_users};

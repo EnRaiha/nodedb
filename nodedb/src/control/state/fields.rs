@@ -380,6 +380,14 @@ pub struct SharedState {
     pub scheduler_config: crate::config::server::SchedulerConfig,
     /// On-disk data directory for host-side appliers (CA-trust, audit segments, etc.).
     pub data_dir: std::path::PathBuf,
+    /// The Event Plane's trigger dead-letter queue, so operator statements can
+    /// read and requeue failed actions. Set at boot; absent on a node that
+    /// runs no Event Plane.
+    pub trigger_dlq: OnceLock<Arc<Mutex<crate::event::trigger::TriggerDlq>>>,
+    /// Where an operator's requeued actions wait for their consumer to collect
+    /// them. Set by the Event Plane, which knows how many consumers it spawned;
+    /// absent on a node that runs none.
+    pub action_requeue: OnceLock<Arc<crate::event::action::ActionRequeueInbox>>,
     /// Test-only drop guard: owns the auto-cleaning temp directory the test
     /// constructor roots its CDC-offset / job-history / MV-persistence stores
     /// under, so they're removed on drop instead of leaking `/tmp/nodedb-test-*`

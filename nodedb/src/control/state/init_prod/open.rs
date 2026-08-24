@@ -401,6 +401,8 @@ impl SharedState {
             tuning,
             scheduler_config: crate::config::server::SchedulerConfig::default(),
             data_dir: std::path::PathBuf::new(),
+            trigger_dlq: std::sync::OnceLock::new(),
+            action_requeue: std::sync::OnceLock::new(),
             // Production stores live under real on-disk paths, not a temp dir.
             _test_state_dir: None,
             schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion::new(

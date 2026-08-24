@@ -22,6 +22,9 @@ use super::super::scope_ddl;
 use super::super::scope_query_ddl;
 use super::super::session_admin;
 
+/// Rows `SHOW TRIGGER DLQ` returns without an explicit LIMIT.
+const DEFAULT_DLQ_LIMIT: usize = 100;
+
 pub(super) async fn try_string(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -103,6 +106,36 @@ pub(super) async fn try_string(
     if upper.starts_with("SHOW AUDIT LOG") || upper.starts_with("SHOW AUDIT_LOG") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(inspect_audit::show_audit_log(state, identity, &parts));
+    }
+    // SHOW TRIGGER DLQ [LIMIT <n>] — dead-lettered trigger and event actions.
+    if upper.starts_with("SHOW TRIGGER DLQ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let limit = match parts.get(3..5) {
+            Some([keyword, value]) if keyword.eq_ignore_ascii_case("LIMIT") => {
+                match value.parse::<usize>() {
+                    Ok(limit) => limit,
+                    Err(_) => {
+                        return Some(Err(DdlError {
+                            sqlstate: "42601".to_string(),
+                            message: "syntax: SHOW TRIGGER DLQ [LIMIT <n>]".to_string(),
+                        }));
+                    }
+                }
+            }
+            _ => DEFAULT_DLQ_LIMIT,
+        };
+        return Some(inspect::show_trigger_dlq(state, identity, limit));
+    }
+    // REQUEUE TRIGGER DLQ <entry_id> — run one dead-lettered action again.
+    if upper.starts_with("REQUEUE TRIGGER DLQ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let Some(entry_id) = parts.get(3).and_then(|id| id.parse::<u64>().ok()) else {
+            return Some(Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "syntax: REQUEUE TRIGGER DLQ <entry_id>".to_string(),
+            }));
+        };
+        return Some(inspect::requeue_trigger_dlq(state, identity, entry_id));
     }
     if upper.starts_with("SHOW GRANTS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();

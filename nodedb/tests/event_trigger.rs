@@ -15,7 +15,7 @@ use nodedb::control::trigger::{DmlEvent, TriggerRegistry};
 use nodedb::event::action::{
     ActionContext, ActionId, ActionKey, ActionPayload, ActionRetryQueue, FailedAction,
 };
-use nodedb::event::trigger::dlq::{DlqEnqueueParams, TriggerDlq};
+use nodedb::event::trigger::dlq::TriggerDlq;
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 
@@ -412,6 +412,22 @@ fn cascade_depth_constant_is_16() {
 // Retry queue mechanics
 // ---------------------------------------------------------------------------
 
+/// One ROW trigger that exhausted its retries and reached the DLQ.
+fn dead_lettered(
+    collection: &str,
+    row_id: &str,
+    trigger: &str,
+    error: &str,
+    source_lsn: u64,
+) -> FailedAction {
+    let mut action = failed_trigger(trigger, source_lsn);
+    action.context.collection = collection.into();
+    action.context.row_id = row_id.into();
+    action.last_error = error.into();
+    action.attempts = 5;
+    action
+}
+
 /// One failed ROW trigger of the write at `source_lsn`.
 fn failed_trigger(trigger: &str, source_lsn: u64) -> FailedAction {
     FailedAction {
@@ -490,24 +506,20 @@ fn dlq_enqueue_and_list() {
     let mut dlq = TriggerDlq::open(dir.path()).unwrap();
 
     let id = dlq
-        .enqueue(DlqEnqueueParams {
-            tenant_id: 1,
-            source_collection: "orders".into(),
-            row_id: "o-1".into(),
-            operation: "INSERT".into(),
-            trigger_name: "audit_trigger".into(),
-            error: "constraint violation".into(),
-            retry_count: 5,
-            source_lsn: 100,
-            source_sequence: 1,
-        })
+        .enqueue(dead_lettered(
+            "orders",
+            "o-1",
+            "audit_trigger",
+            "constraint violation",
+            100,
+        ))
         .unwrap();
 
     assert!(id > 0);
     let unresolved = dlq.list_unresolved();
     assert_eq!(unresolved.len(), 1);
-    assert_eq!(unresolved[0].trigger_name, "audit_trigger");
-    assert_eq!(unresolved[0].error, "constraint violation");
+    assert_eq!(unresolved[0].owner(), "audit_trigger");
+    assert_eq!(unresolved[0].error(), "constraint violation");
 
     // Resolve and verify.
     assert!(dlq.resolve(id));
@@ -527,17 +539,13 @@ fn dlq_evicts_oldest_on_overflow() {
     let mut dlq = TriggerDlq::open(dir.path()).unwrap();
 
     for i in 0..10 {
-        let _ = dlq.enqueue(DlqEnqueueParams {
-            tenant_id: 1,
-            source_collection: "test".into(),
-            row_id: format!("r-{i}"),
-            operation: "INSERT".into(),
-            trigger_name: "t".into(),
-            error: "err".into(),
-            retry_count: 5,
-            source_lsn: i as u64,
-            source_sequence: i as u64,
-        });
+        let _ = dlq.enqueue(dead_lettered(
+            "test",
+            &format!("r-{i}"),
+            "t",
+            "err",
+            i as u64,
+        ));
     }
     assert_eq!(dlq.len(), 10);
 }
@@ -548,18 +556,8 @@ fn dlq_persists_across_reopen() {
 
     let id = {
         let mut dlq = TriggerDlq::open(dir.path()).unwrap();
-        dlq.enqueue(DlqEnqueueParams {
-            tenant_id: 1,
-            source_collection: "orders".into(),
-            row_id: "o-1".into(),
-            operation: "INSERT".into(),
-            trigger_name: "t1".into(),
-            error: "err".into(),
-            retry_count: 3,
-            source_lsn: 50,
-            source_sequence: 1,
-        })
-        .unwrap()
+        dlq.enqueue(dead_lettered("orders", "o-1", "t1", "err", 50))
+            .unwrap()
     };
 
     // Reopen.
@@ -567,7 +565,7 @@ fn dlq_persists_across_reopen() {
     let unresolved = dlq.list_unresolved();
     assert_eq!(unresolved.len(), 1);
     assert_eq!(unresolved[0].entry_id, id);
-    assert_eq!(unresolved[0].trigger_name, "t1");
+    assert_eq!(unresolved[0].owner(), "t1");
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,10 @@
 pub mod codec;
 pub mod queue;
 pub mod record;
+pub mod requeue;
 pub mod store;
 
 pub use self::queue::ActionRetryQueue;
 pub use self::record::{ActionContext, ActionId, ActionKey, ActionPayload, FailedAction};
+pub use self::requeue::{ActionRequeueInbox, RequeueError};
 pub use self::store::ActionStore;

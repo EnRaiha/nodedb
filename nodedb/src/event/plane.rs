@@ -81,6 +81,15 @@ impl EventPlane {
         } = config;
         let num_cores = consumers_rx.len();
 
+        // Publish the requeue inbox before any consumer starts, sized to the
+        // consumers actually being spawned: an operator's requeue is routed by
+        // the same `vshard % cores` mapping the consumers use, so a wrong
+        // width would park actions on a core that never collects them.
+        let _ = shared_state.action_requeue.set(Arc::new(
+            super::action::ActionRequeueInbox::for_cores(num_cores),
+        ));
+        let _ = shared_state.trigger_dlq.set(Arc::clone(&trigger_dlq));
+
         let slab_budget = Arc::new(super::slab_budget::SlabBudget::for_cores(num_cores));
         let mut slab_accounts: Vec<Arc<super::slab_budget::ConsumerSlabAccount>> = Vec::new();
 

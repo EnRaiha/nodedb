@@ -285,9 +285,19 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     continue;
                 }
 
-                // No new events — process retry queue if due.
-                if !retry_queue.is_empty() && last_retry_poll.elapsed() >= RETRY_POLL_INTERVAL {
-                    process_retry_queue(&mut retry_queue, &trigger_dlq, &shared_state).await;
+                // No new events — process retry queue if due. An empty queue
+                // still polls when an operator has requeued something from the
+                // DLQ, since that action arrives out-of-band and would
+                // otherwise wait for an unrelated failure to wake the poll.
+                let requeued_waiting = shared_state
+                    .action_requeue
+                    .get()
+                    .is_some_and(|inbox| inbox.has_work_for(core_id));
+                if (!retry_queue.is_empty() || requeued_waiting)
+                    && last_retry_poll.elapsed() >= RETRY_POLL_INTERVAL
+                {
+                    process_retry_queue(&mut retry_queue, &trigger_dlq, &shared_state, core_id)
+                        .await;
                     last_retry_poll = tokio::time::Instant::now();
                 }
 
@@ -550,39 +560,27 @@ async fn process_retry_queue(
     retry_queue: &mut ActionRetryQueue,
     trigger_dlq: &Arc<std::sync::Mutex<TriggerDlq>>,
     shared_state: &Arc<SharedState>,
+    core_id: usize,
 ) {
+    // Collect anything an operator sent back from the DLQ before draining, so
+    // a requeued action joins this round instead of waiting for the next poll.
+    if let Some(inbox) = shared_state.action_requeue.get() {
+        for action in inbox.take_for_core(core_id) {
+            retry_queue.enqueue(action);
+        }
+    }
+
     let (ready, exhausted) = retry_queue.drain_due();
     if !exhausted.is_empty() {
         let mut dlq = trigger_dlq.lock().unwrap_or_else(|p| p.into_inner());
-        for action in &exhausted {
-            let _ = dlq.enqueue(super::trigger::dlq::DlqEnqueueParams {
-                tenant_id: action.context.tenant_id,
-                source_collection: action.context.collection.clone(),
-                row_id: action.context.row_id.clone(),
-                operation: action_operation(action).to_owned(),
-                trigger_name: action.owner().to_owned(),
-                error: action.last_error.clone(),
-                retry_count: action.attempts,
-                source_lsn: action.key.source_lsn,
-                source_sequence: action.key.source_sequence,
-            });
+        for action in exhausted {
+            let _ = dlq.enqueue(action);
         }
         // dlq MutexGuard dropped before any await.
     }
 
     for action in ready {
         super::trigger::dispatcher::retry_action(&action, shared_state, retry_queue).await;
-    }
-}
-
-/// The DML operation a queued action came from, for its DLQ row. An event
-/// action carries SQL rather than a row operation, so it reports the action
-/// kind instead of inventing one.
-fn action_operation(action: &super::action::FailedAction) -> &str {
-    match &action.payload {
-        super::action::ActionPayload::TriggerRow { operation, .. }
-        | super::action::ActionPayload::TriggerStatement { operation } => operation,
-        super::action::ActionPayload::EventAction { .. } => "EVENT",
     }
 }
 

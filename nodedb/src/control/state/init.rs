@@ -444,6 +444,8 @@ impl SharedState {
             tuning: TuningConfig::default(),
             scheduler_config: crate::config::server::SchedulerConfig::default(),
             data_dir: std::path::PathBuf::new(),
+            trigger_dlq: std::sync::OnceLock::new(),
+            action_requeue: std::sync::OnceLock::new(),
             schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion::new(
             ),
             materialized_sum_index:
