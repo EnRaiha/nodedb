@@ -72,7 +72,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     log_index = idx,
                     "lease GC: released leases of non-member node"
                 ),
-                Err(e) => debug!(node_id, error = %e, "lease GC: proposal deferred"),
+                Err(e) => warn!(node_id, error = %e, "lease GC: proposal failed; will be retried on next sweep"),
             }
         }
     }
