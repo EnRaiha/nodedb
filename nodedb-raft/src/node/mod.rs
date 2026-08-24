@@ -6,6 +6,7 @@
 //! - [`config`]: `RaftConfig` (including voter/learner lists).
 //! - [`core`]: `RaftNode` struct, constructors, simple accessors, `tick`,
 //!   `propose`, and the `Ready` output type.
+//! - [`durability`]: Applied-index durability floor and log compaction.
 //! - [`internal`]: Internal state transitions (elections, replication,
 //!   commit advancement) and timeout math.
 //! - [`membership`]: Dynamic configuration changes — add/remove voters,
@@ -20,6 +21,7 @@
 
 pub mod config;
 pub mod core;
+pub mod durability;
 mod internal;
 pub mod membership;
 pub mod read_index;
