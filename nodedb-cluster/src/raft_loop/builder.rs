@@ -8,13 +8,14 @@
 //! than in [`super::loop_core`] so that the struct definition, constructor,
 //! and runtime methods stay under the file-size limit.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::applied_watcher::GroupAppliedWatchers;
 use crate::catalog::ClusterCatalog;
 use crate::forward::PlanExecutor;
 use crate::metadata_group::applier::MetadataApplier;
+use crate::metadata_group::cache::MetadataCache;
 
 use super::hooks::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
@@ -66,6 +67,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             // Construction-time builder, before `run()` and any join kick — a
             // fresh `Notify` has no pending permit, so this loses nothing.
             reconcile_notify: tokio::sync::Notify::new(),
+            metadata_cache: self.metadata_cache,
         }
     }
 
@@ -263,6 +265,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// [`NoopMetadataApplier`] is kept only for tests that don't care.
     pub fn with_metadata_applier(mut self, applier: Arc<dyn MetadataApplier>) -> Self {
         self.metadata_applier = applier;
+        self
+    }
+
+    /// Wire the metadata cache used by the periodic lease-GC sweep. The
+    /// host passes the same `Arc` the production metadata applier holds.
+    pub fn with_metadata_cache(mut self, cache: Arc<RwLock<MetadataCache>>) -> Self {
+        self.metadata_cache = Some(cache);
         self
     }
 

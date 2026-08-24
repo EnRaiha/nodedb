@@ -5,7 +5,7 @@
 
 use tracing::{debug, error, warn};
 
-use nodedb_cluster::{MetadataApplier, MetadataEntry, RoutingChange, decode_entry};
+use nodedb_cluster::{MetadataApplier, MetadataEntry, RoutingChange, TopologyChange, decode_entry};
 
 use super::types::{CatalogChangeEvent, MetadataCommitApplier};
 
@@ -252,6 +252,31 @@ impl MetadataCommitApplier {
                 placement,
             }) => {
                 return self.apply_set_placement(*group_id, placement, raft_index);
+            }
+            MetadataEntry::TopologyChange(TopologyChange::Leave { node_id }) => {
+                // Lease GC: a node that left the topology can never release
+                // its own leases. Spawn (do NOT propose-and-wait inline —
+                // apply runs on the raft loop task; blocking here would
+                // deadlock the applied-index watcher).
+                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
+                    let shared = std::sync::Arc::clone(&shared);
+                    let left_node_id = *node_id;
+                    tokio::spawn(async move {
+                        if !shared.is_singleton_worker() {
+                            return;
+                        }
+                        if let Err(e) =
+                            crate::control::lease::gc::gc_leases_for_node(&shared, left_node_id)
+                        {
+                            tracing::warn!(
+                                node_id = left_node_id,
+                                error = %e,
+                                "lease GC after Leave failed; periodic sweep will retry"
+                            );
+                        }
+                    });
+                }
+                return Ok(());
             }
             _ => {}
         }

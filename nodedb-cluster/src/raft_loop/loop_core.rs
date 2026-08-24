@@ -20,6 +20,7 @@ use crate::error::Result;
 use crate::forward::{NoopPlanExecutor, PlanExecutor};
 use crate::loop_metrics::LoopMetrics;
 use crate::metadata_group::applier::{MetadataApplier, NoopMetadataApplier};
+use crate::metadata_group::cache::MetadataCache;
 use crate::multi_raft::MultiRaft;
 use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
@@ -284,6 +285,12 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// tick. Fired from [`super::join`] on the success path; consumed by
     /// an extra `select!` arm in [`Self::run`].
     pub(super) reconcile_notify: tokio::sync::Notify,
+
+    /// Optional handle to the metadata group's `MetadataCache` (the same
+    /// `Arc` the `CacheApplier` writes into). When set, the leader's
+    /// periodic lease-GC sweep can read committed lease state directly.
+    /// `None` in cluster-only tests that don't wire it.
+    pub(super) metadata_cache: Option<Arc<RwLock<MetadataCache>>>,
 }
 
 impl<A: CommitApplier> RaftLoop<A> {
@@ -336,6 +343,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             replication_factor: 1,
             tick_count: std::sync::atomic::AtomicU64::new(0),
             reconcile_notify: tokio::sync::Notify::new(),
+            metadata_cache: None,
         }
     }
 }

@@ -68,25 +68,50 @@ impl LeaseReleaseHandle {
         self.release_raw(unheld)
     }
 
-    /// Raw metadata release. The caller must hold `grant_gate`.
+    /// Raw metadata release for this node. The caller must hold `grant_gate`.
     fn release_raw(&self, descriptor_ids: Vec<DescriptorId>) -> Result<(), Error> {
+        self.release_raw_for_node(self.node_id, descriptor_ids)
+    }
+
+    /// Release leases held by an ARBITRARY node. Used by lease GC for
+    /// nodes that left the topology (crashed/decommissioned). Does NOT take
+    /// `grant_gate` (no contention with local grants — the foreign holder
+    /// cannot grant anymore).
+    pub(crate) fn release_for_node(
+        &self,
+        node_id: u64,
+        descriptor_ids: Vec<DescriptorId>,
+    ) -> Result<(), Error> {
+        self.release_raw_for_node(node_id, descriptor_ids)
+    }
+
+    /// Raw metadata release for `node_id`. `release_raw` keeps its gate-taking
+    /// wrapper for the self path; this is the ungated core.
+    fn release_raw_for_node(
+        &self,
+        node_id: u64,
+        descriptor_ids: Vec<DescriptorId>,
+    ) -> Result<(), Error> {
         if descriptor_ids.is_empty() {
             return Ok(());
         }
 
         let Some(metadata_raft) = &self.metadata_raft else {
-            let mut cache = self
-                .metadata_cache
-                .write()
-                .unwrap_or_else(|poison| poison.into_inner());
-            for id in descriptor_ids {
-                cache.leases.remove(&(id, self.node_id));
+            // Single-node fallback: hanya meaningful untuk self.
+            if node_id == self.node_id {
+                let mut cache = self
+                    .metadata_cache
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                for id in descriptor_ids {
+                    cache.leases.remove(&(id, node_id));
+                }
             }
             return Ok(());
         };
 
         let entry = MetadataEntry::DescriptorLeaseRelease {
-            node_id: self.node_id,
+            node_id,
             descriptor_ids,
         };
         let raw = nodedb_cluster::encode_entry(&entry).map_err(|error| Error::Config {
