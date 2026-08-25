@@ -73,13 +73,13 @@ fn check_healthz(port: u16) -> bool {
 }
 
 impl SpawnedServer {
-    /// Poll `/healthz` until the server answers 200, it exits, or `timeout`
-    /// elapses. The error string says which of the three happened.
+    /// Poll `/healthz` until the server answers 200, exits, or times out.
+    /// The error says which.
     fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            // A server that died during boot never answers, so waiting out the
-            // full timeout would hide the real error. Report the exit instead.
+            // A dead server never answers; waiting out the timeout would hide
+            // the real error.
             if let Some(child) = self.child.as_mut()
                 && let Ok(Some(status)) = child.try_wait()
             {
@@ -98,8 +98,7 @@ impl SpawnedServer {
         }
     }
 
-    /// The server's captured stdout and stderr, or a note saying why it could
-    /// not be read. Used to make a startup failure self-explaining.
+    /// The server's captured output, or why it could not be read.
     fn read_log(&self) -> String {
         std::fs::read_to_string(&self.log_path)
             .unwrap_or_else(|e| format!("(could not read {}: {e})", self.log_path.display()))
@@ -114,14 +113,34 @@ pub(super) struct SpawnedServer {
     child: Option<Child>,
 }
 
-/// Spawn the real `nodedb` binary against `data_dir`, writing its config file
-/// there first. Blocks until `/healthz` reports ready, panicking after 20s.
+/// Spawn the real `nodedb` binary against `data_dir` and block until
+/// `/healthz` reports ready.
+///
+/// Retries with fresh ports when the server exits during startup: `free_port`
+/// releases the port before the child binds it, so a suite starting many
+/// servers at once can lose the race. A server that never starts still fails
+/// the test, with its log.
 pub(super) fn spawn(
     data_dir: &Path,
     auth_mode: AuthMode,
     columnar_flush_threshold: Option<usize>,
 ) -> SpawnedServer {
     let config_path = config_toml::write_config(data_dir, auth_mode, columnar_flush_threshold);
+    let mut last_failure = String::new();
+    for _ in 0..START_ATTEMPTS {
+        match try_spawn(data_dir, &config_path) {
+            Ok(server) => return server,
+            Err((reason, log)) => last_failure = format!("{reason}\n--- server log ---\n{log}"),
+        }
+    }
+    panic!("nodedb did not start in {START_ATTEMPTS} attempts.\n{last_failure}");
+}
+
+/// How many times [`spawn`] will re-allocate ports and try again.
+const START_ATTEMPTS: u32 = 3;
+
+/// One spawn attempt. `Err` carries the reason and the server's own log.
+fn try_spawn(data_dir: &Path, config_path: &Path) -> Result<SpawnedServer, (String, String)> {
     let ports = ServerPorts::allocate();
 
     let log_path = data_dir.join("server.log");
@@ -135,7 +154,7 @@ pub(super) fn spawn(
     let child = Command::new(env!("CARGO_BIN_EXE_nodedb"))
         .env("NODEDB_DATA_DIR", data_dir)
         .env("NODEDB_DATA_PLANE_CORES", "1")
-        .env("NODEDB_CONFIG", &config_path)
+        .env("NODEDB_CONFIG", config_path)
         .env("NODEDB_PORT_HTTP", ports.http.to_string())
         .env("NODEDB_PORT_PGWIRE", ports.pgwire.to_string())
         .env("NODEDB_PORT_NATIVE", ports.native.to_string())
@@ -158,16 +177,15 @@ pub(super) fn spawn(
     };
 
     if let Err(reason) = server.wait_until_ready(READY_TIMEOUT) {
-        // The data directory is a temp dir that is removed as soon as this
-        // panic unwinds, taking the server log with it. Print the log here or
-        // the failure is undiagnosable.
-        panic!("{reason}\n--- server log ---\n{}", server.read_log());
+        // The temp dir goes away when the caller panics, taking the log with
+        // it. Read it now. Dropping `server` reaps the child.
+        return Err((reason, server.read_log()));
     }
-    server
+    Ok(server)
 }
 
-/// How long a spawned server has to answer `/healthz`. Generous because the
-/// whole suite runs servers in parallel, so a cold boot competes for CPU.
+/// Budget for `/healthz` to answer. Generous: the suite runs servers in
+/// parallel, so a cold boot competes for CPU.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl SpawnedServer {

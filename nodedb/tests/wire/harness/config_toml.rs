@@ -52,7 +52,30 @@ pub(super) fn write_config(
             "\n[tuning.query]\ncolumnar_flush_threshold = {threshold}\n"
         ));
     }
+    toml.push_str(&format!(
+        "\n[backup_encryption]\nkey_path = {}\n",
+        toml_quote(&write_backup_kek(dir))
+    ));
     let path = dir.join("nodedb.toml");
     std::fs::write(&path, toml).expect("write test server config file");
     path
+}
+
+/// Write the 32-byte key that wraps each backup's data key.
+///
+/// The server refuses plaintext backup envelopes, so without this every backup
+/// test fails on config before reaching the behaviour under test. Nothing
+/// outside this temp dir reads these backups.
+fn write_backup_kek(dir: &Path) -> PathBuf {
+    let path = dir.join("backup.key");
+    std::fs::write(&path, [0u8; 32]).expect("write backup key file");
+    path
+}
+
+/// Render a path as a TOML string. Temp dir names come from the OS, so do not
+/// assume they are free of backslashes or quotes.
+fn toml_quote(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
