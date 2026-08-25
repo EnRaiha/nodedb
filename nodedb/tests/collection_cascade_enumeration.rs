@@ -27,6 +27,7 @@ fn put_rls(catalog: &nodedb::control::security::catalog::SystemCatalog, name: &s
     let p = StoredRlsPolicy {
         tenant_id: TENANT,
         collection: coll.into(),
+        display_collection: coll.into(),
         name: name.into(),
         policy_type_tag: 0,
         compiled_predicate_json: String::new(),
@@ -170,7 +171,7 @@ fn per_kind_finders_match_orchestrator() {
         vec!["t_books_ins"]
     );
     assert_eq!(
-        find_rls_policies_on(&catalog, TENANT, "books").unwrap(),
+        find_rls_policies_on(&catalog, DatabaseId::DEFAULT, TENANT, "books").unwrap(),
         vec!["p_books"]
     );
     assert_eq!(

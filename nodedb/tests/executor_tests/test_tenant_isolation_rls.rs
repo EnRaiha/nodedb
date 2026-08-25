@@ -43,6 +43,7 @@ fn rls_policies_isolated_between_tenants() {
         .create_policy(RlsPolicy {
             name: "require_approved".into(),
             collection: "orders".into(),
+            display_collection: "orders".into(),
             tenant_id: TENANT_A,
             policy_type: PolicyType::Write,
             compiled_predicate: Some(predicate),
@@ -101,6 +102,7 @@ fn rls_policy_listing_scoped() {
             .create_policy(RlsPolicy {
                 name: name.into(),
                 collection: "users".into(),
+                display_collection: "users".into(),
                 tenant_id: tid,
                 policy_type: PolicyType::Read,
                 compiled_predicate: Some(predicate),

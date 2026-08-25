@@ -26,10 +26,22 @@ pub(super) const RLS_POLICIES: TableDefinition<&str, &[u8]> =
 
 /// Catalog-shape RLS policy. JSON strings are sonic_rs-encoded
 /// versions of the runtime types so zerompk can derive the encoder.
+///
+/// Map-encoded (`#[msgpack(map)]`) so `display_collection` could be added
+/// with `#[msgpack(default)]`: records written before that field decode
+/// with `display_collection = ""` instead of failing outright.
 #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack, Debug, Clone)]
+#[msgpack(map)]
 pub struct StoredRlsPolicy {
     pub tenant_id: u64,
+    /// Qualified with the owning database ID — the lookup key. Never
+    /// shown to a user; see `display_collection`.
     pub collection: String,
+    /// The collection name as the user wrote it, unqualified.
+    /// Display-only: falls back to `collection` when empty (records
+    /// written before this field existed).
+    #[msgpack(default)]
+    pub display_collection: String,
     pub name: String,
     /// 0 = Read, 1 = Write, 2 = All.
     pub policy_type_tag: u8,
@@ -55,6 +67,7 @@ impl StoredRlsPolicy {
         Ok(Self {
             tenant_id: p.tenant_id,
             collection: p.collection.clone(),
+            display_collection: p.display_collection.clone(),
             name: p.name.clone(),
             policy_type_tag: match p.policy_type {
                 PolicyType::Read => 0,
@@ -105,9 +118,17 @@ impl StoredRlsPolicy {
         };
         let on_deny: DenyMode = sonic_rs::from_str(&self.on_deny_json)
             .map_err(|e| catalog_err("deser deny mode", e))?;
+        // Records written before `display_collection` existed decode it
+        // empty; fall back to `collection`, which was unqualified then.
+        let display_collection = if self.display_collection.is_empty() {
+            self.collection.clone()
+        } else {
+            self.display_collection.clone()
+        };
         Ok(RlsPolicy {
             name: self.name.clone(),
             collection: self.collection.clone(),
+            display_collection,
             tenant_id: self.tenant_id,
             policy_type,
             compiled_predicate,
@@ -238,6 +259,7 @@ mod tests {
         RlsPolicy {
             name: name.into(),
             collection: collection.into(),
+            display_collection: collection.into(),
             tenant_id,
             policy_type: PolicyType::Read,
             compiled_predicate: None,

@@ -284,6 +284,7 @@ mod tests {
         RlsPolicy {
             name: name.into(),
             collection: collection.into(),
+            display_collection: collection.into(),
             tenant_id: 1,
             policy_type,
             compiled_predicate: None,

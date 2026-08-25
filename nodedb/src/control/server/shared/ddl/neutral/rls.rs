@@ -13,6 +13,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredRlsPolicy;
 use crate::control::security::deny::{self, DenyMode};
@@ -22,6 +23,7 @@ use crate::control::security::predicate_parser::{parse_predicate, validate_auth_
 use crate::control::security::rls::RlsPolicy;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
 
@@ -36,6 +38,10 @@ pub struct CreateRlsPolicyRequest<'a> {
     pub is_restrictive: bool,
     pub on_deny_raw: Option<&'a str>,
     pub tenant_id_override: Option<u64>,
+    /// Database the statement ran against. RLS enforcement looks policies
+    /// up under `db_qualified(database_id, collection)` (the same key
+    /// physical plan ops carry), so the policy must be stored there too.
+    pub database_id: DatabaseId,
 }
 
 /// Result of compiling an RLS predicate string.
@@ -141,8 +147,14 @@ pub fn create_rls_policy(
         is_restrictive,
         on_deny_raw,
         tenant_id_override,
+        database_id,
     } = *req;
     let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
+
+    // Store and key under the same qualified name enforcement looks up
+    // (`db_qualified`, applied to every op's `collection` field). Keep the
+    // bare, user-typed name only for display (`SHOW RLS POLICIES`).
+    let qualified_collection = db_qualified(database_id, collection);
 
     let policy_type_label = policy_type_raw.to_uppercase();
     let policy_type = match policy_type_label.as_str() {
@@ -168,7 +180,10 @@ pub fn create_rls_policy(
     // Pre-check duplicate so the proposing node fails fast with a
     // clean SQLSTATE instead of going through raft only to be a
     // silent overwrite.
-    if state.rls.policy_exists(tenant_id, collection, name) {
+    if state
+        .rls
+        .policy_exists(tenant_id, &qualified_collection, name)
+    {
         return Err(DdlError {
             sqlstate: "42710".to_string(),
             message: format!("RLS policy '{}' already exists on '{}'", name, collection),
@@ -177,7 +192,8 @@ pub fn create_rls_policy(
 
     let policy = RlsPolicy {
         name: name.to_string(),
-        collection: collection.to_string(),
+        collection: qualified_collection,
+        display_collection: collection.to_string(),
         tenant_id,
         policy_type,
         compiled_predicate: compiled.compiled_predicate,
@@ -230,14 +246,19 @@ pub fn create_rls_policy(
 pub fn drop_rls_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     collection: &str,
     if_exists: bool,
     tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
+    let qualified_collection = db_qualified(database_id, collection);
 
-    if !state.rls.policy_exists(tenant_id, collection, name) {
+    if !state
+        .rls
+        .policy_exists(tenant_id, &qualified_collection, name)
+    {
         if if_exists {
             return Ok(status("DROP RLS POLICY"));
         }
@@ -249,7 +270,7 @@ pub fn drop_rls_policy(
 
     let entry = CatalogEntry::DeleteRlsPolicy {
         tenant_id,
-        collection: collection.to_string(),
+        collection: qualified_collection.clone(),
         name: name.to_string(),
     };
     let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
@@ -260,7 +281,7 @@ pub fn drop_rls_policy(
         {
             let catalog = state.credentials.catalog();
             catalog
-                .delete_rls_policy(tenant_id, collection, name)
+                .delete_rls_policy(tenant_id, &qualified_collection, name)
                 .map_err(|e| DdlError {
                     sqlstate: "XX000".to_string(),
                     message: format!("catalog write: {e}"),
@@ -268,7 +289,7 @@ pub fn drop_rls_policy(
         }
         state
             .rls
-            .install_replicated_drop_policy(tenant_id, collection, name);
+            .install_replicated_drop_policy(tenant_id, &qualified_collection, name);
     }
 
     state.audit_record(
@@ -285,13 +306,16 @@ pub fn drop_rls_policy(
 pub fn show_rls_policies(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: Option<&str>,
     tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
 
     let policies = if let Some(coll) = collection {
-        state.rls.all_policies(tenant_id, coll)
+        state
+            .rls
+            .all_policies(tenant_id, &db_qualified(database_id, coll))
     } else {
         state.rls.all_policies_for_tenant(tenant_id)
     };
@@ -312,7 +336,7 @@ pub fn show_rls_policies(
         row.insert("name".to_string(), JsonValue::String(p.name.clone()));
         row.insert(
             "collection".to_string(),
-            JsonValue::String(p.collection.clone()),
+            JsonValue::String(p.display_collection.clone()),
         );
         row.insert(
             "type".to_string(),

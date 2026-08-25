@@ -432,6 +432,7 @@ mod tests {
             .create_policy(RlsPolicy {
                 name: "cpu_owner".into(),
                 collection: "cpu".into(),
+                display_collection: "cpu".into(),
                 tenant_id: 9,
                 policy_type: PolicyType::Write,
                 compiled_predicate: Some(RlsPredicate::Compare {

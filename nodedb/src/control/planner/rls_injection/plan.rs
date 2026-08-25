@@ -163,6 +163,7 @@ pub(super) mod test_support {
         let policy = RlsPolicy {
             name: format!("{collection}_owner"),
             collection: collection.into(),
+            display_collection: collection.into(),
             tenant_id: TENANT,
             policy_type: PolicyType::Read,
             compiled_predicate: Some(RlsPredicate::Compare {
@@ -217,6 +218,7 @@ pub(super) mod test_support {
             .create_policy(RlsPolicy {
                 name: format!("{collection}_{policy_type:?}"),
                 collection: collection.into(),
+                display_collection: collection.into(),
                 tenant_id: TENANT,
                 policy_type,
                 compiled_predicate: Some(predicate),

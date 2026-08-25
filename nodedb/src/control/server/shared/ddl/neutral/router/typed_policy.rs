@@ -52,6 +52,7 @@ pub(super) async fn try_typed(
                 is_restrictive: *is_restrictive,
                 on_deny_raw: on_deny_raw.as_deref(),
                 tenant_id_override: *tenant_id_override,
+                database_id,
             },
         )),
 
@@ -63,6 +64,7 @@ pub(super) async fn try_typed(
         }) => Some(rls::drop_rls_policy(
             state,
             identity,
+            database_id,
             name,
             collection,
             *if_exists,
@@ -75,6 +77,7 @@ pub(super) async fn try_typed(
         }) => Some(rls::show_rls_policies(
             state,
             identity,
+            database_id,
             collection.as_deref(),
             *tenant_id_override,
         )),

@@ -90,7 +90,7 @@ pub fn collect_dependents(
             });
         }
     }
-    for name in rls::find_rls_policies_on(catalog, tenant_id, root_collection)? {
+    for name in rls::find_rls_policies_on(catalog, database_id, tenant_id, root_collection)? {
         if visited.insert((DependentKind::RlsPolicy, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::RlsPolicy,

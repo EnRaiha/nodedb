@@ -13,8 +13,13 @@ use crate::control::security::predicate::{PolicyMode, RlsPredicate};
 pub struct RlsPolicy {
     /// Policy name (unique per collection).
     pub name: String,
-    /// Collection this policy applies to.
+    /// Collection this policy applies to, qualified with the owning
+    /// database ID (see `db_qualified`). This is the lookup key used by
+    /// the store and by enforcement — never show it to a user.
     pub collection: String,
+    /// The collection name as the user wrote it in the DDL, unqualified.
+    /// Display-only: `SHOW RLS POLICIES` renders this, not `collection`.
+    pub display_collection: String,
     /// Tenant scope.
     pub tenant_id: u64,
     /// Policy type: read, write, or both.

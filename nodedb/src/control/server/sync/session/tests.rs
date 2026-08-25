@@ -206,6 +206,7 @@ fn delta_push_defers_rls_until_authoritative_admission() {
         .create_policy(RlsPolicy {
             name: "require_active".into(),
             collection: "orders".into(),
+            display_collection: "orders".into(),
             tenant_id: 1,
             policy_type: PolicyType::Write,
             compiled_predicate: Some(predicate),

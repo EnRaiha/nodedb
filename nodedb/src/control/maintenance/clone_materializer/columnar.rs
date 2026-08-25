@@ -156,13 +156,11 @@ pub(super) async fn materialize_columnar_collection(
                     wal_lsn: None,
                     surrogates: vec![target_surrogate],
                     provenance: None,
-                    // Fails closed: this dispatches a fresh write into the
-                    // TARGET clone collection through the live write path
-                    // (its own new surrogate, its own dispatch), not a
-                    // replayed or already-committed write against target.
-                    // Target can carry its own write policy independent of
-                    // source, so the row must be checked against it.
-                    rls_write_check: RlsWriteCheck::pending_injection(),
+                    // `materialize_one` (walker.rs) already refused this
+                    // materialization if either side carried an RLS policy,
+                    // so no policy applies to source or target here — this
+                    // reflects a check that ran, not an assumption.
+                    rls_write_check: RlsWriteCheck::NoPolicyApplies,
                     returning: None,
                     rls_filters: Vec::new(),
                 })
@@ -177,13 +175,11 @@ pub(super) async fn materialize_columnar_collection(
                     schema_bytes: Vec::new(),
                     provenance: None,
                     wal_lsn: None,
-                    // Fails closed: this dispatches a fresh write into the
-                    // TARGET clone collection through the live write path
-                    // (its own new surrogate, its own dispatch), not a
-                    // replayed or already-committed write against target.
-                    // Target can carry its own write policy independent of
-                    // source, so the row must be checked against it.
-                    rls_write_check: RlsWriteCheck::pending_injection(),
+                    // `materialize_one` (walker.rs) already refused this
+                    // materialization if either side carried an RLS policy,
+                    // so no policy applies to source or target here — this
+                    // reflects a check that ran, not an assumption.
+                    rls_write_check: RlsWriteCheck::NoPolicyApplies,
                     // Internal row copy — nothing is projected back and no
                     // caller identity's reads are being gated.
                     returning: None,

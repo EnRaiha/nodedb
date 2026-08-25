@@ -5,6 +5,7 @@ mod dispatch;
 mod document;
 mod kv;
 mod reaper;
+mod rls_gate;
 
 pub mod progress;
 pub mod walker;

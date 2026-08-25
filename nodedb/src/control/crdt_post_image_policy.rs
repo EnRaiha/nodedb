@@ -142,6 +142,7 @@ mod tests {
             .create_policy(RlsPolicy {
                 name: "write_policy".into(),
                 collection: "orders".into(),
+                display_collection: "orders".into(),
                 tenant_id: 1,
                 policy_type: PolicyType::Write,
                 compiled_predicate: predicate,

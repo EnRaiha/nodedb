@@ -86,6 +86,7 @@ fn security_rls_policy_enforcement() {
         .create_policy(RlsPolicy {
             name: "require_approved".into(),
             collection: "orders".into(),
+            display_collection: "orders".into(),
             tenant_id: 1,
             policy_type: PolicyType::Write,
             compiled_predicate: Some(predicate),

@@ -33,6 +33,7 @@ fn status_policy(tenant_id: u64, name: &str) -> RlsPolicy {
     RlsPolicy {
         name: name.into(),
         collection: "orders".into(),
+        display_collection: "orders".into(),
         tenant_id,
         policy_type: PolicyType::Write,
         compiled_predicate: Some(RlsPredicate::Compare {
@@ -79,6 +80,7 @@ fn rls_same_name_policy_in_different_tenants_is_isolated() {
         .create_policy(RlsPolicy {
             name: "shared_name".into(),
             collection: "orders".into(),
+            display_collection: "orders".into(),
             tenant_id: TENANT_B,
             policy_type: PolicyType::Read,
             compiled_predicate: None,

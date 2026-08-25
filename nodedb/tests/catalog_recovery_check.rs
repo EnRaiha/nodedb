@@ -207,6 +207,7 @@ async fn rls_policy_orphan_refuses_startup() {
     let stored = nodedb::control::security::catalog::rls::StoredRlsPolicy {
         tenant_id: 1,
         collection: "orders".to_string(),
+        display_collection: "orders".to_string(),
         name: "only_own_orders".to_string(),
         policy_type_tag: 0,
         compiled_predicate_json: String::new(),
@@ -513,6 +514,7 @@ async fn rls_policy_value_mismatch_detected() {
     let stored = nodedb::control::security::catalog::rls::StoredRlsPolicy {
         tenant_id: 1,
         collection: "docs".to_string(),
+        display_collection: "docs".to_string(),
         name: "read_own".to_string(),
         policy_type_tag: 0,
         compiled_predicate_json: String::new(),

@@ -34,6 +34,7 @@ use super::columnar::materialize_columnar_collection;
 use super::document::materialize_document_collection;
 use super::kv::materialize_kv_collection;
 use super::progress::CloneMaterializerHandle;
+use super::rls_gate::refuse_if_rls_policy_applies;
 
 /// Result of a single `materialize_database` call.
 #[derive(Debug)]
@@ -188,11 +189,19 @@ fn pending_clone_collections(
 /// requires a multi-threaded runtime — the production server uses
 /// `#[tokio::main]` (multi-thread by default) and tests must annotate with
 /// `#[tokio::test(flavor = "multi_thread")]`.
+///
+/// Every engine's materialization flows through this function, so the RLS
+/// policy-existence gate is checked once here, before any scan or write plan
+/// is built for any of the four write sites (KV `Put`, Document
+/// `PointInsert`, Columnar `Insert`, Timeseries `Ingest`) or their matching
+/// source-side `MaterializeScan`s.
 fn materialize_one(
     runtime: &tokio::runtime::Handle,
     params: &MaterializeParams<'_>,
     coll: &StoredCollection,
 ) -> crate::Result<()> {
+    refuse_if_rls_policy_applies(params.state, params.db_id, coll)?;
+
     match &coll.collection_type {
         CollectionType::KeyValue(_) => tokio::task::block_in_place(|| {
             runtime.block_on(materialize_kv_collection(

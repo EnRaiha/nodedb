@@ -34,7 +34,13 @@ pub(super) fn purge_owned_for_tenant_teardown(
             ))
         })?;
         if kind == OwnerKind::Collection {
-            purge_collection_rls_policies(state, catalog, tenant, &owner.object_name)?;
+            purge_collection_rls_policies(
+                state,
+                catalog,
+                tenant,
+                crate::types::DatabaseId::new(owner.database_id),
+                &owner.object_name,
+            )?;
             purge_collection_redaction_policies(state, catalog, tenant, &owner.object_name)?;
         }
         let entry = teardown_delete_entry(kind, tenant, &owner);
@@ -96,19 +102,24 @@ fn purge_collection_rls_policies(
     state: &SharedState,
     catalog: &SystemCatalog,
     tenant: TenantId,
+    database_id: crate::types::DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
     let tenant_id = tenant.as_u64();
+    // RLS policies are keyed by `db_qualified(database_id, collection)`, not
+    // the bare collection name the owner catalog carries — match on that.
+    let qualified_collection =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection);
     let policies = catalog
         .load_all_rls_policies()
         .map_err(|e| ddl_err(format!("load RLS policies: {e}")))?;
     for policy in policies
         .into_iter()
-        .filter(|policy| policy.tenant_id == tenant_id && policy.collection == collection)
+        .filter(|policy| policy.tenant_id == tenant_id && policy.collection == qualified_collection)
     {
         let entry = CatalogEntry::DeleteRlsPolicy {
             tenant_id,
-            collection: collection.to_string(),
+            collection: qualified_collection.clone(),
             name: policy.name.clone(),
         };
         let log_index = propose(state, &entry)?;
@@ -116,9 +127,11 @@ fn purge_collection_rls_policies(
             state, &entry, log_index,
         );
         if log_index == 0 {
-            state
-                .rls
-                .install_replicated_drop_policy(tenant_id, collection, &policy.name);
+            state.rls.install_replicated_drop_policy(
+                tenant_id,
+                &qualified_collection,
+                &policy.name,
+            );
         }
     }
     Ok(())
