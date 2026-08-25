@@ -221,9 +221,22 @@ impl RlsCtx<'_> {
     /// A payload that is neither an array of rows nor a single row object is
     /// refused rather than admitted — an image the policy could not be
     /// evaluated against is not an image the policy admitted.
-    pub(super) fn admit_write_batch(&self, collection: &str, payload: &[u8]) -> crate::Result<()> {
+    ///
+    /// Takes the plan's check slot and records the verdict in it. The decision
+    /// happened here, against the exact rows the plan carries, so the slot must
+    /// say so — a slot left at
+    /// [`nodedb_types::RlsWriteCheck::PendingInjection`] reads as "injection
+    /// never ran" everywhere downstream, and the write is refused even though
+    /// the policy admitted it.
+    pub(super) fn admit_write_batch(
+        &self,
+        collection: &str,
+        payload: &[u8],
+        rls_write_check: &mut nodedb_types::RlsWriteCheck,
+    ) -> crate::Result<()> {
         let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
         if check.is_empty() {
+            *rls_write_check = nodedb_types::RlsWriteCheck::NoPolicyApplies;
             return Ok(());
         }
         let rows = match nodedb_types::value_from_msgpack(payload) {
@@ -251,6 +264,9 @@ impl RlsCtx<'_> {
                 collection,
             )?;
         }
+        // Every row was decided here, in this request, with a live identity,
+        // against the exact images the plan carries.
+        *rls_write_check = nodedb_types::RlsWriteCheck::decided_earlier_in_request();
         Ok(())
     }
 

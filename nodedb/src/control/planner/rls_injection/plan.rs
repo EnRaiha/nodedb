@@ -69,6 +69,7 @@ pub fn inject_rls(
             auth,
         };
         walk(&ctx, &mut task.plan)?;
+        refuse_undecided_write_check(&task.plan)?;
     }
     Ok(())
 }
@@ -85,7 +86,38 @@ pub fn inject_rls_for_single_plan(
         tenant_id,
         auth,
     };
-    walk(&ctx, plan)
+    walk(&ctx, plan)?;
+    refuse_undecided_write_check(plan)
+}
+
+/// Refuse a plan whose write-check slot this pass left undecided.
+///
+/// The walk is exhaustive over every op, but an arm can still handle an op
+/// that carries a check slot and never touch it — that is invisible to the
+/// compiler, and it is how a plain columnar `INSERT` once reached dispatch
+/// stamped [`nodedb_types::RlsWriteCheck::PendingInjection`] and was refused
+/// as un-injected. Catching it at the pass boundary turns a silently
+/// unstamped arm into a loud planner error naming the collection, instead of
+/// an internal-invariant break several layers down.
+///
+/// Every arm that decides a write must record its verdict in the slot, whether
+/// it evaluated the rows here or shipped the predicate to the Data Plane.
+fn refuse_undecided_write_check(plan: &PhysicalPlan) -> crate::Result<()> {
+    if !plan
+        .rls_write_checks()
+        .iter()
+        .any(|check| check.is_pending_injection())
+    {
+        return Ok(());
+    }
+    Err(crate::Error::PlanError {
+        detail: format!(
+            "internal invariant break: RLS injection ran over the write plan for '{}' without \
+             deciding its write-policy check; this is a missing decision in the injection pass, \
+             not a policy rejection",
+            plan.collection().unwrap_or("<unknown>")
+        ),
+    })
 }
 
 /// Core dispatch: resolve RLS for one physical plan.
@@ -133,11 +165,14 @@ pub(super) mod test_support {
         plan: &mut crate::bridge::envelope::PhysicalPlan,
     ) {
         use crate::bridge::envelope::PhysicalPlan;
-        use nodedb_physical::physical_plan::{DocumentOp, GraphOp, TimeseriesOp};
+        use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, GraphOp, TimeseriesOp};
         use nodedb_types::RlsWriteCheck::PendingInjection;
 
         match plan {
-            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 rls_write_check, ..
             })
             | PhysicalPlan::Graph(GraphOp::EdgeDelete {

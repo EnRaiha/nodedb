@@ -22,19 +22,19 @@ use nodedb_types::sync::wire::SyncProvenance;
 /// `Flush` and every read / DDL op return `None`.
 pub(super) fn array_write(op: &ArrayOp) -> Option<ReplicatedWrite> {
     match op {
+        // wal_lsn is omitted from the wire envelope; followers allocate
+        // their own LSN at apply time (like `ColumnarIngest`).
         ArrayOp::Put {
             array_id,
             cells_msgpack,
+            wal_lsn: _,
             provenance,
-            // wal_lsn is omitted from the wire envelope; followers allocate
-            // their own LSN at apply time (like `ColumnarIngest`).
-            ..
         } => Some(cell_put(&array_id.name, cells_msgpack, provenance)),
         ArrayOp::Delete {
             array_id,
             coords_msgpack,
+            wal_lsn: _,
             provenance,
-            ..
         } => Some(cell_delete(&array_id.name, coords_msgpack, provenance)),
 
         // Not replicated: `Flush` is durable-elsewhere — it forces a memtable

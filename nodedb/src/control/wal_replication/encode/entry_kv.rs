@@ -125,37 +125,49 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
                 rls_filters,
             },
         ),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::Expire {
             collection,
             key,
             ttl_ms,
-            ..
+            rls_write_check: _,
         } => kv::expire(collection, key, *ttl_ms),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::Persist {
-            collection, key, ..
+            collection,
+            key,
+            rls_write_check: _,
         } => kv::persist(collection, key),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::Incr {
             collection,
             key,
             delta,
             ttl_ms,
             surrogate,
-            ..
+            rls_write_check: _,
         } => kv::incr(collection, key, *delta, *ttl_ms, surrogate.as_u32()),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::IncrFloat {
             collection,
             key,
             delta,
             surrogate,
-            ..
+            rls_write_check: _,
         } => kv::incr_float(collection, key, *delta, surrogate.as_u32()),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::Cas {
             collection,
             key,
             expected,
             new_value,
             surrogate,
-            ..
+            rls_write_check: _,
         } => kv::cas(collection, key, expected, new_value, surrogate.as_u32()),
         KvOp::GetSet {
             collection,
@@ -194,13 +206,17 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             backfill,
         } => kv::register_index(collection, field, *field_position, *backfill),
         KvOp::DropIndex { collection, field } => kv::drop_index(collection, field),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::FieldSet {
             collection,
             key,
             updates,
             surrogate,
-            ..
+            rls_write_check: _,
         } => kv::field_set(collection, key, updates, surrogate.as_u32()),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::Transfer {
             collection,
             source_key,
@@ -209,7 +225,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             amount,
             debit_surrogate,
             credit_surrogate,
-            ..
+            rls_write_check: _,
         } => kv::transfer(
             collection,
             source_key,
@@ -219,13 +235,16 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             debit_surrogate.as_u32(),
             credit_surrogate.as_u32(),
         ),
+        // A follower has no writing identity; decode stamps
+        // `already_decided_elsewhere()`.
         KvOp::TransferItem {
             source_collection,
             dest_collection,
             item_key,
             dest_key,
             surrogate,
-            ..
+            source_rls_write_check: _,
+            dest_rls_write_check: _,
         } => kv::transfer_item(
             source_collection,
             dest_collection,

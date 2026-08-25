@@ -342,7 +342,9 @@ impl NodeDbPgHandler {
                 authorized.tenant_id(),
                 authorized.database_id(),
                 authorized.vshard_id(),
-                authorized.plan(),
+                &crate::control::wal_replication::ReplicableWrite::decide_for_replication(
+                    authorized.plan(),
+                )?,
             )?
         {
             return self

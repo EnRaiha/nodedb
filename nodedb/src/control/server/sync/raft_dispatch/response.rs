@@ -8,7 +8,7 @@
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::to_replicated_entry;
+use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
 use crate::event::EventSource;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
 
@@ -110,7 +110,12 @@ async fn dispatch_sync_response_inner(
     } = params;
     reject_unadmitted_crdt_apply(&plan)?;
     if let Some(proposer) = state.async_raft_proposer()
-        && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)?
+        && let Some(entry) = to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &ReplicableWrite::decide_for_replication(&plan)?,
+        )?
     {
         let payload = propose_sync_write(state, entry, proposer).await?;
         let request_id = state.next_request_id();

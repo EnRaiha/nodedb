@@ -66,7 +66,7 @@ async fn reissue_crdt_collection(
             tenant_id,
             database_id,
             vshard,
-            &plan,
+            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)?,
         )?
         .ok_or_else(|| Error::Internal {
             detail: "restore reissue: crdt import did not map to a replicated write".into(),

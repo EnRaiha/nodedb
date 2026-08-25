@@ -108,11 +108,16 @@ impl DataPlaneArrayExecutor {
         op_label: &str,
     ) -> Result<u64> {
         if let Some(proposer) = self.state.async_raft_proposer() {
+            let replicable =
+                crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)
+                    .map_err(|e| ClusterError::Storage {
+                        detail: format!("{op_label}: {e}"),
+                    })?;
             let entry = crate::control::wal_replication::to_replicated_entry(
                 array_id.tenant_id,
                 array_id.database_id,
                 VShardId::new(local_vshard_id),
-                &plan,
+                &replicable,
             )
             .map_err(|e| ClusterError::Storage {
                 detail: format!("{op_label}: {e}"),

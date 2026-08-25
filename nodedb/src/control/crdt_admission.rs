@@ -10,7 +10,7 @@ use nodedb_types::CrdtPreviewResult;
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Status};
 use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::to_replicated_entry;
+use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
 use crate::event::EventSource;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
@@ -509,7 +509,7 @@ async fn apply_fenced(
             workflow.tenant_id,
             workflow.database_id,
             workflow.vshard_id,
-            &plan,
+            &ReplicableWrite::decide_for_replication(&plan)?,
         )?
         .ok_or(crate::Error::CrdtAdmissionInvalidPlan {
             reason: "admitted CRDT Apply has no replicated form",

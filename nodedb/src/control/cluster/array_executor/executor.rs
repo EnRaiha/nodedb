@@ -109,7 +109,7 @@ fn local_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::wal_replication::to_replicated_entry;
+    use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
     use crate::types::{DatabaseId, TenantId};
     use nodedb_physical::physical_plan::{ArrayOp, PhysicalPlan};
 
@@ -131,7 +131,9 @@ mod tests {
         });
 
         let vshard_id = VShardId::new(19);
-        let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
+        let replicable = ReplicableWrite::decide_for_replication(&plan)
+            .expect("array write plan carries no live RLS predicate");
+        let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)
             .expect("array write plan encode must not error")
             .expect("array write plan must be replicated");
         assert_eq!(entry.tenant_id, tenant_id.as_u64());

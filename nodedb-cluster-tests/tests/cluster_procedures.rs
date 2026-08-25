@@ -17,6 +17,18 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::sync::compensation::CompensationHint;
 use nodedb_types::sync::wire::DeltaRejectMsg;
 
+/// Decide + encode in one call: `to_replicated_entry` takes a decided
+/// `ReplicableWrite`, and none of these fixtures carries a live RLS predicate.
+fn encode_entry(
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: &PhysicalPlan,
+) -> nodedb::Result<Option<nodedb::control::wal_replication::ReplicatedEntry>> {
+    let write = nodedb::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+    nodedb::control::wal_replication::to_replicated_entry(tenant_id, database_id, vshard_id, &write)
+}
+
 // ---------------------------------------------------------------------------
 // Procedure DML replicates via normal Raft path
 // ---------------------------------------------------------------------------
@@ -35,7 +47,7 @@ fn procedure_dml_creates_replicated_entry() {
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
     });
-    let entry = nodedb::control::wal_replication::to_replicated_entry(
+    let entry = encode_entry(
         TenantId::new(1),
         DatabaseId::DEFAULT,
         VShardId::new(0),
@@ -61,7 +73,7 @@ fn procedure_reads_not_replicated() {
         valid_at_ms: None,
         prefilter: None,
     });
-    let entry = nodedb::control::wal_replication::to_replicated_entry(
+    let entry = encode_entry(
         TenantId::new(1),
         DatabaseId::DEFAULT,
         VShardId::new(0),
@@ -122,14 +134,9 @@ fn tx_ctx_commit_yields_independent_tasks() {
     // Each task is an independent write that replicates via Raft.
     for task in &tasks {
         assert!(
-            nodedb::control::wal_replication::to_replicated_entry(
-                task.tenant_id,
-                task.database_id,
-                task.vshard_id,
-                &task.plan,
-            )
-            .expect("encode replicated entry")
-            .is_some()
+            encode_entry(task.tenant_id, task.database_id, task.vshard_id, &task.plan,)
+                .expect("encode replicated entry")
+                .is_some()
         );
     }
 }

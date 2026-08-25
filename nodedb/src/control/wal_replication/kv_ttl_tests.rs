@@ -21,6 +21,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::KvOp;
 
+use super::test_support::to_replicated_entry;
+
 #[test]
 fn kv_put_resolved_now_ms_roundtrips_verbatim_not_a_fresh_clock_read() {
     let tenant = TenantId::new(1);

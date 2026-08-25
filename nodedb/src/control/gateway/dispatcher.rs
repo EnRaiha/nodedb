@@ -320,7 +320,7 @@ async fn dispatch_local(
             tenant_id,
             database_id,
             vshard_id,
-            &route.plan,
+            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&route.plan)?,
         )?
     {
         let (payload, write_version) =

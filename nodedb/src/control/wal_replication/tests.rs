@@ -12,6 +12,8 @@ use nodedb_types::geometry::Geometry;
 use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::{PayloadIndexKind, Surrogate, VectorQuantization, VectorStorageDtype};
 
+use super::test_support::to_replicated_entry;
+
 #[test]
 fn replicated_entry_roundtrip() {
     let entry = ReplicatedEntry::new(
@@ -408,7 +410,7 @@ fn materialized_sum_resolution_roundtrips() {
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: vec![ResolvedSumTarget::new(
             "accounts",
             "acc-1",
@@ -500,7 +502,7 @@ fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
         pk_bytes: b"e1".to_vec(),
         returning: None,
         rls_filters: Vec::new(),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: vec![
             ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
             ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
@@ -1068,7 +1070,7 @@ fn columnar_ingest_provenance_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: Some(prov.clone()),
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1129,7 +1131,7 @@ fn timeseries_ingest_provenance_roundtrip() {
         wal_lsn: None,
         surrogates: vec![nodedb_types::Surrogate::new(99)],
         provenance: Some(prov.clone()),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1170,7 +1172,7 @@ fn columnar_ingest_on_conflict_updates_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1216,7 +1218,7 @@ fn columnar_ingest_intent_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1259,7 +1261,7 @@ fn columnar_ingest_json_format_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1307,7 +1309,7 @@ fn columnar_ingest_returning_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: Some(spec.clone()),
         rls_filters: Vec::new(),
     });
@@ -1351,7 +1353,7 @@ fn columnar_ingest_rls_filters_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: b"rls-predicate".to_vec(),
     });
@@ -1393,7 +1395,7 @@ fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
         wal_lsn: None,
         surrogates: vec![nodedb_types::Surrogate::new(99)],
         provenance: None,
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: Some(spec.clone()),
         rls_filters: b"rls-predicate".to_vec(),
     });
@@ -1502,7 +1504,7 @@ fn document_point_update_returning_and_rls_filters_roundtrip() {
         updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
         returning: Some(spec.clone()),
         rls_filters: b"rls-predicate".to_vec(),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(
@@ -1552,7 +1554,7 @@ fn document_point_delete_returning_and_rls_filters_roundtrip() {
         pk_bytes: b"a1".to_vec(),
         returning: Some(spec.clone()),
         rls_filters: b"rls-predicate".to_vec(),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(
@@ -1601,7 +1603,7 @@ fn document_upsert_returning_and_rls_filters_roundtrip() {
         value: b"{}".to_vec(),
         on_conflict_updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
         surrogate: Surrogate::new(4),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: Some(spec.clone()),
         rls_filters: b"rls-predicate".to_vec(),
         resolved_sum_targets: Vec::new(),
@@ -2429,7 +2431,7 @@ fn known_write_gaps_are_not_replicated() {
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 resolved_sum_targets: Vec::new(),
             }),
         ),
@@ -2447,7 +2449,7 @@ fn known_write_gaps_are_not_replicated() {
                 resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 resolved_sum_targets: Vec::new(),
             }),
         ),
@@ -2647,7 +2649,7 @@ fn kv_insert_on_conflict_update_returning_and_rls_filters_roundtrip() {
         ttl_ms: 0,
         updates: vec![("balance".into(), UpdateValue::Literal(b"100".to_vec()))],
         surrogate: Surrogate::new(2),
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: Some(spec.clone()),
         rls_filters: b"rls-predicate".to_vec(),
     });

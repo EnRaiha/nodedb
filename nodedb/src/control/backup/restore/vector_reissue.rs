@@ -134,7 +134,7 @@ pub async fn reissue_vector_durably(
             tenant_id,
             database_id,
             vshard,
-            &plan,
+            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)?,
         )?
         .ok_or_else(|| Error::Internal {
             detail: format!(

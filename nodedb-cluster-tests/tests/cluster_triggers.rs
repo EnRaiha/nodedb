@@ -21,6 +21,18 @@ use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use std::sync::Arc;
 
+/// Decide + encode in one call: `to_replicated_entry` takes a decided
+/// `ReplicableWrite`, and none of these fixtures carries a live RLS predicate.
+fn encode_entry(
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: &PhysicalPlan,
+) -> nodedb::Result<Option<nodedb::control::wal_replication::ReplicatedEntry>> {
+    let write = nodedb::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+    nodedb::control::wal_replication::to_replicated_entry(tenant_id, database_id, vshard_id, &write)
+}
+
 // ---------------------------------------------------------------------------
 // ASYNC triggers: Raft log contains ONLY the original DML
 // ---------------------------------------------------------------------------
@@ -43,7 +55,7 @@ fn async_trigger_not_in_raft_log() {
 
     // to_replicated_entry converts the plan to a Raft log entry.
     // It should contain ONLY the PointPut — no trigger side effects.
-    let entry = nodedb::control::wal_replication::to_replicated_entry(
+    let entry = encode_entry(
         TenantId::new(1),
         DatabaseId::DEFAULT,
         VShardId::new(0),
@@ -204,7 +216,7 @@ fn replicated_entry_roundtrip_point_delete() {
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
-    let entry = nodedb::control::wal_replication::to_replicated_entry(
+    let entry = encode_entry(
         TenantId::new(1),
         DatabaseId::DEFAULT,
         VShardId::new(0),
@@ -234,7 +246,7 @@ fn read_ops_not_replicated() {
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
     });
-    let entry = nodedb::control::wal_replication::to_replicated_entry(
+    let entry = encode_entry(
         TenantId::new(1),
         DatabaseId::DEFAULT,
         VShardId::new(0),
@@ -265,7 +277,7 @@ fn procedure_dml_is_normal_write() {
     });
     // This is a normal write → replicates via Raft.
     assert!(
-        nodedb::control::wal_replication::to_replicated_entry(
+        encode_entry(
             TenantId::new(1),
             DatabaseId::DEFAULT,
             VShardId::new(0),

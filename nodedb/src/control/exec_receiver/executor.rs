@@ -295,11 +295,23 @@ impl LocalPlanExecutor {
         }
 
         if let Some(proposer) = self.state.async_raft_proposer() {
+            let replicable =
+                match crate::control::wal_replication::ReplicableWrite::decide_for_replication(
+                    &plan,
+                ) {
+                    Ok(replicable) => replicable,
+                    Err(e) => {
+                        return ExecuteResponse::err(TypedClusterError::Internal {
+                            code: PLAN_DECODE_FAILED,
+                            message: e.to_string(),
+                        });
+                    }
+                };
             match crate::control::wal_replication::to_replicated_entry(
                 tenant_id,
                 database_id,
                 vshard_id,
-                &plan,
+                &replicable,
             ) {
                 Err(e) => {
                     return ExecuteResponse::err(TypedClusterError::Internal {

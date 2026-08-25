@@ -10,7 +10,9 @@ use nodedb_types::{DatabaseId, TenantId};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::server::dispatch_utils::publish_origin_change_events;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::{propose_replicated_entry, to_replicated_entry};
+use crate::control::wal_replication::{
+    ReplicableWrite, propose_replicated_entry, to_replicated_entry,
+};
 use crate::types::{RequestId, VShardId};
 
 /// One propose attempt's outcome.
@@ -46,8 +48,10 @@ pub(super) async fn propose_resolved(
             ),
         })?;
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    // The resolved op stamps `DecidedEarlierInRequest`, so this never refuses.
+    let replicable = ReplicableWrite::decide_for_replication(&plan)?;
     let entry =
-        to_replicated_entry(tenant_id, database_id, vshard_id, &plan)?.ok_or_else(|| {
+        to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)?.ok_or_else(|| {
             crate::Error::Internal {
                 detail: format!(
                     "columnar predicate DML: resolved plan for '{collection}' did not map to a \

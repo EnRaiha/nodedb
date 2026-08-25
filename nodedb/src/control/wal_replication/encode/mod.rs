@@ -6,8 +6,8 @@
 //! `entry_*` modules hold the exhaustive per-op classification (write vs.
 //! not-a-write) for each engine; the sibling modules hold the per-op wire
 //! encoders they call into:
-//! - [`entry`]: top-level dispatcher (`to_replicated_entry`) + shared
-//!   provenance-encoding helper.
+//! - [`entry`]: top-level dispatcher (`to_replicated_entry`, over a
+//!   `ReplicableWrite`) + shared provenance-encoding helper.
 //! - [`entry_document`] / [`document`]: `PhysicalPlan::Document`.
 //! - [`entry_kv`] / [`kv`]: `PhysicalPlan::Kv`.
 //! - [`entry_graph`] / [`graph`]: `PhysicalPlan::Graph`.

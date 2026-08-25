@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Entry point: encode a write-side `PhysicalPlan` into a `ReplicatedEntry`
+//! Entry point: encode a decided [`ReplicableWrite`] into a `ReplicatedEntry`
 //! for Raft proposal, plus the shared provenance-encoding helper.
 //!
 //! `to_replicated_entry` is the single oracle deciding which `PhysicalPlan`
@@ -15,6 +15,7 @@
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
+use super::super::replicable_write::ReplicableWrite;
 use super::super::types::ReplicatedEntry;
 use super::{
     crdt, entry_array, entry_columnar_family, entry_document, entry_graph, entry_kv, vector,
@@ -51,47 +52,20 @@ pub(super) fn encode_returning(
         .map(|r| zerompk::to_msgpack_vec(r).expect("ReturningSpec serialization is infallible"))
 }
 
-/// Refuse to replicate any write still carrying a live RLS write predicate.
+/// Encode a [`ReplicableWrite`] into a `ReplicatedEntry` for Raft proposal, or
+/// `Ok(None)` for a plan that is not a replicated write.
 ///
-/// A compiled predicate is decided against the writing identity. A follower
-/// has no such identity, so the predicate cannot cross the wire — and the
-/// leader applies through the same decode as every follower, so dropping it
-/// leaves the write ungoverned on every replica.
-///
-/// An op whose policy decision is deferred to the handler must therefore be
-/// resolved to a concrete row set before it is proposed. Columnar
-/// `UPDATE`/`DELETE` already are, by
-/// `control::columnar_predicate_dml_orchestrator`. Every other engine reaches
-/// here still carrying the predicate, and this refuses it rather than
-/// replicating a write no replica will govern.
-///
-/// Plain inserts are unaffected: the policy decides their rows at plan time,
-/// so they arrive stamped `NoPolicyApplies`, never `Predicate`.
-fn refuse_live_write_predicate(plan: &PhysicalPlan) -> crate::Result<()> {
-    if !plan.rls_write_checks().iter().any(|c| c.has_predicate()) {
-        return Ok(());
-    }
-    Err(crate::Error::PlanError {
-        detail: format!(
-            "this write on '{}' carries an RLS write policy whose decision is deferred to the \
-             handler, and a follower has no writing identity to evaluate it against. It must \
-             be resolved to a concrete row set before it is proposed.",
-            plan.collection().unwrap_or("<unknown>")
-        ),
-    })
-}
-
-/// Encode a write-side `PhysicalPlan` into a `ReplicatedEntry` for Raft
-/// proposal, `Ok(None)` for a plan that is not a replicated write, or an
-/// error when the plan cannot be replicated safely.
+/// The live-predicate refusal lives in `ReplicableWrite::decide_for_replication`
+/// — the argument type carries the guarantee, so there is nothing to re-check
+/// here.
 pub fn to_replicated_entry(
     tenant_id: TenantId,
     database_id: DatabaseId,
     vshard_id: VShardId,
-    plan: &PhysicalPlan,
+    write: &ReplicableWrite<'_>,
 ) -> crate::Result<Option<ReplicatedEntry>> {
-    refuse_live_write_predicate(plan)?;
-    let write = match plan {
+    let plan = write.plan();
+    let encoded = match plan {
         PhysicalPlan::Document(op) => entry_document::document_write(op),
         PhysicalPlan::Kv(op) => entry_kv::kv_write(op),
         // `vector::encode` / `crdt::encode` are exhaustive over their op enums
@@ -116,7 +90,7 @@ pub fn to_replicated_entry(
         PhysicalPlan::Meta(_) | PhysicalPlan::ClusterEvent(_) => None,
     };
 
-    Ok(write.map(|write| {
+    Ok(encoded.map(|write| {
         ReplicatedEntry::new(
             tenant_id.as_u64(),
             database_id.as_u64(),

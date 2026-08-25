@@ -55,7 +55,7 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
             ..
         } => {
             if on_conflict_updates.is_empty() {
-                ctx.admit_write_batch(collection, payload)?;
+                ctx.admit_write_batch(collection, payload, rls_write_check)?;
             } else {
                 ctx.set_write_check(collection, rls_write_check)?;
             }
@@ -265,6 +265,44 @@ mod tests {
             inject(&mut violating, &store),
             Err(crate::Error::RejectedAuthz { .. })
         ));
+    }
+
+    /// Deciding the rows here still has to be recorded in the slot.
+    ///
+    /// A plain insert is admitted at plan time, so nothing ships to the Data
+    /// Plane gate — but a slot left at `PendingInjection` reads as "injection
+    /// never ran" at the dispatch chokepoint, and the write is refused even
+    /// though the policy admitted it.
+    #[test]
+    fn a_plain_insert_records_that_its_rows_were_decided() {
+        let store = store_with_write_policy("events");
+        let mut plan = columnar_insert("events", &["42"]);
+        assert!(inject(&mut plan, &store).is_ok());
+        assert_eq!(
+            write_check(&plan),
+            &nodedb_types::RlsWriteCheck::DecidedEarlierInRequest
+        );
+    }
+
+    /// …and with no policy the slot says so, rather than staying un-injected.
+    #[test]
+    fn a_plain_insert_without_a_policy_records_that_injection_ran() {
+        let mut plan = columnar_insert("events", &["42"]);
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+
+        assert_eq!(
+            write_check(&before),
+            &nodedb_types::RlsWriteCheck::PendingInjection
+        );
+        assert_eq!(
+            write_check(&plan),
+            &nodedb_types::RlsWriteCheck::NoPolicyApplies
+        );
+
+        let mut normalized = plan.clone();
+        super::super::plan::test_support::reset_write_check(&mut normalized);
+        assert_eq!(normalized, before, "nothing else may change");
     }
 
     /// A payload that is not a decodable row batch fails closed rather than

@@ -379,15 +379,19 @@ impl NodeDbPgHandler {
 /// the "not a write" case `Ok(None)` covers.
 pub(super) fn has_replicated_writes(tasks: &[PhysicalTask]) -> bool {
     tasks.iter().any(|t| {
-        !matches!(
-            crate::control::wal_replication::to_replicated_entry(
-                t.tenant_id,
-                t.database_id,
-                t.vshard_id,
-                &t.plan,
+        match crate::control::wal_replication::ReplicableWrite::decide_for_replication(&t.plan) {
+            // Refused: still a write that belongs on the Raft path.
+            Err(_) => true,
+            Ok(replicable) => !matches!(
+                crate::control::wal_replication::to_replicated_entry(
+                    t.tenant_id,
+                    t.database_id,
+                    t.vshard_id,
+                    &replicable,
+                ),
+                Ok(None)
             ),
-            Ok(None)
-        )
+        }
     })
 }
 
