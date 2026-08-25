@@ -140,8 +140,27 @@ slow-timeout = { period = "30s", terminate-after = 8 }
 filter = 'binary(ilp_client_address) | binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(crash_resp_kv_write) | binary(crash_metadata_applier_wedge) | binary(crash_dropped_collection_reclaim) | binary(crash_mid_replay) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
 test-group = 'server-process'
 
+# Every test in the `wire` target spawns its own real `nodedb` server process.
+# At full fan-out the box runs one server per core, and each server carries a
+# Data Plane plus Raft groups — enough CPU starvation that a metadata propose
+# misses its 5s deadline and the statement fails. Capping concurrent servers
+# fixes the starvation; widening that deadline would only hide it, and the
+# deadline is real.
+#
+# Own group rather than the shared `server-process` cap of 2: this target will
+# hold the bulk of the suite once the port completes, so 2 would serialize
+# almost everything. No `threads-required` — these are single-node ephemeral
+# servers, so cheap unit tests can run alongside without stealing ports.
+[[profile.default.overrides]]
+filter = 'binary(wire)'
+test-group = 'wire-server'
+
 [test-groups]
 cluster = { max-threads = 1 }
+# Bounded concurrent single-node servers for the `wire` target. 4 keeps Raft
+# metadata proposes inside their deadline on a loaded box while leaving the
+# suite's wall clock reasonable.
+wire-server = { max-threads = 4 }
 load-sensitive = { max-threads = 1 }
 # Up to 2 real-server tests concurrently. Each picks ephemeral (OS-assigned)
 # ports + a private tempdir, so two running side by side never collide on
