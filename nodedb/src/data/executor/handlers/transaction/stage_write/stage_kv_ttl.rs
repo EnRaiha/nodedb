@@ -50,9 +50,8 @@ pub(in crate::data::executor) struct StageKvTtlTarget<'a> {
     pub txn_id: TxnId,
     pub collection: &'a str,
     pub key: &'a [u8],
-    /// Compiled row-level-security WRITE predicate. Empty means no write
-    /// policy restricts this identity here.
-    pub rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -139,9 +138,12 @@ impl CoreLoop {
         &self,
         ctx: &super::context::StageCtx<'_>,
         key: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
-        if rls_write_check.is_empty() {
+        if matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             return Ok(());
         }
         let Some(body) = self.resolve_kv_current(ctx, key) else {

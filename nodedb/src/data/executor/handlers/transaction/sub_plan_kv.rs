@@ -35,7 +35,7 @@ pub(super) struct TxColumnarInsertParams<'a> {
     /// Compiled row-level-security WRITE predicate carried by the buffered
     /// plan. COMMIT replay is the sole durable apply for an in-transaction
     /// columnar write, so the predicate has to survive the buffering.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Parameters for [`CoreLoop::execute_tx_timeseries_ingest`].
@@ -47,7 +47,7 @@ pub(super) struct TxTimeseriesIngestParams<'a> {
     pub wal_lsn: Option<u64>,
     /// Compiled row-level-security WRITE predicate carried by the buffered
     /// plan; see [`TxColumnarInsertParams::rls_write_check`].
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {

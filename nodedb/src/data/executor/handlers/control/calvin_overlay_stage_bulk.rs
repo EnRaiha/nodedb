@@ -69,9 +69,8 @@ pub(in crate::data::executor) struct CalvinBulkUpdateStage<'a> {
     pub collection: &'a str,
     pub updates: &'a [(String, UpdateValue)],
     pub ollp_predicted_surrogates: Option<&'a [u32]>,
-    /// Compiled RLS write policy gating each staged post-image. Empty = no
-    /// write policy.
-    pub rls_write_check: &'a [u8],
+    /// Compiled RLS write policy gating each staged post-image.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -86,7 +85,7 @@ impl CoreLoop {
         txn_id: TxnId,
         collection: &str,
         ollp_predicted_surrogates: Option<&[u32]>,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
         let Some(predicted) = ollp_predicted_surrogates else {
             return Err(missing_prediction_error(collection));
@@ -105,7 +104,10 @@ impl CoreLoop {
         // policy BEFORE any tombstone is staged, so a rejected row cannot leave
         // the rows ahead of it hidden from the rest of the transaction. A row
         // with no current body removes nothing and is admitted.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             for doc_id in &doc_ids {
                 if let Some(body) =
                     self.sparse

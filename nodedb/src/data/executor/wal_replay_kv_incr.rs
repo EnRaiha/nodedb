@@ -262,7 +262,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -351,7 +351,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_p, incr]);
@@ -383,7 +383,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::Incr {
             collection: "counters".into(),
@@ -391,7 +391,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_p, incr1, incr2]);
@@ -423,7 +423,7 @@ mod tests {
             delta: 3,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_p, incr]);
@@ -505,7 +505,7 @@ mod tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_str, incr]);
@@ -539,7 +539,7 @@ mod tests {
             delta: 1,
             ttl_ms: 86_400_000,
             surrogate: Surrogate::new(7),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let outcome = wal_append_if_write(
             &wal,

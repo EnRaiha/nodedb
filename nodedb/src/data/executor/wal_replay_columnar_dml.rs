@@ -48,6 +48,7 @@ use super::core_loop::CoreLoop;
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::ColumnarOp;
+use nodedb_types::RlsWriteCheck;
 use nodedb_types::columnar::ColumnarDmlWalRecord;
 
 impl CoreLoop {
@@ -98,23 +99,23 @@ impl CoreLoop {
         // silently degrade to a no-op against an empty collection name the day a
         // handler starts reading the plan; on a once-per-record startup path the
         // clone costs nothing worth that risk.
-        // Replay carries no row-level-security predicate: the policy already
-        // decided these rows when the record was written, and the identity that
-        // wrote it is not present at boot to resolve `$auth.*` against. A
-        // refused write never reaches replay at all — its record is cancelled
-        // by a `WriteAborted` marker before the refusal is acknowledged.
+        // No predicate here: this is crash-recovery replay of an
+        // already-committed WAL record. The identity that wrote it is not
+        // present at boot to resolve `$auth.*` against. A refused write never
+        // reaches replay at all — its record is cancelled by a
+        // `WriteAborted` marker before the refusal is acknowledged.
         let plan = if record.is_update {
             PhysicalPlan::Columnar(ColumnarOp::Update {
                 collection: record.collection.clone(),
                 filters: record.filters.clone(),
                 updates: record.updates.clone(),
-                rls_write_check: Vec::new(),
+                rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             })
         } else {
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: record.collection.clone(),
                 filters: record.filters.clone(),
-                rls_write_check: Vec::new(),
+                rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             })
         };
         let task = Self::replay_task(
@@ -128,17 +129,30 @@ impl CoreLoop {
         // Re-execute via the same live handlers the autocommit dispatch used —
         // `undo_log: None` mirrors the autocommit path (no transaction batch
         // to roll back).
+        //
+        // Replay carries no predicate. The policy decided these rows when the
+        // record was written, and the identity that wrote it is not present at
+        // boot to resolve `$auth.*` against. A refused write never reaches
+        // replay: its record is cancelled by a `WriteAborted` marker before
+        // the refusal is acknowledged.
+        let replay_check = nodedb_types::RlsWriteCheck::already_decided_elsewhere();
         let response = if record.is_update {
             self.execute_columnar_update(
                 &task,
                 &record.collection,
                 &record.filters,
                 &record.updates,
-                &[],
+                &replay_check,
                 None,
             )
         } else {
-            self.execute_columnar_delete(&task, &record.collection, &record.filters, &[], None)
+            self.execute_columnar_delete(
+                &task,
+                &record.collection,
+                &record.filters,
+                &replay_check,
+                None,
+            )
         };
 
         if response.status != Status::Ok {
@@ -166,7 +180,7 @@ mod tests {
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
     use nodedb_query::scan_filter::{FilterOp, ScanFilter};
-    use nodedb_types::Value;
+    use nodedb_types::{RlsWriteCheck, Value};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -221,7 +235,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             returning: None,
             rls_filters: Vec::new(),
         })
@@ -313,7 +327,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: COLLECTION.into(),
             filters: eq_filter_bytes("id", Value::Integer(2)),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -345,7 +359,7 @@ mod tests {
                 // encoding `zerompk::to_msgpack_vec(&Value)` would emit.
                 nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
             )],
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let outcome = wal_append_if_write(
             &wal,
@@ -368,7 +382,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: COLLECTION.into(),
             filters: eq_filter_bytes("id", Value::Integer(2)),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[insert, delete]);
@@ -400,7 +414,7 @@ mod tests {
                 "v".to_string(),
                 nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
             )],
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[insert, update]);

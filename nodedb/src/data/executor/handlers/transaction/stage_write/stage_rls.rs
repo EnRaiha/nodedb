@@ -30,17 +30,20 @@ use crate::types::{TenantId, TxnId};
 
 impl CoreLoop {
     /// Decide a set of schema-ordered columnar rows against the compiled write
-    /// policy. Empty `rls_write_check` admits everything.
+    /// policy.
     pub(super) fn stage_admit_columnar_rows<'a>(
         &self,
         task: &ExecutionTask,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         rows: impl IntoIterator<Item = &'a [Value]>,
         schema: &ColumnarSchema,
         tid: u64,
         collection: &str,
     ) -> Result<(), Response> {
-        if rls_write_check.is_empty() {
+        if matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             return Ok(());
         }
         for row in rows {

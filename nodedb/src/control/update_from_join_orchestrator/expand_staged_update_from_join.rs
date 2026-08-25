@@ -86,10 +86,10 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
     // `UpdateFromJoin` plan is the last thing that can decide these rows;
     // without the check here, expanding a governed update would launder it into
     // ungoverned point writes.
-    if !rls_write_check.is_empty() {
+    if let nodedb_types::WriteGateDecision::Evaluate(predicate) = rls_write_check.decision() {
         for (_, _, body, _) in &resolved {
             crate::control::security::rls::admit_compiled_write_image(
-                &rls_write_check,
+                predicate,
                 body,
                 tenant_id.as_u64(),
                 &target_collection,
@@ -221,7 +221,9 @@ async fn resolve_update_rows(
         // decides the resolved post-images against the statement's write
         // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        // Never evaluated: the resolve pass writes nothing, so no gate ever
+        // reads this.
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         // The RESOLVE pass writes nothing, so it folds no materialized-sum
         // delta. The point ops this expansion emits carry their own resolution.
         resolved_sum_targets: Vec::new(),

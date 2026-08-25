@@ -282,7 +282,7 @@ mod tests {
             wal_lsn: None,
             surrogates: vec![],
             provenance: None,
-            rls_write_check: vec![],
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: vec![],
         });

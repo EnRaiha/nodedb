@@ -111,7 +111,7 @@ pub async fn remote_write(
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             // Prometheus remote-write answers with an HTTP status, never rows,
             // for the same reason the line-protocol listener does. `inject_rls`
             // still runs over this task, so the read filter it fills in is

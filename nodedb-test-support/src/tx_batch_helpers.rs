@@ -251,7 +251,9 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
         schema_bytes: Vec::new(),
         provenance: None,
         wal_lsn: None,
-        rls_write_check: Vec::new(),
+        // These helpers build plans for transaction-batch tests on
+        // collections that carry no RLS policy.
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     })
@@ -287,7 +289,8 @@ pub fn timeseries_ingest(collection: &str, ilp: &str) -> PhysicalPlan {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        // No RLS policy on the collections these helpers build plans for.
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     })

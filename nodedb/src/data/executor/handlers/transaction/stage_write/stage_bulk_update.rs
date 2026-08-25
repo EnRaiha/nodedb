@@ -34,8 +34,7 @@ pub(in crate::data::executor) struct StageBulkUpdateParams<'a> {
     pub filter_bytes: &'a [u8],
     pub updates: &'a [(String, UpdateValue)],
     /// Compiled RLS write policy gating each matched row's staged post-image.
-    /// Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {

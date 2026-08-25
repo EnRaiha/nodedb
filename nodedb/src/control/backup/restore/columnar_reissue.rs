@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use nodedb_columnar::{ColumnarEngineSnapshot, MutationEngine, materialize_segment_live_rows};
+use nodedb_types::RlsWriteCheck;
 use nodedb_types::surrogate::Surrogate;
 use nodedb_types::value::Value;
 
@@ -156,7 +157,10 @@ pub fn build_columnar_insert_plan(
         schema_bytes: decoded.schema_bytes,
         provenance: None,
         wal_lsn: None,
-        rls_write_check: Vec::new(),
+        // No predicate here: a restore re-issues rows that were already
+        // admitted before the backup was taken. The identity that admitted
+        // them is not available during restore.
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         // A restore re-issues stored rows; no client is waiting on a
         // projection, and there is no identity whose reads need gating.
         returning: None,

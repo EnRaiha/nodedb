@@ -69,7 +69,7 @@ pub async fn kv_incr(
         surrogate,
         // Filled by `dispatch_and_respond`, which runs the same RLS injection
         // pass the planner-driven path runs.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(
@@ -127,7 +127,7 @@ pub async fn kv_incr_float(
         delta,
         surrogate,
         // Filled by `dispatch_and_respond` — see `kv_incr`.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(
@@ -182,7 +182,7 @@ pub async fn kv_cas(
         new_value: new_value.into_bytes(),
         surrogate,
         // Filled by `dispatch_and_respond` — see `kv_incr`.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(
@@ -237,7 +237,7 @@ pub async fn kv_getset(
         // Both filled by `dispatch_and_respond`: the read half gates the old
         // value this function returns, the write half the value it stores.
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(

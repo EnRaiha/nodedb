@@ -37,8 +37,7 @@ pub(in crate::data::executor) struct BulkDeleteParams<'a> {
     /// Compiled RLS write policy gating the REMOVAL, decided per row against
     /// its pre-deletion image. A separate slot from `rls_filters`: that one
     /// bounds what may be shown back, this one bounds what may be removed.
-    /// Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// the rows this predicate matches contribute to, resolved on the Control
     /// Plane from its recon scan of the same predicate.
@@ -170,7 +169,10 @@ impl CoreLoop {
         // deleted. The pre-deletion image is the only image a delete has. A row
         // that is already absent is admitted: it removes nothing, so there is
         // no image for the policy to restrict.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             for doc_id in &apply_ids {
                 let stored = match self.sparse.get(database_id, tid, collection, doc_id) {
                     Ok(Some(bytes)) => bytes,

@@ -35,6 +35,7 @@ use super::handlers::graph::EdgePutParams;
 use super::task::{ExecutionTask, TaskState};
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
 use crate::types::{DatabaseId, Lsn, ReadConsistency};
+use nodedb_types::RlsWriteCheck;
 
 impl CoreLoop {
     /// Replay reconstituted graph edge `Put` / `Delete` redo sub-records.
@@ -173,12 +174,10 @@ impl CoreLoop {
                         dst_id: dst_id.clone(),
                         src_surrogate: nodedb_types::Surrogate::ZERO,
                         dst_surrogate: nodedb_types::Surrogate::ZERO,
-                        // Replay re-applies a delete that was already admitted
-                        // by the write policy when it was first accepted;
-                        // re-deciding it here against today's policies would
-                        // make recovery depend on catalog state the record
-                        // never carried.
-                        rls_write_check: Vec::new(),
+                        // No predicate here: this is crash-recovery replay of
+                        // an already-committed WAL record. The identity that
+                        // wrote it is not present at boot.
+                        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
                     }),
                 );
                 self.active_graph_system_from = system_from;
@@ -190,7 +189,10 @@ impl CoreLoop {
                         src_id: &src_id,
                         label: &label,
                         dst_id: &dst_id,
-                        rls_write_check: &[],
+                        // Replay carries no predicate: the policy decided this
+                        // edge when the record was written, and the writing
+                        // identity is not present at boot.
+                        rls_write_check: &nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                     },
                 );
                 self.active_graph_system_from = None;

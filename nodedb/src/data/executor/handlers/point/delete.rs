@@ -29,8 +29,8 @@ pub(in crate::data::executor) struct PointDeleteExec<'a> {
     /// Compiled RLS write policy gating the REMOVAL, decided against the row's
     /// pre-deletion image — the only image a delete has. A separate slot from
     /// `rls_filters`: that one bounds what may be shown back, this one bounds
-    /// what may be removed. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    /// what may be removed.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this delete must debit, resolved on the Control Plane at plan time.
     pub resolved_sum_targets: &'a [ResolvedSumTarget],
@@ -265,9 +265,12 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         surrogate: Surrogate,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
-        if rls_write_check.is_empty() {
+        if matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             return Ok(());
         }
         let database_id = task.request.database_id.as_u64();

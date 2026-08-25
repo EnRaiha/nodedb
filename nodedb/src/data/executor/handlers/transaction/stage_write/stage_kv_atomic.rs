@@ -188,7 +188,7 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         delta: i64,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr(current.as_deref(), delta) {
@@ -210,7 +210,7 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         delta: f64,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr_float(current.as_deref(), delta) {
@@ -237,7 +237,7 @@ impl CoreLoop {
         &self,
         ctx: &StageCtx<'_>,
         image: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
         self.stage_admit_write(
             rls_write_check,
@@ -257,7 +257,7 @@ impl CoreLoop {
         key: &[u8],
         expected: &[u8],
         new_value: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let (matches, write_bytes) = atomic_compute::cas(current.as_deref(), expected, new_value);
@@ -291,7 +291,7 @@ impl CoreLoop {
         key: &[u8],
         new_value: &[u8],
         rls_filters: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let write_bytes = atomic_compute::getset(current.as_deref(), new_value);

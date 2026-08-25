@@ -539,7 +539,7 @@ mod tests {
                     delta,
                     ttl_ms: 0,
                     surrogate: Surrogate::ZERO,
-                    rls_write_check: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 },
             );
             assert_eq!(resp.status, Status::Ok, "stage incr: {resp:?}");
@@ -657,7 +657,7 @@ mod tests {
             &[PhysicalPlan::Kv(KvOp::Delete {
                 collection: "kvc".to_string(),
                 keys: vec![b"gone".to_vec()],
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             })],
         );
         let redo = decode_redo(&resp);
@@ -736,7 +736,7 @@ mod tests {
                 columns: ReturningColumns::Star,
             }),
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
 
@@ -806,7 +806,7 @@ mod tests {
                 columns: ReturningColumns::Star,
             }),
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
 
@@ -862,7 +862,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
 
@@ -917,7 +917,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
 
@@ -968,7 +968,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
 
@@ -1027,7 +1027,7 @@ mod tests {
                 resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
@@ -1042,7 +1042,7 @@ mod tests {
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
@@ -1526,7 +1526,7 @@ mod tests {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[delete_plan]);
@@ -1963,7 +1963,7 @@ mod tests {
             dst_id: "b".to_string(),
             src_surrogate: Surrogate::ZERO,
             dst_surrogate: Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -2527,7 +2527,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -2591,7 +2591,7 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -2650,7 +2650,7 @@ mod tests {
             wal_lsn: None,
             surrogates: vec![Surrogate::new(701)],
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -2713,7 +2713,7 @@ mod tests {
             collection: "cevents".to_string(),
             filters: Vec::new(),
             updates: vec![("a".to_string(), vec![1, 2, 3])],
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(44), &[update]);
         assert_eq!(resp.status, Status::Ok);
@@ -2730,7 +2730,7 @@ mod tests {
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "cevents".to_string(),
             filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(45), &[delete]);
         assert_eq!(resp.status, Status::Ok);
@@ -2877,7 +2877,7 @@ mod tests {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
             }),

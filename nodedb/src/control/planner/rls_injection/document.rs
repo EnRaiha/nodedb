@@ -269,13 +269,13 @@ mod tests {
             updates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         })
     }
 
     /// The compiled write predicate a plan carries into the Data Plane.
-    fn write_check(plan: &PhysicalPlan) -> &[u8] {
+    fn write_check(plan: &PhysicalPlan) -> &nodedb_types::RlsWriteCheck {
         match plan {
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 rls_write_check, ..
@@ -357,7 +357,7 @@ mod tests {
         let mut plan = point_update("orders");
         assert!(inject(&mut plan, &store).is_ok());
         assert!(
-            !write_check(&plan).is_empty(),
+            write_check(&plan).has_predicate(),
             "write policy must reach the Data-Plane gate"
         );
     }
@@ -374,11 +374,11 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// Every MERGE arm writes a row resolved against the target, so the
@@ -398,11 +398,11 @@ mod tests {
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// An upsert's conflict branch persists a merge with the stored row, so its
@@ -416,13 +416,13 @@ mod tests {
             value: body("42"),
             on_conflict_updates: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// A `RETURNING` on an insert ships rows back, so a read-only policy must
@@ -499,7 +499,7 @@ mod tests {
             }) => {
                 assert!(!rls_filters.is_empty(), "read half must gate RETURNING");
                 assert!(
-                    !rls_write_check.is_empty(),
+                    rls_write_check.has_predicate(),
                     "write half must gate the write"
                 );
             }
@@ -526,17 +526,31 @@ mod tests {
 
         let mut update = point_update("orders");
         assert!(inject(&mut update, &store).is_ok());
-        assert!(write_check(&update).is_empty());
+        assert!(!write_check(&update).has_predicate());
     }
 
     /// With no policy at all every write shape runs untouched.
     #[test]
-    fn writes_without_a_policy_are_untouched() {
-        for mut plan in [point_insert("orders", "99"), point_update("orders")] {
-            let before = plan.clone();
-            assert!(inject_without_policy(&mut plan).is_ok());
-            assert_eq!(plan, before);
-        }
+    fn writes_without_a_policy_record_that_injection_ran() {
+        // `point_insert` is decided at plan time and carries no write-check
+        // slot to stamp, so only the update is checked for the stamp. Both are
+        // checked for leaving everything else alone.
+        let mut insert = point_insert("orders", "99");
+        let insert_before = insert.clone();
+        assert!(inject_without_policy(&mut insert).is_ok());
+        assert_eq!(insert, insert_before);
+
+        let mut update = point_update("orders");
+        let update_before = update.clone();
+        assert!(inject_without_policy(&mut update).is_ok());
+        assert_eq!(
+            write_check(&update),
+            &nodedb_types::RlsWriteCheck::NoPolicyApplies
+        );
+
+        let mut normalized = update.clone();
+        super::super::plan::test_support::reset_write_check(&mut normalized);
+        assert_eq!(normalized, update_before, "nothing else may change");
     }
 
     fn indexed_fetch(collection: &str) -> PhysicalPlan {
@@ -588,7 +602,7 @@ mod tests {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
@@ -628,7 +642,7 @@ mod tests {
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());

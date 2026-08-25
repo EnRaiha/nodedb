@@ -50,6 +50,7 @@ pub mod namespace;
 pub mod pg_compat;
 pub mod protocol;
 pub mod result;
+pub mod rls_write_check;
 pub mod sparse_vector;
 pub mod sql_quote;
 pub mod surrogate;
@@ -113,6 +114,7 @@ pub use quota::{
     PriorityClass, PriorityClassParseError, QuotaRecord, QuotaSpec, QuotaValidationError,
 };
 pub use result::{QueryResult, SearchResult, SubGraph};
+pub use rls_write_check::{RlsWriteCheck, WriteGateDecision};
 pub use sparse_vector::{SparseVector, SparseVectorError};
 pub use sql_quote::{quote_ident, quote_literal};
 pub use surrogate::Surrogate;

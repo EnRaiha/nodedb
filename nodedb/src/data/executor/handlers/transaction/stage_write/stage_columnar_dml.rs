@@ -67,7 +67,7 @@ pub(in crate::data::executor) struct StageColumnarDeleteParams<'a> {
     pub filter_bytes: &'a [u8],
     /// Compiled row-level-security WRITE predicate carried by the plan,
     /// decided against the pre-image of every row this would remove.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Routing identity + payload for one staged columnar predicate `UPDATE`.
@@ -82,7 +82,7 @@ pub(in crate::data::executor) struct StageColumnarUpdateParams<'a> {
     pub updates: &'a [(String, Vec<u8>)],
     /// Compiled row-level-security WRITE predicate carried by the plan,
     /// decided against each row's post-image once the assignments are applied.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -118,7 +118,10 @@ impl CoreLoop {
         // The image a delete is governed by is the row it removes. Decided for
         // the whole matching set before the first tombstone, so a refusal
         // leaves the overlay untouched.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             let schema = match self.columnar_engine_schema(task, tid, collection) {
                 Ok(s) => s,
                 Err(resp) => return resp,

@@ -32,7 +32,7 @@ impl CoreLoop {
         collection: &str,
         filter_bytes: &[u8],
         updates: &[(String, Vec<u8>)],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         undo_log: Option<&mut Vec<UndoEntry>>,
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar update");
@@ -265,7 +265,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         collection: &str,
         filter_bytes: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         undo_log: Option<&mut Vec<UndoEntry>>,
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar delete");

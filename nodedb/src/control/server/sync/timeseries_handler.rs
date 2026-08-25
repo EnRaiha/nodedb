@@ -116,7 +116,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             // Edge-to-origin sync replays rows already decided by the policy
             // where they were written; the writing device's session is not
             // present here to resolve `$auth.*` against.
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             returning: None,
             rls_filters: Vec::new(),
         });

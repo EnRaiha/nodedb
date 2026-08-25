@@ -38,9 +38,8 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     pub rls_filters: &'a [u8],
     /// Compiled RLS write policy gating the PERSIST, decided against the
     /// post-update image. A separate slot from `rls_filters`: that one bounds
-    /// what may be shown back, this one bounds what may be written. Empty = no
-    /// write policy.
-    pub rls_write_check: &'a [u8],
+    /// what may be shown back, this one bounds what may be written.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this update may touch — both sides of a join-key change. Resolved on the
     /// Control Plane at plan time.

@@ -386,7 +386,7 @@ fn materialized_sum_resolution_roundtrips() {
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         resolved_sum_targets: vec![ResolvedSumTarget::new(
             "accounts",
             "acc-1",
@@ -475,7 +475,7 @@ fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
         pk_bytes: b"e1".to_vec(),
         returning: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         resolved_sum_targets: vec![
             ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
             ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
@@ -1027,7 +1027,7 @@ fn columnar_ingest_provenance_roundtrip() {
         schema_bytes: Vec::new(),
         provenance: Some(prov.clone()),
         wal_lsn: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1087,7 +1087,7 @@ fn timeseries_ingest_provenance_roundtrip() {
         wal_lsn: None,
         surrogates: vec![nodedb_types::Surrogate::new(99)],
         provenance: Some(prov.clone()),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -1884,7 +1884,7 @@ fn known_write_gaps_are_not_replicated() {
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
         ),
@@ -1902,7 +1902,7 @@ fn known_write_gaps_are_not_replicated() {
                 resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
         ),

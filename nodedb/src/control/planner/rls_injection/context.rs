@@ -265,14 +265,21 @@ impl RlsCtx<'_> {
     ///
     /// Resolved through the same [`get_rls_write`] as [`Self::admit_write_image`],
     /// so superuser bypass and the fail-closed deny on an unresolvable
-    /// `$auth.*` reference behave identically on both paths. Empty bytes mean
-    /// no write policy restricts this identity here.
+    /// `$auth.*` reference behave identically on both paths. An empty
+    /// predicate becomes [`nodedb_types::RlsWriteCheck::NoPolicyApplies`], so
+    /// "no policy restricts this identity" and "the predicate was lost" can
+    /// never be confused.
     pub(super) fn set_write_check(
         &self,
         collection: &str,
-        rls_write_check: &mut Vec<u8>,
+        rls_write_check: &mut nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
-        *rls_write_check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        *rls_write_check = nodedb_types::RlsWriteCheck::from_injected(get_rls_write(
+            self.store,
+            self.tenant_id,
+            collection,
+            self.auth,
+        )?);
         Ok(())
     }
 

@@ -197,7 +197,7 @@ fn bulk_update_moves_the_total_by_the_difference() {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &resolved,
         },
     );
@@ -226,7 +226,7 @@ fn bulk_delete_subtracts_every_removed_rows_contribution() {
             filter_bytes: &[],
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &resolved,
             ollp: OllpPrediction {
                 surrogates: None,
@@ -308,7 +308,7 @@ fn update_from_join_moves_the_total_by_the_difference() {
             resolve_only: false,
             source_rows: Some(source_rows.as_slice()),
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &resolved,
         },
     );
@@ -402,7 +402,7 @@ fn an_uncovered_join_value_retries_instead_of_writing_a_wrong_total() {
             filter_bytes: &[],
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &resolved,
             ollp: OllpPrediction {
                 surrogates: None,
@@ -475,7 +475,7 @@ fn an_uncovered_cross_shard_join_value_is_deferred_rather_than_retried() {
             filter_bytes: &[],
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &[],
             ollp: OllpPrediction {
                 surrogates: None,
@@ -536,7 +536,7 @@ fn an_over_resolved_plan_is_not_a_divergence() {
             filter_bytes: &[],
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &resolved,
             ollp: OllpPrediction {
                 surrogates: None,

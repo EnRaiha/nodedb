@@ -365,7 +365,7 @@ impl CoreLoop {
                             // A batched edge carries no property image, so the
                             // planner refuses the batch outright while a write
                             // policy applies — nothing reaches here to decide.
-                            rls_write_check: &[],
+                            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
                         },
                         undo_log,
                     )?;

@@ -26,9 +26,8 @@ pub(in crate::data::executor) struct ColumnarInsertParams<'a> {
     pub surrogates: &'a [Surrogate],
     pub schema_bytes: &'a [u8],
     pub provenance: Option<&'a SyncProvenance>,
-    /// Compiled row-level-security WRITE predicate carried by the plan; empty
-    /// when no policy restricts this identity on the collection.
-    pub rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the plan.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Projection for a `RETURNING` clause, when the statement carried one.
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled row-level-security READ predicate gating the rows `returning`

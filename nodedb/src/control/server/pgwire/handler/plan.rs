@@ -273,7 +273,7 @@ mod tests {
         let delete = PhysicalPlan::Kv(KvOp::Delete {
             collection: "items".into(),
             keys: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(!is_calvin_foldable(&delete));
         assert!(calvin_tag_for_plan(&delete).is_err());
@@ -285,7 +285,7 @@ mod tests {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(!is_calvin_foldable(&point_delete));

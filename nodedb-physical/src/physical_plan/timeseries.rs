@@ -2,7 +2,7 @@
 
 //! Timeseries engine operations dispatched to the Data Plane.
 
-use nodedb_types::{Surrogate, SystemTimeScope};
+use nodedb_types::{RlsWriteCheck, Surrogate, SystemTimeScope};
 
 use crate::physical_plan::document::ReturningSpec;
 
@@ -100,13 +100,11 @@ pub enum TimeseriesOp {
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
         /// Compiled row-level-security WRITE predicate (`Vec<ScanFilter>` as
         /// MessagePack), evaluated in the Data Plane against every parsed row
-        /// before it reaches the memtable. Every ingest format normalizes into
-        /// ILP inside the handler, so one gate there covers all of them —
-        /// including the raw ILP listener, which builds its tasks outside the
-        /// SQL planner. Empty means no write policy restricts this identity
-        /// here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// before it reaches the memtable, or the reason no predicate is
+        /// attached. Every ingest format normalizes into ILP inside the
+        /// handler, so one gate there covers all of them — including the raw
+        /// ILP listener, which builds its tasks outside the SQL planner.
+        rls_write_check: RlsWriteCheck,
         /// When `Some`, return the STORED post-image of each ingested point —
         /// the row as it exists after time-key normalization, tag/field
         /// splitting and schema resolution, read back through the ordinary scan

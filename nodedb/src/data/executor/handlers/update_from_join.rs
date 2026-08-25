@@ -209,7 +209,10 @@ impl CoreLoop {
         // applied, so it is the row that would exist afterwards. The RESOLVE
         // pass returns above without writing; the Control-Plane expander that
         // consumes it gates the point ops it emits.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             for row in &rows {
                 if let Err(e) =
                     rls_write_gate::admit_row(rls_write_check, &row.doc, tid, target_collection)

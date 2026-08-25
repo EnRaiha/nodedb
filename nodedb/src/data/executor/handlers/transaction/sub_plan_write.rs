@@ -43,7 +43,7 @@ pub(super) struct TxEdgeDeleteParams<'a> {
     /// Compiled RLS write-policy filters the staged plan carried. Decided
     /// against the edge's pre-image inside the batch, so a rejected delete
     /// fails the whole transaction instead of applying unchecked.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -234,7 +234,7 @@ impl CoreLoop {
         collection: &str,
         filters: &[u8],
         updates: &[(String, Vec<u8>)],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
         let resp = self.execute_columnar_update(
@@ -259,7 +259,7 @@ impl CoreLoop {
         dummy_task: &ExecutionTask,
         collection: &str,
         filters: &[u8],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
         let resp = self.execute_columnar_delete(

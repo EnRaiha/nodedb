@@ -370,7 +370,7 @@ mod tests {
             pk_bytes: b"e1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         }
     }
@@ -384,7 +384,7 @@ mod tests {
             updates: assignments(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         }
     }
@@ -409,7 +409,7 @@ mod tests {
             value: Vec::new(),
             on_conflict_updates: assignments(),
             surrogate: ROW,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
@@ -496,7 +496,7 @@ mod tests {
             value,
             on_conflict_updates,
             surrogate: ROW,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),

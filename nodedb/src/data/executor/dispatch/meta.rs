@@ -462,6 +462,7 @@ mod txn_created_columnar_engine_tests {
         let sb = schema_bytes();
         let pl = payload(1, 1.0);
         let surrogates = [Surrogate::new(1)];
+        let no_policy = nodedb_types::RlsWriteCheck::NoPolicyApplies;
         let resp = core.stage_columnar_insert(StageColumnarInsertParams {
             task,
             tid: TID,
@@ -471,7 +472,7 @@ mod txn_created_columnar_engine_tests {
             surrogates: &surrogates,
             schema_bytes: &sb,
             on_conflict_updates: &[],
-            rls_write_check: &[],
+            rls_write_check: &no_policy,
         });
         assert_eq!(
             resp.status,
@@ -590,6 +591,7 @@ mod txn_created_columnar_engine_tests {
         let sb = schema_bytes();
         let pl = payload(2, 2.0);
         let surrogates = [Surrogate::new(2)];
+        let no_policy = nodedb_types::RlsWriteCheck::NoPolicyApplies;
         let resp = core.stage_columnar_insert(StageColumnarInsertParams {
             task: &task,
             tid: TID,
@@ -599,7 +601,7 @@ mod txn_created_columnar_engine_tests {
             surrogates: &surrogates,
             schema_bytes: &sb,
             on_conflict_updates: &[],
-            rls_write_check: &[],
+            rls_write_check: &no_policy,
         });
         assert_eq!(resp.status, Status::Ok);
         assert!(

@@ -49,14 +49,17 @@ pub(super) fn record_put_index_undo(undo_log: &mut Vec<UndoEntry>, outcome: &mut
 /// Every captured body is MessagePack for BOTH storage modes —
 /// `collect_merge_plan` decodes a strict target's Binary Tuple and re-encodes
 /// the resolved row before the apply pass sees it — so the decode takes no
-/// strict schema. Empty `rls_write_check` means no write policy applies.
+/// strict schema.
 pub(super) fn gate_merge_arms(
     plan: &MergePlanActions,
-    rls_write_check: &[u8],
+    rls_write_check: &nodedb_types::RlsWriteCheck,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
+    if matches!(
+        rls_write_check.decision(),
+        nodedb_types::WriteGateDecision::AdmitAll
+    ) {
         return Ok(());
     }
     let arms = plan

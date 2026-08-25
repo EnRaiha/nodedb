@@ -95,7 +95,7 @@ fn bulk_update_task(vshard: u32) -> PhysicalTask {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: vec![],
-            rls_write_check: vec![],
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
@@ -158,12 +158,12 @@ fn is_write_plan_classifies_columnar_update_and_delete() {
         collection: "metrics".to_owned(),
         filters: vec![],
         updates: vec![],
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
         collection: "metrics".to_owned(),
         filters: vec![],
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(
         is_write_plan(&update),

@@ -103,9 +103,11 @@ pub async fn rate_check(
         delta: 1,
         ttl_ms: actual_ttl,
         surrogate,
-        // The rate-gate collection is internal bookkeeping, not user rows, so
-        // no user row policy governs it.
-        rls_write_check: Vec::new(),
+        // The rate-gate collection is internal bookkeeping, not user rows. It
+        // is never user-created and can never carry an RLS policy, so this
+        // dispatch bypasses the injection pass by design rather than pending
+        // a decision that will never come.
+        rls_write_check: nodedb_types::RlsWriteCheck::system_internal_collection(),
     });
 
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
@@ -243,7 +245,7 @@ pub async fn rate_reset(
         collection: RATE_COLLECTION.to_string(),
         keys: vec![rate_key.as_bytes().to_vec()],
         // Internal bookkeeping collection — see `rate_gate`'s INCR above.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::system_internal_collection(),
     });
 
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(

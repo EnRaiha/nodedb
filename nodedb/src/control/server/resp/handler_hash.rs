@@ -138,7 +138,7 @@ pub(super) async fn handle_hset(
         updates,
         surrogate,
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

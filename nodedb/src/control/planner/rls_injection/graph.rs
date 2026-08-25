@@ -292,7 +292,7 @@ mod tests {
             dst_id: "b".into(),
             src_surrogate: nodedb_types::Surrogate::ZERO,
             dst_surrogate: nodedb_types::Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })
     }
 
@@ -350,7 +350,7 @@ mod tests {
             PhysicalPlan::Graph(GraphOp::EdgeDelete {
                 rls_write_check, ..
             }) => assert!(
-                !rls_write_check.is_empty(),
+                rls_write_check.has_predicate(),
                 "a governed edge delete must ship the compiled predicate"
             ),
             other => panic!("expected an EdgeDelete plan, got {other:?}"),
@@ -360,11 +360,22 @@ mod tests {
     /// …and an ungoverned collection ships an empty check, which admits
     /// everything and costs the Data Plane no pre-image read.
     #[test]
-    fn edge_delete_without_a_policy_is_untouched() {
+    fn edge_delete_without_a_policy_records_that_injection_ran() {
         let mut plan = edge_delete("users");
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
-        assert_eq!(plan, before);
+
+        // Injection's only mark on a plan it finds no policy for is the write
+        // check itself. That stamp is what tells the Data Plane gate the pass
+        // ran, rather than having been skipped.
+        assert_eq!(
+            plan.rls_write_checks(),
+            vec![&nodedb_types::RlsWriteCheck::NoPolicyApplies]
+        );
+
+        let mut normalized = plan.clone();
+        super::super::plan::test_support::reset_write_check(&mut normalized);
+        assert_eq!(normalized, before, "nothing else may change");
     }
 
     /// A graph algorithm runs over every edge of the collection.

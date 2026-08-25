@@ -29,8 +29,8 @@ pub(in crate::data::executor) struct UpsertParams<'a> {
     pub on_conflict_updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
     /// Compiled RLS write policy gating the PERSIST, decided against whichever
     /// body this call actually stores — the merged row on the conflict branch,
-    /// the incoming body on the insert branch. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    /// the incoming body on the insert branch.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// When `Some`, project the STORED post-image per spec: the merged row on
     /// the conflict branch, the inserted row otherwise. Never the submitted
     /// body — on a conflict the caller's values are only part of the result.

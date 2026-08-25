@@ -70,11 +70,12 @@ pub(in crate::data::executor) struct StageColumnarInsertParams<'a> {
     /// the merged row, not the submitted one. The staged body itself is
     /// unaffected.
     pub on_conflict_updates: &'a [(String, UpdateValue)],
-    /// Compiled row-level-security WRITE predicate carried by the plan. Empty
-    /// for a plain insert, whose rows the Control Plane already decided at plan
-    /// time; non-empty for the ON CONFLICT shape, whose merged image only
-    /// exists once the stored row has been read.
-    pub rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the plan.
+    /// `NoPolicyApplies`/`AlreadyDecidedElsewhere` for a plain insert, whose
+    /// rows the Control Plane already decided at plan time; a real predicate
+    /// for the ON CONFLICT shape, whose merged image only exists once the
+    /// stored row has been read.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {

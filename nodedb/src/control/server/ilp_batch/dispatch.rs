@@ -309,7 +309,7 @@ fn build_ilp_calvin_tasks(
                     // runs over these tasks before they are authorized or
                     // dispatched. Left empty here so this builder stays a pure
                     // function of the preflighted batch.
-                    rls_write_check: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                     // The line-protocol listener answers with an ingest ack, not
                     // a row set — there is no SQL statement behind it to carry a
                     // projection, and so no rows whose visibility needs gating.
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(format, "ilp-msgpack");
         assert_eq!(*wal_lsn, None);
         assert!(
-            rls_write_check.is_empty(),
+            rls_write_check.is_pending_injection(),
             "the builder must leave the predicate to the injection pass"
         );
         assert_eq!(surrogates, &vec![Surrogate::new(1), Surrogate::new(2)]);

@@ -67,7 +67,7 @@ pub(in crate::data::executor) struct StageTimeseriesInsertParams<'a> {
     pub format: &'a str,
     /// Compiled row-level-security WRITE predicate carried by the plan,
     /// decided here against the normalized row every payload shape produces.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Borrowed inputs for the canonical line-protocol staging path. Bundled
@@ -80,7 +80,7 @@ struct CanonicalIlpStage<'a> {
     collection: &'a str,
     payload: &'a [u8],
     surrogates: &'a [Surrogate],
-    rls_write_check: &'a [u8],
+    rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -486,7 +486,7 @@ mod tests {
                     wal_lsn: None,
                     surrogates: Vec::new(),
                     provenance: None,
-                    rls_write_check: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                     returning: None,
                     rls_filters: Vec::new(),
                 }),
@@ -526,7 +526,7 @@ mod tests {
             collection: "metrics",
             payload: &payload,
             surrogates: &[Surrogate::new(700)],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
         assert_ne!(response.status, crate::bridge::envelope::Status::Error);
         let body = core
@@ -568,7 +568,7 @@ mod tests {
             collection: "metrics",
             payload: &payload,
             surrogates: &[Surrogate::new(701), Surrogate::new(702)],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
 
         assert_eq!(response.status, crate::bridge::envelope::Status::Error);
@@ -589,7 +589,7 @@ mod tests {
             wal_lsn: None,
             provenance: None,
             mode: TimeseriesApplyMode::Immediate,
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: &[],
         });

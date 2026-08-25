@@ -28,9 +28,8 @@ pub(in crate::data::executor) struct TimeseriesIngestExec<'a> {
     pub wal_lsn: Option<u64>,
     pub provenance: Option<&'a SyncProvenance>,
     pub mode: TimeseriesApplyMode,
-    /// Compiled row-level-security WRITE predicate carried by the plan; empty
-    /// when no policy restricts this identity on the collection.
-    pub rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the plan.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Projection for a `RETURNING` clause, when the statement carried one.
     /// The ILP listener and Prometheus remote-write build this op directly with
     /// no SQL statement behind them, so they leave it `None`.
@@ -53,7 +52,7 @@ pub(in crate::data::executor) struct TimeseriesIngestParams<'a> {
     /// Compiled row-level-security WRITE predicate, decided against every
     /// parsed row in `execute_ilp_ingest` — the one point every payload format
     /// funnels through.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Carried through the format decoders unchanged so the projection is
     /// resolved in `execute_ilp_ingest`, on the far side of every format's
     /// normalization into ILP. Projecting in a decoder instead would report the

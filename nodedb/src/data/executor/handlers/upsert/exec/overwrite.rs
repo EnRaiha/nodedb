@@ -24,7 +24,7 @@ pub(super) struct OverwriteCtx<'a> {
     pub row_key: &'a str,
     pub value: &'a [u8],
     pub on_conflict_updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     pub returning: Option<&'a nodedb_physical::physical_plan::ReturningSpec>,
     pub rls_filters: &'a [u8],
     pub database_id: u64,

@@ -61,7 +61,7 @@ pub(crate) fn build_ingest(fields: &TextFields, collection: &str) -> crate::Resu
         // per-row identity binding.
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         returning: None,
         rls_filters: Vec::new(),
     }))

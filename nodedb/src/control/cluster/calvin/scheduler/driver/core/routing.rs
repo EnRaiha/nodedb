@@ -537,14 +537,14 @@ mod tests {
             collection: "metrics".to_owned(),
             filters: Vec::new(),
             updates: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert_eq!(vshards_of(&update), vec![want]);
 
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "metrics".to_owned(),
             filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert_eq!(vshards_of(&delete), vec![want]);
     }
@@ -627,7 +627,7 @@ mod tests {
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
@@ -658,7 +658,7 @@ mod tests {
             resolve_only: false,
             source_rows: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
@@ -672,8 +672,8 @@ mod tests {
             item_key: vec![1, 2, 3],
             dest_key: vec![4, 5, 6],
             surrogate: Surrogate::new(1),
-            source_rls_write_check: Vec::new(),
-            dest_rls_write_check: Vec::new(),
+            source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

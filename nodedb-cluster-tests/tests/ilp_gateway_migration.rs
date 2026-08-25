@@ -76,7 +76,7 @@ async fn ilp_gateway_migration_single_node_ingest() {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -125,7 +125,7 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -150,7 +150,7 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     });
@@ -167,7 +167,7 @@ async fn ilp_gateway_migration_cross_node_ingest() {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
             });

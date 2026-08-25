@@ -322,7 +322,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::{KvOp, UpdateValue};
-    use nodedb_types::{Surrogate, Value};
+    use nodedb_types::{RlsWriteCheck, Surrogate, Value};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -428,7 +428,7 @@ mod tests {
             ttl_ms: 0,
             updates: updates.clone(),
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -472,7 +472,7 @@ mod tests {
             ttl_ms: 0,
             updates,
             surrogate: Surrogate::new(3),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             returning: None,
             rls_filters: Vec::new(),
         });

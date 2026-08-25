@@ -121,6 +121,40 @@ pub(super) mod test_support {
 
     pub(in crate::control::planner::rls_injection) const TENANT: u64 = 1;
 
+    /// Stamp a plan's write check back to `PendingInjection`.
+    ///
+    /// Injection's only effect on a plan with no matching policy is to move
+    /// that slot from `PendingInjection` to `NoPolicyApplies`. Undoing just
+    /// that lets a test assert nothing ELSE about the plan changed, by
+    /// comparing against the pre-injection clone.
+    ///
+    /// Covers only the variants the tests in this module build.
+    pub(in crate::control::planner::rls_injection) fn reset_write_check(
+        plan: &mut crate::bridge::envelope::PhysicalPlan,
+    ) {
+        use crate::bridge::envelope::PhysicalPlan;
+        use nodedb_physical::physical_plan::{DocumentOp, GraphOp, TimeseriesOp};
+        use nodedb_types::RlsWriteCheck::PendingInjection;
+
+        match plan {
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Graph(GraphOp::EdgeDelete {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Document(
+                DocumentOp::PointUpdate {
+                    rls_write_check, ..
+                }
+                | DocumentOp::PointDelete {
+                    rls_write_check, ..
+                },
+            ) => *rls_write_check = PendingInjection,
+            other => panic!("reset_write_check does not cover {other:?}"),
+        }
+    }
+
     /// A store holding one restrictive read policy: `owner_id = $auth.id`.
     pub(in crate::control::planner::rls_injection) fn store_with_read_policy(
         collection: &str,

@@ -63,8 +63,8 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     /// Compiled RLS write policy of the TARGET collection, gating the PERSIST,
     /// decided per matched row against its post-image. A separate slot from
     /// `rls_filters`: that one bounds what may be shown back, this one bounds
-    /// what may be written. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    /// what may be written.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// the matched target rows may touch, resolved on the Control Plane.
     pub resolved_sum_targets: &'a [ResolvedSumTarget],

@@ -273,7 +273,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -362,7 +362,7 @@ mod tests {
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_p1, cas]);
@@ -397,7 +397,7 @@ mod tests {
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_p1, cas]);
@@ -421,7 +421,7 @@ mod tests {
             expected: Vec::new(),
             new_value: b"idle".to_vec(),
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[cas]);
@@ -443,14 +443,14 @@ mod tests {
             key: b"dmg".to_vec(),
             delta: 3.0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::IncrFloat {
             collection: "scores".into(),
             key: b"dmg".to_vec(),
             delta: 1.5,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[incr1, incr2]);
@@ -482,7 +482,7 @@ mod tests {
             key: b"str".to_vec(),
             delta: 1.0,
             surrogate: Surrogate::new(1),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_str, incr]);
@@ -515,7 +515,7 @@ mod tests {
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[put_tok, getset]);
@@ -538,7 +538,7 @@ mod tests {
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
 
         let records = append_via_autocommit(&[getset]);

@@ -188,11 +188,10 @@ pub(super) fn point_delete(
         pk_bytes,
         returning: None,
         rls_filters: Vec::new(),
-        // A replayed entry carries no policy of its own: the leader decided
-        // this row against the writer's write policy before the record was
-        // committed, and a follower must apply exactly what the leader applied
-        // or the replicas diverge. Both slots stay empty for the same reason.
-        rls_write_check: Vec::new(),
+        // No predicate here: this node is a follower applying an
+        // already-committed write. The writing identity is not available on
+        // this node. The leader enforces RLS before proposing the write.
+        rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
@@ -217,8 +216,8 @@ pub(super) fn point_update(
         updates: updates.to_vec(),
         returning: None,
         rls_filters: Vec::new(),
-        // Empty on replay — see `point_delete`.
-        rls_write_check: Vec::new(),
+        // No predicate on replay — see `point_delete`.
+        rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
@@ -242,8 +241,8 @@ pub(super) fn doc_upsert(
         value: value.to_vec(),
         on_conflict_updates: on_conflict_updates.to_vec(),
         surrogate,
-        // Empty on replay — see `point_delete`.
-        rls_write_check: Vec::new(),
+        // No predicate on replay — see `point_delete`.
+        rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
         returning: None,
         rls_filters: Vec::new(),
         // Read off the record — see this module's doc.
@@ -339,8 +338,8 @@ pub(super) fn bulk_dml(
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            // Empty on replay — see `point_delete`.
-            rls_write_check: Vec::new(),
+            // No predicate on replay — see `point_delete`.
+            rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             resolved_sum_targets,
         })
     } else {
@@ -351,8 +350,8 @@ pub(super) fn bulk_dml(
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            // Empty on replay — see `point_delete`.
-            rls_write_check: Vec::new(),
+            // No predicate on replay — see `point_delete`.
+            rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             resolved_sum_targets,
         })
     }

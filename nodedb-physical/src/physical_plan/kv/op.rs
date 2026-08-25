@@ -2,7 +2,7 @@
 
 //! The KV operation enum — the wire shape and nothing else.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{RlsWriteCheck, Surrogate};
 
 use crate::physical_plan::document::ReturningSpec;
 
@@ -129,15 +129,14 @@ pub enum KvOp {
         /// Compiled row-level-security WRITE predicate, evaluated in the Data
         /// Plane against the body actually persisted — the incoming row on the
         /// insert branch, the merge of it with the stored row on the conflict
-        /// branch, neither of which exists at plan time. Empty means no write
-        /// policy restricts this identity here.
+        /// branch, neither of which exists at plan time — or the reason no
+        /// predicate is attached.
         ///
         /// Distinct from the read-side `rls_filters` slot beside it: that one
         /// bounds what may be shown back, this one bounds what may be written
         /// at all. Never conflate them — a write gate used as row redaction
         /// admits rows it should hide, and the reverse silently drops writes.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        rls_write_check: RlsWriteCheck,
         /// When `Some`, return the STORED post-image projected per spec: the
         /// merged row on the conflict branch, the inserted row otherwise.
         /// Never the submitted body — on a conflict the caller's values are
@@ -155,11 +154,10 @@ pub enum KvOp {
         collection: String,
         keys: Vec<Vec<u8>>,
         /// Compiled row-level-security WRITE predicate, evaluated in the Data
-        /// Plane against the stored row being removed. Empty means no write
-        /// policy restricts this identity here; only a non-empty check makes
-        /// the handler read the pre-image at all.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// Plane against the stored row being removed, or the reason no
+        /// predicate is attached. Only `RlsWriteCheck::Predicate` makes the
+        /// handler read the pre-image at all.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Cursor-based scan with optional filter predicate.
@@ -193,13 +191,11 @@ pub enum KvOp {
         key: Vec<u8>,
         /// TTL in milliseconds from now.
         ttl_ms: u64,
-        /// Compiled row-level-security WRITE predicate. The body is unchanged
-        /// by a TTL mutation, so the stored row is both the pre- and the
-        /// post-image and the Data Plane decides it before touching the
-        /// expiry metadata. Empty means no write policy restricts this
-        /// identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate, or the reason no
+        /// predicate is attached. The body is unchanged by a TTL mutation, so
+        /// the stored row is both the pre- and the post-image and the Data
+        /// Plane decides it before touching the expiry metadata.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Remove TTL from an existing key (make it persistent).
@@ -209,8 +205,7 @@ pub enum KvOp {
         /// Compiled row-level-security WRITE predicate — see `Expire`, which
         /// this mirrors: the row body does not change, so the stored row is
         /// the image the policy decides.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Get remaining TTL for a key without fetching the value.
@@ -307,10 +302,9 @@ pub enum KvOp {
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate, evaluated against the
         /// merged body — which exists only after the stored row has been read
-        /// and the field updates applied. Empty means no write policy
-        /// restricts this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// and the field updates applied — or the reason no predicate is
+        /// attached.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Truncate: delete ALL entries in a KV collection.
@@ -335,13 +329,12 @@ pub enum KvOp {
         /// surrogate its original insert assigned. `Surrogate::ZERO` only in
         /// test fixtures / when no assigner is wired.
         surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate. The incremented value
-        /// is computed inside the engine, so the engine consults this check
-        /// with the computed image before making it durable rather than the
-        /// handler guessing the result. Empty means no write policy restricts
-        /// this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate, or the reason no
+        /// predicate is attached. The incremented value is computed inside
+        /// the engine, so the engine consults this check with the computed
+        /// image before making it durable rather than the handler guessing
+        /// the result.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Atomic float increment on a numeric value. Returns new value.
@@ -356,8 +349,7 @@ pub enum KvOp {
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate — see `Incr`, whose
         /// engine-internal compute-and-persist this mirrors.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Compare-and-swap: set value to `new_value` only if current equals `expected`.
@@ -372,10 +364,9 @@ pub enum KvOp {
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate, evaluated against
-        /// `new_value` before the swap is attempted. Empty means no write
-        /// policy restricts this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// `new_value` before the swap is attempted, or the reason no
+        /// predicate is attached.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Atomic get-and-set: set new value, return old value.
@@ -394,10 +385,10 @@ pub enum KvOp {
         #[serde(default)]
         rls_filters: Vec<u8>,
         /// Compiled row-level-security WRITE predicate, evaluated against
-        /// `new_value` before the swap. Never an alias of `rls_filters`: one
-        /// decides what may be shown, the other what may be written.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// `new_value` before the swap, or the reason no predicate is
+        /// attached. Never an alias of `rls_filters`: one decides what may be
+        /// shown, the other what may be written.
+        rls_write_check: RlsWriteCheck,
     },
 
     // ── Atomic Transfer Operations ───────────────────────────────────
@@ -423,12 +414,11 @@ pub enum KvOp {
         /// `debit_surrogate` so the two rows never collapse onto one identity.
         credit_surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate for the collection both
-        /// rows live in. Both post-images — the debited source and the credited
-        /// dest — are decided against it before either is persisted, so a
-        /// transfer cannot half-apply. Empty means no write policy restricts
-        /// this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// rows live in, or the reason no predicate is attached. Both
+        /// post-images — the debited source and the credited dest — are
+        /// decided against it before either is persisted, so a transfer
+        /// cannot half-apply.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
@@ -446,16 +436,16 @@ pub enum KvOp {
         /// `Surrogate::ZERO` only in test fixtures / when no assigner is wired.
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate of the SOURCE
-        /// collection, decided against the row being removed from it.
-        #[serde(default)]
-        source_rls_write_check: Vec<u8>,
+        /// collection, decided against the row being removed from it, or the
+        /// reason no predicate is attached.
+        source_rls_write_check: RlsWriteCheck,
         /// Compiled row-level-security WRITE predicate of the DESTINATION
         /// collection, decided against the same bytes as the row being
-        /// inserted there. Kept separate from the source check because the two
-        /// collections carry independent policies — one identity may be
-        /// allowed to give a row up but not to receive it.
-        #[serde(default)]
-        dest_rls_write_check: Vec<u8>,
+        /// inserted there, or the reason no predicate is attached. Kept
+        /// separate from the source check because the two collections carry
+        /// independent policies — one identity may be allowed to give a row
+        /// up but not to receive it.
+        dest_rls_write_check: RlsWriteCheck,
     },
 
     // ── Sorted Index (Leaderboard) Operations ──────────────────────────

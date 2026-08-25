@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::Value;
+use nodedb_types::{RlsWriteCheck, Value, WriteGateDecision};
 
 use super::{ingest_formats, msgpack_decode};
 use crate::data::executor::handlers::rls_write_gate::admit_value_row;
@@ -32,14 +32,14 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 /// timestamp. Empty `rls_write_check` admits everything, the same convention
 /// every other write gate uses.
 pub(in crate::data::executor) fn admit_ilp_lines(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     lines: &[IlpLine<'_>],
     time_key: Option<&str>,
     default_timestamp_ms: i64,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
+    if matches!(rls_write_check.decision(), WriteGateDecision::AdmitAll) {
         return Ok(());
     }
     for line in lines {
@@ -63,7 +63,7 @@ pub(in crate::data::executor) fn admit_ilp_lines(
 /// refused rather than admitted — an image the policy could not be evaluated
 /// against is not an image the policy admitted.
 pub(in crate::data::executor) fn admit_msgpack_rows(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     payload: &[u8],
     measurement: &str,
     time_key: Option<&str>,
@@ -71,7 +71,7 @@ pub(in crate::data::executor) fn admit_msgpack_rows(
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
+    if matches!(rls_write_check.decision(), WriteGateDecision::AdmitAll) {
         return Ok(());
     }
     let undecodable = || crate::Error::RejectedAuthz {
@@ -159,7 +159,17 @@ mod tests {
     #[test]
     fn an_empty_check_admits_every_line() {
         let batch = "cpu,owner=mallory value=1i\n";
-        assert!(admit_ilp_lines(&[], &lines(batch), Some("ts"), 0, 1, "cpu").is_ok());
+        assert!(
+            admit_ilp_lines(
+                &RlsWriteCheck::NoPolicyApplies,
+                &lines(batch),
+                Some("ts"),
+                0,
+                1,
+                "cpu"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -167,7 +177,7 @@ mod tests {
         let batch = "cpu,owner=alice value=1i\n";
         assert!(
             admit_ilp_lines(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &lines(batch),
                 Some("ts"),
                 0,
@@ -185,7 +195,7 @@ mod tests {
         let batch = "cpu,owner=alice value=1i\ncpu,owner=mallory value=2i\n";
         assert!(matches!(
             admit_ilp_lines(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &lines(batch),
                 Some("ts"),
                 0,
@@ -203,7 +213,7 @@ mod tests {
         let batch = "cpu value=1i\n";
         assert!(
             admit_ilp_lines(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &lines(batch),
                 Some("ts"),
                 0,
@@ -219,7 +229,35 @@ mod tests {
     #[test]
     fn a_corrupt_check_denies() {
         let batch = "cpu,owner=alice value=1i\n";
-        assert!(admit_ilp_lines(&[0xFF, 0xFE], &lines(batch), Some("ts"), 0, 1, "cpu").is_err());
+        assert!(
+            admit_ilp_lines(
+                &RlsWriteCheck::Predicate(vec![0xFF, 0xFE]),
+                &lines(batch),
+                Some("ts"),
+                0,
+                1,
+                "cpu"
+            )
+            .is_err()
+        );
+    }
+
+    /// A plan that reached the gate without RLS injection is denied, not
+    /// admitted.
+    #[test]
+    fn pending_injection_denies_the_batch() {
+        let batch = "cpu,owner=alice value=1i\n";
+        assert!(matches!(
+            admit_ilp_lines(
+                &RlsWriteCheck::PendingInjection,
+                &lines(batch),
+                Some("ts"),
+                0,
+                1,
+                "cpu"
+            ),
+            Err(crate::Error::Internal { .. })
+        ));
     }
 
     /// A structured MessagePack batch is decided against the values the ingest
@@ -237,7 +275,9 @@ mod tests {
             clauses: Vec::new(),
             expr: None,
         };
-        let policy = zerompk::to_msgpack_vec(&vec![filter]).expect("encode policy filter");
+        let policy = RlsWriteCheck::Predicate(
+            zerompk::to_msgpack_vec(&vec![filter]).expect("encode policy filter"),
+        );
 
         // What the planner emits for `VALUES (…, 1.5)`: the decimal arrives as
         // a string, and only the ILP conversion recovers its numeric type.
@@ -254,7 +294,7 @@ mod tests {
     /// …and a row whose stored value does not satisfy it is still refused.
     #[test]
     fn a_violating_msgpack_row_is_still_refused_after_normalization() {
-        let policy = owner_policy("alice");
+        let policy = RlsWriteCheck::Predicate(owner_policy("alice"));
         let payload = nodedb_types::json_to_msgpack_or_empty(&serde_json::json!([{
             "owner": "mallory",
             "value": 1,
@@ -271,7 +311,7 @@ mod tests {
     fn an_undecodable_msgpack_payload_is_refused() {
         assert!(
             admit_msgpack_rows(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &[0xC1],
                 "cpu",
                 Some("ts"),

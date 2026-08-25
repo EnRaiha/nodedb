@@ -18,6 +18,7 @@ pub mod kv;
 pub mod meta;
 pub mod meta_calvin;
 pub mod query;
+pub mod rls_write_check_accessor;
 pub mod routing;
 pub mod sort_key;
 pub mod spatial;

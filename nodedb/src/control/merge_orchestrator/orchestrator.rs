@@ -82,7 +82,7 @@ pub struct MergeArgs<'a> {
     /// plan. Carried onto the apply pass, which decides every arm's row image
     /// against it before writing. A separate slot from `rls_filters`: that one
     /// bounds what may be shown back, this one bounds what may be written.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Consume an authorized autocommit `MERGE` at the orchestration boundary.
@@ -314,7 +314,7 @@ fn merge_plan(
         // is inert there; carrying it unconditionally keeps the two passes
         // byte-identical apart from the fields that must differ, so a future
         // writing resolve cannot silently lose the gate.
-        rls_write_check: args.rls_write_check.to_vec(),
+        rls_write_check: args.rls_write_check.clone(),
         // Empty on the RESOLVE pass — it writes nothing, so it folds no delta.
         // The APPLY pass carries the resolution derived from that pass's arms.
         resolved_sum_targets,

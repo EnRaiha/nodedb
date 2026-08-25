@@ -219,7 +219,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             // Edge-to-origin sync replays rows already decided by the policy
             // where they were written; the writing device's session is not
             // present here to resolve `$auth.*` against.
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             // Sync answers with an ack, never a row set, for the same reason:
             // there is no requesting identity here to project or gate rows for.
             returning: None,

@@ -106,7 +106,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         }),
         post_set_op: PostSetOp::None,

@@ -108,7 +108,7 @@ fn delete(ctx: &mut TestCtx, collection: &str, doc_id: &str, surrogate: u32) {
             pk_bytes: doc_id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         }),
     );

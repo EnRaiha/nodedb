@@ -173,7 +173,7 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         }),
@@ -184,7 +184,7 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         }),
@@ -259,7 +259,7 @@ fn transactional_timeseries_flush_uses_the_enclosing_wal_lsn() {
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         returning: None,
         rls_filters: Vec::new(),
     })];
@@ -702,7 +702,7 @@ fn columnar_predicate_update_rolls_back_on_sibling_failure() {
         collection: "m".to_string(),
         filters: Vec::new(),
         updates,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
     });
 
     let mut undo_log = Vec::new();
@@ -742,7 +742,7 @@ fn columnar_predicate_delete_rolls_back_on_sibling_failure() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Delete {
         collection: "m".to_string(),
         filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
     });
 
     let mut undo_log = Vec::new();

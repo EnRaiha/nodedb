@@ -209,7 +209,7 @@ async fn handle_expire(
         key,
         ttl_ms,
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -268,7 +268,7 @@ async fn handle_persist(
         collection: session.collection.clone(),
         key: key.to_vec(),
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     match dispatch_kv_write(state, session, plan).await {

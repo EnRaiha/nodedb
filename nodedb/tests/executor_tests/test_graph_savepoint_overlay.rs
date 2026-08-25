@@ -69,7 +69,7 @@ fn stage_edge_delete(collection: &str, src: &str, label: &str, dst: &str) -> Phy
             dst_id: dst.into(),
             src_surrogate: nodedb_types::Surrogate::ZERO,
             dst_surrogate: nodedb_types::Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         })),
     })
 }
@@ -298,7 +298,7 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
                 collection: "c".into(),
                 key: b"k".to_vec(),
                 ttl_ms: 60_000,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             })),
         }),
     );
@@ -337,7 +337,7 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
             plan: Box::new(PhysicalPlan::Kv(KvOp::Persist {
                 collection: "c".into(),
                 key: b"k".to_vec(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             })),
         }),
     );

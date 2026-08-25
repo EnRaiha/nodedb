@@ -32,7 +32,7 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         value: &[u8],
         on_conflict_updates: &[(String, UpdateValue)],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let existing_bytes = match self.resolve_doc_current(ctx) {
             Ok(b) => b,

@@ -28,8 +28,8 @@ pub(in crate::data::executor) struct StageBulkDeleteParams<'a> {
     pub collection: &'a str,
     pub filter_bytes: &'a [u8],
     /// Compiled RLS write policy gating each matched row's removal, decided
-    /// against its pre-deletion image. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    /// against its pre-deletion image.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -110,7 +110,10 @@ impl CoreLoop {
         // it already hidden from the rest of the transaction. Each row's
         // current BASE ∪ OVERLAY body is the pre-deletion image the policy
         // decides — the only image a delete has.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             for (row_key, body) in &rows {
                 if let Err(e) = self.stage_admit_write(
                     rls_write_check,

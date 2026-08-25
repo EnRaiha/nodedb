@@ -155,7 +155,7 @@ fn classify_point_delete() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
@@ -177,7 +177,7 @@ fn classify_point_update() {
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();
@@ -197,7 +197,7 @@ fn classify_bulk_delete() {
         ollp_predicted_surrogates: None,
         ollp_predicted_edges: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let info = classify_dml_write(&plan).unwrap();

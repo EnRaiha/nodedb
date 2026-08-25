@@ -99,7 +99,7 @@ pub async fn transfer(
         credit_surrogate,
         // Filled by `dispatch_and_respond`, which runs the same RLS injection
         // pass the planner-driven path runs.
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(
@@ -176,8 +176,8 @@ pub async fn transfer_item(
         surrogate,
         // One predicate per side, both filled by `dispatch_and_respond`: the
         // two collections carry independent policies.
-        source_rls_write_check: Vec::new(),
-        dest_rls_write_check: Vec::new(),
+        source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
 
     dispatch_and_respond(

@@ -9,7 +9,7 @@
 //!
 //! All profiles share the same `ColumnarMemtable` → `SegmentWriter` infrastructure.
 
-use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use crate::physical_plan::document::ReturningSpec;
 
@@ -140,12 +140,11 @@ pub enum ColumnarOp {
         #[serde(default)]
         wal_lsn: Option<u64>,
         /// Compiled row-level-security WRITE predicate (`Vec<ScanFilter>` as
-        /// MessagePack). Carried only for the ON CONFLICT DO UPDATE shape,
-        /// whose merged post-image exists only inside the handler; a plain
-        /// insert's rows are decided at plan time instead. Empty means no
-        /// write policy restricts this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// MessagePack), or the reason no predicate is attached. Carried only
+        /// for the ON CONFLICT DO UPDATE shape, whose merged post-image
+        /// exists only inside the handler; a plain insert's rows are decided
+        /// at plan time instead.
+        rls_write_check: RlsWriteCheck,
         /// When `Some`, return the STORED post-image of each written row
         /// projected per spec — the row assembled from the values that reached
         /// the engine, in schema order, so it matches what a `SELECT` on the
@@ -175,10 +174,9 @@ pub enum ColumnarOp {
         /// Field assignments: `(column_name, json_value_bytes)`.
         updates: Vec<(String, Vec<u8>)>,
         /// Compiled row-level-security WRITE predicate, evaluated against each
-        /// row's post-image once the assignments have been applied. Empty means
-        /// no write policy restricts this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// row's post-image once the assignments have been applied, or the
+        /// reason no predicate is attached.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Delete rows matching filter predicates.
@@ -189,10 +187,9 @@ pub enum ColumnarOp {
         /// Serialized `Vec<ScanFilter>` (MessagePack).
         filters: Vec<u8>,
         /// Compiled row-level-security WRITE predicate, evaluated against the
-        /// pre-image of every row this removes. Empty means no write policy
-        /// restricts this identity here.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// pre-image of every row this removes, or the reason no predicate is
+        /// attached.
+        rls_write_check: RlsWriteCheck,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.

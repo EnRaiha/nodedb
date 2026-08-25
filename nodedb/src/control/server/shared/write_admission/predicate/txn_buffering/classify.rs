@@ -555,7 +555,7 @@ mod tests {
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointUpdate {
@@ -566,7 +566,7 @@ mod tests {
                 updates: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Scan {
@@ -644,7 +644,7 @@ mod tests {
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
@@ -658,7 +658,7 @@ mod tests {
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -668,7 +668,7 @@ mod tests {
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP surrogate set present — the
@@ -681,7 +681,7 @@ mod tests {
                 ollp_predicted_surrogates: Some(vec![1, 2]),
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -691,7 +691,7 @@ mod tests {
                 ollp_predicted_surrogates: Some(vec![1, 2]),
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             // BulkUpdate / BulkDelete: OLLP edge set present, surrogates None —
@@ -709,7 +709,7 @@ mod tests {
                     label: None,
                 }]),
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
@@ -724,7 +724,7 @@ mod tests {
                     label: None,
                 }]),
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::MaterializeScan {
@@ -1026,7 +1026,7 @@ mod tests {
                 dst_id: "b".into(),
                 src_surrogate: Surrogate::ZERO,
                 dst_surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
                 edges: Vec::<BatchEdge>::new(),
@@ -1199,14 +1199,14 @@ mod tests {
                 ttl_ms: 0,
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Delete {
                 collection: "c".into(),
                 keys: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::Scan {
                 collection: "c".into(),
@@ -1221,12 +1221,12 @@ mod tests {
                 collection: "c".into(),
                 key: Vec::new(),
                 ttl_ms: 0,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::Persist {
                 collection: "c".into(),
                 key: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::GetTtl {
                 collection: "c".into(),
@@ -1256,7 +1256,7 @@ mod tests {
                 key: Vec::new(),
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::Incr {
                 collection: "c".into(),
@@ -1264,14 +1264,14 @@ mod tests {
                 delta: 0,
                 ttl_ms: 0,
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::IncrFloat {
                 collection: "c".into(),
                 key: Vec::new(),
                 delta: 0.0,
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::Cas {
                 collection: "c".into(),
@@ -1279,7 +1279,7 @@ mod tests {
                 expected: Vec::new(),
                 new_value: Vec::new(),
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::GetSet {
                 collection: "c".into(),
@@ -1287,7 +1287,7 @@ mod tests {
                 new_value: Vec::new(),
                 surrogate: Surrogate::ZERO,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::Transfer {
                 collection: "c".into(),
@@ -1297,7 +1297,7 @@ mod tests {
                 amount: 0.0,
                 debit_surrogate: Surrogate::ZERO,
                 credit_surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::TransferItem {
                 source_collection: "s".into(),
@@ -1305,8 +1305,8 @@ mod tests {
                 item_key: Vec::new(),
                 dest_key: Vec::new(),
                 surrogate: Surrogate::ZERO,
-                source_rls_write_check: Vec::new(),
-                dest_rls_write_check: Vec::new(),
+                source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
                 collection: "c".into(),
@@ -1377,7 +1377,7 @@ mod tests {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -1385,12 +1385,12 @@ mod tests {
                 collection: "c".into(),
                 filters: Vec::new(),
                 updates: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: "c".into(),
                 filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::MaterializeScan {
                 collection: "c".into(),
@@ -1421,7 +1421,7 @@ mod tests {
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -2022,7 +2022,7 @@ mod tests {
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
@@ -2037,7 +2037,7 @@ mod tests {
                 resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {

@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use nodedb_types::RlsWriteCheck;
 use nodedb_types::columnar::schema::TS_SYSTEM;
 use nodedb_types::value::Value;
 
@@ -297,7 +298,10 @@ pub fn build_timeseries_ingest_plan(
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
-        rls_write_check: Vec::new(),
+        // No predicate here: a restore re-issues rows that were already
+        // admitted before the backup was taken. The identity that admitted
+        // them is not available during restore.
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         returning: None,
         rls_filters: Vec::new(),
     }))

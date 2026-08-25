@@ -102,7 +102,7 @@ pub(in super::super) fn convert_merge(
             // conversion — the read filter gating `returning` and the write
             // predicate gating the persist are separate slots.
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             // Filled in by the merge orchestrator from its RESOLVE pass's arms;
             // the neutral plan has no classification to derive keys from.
             resolved_sum_targets: Vec::new(),

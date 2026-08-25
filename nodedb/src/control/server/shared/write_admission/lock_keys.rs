@@ -259,7 +259,7 @@ mod tests {
                 delta: 1,
                 ttl_ms: 0,
                 surrogate: Surrogate::new(1),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -276,7 +276,7 @@ mod tests {
                 key: b"k1".to_vec(),
                 delta: 1.5,
                 surrogate: Surrogate::new(1),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -294,7 +294,7 @@ mod tests {
                 expected: vec![],
                 new_value: vec![],
                 surrogate: Surrogate::new(1),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -312,7 +312,7 @@ mod tests {
                 new_value: vec![],
                 surrogate: Surrogate::new(1),
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -329,7 +329,7 @@ mod tests {
                 key: b"k1".to_vec(),
                 updates: vec![],
                 surrogate: Surrogate::new(1),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             LockKey::Kv {
                 collection: Arc::from("counters"),
@@ -359,7 +359,7 @@ mod tests {
             kv_point_key(&KvOp::Delete {
                 collection: "counters".to_owned(),
                 keys: vec![b"k1".to_vec(), b"k2".to_vec()],
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             None
         );
@@ -374,7 +374,7 @@ mod tests {
                 value: vec![],
                 on_conflict_updates: vec![],
                 surrogate: Surrogate::new(7),
-                rls_write_check: vec![],
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),

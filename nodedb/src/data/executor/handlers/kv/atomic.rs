@@ -20,10 +20,10 @@ pub(in crate::data::executor) struct KvAtomicCtx<'a> {
     pub(in crate::data::executor) collection: &'a str,
     pub(in crate::data::executor) key: &'a [u8],
     pub(in crate::data::executor) surrogate: nodedb_types::Surrogate,
-    /// Compiled row-level-security WRITE predicate from the plan. Empty means
-    /// no write policy restricts this identity on `collection`; every handler
-    /// reading this field decides the image it is about to persist against it.
-    pub(in crate::data::executor) rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate from the plan. Every
+    /// handler reading this field decides the image it is about to persist
+    /// against it.
+    pub(in crate::data::executor) rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {

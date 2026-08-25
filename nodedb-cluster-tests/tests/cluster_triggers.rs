@@ -200,7 +200,7 @@ fn replicated_entry_roundtrip_point_delete() {
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: Vec::new(),
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(

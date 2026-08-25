@@ -41,9 +41,8 @@ pub(in crate::data::executor) struct EdgeDeleteParams<'a> {
     pub src_id: &'a str,
     pub label: &'a str,
     pub dst_id: &'a str,
-    /// Compiled RLS write-policy filters the plan carried, or empty when no
-    /// write policy restricts this identity on `collection`.
-    pub rls_write_check: &'a [u8],
+    /// Compiled RLS write-policy filters the plan carried.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -420,7 +419,11 @@ impl CoreLoop {
         // when a write policy has to be decided against it. An ungoverned
         // delete with no undo log reads nothing, so the common path pays no
         // extra lookup.
-        let old_properties = if undo.is_some() || !rls_write_check.is_empty() {
+        let old_properties = if undo.is_some()
+            || !matches!(
+                rls_write_check.decision(),
+                nodedb_types::WriteGateDecision::AdmitAll
+            ) {
             self.edge_store
                 .get_edge(
                     database_id,
@@ -683,7 +686,7 @@ mod tests {
             Status::Ok
         );
 
-        let check = owner_write_check("mallory");
+        let check = nodedb_types::RlsWriteCheck::Predicate(owner_write_check("mallory"));
         let del_task = make_task_with_lsn(91);
         let resp = h.core.execute_edge_delete(
             &del_task,
@@ -738,7 +741,7 @@ mod tests {
             Status::Ok
         );
 
-        let check = owner_write_check("alice");
+        let check = nodedb_types::RlsWriteCheck::Predicate(owner_write_check("alice"));
         let del_task = make_task_with_lsn(93);
         let resp = h.core.execute_edge_delete(
             &del_task,
@@ -784,6 +787,10 @@ mod tests {
         let _ = consumers[0].try_recv(); // drain the put event
 
         let del_task = make_task_with_lsn(81);
+        // This test exercises CDC emission on delete, not the RLS write gate,
+        // so it carries no policy — mirrors the old empty-slice "admits
+        // everything" convention.
+        let no_policy = nodedb_types::RlsWriteCheck::NoPolicyApplies;
         let resp = h.core.execute_edge_delete(
             &del_task,
             EdgeDeleteParams {
@@ -792,7 +799,7 @@ mod tests {
                 src_id: "a",
                 label: "KNOWS",
                 dst_id: "b",
-                rls_write_check: &[],
+                rls_write_check: &no_policy,
             },
         );
         assert_eq!(resp.status, Status::Ok);

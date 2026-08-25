@@ -29,8 +29,8 @@ pub(in crate::data::executor) struct TransferParams<'a> {
     /// Cross-engine surrogate of the credit (dest) row.
     pub credit_surrogate: nodedb_types::Surrogate,
     /// Compiled row-level-security WRITE predicate for the collection both
-    /// rows live in. Empty means no write policy applies.
-    pub rls_write_check: &'a [u8],
+    /// rows live in.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Parameters for an atomic non-fungible item transfer.
@@ -45,12 +45,12 @@ pub(in crate::data::executor) struct TransferItemParams<'a> {
     pub surrogate: nodedb_types::Surrogate,
     /// Compiled row-level-security WRITE predicate of the SOURCE collection,
     /// decided against the row being removed from it.
-    pub source_rls_write_check: &'a [u8],
+    pub source_rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Compiled row-level-security WRITE predicate of the DESTINATION
     /// collection, decided against the same bytes being inserted there. The
     /// two collections carry independent policies, so the two checks stay
     /// separate.
-    pub dest_rls_write_check: &'a [u8],
+    pub dest_rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {

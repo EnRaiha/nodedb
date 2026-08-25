@@ -106,7 +106,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
             // conversion — the read filter gating `returning` and the write
             // predicate gating the persist are separate slots.
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             // Filled in by the materialized-sum resolution pass, which
             // recon-scans the target rows this join matches.
             resolved_sum_targets: Vec::new(),

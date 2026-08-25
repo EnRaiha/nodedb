@@ -262,7 +262,7 @@ mod tests {
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: vec![],
-                rls_write_check: vec![],
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 resolved_sum_targets: Vec::new(),
             }),
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,

@@ -186,7 +186,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         })
@@ -197,7 +197,7 @@ mod tests {
             collection: collection.into(),
             filters: Vec::new(),
             updates: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })
     }
 
@@ -209,14 +209,14 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         })
     }
 
     /// The compiled write predicate a plan carries into the Data Plane.
-    fn write_check(plan: &PhysicalPlan) -> &[u8] {
+    fn write_check(plan: &PhysicalPlan) -> &nodedb_types::RlsWriteCheck {
         match plan {
             PhysicalPlan::Columnar(ColumnarOp::Insert {
                 rls_write_check, ..
@@ -266,7 +266,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -292,13 +292,13 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(
-            !write_check(&plan).is_empty(),
+            write_check(&plan).has_predicate(),
             "write policy must reach the Data-Plane gate"
         );
     }
@@ -311,15 +311,15 @@ mod tests {
 
         let mut update = columnar_update("events");
         assert!(inject(&mut update, &store).is_ok());
-        assert!(!write_check(&update).is_empty());
+        assert!(write_check(&update).has_predicate());
 
         let mut delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "events".into(),
             filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut delete, &store).is_ok());
-        assert!(!write_check(&delete).is_empty());
+        assert!(write_check(&delete).has_predicate());
     }
 
     /// A structured MessagePack batch is NOT decided here even though the plan
@@ -337,7 +337,7 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -346,7 +346,7 @@ mod tests {
             "the violating row must be left for the Data-Plane gate, not refused here"
         );
         assert!(
-            !write_check(&plan).is_empty(),
+            write_check(&plan).has_predicate(),
             "the predicate must reach the gate that sees the stored image"
         );
     }
@@ -359,7 +359,7 @@ mod tests {
             let mut plan = ingest("metrics", format);
             assert!(inject(&mut plan, &store).is_ok());
             assert!(
-                !write_check(&plan).is_empty(),
+                write_check(&plan).has_predicate(),
                 "{format} ingest must carry the predicate to the gate"
             );
         }
@@ -367,11 +367,26 @@ mod tests {
 
     /// …and runs untouched when no policy applies.
     #[test]
-    fn timeseries_ingest_without_a_policy_is_untouched() {
+    fn timeseries_ingest_without_a_policy_records_that_injection_ran() {
         let mut plan = ingest("metrics", "ilp");
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
-        assert_eq!(plan, before);
+
+        // The only change injection makes here is to stamp the write check.
+        // The plan goes in un-injected and comes out saying no policy applies,
+        // which is what tells the Data Plane gate that the pass actually ran.
+        assert_eq!(
+            write_check(&before),
+            &nodedb_types::RlsWriteCheck::PendingInjection
+        );
+        assert_eq!(
+            write_check(&plan),
+            &nodedb_types::RlsWriteCheck::NoPolicyApplies
+        );
+
+        let mut normalized = plan.clone();
+        super::super::plan::test_support::reset_write_check(&mut normalized);
+        assert_eq!(normalized, before, "nothing else may change");
     }
 
     /// A read policy alone must not start rejecting or gating writes.
@@ -384,7 +399,7 @@ mod tests {
 
         let mut update = columnar_update("events");
         assert!(inject(&mut update, &store).is_ok());
-        assert!(write_check(&update).is_empty());
+        assert!(!write_check(&update).has_predicate());
     }
 
     /// A spatial write carries geometry and a surrogate, not the row body the

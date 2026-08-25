@@ -69,7 +69,7 @@ pub struct UpdateFromJoinArgs<'a> {
     /// row's post-image against it before writing. A separate slot from
     /// `rls_filters`: that one bounds what may be shown back, this one bounds
     /// what may be written.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// Consume an authorized autocommit `UPDATE ... FROM` at orchestration.
@@ -186,7 +186,7 @@ pub(crate) async fn run_update_from_join(
             resolve_only: false,
             source_rows: Some(source_rows),
             rls_filters: args.rls_filters.to_vec(),
-            rls_write_check: args.rls_write_check.to_vec(),
+            rls_write_check: args.rls_write_check.clone(),
             resolved_sum_targets,
         });
 
@@ -273,7 +273,11 @@ async fn resolve_matched_sum_targets(
         // neither policy has anything to gate; the write pass below runs both
         // against the rows it actually rewrites.
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        // Never evaluated: the resolve pass writes nothing, so no gate ever
+        // reads this. Pending rather than a bypass so a future write path built
+        // from this same plan shape fails closed instead of inheriting a
+        // silent admit-all.
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         // A read-only pass folds no delta, so it needs no resolution of its own.
         resolved_sum_targets: Vec::new(),
     });

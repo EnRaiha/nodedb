@@ -533,7 +533,7 @@ mod tests {
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
         })
     }
@@ -602,7 +602,7 @@ mod tests {
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: spec(),
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
@@ -653,7 +653,7 @@ mod tests {
                 ttl_ms: 0,
                 updates: Vec::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: spec(),
                 rls_filters: Vec::new(),
             }),

@@ -362,14 +362,17 @@ impl CoreLoop {
     /// would yield a document with no columns and reject permitted writes.
     pub(in crate::data::executor) fn stage_admit_write(
         &self,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
         body: &[u8],
         doc_id: &str,
         database_id: u64,
         tid: u64,
         collection: &str,
     ) -> crate::Result<()> {
-        if rls_write_check.is_empty() {
+        if matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             return Ok(());
         }
         let schema = self.resolve_strict_schema(database_id, tid, collection);

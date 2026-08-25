@@ -13,15 +13,22 @@
 //! - **A rejected row fails the statement.** Skipping it would report a write
 //!   that never happened, and leave the remaining rows of a multi-row statement
 //!   applied — a partial write the caller cannot see or undo.
-//! - **An empty check admits everything.** Empty means "no write policy
-//!   restricts this identity here" (or superuser), the same convention the read
-//!   filters use, so an ungoverned collection pays nothing.
+//! - **[`RlsWriteCheck`] names why no predicate is attached.** A bare empty
+//!   byte slice used to mean either "no policy applies" or "the predicate was
+//!   lost", and the two were indistinguishable, which silently disabled the
+//!   write policy when injection failed to run. The enum keeps those states
+//!   apart: [`RlsWriteCheck::NoPolicyApplies`] and
+//!   [`RlsWriteCheck::AlreadyDecidedElsewhere`] admit everything, exactly as
+//!   an empty check used to; a plan that reached this gate before RLS
+//!   injection ran carries [`RlsWriteCheck::PendingInjection`] instead, and
+//!   that is denied, not admitted.
 //!
 //! Distinct from [`super::rls_eval`], which decides the READ policy: that one
 //! bounds which rows a `RETURNING` clause may show, this one bounds which rows
 //! may be written at all.
 
 use nodedb_types::columnar::{ColumnarSchema, StrictSchema};
+use nodedb_types::{RlsWriteCheck, WriteGateDecision};
 
 use crate::bridge::scan_filter::ScanFilter;
 
@@ -35,18 +42,29 @@ use super::rls_eval;
 /// Fails closed: an undecodable filter payload or an evaluation error denies,
 /// so an adversarial predicate cannot be turned into an admitted write.
 pub(in crate::data::executor) fn admit_row(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     image: &serde_json::Value,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() || rls_eval::rls_check_document(rls_write_check, image) {
-        return Ok(());
+    match rls_write_check.decision() {
+        WriteGateDecision::AdmitAll => Ok(()),
+        WriteGateDecision::Evaluate(bytes) => {
+            if rls_eval::rls_check_document(bytes, image) {
+                return Ok(());
+            }
+            Err(crate::Error::RejectedAuthz {
+                tenant_id: crate::types::TenantId::new(tid),
+                resource: format!("RLS write policy on '{collection}' rejected the row"),
+            })
+        }
+        WriteGateDecision::DenyNotInjected => Err(crate::Error::Internal {
+            detail: format!(
+                "write plan for '{collection}' reached the Data Plane RLS write gate before \
+                 RLS injection ran; this is an internal invariant break, not a policy rejection"
+            ),
+        }),
     }
-    Err(crate::Error::RejectedAuthz {
-        tenant_id: crate::types::TenantId::new(tid),
-        resource: format!("RLS write policy on '{collection}' rejected the row"),
-    })
 }
 
 /// Decide one STORED row body — the bytes about to be written, or the bytes
@@ -62,25 +80,33 @@ pub(in crate::data::executor) fn admit_row(
 /// unchecked — an image the policy could not be evaluated against is not an
 /// image the policy admitted.
 pub(in crate::data::executor) fn admit_stored_row(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     body: &[u8],
     doc_id: &str,
     strict_schema: Option<&StrictSchema>,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
-        return Ok(());
-    }
-    match returning_doc::from_stored(body, doc_id, strict_schema) {
-        Ok(image) => admit_row(rls_write_check, &image, tid, collection),
-        Err(e) => Err(crate::Error::RejectedAuthz {
-            tenant_id: crate::types::TenantId::new(tid),
-            resource: format!(
-                "RLS write policy on '{collection}': row '{doc_id}' did not decode, so the policy \
-                 could not be evaluated against it: {e}"
+    match rls_write_check.decision() {
+        WriteGateDecision::AdmitAll => Ok(()),
+        WriteGateDecision::DenyNotInjected => Err(crate::Error::Internal {
+            detail: format!(
+                "write plan for '{collection}' reached the Data Plane RLS write gate before \
+                 RLS injection ran; this is an internal invariant break, not a policy rejection"
             ),
         }),
+        WriteGateDecision::Evaluate(_) => {
+            match returning_doc::from_stored(body, doc_id, strict_schema) {
+                Ok(image) => admit_row(rls_write_check, &image, tid, collection),
+                Err(e) => Err(crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(tid),
+                    resource: format!(
+                        "RLS write policy on '{collection}': row '{doc_id}' did not decode, so the \
+                     policy could not be evaluated against it: {e}"
+                    ),
+                }),
+            }
+        }
     }
 }
 
@@ -98,27 +124,35 @@ pub(in crate::data::executor) fn admit_stored_row(
 /// carries no field the predicate can test. Both deny: an image the policy
 /// could not be evaluated against is not an image the policy admitted.
 pub(in crate::data::executor) fn admit_edge_properties(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     properties: Option<&[u8]>,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
-        return Ok(());
-    }
-    let decoded =
-        properties.and_then(|bytes| sonic_rs::from_slice::<serde_json::Value>(bytes).ok());
-    match decoded {
-        Some(image @ serde_json::Value::Object(_)) => {
-            admit_row(rls_write_check, &image, tid, collection)
-        }
-        _ => Err(crate::Error::RejectedAuthz {
-            tenant_id: crate::types::TenantId::new(tid),
-            resource: format!(
-                "RLS write policy on '{collection}': the edge carries no decodable property \
-                 object, so the policy could not be evaluated against it"
+    match rls_write_check.decision() {
+        WriteGateDecision::AdmitAll => Ok(()),
+        WriteGateDecision::DenyNotInjected => Err(crate::Error::Internal {
+            detail: format!(
+                "write plan for '{collection}' reached the Data Plane RLS write gate before \
+                 RLS injection ran; this is an internal invariant break, not a policy rejection"
             ),
         }),
+        WriteGateDecision::Evaluate(_) => {
+            let decoded =
+                properties.and_then(|bytes| sonic_rs::from_slice::<serde_json::Value>(bytes).ok());
+            match decoded {
+                Some(image @ serde_json::Value::Object(_)) => {
+                    admit_row(rls_write_check, &image, tid, collection)
+                }
+                _ => Err(crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(tid),
+                    resource: format!(
+                        "RLS write policy on '{collection}': the edge carries no decodable \
+                         property object, so the policy could not be evaluated against it"
+                    ),
+                }),
+            }
+        }
     }
 }
 
@@ -133,15 +167,25 @@ pub(in crate::data::executor) fn admit_edge_properties(
 ///
 /// Fails closed: an undecodable filter payload or an evaluation error denies.
 pub(in crate::data::executor) fn admit_value_row(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     image: &nodedb_types::Value,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
-        return Ok(());
-    }
-    let admitted = match zerompk::from_msgpack::<Vec<ScanFilter>>(rls_write_check) {
+    let bytes = match rls_write_check.decision() {
+        WriteGateDecision::AdmitAll => return Ok(()),
+        WriteGateDecision::DenyNotInjected => {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "write plan for '{collection}' reached the Data Plane RLS write gate before \
+                     RLS injection ran; this is an internal invariant break, not a policy \
+                     rejection"
+                ),
+            });
+        }
+        WriteGateDecision::Evaluate(bytes) => bytes,
+    };
+    let admitted = match zerompk::from_msgpack::<Vec<ScanFilter>>(bytes) {
         Ok(filters) => value_matches_filters(image, &filters).unwrap_or(false),
         Err(_) => false,
     };
@@ -157,15 +201,12 @@ pub(in crate::data::executor) fn admit_value_row(
 /// Decide one schema-ordered columnar row — the values about to be written, or
 /// the values about to be removed — against the compiled write policy.
 pub(in crate::data::executor) fn admit_columnar_row(
-    rls_write_check: &[u8],
+    rls_write_check: &RlsWriteCheck,
     row: &[nodedb_types::value::Value],
     schema: &ColumnarSchema,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
-        return Ok(());
-    }
     admit_value_row(
         rls_write_check,
         &row_values_to_object(schema, row),
@@ -191,15 +232,36 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_check_admits_every_row() {
-        assert!(admit_row(&[], &json!({"owner": "mallory"}), 1, "orders").is_ok());
+    fn no_policy_applies_admits_every_row() {
+        assert!(
+            admit_row(
+                &RlsWriteCheck::NoPolicyApplies,
+                &json!({"owner": "mallory"}),
+                1,
+                "orders"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn pending_injection_is_denied() {
+        assert!(matches!(
+            admit_row(
+                &RlsWriteCheck::PendingInjection,
+                &json!({"owner": "mallory"}),
+                1,
+                "orders"
+            ),
+            Err(crate::Error::Internal { .. })
+        ));
     }
 
     #[test]
     fn a_conforming_row_is_admitted() {
         assert!(
             admit_row(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &json!({"owner": "alice"}),
                 1,
                 "orders"
@@ -212,7 +274,7 @@ mod tests {
     fn a_violating_row_is_rejected() {
         assert!(matches!(
             admit_row(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 &json!({"owner": "bob"}),
                 1,
                 "orders"
@@ -225,19 +287,27 @@ mod tests {
     /// rejected rather than admitted by omission.
     #[test]
     fn a_row_without_the_governed_column_is_rejected() {
-        assert!(admit_row(&owner_policy("alice"), &json!({"note": "x"}), 1, "orders").is_err());
+        assert!(
+            admit_row(
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
+                &json!({"note": "x"}),
+                1,
+                "orders"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn an_empty_check_admits_an_edge_with_no_properties() {
-        assert!(admit_edge_properties(&[], None, 1, "knows").is_ok());
+        assert!(admit_edge_properties(&RlsWriteCheck::NoPolicyApplies, None, 1, "knows").is_ok());
     }
 
     #[test]
     fn a_conforming_edge_property_object_is_admitted() {
         assert!(
             admit_edge_properties(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 Some(br#"{"owner":"alice"}"#),
                 1,
                 "knows"
@@ -250,7 +320,7 @@ mod tests {
     fn a_violating_edge_property_object_is_rejected() {
         assert!(
             admit_edge_properties(
-                &owner_policy("alice"),
+                &RlsWriteCheck::Predicate(owner_policy("alice")),
                 Some(br#"{"owner":"bob"}"#),
                 1,
                 "knows"
@@ -264,7 +334,7 @@ mod tests {
     /// denies rather than being admitted by omission.
     #[test]
     fn an_edge_without_a_decodable_property_object_is_rejected() {
-        let policy = owner_policy("alice");
+        let policy = RlsWriteCheck::Predicate(owner_policy("alice"));
         assert!(admit_edge_properties(&policy, None, 1, "knows").is_err());
         assert!(admit_edge_properties(&policy, Some(b""), 1, "knows").is_err());
         assert!(admit_edge_properties(&policy, Some(b"[1,2]"), 1, "knows").is_err());
@@ -274,6 +344,14 @@ mod tests {
     /// the row through unchecked.
     #[test]
     fn a_corrupt_check_denies() {
-        assert!(admit_row(&[0xFF, 0xFE], &json!({"owner": "alice"}), 1, "orders").is_err());
+        assert!(
+            admit_row(
+                &RlsWriteCheck::Predicate(vec![0xFF, 0xFE]),
+                &json!({"owner": "alice"}),
+                1,
+                "orders"
+            )
+            .is_err()
+        );
     }
 }

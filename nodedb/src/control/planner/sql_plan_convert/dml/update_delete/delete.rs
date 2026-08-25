@@ -44,7 +44,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 keys,
                 // Filled by the RLS injection pass, which runs after plan
                 // conversion.
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -66,7 +66,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             plan: PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection: collection.into(),
                 filters: effective_filter,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -112,7 +112,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 // Filled in by the materialized-sum resolution pass, which
                 // recon-scans the rows this predicate matches.
                 resolved_sum_targets: Vec::new(),
@@ -150,7 +150,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                     pk_bytes,
                     returning: None,
                     rls_filters: Vec::new(),
-                    rls_write_check: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                     resolved_sum_targets: Vec::new(),
                 })
             };
@@ -177,7 +177,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 ollp_predicted_surrogates: None,
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 // Filled in by the materialized-sum resolution pass, which
                 // recon-scans the rows this predicate matches.
                 resolved_sum_targets: Vec::new(),

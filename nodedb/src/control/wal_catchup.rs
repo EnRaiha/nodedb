@@ -21,7 +21,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
-use nodedb_types::Lsn;
+use nodedb_types::{Lsn, RlsWriteCheck};
 
 /// Max WAL records to read per catch-up cycle. Bounds memory to
 /// O(PAGE_SIZE) instead of O(all WAL data).
@@ -194,9 +194,9 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
             // raw ILP — row identities are reconstructed from the wire).
             surrogates: Vec::new(),
             provenance: None,
-            // Catch-up re-applies a record the policy already decided when it
-            // was written, and the writing identity is gone by now.
-            rls_write_check: Vec::new(),
+            // No predicate here: catch-up replays an already-committed WAL
+            // record. The writing identity is not available on this node.
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             returning: None,
             rls_filters: Vec::new(),
         });

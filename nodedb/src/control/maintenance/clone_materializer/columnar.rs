@@ -24,7 +24,7 @@
 //! storage layer. A single `ColumnarOp::MaterializeScan` handler (and this
 //! Control Plane loop) serves all three profiles.
 
-use nodedb_types::{CloneStatus, DatabaseId, Lsn, TenantId};
+use nodedb_types::{CloneStatus, DatabaseId, Lsn, RlsWriteCheck, TenantId};
 
 use super::dispatch::dispatch_local;
 use super::reaper::{ReapParams, reap_materialized_collection};
@@ -156,7 +156,13 @@ pub(super) async fn materialize_columnar_collection(
                     wal_lsn: None,
                     surrogates: vec![target_surrogate],
                     provenance: None,
-                    rls_write_check: Vec::new(),
+                    // Fails closed: this dispatches a fresh write into the
+                    // TARGET clone collection through the live write path
+                    // (its own new surrogate, its own dispatch), not a
+                    // replayed or already-committed write against target.
+                    // Target can carry its own write policy independent of
+                    // source, so the row must be checked against it.
+                    rls_write_check: RlsWriteCheck::pending_injection(),
                     returning: None,
                     rls_filters: Vec::new(),
                 })
@@ -171,7 +177,13 @@ pub(super) async fn materialize_columnar_collection(
                     schema_bytes: Vec::new(),
                     provenance: None,
                     wal_lsn: None,
-                    rls_write_check: Vec::new(),
+                    // Fails closed: this dispatches a fresh write into the
+                    // TARGET clone collection through the live write path
+                    // (its own new surrogate, its own dispatch), not a
+                    // replayed or already-committed write against target.
+                    // Target can carry its own write policy independent of
+                    // source, so the row must be checked against it.
+                    rls_write_check: RlsWriteCheck::pending_injection(),
                     // Internal row copy — nothing is projected back and no
                     // caller identity's reads are being gated.
                     returning: None,

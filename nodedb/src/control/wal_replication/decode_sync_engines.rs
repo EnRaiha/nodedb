@@ -11,7 +11,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{
     ColumnarInsertIntent, ColumnarOp, SpatialOp, TextOp, TimeseriesOp,
 };
-use nodedb_types::Surrogate;
+use nodedb_types::{RlsWriteCheck, Surrogate};
 
 /// Decode optional sync provenance from the wire bytes.
 ///
@@ -52,7 +52,9 @@ pub fn columnar_ingest(
         schema_bytes: schema_bytes.to_vec(),
         provenance,
         wal_lsn: None,
-        rls_write_check: Vec::new(),
+        // No predicate here: this node applies an already-committed sync
+        // write. The writing identity is not available on this node.
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         // A replicated entry reconstructs stored rows; the response shape a
         // projection would produce belongs to the originating request only.
         returning: None,
@@ -75,7 +77,9 @@ pub fn timeseries_ingest(
         wal_lsn: None,
         surrogates: surrogates.iter().copied().map(Surrogate::new).collect(),
         provenance,
-        rls_write_check: Vec::new(),
+        // No predicate here: this node applies an already-committed sync
+        // write. The writing identity is not available on this node.
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         returning: None,
         rls_filters: Vec::new(),
     }))

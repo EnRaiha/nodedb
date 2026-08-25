@@ -23,16 +23,20 @@ use crate::data::executor::handlers::rls_write_gate;
 
 /// Decide one KV row body against the compiled write policy.
 ///
-/// `rls_write_check` empty means no write policy restricts this identity here,
-/// and the row is admitted without decoding anything.
+/// [`nodedb_types::WriteGateDecision::AdmitAll`] means no write policy
+/// restricts this identity here, and the row is admitted without decoding
+/// anything.
 pub(in crate::data::executor) fn admit_kv_row(
-    rls_write_check: &[u8],
+    rls_write_check: &nodedb_types::RlsWriteCheck,
     body: &[u8],
     key: &[u8],
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
-    if rls_write_check.is_empty() {
+    if matches!(
+        rls_write_check.decision(),
+        nodedb_types::WriteGateDecision::AdmitAll
+    ) {
         return Ok(());
     }
     // The key is shown for diagnostics only; a non-UTF-8 key is lossily

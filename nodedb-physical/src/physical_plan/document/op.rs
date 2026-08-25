@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use super::merge_types::MergeClauseOp;
 use super::ollp_edge::OllpPredictedEdge;
@@ -155,16 +155,15 @@ pub enum DocumentOp {
         rls_filters: Vec<u8>,
         /// Compiled write policy gating the PERSIST, evaluated in the Data
         /// Plane against the row image the statement actually writes — the
-        /// pre-image for a delete, the post-image for an update. A row that
-        /// fails it fails the whole statement with `RejectedAuthz`; never a
-        /// silent skip, which would report a write that did happen as one that
-        /// did not. Empty = no write policy restricts this identity here.
+        /// pre-image for a delete, the post-image for an update — or the
+        /// reason no predicate is attached. A row that fails it fails the
+        /// whole statement with `RejectedAuthz`; never a silent skip, which
+        /// would report a write that did happen as one that did not.
         ///
         /// A slot of its own, never an alias of `rls_filters`: that field is
         /// the READ policy bounding what `RETURNING` may show. Conflating the
         /// two would turn a write gate into row redaction, or the reverse.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// this collection's materialized-sum bindings, resolved on the Control
         /// Plane at plan time. Keyed on the PAIR because one source may drive
@@ -194,9 +193,9 @@ pub enum DocumentOp {
         #[serde(default)]
         rls_filters: Vec<u8>,
         /// Write policy gating the persist, evaluated against the post-update
-        /// image — see `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// image, or the reason no predicate is attached — see
+        /// `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// this collection's materialized-sum bindings, resolved on the Control
         /// Plane at plan time. Keyed on the PAIR because one source may drive
@@ -441,9 +440,9 @@ pub enum DocumentOp {
         /// Write policy gating the persist, evaluated against the body actually
         /// stored by whichever branch runs: the insert body when the row is
         /// absent, the merge with the stored row (or the `on_conflict_updates`
-        /// result) when it is present. See `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// result) when it is present, or the reason no predicate is attached.
+        /// See `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// When `Some`, return the STORED post-image projected per spec: the
         /// merged row on the conflict branch, the inserted row otherwise.
         /// Never the submitted body — on a conflict the caller's values are
@@ -523,9 +522,9 @@ pub enum DocumentOp {
         rls_filters: Vec<u8>,
         /// Write policy of `target_collection` gating the persist, evaluated
         /// against each matched target row's post-image — every row this op
-        /// writes is a target row. See `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// writes is a target row — or the reason no predicate is attached.
+        /// See `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// `target_collection`'s materialized-sum bindings, resolved on the
         /// Control Plane from a recon scan of the target rows this statement
@@ -570,9 +569,9 @@ pub enum DocumentOp {
         #[serde(default)]
         rls_filters: Vec<u8>,
         /// Write policy gating the persist, evaluated against each matched
-        /// row's post-update image — see `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// row's post-update image, or the reason no predicate is attached —
+        /// see `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// this collection's materialized-sum bindings, resolved on the Control
         /// Plane from a recon scan of the rows the predicate matches. Both
@@ -618,10 +617,9 @@ pub enum DocumentOp {
         #[serde(default)]
         rls_filters: Vec<u8>,
         /// Write policy gating the persist, evaluated against each matched
-        /// row's pre-deletion image — the only image a delete has. See
-        /// `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// row's pre-deletion image — the only image a delete has — or the
+        /// reason no predicate is attached. See `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// this collection's materialized-sum bindings, resolved on the Control
         /// Plane from a recon scan of the rows the predicate matches.
@@ -701,10 +699,9 @@ pub enum DocumentOp {
         rls_filters: Vec<u8>,
         /// Write policy of `target_collection` gating the persist: every arm
         /// writes a target row, gated against the image it stores — post for an
-        /// UPDATE/INSERT arm, pre for a DELETE arm. See
-        /// `PointDelete::rls_write_check`.
-        #[serde(default)]
-        rls_write_check: Vec<u8>,
+        /// UPDATE/INSERT arm, pre for a DELETE arm — or the reason no
+        /// predicate is attached. See `PointDelete::rls_write_check`.
+        rls_write_check: RlsWriteCheck,
         /// `(target collection, join-key value)` → target row surrogate for
         /// `target_collection`'s materialized-sum bindings, resolved on the
         /// Control Plane from the RESOLVE pass's classification. Every arm

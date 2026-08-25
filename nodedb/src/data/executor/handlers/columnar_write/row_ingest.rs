@@ -26,11 +26,11 @@ pub(in crate::data::executor) struct RowIngestParams<'a> {
     pub on_conflict_updates: &'a [(String, UpdateValue)],
     pub surrogates: &'a [Surrogate],
     pub ndb_rows: &'a [nodedb_types::Value],
-    /// Compiled row-level-security WRITE predicate carried by the plan. Non-empty
-    /// only for the ON CONFLICT DO UPDATE shape, whose merged post-image the
-    /// Control Plane could not see; a plain insert's rows were already decided
-    /// at plan time. Empty admits every row.
-    pub rls_write_check: &'a [u8],
+    /// Compiled row-level-security WRITE predicate carried by the plan. A real
+    /// predicate only for the ON CONFLICT DO UPDATE shape, whose merged
+    /// post-image the Control Plane could not see; a plain insert's rows were
+    /// already decided at plan time.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Whether the caller needs the stored post-image of every row that was
     /// actually written. Only a `RETURNING` clause sets this; the row images
     /// are cloned, so a plain insert must not pay for them.

@@ -243,8 +243,8 @@ pub(crate) fn build_edge_delete(
         src_surrogate,
         dst_surrogate,
         // Filled by the RLS injection pass that runs over this plan before
-        // dispatch; empty here means "not yet resolved", never "no policy".
-        rls_write_check: Vec::new(),
+        // dispatch.
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     }))
 }
 

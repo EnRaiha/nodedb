@@ -113,7 +113,7 @@ pub(in super::super) fn convert_upsert(
                         surrogate,
                         // Filled in by the RLS injection pass, which runs after
                         // conversion.
-                        rls_write_check: Vec::new(),
+                        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                         rls_filters: Vec::new(),
                         // Filled in by the protocol layer's RETURNING injection.
                         returning: None,
@@ -161,7 +161,7 @@ pub(in super::super) fn convert_upsert(
                 schema_bytes,
                 provenance: None,
                 wal_lsn: None,
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 // Filled by the later `inject_returning_spec` / row-level-security
                 // passes — see the plain-insert site above.
                 returning: None,

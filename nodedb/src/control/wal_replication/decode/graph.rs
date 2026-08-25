@@ -5,6 +5,7 @@
 use super::ctx::DecodeCtx;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
+use nodedb_types::RlsWriteCheck;
 
 /// Fields of the `EdgePut` wire variant, bundled so [`edge_put`] stays under
 /// the `too_many_arguments` clippy threshold.
@@ -90,10 +91,10 @@ pub(super) fn edge_delete(
         dst_id: dst_id.to_owned(),
         src_surrogate,
         dst_surrogate,
-        // A replicated write was already admitted by the write policy on the
-        // leader that accepted it; re-deciding it on the follower would make
-        // replication depend on per-node policy state.
-        rls_write_check: Vec::new(),
+        // No predicate here: this node is a follower applying an
+        // already-committed write. The writing identity is not available on
+        // this node. The leader enforces RLS before proposing the write.
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 

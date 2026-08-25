@@ -23,12 +23,15 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         keys: &[Vec<u8>],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv delete");
         let now_ms = current_ms();
 
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             for key in keys {
                 // An absent key removes no row, so there is no image to decide;
                 // the delete simply counts it as not-deleted.

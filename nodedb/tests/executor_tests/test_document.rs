@@ -162,7 +162,7 @@ fn point_delete_removes() {
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         }),
     );

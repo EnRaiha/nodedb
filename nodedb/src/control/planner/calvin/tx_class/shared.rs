@@ -406,7 +406,7 @@ mod lockstep_tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: Surrogate::new(3),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         }));
     }
 
@@ -418,7 +418,7 @@ mod lockstep_tests {
             expected: vec![],
             new_value: vec![],
             surrogate: Surrogate::new(3),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         }));
     }
 
@@ -430,7 +430,7 @@ mod lockstep_tests {
             value: vec![],
             on_conflict_updates: vec![],
             surrogate: Surrogate::new(9),
-            rls_write_check: vec![],
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),

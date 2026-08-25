@@ -5,6 +5,7 @@
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::RlsWriteCheck;
 
 pub(super) fn put(
     ctx: &DecodeCtx,
@@ -30,16 +31,17 @@ pub(super) fn put(
     }))
 }
 
-/// Every plan reconstructed in this module carries an empty RLS write check.
-/// The predicate is a property of the session that issued the write, not of the
-/// row, and is deliberately absent from the durable record: a replay re-applies
-/// a write that was already admitted, so re-deciding it against the policies of
-/// whoever is connected at recovery time would make recovery non-deterministic.
+/// Every plan reconstructed in this module carries
+/// `RlsWriteCheck::already_decided_elsewhere()`. The predicate is a property
+/// of the session that issued the write, not of the row, and the writing
+/// identity is not available on this node: a replay re-applies a write that
+/// was already admitted, so re-deciding it against the policies of whoever
+/// is connected at recovery time would make recovery non-deterministic.
 pub(super) fn delete(collection: &str, keys: &[Vec<u8>]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Delete {
         collection: collection.to_owned(),
         keys: keys.to_vec(),
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
 }
 
@@ -112,7 +114,7 @@ pub(super) fn insert_on_conflict_update(
         ttl_ms,
         updates: updates.to_vec(),
         surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         returning: None,
         rls_filters: Vec::new(),
     }))
@@ -151,7 +153,7 @@ pub(super) fn expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan 
         collection: collection.to_owned(),
         key: key.to_vec(),
         ttl_ms,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
 }
 
@@ -159,7 +161,7 @@ pub(super) fn persist(collection: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Persist {
         collection: collection.to_owned(),
         key: key.to_vec(),
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
 }
 
@@ -179,7 +181,7 @@ pub(super) fn incr(
         delta,
         ttl_ms,
         surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -197,7 +199,7 @@ pub(super) fn incr_float(
         key: key.to_vec(),
         delta,
         surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -217,7 +219,7 @@ pub(super) fn cas(
         expected: expected.to_vec(),
         new_value: new_value.to_vec(),
         surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -236,7 +238,7 @@ pub(super) fn get_set(
         new_value: new_value.to_vec(),
         surrogate,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -314,7 +316,7 @@ pub(super) fn field_set(
         key: key.to_vec(),
         updates: updates.to_vec(),
         surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -343,7 +345,7 @@ pub(super) fn transfer(ctx: &DecodeCtx, f: TransferFields) -> crate::Result<Phys
         amount: f.amount,
         debit_surrogate,
         credit_surrogate,
-        rls_write_check: Vec::new(),
+        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
 
@@ -371,7 +373,7 @@ pub(super) fn transfer_item(
         item_key: item_key.to_vec(),
         dest_key: dest_key.to_vec(),
         surrogate,
-        source_rls_write_check: Vec::new(),
-        dest_rls_write_check: Vec::new(),
+        source_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+        dest_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }

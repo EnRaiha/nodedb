@@ -110,7 +110,7 @@ fn is_write_plan_true_for_kv_expire() {
         collection: "cache".to_owned(),
         key: b"k".to_vec(),
         ttl_ms: 1000,
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::Expire must be a write");
 }
@@ -120,7 +120,7 @@ fn is_write_plan_true_for_kv_persist() {
     let plan = PhysicalPlan::Kv(KvOp::Persist {
         collection: "cache".to_owned(),
         key: b"k".to_vec(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::Persist must be a write");
 }
@@ -132,7 +132,7 @@ fn is_write_plan_true_for_kv_field_set() {
         key: b"k".to_vec(),
         updates: vec![("field".to_owned(), b"v".to_vec())],
         surrogate: Surrogate::new(1),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::FieldSet must be a write");
 }
@@ -145,7 +145,7 @@ fn is_write_plan_true_for_kv_incr() {
         delta: 1,
         ttl_ms: 0,
         surrogate: Surrogate::new(1),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::Incr must be a write");
 }
@@ -157,7 +157,7 @@ fn is_write_plan_true_for_kv_incr_float() {
         key: b"k".to_vec(),
         delta: 1.5,
         surrogate: Surrogate::new(1),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::IncrFloat must be a write");
 }
@@ -170,7 +170,7 @@ fn is_write_plan_true_for_kv_cas() {
         expected: b"old".to_vec(),
         new_value: b"new".to_vec(),
         surrogate: Surrogate::new(1),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::Cas must be a write");
 }
@@ -183,7 +183,7 @@ fn is_write_plan_true_for_kv_get_set() {
         new_value: b"new".to_vec(),
         surrogate: Surrogate::new(1),
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::GetSet must be a write");
 }
@@ -198,7 +198,7 @@ fn is_write_plan_true_for_kv_transfer() {
         amount: 10.0,
         debit_surrogate: Surrogate::new(1),
         credit_surrogate: Surrogate::new(2),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     assert!(is_write_plan(&plan), "KvOp::Transfer must be a write");
 }

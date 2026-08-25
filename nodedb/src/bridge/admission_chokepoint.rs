@@ -54,6 +54,40 @@ pub(crate) fn assert_write_admitted(request: &Request) {
     );
 }
 
+/// Refuse a write plan that reached the Data Plane before RLS injection
+/// filled in its write check.
+///
+/// A write op's `RlsWriteCheck` starts as `PendingInjection` when the plan
+/// is built, and RLS injection later replaces it with the real decision
+/// (`Predicate`, `NoPolicyApplies`, or one of the other resolved states).
+/// If any check on the plan is still `PendingInjection` here, injection was
+/// skipped, and letting the write through would silently run it with no
+/// write policy at all. This returns `Err` in every build — unlike
+/// [`assert_write_admitted`], which only counts in release builds, a
+/// `PendingInjection` write must never reach the Data Plane.
+pub(crate) fn reject_uninjected_write(request: &Request) -> crate::Result<()> {
+    let has_pending = request
+        .plan
+        .rls_write_checks()
+        .into_iter()
+        .any(|check| check.is_pending_injection());
+    if !has_pending {
+        return Ok(());
+    }
+    let detail = match request.plan.collection() {
+        Some(collection) => format!(
+            "internal invariant break: write plan for collection '{collection}' reached the \
+             Data Plane before RLS injection ran (RlsWriteCheck::PendingInjection); this is not \
+             a policy rejection, it is a skipped injection step"
+        ),
+        None => "internal invariant break: write plan reached the Data Plane before RLS \
+                  injection ran (RlsWriteCheck::PendingInjection); this is not a policy \
+                  rejection, it is a skipped injection step"
+            .to_string(),
+    };
+    Err(crate::Error::Internal { detail })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +205,83 @@ mod tests {
             !(plan_is_write(&w)
                 && Admission::Exempt(ExemptReason::AlreadyOrdered).is_exempt_as_read())
         );
+    }
+
+    /// A `KvOp::Delete` write plan carrying the given `RlsWriteCheck`.
+    fn delete_plan_with_check(check: nodedb_types::RlsWriteCheck) -> PhysicalPlan {
+        PhysicalPlan::Kv(KvOp::Delete {
+            collection: "c".into(),
+            keys: vec![b"k".to_vec()],
+            rls_write_check: check,
+        })
+    }
+
+    /// A `KvOp::TransferItem` plan with independently settable source and
+    /// dest checks — exercises both check slots on one plan.
+    fn transfer_item_plan_with_checks(
+        source: nodedb_types::RlsWriteCheck,
+        dest: nodedb_types::RlsWriteCheck,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Kv(KvOp::TransferItem {
+            source_collection: "src".into(),
+            dest_collection: "dst".into(),
+            item_key: b"item".to_vec(),
+            dest_key: b"item".to_vec(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            source_rls_write_check: source,
+            dest_rls_write_check: dest,
+        })
+    }
+
+    /// A `PendingInjection` write plan is refused: injection never ran.
+    #[test]
+    fn pending_injection_write_is_rejected() {
+        let req = request_with(
+            delete_plan_with_check(nodedb_types::RlsWriteCheck::PendingInjection),
+            Admission::Admitted,
+        );
+        let err = reject_uninjected_write(&req).expect_err("must reject PendingInjection");
+        assert!(matches!(err, crate::Error::Internal { .. }));
+    }
+
+    /// Every resolved `RlsWriteCheck` state — the outcomes RLS injection can
+    /// actually leave behind — is accepted.
+    #[test]
+    fn resolved_write_checks_are_accepted() {
+        let resolved = [
+            nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            nodedb_types::RlsWriteCheck::Predicate(vec![1, 2, 3]),
+            nodedb_types::RlsWriteCheck::AlreadyDecidedElsewhere,
+            nodedb_types::RlsWriteCheck::DecidedEarlierInRequest,
+            nodedb_types::RlsWriteCheck::SystemInternalCollection,
+        ];
+        for check in resolved {
+            let req = request_with(delete_plan_with_check(check), Admission::Admitted);
+            reject_uninjected_write(&req).expect("resolved check must be accepted");
+        }
+    }
+
+    /// A read-class plan carries no write check at all and is accepted.
+    #[test]
+    fn read_plan_is_accepted() {
+        let req = request_with(read_plan(), Admission::Exempt(ExemptReason::Read));
+        reject_uninjected_write(&req).expect("read plan must be accepted");
+    }
+
+    /// `KvOp::TransferItem` carries two check slots. A `PendingInjection` in
+    /// the SECOND (dest) slot alone must still be caught — proves the guard
+    /// checks every slot, not just the first.
+    #[test]
+    fn transfer_item_pending_in_dest_slot_is_rejected() {
+        let req = request_with(
+            transfer_item_plan_with_checks(
+                nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                nodedb_types::RlsWriteCheck::PendingInjection,
+            ),
+            Admission::Admitted,
+        );
+        let err = reject_uninjected_write(&req)
+            .expect_err("PendingInjection in the dest slot alone must be rejected");
+        assert!(matches!(err, crate::Error::Internal { .. }));
     }
 }

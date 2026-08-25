@@ -53,6 +53,7 @@ use super::super::scan_normalize::decoded_col_to_value;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
+use nodedb_types::RlsWriteCheck;
 use nodedb_types::columnar::ColumnType;
 
 impl CoreLoop {
@@ -119,7 +120,10 @@ impl CoreLoop {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: None,
-                rls_write_check: Vec::new(),
+                // No predicate here: this restore re-derives an index from
+                // rows that are already durable and admits no new write. The
+                // writing identity that admitted those rows is gone.
+                rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),

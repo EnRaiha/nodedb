@@ -200,7 +200,9 @@ async fn wal_redispatch_makes_data_queryable() {
                     wal_lsn: Some(record.header.lsn),
                     surrogates: Vec::new(),
                     provenance: None,
-                    rls_write_check: Vec::new(),
+                    // Re-dispatch of a WAL record: the writing identity is not
+                    // present on this path.
+                    rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                     returning: None,
                     rls_filters: Vec::new(),
                 }),
@@ -292,7 +294,9 @@ async fn catchup_fills_gaps_from_spsc_drops() {
                     wal_lsn: Some(record.header.lsn),
                     surrogates: Vec::new(),
                     provenance: None,
-                    rls_write_check: Vec::new(),
+                    // Re-dispatch of a WAL record: the writing identity is not
+                    // present on this path.
+                    rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                     returning: None,
                     rls_filters: Vec::new(),
                 }),
@@ -444,7 +448,9 @@ async fn production_scenario_catchup_drains_wal_after_ingest() {
                         wal_lsn: None,
                         surrogates: Vec::new(),
                         provenance: None,
-                        rls_write_check: Vec::new(),
+                        // Direct dispatch (simulated SPSC success), not a WAL
+                        // replay: no RLS policy exists on this collection.
+                        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                         returning: None,
                         rls_filters: Vec::new(),
                     }),

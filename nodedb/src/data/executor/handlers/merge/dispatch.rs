@@ -52,8 +52,8 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// Every arm writes a target row, decided against the image it stores: the
     /// post-image for an UPDATE or INSERT arm, the pre-image for a DELETE arm.
     /// A separate slot from `rls_filters`: that one bounds what may be shown
-    /// back, this one bounds what may be written. Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    /// back, this one bounds what may be written.
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// this merge's arms may touch, resolved on the Control Plane from the
     /// RESOLVE pass's classification. Empty on the RESOLVE pass itself, which

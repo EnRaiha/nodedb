@@ -472,7 +472,7 @@ mod tests {
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
-                    rls_write_check: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                     resolved_sum_targets: Vec::new(),
                 }),
             ],
@@ -500,7 +500,7 @@ mod tests {
             schema_bytes: Vec::new(),
             provenance: None,
             wal_lsn: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -520,7 +520,7 @@ mod tests {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "metrics".into(),
             filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(
@@ -729,8 +729,8 @@ mod tests {
             item_key: b"sword".to_vec(),
             dest_key: b"sword".to_vec(),
             surrogate: Surrogate::new(9),
-            source_rls_write_check: Vec::new(),
-            dest_rls_write_check: Vec::new(),
+            source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(

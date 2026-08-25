@@ -576,7 +576,7 @@ mod tests {
             wal_lsn: None,
             surrogates: tokens.into_iter().map(Surrogate::new).collect(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         })
@@ -590,7 +590,7 @@ mod tests {
             ollp_predicted_surrogates: predicted,
             ollp_predicted_edges: None,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: Vec::new(),
         })
     }
@@ -822,7 +822,7 @@ mod tests {
             wal_lsn: None,
             surrogates: vec![Surrogate::new(1)],
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: Vec::new(),
         });

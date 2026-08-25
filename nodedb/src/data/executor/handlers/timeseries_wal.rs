@@ -135,7 +135,7 @@ impl CoreLoop {
                 wal_lsn: Some(record_lsn),
                 surrogates: Vec::new(),
                 provenance: provenance.clone(),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -154,7 +154,7 @@ impl CoreLoop {
             // written, and the identity that wrote it is not present at boot to
             // resolve `$auth.*` against. A refused write never reaches replay:
             // its record is cancelled before the refusal is acknowledged.
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             // Replay rebuilds stored state at boot; there is no client waiting
             // on a row set, and no identity whose reads would need gating. The
             // projection belongs to the originating request, which was answered
@@ -210,7 +210,7 @@ impl CoreLoop {
                 schema_bytes: Vec::new(),
                 provenance: None,
                 wal_lsn: Some(record_lsn),
-                rls_write_check: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -231,7 +231,7 @@ impl CoreLoop {
                 surrogates: &surrogates,
                 schema_bytes: &[],
                 provenance: provenance.as_ref(),
-                rls_write_check: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
                 // WAL replay reconstructs stored state; there is no client
                 // waiting on a projection, and no identity to gate reads for.
                 returning: None,

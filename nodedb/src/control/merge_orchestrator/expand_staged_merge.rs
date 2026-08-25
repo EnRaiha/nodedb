@@ -80,7 +80,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
     // predicate compiled into the MERGE plan is the last thing that can decide
     // these rows; without the check here, expanding a governed MERGE would
     // launder it into ungoverned point writes.
-    if !rls_write_check.is_empty() {
+    if let nodedb_types::WriteGateDecision::Evaluate(predicate) = rls_write_check.decision() {
         let bodies = arms
             .updates
             .iter()
@@ -89,7 +89,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
             .chain(arms.inserts.iter().map(|(_, body)| body));
         for body in bodies {
             crate::control::security::rls::admit_compiled_write_image(
-                &rls_write_check,
+                predicate,
                 body,
                 tenant_id.as_u64(),
                 &target_collection,
@@ -177,7 +177,9 @@ async fn resolve_merge_arms(
         // caller decides the resolved arms against the statement's write
         // predicate before any of them becomes a point op.
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        // Never evaluated: the resolve pass writes nothing, so no gate ever
+        // reads this.
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         // The RESOLVE pass writes nothing, so it folds no materialized-sum
         // delta. The point ops this expansion emits carry their own resolution.
         resolved_sum_targets: Vec::new(),
@@ -286,9 +288,13 @@ fn emit_arms(
                 returning: None,
                 rls_filters: Vec::new(),
                 // The arm's pre-image was already decided against the merge's
-                // write predicate before this op was emitted, so re-checking it
-                // in the staging path would only re-run the same test.
-                rls_write_check: Vec::new(),
+                // write predicate before this op was emitted, by the
+                // `admit_compiled_write_image` pass above. This op removes
+                // that same row, so re-checking it would re-run the same test
+                // against the same image. The identity that decided it is live
+                // and known here, which is what separates this from a
+                // follower or replay path.
+                rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
                 resolved_sum_targets: Vec::new(),
             }),
         ));

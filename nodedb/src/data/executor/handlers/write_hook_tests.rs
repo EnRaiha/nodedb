@@ -181,7 +181,7 @@ fn upsert(core: &mut CoreLoop, task: &ExecutionTask, body: &[u8]) -> Status {
             surrogate: Surrogate(61),
             value: body,
             on_conflict_updates: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: &[],
             resolved_sum_targets: &targets,
@@ -252,7 +252,7 @@ fn point_delete_takes_the_row_back_off_the_total() {
             surrogate: Surrogate(31),
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &targets,
         },
     );
@@ -289,7 +289,7 @@ fn point_update_moves_the_amount_when_the_join_key_changes() {
             updates: &updates,
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &targets,
         },
     );
@@ -331,7 +331,7 @@ fn point_update_deltas_the_amount_in_place() {
             updates: &updates,
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &targets,
         },
     );
@@ -411,7 +411,7 @@ fn a_transactional_delete_takes_the_row_back_off_the_total() {
         pk_bytes: b"e81".to_vec(),
         returning: None,
         rls_filters: Vec::new(),
-        rls_write_check: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         resolved_sum_targets: resolved(),
     });
     let resp = core.execute_transaction_batch(&task, TID, &[plan], &[], None);
@@ -498,7 +498,7 @@ fn a_delete_on_a_hash_chained_collection_is_refused() {
             surrogate: Surrogate(91),
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &[],
         },
     );
@@ -532,7 +532,7 @@ fn an_update_on_a_hash_chained_collection_is_refused() {
             updates: &updates,
             returning: None,
             rls_filters: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             resolved_sum_targets: &[],
         },
     );
@@ -570,7 +570,7 @@ fn an_upsert_onto_an_existing_hash_chained_row_is_refused() {
             surrogate: Surrogate(91),
             value: &entry(A1, 999),
             on_conflict_updates: &[],
-            rls_write_check: &[],
+            rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
             returning: None,
             rls_filters: &[],
             resolved_sum_targets: &[],

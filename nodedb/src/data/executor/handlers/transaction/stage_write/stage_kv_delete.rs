@@ -37,7 +37,7 @@ impl CoreLoop {
         txn_id: TxnId,
         collection: &str,
         keys: &[Vec<u8>],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let did = task.request.database_id;
         let mut deleted = 0usize;
@@ -95,7 +95,10 @@ impl CoreLoop {
             // The row being removed is the image the write policy decides, and
             // it is resolved under BASE ∪ OVERLAY so a row staged earlier in
             // this transaction is judged as it now stands, not as it was.
-            if !rls_write_check.is_empty() {
+            if !matches!(
+                rls_write_check.decision(),
+                nodedb_types::WriteGateDecision::AdmitAll
+            ) {
                 let current = match self
                     .txn_overlays
                     .get(&txn_id)

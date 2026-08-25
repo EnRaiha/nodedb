@@ -89,7 +89,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn stage_point_delete(
         &mut self,
         ctx: &StageCtx<'_>,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         // Resolve the row against BASE ∪ OVERLAY first — the same probe the
         // staged INSERT runs. A delete only affects a row that is actually
@@ -118,7 +118,10 @@ impl CoreLoop {
         // Gate the removal on the collection's write policy, decided against
         // the row as this transaction currently sees it (BASE ∪ OVERLAY) — the
         // only image a delete has, and the one the COMMIT install will remove.
-        if !rls_write_check.is_empty() {
+        if !matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             let current = match self.resolve_doc_current(ctx) {
                 Ok(body) => body,
                 Err(e) => return self.response_error(ctx.task, e),
@@ -149,7 +152,7 @@ impl CoreLoop {
         &mut self,
         ctx: &StageCtx<'_>,
         updates: &[(String, UpdateValue)],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let config_key = (
             crate::types::DatabaseId::new(ctx.database_id),

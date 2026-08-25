@@ -52,7 +52,7 @@ struct StageTransfer<'a> {
     field: &'a str,
     amount: f64,
     /// Compiled RLS write predicate for the collection both rows live in.
-    rls_write_check: &'a [u8],
+    rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 /// The per-statement inputs of a staged cross-collection item move. The two
@@ -63,8 +63,8 @@ struct StageTransferItem<'a> {
     dest_collection: &'a str,
     item_key: &'a [u8],
     dest_key: &'a [u8],
-    source_rls_write_check: &'a [u8],
-    dest_rls_write_check: &'a [u8],
+    source_rls_write_check: &'a nodedb_types::RlsWriteCheck,
+    dest_rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -146,7 +146,7 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         updates: &[(String, Vec<u8>)],
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         let computed = match merge_field_updates(current.as_deref(), updates) {

@@ -288,12 +288,12 @@ mod tests {
         PhysicalPlan::Kv(KvOp::Delete {
             collection: collection.into(),
             keys: vec![b"k1".to_vec()],
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })
     }
 
     /// The compiled write predicate a plan carries into the Data Plane.
-    fn write_check(plan: &PhysicalPlan) -> &[u8] {
+    fn write_check(plan: &PhysicalPlan) -> &nodedb_types::RlsWriteCheck {
         match plan {
             PhysicalPlan::Kv(KvOp::Delete {
                 rls_write_check, ..
@@ -395,7 +395,7 @@ mod tests {
         let mut plan = kv_delete("sessions");
         assert!(inject(&mut plan, &store).is_ok());
         assert!(
-            !write_check(&plan).is_empty(),
+            write_check(&plan).has_predicate(),
             "write policy must reach the Data-Plane gate"
         );
     }
@@ -409,10 +409,10 @@ mod tests {
             collection: "sessions".into(),
             key: b"k1".to_vec(),
             ttl_ms: 1_000,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// A field merge exists only after the stored row is read.
@@ -424,10 +424,10 @@ mod tests {
             key: b"k1".to_vec(),
             updates: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// The incremented value is computed inside the engine, so the predicate
@@ -441,10 +441,10 @@ mod tests {
             delta: 1,
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut plan, &store).is_ok());
-        assert!(!write_check(&plan).is_empty());
+        assert!(write_check(&plan).has_predicate());
     }
 
     /// `GETSET` needs both halves: the read filter bounds the old value it
@@ -467,7 +467,7 @@ mod tests {
             new_value: body("42"),
             surrogate: nodedb_types::Surrogate::ZERO,
             rls_filters: Vec::new(),
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {
@@ -481,7 +481,7 @@ mod tests {
                     "read half must gate the returned old value"
                 );
                 assert!(
-                    !rls_write_check.is_empty(),
+                    rls_write_check.has_predicate(),
                     "write half must gate the write"
                 );
             }
@@ -500,8 +500,8 @@ mod tests {
             item_key: b"i1".to_vec(),
             dest_key: b"d1".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
-            source_rls_write_check: Vec::new(),
-            dest_rls_write_check: Vec::new(),
+            source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {
@@ -511,11 +511,11 @@ mod tests {
                 ..
             }) => {
                 assert!(
-                    !source_rls_write_check.is_empty(),
+                    source_rls_write_check.has_predicate(),
                     "the policed source must reach its own gate"
                 );
                 assert!(
-                    dest_rls_write_check.is_empty(),
+                    !dest_rls_write_check.has_predicate(),
                     "an unpoliced destination must not inherit the source's predicate"
                 );
             }
@@ -544,7 +544,7 @@ mod tests {
 
         let mut delete = kv_delete("sessions");
         assert!(inject(&mut delete, &store).is_ok());
-        assert!(write_check(&delete).is_empty());
+        assert!(!write_check(&delete).has_predicate());
     }
 
     /// A policy on a different collection must not restrict this one.

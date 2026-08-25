@@ -31,7 +31,7 @@ impl CoreLoop {
         value: &[u8],
         updates: &[(String, UpdateValue)],
         ttl_ms: u64,
-        rls_write_check: &[u8],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let existing = self.resolve_kv_current(ctx, key);
         let (stored_bytes, op) = match &existing {

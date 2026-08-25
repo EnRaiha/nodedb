@@ -35,8 +35,7 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     /// Compiled RLS write policy gating the PERSIST, decided per row against
     /// its post-update image. A separate slot from `rls_filters`: that one
     /// bounds what may be shown back, this one bounds what may be written.
-    /// Empty = no write policy.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// Join-key VALUE → target row surrogate for every materialized-sum target
     /// the rows this predicate matches may touch, resolved on the Control Plane
     /// from its recon scan of the same predicate. Both sides of a join-key

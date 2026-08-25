@@ -1192,7 +1192,7 @@ mod tests {
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
         });

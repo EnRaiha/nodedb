@@ -31,10 +31,10 @@ pub(in crate::data::executor) struct KvTtlTarget<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub key: &'a [u8],
-    /// Compiled row-level-security WRITE predicate. Empty means no write
+    /// Compiled row-level-security WRITE predicate. `AdmitAll` means no write
     /// policy restricts this identity here, and the stored row is not read at
     /// all — an ungoverned collection still touches only the TTL metadata.
-    pub rls_write_check: &'a [u8],
+    pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
@@ -119,7 +119,10 @@ impl CoreLoop {
             key,
             rls_write_check,
         } = *target;
-        if rls_write_check.is_empty() {
+        if matches!(
+            rls_write_check.decision(),
+            nodedb_types::WriteGateDecision::AdmitAll
+        ) {
             return Ok(());
         }
         let Some(body) = self.kv_engine.get(did, tid, collection, key, now_ms) else {

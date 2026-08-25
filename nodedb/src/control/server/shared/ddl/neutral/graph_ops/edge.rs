@@ -306,7 +306,7 @@ pub async fn delete_edge(
             dst_id: dst,
             src_surrogate,
             dst_surrogate,
-            rls_write_check: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         },
     )?;
 
