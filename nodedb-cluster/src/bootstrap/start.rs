@@ -34,6 +34,7 @@ use crate::subsystem::{
     DecommissionSubsystem, ReachabilitySubsystem, RebalancerSubsystem, RunningCluster,
     SubsystemRegistry, SwimSubsystem, SwimSubsystemConfig,
 };
+use crate::MembershipSubscriber;
 use crate::swim::config::SwimConfig;
 use crate::swim::incarnation::Incarnation;
 use crate::swim::incarnation_store::CatalogIncarnationStore;
@@ -73,6 +74,7 @@ pub fn register_default_subsystems(
     ctx: &BootstrapCtx,
     executor: Arc<MigrationExecutor>,
     catalog: &Arc<ClusterCatalog>,
+    extra_swim_subscribers: Vec<Arc<dyn MembershipSubscriber>>,
 ) -> crate::error::Result<()> {
     // Fast-restart rejoin safety: resume SWIM above the last persisted
     // incarnation. A node that crashed while peers held `Dead(A, N)`
@@ -112,7 +114,7 @@ pub fn register_default_subsystems(
         swim_cfg,
         Arc::clone(&ctx.routing),
         Arc::clone(&ctx.topology),
-        vec![],
+        extra_swim_subscribers,
     )));
 
     registry.register(Arc::new(ReachabilitySubsystem::new(
@@ -208,6 +210,7 @@ pub async fn start_cluster_subsystems(
     transport: Arc<NexarTransport>,
     raft_multi_raft: Arc<std::sync::Mutex<crate::multi_raft::MultiRaft>>,
     catalog: &Arc<ClusterCatalog>,
+    extra_swim_subscribers: Vec<Arc<dyn MembershipSubscriber>>,
 ) -> Result<RunningCluster> {
     let health = ClusterHealth::new();
     let (decommission_signal, _) = tokio::sync::watch::channel(false);
@@ -228,7 +231,7 @@ pub async fn start_cluster_subsystems(
     ));
 
     let mut registry = SubsystemRegistry::new();
-    register_default_subsystems(&mut registry, config, &ctx, executor, catalog)?;
+    register_default_subsystems(&mut registry, config, &ctx, executor, catalog, extra_swim_subscribers)?;
 
     registry
         .start_all(&ctx)

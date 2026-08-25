@@ -56,7 +56,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// may still be live on a holder whose clock is behind ours, so it is kept
 /// while `expires_at > now - MAX_SKEW`. The trade-off (safety-first, per #246)
 /// is that a genuinely-dead lease drains up to `MAX_SKEW` later.
-const MAX_SKEW_NS: u64 = 300_000_000_000;
+pub(crate) const MAX_SKEW_NS: u64 = 300_000_000_000;
 
 /// Grace period added on top of the configured lease duration
 /// when computing the `expires_at` stamped onto a drain entry.

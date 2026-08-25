@@ -4,12 +4,18 @@
 //!
 //! A crashed node's leases are never TTL-pruned from `MetadataCache.leases`
 //! (only a `DescriptorLeaseRelease` entry removes them), so every DDL drain
-//! on those descriptors times out forever. Two triggers run this module:
-//! the `TopologyChange::Leave` apply hook (immediate) and the metadata
-//! leader's periodic sweep (safety net).
+//! on those descriptors times out forever. Three triggers run this module:
+//! the SWIM-Dead subscriber hook (immediate on confirmed crash),
+//! the `TopologyChange::Leave` apply hook (immediate on graceful leave) and
+//! the metadata leader's periodic sweep (safety net).
 
-use nodedb_cluster::DescriptorId;
+use std::sync::{Arc, Weak};
 
+use nodedb_cluster::{DescriptorId, DescriptorLease, MemberState, MembershipSubscriber};
+use nodedb_types::NodeId;
+use tracing::{debug, warn};
+
+use crate::control::lease::drain_propose::MAX_SKEW_NS;
 use crate::control::lease::release::LeaseReleaseHandle;
 use crate::control::state::SharedState;
 
@@ -49,6 +55,23 @@ pub(crate) fn collect_non_member_leases(shared: &SharedState) -> Vec<(u64, Vec<D
 /// periodic sweep). Blocks on the local applied watermark like the
 /// normal release path; callers on hot paths must spawn this.
 pub(crate) fn gc_leases_for_node(shared: &SharedState, node_id: u64) -> Result<(), crate::Error> {
+    gc_leases_for_node_if(shared, node_id, |_| true)
+}
+
+/// Like [`gc_leases_for_node`], but only for leases accepted by `filter`.
+///
+/// The filter runs on each lease value before the release proposal, so a
+/// caller (e.g. the SWIM-Dead hook) can apply a grace window without
+/// duplicating the collection logic. [`gc_leases_for_node`] is the
+/// always-true case.
+pub(crate) fn gc_leases_for_node_if<F>(
+    shared: &SharedState,
+    node_id: u64,
+    filter: F,
+) -> Result<(), crate::Error>
+where
+    F: Fn(&DescriptorLease) -> bool,
+{
     let ids: Vec<DescriptorId> = {
         let cache = shared
             .metadata_cache
@@ -56,15 +79,97 @@ pub(crate) fn gc_leases_for_node(shared: &SharedState, node_id: u64) -> Result<(
             .unwrap_or_else(|p| p.into_inner());
         cache
             .leases
-            .keys()
-            .filter(|(_, holder)| *holder == node_id)
-            .map(|(id, _)| id.clone())
+            .iter()
+            .filter(|(_, l)| l.node_id == node_id && filter(l))
+            .map(|((id, _), _)| id.clone())
             .collect()
     };
     if ids.is_empty() {
         return Ok(());
     }
     LeaseReleaseHandle::from_shared(shared).release_for_node(node_id, ids)
+}
+
+// ---------------------------------------------------------------------------
+// SWIM-Dead → lease release hook
+// ---------------------------------------------------------------------------
+
+/// Parse a SWIM `NodeId` (a decimal string in production) into its numeric
+/// form. `seed:…` placeholder ids and any other non-numeric id are skipped
+/// with a debug log — they cannot name a lease holder.
+fn parse_swim_node_id(node_id: &NodeId) -> Option<u64> {
+    match node_id.as_str().parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            debug!(node_id = %node_id, "lease GC: skipping non-numeric SWIM node id");
+            None
+        }
+    }
+}
+
+/// Grace-window predicate: release only leases expiring within [`MAX_SKEW_NS`]
+/// of `now` (including already-expired ones). A false-positive Dead (a
+/// live-but-partitioned node) must not yank a fresh lease; leases beyond the
+/// window are left to the periodic sweep, which only acts once the node
+/// remains a non-member.
+fn near_expiry_filter(now_wall_ns: u64, expires_at: &nodedb_types::Hlc) -> bool {
+    expires_at.wall_ns <= now_wall_ns.saturating_add(MAX_SKEW_NS)
+}
+
+/// Subscriber that triggers lease GC the moment SWIM confirms a member Dead.
+///
+/// Mirrors the `TopologyChange::Leave` apply hook in `dispatch.rs`: the GC is
+/// spawned, never run inline (an inline propose-and-wait would deadlock the
+/// applied-index watcher), gated on [`SharedState::is_singleton_worker`], and
+/// the hook holds only a `Weak<SharedState>` so it never keeps the process
+/// alive at shutdown.
+pub(crate) struct LeaseGcOnCrashHook {
+    shared: Weak<SharedState>,
+}
+
+impl LeaseGcOnCrashHook {
+    pub(crate) fn new(shared: &Arc<SharedState>) -> Self {
+        Self {
+            shared: Arc::downgrade(shared),
+        }
+    }
+
+    /// Pure decision: which node, if any, this transition should trigger GC
+    /// for. Split out for deterministic unit testing without spawning.
+    fn should_release(&self, node_id: &NodeId, new: MemberState) -> Option<u64> {
+        if new != MemberState::Dead {
+            return None;
+        }
+        parse_swim_node_id(node_id)
+    }
+}
+
+impl MembershipSubscriber for LeaseGcOnCrashHook {
+    fn on_state_change(&self, node_id: &NodeId, _old: Option<MemberState>, new: MemberState) {
+        let Some(node_id) = self.should_release(node_id, new) else {
+            return;
+        };
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            // Only the metadata-leader-or-standalone worker performs GC
+            // (mirrors the Leave hook's guard).
+            if !shared.is_singleton_worker() {
+                return;
+            }
+            let now_wall_ns = crate::control::lease::wall_now_ns();
+            if let Err(e) = gc_leases_for_node_if(&shared, node_id, |l| {
+                near_expiry_filter(now_wall_ns, &l.expires_at)
+            }) {
+                warn!(
+                    node_id,
+                    error = %e,
+                    "lease GC after SWIM Dead failed; periodic sweep will retry"
+                );
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +343,109 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parse_swim_node_id_numeric_only() {
+        let numeric = nodedb_types::NodeId::try_new("42").expect("valid id");
+        assert_eq!(parse_swim_node_id(&numeric), Some(42));
+
+        let seed = nodedb_types::NodeId::try_new("seed:127.0.0.1:9000").expect("valid id");
+        assert_eq!(parse_swim_node_id(&seed), None);
+
+        let junk = nodedb_types::NodeId::try_new("not-a-number").expect("valid id");
+        assert_eq!(parse_swim_node_id(&junk), None);
+    }
+
+    #[test]
+    fn near_expiry_filter_uses_max_skew_window() {
+        let now = 1_000_000_000_000_000u64;
+        // Already expired → within the window → release.
+        assert!(near_expiry_filter(now, &nodedb_types::Hlc::new(now - 100_000_000, 0)));
+        // Expiring exactly at the window edge → release.
+        assert!(near_expiry_filter(now, &nodedb_types::Hlc::new(now + MAX_SKEW_NS, 0)));
+        // Expiring beyond the window → spare (sweep's job).
+        assert!(!near_expiry_filter(now, &nodedb_types::Hlc::new(now + MAX_SKEW_NS + 1, 0)));
+    }
+
+    #[test]
+    fn hook_releases_only_on_dead() {
+        let (state, _directory) = test_state();
+        let hook = LeaseGcOnCrashHook::new(&state);
+        let node = nodedb_types::NodeId::try_new("42").expect("valid id");
+
+        assert_eq!(hook.should_release(&node, MemberState::Alive), None);
+        assert_eq!(hook.should_release(&node, MemberState::Suspect), None);
+        assert_eq!(hook.should_release(&node, MemberState::Left), None);
+        assert_eq!(hook.should_release(&node, MemberState::Dead), Some(42));
+
+        // Dead with a non-numeric id (seed placeholder) → no target.
+        let seed = nodedb_types::NodeId::try_new("seed:127.0.0.1:9000").expect("valid id");
+        assert_eq!(hook.should_release(&seed, MemberState::Dead), None);
+    }
+
+    /// The grace-window filter is applied at collection time: a near-expiry
+    /// lease of the dead node is released, a fresh lease held by the same
+    /// node is spared.
+    #[test]
+    fn gc_leases_for_node_if_applies_grace_window() {
+        let (state, _directory) = test_state();
+        let watcher = state.applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID);
+        let proposer = Arc::new(RecordingProposer {
+            proposed: std::sync::Mutex::new(Vec::new()),
+            watcher: Arc::clone(&watcher),
+        });
+        state
+            .metadata_raft
+            .set(proposer.clone())
+            .unwrap_or_else(|_| panic!("metadata raft handle already set in test"));
+
+        let now_wall_ns = crate::control::lease::wall_now_ns();
+        let near = id("near");
+        state
+            .metadata_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .leases
+            .insert(
+                (near.clone(), 42),
+                nodedb_cluster::DescriptorLease {
+                    descriptor_id: near.clone(),
+                    version: 1,
+                    node_id: 42,
+                    // Already expired in wall time → inside the grace window.
+                    expires_at: nodedb_types::Hlc::new(now_wall_ns, 0),
+                },
+            );
+        let fresh = id("fresh");
+        state
+            .metadata_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .leases
+            .insert(
+                (fresh.clone(), 42),
+                nodedb_cluster::DescriptorLease {
+                    descriptor_id: fresh.clone(),
+                    version: 1,
+                    node_id: 42,
+                    // 1000s ahead → beyond MAX_SKEW → spared.
+                    expires_at: nodedb_types::Hlc::new(now_wall_ns.saturating_add(1_000_000_000_000), 0),
+                },
+            );
+
+        gc_leases_for_node_if(&state, 42, |l| near_expiry_filter(now_wall_ns, &l.expires_at))
+            .expect("grace-window GC");
+
+        let proposed = proposer.proposed.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(proposed.len(), 1);
+        let entry = decode_entry(&proposed[0]).expect("decode proposed entry");
+        assert!(matches!(
+            entry,
+            MetadataEntry::DescriptorLeaseRelease {
+                node_id: 42,
+                ref descriptor_ids,
+            } if descriptor_ids == &vec![near]
+        ));
     }
 }

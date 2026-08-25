@@ -165,6 +165,14 @@ pub(super) fn build_raft_loop(
         scheduler_config: &scheduler_config,
     })?;
 
+    // SWIM-Dead → lease GC hook: release a crashed node's leases the moment
+    // SWIM confirms it Dead (grace-windowed), instead of waiting for the
+    // metadata leader's periodic sweep.
+    let extra_swim_subscribers: Vec<std::sync::Arc<dyn nodedb_cluster::MembershipSubscriber>> =
+        vec![std::sync::Arc::new(
+            crate::control::lease::gc::LeaseGcOnCrashHook::new(&shared),
+        )];
+
     let running = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(nodedb_cluster::start_cluster_subsystems(
             &pending.config,
@@ -173,6 +181,7 @@ pub(super) fn build_raft_loop(
             Arc::clone(&handle.transport),
             raft_loop_handle,
             &handle.catalog,
+            extra_swim_subscribers,
         ))
     })
     .map_err(|e| crate::Error::Config {
