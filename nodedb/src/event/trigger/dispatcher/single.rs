@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
@@ -25,6 +25,7 @@ use crate::control::trigger::TriggerScope;
 use crate::control::trigger::fire;
 use crate::control::trigger::fire_common::{FireErrorPolicy, FireReport};
 use crate::control::trigger::fire_statement::{FireAfterStatementParams, fire_after_statement};
+use crate::control::system_txn::{SystemTxnScope, commit_scope, rollback_scope};
 use crate::control::trigger::row_identity::inject_row_identity;
 use crate::event::action::ActionRetryQueue;
 use crate::event::types::{EventSource, WriteEvent, WriteOp, deserialize_event_payload};
@@ -61,6 +62,26 @@ pub async fn dispatch_triggers(
 
     let identity = trigger_identity(event.tenant_id);
     let op_str = event.op.to_string();
+
+    // System-transaction scope for the Event-Plane ASYNC fire path: every
+    // body fired by this event stages into ONE transaction, so a mid-body
+    // failure rolls back the whole event (all-or-nothing + retry-safe).
+    // Sync and DEFERRED fires must NOT be wrapped — they already run inside
+    // the client's transaction.
+    let system_scope = if event.source == EventSource::User {
+        match SystemTxnScope::begin(state) {
+            Ok(scope) => Some(Arc::new(scope)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "trigger dispatch: system txn begin failed; firing without atomicity"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let source = ActionSource {
         database_id: event.database_id,
         tenant_id: event.tenant_id.as_u64(),
@@ -84,6 +105,7 @@ pub async fn dispatch_triggers(
         WriteOp::BulkInsert { .. } | WriteOp::BulkDelete { .. }
     );
 
+    let mut row_failed = false;
     if !is_bulk {
         let report = fire_for_operation(FireForOperationParams {
             operation: &op_str,
@@ -104,8 +126,10 @@ pub async fn dispatch_triggers(
             }),
             on_error: FireErrorPolicy::Continue,
             only_trigger: None,
+            system_scope: system_scope.clone(),
         })
         .await;
+        row_failed = report.has_failure();
         record_row_failures(
             &source,
             report,
@@ -133,9 +157,23 @@ pub async fn dispatch_triggers(
         mode_filter,
         on_error: FireErrorPolicy::Continue,
         only_trigger: None,
+        system_scope: system_scope.clone(),
     })
     .await;
+    let stmt_failed = report.has_failure();
     record_statement_failures(&source, report, queue);
+
+    if let Some(ref scope) = system_scope {
+        if row_failed || stmt_failed {
+            rollback_scope(scope, &identity, state, event.source).await;
+            trace!(
+                collection = %event.collection,
+                "trigger body failed; fired-event system transaction rolled back"
+            );
+        } else if let Err(e) = commit_scope(scope, &identity, state, event.source).await {
+            warn!(error = %e, "trigger fired-event system transaction commit failed");
+        }
+    }
 }
 
 /// Decode one side of an event payload into trigger row bindings.
@@ -191,6 +229,8 @@ pub(super) struct FireForOperationParams<'a> {
     /// Source-write context, so a trigger body writing to a remote-homed
     /// collection is dispatched to the owning node instead of the local core.
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// System transaction scope (Event-Plane fire path); `None` otherwise.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
     /// Restricts firing to the one named trigger; `None` fires every match.
@@ -214,6 +254,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        system_scope,
         on_error,
         only_trigger,
     } = params;
@@ -231,6 +272,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cascade_depth,
                     mode_filter,
                     cross_shard_origin,
+        system_scope,
                     on_error,
                     only_trigger,
                 })
@@ -251,6 +293,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cascade_depth,
                     mode_filter,
                     cross_shard_origin,
+        system_scope,
                     on_error,
                     only_trigger,
                 })
@@ -270,6 +313,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cascade_depth,
                     mode_filter,
                     cross_shard_origin,
+        system_scope,
                     on_error,
                     only_trigger,
                 })

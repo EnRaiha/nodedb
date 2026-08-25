@@ -14,6 +14,8 @@
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::CrossShardOrigin;
+use crate::control::system_txn::SystemTxnScope;
+use std::sync::Arc;
 use crate::control::security::catalog::trigger_types::{TriggerExecutionMode, TriggerTiming};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -46,6 +48,8 @@ pub struct FireAfterInsertParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// System transaction scope (Event-Plane fire path); `None` otherwise.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
     /// Restricts firing to the one named trigger; `None` fires every match.
@@ -76,6 +80,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport 
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        system_scope,
         on_error,
         only_trigger,
     } = params;
@@ -113,6 +118,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport 
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        system_scope,
         on_error,
     })
     .await
@@ -140,6 +146,8 @@ pub struct FireAfterUpdateParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// System transaction scope (Event-Plane fire path); `None` otherwise.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
     /// Restricts firing to the one named trigger; `None` fires every match.
@@ -165,6 +173,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> FireReport 
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        system_scope,
         on_error,
         only_trigger,
     } = params;
@@ -202,6 +211,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> FireReport 
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        system_scope,
         on_error,
     })
     .await
@@ -227,6 +237,8 @@ pub struct FireAfterDeleteParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// Cross-shard origin context (Event-Plane fire path only).
     pub cross_shard_origin: Option<CrossShardOrigin>,
+    /// System transaction scope (Event-Plane fire path); `None` otherwise.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
     /// Restricts firing to the one named trigger; `None` fires every match.
@@ -250,6 +262,7 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> FireReport 
         cascade_depth,
         mode_filter,
         cross_shard_origin,
+        system_scope,
         on_error,
         only_trigger,
     } = params;
@@ -287,6 +300,7 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> FireReport 
         bindings: &bindings,
         cascade_depth,
         cross_shard_origin,
+        system_scope,
         on_error,
     })
     .await

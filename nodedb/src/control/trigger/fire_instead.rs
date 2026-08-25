@@ -76,6 +76,7 @@ pub async fn fire_instead_of_insert(
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
         on_error: FireErrorPolicy::Abort,
+        system_scope: None,
     })
     .await
     .into_result()?;
@@ -150,6 +151,7 @@ pub async fn fire_instead_of_update(
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
         on_error: FireErrorPolicy::Abort,
+        system_scope: None,
     })
     .await
     .into_result()?;
@@ -199,6 +201,7 @@ pub async fn fire_instead_of_delete(
         // they are not part of the Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
         on_error: FireErrorPolicy::Abort,
+        system_scope: None,
     })
     .await
     .into_result()?;

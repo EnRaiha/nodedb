@@ -227,6 +227,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                     new_fields,
                     cascade_depth,
                     mode_filter: Some(TriggerExecutionMode::Sync),
+                system_scope: None,
                     // SYNC post-dispatch triggers run in the Control-Plane write
                     // path (no source-write LSN/HWM identity); cross-shard
                     // origination for this path is a tracked follow-up.
@@ -251,6 +252,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 new_fields,
                 cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Sync),
+                system_scope: None,
                 cross_shard_origin: None,
                 on_error: FireErrorPolicy::Abort,
                 only_trigger: None,
@@ -269,6 +271,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 old_fields,
                 cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Sync),
+                system_scope: None,
                 cross_shard_origin: None,
                 on_error: FireErrorPolicy::Abort,
                 only_trigger: None,
@@ -290,6 +293,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
         event: info.event,
         cascade_depth,
         mode_filter: Some(TriggerExecutionMode::Sync),
+                system_scope: None,
         on_error: FireErrorPolicy::Abort,
         only_trigger: None,
     })

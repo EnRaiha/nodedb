@@ -5,6 +5,7 @@
 //! Used by BEFORE, AFTER, and INSTEAD OF trigger fire paths.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tracing::{info, warn};
 
@@ -12,6 +13,7 @@ use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::{
     CrossShardOrigin, MAX_CASCADE_DEPTH, StatementExecutor,
 };
+use crate::control::system_txn::SystemTxnScope;
 use crate::control::security::catalog::trigger_types::{StoredTrigger, TriggerSecurity};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
@@ -52,6 +54,11 @@ pub struct FireTriggersParams<'a> {
     pub cross_shard_origin: Option<CrossShardOrigin>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
+    /// System transaction scope for the Event-Plane fire path. When set,
+    /// every body's DML stages into this scope — all-or-nothing per fired
+    /// event, and cascade (nested) executors inherit the same scope. `None`
+    /// for the in-transaction sync/deferred paths.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
 }
 
 /// What happens to the remaining triggers when one of them fails.
@@ -106,6 +113,13 @@ impl FireReport {
         self.refusal.as_ref()
     }
 
+    /// Non-consuming check: did the pass refuse, or did any trigger fail?
+    /// (The Event-Plane dispatcher uses this to decide system-txn commit vs
+    /// rollback BEFORE the report is consumed by the retry queue.)
+    pub fn has_failure(&self) -> bool {
+        self.refusal.is_some() || self.outcomes.iter().any(|outcome| outcome.error.is_some())
+    }
+
     /// Every trigger that failed, in registration order. A refused pass
     /// yields nothing — no individual trigger ran.
     pub fn into_failures(self) -> impl Iterator<Item = TriggerOutcome> {
@@ -146,6 +160,7 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> FireReport {
         cascade_depth,
         cross_shard_origin,
         on_error,
+        system_scope,
     } = params;
 
     let mut report = FireReport::default();
@@ -194,6 +209,11 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> FireReport {
         );
         if let Some(ref origin) = cross_shard_origin {
             executor = executor.with_cross_shard_origin(origin.clone());
+        }
+        if let Some(ref system_scope) = system_scope {
+            // Cascade inheritance (Gap 2): a body's DML that fires another
+            // trigger must stage into the SAME system transaction.
+            executor = executor.with_system_scope(Arc::clone(system_scope));
         }
 
         let error = executor

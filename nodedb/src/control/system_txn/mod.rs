@@ -13,5 +13,7 @@ mod data_plane;
 mod run;
 mod scope;
 
-pub use self::run::{SystemTxnError, run_tasks_atomically};
+pub use self::run::{
+    SystemTxnError, commit_scope, push_task_into_scope, rollback_scope, run_tasks_atomically,
+};
 pub use self::scope::SystemTxnScope;

@@ -174,6 +174,7 @@ pub async fn fire_before_delete(
         // Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
         on_error: FireErrorPolicy::Abort,
+        system_scope: None,
     })
     .await
     .into_result()

@@ -17,6 +17,8 @@ use super::fire_common::{
 };
 use super::registry::DmlEvent;
 use crate::control::planner::procedural::executor::bindings::RowBindings;
+use crate::control::system_txn::SystemTxnScope;
+use std::sync::Arc;
 use crate::control::security::catalog::trigger_types::{
     TriggerExecutionMode, TriggerGranularity, TriggerTiming,
 };
@@ -41,6 +43,8 @@ pub struct FireAfterStatementParams<'a> {
     pub mode_filter: Option<TriggerExecutionMode>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
+    /// System transaction scope (Event-Plane fire path); `None` otherwise.
+    pub system_scope: Option<Arc<SystemTxnScope>>,
     /// Restricts firing to the one named trigger; `None` fires every match.
     ///
     /// A retry sets this so it re-runs only the trigger that failed.
@@ -68,6 +72,7 @@ pub async fn fire_after_statement(params: FireAfterStatementParams<'_>) -> FireR
         cascade_depth,
         mode_filter,
         on_error,
+        system_scope,
         only_trigger,
     } = params;
     let triggers = state.trigger_registry.get_matching(
@@ -108,6 +113,7 @@ pub async fn fire_after_statement(params: FireAfterStatementParams<'_>) -> FireR
         // cross-shard sender path (see tracked follow-up).
         cross_shard_origin: None,
         on_error,
+        system_scope,
     })
     .await
 }

@@ -109,6 +109,7 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
                     source_collection: action.context.collection.clone(),
                 }),
                 on_error: FireErrorPolicy::Abort,
+                system_scope: None,
                 only_trigger: Some(trigger_name),
             })
             .await
@@ -134,6 +135,7 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
                 cascade_depth: action.context.cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Async),
                 on_error: FireErrorPolicy::Abort,
+                system_scope: None,
                 only_trigger: Some(trigger_name),
             })
             .await

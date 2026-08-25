@@ -115,6 +115,8 @@ pub async fn dispatch_trigger_batch(
                 // available here; see the tracked follow-up.
                 cross_shard_origin: None,
                 on_error: fire_common::FireErrorPolicy::Abort,
+                // Batch path is not wired into the production consumer loop.
+                system_scope: None,
             })
             .await;
 

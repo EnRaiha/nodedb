@@ -2,6 +2,9 @@
 
 //! An owned transaction block for work the database initiates itself.
 
+use std::sync::Arc;
+
+use crate::control::lease::QueryLeaseScope;
 use crate::control::server::shared::session::{DmlTxnCtx, SessionId, SessionStore};
 use crate::control::state::SharedState;
 
@@ -13,6 +16,12 @@ use crate::control::state::SharedState;
 pub struct SystemTxnScope {
     sessions: SessionStore,
     session_id: SessionId,
+    /// Lease scopes retained by statement-serial planning (procedural trigger
+    /// bodies). Each buffered task's `QueryLeaseScope` must stay alive until
+    /// COMMIT finishes the version fence; the scope owns them so a per-statement
+    /// `Arc` cannot drop early. `Mutex` because the scope is shared as an
+    /// `Arc<SystemTxnScope>` between the executor and the commit path.
+    lease_scopes: std::sync::Mutex<Vec<Arc<QueryLeaseScope>>>,
 }
 
 impl SystemTxnScope {
@@ -48,6 +57,7 @@ impl SystemTxnScope {
         Ok(Self {
             sessions,
             session_id,
+            lease_scopes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -65,5 +75,17 @@ impl SystemTxnScope {
 
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// Retain a plan lease scope until the scope's COMMIT finishes the
+    /// version fence. Statement-serial planning (procedural trigger bodies)
+    /// acquires one `Arc<QueryLeaseScope>` per statement; without retention
+    /// the Arc would drop when the statement returns and the COMMIT fence
+    /// would lose the versions it must compare.
+    pub fn retain_lease_scope(&self, lease_scope: Arc<QueryLeaseScope>) {
+        self.lease_scopes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(lease_scope);
     }
 }

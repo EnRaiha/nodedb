@@ -59,6 +59,12 @@ pub struct StatementExecutor<'a> {
     /// Arc<Mutex> required (not RefCell) because execute_statement returns `+ Send` futures.
     pub(super) new_mutations: Arc<Mutex<HashMap<String, nodedb_types::Value>>>,
     pub(super) tx_ctx: Option<Arc<Mutex<ProcedureTransactionCtx>>>,
+    /// System transaction scope for the Event-Plane trigger fire path.
+    /// When set, `execute_sql` stages every task into this scope
+    /// (all-or-nothing per fired body) instead of dispatching immediately.
+    /// Nested (cascade) executors inherit the same scope so one failed body
+    /// rolls back every body the cascade touched.
+    pub(super) system_scope: Option<Arc<crate::control::system_txn::SystemTxnScope>>,
     pub(super) out_values: Arc<Mutex<HashMap<String, nodedb_types::Value>>>,
     /// Cross-shard origin context; `Some` only in the Event-Plane trigger fire
     /// path. Gates remote-write dispatch in `execute_sql`.
@@ -127,6 +133,7 @@ impl<'a> StatementExecutor<'a> {
             event_source,
             new_mutations: Arc::new(Mutex::new(HashMap::new())),
             tx_ctx: None,
+            system_scope: None,
             out_values: Arc::new(Mutex::new(HashMap::new())),
             cross_shard_origin: None,
         }
@@ -135,6 +142,14 @@ impl<'a> StatementExecutor<'a> {
     /// Enable procedure transaction context for COMMIT/ROLLBACK/SAVEPOINT.
     pub fn with_transaction_context(mut self) -> Self {
         self.tx_ctx = Some(Arc::new(Mutex::new(ProcedureTransactionCtx::new())));
+        self
+    }
+
+    /// Stage every statement's tasks into `scope` instead of dispatching
+    /// immediately. Used by the Event-Plane trigger fire path so a body is
+    /// all-or-nothing; nested cascade executors share the same scope.
+    pub fn with_system_scope(mut self, scope: Arc<crate::control::system_txn::SystemTxnScope>) -> Self {
+        self.system_scope = Some(scope);
         self
     }
 

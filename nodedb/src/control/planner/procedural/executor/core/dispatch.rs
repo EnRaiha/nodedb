@@ -102,7 +102,24 @@ impl<'a> StatementExecutor<'a> {
             })
             .await?;
 
-        if let Some(ref tx_ctx) = self.tx_ctx {
+        if let Some(ref system_scope) = self.system_scope {
+            // System-transaction mode (Event-Plane trigger fire): stage every
+            // task into the active scope instead of dispatching immediately.
+            // All statements of the fired body commit or roll back together;
+            // the scope retains each plan's lease scope until COMMIT.
+            let lease_scope = std::sync::Arc::new(lease_scope);
+            for task in tasks {
+                crate::control::system_txn::push_task_into_scope(
+                    system_scope,
+                    self.state,
+                    task,
+                    std::sync::Arc::clone(&lease_scope),
+                    self.event_source,
+                )
+                .await
+                .map_err(|e| crate::Error::BadRequest { detail: e.to_string() })?;
+            }
+        } else if let Some(ref tx_ctx) = self.tx_ctx {
             let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
             guard.buffer_statement(tasks, lease_scope);
         } else {

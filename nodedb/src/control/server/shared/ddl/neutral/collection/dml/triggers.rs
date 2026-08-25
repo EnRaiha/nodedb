@@ -31,6 +31,7 @@ pub(super) async fn fire_sync_after_triggers(
             new_fields: fields,
             cascade_depth: 0,
             mode_filter: Some(TriggerExecutionMode::Sync),
+            system_scope: None,
             // SYNC AFTER triggers fire in the Control-Plane write path, which
             // has no source-write LSN/HWM identity; cross-shard origination for
             // this path is a tracked follow-up.
@@ -73,6 +74,7 @@ pub(super) async fn fire_sync_after_update_triggers(
             new_fields,
             cascade_depth: 0,
             mode_filter: Some(TriggerExecutionMode::Sync),
+            system_scope: None,
             // SYNC AFTER triggers run in the Control-Plane write path (no
             // source-write LSN/HWM identity); cross-shard origination here is a
             // tracked follow-up.
