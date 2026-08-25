@@ -309,6 +309,10 @@ debug = "line-tables-only"
 # builds; when you need to debug, build with `--profile debugging`, which keeps
 # full symbols (see below).
 strip = true
+# Incremental caches buy little here and cost tens of GB. The dominant build cost
+# is linking one binary per test file, which incremental does not help, and the
+# cache is discarded every time target/ is cleared for space.
+incremental = false
 
 [profile.dev.package."*"]
 debug = false
