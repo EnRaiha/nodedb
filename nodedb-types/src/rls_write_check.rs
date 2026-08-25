@@ -2,26 +2,17 @@
 
 //! The compiled row-level-security WRITE predicate carried on a write plan.
 //!
-//! This type exists because a bare `Vec<u8>` could not tell two very
-//! different things apart:
+//! A bare `Vec<u8>` could not separate "no policy restricts this write" from
+//! "the predicate was lost in transit". Both read as empty, and the second
+//! silently disables the policy. Each value here names which case it is.
 //!
-//! - no write policy restricts this identity here, so admit every row;
-//! - a policy does restrict it, but the predicate was dropped somewhere
-//!   between the planner and the handler, so admit every row.
-//!
-//! Both read as "empty", and the second one silently disables the policy.
-//! Every value of this type names which case it is, so a lost predicate
-//! cannot be mistaken for an unrestricted write.
-//!
-//! There is deliberately no `Default`. A write plan cannot be built with an
-//! unexplained empty check.
+//! No `Default`: a write plan cannot carry an unexplained empty check.
 
 use serde::{Deserialize, Serialize};
 
 /// What the Data Plane gate must do with one write's policy check.
 ///
-/// Returned by [`RlsWriteCheck::decision`]. Matching on it is exhaustive, so
-/// a caller cannot handle the admit cases and forget the deny case.
+/// Exhaustive, so a caller cannot handle the admit cases and forget the deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteGateDecision<'a> {
     /// Admit every row without evaluating anything.
@@ -45,61 +36,48 @@ pub enum WriteGateDecision<'a> {
     zerompk::FromMessagePack,
 )]
 pub enum RlsWriteCheck {
-    /// A compiled predicate. The Data Plane decodes these bytes as
-    /// `Vec<ScanFilter>` and evaluates them against each row image.
+    /// Compiled predicate bytes, decoded as `Vec<ScanFilter>` and evaluated
+    /// against each row image.
     Predicate(Vec<u8>),
 
-    /// RLS injection ran and found no write policy restricting this identity
-    /// on this collection. Admits every row.
+    /// Injection ran and found no write policy for this identity here.
     NoPolicyApplies,
 
-    /// A follower applying a replicated write, or a WAL replay after a crash.
+    /// Follower apply, or WAL replay after a crash.
     ///
-    /// The identity that authored the write is not present here. Re-deciding
-    /// the predicate against a missing identity could deny a write the leader
-    /// already committed, which would diverge the replicas. So this admits
-    /// every row on purpose.
+    /// The authoring identity is absent, so re-deciding could deny a write the
+    /// leader already committed and diverge the replicas. Admits on purpose.
     ///
-    /// Only follower-apply and WAL-replay code may build this. Never build it
-    /// on a path that still has a live writing identity.
+    /// Only follower-apply and replay code may build this. Never build it where
+    /// a live writing identity exists.
     AlreadyDecidedElsewhere,
 
-    /// The same request already ran the write policy over this exact row
-    /// image, in the Control Plane, moments before this op was built.
-    ///
-    /// A merge's delete arm and a mirrored implicit-edge delete both work this
-    /// way: the policy admitted the row, and this op removes that same row.
-    /// The writing identity is live and known here — that is what separates
-    /// this from [`RlsWriteCheck::AlreadyDecidedElsewhere`].
+    /// This request already ran the policy over this exact row image, with a
+    /// live identity. That live identity separates it from
+    /// [`RlsWriteCheck::AlreadyDecidedElsewhere`].
     ///
     /// Only build this where the earlier decision provably covered the same
-    /// row image. If the op could touch a row the earlier check did not see,
-    /// it is not this variant.
+    /// image. If the op can touch a row that check did not see, it is not this.
     DecidedEarlierInRequest,
 
-    /// The write targets a collection NodeDB maintains for itself, which no
-    /// user can create and no policy can be attached to.
+    /// A collection NodeDB maintains for itself, which no user creates and no
+    /// policy attaches to — rate-limit bookkeeping, for example.
     ///
-    /// Rate-limit bookkeeping is the example. These writes never go through
-    /// RLS injection, so they cannot use [`RlsWriteCheck::NoPolicyApplies`],
-    /// which means injection ran and found nothing.
+    /// These never run injection, so they cannot claim `NoPolicyApplies`.
     SystemInternalCollection,
 
-    /// The plan has been built but RLS injection has not run over it yet.
+    /// Built, but injection has not run yet. Transient, Control Plane only.
     ///
-    /// This is a transient state inside the Control Plane. It must never reach
-    /// the Data Plane. If it does, the gate denies the write rather than
-    /// admitting it, so a missed injection fails loudly instead of quietly
-    /// disabling the policy.
+    /// If it reaches the gate, the write is DENIED — a missed injection fails
+    /// loudly instead of quietly disabling the policy.
     PendingInjection,
 }
 
 impl RlsWriteCheck {
     /// Build the check from the policy compiler's output.
     ///
-    /// Empty bytes mean no policy restricts this identity, and become
-    /// [`RlsWriteCheck::NoPolicyApplies`] rather than an empty predicate, so a
-    /// later reader cannot confuse "no policy" with "predicate lost".
+    /// Empty bytes become [`RlsWriteCheck::NoPolicyApplies`], never an empty
+    /// predicate, so "no policy" cannot later read as "predicate lost".
     ///
     /// Call this only from the RLS injection pass.
     pub fn from_injected(predicate_bytes: Vec<u8>) -> Self {
@@ -110,36 +88,29 @@ impl RlsWriteCheck {
         }
     }
 
-    /// The explicit bypass for a follower's replicated apply or a WAL replay.
+    /// Bypass for follower apply or WAL replay.
     ///
-    /// See [`RlsWriteCheck::AlreadyDecidedElsewhere`] for why these paths carry
-    /// no predicate. Do not use it to silence a compile error on a path that
-    /// has a live writing identity — use [`RlsWriteCheck::pending_injection`]
-    /// there instead, which fails closed.
+    /// Never use it to silence a compile error where a live writing identity
+    /// exists — [`RlsWriteCheck::pending_injection`] fails closed there.
     pub fn already_decided_elsewhere() -> Self {
         RlsWriteCheck::AlreadyDecidedElsewhere
     }
 
-    /// The bypass for an op whose rows this same request already admitted.
-    ///
-    /// See [`RlsWriteCheck::DecidedEarlierInRequest`]. Use it only when the
+    /// Bypass for rows this same request already admitted. Only when the
     /// earlier check covered the same row image.
     pub fn decided_earlier_in_request() -> Self {
         RlsWriteCheck::DecidedEarlierInRequest
     }
 
-    /// The bypass for a write to one of NodeDB's own internal collections.
-    ///
-    /// See [`RlsWriteCheck::SystemInternalCollection`].
+    /// Bypass for a write to one of NodeDB's own internal collections.
     pub fn system_internal_collection() -> Self {
         RlsWriteCheck::SystemInternalCollection
     }
 
-    /// The placeholder a plan carries between construction and injection.
+    /// Placeholder between plan construction and injection.
     ///
-    /// Safe to use wherever the correct value is not yet known: it fails
-    /// closed, and the dispatch boundary rejects any write plan still holding
-    /// it.
+    /// Safe wherever the right value is not yet known: it fails closed, and the
+    /// dispatch boundary rejects any write plan still holding it.
     pub fn pending_injection() -> Self {
         RlsWriteCheck::PendingInjection
     }
@@ -156,19 +127,15 @@ impl RlsWriteCheck {
         }
     }
 
-    /// True only when a compiled predicate is attached.
-    ///
-    /// Control Plane callers use this to ask "does a write policy restrict
-    /// this collection for this identity". It is not a gate decision — the
-    /// Data Plane uses [`RlsWriteCheck::decision`] for that.
+    /// True only when a compiled predicate is attached — "does a policy
+    /// restrict this identity here". Not a gate decision; see
+    /// [`RlsWriteCheck::decision`].
     pub fn has_predicate(&self) -> bool {
         matches!(self, RlsWriteCheck::Predicate(_))
     }
 
-    /// True while this plan has not been through RLS injection.
-    ///
-    /// The dispatch boundary uses this to refuse a write plan that would
-    /// otherwise reach the Data Plane un-injected.
+    /// True while the plan has not been through injection. The dispatch
+    /// boundary uses it to refuse un-injected writes.
     pub fn is_pending_injection(&self) -> bool {
         matches!(self, RlsWriteCheck::PendingInjection)
     }
