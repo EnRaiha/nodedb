@@ -306,6 +306,20 @@ impl CoreLoop {
                 continue;
             }
 
+            // Resolved-row-set DML (`columnar_resolved_dml`) is likewise a
+            // disjoint map shape and must be tried before the generic decode
+            // below for the same reason as the predicate-DML check above.
+            if let Some(applied) = self.try_replay_columnar_resolved_predicate_dml(
+                &record.payload,
+                record.header.tenant_id,
+                DatabaseId::new(record.header.database_id),
+                record.header.lsn,
+                tombstones,
+            ) {
+                replayed += applied;
+                continue;
+            }
+
             // Decode the record. The columnar path now uses a map-shaped
             // `ColumnarWalRecord` carrying per-row surrogates; legacy records
             // (timeseries 4-tuple, and pre-surrogate columnar 4-tuple / older

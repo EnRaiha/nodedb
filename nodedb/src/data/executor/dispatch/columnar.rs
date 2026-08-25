@@ -117,6 +117,43 @@ impl CoreLoop {
                 *count,
                 *system_as_of_ms,
             ),
+
+            ColumnarOp::ResolvedUpdate {
+                collection,
+                rows,
+                rls_write_check,
+            } => {
+                if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
+                    return r;
+                }
+                self.execute_columnar_resolved_update(task, collection, rows, rls_write_check, None)
+            }
+
+            ColumnarOp::ResolvedDelete {
+                collection,
+                pks,
+                rls_write_check,
+            } => {
+                if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
+                    return r;
+                }
+                self.execute_columnar_resolved_delete(task, collection, pks, rls_write_check, None)
+            }
+
+            ColumnarOp::ResolveDml {
+                collection,
+                filters,
+                updates,
+                is_update,
+                rls_write_check,
+            } => self.execute_columnar_resolve_dml(
+                task,
+                collection,
+                filters,
+                updates,
+                *is_update,
+                rls_write_check,
+            ),
         }
     }
 }

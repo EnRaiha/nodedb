@@ -14,9 +14,13 @@ use super::{columnar, entry::encode_provenance};
 use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TextOp, TimeseriesOp};
 
 /// Encode a `ColumnarOp` write variant into its `ReplicatedWrite` wire shape,
-/// or `None` for scans.
-pub(super) fn columnar_write(op: &ColumnarOp) -> Option<ReplicatedWrite> {
-    Some(match op {
+/// `Ok(None)` for scans, or an error when the op cannot be replicated safely.
+///
+/// `ColumnarOp::Update` / `ColumnarOp::Delete` refuse when
+/// `rls_write_check.has_predicate()` — see the arm below for why: a governed
+/// predicate DML must never cross the wire as a bare predicate.
+pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<ReplicatedWrite>> {
+    Ok(Some(match op {
         ColumnarOp::Insert {
             collection,
             payload,
@@ -34,26 +38,80 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> Option<ReplicatedWrite> {
             schema_bytes,
             encode_provenance(provenance),
         ),
-        // The compiled RLS predicate is deliberately not replicated: it was
-        // already applied by the leader that accepted this write, and it
-        // resolves against the writing identity's session, which no follower
-        // has. A follower re-evaluating it would deny writes the leader
-        // committed.
+        // The compiled RLS predicate is deliberately not replicated when NO
+        // write policy restricts this collection: there is nothing for a
+        // follower to decide either way, so re-scanning the predicate at each
+        // replica's own committed state is exactly the deterministic-replay
+        // behavior `ColumnarBulkDml` is built for.
+        //
+        // When a write policy DOES restrict this collection
+        // (`rls_write_check.has_predicate()`), shipping the bare predicate is
+        // the bug this refusal closes: a follower has no writing identity to
+        // decide the predicate against, so `ColumnarBulkDml` would either
+        // admit every row on every replica (silent bypass) or have the
+        // leader re-decide after commit and reject what followers already
+        // applied (divergence). A governed predicate DML must be resolved to
+        // a concrete row set (`ColumnarOp::ResolvedUpdate` /
+        // `ColumnarOp::ResolvedDelete`) before it reaches this encoder.
         ColumnarOp::Delete {
             collection,
             filters,
-            rls_write_check: _,
-        } => columnar::bulk_delete(collection, filters),
+            rls_write_check,
+        } => {
+            refuse_governed_predicate_dml(collection, rls_write_check)?;
+            columnar::bulk_delete(collection, filters)
+        }
         ColumnarOp::Update {
             collection,
             filters,
             updates,
-            rls_write_check: _,
-        } => columnar::bulk_update(collection, filters, updates),
+            rls_write_check,
+        } => {
+            refuse_governed_predicate_dml(collection, rls_write_check)?;
+            columnar::bulk_update(collection, filters, updates)
+        }
 
-        // Not a write — reads / scans.
-        ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => return None,
-    })
+        // The Control Plane already resolved these rows and decided the
+        // write policy against their exact images, so the wire shape carries
+        // the resolved row set — never a predicate — and needs no refusal
+        // check.
+        ColumnarOp::ResolvedUpdate {
+            collection,
+            rows,
+            rls_write_check: _,
+        } => columnar::bulk_resolved_update(collection, rows),
+        ColumnarOp::ResolvedDelete {
+            collection,
+            pks,
+            rls_write_check: _,
+        } => columnar::bulk_resolved_delete(collection, pks),
+
+        // Not a write — reads / scans. `ResolveDml` is a read too: it mutates
+        // nothing, only reports the row set a predicate DML would touch.
+        ColumnarOp::Scan { .. }
+        | ColumnarOp::MaterializeScan { .. }
+        | ColumnarOp::ResolveDml { .. } => return Ok(None),
+    }))
+}
+
+/// Refuse a predicate `UPDATE` / `DELETE` on a collection that carries an RLS
+/// write policy — see [`columnar_write`]'s `Delete` / `Update` arms for the
+/// full reasoning.
+fn refuse_governed_predicate_dml(
+    collection: &str,
+    rls_write_check: &nodedb_types::RlsWriteCheck,
+) -> crate::Result<()> {
+    if rls_write_check.has_predicate() {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "columnar predicate UPDATE/DELETE on '{collection}' cannot be replicated as a \
+                 predicate because it carries an RLS write policy: a follower has no writing \
+                 identity to evaluate the predicate against. It must be resolved to a concrete \
+                 row set before it is proposed."
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Encode a `TimeseriesOp` write variant into its `ReplicatedWrite` wire

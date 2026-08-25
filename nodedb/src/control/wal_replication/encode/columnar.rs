@@ -124,3 +124,51 @@ pub(super) fn bulk_update(
         updates: updates.to_vec(),
     }
 }
+
+/// Columnar resolved-row-set UPDATE (governed by an RLS write policy): the
+/// Control Plane already resolved the predicate to concrete rows and decided
+/// the policy against their exact post-images, so every replica applies
+/// exactly these rows and evaluates nothing.
+pub(super) fn bulk_resolved_update(
+    collection: &str,
+    rows: &[(nodedb_types::Value, Vec<nodedb_types::Value>)],
+) -> ReplicatedWrite {
+    ReplicatedWrite::ColumnarBulkDmlResolved {
+        collection: collection.to_owned(),
+        is_update: true,
+        rows: rows
+            .iter()
+            .map(|(pk, new_row)| super::super::types::ColumnarResolvedRow {
+                pk_msgpack: encode_resolved_value(pk),
+                new_row_msgpack: encode_resolved_value(&nodedb_types::Value::Array(
+                    new_row.clone(),
+                )),
+            })
+            .collect(),
+    }
+}
+
+/// Columnar resolved-row-set DELETE (governed by an RLS write policy): see
+/// [`bulk_resolved_update`].
+pub(super) fn bulk_resolved_delete(
+    collection: &str,
+    pks: &[nodedb_types::Value],
+) -> ReplicatedWrite {
+    ReplicatedWrite::ColumnarBulkDmlResolved {
+        collection: collection.to_owned(),
+        is_update: false,
+        rows: pks
+            .iter()
+            .map(|pk| super::super::types::ColumnarResolvedRow {
+                pk_msgpack: encode_resolved_value(pk),
+                new_row_msgpack: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// Encode a resolved row's `Value` for the wire. Same infallible contract as
+/// `geometry_bytes` above: a `Value` these rows carry never fails to encode.
+fn encode_resolved_value(value: &nodedb_types::Value) -> Vec<u8> {
+    nodedb_types::value_to_msgpack(value).expect("resolved row Value serialization is infallible")
+}

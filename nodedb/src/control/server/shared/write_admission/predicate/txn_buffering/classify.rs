@@ -264,12 +264,21 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
         // ---- Columnar: encoded (buffered) ----
         PhysicalPlan::Columnar(
-            ColumnarOp::Insert { .. } | ColumnarOp::Delete { .. } | ColumnarOp::Update { .. },
+            ColumnarOp::Insert { .. }
+            | ColumnarOp::Delete { .. }
+            | ColumnarOp::Update { .. }
+            | ColumnarOp::ResolvedUpdate { .. }
+            | ColumnarOp::ResolvedDelete { .. },
         ) => true,
         // ---- Columnar: reads, not encoded ----
-        PhysicalPlan::Columnar(ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. }) => {
-            false
-        }
+        // `ResolveDml` mirrors the oracle too: `to_replicated_entry` returns
+        // `None` for it (see `entry_columnar_family::columnar_write`), so it
+        // is a read here as well.
+        PhysicalPlan::Columnar(
+            ColumnarOp::Scan { .. }
+                | ColumnarOp::MaterializeScan { .. }
+                | ColumnarOp::ResolveDml { .. },
+        ) => false,
 
         // ---- Timeseries ----
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => true,
@@ -472,7 +481,9 @@ mod tests {
     }
 
     fn assert_matches_oracle(plan: &PhysicalPlan) {
-        let expected = to_replicated_entry(tenant(), db(), vshard(), plan).is_some();
+        let expected = to_replicated_entry(tenant(), db(), vshard(), plan)
+            .expect("encode must not error for this fixture")
+            .is_some();
         let actual = plan_requires_txn_buffering(plan);
         assert_eq!(
             actual, expected,
@@ -492,7 +503,9 @@ mod tests {
             "expected {plan:?} to require txn buffering"
         );
         assert!(
-            to_replicated_entry(tenant(), db(), vshard(), plan).is_none(),
+            to_replicated_entry(tenant(), db(), vshard(), plan)
+                .expect("encode must not error for this fixture")
+                .is_none(),
             "expected {plan:?} to still have no WAL encoder arm (encoder omission is a separate, undone unit)"
         );
     }
@@ -510,7 +523,9 @@ mod tests {
             "expected {plan:?} to not require txn buffering (autocommit-only)"
         );
         assert!(
-            to_replicated_entry(tenant(), db(), vshard(), plan).is_some(),
+            to_replicated_entry(tenant(), db(), vshard(), plan)
+                .expect("encode must not error for this fixture")
+                .is_some(),
             "expected {plan:?} to have a WAL encoder arm"
         );
     }
@@ -1391,6 +1406,16 @@ mod tests {
                 collection: "c".into(),
                 filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            }),
+            PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
+                collection: "c".into(),
+                rows: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
+            }),
+            PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
+                collection: "c".into(),
+                pks: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::MaterializeScan {
                 collection: "c".into(),

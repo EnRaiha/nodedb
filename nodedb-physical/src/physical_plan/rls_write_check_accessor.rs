@@ -37,6 +37,15 @@ impl PhysicalPlan {
             | PhysicalPlan::Columnar(ColumnarOp::Delete {
                 rls_write_check, ..
             })
+            | PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Columnar(ColumnarOp::ResolveDml {
+                rls_write_check, ..
+            })
             | PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 rls_write_check, ..
             })

@@ -270,10 +270,14 @@ fn columnar_routing(op: &ColumnarOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         ColumnarOp::Insert { collection, .. }
         | ColumnarOp::Update { collection, .. }
-        | ColumnarOp::Delete { collection, .. } => {
+        | ColumnarOp::Delete { collection, .. }
+        | ColumnarOp::ResolvedUpdate { collection, .. }
+        | ColumnarOp::ResolvedDelete { collection, .. } => {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
-        ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => PlanRouting::NotAWrite,
+        ColumnarOp::Scan { .. }
+        | ColumnarOp::MaterializeScan { .. }
+        | ColumnarOp::ResolveDml { .. } => PlanRouting::NotAWrite,
     }
 }
 

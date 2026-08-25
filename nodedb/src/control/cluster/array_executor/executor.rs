@@ -132,6 +132,7 @@ mod tests {
 
         let vshard_id = VShardId::new(19);
         let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
+            .expect("array write plan encode must not error")
             .expect("array write plan must be replicated");
         assert_eq!(entry.tenant_id, tenant_id.as_u64());
         assert_eq!(entry.database_id, database_id.as_u64());

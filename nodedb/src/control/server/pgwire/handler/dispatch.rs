@@ -260,6 +260,29 @@ impl NodeDbPgHandler {
             .await;
         }
 
+        // A governed columnar predicate `UPDATE`/`DELETE` — a collection
+        // carrying an RLS write policy — cannot replicate a bare predicate
+        // over Raft (`wal_replication::encode::entry_columnar_family` refuses
+        // it): a follower has no writing identity to decide `$auth.*`
+        // against. `columnar_predicate_dml_orchestrator` resolves the
+        // predicate to a concrete row set, decides the policy against those
+        // exact images while the writing identity is live, and proposes the
+        // resolved row set instead. Only routed here when a Raft proposer is
+        // actually live — on the single-node/local path the predicate
+        // reaches the Data Plane gate intact and is enforced correctly
+        // there, so resolving would only add cost.
+        if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
+            &task.plan,
+        ) && self.state.async_raft_proposer().is_some()
+        {
+            let authorized = self.authorize_for_dispatch(identity, &task)?;
+            return crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+                &self.state,
+                authorized,
+            )
+            .await;
+        }
+
         // `DROP ARRAY` must reach every Data-Plane core so each can release
         // its per-core store and remove the on-disk segment dir; otherwise
         // a follow-up `CREATE ARRAY` of the same name carries stale state.
@@ -320,7 +343,7 @@ impl NodeDbPgHandler {
                 authorized.database_id(),
                 authorized.vshard_id(),
                 authorized.plan(),
-            )
+            )?
         {
             return self
                 .dispatch_replicated_write(ReplicatedWrite {

@@ -327,7 +327,7 @@ pub async fn reissue_timeseries_durably(
             database_id,
             vshard,
             &plan,
-        )
+        )?
         .ok_or_else(|| Error::Internal {
             detail: format!(
                 "restore reissue: timeseries plan for '{collection}' did not map to a \

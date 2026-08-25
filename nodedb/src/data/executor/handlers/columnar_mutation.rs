@@ -11,7 +11,9 @@ use tracing::{debug, warn};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::columnar_read::filter::row_matches_filters;
+use crate::data::executor::handlers::columnar_resolve::{
+    ResolveUpdateRowsParams, require_pk_column_index, resolve_delete_rows, resolve_update_rows,
+};
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
 
@@ -57,22 +59,10 @@ impl CoreLoop {
         // Columnar UPDATE: scan memtable rows matching filter predicates,
         // then apply updates via PK-based MutationEngine (delete + re-insert).
         let schema = engine.schema().clone();
-        let pk_cols: Vec<usize> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .map(|(i, _)| i)
-            .collect();
-
-        if pk_cols.is_empty() {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: "columnar UPDATE requires a PRIMARY KEY column".into(),
-                },
-            );
-        }
+        let pk_col_idx = match require_pk_column_index(&schema, "UPDATE") {
+            Ok(idx) => idx,
+            Err(e) => return self.response_error(task, e),
+        };
 
         let filter_predicates: Vec<ScanFilter> = if !filter_bytes.is_empty() {
             zerompk::from_msgpack(filter_bytes).unwrap_or_default()
@@ -80,9 +70,28 @@ impl CoreLoop {
             Vec::new()
         };
 
-        // Scan memtable rows to find matches and apply updates.
-        // Collect rows to update (can't mutate while iterating).
-        let rows: Vec<Vec<nodedb_types::value::Value>> = engine.scan_memtable_rows().collect();
+        // Resolve every matching row's post-image, and let the write policy
+        // decide all of them, BEFORE any row is mutated. The post-image is what
+        // the policy governs and it exists only once the assignments have been
+        // applied, so the check cannot happen earlier — and it must happen for
+        // the whole statement before the first `engine.update`, or a rejection
+        // partway through would leave the rows ahead of it already changed with
+        // no way for the caller to see or undo that. Shared with
+        // `execute_columnar_resolve_dml`, which reports this same selection
+        // instead of applying it.
+        let pending = match resolve_update_rows(ResolveUpdateRowsParams {
+            engine,
+            schema: &schema,
+            pk_col_idx,
+            filter_predicates: &filter_predicates,
+            updates,
+            rls_write_check,
+            tid: task.request.tenant_id.as_u64(),
+            collection,
+        }) {
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // Undo capture (only on the durable COMMIT-replay path). `row_count_before`
         // is the memtable size before any replacement row is appended, so the
@@ -94,74 +103,8 @@ impl CoreLoop {
         let mut displaced: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)> = Vec::new();
         let mut restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)> = Vec::new();
 
-        // Resolve every matching row's post-image, and let the write policy
-        // decide all of them, BEFORE any row is mutated. The post-image is what
-        // the policy governs and it exists only once the assignments have been
-        // applied, so the check cannot happen earlier — and it must happen for
-        // the whole statement before the first `engine.update`, or a rejection
-        // partway through would leave the rows ahead of it already changed with
-        // no way for the caller to see or undo that.
-        let mut pending: Vec<(
-            &Vec<nodedb_types::value::Value>,
-            Vec<nodedb_types::value::Value>,
-        )> = Vec::new();
-        for row in &rows {
-            // Skip rows that don't match WHERE filters.
-            if !filter_predicates.is_empty() {
-                match row_matches_filters(row, &schema, &filter_predicates) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(_e) => {
-                        return self.response_error(task, ErrorCode::DivisionByZero);
-                    }
-                }
-            }
-            // Apply field updates to the row.
-            let mut new_row = row.clone();
-            for (field_name, value_bytes) in updates {
-                if let Some(col_idx) = schema.columns.iter().position(|c| c.name == *field_name) {
-                    let typed_val = match nodedb_types::value_from_msgpack(value_bytes) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                core = self.core_id,
-                                %collection,
-                                field = %field_name,
-                                error = %e,
-                                "columnar update: failed to decode field value as MessagePack; skipping row"
-                            );
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: format!(
-                                        "failed to decode update value for field '{field_name}': {e}"
-                                    ),
-                                },
-                            );
-                        }
-                    };
-                    new_row[col_idx] = typed_val;
-                }
-            }
-
-            if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
-                rls_write_check,
-                &new_row,
-                &schema,
-                task.request.tenant_id.as_u64(),
-                collection,
-            ) {
-                return self.response_error(task, error);
-            }
-
-            pending.push((row, new_row));
-        }
-
         let mut affected = 0u64;
-        for (row, new_row) in &pending {
-            // Extract old PK value.
-            let old_pk = &row[pk_cols[0]];
-
+        for (old_pk, new_row) in &pending {
             // Capture the pre-image BEFORE mutating (the update removes the old
             // PK binding and appends a new row): the tombstoned original's
             // location, the appended replacement's PK, and — for a PK-changing
@@ -288,22 +231,10 @@ impl CoreLoop {
         };
 
         let schema = engine.schema().clone();
-        let pk_cols: Vec<usize> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .map(|(i, _)| i)
-            .collect();
-
-        if pk_cols.is_empty() {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: "columnar DELETE requires a PRIMARY KEY column".into(),
-                },
-            );
-        }
+        let pk_col_idx = match require_pk_column_index(&schema, "DELETE") {
+            Ok(idx) => idx,
+            Err(e) => return self.response_error(task, e),
+        };
 
         let filter_predicates: Vec<ScanFilter> = if !filter_bytes.is_empty() {
             zerompk::from_msgpack(filter_bytes).unwrap_or_default()
@@ -311,35 +242,23 @@ impl CoreLoop {
             Vec::new()
         };
 
-        // Collect only the PK values of rows that match the WHERE filter
-        // (can't mutate while iterating).
-        let rows: Vec<Vec<nodedb_types::value::Value>> = engine.scan_memtable_rows().collect();
-        let mut pk_values: Vec<nodedb_types::value::Value> = Vec::new();
-        for row in &rows {
-            if !filter_predicates.is_empty() {
-                match row_matches_filters(row, &schema, &filter_predicates) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(_e) => {
-                        return self.response_error(task, ErrorCode::DivisionByZero);
-                    }
-                }
-            }
-            // The image a delete is governed by is the row it removes, and that
-            // row is only known here. Every matched row is decided before the
-            // first `engine.delete`, so a rejection removes nothing at all
-            // rather than leaving the rows ahead of it already tombstoned.
-            if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
-                rls_write_check,
-                row,
-                &schema,
-                task.request.tenant_id.as_u64(),
-                collection,
-            ) {
-                return self.response_error(task, error);
-            }
-            pk_values.push(row[pk_cols[0]].clone());
-        }
+        // The image a delete is governed by is the row it removes. Every
+        // matched row is decided before the first `engine.delete`, so a
+        // rejection removes nothing at all rather than leaving the rows ahead
+        // of it already tombstoned. Shared with `execute_columnar_resolve_dml`,
+        // which reports this same selection instead of applying it.
+        let pk_values = match resolve_delete_rows(
+            engine,
+            &schema,
+            pk_col_idx,
+            &filter_predicates,
+            rls_write_check,
+            task.request.tenant_id.as_u64(),
+            collection,
+        ) {
+            Ok(pks) => pks,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // Undo capture (only on the durable COMMIT-replay path): the location
         // and PK bytes of each tombstoned row, so the undo can clear its

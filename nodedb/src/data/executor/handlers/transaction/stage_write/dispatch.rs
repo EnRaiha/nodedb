@@ -9,7 +9,8 @@ use super::constraint::OverlayPk;
 use super::context::StageCtx;
 use super::{
     StageBulkDeleteParams, StageBulkUpdateParams, StageColumnarDeleteParams,
-    StageColumnarInsertParams, StageColumnarUpdateParams, StageSpatialInsertParams,
+    StageColumnarInsertParams, StageColumnarResolvedDeleteParams,
+    StageColumnarResolvedUpdateParams, StageColumnarUpdateParams, StageSpatialInsertParams,
     StageTimeseriesInsertParams,
 };
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
@@ -98,8 +99,42 @@ impl CoreLoop {
                 });
             }
             PhysicalPlan::Columnar(
-                ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. },
+                ColumnarOp::Scan { .. }
+                | ColumnarOp::MaterializeScan { .. }
+                | ColumnarOp::ResolveDml { .. },
             ) => return self.stage_not_point_write(task),
+            // Resolved-row-set forms of UPDATE/DELETE on a collection with a
+            // write policy: the Control Plane already resolved the predicate
+            // and decided the policy, so staging locates each shipped PK in
+            // the current BASE ∪ OVERLAY view rather than re-evaluating a
+            // predicate.
+            PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
+                collection,
+                rows,
+                rls_write_check,
+            }) => {
+                return self.stage_columnar_resolved_update(StageColumnarResolvedUpdateParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    rows,
+                    rls_write_check,
+                });
+            }
+            PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
+                collection,
+                pks,
+                rls_write_check: _,
+            }) => {
+                return self.stage_columnar_resolved_delete(StageColumnarResolvedDeleteParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    pks,
+                });
+            }
             PhysicalPlan::Spatial(SpatialOp::Insert {
                 collection,
                 field,

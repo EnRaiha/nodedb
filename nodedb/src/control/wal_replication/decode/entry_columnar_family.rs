@@ -79,6 +79,11 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             is_update,
             updates,
         } => Ok(columnar::bulk_dml(collection, filters, *is_update, updates)),
+        ReplicatedWrite::ColumnarBulkDmlResolved {
+            collection,
+            is_update,
+            rows,
+        } => columnar::bulk_dml_resolved(collection, *is_update, rows),
         _ => Err(crate::Error::Internal {
             detail: "entry_columnar_family::decode_arm called with a non-columnar-family \
                 ReplicatedWrite variant (dispatch bug in decode/entry.rs's grouped \

@@ -166,7 +166,8 @@ fn to_physical_plan(
         | ReplicatedWrite::FtsDelete { .. }
         | ReplicatedWrite::SpatialInsert { .. }
         | ReplicatedWrite::SpatialDelete { .. }
-        | ReplicatedWrite::ColumnarBulkDml { .. } => {
+        | ReplicatedWrite::ColumnarBulkDml { .. }
+        | ReplicatedWrite::ColumnarBulkDmlResolved { .. } => {
             Ok((entry_columnar_family::decode_arm(write)?, None))
         }
         // Raft-native array cell writes (`PhysicalPlan::Array`) — the cluster

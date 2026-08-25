@@ -212,6 +212,58 @@ pub(crate) fn encode_columnar_dml_payload(
     })
 }
 
+/// Encode the payload of a `TimeseriesBatch` WAL record for a columnar
+/// resolved-row-set DML (`ColumnarOp::ResolvedUpdate` /
+/// `ColumnarOp::ResolvedDelete`).
+///
+/// Produces the map-shaped
+/// [`nodedb_types::columnar::ColumnarResolvedDmlWalRecord`] with `kind =
+/// "columnar_resolved_dml"`, carrying the concrete row images the Control
+/// Plane already resolved and decided against the write policy — never a
+/// predicate. `updates` carries `Vec::new()` for a delete row.
+pub(crate) fn encode_columnar_resolved_dml_payload(
+    collection: &str,
+    is_update: bool,
+    rows: &[(nodedb_types::Value, Vec<nodedb_types::Value>)],
+    pks: &[nodedb_types::Value],
+) -> crate::Result<Vec<u8>> {
+    let to_msgpack = |v: &nodedb_types::Value| {
+        nodedb_types::value_to_msgpack(v).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal columnar resolved dml row: {e}"),
+        })
+    };
+    let wal_rows = if is_update {
+        rows.iter()
+            .map(|(pk, new_row)| {
+                Ok(nodedb_types::columnar::ColumnarResolvedDmlWalRow {
+                    pk_msgpack: to_msgpack(pk)?,
+                    new_row_msgpack: to_msgpack(&nodedb_types::Value::Array(new_row.clone()))?,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+    } else {
+        pks.iter()
+            .map(|pk| {
+                Ok(nodedb_types::columnar::ColumnarResolvedDmlWalRow {
+                    pk_msgpack: to_msgpack(pk)?,
+                    new_row_msgpack: Vec::new(),
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+    };
+    let record = nodedb_types::columnar::ColumnarResolvedDmlWalRecord {
+        kind: "columnar_resolved_dml".to_string(),
+        collection: collection.to_string(),
+        is_update,
+        rows: wal_rows,
+    };
+    zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal columnar resolved dml: {e}"),
+    })
+}
+
 /// Record-level fields for a columnar WAL append.
 ///
 /// Groups the collection identity, row payload, sync provenance, and

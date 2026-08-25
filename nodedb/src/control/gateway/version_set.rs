@@ -300,6 +300,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | Insert { collection, .. }
                 | Update { collection, .. }
                 | Delete { collection, .. }
+                | ResolvedUpdate { collection, .. }
+                | ResolvedDelete { collection, .. }
+                | ResolveDml { collection, .. }
                 | MaterializeScan { collection, .. } => out.push(collection.clone()),
             }
         }

@@ -323,6 +323,46 @@ pub async fn query(
                 continue;
             }
 
+            // A governed columnar predicate `UPDATE`/`DELETE` (RLS write
+            // policy + live Raft proposer) is resolved to a concrete row set
+            // on the Control Plane before it is proposed. The orchestrator
+            // issues its own write, so the per-task WAL append below is
+            // skipped for it. On the local (non-Raft) path the predicate
+            // reaches the Data Plane gate intact and is enforced correctly
+            // there, so this intercept is skipped in that case.
+            if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
+                &task.plan,
+            ) && state.shared.async_raft_proposer().is_some()
+            {
+                let plan_kind = describe_plan(&task.plan);
+                let plan_for_shape = task.plan.clone();
+                let resp = crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+                    &state.shared,
+                    authorized_task,
+                )
+                .await
+                .map_err(gateway_error)?;
+                append_response(
+                    &mut result_rows,
+                    resp,
+                    ShapedAppend {
+                        plan: &plan_for_shape,
+                        plan_kind,
+                        output_schema: &output_schema,
+                        state: &state,
+                        database_id,
+                        tenant_id,
+                        redaction: &QueryRedaction::for_plan(
+                            tenant_id,
+                            scope.auth(),
+                            &plan_for_shape,
+                        ),
+                    },
+                )?;
+                meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
+                continue;
+            }
+
             // Captured before dispatch moves `task.plan` — needed by the
             // protocol-neutral shaping core below.
             let plan_kind = describe_plan(&task.plan);

@@ -40,7 +40,8 @@ fn procedure_dml_creates_replicated_entry() {
         DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
-    );
+    )
+    .expect("encode replicated entry");
     assert!(entry.is_some()); // DML → replicated
 }
 
@@ -65,7 +66,8 @@ fn procedure_reads_not_replicated() {
         DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
-    );
+    )
+    .expect("encode replicated entry");
     assert!(entry.is_none()); // Reads don't replicate
 }
 
@@ -126,6 +128,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
                 task.vshard_id,
                 &task.plan,
             )
+            .expect("encode replicated entry")
             .is_some()
         );
     }

@@ -174,7 +174,16 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         PhysicalPlan::Meta(MetaOp::WalAppend { .. }) => Permission::Write,
 
         PhysicalPlan::Columnar(
-            ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. },
+            ColumnarOp::Insert { .. }
+            | ColumnarOp::Update { .. }
+            | ColumnarOp::Delete { .. }
+            | ColumnarOp::ResolvedUpdate { .. }
+            | ColumnarOp::ResolvedDelete { .. }
+            // Resolves and decides a write policy, so it requires the same
+            // Write permission the predicate it resolves requires — even
+            // though it is not itself a write-class plan for admission /
+            // replication purposes (see `write_class::columnar_is_write`).
+            | ColumnarOp::ResolveDml { .. },
         ) => Permission::Write,
 
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => Permission::Write,

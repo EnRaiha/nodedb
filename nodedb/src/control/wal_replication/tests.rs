@@ -302,7 +302,11 @@ fn to_replicated_entry_writes_only() {
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
     });
-    assert!(to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan).is_some());
+    assert!(
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .is_some()
+    );
 
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: "c".into(),
@@ -313,7 +317,11 @@ fn to_replicated_entry_writes_only() {
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
-    assert!(to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan).is_none());
+    assert!(
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .is_none()
+    );
 }
 
 /// The materialized-sum resolution survives the wire, on the insert shape and
@@ -348,6 +356,7 @@ fn materialized_sum_resolution_roundtrips() {
         deferred_sum_targets: vec!["accounts_elsewhere".to_string()],
     });
     let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("a document insert must replicate")
         .to_bytes();
     let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
@@ -394,6 +403,7 @@ fn materialized_sum_resolution_roundtrips() {
         )],
     });
     let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &bulk)
+        .expect("encode must not error")
         .expect("a single-shard bulk delete must replicate")
         .to_bytes();
     let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
@@ -487,6 +497,7 @@ fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
         VShardId::new(0),
         &plan,
     )
+    .expect("encode must not error")
     .expect("a point delete must replicate");
     match &entry.write {
         ReplicatedWrite::PointDelete {
@@ -550,6 +561,7 @@ fn vector_insert_provenance_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("VectorInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
@@ -580,6 +592,7 @@ fn vector_insert_provenance_roundtrip() {
         provenance: None,
     });
     let entry_none = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_none)
+        .expect("encode must not error")
         .expect("VectorInsert(no provenance) should produce a ReplicatedEntry");
     let bytes_none = entry_none.to_bytes();
     let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
@@ -620,6 +633,7 @@ fn crdt_apply_legacy_and_fenced_wire_compatibility() {
         expected_frontier_digest: Some([42; 32]),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtApply should produce a ReplicatedEntry");
     assert!(matches!(
         &entry.write,
@@ -703,6 +717,7 @@ fn crdt_list_insert_roundtrip() {
         surrogate: Surrogate::ZERO,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtOp::ListInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -749,6 +764,7 @@ fn doc_batch_insert_roundtrip() {
         deferred_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     // Decode with no assigner: carried surrogates fall through verbatim, so we
@@ -789,6 +805,7 @@ fn doc_truncate_roundtrip() {
         resolved_sum_targets: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("DocumentOp::Truncate should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -817,6 +834,7 @@ fn kv_truncate_roundtrip() {
         collection: "kv".into(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("KvOp::Truncate should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -850,6 +868,7 @@ fn kv_register_index_roundtrip() {
         backfill: true,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("KvOp::RegisterIndex must now produce a ReplicatedEntry (cluster-replicated)");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
@@ -882,6 +901,7 @@ fn kv_register_index_roundtrip() {
         backfill: false,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("KvOp::RegisterIndex must produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -908,6 +928,7 @@ fn kv_drop_index_roundtrip() {
         field: "name".into(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("KvOp::DropIndex must now produce a ReplicatedEntry (cluster-replicated)");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -935,6 +956,7 @@ fn crdt_list_delete_roundtrip() {
         surrogate: Surrogate::ZERO,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtOp::ListDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -975,6 +997,7 @@ fn crdt_list_move_roundtrip_distinct_indices() {
         surrogate: Surrogate::ZERO,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtOp::ListMove should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1032,6 +1055,7 @@ fn columnar_ingest_provenance_roundtrip() {
         rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("ColumnarIngest should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
@@ -1092,6 +1116,7 @@ fn timeseries_ingest_provenance_roundtrip() {
         rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("TimeseriesIngest should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1130,6 +1155,7 @@ fn fts_index_provenance_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("FtsIndex should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1165,6 +1191,7 @@ fn fts_delete_provenance_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("FtsDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1205,6 +1232,7 @@ fn spatial_insert_provenance_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("SpatialInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1243,6 +1271,7 @@ fn spatial_delete_provenance_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("SpatialDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1276,6 +1305,7 @@ fn edge_put_surrogates_roundtrip() {
         dst_surrogate: nodedb_types::Surrogate::new(22),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("EdgePut should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
 
@@ -1356,6 +1386,7 @@ fn array_cell_put_roundtrips_and_carries_surrogate() {
 
     // Must encode (no longer a replication gap).
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("ArrayOp::Put must encode to a ReplicatedWrite");
     let bytes = entry.to_bytes();
 
@@ -1407,6 +1438,7 @@ fn array_cell_delete_roundtrips_verbatim() {
     });
 
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("ArrayOp::Delete must encode to a ReplicatedWrite");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1509,6 +1541,7 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
     });
 
     let entry = to_replicated_entry(tenant, database, vshard, &plan)
+        .expect("encode must not error")
         .expect("PointPut should produce a ReplicatedEntry");
     assert_eq!(entry.database_id, database.as_u64());
 
@@ -1592,7 +1625,9 @@ fn vector_extended_variants_all_encode_to_some() {
         // On the pre-fix code this is `None` for all six — that regression
         // is exactly what this assertion catches.
         assert!(
-            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan).is_some(),
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan)
+                .expect("encode must not error")
+                .is_some(),
             "expected {plan:?} to be replicated, but to_replicated_entry returned None \
              (this Vector write would execute locally and never reach Raft)"
         );
@@ -1610,6 +1645,7 @@ fn sparse_insert_roundtrip() {
         entries: vec![(10, 0.25), (20, 0.75)],
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("SparseInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1628,6 +1664,7 @@ fn sparse_delete_roundtrip() {
         doc_id: "doc-42".into(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("SparseDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1651,6 +1688,7 @@ fn multi_vector_insert_roundtrip_shares_one_surrogate() {
         dim: 2,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("MultiVectorInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
 
@@ -1706,6 +1744,7 @@ fn multi_vector_delete_roundtrip() {
         document_surrogate: Surrogate::new(888),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("MultiVectorDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1742,6 +1781,7 @@ fn delete_by_surrogate_roundtrip() {
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("DeleteBySurrogate should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1784,6 +1824,7 @@ fn direct_upsert_roundtrip() {
         rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("DirectUpsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1919,7 +1960,9 @@ fn known_write_gaps_are_not_replicated() {
 
     for (name, plan) in &gaps {
         assert!(
-            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan).is_none(),
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan)
+                .expect("encode must not error")
+                .is_none(),
             "{name} is a known replication gap; wiring is a tracked follow-up — \
              this test fails loudly if someone wires it so they update the tracking"
         );
@@ -1937,6 +1980,7 @@ fn crdt_set_constraints_roundtrip() {
         constraints: vec![vec![1, 2, 3], vec![4, 5]],
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtOp::SetConstraints should replicate as a ConstraintChange");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -1966,6 +2010,7 @@ fn crdt_drop_constraints_roundtrip() {
         constraint_version: 9,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("CrdtOp::DropConstraints should replicate as a ConstraintChange");
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
@@ -2003,7 +2048,9 @@ fn representative_handled_writes_still_replicate() {
         resolved_sum_targets: Vec::new(),
     });
     assert!(
-        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &point_put).is_some(),
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &point_put)
+            .expect("encode must not error")
+            .is_some(),
         "Document::PointPut must still replicate"
     );
 
@@ -2017,7 +2064,9 @@ fn representative_handled_writes_still_replicate() {
         rls_filters: Vec::new(),
     });
     assert!(
-        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &kv_put).is_some(),
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &kv_put)
+            .expect("encode must not error")
+            .is_some(),
         "Kv::Put must still replicate"
     );
 }

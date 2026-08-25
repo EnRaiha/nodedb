@@ -48,7 +48,8 @@ fn async_trigger_not_in_raft_log() {
         DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
-    );
+    )
+    .expect("encode replicated entry");
     assert!(entry.is_some());
 
     // The entry serializes to bytes that can be deserialized back.
@@ -209,7 +210,8 @@ fn replicated_entry_roundtrip_point_delete() {
         VShardId::new(0),
         &plan,
     )
-    .unwrap();
+    .expect("encode replicated entry")
+    .expect("a write plan encodes to an entry");
     let bytes = entry.to_bytes();
     let (_, _, restored, _) = nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
         .unwrap()
@@ -237,7 +239,8 @@ fn read_ops_not_replicated() {
         DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
-    );
+    )
+    .expect("encode replicated entry");
     assert!(entry.is_none()); // Reads don't replicate.
 }
 
@@ -268,6 +271,7 @@ fn procedure_dml_is_normal_write() {
             VShardId::new(0),
             &plan,
         )
+        .expect("encode replicated entry")
         .is_some()
     );
 }

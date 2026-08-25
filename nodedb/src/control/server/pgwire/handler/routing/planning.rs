@@ -372,15 +372,22 @@ impl NodeDbPgHandler {
 }
 
 /// Whether any task in the set replicates through Raft.
+///
+/// A task whose encode refuses (the governed-predicate-DML guard) still
+/// counts as a replicated write here: it names a write that belongs on the
+/// Raft path, refusing only because it must be resolved first — it is never
+/// the "not a write" case `Ok(None)` covers.
 pub(super) fn has_replicated_writes(tasks: &[PhysicalTask]) -> bool {
     tasks.iter().any(|t| {
-        crate::control::wal_replication::to_replicated_entry(
-            t.tenant_id,
-            t.database_id,
-            t.vshard_id,
-            &t.plan,
+        !matches!(
+            crate::control::wal_replication::to_replicated_entry(
+                t.tenant_id,
+                t.database_id,
+                t.vshard_id,
+                &t.plan,
+            ),
+            Ok(None)
         )
-        .is_some()
     })
 }
 

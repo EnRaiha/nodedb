@@ -87,6 +87,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Columnar(ColumnarOp::Insert { collection, .. })
         | PhysicalPlan::Columnar(ColumnarOp::Update { collection, .. })
         | PhysicalPlan::Columnar(ColumnarOp::Delete { collection, .. })
+        | PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { collection, .. })
+        | PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
         | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })

@@ -2,7 +2,9 @@
 //! Append-only Raft write wire ABI; variants must never be reordered.
 
 use super::aliases::{default_ivf_cells, default_ivf_nprobe, default_pq_m};
-use super::wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget};
+use super::wire_shapes::{
+    ColumnarResolvedRow, ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget,
+};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
 
 #[derive(
@@ -643,5 +645,22 @@ pub enum ReplicatedWrite {
         join_column: String,
         /// Join value that resolved to `surrogate`, same purpose.
         join_value: String,
+    },
+
+    /// Resolved-row-set form of a columnar predicate `UPDATE` / `DELETE` on a
+    /// collection carrying a write policy. Appended last to preserve the
+    /// positional ABI.
+    ///
+    /// The Control Plane already resolved the predicate to a concrete row set
+    /// and decided the write policy against those exact row images while the
+    /// writing identity was live, so this carries the verdict, not a
+    /// predicate. A follower has no writing identity to decide a predicate
+    /// against — re-deciding after commit would let it reject what the
+    /// leader already committed, diverging the replicas — so every replica
+    /// applies exactly these rows and evaluates nothing.
+    ColumnarBulkDmlResolved {
+        collection: String,
+        is_update: bool,
+        rows: Vec<ColumnarResolvedRow>,
     },
 }

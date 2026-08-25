@@ -60,7 +60,9 @@ impl CoreLoop {
                 let coll = match op {
                     ColumnarOp::Insert { collection, .. }
                     | ColumnarOp::Update { collection, .. }
-                    | ColumnarOp::Delete { collection, .. } => Some(collection.as_str()),
+                    | ColumnarOp::Delete { collection, .. }
+                    | ColumnarOp::ResolvedUpdate { collection, .. }
+                    | ColumnarOp::ResolvedDelete { collection, .. } => Some(collection.as_str()),
                     _ => None,
                 };
                 if let Some(c) = coll {

@@ -248,6 +248,15 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Columnar(ColumnarOp::Delete { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
         }
+        // Resolved-row-set form of the same UPDATE/DELETE, taken by a
+        // collection with a write policy attached — same CDC event as the
+        // predicate arms above.
+        PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { collection, .. }) => {
+            vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
+        }
+        PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete { collection, .. }) => {
+            vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
+        }
         // Scan / MaterializeScan are reads — no row changed.
         PhysicalPlan::Columnar(_) => Vec::new(),
 

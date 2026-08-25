@@ -105,6 +105,23 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
+    // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy +
+    // live Raft proposer) is resolved to a concrete row set on the Control
+    // Plane before it is proposed (`control::columnar_predicate_dml_orchestrator`).
+    // On the local (non-Raft) path the predicate reaches the Data Plane gate
+    // intact and is enforced correctly there.
+    if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
+        &task.plan,
+    ) && ctx.state.async_raft_proposer().is_some()
+    {
+        let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
+        let resp = crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+            ctx.state, authorized,
+        )
+        .await?;
+        return Ok((resp, Vec::new(), Vec::new()));
+    }
+
     // Native DROP uses the same authorization and reversible all-core
     // protocol as pgwire; it must never bypass the catalog transition.
     if matches!(

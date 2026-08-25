@@ -135,7 +135,7 @@ pub async fn reissue_vector_durably(
             database_id,
             vshard,
             &plan,
-        )
+        )?
         .ok_or_else(|| Error::Internal {
             detail: format!(
                 "restore reissue: vector plan for '{collection}' did not map to a \

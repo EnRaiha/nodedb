@@ -114,6 +114,9 @@ impl DataPlaneArrayExecutor {
                 VShardId::new(local_vshard_id),
                 &plan,
             )
+            .map_err(|e| ClusterError::Storage {
+                detail: format!("{op_label}: {e}"),
+            })?
             .ok_or_else(|| ClusterError::Storage {
                 detail: format!("{op_label}: plan is not encodable as a replicated entry"),
             })?;

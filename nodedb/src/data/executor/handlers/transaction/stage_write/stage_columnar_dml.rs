@@ -245,7 +245,7 @@ impl CoreLoop {
     /// Mirrors `execute_columnar_delete` / `execute_columnar_update`: the base
     /// set is the live memtable (the same scope the durable handlers mutate),
     /// so the staged affected set matches exactly what COMMIT replay applies.
-    fn columnar_txn_matching_rows(
+    pub(super) fn columnar_txn_matching_rows(
         &self,
         task: &ExecutionTask,
         tid: u64,
@@ -339,7 +339,7 @@ impl CoreLoop {
     /// no-PK columnar UPDATE/DELETE fails at the statement inside a
     /// transaction exactly as it fails in autocommit — keeping statement-time
     /// success/failure aligned with COMMIT replay.
-    fn columnar_engine_schema(
+    pub(super) fn columnar_engine_schema(
         &self,
         task: &ExecutionTask,
         tid: u64,
@@ -372,7 +372,11 @@ impl CoreLoop {
 
     /// Encode the shared `{"affected": N}` payload columnar predicate DML
     /// returns (matching `execute_columnar_delete` / `execute_columnar_update`).
-    fn stage_columnar_dml_response(&self, task: &ExecutionTask, affected: usize) -> Response {
+    pub(super) fn stage_columnar_dml_response(
+        &self,
+        task: &ExecutionTask,
+        affected: usize,
+    ) -> Response {
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

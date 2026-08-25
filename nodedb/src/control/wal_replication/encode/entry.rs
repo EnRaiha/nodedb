@@ -38,12 +38,16 @@ pub(super) fn encode_provenance(
         .map(|p| zerompk::to_msgpack_vec(p).expect("SyncProvenance serialization is infallible"))
 }
 
+/// Encode a write-side `PhysicalPlan` into a `ReplicatedEntry` for Raft
+/// proposal, `Ok(None)` for a plan that is not a replicated write, or an
+/// error when the plan cannot be replicated safely (see
+/// `entry_columnar_family::columnar_write`'s governed-predicate-DML refusal).
 pub fn to_replicated_entry(
     tenant_id: TenantId,
     database_id: DatabaseId,
     vshard_id: VShardId,
     plan: &PhysicalPlan,
-) -> Option<ReplicatedEntry> {
+) -> crate::Result<Option<ReplicatedEntry>> {
     let write = match plan {
         PhysicalPlan::Document(op) => entry_document::document_write(op),
         PhysicalPlan::Kv(op) => entry_kv::kv_write(op),
@@ -53,7 +57,9 @@ pub fn to_replicated_entry(
         PhysicalPlan::Vector(op) => vector::encode(op),
         PhysicalPlan::Crdt(op) => crdt::encode(op),
         PhysicalPlan::Graph(op) => entry_graph::graph_write(op),
-        PhysicalPlan::Columnar(op) => entry_columnar_family::columnar_write(op),
+        // The only fallible arm: a governed predicate DML refuses rather than
+        // encode a bare predicate for a collection with a write policy.
+        PhysicalPlan::Columnar(op) => entry_columnar_family::columnar_write(op)?,
         PhysicalPlan::Timeseries(op) => entry_columnar_family::timeseries_write(op),
         PhysicalPlan::Text(op) => entry_columnar_family::text_write(op),
         PhysicalPlan::Spatial(op) => entry_columnar_family::spatial_write(op),
@@ -67,12 +73,12 @@ pub fn to_replicated_entry(
         PhysicalPlan::Meta(_) | PhysicalPlan::ClusterEvent(_) => None,
     };
 
-    write.map(|write| {
+    Ok(write.map(|write| {
         ReplicatedEntry::new(
             tenant_id.as_u64(),
             database_id.as_u64(),
             vshard_id.as_u32(),
             write,
         )
-    })
+    }))
 }

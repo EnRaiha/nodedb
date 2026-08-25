@@ -192,6 +192,53 @@ pub enum ColumnarOp {
         rls_write_check: RlsWriteCheck,
     },
 
+    /// Update rows the Control Plane already resolved to concrete images.
+    ///
+    /// Built only for a collection carrying a write policy. The Control
+    /// Plane resolved the predicate to a row set and decided the policy
+    /// against each row's exact post-image while the writing identity was
+    /// live, so this carries the verdict, not a predicate to re-evaluate.
+    /// The Data Plane applies exactly these rows and evaluates nothing.
+    ResolvedUpdate {
+        collection: String,
+        /// (primary key, full post-image) for each row the Control Plane
+        /// resolved and the write policy admitted.
+        rows: Vec<(nodedb_types::Value, Vec<nodedb_types::Value>)>,
+        rls_write_check: RlsWriteCheck,
+    },
+
+    /// Delete rows the Control Plane already resolved to concrete keys.
+    ///
+    /// Built only for a collection carrying a write policy. The Control
+    /// Plane resolved the predicate to a row set and decided the policy
+    /// against each row's pre-image while the writing identity was live,
+    /// so this carries the verdict, not a predicate to re-evaluate. The
+    /// Data Plane removes exactly these rows and evaluates nothing.
+    ResolvedDelete {
+        collection: String,
+        /// Primary key of each row the write policy admitted for removal.
+        pks: Vec<nodedb_types::Value>,
+        rls_write_check: RlsWriteCheck,
+    },
+
+    /// Resolve a predicate UPDATE/DELETE to the concrete rows it would write,
+    /// deciding the write policy against those exact images.
+    ///
+    /// Read-only: it mutates nothing. The Control Plane runs this before
+    /// proposing, then proposes the resolved rows instead of the predicate,
+    /// because a follower has no writing identity to evaluate a predicate
+    /// against.
+    ResolveDml {
+        collection: String,
+        /// Serialized `Vec<ScanFilter>` — the statement's WHERE clause.
+        filters: Vec<u8>,
+        /// Field assignments for an UPDATE. Empty for a DELETE.
+        updates: Vec<(String, Vec<u8>)>,
+        /// True for UPDATE, false for DELETE.
+        is_update: bool,
+        rls_write_check: RlsWriteCheck,
+    },
+
     /// Cursor-paginated raw scan for the clone materializer.
     ///
     /// Returns `(surrogate, row_value_bytes)` pairs plus next-cursor in one

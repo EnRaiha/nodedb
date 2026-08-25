@@ -49,6 +49,7 @@ use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::ColumnarOp;
 use nodedb_types::RlsWriteCheck;
+use nodedb_types::Value;
 use nodedb_types::columnar::ColumnarDmlWalRecord;
 
 impl CoreLoop {
@@ -163,6 +164,174 @@ impl CoreLoop {
                 is_update = record.is_update,
                 error = ?response.error_code,
                 "columnar predicate DML WAL replay failed; skipping record"
+            );
+            return Some(0);
+        }
+        Some(1)
+    }
+
+    /// Try to decode `payload` as a `columnar_resolved_dml` record (the
+    /// resolved-row-set form of `ColumnarOp::ResolvedUpdate` /
+    /// `ColumnarOp::ResolvedDelete`) and, if it is one, replay it.
+    ///
+    /// Returns `None` when the payload does not decode as this shape,
+    /// `Some(0)` when it decoded but was tombstoned, already covered by the
+    /// restored columnar checkpoint, failed to decode a row, or the live
+    /// re-execution reported a typed error, `Some(1)` on successful replay.
+    ///
+    /// Replay carries `RlsWriteCheck::already_decided_elsewhere()`: the
+    /// policy decided these rows when the record was written, and the
+    /// identity that wrote it is not present at boot to resolve `$auth.*`
+    /// against. A refused write never reaches replay — its record is
+    /// cancelled by a `WriteAborted` marker before the refusal is
+    /// acknowledged.
+    ///
+    /// ## The drift check at replay
+    ///
+    /// `execute_columnar_resolved_update` / `execute_columnar_resolved_delete`
+    /// verify every shipped PK is still present before mutating anything, and
+    /// answer `ErrorCode::OllpRetryRequired` on a miss. On the live write path
+    /// that code asks the caller to re-resolve and retry. Replay has no
+    /// caller to retry against — it runs once, against state rebuilt from the
+    /// committed WAL prefix, which by construction already contains every row
+    /// this record's rows were resolved against. So a miss here is never a
+    /// normal drift condition; it is a genuine WAL/state inconsistency. This
+    /// function does not treat that specially — it can't distinguish
+    /// `OllpRetryRequired` from any other execution error at the response
+    /// level — but it reports it exactly like the existing predicate-DML
+    /// replay reports any failed re-execution: `warn!` with the LSN, then
+    /// skip the record rather than aborting boot. Matching that established
+    /// idiom (rather than inventing a second failure-reporting path in the
+    /// same file) keeps one place operators check for a botched columnar WAL
+    /// replay.
+    pub(in crate::data::executor) fn try_replay_columnar_resolved_predicate_dml(
+        &mut self,
+        payload: &[u8],
+        tenant_id: u64,
+        database_id: DatabaseId,
+        record_lsn: u64,
+        tombstones: &nodedb_wal::TombstoneSet,
+    ) -> Option<usize> {
+        let record: nodedb_types::columnar::ColumnarResolvedDmlWalRecord =
+            zerompk::from_msgpack(payload).ok()?;
+        if record.kind != "columnar_resolved_dml" {
+            return None;
+        }
+
+        if tombstones.is_tombstoned(
+            database_id.as_u64(),
+            tenant_id,
+            &record.collection,
+            record_lsn,
+        ) {
+            return Some(0);
+        }
+
+        if self.floors.replay_floors.columnar.covers(record_lsn) {
+            return Some(0);
+        }
+
+        let tid = TenantId::new(tenant_id);
+        let vshard_id = VShardId::from_collection_in_database(database_id, &record.collection);
+        let replay_check = RlsWriteCheck::already_decided_elsewhere();
+
+        let response = if record.is_update {
+            let mut rows: Vec<(Value, Vec<Value>)> = Vec::with_capacity(record.rows.len());
+            for wal_row in &record.rows {
+                let pk = match nodedb_types::value_from_msgpack(&wal_row.pk_msgpack) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            core = self.core_id,
+                            collection = %record.collection,
+                            lsn = record_lsn,
+                            error = %e,
+                            "columnar resolved-row-set DML WAL replay: malformed PK; skipping record"
+                        );
+                        return Some(0);
+                    }
+                };
+                let new_row = match nodedb_types::value_from_msgpack(&wal_row.new_row_msgpack) {
+                    Ok(Value::Array(arr)) => arr,
+                    Ok(_) | Err(_) => {
+                        warn!(
+                            core = self.core_id,
+                            collection = %record.collection,
+                            lsn = record_lsn,
+                            "columnar resolved-row-set DML WAL replay: malformed post-image row; \
+                             skipping record"
+                        );
+                        return Some(0);
+                    }
+                };
+                rows.push((pk, new_row));
+            }
+            let plan = PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
+                collection: record.collection.clone(),
+                rows: rows.clone(),
+                rls_write_check: replay_check.clone(),
+            });
+            let task = Self::replay_task(
+                tid,
+                database_id,
+                vshard_id,
+                plan,
+                Some(Lsn::new(record_lsn)),
+            );
+            self.execute_columnar_resolved_update(
+                &task,
+                &record.collection,
+                &rows,
+                &replay_check,
+                None,
+            )
+        } else {
+            let mut pks: Vec<Value> = Vec::with_capacity(record.rows.len());
+            for wal_row in &record.rows {
+                let pk = match nodedb_types::value_from_msgpack(&wal_row.pk_msgpack) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            core = self.core_id,
+                            collection = %record.collection,
+                            lsn = record_lsn,
+                            error = %e,
+                            "columnar resolved-row-set DML WAL replay: malformed PK; skipping record"
+                        );
+                        return Some(0);
+                    }
+                };
+                pks.push(pk);
+            }
+            let plan = PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
+                collection: record.collection.clone(),
+                pks: pks.clone(),
+                rls_write_check: replay_check.clone(),
+            });
+            let task = Self::replay_task(
+                tid,
+                database_id,
+                vshard_id,
+                plan,
+                Some(Lsn::new(record_lsn)),
+            );
+            self.execute_columnar_resolved_delete(
+                &task,
+                &record.collection,
+                &pks,
+                &replay_check,
+                None,
+            )
+        };
+
+        if response.status != Status::Ok {
+            warn!(
+                core = self.core_id,
+                collection = %record.collection,
+                lsn = record_lsn,
+                is_update = record.is_update,
+                error = ?response.error_code,
+                "columnar resolved-row-set DML WAL replay failed; skipping record"
             );
             return Some(0);
         }

@@ -321,7 +321,7 @@ async fn dispatch_local(
             database_id,
             vshard_id,
             &route.plan,
-        )
+        )?
     {
         let (payload, write_version) =
             crate::control::wal_replication::propose_replicated_entry(shared, proposer, entry)

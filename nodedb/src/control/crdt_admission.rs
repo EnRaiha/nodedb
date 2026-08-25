@@ -510,7 +510,7 @@ async fn apply_fenced(
             workflow.database_id,
             workflow.vshard_id,
             &plan,
-        )
+        )?
         .ok_or(crate::Error::CrdtAdmissionInvalidPlan {
             reason: "admitted CRDT Apply has no replicated form",
         })?;

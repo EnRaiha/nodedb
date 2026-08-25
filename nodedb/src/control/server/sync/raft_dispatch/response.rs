@@ -110,7 +110,7 @@ async fn dispatch_sync_response_inner(
     } = params;
     reject_unadmitted_crdt_apply(&plan)?;
     if let Some(proposer) = state.async_raft_proposer()
-        && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
+        && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)?
     {
         let payload = propose_sync_write(state, entry, proposer).await?;
         let request_id = state.next_request_id();

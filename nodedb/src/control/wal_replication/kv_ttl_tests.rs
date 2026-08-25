@@ -212,6 +212,7 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
         rls_filters: Vec::new(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
         .expect("Kv(Put) should produce a ReplicatedEntry");
     match entry.write {
         ReplicatedWrite::KvPut {
@@ -233,6 +234,7 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
         rls_filters: Vec::new(),
     });
     let entry_no_ttl = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_no_ttl)
+        .expect("encode must not error")
         .expect("Kv(Put) should produce a ReplicatedEntry");
     match entry_no_ttl.write {
         ReplicatedWrite::KvPut {

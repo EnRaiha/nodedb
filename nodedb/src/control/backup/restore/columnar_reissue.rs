@@ -188,7 +188,7 @@ pub async fn reissue_columnar_durably(
             database_id,
             vshard,
             &plan,
-        )
+        )?
         .ok_or_else(|| Error::Internal {
             detail: format!(
                 "restore reissue: columnar plan for '{collection}' did not map to a \

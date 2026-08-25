@@ -294,31 +294,40 @@ impl LocalPlanExecutor {
             return ExecuteResponse::err(error);
         }
 
-        if let Some(proposer) = self.state.async_raft_proposer()
-            && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
+        if let Some(proposer) = self.state.async_raft_proposer() {
+            match crate::control::wal_replication::to_replicated_entry(
                 tenant_id,
                 database_id,
                 vshard_id,
                 &plan,
-            )
-        {
-            return match crate::control::wal_replication::propose_replicated_entry(
-                &self.state,
-                proposer,
-                entry,
-            )
-            .await
-            {
-                // Replicated writes carry no read watermark → 0. The write's
-                // per-collection version rides alongside the payload but is not
-                // needed here: it floors a SESSION's later reads, and this RPC
-                // seam serves a remote coordinator that holds no session.
-                Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
-                Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: e.to_string(),
-                }),
-            };
+            ) {
+                Err(e) => {
+                    return ExecuteResponse::err(TypedClusterError::Internal {
+                        code: PLAN_DECODE_FAILED,
+                        message: e.to_string(),
+                    });
+                }
+                Ok(Some(entry)) => {
+                    return match crate::control::wal_replication::propose_replicated_entry(
+                        &self.state,
+                        proposer,
+                        entry,
+                    )
+                    .await
+                    {
+                        // Replicated writes carry no read watermark → 0. The write's
+                        // per-collection version rides alongside the payload but is not
+                        // needed here: it floors a SESSION's later reads, and this RPC
+                        // seam serves a remote coordinator that holds no session.
+                        Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
+                        Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
+                            code: PLAN_DECODE_FAILED,
+                            message: e.to_string(),
+                        }),
+                    };
+                }
+                Ok(None) => {}
+            }
         }
 
         match tokio::time::timeout(

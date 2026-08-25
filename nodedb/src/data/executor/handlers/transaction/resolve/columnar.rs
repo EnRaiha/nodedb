@@ -46,7 +46,7 @@ use nodedb_wal::record::RecordType;
 
 use crate::control::server::wal_dispatch::{
     encode_columnar_batch_payload, encode_columnar_dml_payload,
-    encode_timeseries_batch_payload_with_format,
+    encode_columnar_resolved_dml_payload, encode_timeseries_batch_payload_with_format,
 };
 use crate::wal::RedoSubRecord;
 
@@ -89,8 +89,11 @@ pub(super) fn serialize_columnar_op(
             Ok(())
         }
 
-        // Read families: no persisted post-image.
-        ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => Ok(()),
+        // Read families: no persisted post-image. `ResolveDml` mutates
+        // nothing, so it emits no redo sub-record either.
+        ColumnarOp::Scan { .. }
+        | ColumnarOp::MaterializeScan { .. }
+        | ColumnarOp::ResolveDml { .. } => Ok(()),
 
         // Predicate DML: emit the SAME `ColumnarDmlWalRecord` (kind
         // `"columnar_dml"`, carried under `RecordType::TimeseriesBatch`) the
@@ -119,6 +122,35 @@ pub(super) fn serialize_columnar_op(
             rls_write_check: _,
         } => {
             let sub_payload = encode_columnar_dml_payload(collection, false, filters, &[])?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::TimeseriesBatch as u32,
+                payload: sub_payload,
+            });
+            Ok(())
+        }
+
+        // Resolved-row-set DML: the Control Plane already resolved these rows
+        // and decided the write policy against them, so the redo record
+        // carries the exact images, never a predicate — same reasoning as
+        // the autocommit encoder (`encode_columnar_resolved_dml_payload`).
+        ColumnarOp::ResolvedUpdate {
+            collection,
+            rows,
+            rls_write_check: _,
+        } => {
+            let sub_payload = encode_columnar_resolved_dml_payload(collection, true, rows, &[])?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::TimeseriesBatch as u32,
+                payload: sub_payload,
+            });
+            Ok(())
+        }
+        ColumnarOp::ResolvedDelete {
+            collection,
+            pks,
+            rls_write_check: _,
+        } => {
+            let sub_payload = encode_columnar_resolved_dml_payload(collection, false, &[], pks)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,

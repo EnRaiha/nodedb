@@ -51,6 +51,25 @@ pub(super) fn apply_columnar(ctx: &PermCtx<'_>, op: &mut ColumnarOp) -> crate::R
             ctx.authorize(collection, PermTreeLevel::Delete)?;
             ctx.filter_into(collection, PermTreeLevel::Delete, filters)
         }
+
+        // Authorize (blanket): the Control Plane already resolved these rows
+        // against the write policy, so there is no predicate left to narrow.
+        // The subtree still gates whether this identity may write/delete on
+        // the collection at all.
+        ColumnarOp::ResolvedUpdate { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Write)
+        }
+        ColumnarOp::ResolvedDelete { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Delete)
+        }
+
+        // Authorize (blanket): constructed internally by the columnar
+        // predicate DML orchestrator from an already-authorized Update/Delete
+        // plan and dispatched straight to the Data Plane, never through this
+        // pipeline. Mirrors `ResolvedUpdate`/`ResolvedDelete`.
+        ColumnarOp::ResolveDml { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Write)
+        }
     }
 }
 

@@ -86,8 +86,42 @@ pub(super) fn wal_append_columnar_op(
                 super::timeseries::encode_columnar_dml_payload(collection, false, filters, &[])?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
-        // NotAWrite — reads / query ops / DDL that produces no engine mutation here
-        ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => None,
+        ColumnarOp::ResolvedUpdate {
+            collection,
+            rows,
+            rls_write_check: _,
+        } => {
+            // Rows the Control Plane already resolved and decided against the
+            // write policy, so the durable record carries the exact images,
+            // never a predicate: replay has no writing identity to decide one
+            // against.
+            let wal_payload = super::timeseries::encode_columnar_resolved_dml_payload(
+                collection,
+                true,
+                rows,
+                &[],
+            )?;
+            Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
+        }
+        ColumnarOp::ResolvedDelete {
+            collection,
+            pks,
+            rls_write_check: _,
+        } => {
+            let wal_payload = super::timeseries::encode_columnar_resolved_dml_payload(
+                collection,
+                false,
+                &[],
+                pks,
+            )?;
+            Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
+        }
+        // NotAWrite — reads / query ops / DDL that produces no engine mutation
+        // here. `ResolveDml` mutates nothing; it only reports the row set a
+        // predicate DML would touch, so it appends no durable record.
+        ColumnarOp::Scan { .. }
+        | ColumnarOp::MaterializeScan { .. }
+        | ColumnarOp::ResolveDml { .. } => None,
     };
     Ok(appended)
 }

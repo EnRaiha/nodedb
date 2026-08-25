@@ -277,6 +277,58 @@ impl CoreLoop {
         Ok(resp)
     }
 
+    /// Apply a columnar `ResolvedUpdate` (Control-Plane-resolved row set),
+    /// recording undo for atomic rollback. Mirrors `exec_tx_columnar_update`
+    /// exactly — the underlying handler decides `{"affected": N}` vs a
+    /// drift-check `OllpRetryRequired` the same way regardless of caller.
+    pub(super) fn exec_tx_columnar_resolved_update(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        collection: &str,
+        rows: &[(nodedb_types::Value, Vec<nodedb_types::Value>)],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        let resp = self.execute_columnar_resolved_update(
+            dummy_task,
+            collection,
+            rows,
+            rls_write_check,
+            Some(undo_log),
+        );
+        if resp.status == Status::Error {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
+                detail: "columnar resolved update failed".into(),
+            }));
+        }
+        Ok(resp)
+    }
+
+    /// Apply a columnar `ResolvedDelete` (Control-Plane-resolved row set),
+    /// recording undo for atomic rollback.
+    pub(super) fn exec_tx_columnar_resolved_delete(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        collection: &str,
+        pks: &[nodedb_types::Value],
+        rls_write_check: &nodedb_types::RlsWriteCheck,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        let resp = self.execute_columnar_resolved_delete(
+            dummy_task,
+            collection,
+            pks,
+            rls_write_check,
+            Some(undo_log),
+        );
+        if resp.status == Status::Error {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
+                detail: "columnar resolved delete failed".into(),
+            }));
+        }
+        Ok(resp)
+    }
+
     /// Execute a read-only / DDL sub-plan via the standard dispatch path.
     ///
     /// None of these variants mutate engine state, so no undo entry is needed.

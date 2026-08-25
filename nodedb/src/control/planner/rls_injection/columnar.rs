@@ -77,6 +77,22 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
             rls_write_check,
             ..
         } => ctx.set_write_check(collection, rls_write_check),
+
+        // No injection: the Control Plane already resolved the predicate to
+        // a concrete row set and decided the write policy against those
+        // exact images while the writing identity was live. The check slot
+        // already carries `DecidedEarlierInRequest` from that resolve step,
+        // so overwriting it here would re-run a decision this op cannot
+        // repeat — the rows are already gone from the plan's view of the
+        // predicate.
+        // No injection: constructed internally by the columnar predicate DML
+        // orchestrator from an already-injected Update/Delete plan's
+        // `rls_write_check`, and dispatched straight to the Data Plane —
+        // never through this planning pipeline. Same reasoning as
+        // `ResolvedUpdate`/`ResolvedDelete`.
+        ColumnarOp::ResolvedUpdate { .. }
+        | ColumnarOp::ResolvedDelete { .. }
+        | ColumnarOp::ResolveDml { .. } => Ok(()),
     }
 }
 

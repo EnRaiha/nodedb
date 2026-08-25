@@ -67,7 +67,7 @@ async fn reissue_crdt_collection(
             database_id,
             vshard,
             &plan,
-        )
+        )?
         .ok_or_else(|| Error::Internal {
             detail: "restore reissue: crdt import did not map to a replicated write".into(),
         })?;

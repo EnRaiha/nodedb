@@ -10,9 +10,7 @@ use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TraceId};
-use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, TimeseriesOp, VectorOp,
-};
+use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, MetaOp, TimeseriesOp, VectorOp};
 
 use super::sub_plan_doc::{TxPointDelete, TxPointPut};
 use super::sub_plan_write::{TxEdgeDeleteParams, TxEdgePutParams, TxVectorInsertParams};
@@ -395,85 +393,6 @@ impl CoreLoop {
                     detail: "CRDT Apply is not supported inside transaction batches".into(),
                 })
             }
-            _ => self.exec_tx_passthrough(tid, plan),
-        }
-    }
-
-    /// Columnar engine: insert / predicate update / predicate delete are
-    /// undo-tracked; everything else passes through the standard dispatch
-    /// path.
-    ///
-    /// Predicate update/delete are staged at statement time; this is the
-    /// durable COMMIT replay. Undo is captured here so a sibling sub-plan
-    /// failing later in the same COMMIT batch reverses this mutation —
-    /// without it the columnar change would survive an atomic-rollback
-    /// (partial commit).
-    fn exec_tx_columnar(
-        &mut self,
-        dummy_task: &ExecutionTask,
-        tid: u64,
-        plan: &PhysicalPlan,
-        op: &ColumnarOp,
-        undo_log: &mut Vec<UndoEntry>,
-    ) -> Result<Response, ErrorCode> {
-        match op {
-            ColumnarOp::Insert {
-                collection,
-                payload,
-                format,
-                intent,
-                on_conflict_updates,
-                surrogates,
-                schema_bytes,
-                provenance: _,
-                wal_lsn: _,
-                rls_write_check,
-                // A row-returning write is refused before it can be staged into
-                // a transaction, so neither the projection nor the read gate
-                // that bounds it can be set on a plan reaching this path.
-                returning: _,
-                rls_filters: _,
-            } => self.execute_tx_columnar_insert(
-                dummy_task,
-                super::sub_plan_kv::TxColumnarInsertParams {
-                    collection,
-                    payload,
-                    format,
-                    intent: *intent,
-                    on_conflict_updates,
-                    surrogates,
-                    schema_bytes,
-                    rls_write_check,
-                },
-                undo_log,
-            ),
-
-            ColumnarOp::Update {
-                collection,
-                filters,
-                updates,
-                rls_write_check,
-            } => self.exec_tx_columnar_update(
-                dummy_task,
-                collection,
-                filters,
-                updates,
-                rls_write_check,
-                undo_log,
-            ),
-
-            ColumnarOp::Delete {
-                collection,
-                filters,
-                rls_write_check,
-            } => self.exec_tx_columnar_delete(
-                dummy_task,
-                collection,
-                filters,
-                rls_write_check,
-                undo_log,
-            ),
-
             _ => self.exec_tx_passthrough(tid, plan),
         }
     }

@@ -20,6 +20,7 @@ mod stage_bulk_delete;
 mod stage_bulk_update;
 mod stage_columnar;
 mod stage_columnar_dml;
+mod stage_columnar_resolved_dml;
 mod stage_graph;
 mod stage_kv;
 mod stage_kv_atomic;
@@ -39,6 +40,9 @@ pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;
 pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;
 pub(in crate::data::executor) use stage_columnar_dml::{
     StageColumnarDeleteParams, StageColumnarUpdateParams,
+};
+pub(in crate::data::executor) use stage_columnar_resolved_dml::{
+    StageColumnarResolvedDeleteParams, StageColumnarResolvedUpdateParams,
 };
 pub(in crate::data::executor) use stage_graph::GRAPH_LABEL_COLL_KEY;
 pub(in crate::data::executor) use stage_kv::{hex_key, unhex_key};

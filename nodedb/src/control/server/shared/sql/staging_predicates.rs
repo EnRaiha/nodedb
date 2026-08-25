@@ -95,7 +95,11 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
         || matches!(
             plan,
             PhysicalPlan::Columnar(
-                ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. }
+                ColumnarOp::Insert { .. }
+                    | ColumnarOp::Update { .. }
+                    | ColumnarOp::Delete { .. }
+                    | ColumnarOp::ResolvedUpdate { .. }
+                    | ColumnarOp::ResolvedDelete { .. }
             )
         )
         || matches!(plan, PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }))
@@ -239,6 +243,11 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         // predicate-DML arms above resolve to.
         PhysicalPlan::Columnar(ColumnarOp::Update { .. }) => StagedTagKind::Update,
         PhysicalPlan::Columnar(ColumnarOp::Delete { .. }) => StagedTagKind::Delete,
+        // Same command tags as the predicate arms above -- these are the
+        // resolved-row-set form of the same UPDATE/DELETE statement, taken
+        // by a collection with a write policy attached.
+        PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { .. }) => StagedTagKind::Update,
+        PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete { .. }) => StagedTagKind::Delete,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Delete { .. }) => StagedTagKind::Delete,

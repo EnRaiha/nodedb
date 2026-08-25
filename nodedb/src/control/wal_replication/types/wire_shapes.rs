@@ -65,6 +65,30 @@ pub struct ReplicatedSumTarget {
     pub surrogate: u32,
 }
 
+/// One row of a `ColumnarBulkDmlResolved` write: the Control Plane already
+/// resolved this row from the predicate and decided the write policy against
+/// its exact image, so the wire shape carries the image itself rather than
+/// anything a follower would need to re-derive.
+///
+/// `new_row_msgpack` is empty for a delete row — a delete needs only the
+/// primary key to remove the row.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct ColumnarResolvedRow {
+    /// MessagePack-encoded primary key value.
+    pub pk_msgpack: Vec<u8>,
+    /// MessagePack-encoded full post-image row. Empty for a delete.
+    pub new_row_msgpack: Vec<u8>,
+}
+
 /// Whether a `ConstraintChange` installs (`Set`) or removes (`Drop`) a
 /// collection's constraint set on every replica.
 #[derive(

@@ -237,8 +237,18 @@ fn timeseries_is_write(op: &TimeseriesOp) -> bool {
 
 fn columnar_is_write(op: &ColumnarOp) -> bool {
     match op {
-        ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. } => true,
-        ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => false,
+        ColumnarOp::Insert { .. }
+        | ColumnarOp::Update { .. }
+        | ColumnarOp::Delete { .. }
+        | ColumnarOp::ResolvedUpdate { .. }
+        | ColumnarOp::ResolvedDelete { .. } => true,
+        // Read-only: resolves a predicate to the rows it would touch and
+        // decides the write policy against them, but mutates nothing. Not a
+        // Calvin write-key: there is no vshard lock to take for a plan that
+        // writes no base state.
+        ColumnarOp::Scan { .. }
+        | ColumnarOp::MaterializeScan { .. }
+        | ColumnarOp::ResolveDml { .. } => false,
     }
 }
 

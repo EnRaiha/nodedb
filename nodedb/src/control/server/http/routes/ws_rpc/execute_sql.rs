@@ -226,6 +226,41 @@ pub async fn execute_sql(
             continue;
         }
 
+        // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy
+        // + live Raft proposer) is resolved to a concrete row set on the
+        // Control Plane before it is proposed. On the local (non-Raft) path
+        // the predicate reaches the Data Plane gate intact and is enforced
+        // correctly there, so this intercept is skipped in that case.
+        if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
+            &task.plan,
+        ) && shared.async_raft_proposer().is_some()
+        {
+            match crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+                shared,
+                authorized_task,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let payload = resp.payload.to_vec();
+                    if !payload.is_empty() {
+                        let json =
+                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
+                        match sonic_rs::from_str::<serde_json::Value>(&json) {
+                            Ok(mut v) => {
+                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                results.push(v);
+                            }
+                            Err(_) => results.push(serde_json::Value::String(json)),
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+            continue;
+        }
+
         let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
