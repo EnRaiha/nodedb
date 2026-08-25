@@ -348,8 +348,6 @@ async fn restore_surfaces_failing_node_id_on_midflight_failure() {
             .unwrap_or_else(|e| panic!("insert f{i}: {}", db_detail(&e)));
     }
 
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-
     // Fault-inject: take down node 2, then pin node 0's routing table
     // so it still believes node 2 is the leader for every raft group.
     // Without the stale-route pin, quorum-replicated failover hides the
@@ -373,6 +371,27 @@ async fn restore_surfaces_failing_node_id_on_midflight_failure() {
         || cluster.nodes[0].active_topology_size() < 3,
     )
     .await;
+
+    // Back up only once the topology has settled, and before the routes
+    // are pinned.
+    //
+    // The restore path refuses an envelope whose watermark predates the
+    // destination's last observed write-HLC, and that high-water advances on
+    // every successful dispatch for the tenant — not only on writes the test
+    // issues itself. Taking the backup first leaves the node teardown and the
+    // SWIM convergence window sitting between the envelope and the restore,
+    // and anything dispatched in there carries the high-water past the
+    // envelope. The restore then fails the staleness check instead of
+    // reaching the fan-out, and the assertion below sees the wrong loud
+    // failure. Capturing after the teardown keeps the envelope dominant;
+    // pinning afterwards adds nothing, since it only rewrites a local routing
+    // table.
+    //
+    // The backup itself still succeeds with the peer down: routing has failed
+    // over to the surviving replicas at this point, which is exactly the
+    // transparent recovery the pin below goes on to defeat.
+    let bytes = drain_backup(0, &cluster, TENANT).await;
+
     for group_id in 0..8u64 {
         cluster.nodes[0].force_stale_route_for_test(group_id, downed_node_id);
     }
