@@ -158,6 +158,7 @@ fn all_write_variants_serialize() {
             peer_id: 7,
             provenance: None,
             constraint_version_required: 0,
+            surrogate: 5,
         },
         ReplicatedWrite::CrdtApplyFenced {
             collection: "c".into(),
@@ -167,6 +168,7 @@ fn all_write_variants_serialize() {
             provenance: None,
             constraint_version_required: 1,
             expected_frontier_digest: [1; 32],
+            surrogate: 6,
         },
         ReplicatedWrite::EdgePut {
             collection: "col".into(),
@@ -694,6 +696,9 @@ fn crdt_apply_legacy_and_fenced_wire_compatibility() {
             peer_id: 8,
             provenance: None,
             constraint_version_required: 0,
+            // Pre-migration wire shape: no surrogate was ever assigned on
+            // this record.
+            surrogate: 0,
         },
     );
     let legacy_bytes = legacy.to_bytes();
@@ -2772,5 +2777,246 @@ fn crdt_doc_upsert_returning_and_rls_filters_roundtrip() {
             );
         }
         other => panic!("expected Crdt(DocUpsert), got {other:?}"),
+    }
+}
+
+/// Build a real (non-`Noop`) `SurrogateAssigner` over a temp `redb` catalog,
+/// mirroring `surrogate::assign::core::assign_ops::tests::open_test`. Needed
+/// here (rather than `assigner: None`) to prove decode BINDS the carried
+/// surrogate into the catalog instead of allocating a fresh one.
+fn open_test_assigner() -> (
+    tempfile::TempDir,
+    crate::control::surrogate::SurrogateAssigner,
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let credentials = std::sync::Arc::new(
+        crate::control::security::credential::CredentialStore::open(
+            &dir.path().join("system.redb"),
+        )
+        .expect("open credential store"),
+    );
+    let registry = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::control::surrogate::SurrogateRegistry::new(),
+    ));
+    let wal: std::sync::Arc<dyn crate::control::surrogate::SurrogateWalAppender> =
+        std::sync::Arc::new(crate::control::surrogate::NoopWalAppender);
+    let assigner = crate::control::surrogate::SurrogateAssigner::new(registry, credentials, wal);
+    (dir, assigner)
+}
+
+/// `CrdtOp::Apply` carries the leader-assigned surrogate on the wire and
+/// decode BINDS it (first-wins) rather than re-deriving via this node's own
+/// allocator. Advance the local allocator past the carried value first, so
+/// a divergent-by-construction fresh `assign()` (which would return the
+/// NEXT local value) is distinguishable from a correct bind (which installs
+/// the carried value verbatim).
+#[test]
+fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let (_dir, assigner) = open_test_assigner();
+
+    // Burn this node's next few local allocations on unrelated keys so a
+    // fresh `assign()` for "doc-1" would return something other than the
+    // leader-carried value below.
+    for i in 0..5 {
+        assigner
+            .assign(
+                DatabaseId::DEFAULT,
+                tenant,
+                "docs",
+                format!("burn-{i}").as_bytes(),
+            )
+            .expect("burn allocation");
+    }
+
+    let leader_surrogate = Surrogate::new(9_001);
+    let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+        collection: "docs".into(),
+        document_id: "doc-1".into(),
+        delta: vec![0xDE, 0xAD],
+        peer_id: 1,
+        mutation_id: 0,
+        surrogate: leader_surrogate,
+        provenance: None,
+        constraint_version_required: 0,
+        expected_frontier_digest: None,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
+        .expect("CrdtOp::Apply should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::Apply { surrogate, .. }) => {
+            assert_eq!(
+                surrogate, leader_surrogate,
+                "decode must bind the leader-carried surrogate, not allocate a fresh one"
+            );
+        }
+        other => panic!("expected Crdt(Apply), got {other:?}"),
+    }
+
+    // The bind must be durably installed: a second decode of the SAME
+    // entry (replay / retry) must return the identical value via the
+    // first-wins pre-check, never re-allocate or overwrite.
+    let (_, _, decoded_again, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_again {
+        PhysicalPlan::Crdt(CrdtOp::Apply { surrogate, .. }) => {
+            assert_eq!(
+                surrogate, leader_surrogate,
+                "replaying the same entry must resolve to the same bound surrogate"
+            );
+        }
+        other => panic!("expected Crdt(Apply), got {other:?}"),
+    }
+
+    assert_eq!(
+        assigner
+            .lookup(DatabaseId::DEFAULT, tenant, "docs", b"doc-1")
+            .expect("catalog lookup"),
+        Some(leader_surrogate),
+        "the carried surrogate must be installed in the local catalog"
+    );
+}
+
+/// A `CrdtApply` entry written before the surrogate field existed
+/// (`surrogate: 0` on the wire, the `#[serde(default)]`) has no leader
+/// value to bind. Decode must still resolve a surrogate via this node's own
+/// allocator (the documented, loud, pre-migration-only fallback) rather
+/// than propagating `Surrogate::ZERO` into a fresh document row.
+#[test]
+fn crdt_apply_legacy_no_surrogate_falls_back_to_local_assign() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let (_dir, assigner) = open_test_assigner();
+
+    let legacy = ReplicatedEntry::new(
+        tenant.as_u64(),
+        DatabaseId::DEFAULT.as_u64(),
+        vshard.as_u32(),
+        ReplicatedWrite::CrdtApply {
+            collection: "docs".into(),
+            document_id: "doc-legacy-2".into(),
+            delta: vec![0x01],
+            peer_id: 3,
+            provenance: None,
+            constraint_version_required: 0,
+            surrogate: 0,
+        },
+    );
+    let bytes = legacy.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::Apply { surrogate, .. }) => {
+            assert_ne!(
+                surrogate,
+                Surrogate::ZERO,
+                "the legacy fallback must still allocate a real identity, not ZERO"
+            );
+        }
+        other => panic!("expected Crdt(Apply), got {other:?}"),
+    }
+}
+
+/// `CrdtOp::ListInsert` / `ListDelete` / `ListMove` carry the parent
+/// document's surrogate on the wire and decode binds it via
+/// `bind_or_lookup` — same identity, no fresh allocation — even though the
+/// live dispatch handler does not yet consume the field.
+#[test]
+fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let (_dir, assigner) = open_test_assigner();
+
+    let parent_surrogate = Surrogate::new(4_242);
+    // Establish the parent document's binding first, exactly as `DocUpsert`
+    // would have when the document was created.
+    assigner
+        .bind(
+            DatabaseId::DEFAULT,
+            tenant,
+            "notes",
+            b"doc-1",
+            parent_surrogate,
+        )
+        .expect("seed parent binding");
+
+    let insert_plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        index: 0,
+        fields_json: "{}".into(),
+        surrogate: parent_surrogate,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &insert_plan)
+        .expect("encode must not error")
+        .expect("CrdtOp::ListInsert should produce a ReplicatedEntry");
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListInsert { surrogate, .. }) => {
+            assert_eq!(
+                surrogate, parent_surrogate,
+                "ListInsert must resolve to the parent document's existing surrogate"
+            );
+        }
+        other => panic!("expected Crdt(ListInsert), got {other:?}"),
+    }
+
+    let delete_plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        index: 0,
+        surrogate: parent_surrogate,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &delete_plan)
+        .expect("encode must not error")
+        .expect("CrdtOp::ListDelete should produce a ReplicatedEntry");
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListDelete { surrogate, .. }) => {
+            assert_eq!(
+                surrogate, parent_surrogate,
+                "ListDelete must resolve to the parent document's existing surrogate"
+            );
+        }
+        other => panic!("expected Crdt(ListDelete), got {other:?}"),
+    }
+
+    let move_plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        from_index: 0,
+        to_index: 1,
+        surrogate: parent_surrogate,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &move_plan)
+        .expect("encode must not error")
+        .expect("CrdtOp::ListMove should produce a ReplicatedEntry");
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListMove { surrogate, .. }) => {
+            assert_eq!(
+                surrogate, parent_surrogate,
+                "ListMove must resolve to the parent document's existing surrogate"
+            );
+        }
+        other => panic!("expected Crdt(ListMove), got {other:?}"),
     }
 }

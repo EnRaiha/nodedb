@@ -14,17 +14,6 @@ pub(super) struct DecodeCtx<'a> {
     pub(super) tenant_id: TenantId,
 }
 
-pub(super) fn assign_or_zero(
-    ctx: &DecodeCtx,
-    collection: &str,
-    pk_bytes: &[u8],
-) -> crate::Result<nodedb_types::Surrogate> {
-    match ctx.assigner {
-        Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk_bytes),
-        None => Ok(nodedb_types::Surrogate::ZERO),
-    }
-}
-
 /// Resolve `carried` for a mutating op that does NOT create rows (UPDATE /
 /// DELETE). When `carried` is authoritative (non-ZERO, from a member
 /// coordinator) the binding is installed first-wins via `bind`. When `carried`

@@ -22,6 +22,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             peer_id,
             provenance,
             constraint_version_required,
+            surrogate,
         } => crdt::apply(
             ctx,
             crdt::ApplyArgs {
@@ -38,6 +39,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
                 delta_signature: [0; 32],
                 signing_required: false,
                 authenticated: false,
+                carried_surrogate: *surrogate,
             },
         ),
         ReplicatedWrite::CrdtApplyFenced {
@@ -48,6 +50,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             provenance,
             constraint_version_required,
             expected_frontier_digest,
+            surrogate,
         } => crdt::apply(
             ctx,
             crdt::ApplyArgs {
@@ -64,6 +67,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
                 delta_signature: [0; 32],
                 signing_required: false,
                 authenticated: false,
+                carried_surrogate: *surrogate,
             },
         ),
         ReplicatedWrite::CrdtApplyAuthenticated {
@@ -79,6 +83,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             auth_seq_no,
             delta_signature,
             signing_required,
+            surrogate,
         } => crdt::apply(
             ctx,
             crdt::ApplyArgs {
@@ -95,6 +100,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
                 delta_signature: *delta_signature,
                 signing_required: *signing_required,
                 authenticated: true,
+                carried_surrogate: *surrogate,
             },
         ),
         ReplicatedWrite::CrdtImportCollection {
@@ -108,20 +114,39 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             list_path,
             index,
             fields_json,
-        } => crdt::list_insert(collection, document_id, list_path, *index, fields_json),
+            surrogate,
+        } => crdt::list_insert(
+            ctx,
+            collection,
+            document_id,
+            list_path,
+            *index,
+            fields_json,
+            *surrogate,
+        ),
         ReplicatedWrite::CrdtListDelete {
             collection,
             document_id,
             list_path,
             index,
-        } => crdt::list_delete(collection, document_id, list_path, *index),
+            surrogate,
+        } => crdt::list_delete(ctx, collection, document_id, list_path, *index, *surrogate),
         ReplicatedWrite::CrdtListMove {
             collection,
             document_id,
             list_path,
             from_index,
             to_index,
-        } => crdt::list_move(collection, document_id, list_path, *from_index, *to_index),
+            surrogate,
+        } => crdt::list_move(
+            ctx,
+            collection,
+            document_id,
+            list_path,
+            *from_index,
+            *to_index,
+            *surrogate,
+        ),
         ReplicatedWrite::CrdtDocUpsert {
             collection,
             document_id,

@@ -283,6 +283,13 @@ pub enum ReplicatedWrite {
         /// Leader-admitted constraint fence; zero means no fence.
         #[serde(default)]
         constraint_version_required: u64,
+        /// Leader-assigned surrogate for `document_id`, carried so every
+        /// replica binds the SAME identity instead of each allocating its
+        /// own on apply. `0` (the wire default) means a record written
+        /// before this field existed — see `decode/crdt.rs::apply` for the
+        /// legacy fallback.
+        #[serde(default)]
+        surrogate: u32,
     },
     ColumnarIngest {
         collection: String,
@@ -641,12 +648,19 @@ pub enum ReplicatedWrite {
         list_path: String,
         index: u64,
         fields_json: String,
+        /// Surrogate of the parent document hosting this block list. See
+        /// `ReplicatedWrite::CrdtApply::surrogate`.
+        #[serde(default)]
+        surrogate: u32,
     },
     CrdtListDelete {
         collection: String,
         document_id: String,
         list_path: String,
         index: u64,
+        /// See `ReplicatedWrite::CrdtListInsert::surrogate`.
+        #[serde(default)]
+        surrogate: u32,
     },
     CrdtListMove {
         collection: String,
@@ -654,6 +668,9 @@ pub enum ReplicatedWrite {
         list_path: String,
         from_index: u64,
         to_index: u64,
+        /// See `ReplicatedWrite::CrdtListInsert::surrogate`.
+        #[serde(default)]
+        surrogate: u32,
     },
     CrdtDocUpsert {
         collection: String,
@@ -732,6 +749,9 @@ pub enum ReplicatedWrite {
         constraint_version_required: u64,
         /// Mandatory exact preview frontier; absent on legacy `CrdtApply`.
         expected_frontier_digest: [u8; 32],
+        /// See `ReplicatedWrite::CrdtApply::surrogate`.
+        #[serde(default)]
+        surrogate: u32,
     },
     CrdtApplyAuthenticated {
         collection: String,
@@ -746,6 +766,9 @@ pub enum ReplicatedWrite {
         auth_seq_no: u64,
         delta_signature: [u8; 32],
         signing_required: bool,
+        /// See `ReplicatedWrite::CrdtApply::surrogate`.
+        #[serde(default)]
+        surrogate: u32,
     },
 
     /// Tear down one vector index on every replica — the counterpart of

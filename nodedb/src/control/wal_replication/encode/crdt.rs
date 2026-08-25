@@ -33,24 +33,23 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             document_id,
             delta,
             peer_id,
-            // Unused downstream: the apply handler
-            // (`data/executor/dispatch/crdt.rs`) ignores it, and the sync DLQ
-            // path carries its own `mutation_id` from `DeltaPushMsg`, never
-            // this one.
+            // Unused downstream: the sync DLQ path carries its own
+            // `mutation_id` from `DeltaPushMsg`, never this one.
             mutation_id: _,
-            surrogate: _,
+            surrogate,
             provenance,
             constraint_version_required,
             expected_frontier_digest,
-        } => apply(
+        } => apply(ApplyFields {
             collection,
             document_id,
             delta,
-            *peer_id,
-            super::entry::encode_provenance(provenance),
-            *constraint_version_required,
-            *expected_frontier_digest,
-        ),
+            peer_id: *peer_id,
+            provenance: super::entry::encode_provenance(provenance),
+            constraint_version_required: *constraint_version_required,
+            expected_frontier_digest: *expected_frontier_digest,
+            surrogate: surrogate.as_u32(),
+        }),
         CrdtOp::ApplyAuthenticated {
             collection,
             document_id,
@@ -58,7 +57,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             peer_id,
             // See `Apply` above.
             mutation_id: _,
-            surrogate: _,
+            surrogate,
             provenance,
             constraint_version_required,
             expected_frontier_digest,
@@ -80,6 +79,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             auth_seq_no: *auth_seq_no,
             delta_signature: *delta_signature,
             signing_required: *signing_required,
+            surrogate: surrogate.as_u32(),
         },
         CrdtOp::ImportSnapshot {
             tenant_id,
@@ -92,23 +92,43 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             list_path,
             index,
             fields_json,
-            surrogate: _,
-        } => list_insert(collection, document_id, list_path, *index, fields_json),
+            surrogate,
+        } => list_insert(
+            collection,
+            document_id,
+            list_path,
+            *index,
+            fields_json,
+            surrogate.as_u32(),
+        ),
         CrdtOp::ListDelete {
             collection,
             document_id,
             list_path,
             index,
-            surrogate: _,
-        } => list_delete(collection, document_id, list_path, *index),
+            surrogate,
+        } => list_delete(
+            collection,
+            document_id,
+            list_path,
+            *index,
+            surrogate.as_u32(),
+        ),
         CrdtOp::ListMove {
             collection,
             document_id,
             list_path,
             from_index,
             to_index,
-            surrogate: _,
-        } => list_move(collection, document_id, list_path, *from_index, *to_index),
+            surrogate,
+        } => list_move(
+            collection,
+            document_id,
+            list_path,
+            *from_index,
+            *to_index,
+            surrogate.as_u32(),
+        ),
         CrdtOp::DocUpsert {
             collection,
             document_id,
@@ -187,15 +207,29 @@ pub(super) fn drop_constraints(collection: &str, constraint_version: u64) -> Rep
     }
 }
 
-pub(super) fn apply(
-    collection: &str,
-    document_id: &str,
-    delta: &[u8],
-    peer_id: u64,
-    provenance: Option<Vec<u8>>,
-    constraint_version_required: u64,
-    expected_frontier_digest: Option<[u8; 32]>,
-) -> ReplicatedWrite {
+/// One CRDT delta apply, as it goes onto the wire.
+pub(super) struct ApplyFields<'a> {
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub delta: &'a [u8],
+    pub peer_id: u64,
+    pub provenance: Option<Vec<u8>>,
+    pub constraint_version_required: u64,
+    pub expected_frontier_digest: Option<[u8; 32]>,
+    pub surrogate: u32,
+}
+
+pub(super) fn apply(fields: ApplyFields<'_>) -> ReplicatedWrite {
+    let ApplyFields {
+        collection,
+        document_id,
+        delta,
+        peer_id,
+        provenance,
+        constraint_version_required,
+        expected_frontier_digest,
+        surrogate,
+    } = fields;
     match expected_frontier_digest {
         Some(expected_frontier_digest) => ReplicatedWrite::CrdtApplyFenced {
             collection: collection.to_owned(),
@@ -205,6 +239,7 @@ pub(super) fn apply(
             provenance,
             constraint_version_required,
             expected_frontier_digest,
+            surrogate,
         },
         None => ReplicatedWrite::CrdtApply {
             collection: collection.to_owned(),
@@ -213,6 +248,7 @@ pub(super) fn apply(
             peer_id,
             provenance,
             constraint_version_required,
+            surrogate,
         },
     }
 }
@@ -233,6 +269,7 @@ pub(super) fn list_insert(
     list_path: &str,
     index: usize,
     fields_json: &str,
+    surrogate: u32,
 ) -> ReplicatedWrite {
     ReplicatedWrite::CrdtListInsert {
         collection: collection.to_owned(),
@@ -240,6 +277,7 @@ pub(super) fn list_insert(
         list_path: list_path.to_owned(),
         index: index as u64,
         fields_json: fields_json.to_owned(),
+        surrogate,
     }
 }
 
@@ -249,12 +287,14 @@ pub(super) fn list_delete(
     document_id: &str,
     list_path: &str,
     index: usize,
+    surrogate: u32,
 ) -> ReplicatedWrite {
     ReplicatedWrite::CrdtListDelete {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         index: index as u64,
+        surrogate,
     }
 }
 
@@ -266,6 +306,7 @@ pub(super) fn list_move(
     list_path: &str,
     from_index: usize,
     to_index: usize,
+    surrogate: u32,
 ) -> ReplicatedWrite {
     ReplicatedWrite::CrdtListMove {
         collection: collection.to_owned(),
@@ -273,6 +314,7 @@ pub(super) fn list_move(
         list_path: list_path.to_owned(),
         from_index: from_index as u64,
         to_index: to_index as u64,
+        surrogate,
     }
 }
 

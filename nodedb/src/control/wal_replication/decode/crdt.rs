@@ -4,7 +4,7 @@
 
 use super::super::decode_sync_engines;
 use super::super::types::ConstraintChangeOp;
-use super::ctx::{DecodeCtx, assign_or_zero};
+use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{CrdtOp, ReturningSpec};
 
@@ -22,6 +22,59 @@ pub(super) struct ApplyArgs<'a> {
     pub(super) delta_signature: [u8; 32],
     pub(super) signing_required: bool,
     pub(super) authenticated: bool,
+    /// Leader-assigned surrogate carried on the wire. `Surrogate::ZERO`
+    /// means a record written before the surrogate field existed — see
+    /// `resolve_apply_surrogate`.
+    pub(super) carried_surrogate: u32,
+}
+
+/// Resolve the surrogate `CrdtOp::Apply` / `ApplyAuthenticated` materializes
+/// under. The leader assigned this surrogate at plan time
+/// (`plan_builder/crdt.rs::build_apply`) and it is now carried on the wire —
+/// bind it first-wins so every replica installs the SAME identity for
+/// `document_id`, exactly like `decode/kv.rs::put`.
+///
+/// A carried `ZERO` means this entry was written before the surrogate field
+/// existed (pre-migration WAL / Raft log). There is no leader value to bind
+/// in that case, so this falls back to the pre-fix behavior — allocate via
+/// this node's own assigner — but loudly: this is the exact per-node
+/// allocation divergence the surrogate-carrying fix closes, tolerated only
+/// as a one-time compatibility path for entries already committed before
+/// upgrade, never for live post-upgrade writes (which always carry a
+/// non-zero surrogate).
+fn resolve_apply_surrogate(
+    ctx: &DecodeCtx,
+    collection: &str,
+    document_id: &str,
+    carried_surrogate: u32,
+) -> crate::Result<nodedb_types::Surrogate> {
+    let carried = nodedb_types::Surrogate::new(carried_surrogate);
+    match ctx.assigner {
+        Some(a) if carried != nodedb_types::Surrogate::ZERO => a.bind(
+            ctx.database_id,
+            ctx.tenant_id,
+            collection,
+            document_id.as_bytes(),
+            carried,
+        ),
+        Some(a) => {
+            tracing::warn!(
+                database_id = ctx.database_id.as_u64(),
+                tenant_id = ctx.tenant_id.as_u64(),
+                collection,
+                document_id,
+                "CRDT apply entry carries no surrogate (pre-migration wire format); \
+                 falling back to per-node allocation, which can diverge from other replicas"
+            );
+            a.assign(
+                ctx.database_id,
+                ctx.tenant_id,
+                collection,
+                document_id.as_bytes(),
+            )
+        }
+        None => Ok(carried),
+    }
 }
 
 pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<PhysicalPlan> {
@@ -39,8 +92,9 @@ pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<Physi
         delta_signature,
         signing_required,
         authenticated,
+        carried_surrogate,
     } = args;
-    let surrogate = assign_or_zero(ctx, collection, document_id.as_bytes())?;
+    let surrogate = resolve_apply_surrogate(ctx, collection, document_id, carried_surrogate)?;
     let provenance = decode_sync_engines::decode_provenance(provenance_bytes)?;
     if authenticated {
         let provenance = provenance.ok_or_else(|| crate::Error::Serialization {
@@ -101,42 +155,62 @@ fn list_index(field: &str, value: u64) -> crate::Result<usize> {
     })
 }
 
-/// Reconstruct `CrdtOp::ListInsert` from its wire intent. No assigner call:
-/// the live dispatch handler
-/// (`data/executor/dispatch/crdt.rs::CrdtOp::ListInsert`) ignores the
-/// `surrogate` field entirely, so `Surrogate::ZERO` carries no
-/// replay-relevant information here.
+/// Reconstruct `CrdtOp::ListInsert` from its wire intent. The current
+/// dispatch handler (`data/executor/dispatch/crdt.rs::CrdtOp::ListInsert`)
+/// still ignores `surrogate`, but the field is documented as the parent
+/// document's identity — bind it the same way `CrdtDocUpsert` does (via
+/// `bind_or_lookup`, never allocating) so it is correct the moment a
+/// consumer starts reading it, rather than a second latent bug. A list op
+/// mutates an existing document, so it never creates identity: `ZERO`
+/// (legacy wire entry, or a non-member coordinator that missed resolution)
+/// resolves via read-only catalog lookup, never binds.
 pub(super) fn list_insert(
+    ctx: &DecodeCtx,
     collection: &str,
     document_id: &str,
     list_path: &str,
     index: u64,
     fields_json: &str,
+    surrogate: u32,
 ) -> crate::Result<PhysicalPlan> {
+    let surrogate = bind_or_lookup(
+        ctx,
+        collection,
+        document_id.as_bytes(),
+        nodedb_types::Surrogate::new(surrogate),
+    )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListInsert {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         index: list_index("index", index)?,
         fields_json: fields_json.to_owned(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate,
     }))
 }
 
 /// Reconstruct `CrdtOp::ListDelete` from its wire intent. See
 /// [`list_insert`] for the surrogate note.
 pub(super) fn list_delete(
+    ctx: &DecodeCtx,
     collection: &str,
     document_id: &str,
     list_path: &str,
     index: u64,
+    surrogate: u32,
 ) -> crate::Result<PhysicalPlan> {
+    let surrogate = bind_or_lookup(
+        ctx,
+        collection,
+        document_id.as_bytes(),
+        nodedb_types::Surrogate::new(surrogate),
+    )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListDelete {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         index: list_index("index", index)?,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate,
     }))
 }
 
@@ -145,19 +219,27 @@ pub(super) fn list_delete(
 /// the other still surfaces as a typed decode error rather than silently
 /// substituting. See [`list_insert`] for the surrogate note.
 pub(super) fn list_move(
+    ctx: &DecodeCtx,
     collection: &str,
     document_id: &str,
     list_path: &str,
     from_index: u64,
     to_index: u64,
+    surrogate: u32,
 ) -> crate::Result<PhysicalPlan> {
+    let surrogate = bind_or_lookup(
+        ctx,
+        collection,
+        document_id.as_bytes(),
+        nodedb_types::Surrogate::new(surrogate),
+    )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListMove {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         from_index: list_index("from_index", from_index)?,
         to_index: list_index("to_index", to_index)?,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate,
     }))
 }
 

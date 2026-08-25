@@ -33,15 +33,18 @@ pub type DecodedEntry = (TenantId, VShardId, PhysicalPlan, Option<u64>);
 
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
 ///
-/// `assigner`, when `Some`, drives follower-local surrogate binding.
-/// Single-row writers (documents, KV, vector, graph edges) carry the
-/// leader-assigned surrogate verbatim on the wire and call
-/// `assigner.bind(...)` to install that exact identity in the local catalog
-/// (+ `SurrogateBind` WAL record) — they never re-allocate, so the same key
-/// resolves to the same surrogate on every node. CRDT variants still
-/// re-derive via `assign`. When `None`, surrogate fields fall back to the
-/// carried value / `Surrogate::ZERO` without catalog writes (used by tests
-/// that exercise the decoder without `SharedState`).
+/// `assigner`, when `Some`, drives follower-local surrogate binding. Every
+/// write family (documents, KV, vector, graph edges, CRDT apply / list ops)
+/// carries the leader-assigned surrogate verbatim on the wire and calls
+/// `assigner.bind(...)` / `bind_or_lookup(...)` to install that exact
+/// identity in the local catalog (+ `SurrogateBind` WAL record) — they never
+/// re-allocate, so the same key resolves to the same surrogate on every
+/// node. The lone exception is a CRDT apply entry written before it carried
+/// a surrogate (pre-migration wire format, `surrogate == 0`): that legacy
+/// case falls back to per-node `assign` with a loud warning — see
+/// `decode/crdt.rs::resolve_apply_surrogate`. When `None`, surrogate fields
+/// fall back to the carried value / `Surrogate::ZERO` without catalog writes
+/// (used by tests that exercise the decoder without `SharedState`).
 pub fn from_replicated_entry(
     data: &[u8],
     assigner: Option<&SurrogateAssigner>,
