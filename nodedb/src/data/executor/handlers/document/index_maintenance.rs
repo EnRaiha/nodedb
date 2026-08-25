@@ -127,6 +127,10 @@ impl CoreLoop {
             }
         };
 
+        // Index keys are accumulated here and written in one sorted pass after
+        // the scan; see the bulk insert below.
+        let mut pending_keys: Vec<String> = Vec::with_capacity(docs.len());
+
         for (doc_id, bytes) in &docs {
             // A row skipped here is a row the finished index permanently omits,
             // and the index is then reported as built — every later lookup on
@@ -168,8 +172,7 @@ impl CoreLoop {
                 if unique {
                     seen.insert(stored.clone(), doc_id.clone());
                 }
-                if let Err(e) = self.sparse.index_put_in_txn(
-                    &txn,
+                pending_keys.push(crate::engine::sparse::btree_index::index_key_for(
                     crate::engine::sparse::btree_index::IndexEntryTxn {
                         database_id: task.request.database_id.as_u64(),
                         tenant_id: tid,
@@ -178,15 +181,22 @@ impl CoreLoop {
                         value: &stored,
                         document_id: doc_id,
                     },
-                ) {
-                    return self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!("backfill index_put: {e}"),
-                        },
-                    );
-                }
+                ));
             }
+        }
+
+        // One sorted pass instead of a descent per value. The scan yields
+        // documents in id order while the index is ordered by value, so the
+        // per-entry path re-enters the tree at a random position for every key
+        // it writes. Buffering the keys and writing them in order turns the
+        // whole backfill into a single forward walk.
+        if let Err(e) = self.sparse.index_put_sorted_in_txn(&txn, &mut pending_keys) {
+            return self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Internal {
+                    detail: format!("backfill index_put: {e}"),
+                },
+            );
         }
 
         if let Err(e) = txn.commit() {

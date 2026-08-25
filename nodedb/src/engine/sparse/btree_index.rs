@@ -287,6 +287,46 @@ impl SparseEngine {
         )
     }
 
+    /// Insert many secondary-index entries in one pass.
+    ///
+    /// `keys` are the fully-built index keys; they are sorted and deduplicated
+    /// here, then written in that order into a single opened table. This is
+    /// what a backfill wants: the scan yields documents in id order while the
+    /// index is ordered by value, so writing as it scans re-enters the tree at
+    /// an unrelated position for every key. Writing in key order keeps each
+    /// insert near the last, and the table is opened once rather than once per
+    /// entry as [`Self::index_put_in_txn`] does.
+    ///
+    /// Deduplication is not optional: an array field can yield the same value
+    /// twice for one document (`tags: ["a", "a"]`), producing the same key
+    /// twice.
+    ///
+    /// A cursor would remove the per-insert descent entirely, but cannot be
+    /// used here: its `insert_after` requires each key to sort strictly between
+    /// the entries adjacent to it, so a key already present — which `insert`
+    /// simply overwrites, and which a re-run of a backfill produces — is an
+    /// error rather than an update.
+    pub fn index_put_sorted_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        keys: &mut Vec<String>,
+    ) -> crate::Result<()> {
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut table = txn
+            .open_table(INDEXES)
+            .map_err(|e| redb_err("open table", e))?;
+        for key in keys.iter() {
+            table
+                .insert(key.as_str(), [].as_slice())
+                .map_err(|e| redb_err("index insert", e))?;
+        }
+        Ok(())
+    }
+
     /// Remove a secondary index entry from an already-open write txn.
     ///
     /// Mirror of [`Self::index_put_in_txn`] using the same tenant-scoped key
@@ -431,4 +471,23 @@ impl SparseEngine {
             Err(e) => Err(redb_err("raw get", e)),
         }
     }
+}
+
+/// Build the index key for `entry` as an owned `String`.
+///
+/// The same composite the per-entry write path builds, materialized rather than
+/// borrowed, so a caller can collect many keys and write them in sorted order.
+/// Ordering on this string IS the table's ordering — the key is
+/// `database:tenant:collection:field:value:document` — so sorting the strings
+/// sorts the rows.
+pub fn index_key_for(entry: IndexEntryTxn<'_>) -> String {
+    super::btree::with_tenant_key4(
+        entry.database_id,
+        entry.tenant_id,
+        entry.collection,
+        entry.field,
+        entry.value,
+        entry.document_id,
+        |key| key.to_string(),
+    )
 }
