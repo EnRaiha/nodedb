@@ -231,13 +231,13 @@ pub async fn execute_sql(
         // Control Plane before it is proposed. On the local (non-Raft) path
         // the predicate reaches the Data Plane gate intact and is enforced
         // correctly there, so this intercept is skipped in that case.
-        if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
-            &task.plan,
-        ) && shared.async_raft_proposer().is_some()
+        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
+            && shared.async_raft_proposer().is_some()
         {
-            match crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+            match crate::control::write_resolve::run_authorized_write_resolve(
                 shared,
                 authorized_task,
+                resolver,
             )
             .await
             {

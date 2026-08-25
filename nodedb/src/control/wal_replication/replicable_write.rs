@@ -27,7 +27,7 @@ impl<'a> ReplicableWrite<'a> {
     ///
     /// An op whose policy decision is deferred to the handler must be resolved
     /// to a concrete row set before it is proposed. Columnar `UPDATE`/`DELETE`
-    /// already are, by `control::columnar_predicate_dml_orchestrator`. Every
+    /// already are, by `control::write_resolve`. Every
     /// other engine reaches here still carrying the predicate, and this refuses
     /// it rather than replicating a write no replica will govern.
     ///

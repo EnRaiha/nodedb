@@ -231,13 +231,11 @@ pub(crate) async fn handle_direct_op(
 
         // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy +
         // live Raft proposer) is resolved to a concrete row set on the
-        // Control Plane before it is proposed — see
-        // `columnar_predicate_dml_orchestrator`. On the local (non-Raft)
-        // path the predicate reaches the Data Plane gate intact and is
-        // enforced correctly there.
-        if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
-            &plan,
-        ) && ctx.state.async_raft_proposer().is_some()
+        // Control Plane before it is proposed — see `control::write_resolve`.
+        // On the local (non-Raft) path the predicate reaches the Data Plane
+        // gate intact and is enforced correctly there.
+        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&plan)
+            && ctx.state.async_raft_proposer().is_some()
         {
             let task = PhysicalTask {
                 tenant_id,
@@ -252,11 +250,10 @@ pub(crate) async fn handle_direct_op(
                 Err(error) => return error_to_native(seq, &error),
             };
             let _request = ctx.state.tenant_request_guard(tenant_id);
-            let result =
-                crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
-                    ctx.state, authorized,
-                )
-                .await;
+            let result = crate::control::write_resolve::run_authorized_write_resolve(
+                ctx.state, authorized, resolver,
+            )
+            .await;
             return match result {
                 Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
                 Err(e) => error_to_native(seq, &e),

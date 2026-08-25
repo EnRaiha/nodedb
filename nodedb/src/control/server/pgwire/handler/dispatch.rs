@@ -264,21 +264,21 @@ impl NodeDbPgHandler {
         // carrying an RLS write policy — cannot replicate a bare predicate
         // over Raft (`wal_replication::encode::entry_columnar_family` refuses
         // it): a follower has no writing identity to decide `$auth.*`
-        // against. `columnar_predicate_dml_orchestrator` resolves the
+        // against. `control::write_resolve` resolves the
         // predicate to a concrete row set, decides the policy against those
         // exact images while the writing identity is live, and proposes the
         // resolved row set instead. Only routed here when a Raft proposer is
         // actually live — on the single-node/local path the predicate
         // reaches the Data Plane gate intact and is enforced correctly
         // there, so resolving would only add cost.
-        if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
-            &task.plan,
-        ) && self.state.async_raft_proposer().is_some()
+        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
+            && self.state.async_raft_proposer().is_some()
         {
             let authorized = self.authorize_for_dispatch(identity, &task)?;
-            return crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+            return crate::control::write_resolve::run_authorized_write_resolve(
                 &self.state,
                 authorized,
+                resolver,
             )
             .await;
         }

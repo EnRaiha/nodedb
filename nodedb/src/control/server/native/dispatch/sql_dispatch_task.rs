@@ -107,16 +107,15 @@ pub(super) async fn dispatch_task(
 
     // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy +
     // live Raft proposer) is resolved to a concrete row set on the Control
-    // Plane before it is proposed (`control::columnar_predicate_dml_orchestrator`).
-    // On the local (non-Raft) path the predicate reaches the Data Plane gate
-    // intact and is enforced correctly there.
-    if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
-        &task.plan,
-    ) && ctx.state.async_raft_proposer().is_some()
+    // Plane before it is proposed (`control::write_resolve`). On the local
+    // (non-Raft) path the predicate reaches the Data Plane gate intact and is
+    // enforced correctly there.
+    if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
+        && ctx.state.async_raft_proposer().is_some()
     {
         let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
-        let resp = crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
-            ctx.state, authorized,
+        let resp = crate::control::write_resolve::run_authorized_write_resolve(
+            ctx.state, authorized, resolver,
         )
         .await?;
         return Ok((resp, Vec::new(), Vec::new()));

@@ -11,7 +11,6 @@ pub mod checkpoint_manager;
 pub mod clone;
 pub mod cluster;
 pub mod cold_tier;
-pub mod columnar_predicate_dml_orchestrator;
 pub mod crdt_admission;
 pub mod crdt_post_image_policy;
 pub mod custom_type;
@@ -56,6 +55,7 @@ pub mod update_from_join_orchestrator;
 pub mod vshard_admission;
 pub mod wal_catchup;
 pub mod wal_replication;
+pub mod write_resolve;
 
 pub use exec_receiver::LocalPlanExecutor;
 pub use request_tracker::RequestTracker;

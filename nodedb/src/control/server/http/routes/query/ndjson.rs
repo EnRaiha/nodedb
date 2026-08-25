@@ -272,9 +272,8 @@ pub async fn query_ndjson(
             )
             .await
             .map(|response| vec![response.payload.to_vec()])
-        } else if crate::control::columnar_predicate_dml_orchestrator::is_governed_columnar_predicate_dml(
-            &task.plan,
-        ) && state.shared.async_raft_proposer().is_some()
+        } else if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
+            && state.shared.async_raft_proposer().is_some()
         {
             // A governed columnar predicate `UPDATE`/`DELETE` (RLS write
             // policy + live Raft proposer) is resolved to a concrete row set
@@ -282,9 +281,10 @@ pub async fn query_ndjson(
             // (non-Raft) path the predicate reaches the Data Plane gate
             // intact and is enforced correctly there, so this branch is
             // skipped in that case.
-            crate::control::columnar_predicate_dml_orchestrator::run_authorized_columnar_predicate_dml(
+            crate::control::write_resolve::run_authorized_write_resolve(
                 &state.shared,
                 authorized_task,
+                resolver,
             )
             .await
             .map(|response| vec![response.payload.to_vec()])
