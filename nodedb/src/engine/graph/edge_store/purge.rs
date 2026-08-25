@@ -9,10 +9,41 @@
 //! `collection\x00src\x00label\x00dst` layout of the composite key.
 
 use nodedb_types::TenantId;
-use redb::ReadableTable;
+use redb::KeyRange;
 
 use super::stats::table::{GRAPH_STATS, collection_stat_prefix};
 use super::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
+
+/// Remove every entry of `table` inside `range`, returning how many went.
+///
+/// One pass over the range: `extract_from_if` yields each entry and removes it
+/// as it is read, so nothing is materialized and no key is descended to twice.
+/// The shape this replaces collected every key in the range into a `Vec` and
+/// then called `remove` per key — holding the whole range in memory and paying
+/// a fresh root-to-leaf descent for each removal, on a path whose entire job is
+/// to empty that range.
+///
+/// `what` names the table for the error message; a purge that fails partway
+/// should say which table it was draining.
+fn drain_range<'a, K, V>(
+    table: &mut redb::Table<'_, K, V>,
+    range: impl KeyRange<'a, K>,
+    what: &'static str,
+) -> crate::Result<usize>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    let mut removed = 0usize;
+    let drained = table
+        .extract_from_if(range, |_, _| true)
+        .map_err(|e| redb_err(what, e))?;
+    for entry in drained {
+        entry.map_err(|e| redb_err(what, e))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
 
 impl EdgeStore {
     /// Purge all edges belonging to a `(database, tenant)`. O(tenant-size)
@@ -29,36 +60,18 @@ impl EdgeStore {
             let mut edges = write_txn
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
-            let keys: Vec<String> = edges
-                .range((db, t, "")..(db, t + 1, ""))
-                .map_err(|e| redb_err("edge range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            removed += keys.len();
-            for key in &keys {
-                edges
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("edge remove", e))?;
-            }
+            removed += drain_range(&mut edges, (db, t, "")..(db, t + 1, ""), "edge purge")?;
         }
 
         {
             let mut rev_t = write_txn
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
-            let keys: Vec<String> = rev_t
-                .range((db, t, "")..(db, t + 1, ""))
-                .map_err(|e| redb_err("rev range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            removed += keys.len();
-            for key in &keys {
-                rev_t
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("reverse remove", e))?;
-            }
+            removed += drain_range(
+                &mut rev_t,
+                (db, t, "")..(db, t + 1, ""),
+                "reverse edge purge",
+            )?;
         }
 
         // Clear the GRAPH_STATS rows for the whole tenant too — otherwise a
@@ -71,17 +84,11 @@ impl EdgeStore {
             let mut stats_t = write_txn
                 .open_table(GRAPH_STATS)
                 .map_err(|e| redb_err("open graph_stats", e))?;
-            let keys: Vec<String> = stats_t
-                .range((db, t, "")..(db, t + 1, ""))
-                .map_err(|e| redb_err("stats range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            for key in &keys {
-                stats_t
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("stats remove", e))?;
-            }
+            drain_range(
+                &mut stats_t,
+                (db, t, "")..(db, t + 1, ""),
+                "graph stats purge",
+            )?;
         }
 
         write_txn
@@ -112,35 +119,22 @@ impl EdgeStore {
             let mut edges = write_txn
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
-            let keys: Vec<String> = edges
-                .range((db, t, prefix.as_str())..(db, t, prefix_end.as_str()))
-                .map_err(|e| redb_err("edge range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            removed += keys.len();
-            for key in &keys {
-                edges
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("edge remove", e))?;
-            }
+            removed += drain_range(
+                &mut edges,
+                (db, t, prefix.as_str())..(db, t, prefix_end.as_str()),
+                "edge purge",
+            )?;
         }
 
         {
             let mut rev_t = write_txn
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
-            let keys: Vec<String> = rev_t
-                .range((db, t, prefix.as_str())..(db, t, prefix_end.as_str()))
-                .map_err(|e| redb_err("rev range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            for key in &keys {
-                rev_t
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("reverse remove", e))?;
-            }
+            drain_range(
+                &mut rev_t,
+                (db, t, prefix.as_str())..(db, t, prefix_end.as_str()),
+                "reverse edge purge",
+            )?;
         }
 
         // Clear the GRAPH_STATS summary + per-label rows for this collection
@@ -153,17 +147,11 @@ impl EdgeStore {
             let mut stats_t = write_txn
                 .open_table(GRAPH_STATS)
                 .map_err(|e| redb_err("open graph_stats", e))?;
-            let keys: Vec<String> = stats_t
-                .range((db, t, stats_prefix.as_str())..(db, t, stats_prefix_end.as_str()))
-                .map_err(|e| redb_err("stats range", e))?
-                .map(|r| r.map(|(k, _)| k.value().2.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| redb_err("range iter", e))?;
-            for key in &keys {
-                stats_t
-                    .remove((db, t, key.as_str()))
-                    .map_err(|e| redb_err("stats remove", e))?;
-            }
+            drain_range(
+                &mut stats_t,
+                (db, t, stats_prefix.as_str())..(db, t, stats_prefix_end.as_str()),
+                "graph stats purge",
+            )?;
         }
 
         write_txn

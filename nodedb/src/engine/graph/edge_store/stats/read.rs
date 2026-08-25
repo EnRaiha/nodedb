@@ -19,7 +19,7 @@
 //! whose latest qualifying version at `ts` is not a sentinel. This is the same
 //! ceiling-resolution logic used by `ceiling_resolve_edge`, applied in aggregate.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 use nodedb_types::TenantId;
@@ -94,13 +94,21 @@ impl EdgeStore {
             .open_table(GRAPH_STATS)
             .map_err(|e| redb_err("open graph_stats (read)", e))?;
 
-        let summary_bytes = stats_table
-            .get((db, t, skey.as_str()))
-            .map_err(|e| redb_err("read summary", e))?;
+        // Decode inside a tight scope so the access guard's borrow of
+        // `stats_table` ends before the table is moved. The guard borrows the
+        // table it was read from, and both paths below drop the table early to
+        // release the read transaction.
+        let summary = {
+            let guard = stats_table
+                .get((db, t, skey.as_str()))
+                .map_err(|e| redb_err("read summary", e))?;
+            match guard {
+                Some(bytes) => Some(SummaryRow::decode(bytes.value())?),
+                None => None,
+            }
+        };
 
-        if let Some(bytes) = summary_bytes {
-            let summary = SummaryRow::decode(bytes.value())?;
-            drop(bytes);
+        if let Some(summary) = summary {
             if summary.ownership_version == 0 {
                 drop(stats_table);
                 drop(read_txn);
