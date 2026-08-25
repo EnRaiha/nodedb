@@ -3,7 +3,8 @@
 //! Encode `PhysicalPlan::Kv` variants into `ReplicatedWrite`.
 
 use super::super::types::ReplicatedWrite;
-use nodedb_physical::physical_plan::UpdateValue;
+use super::entry::encode_returning;
+use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
 use nodedb_types::Surrogate;
 
 /// Resolve the wall-clock instant for a TTL-bearing replicated KV write,
@@ -22,12 +23,21 @@ fn resolve_now_ms(ttl_ms: u64) -> Option<u64> {
     }
 }
 
+/// The RETURNING wire pair every `Put`/`Insert`-family KV op carries — see
+/// `ReplicatedWrite::KvPut::returning`. Bundled — plain positional arguments
+/// exceed clippy's arity lint once every KV write function carries it.
+pub(super) struct WireReturning<'a> {
+    pub returning: &'a Option<ReturningSpec>,
+    pub rls_filters: &'a [u8],
+}
+
 pub(super) fn put(
     collection: &str,
     key: &[u8],
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvPut {
         collection: collection.to_owned(),
@@ -36,6 +46,8 @@ pub(super) fn put(
         ttl_ms,
         surrogate,
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        returning: encode_returning(returning.returning),
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -52,6 +64,7 @@ pub(super) fn insert(
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvInsert {
         collection: collection.to_owned(),
@@ -60,6 +73,8 @@ pub(super) fn insert(
         ttl_ms,
         surrogate,
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        returning: encode_returning(returning.returning),
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -69,6 +84,7 @@ pub(super) fn insert_if_absent(
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvInsertIfAbsent {
         collection: collection.to_owned(),
@@ -77,6 +93,8 @@ pub(super) fn insert_if_absent(
         ttl_ms,
         surrogate,
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        returning: encode_returning(returning.returning),
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -87,6 +105,7 @@ pub(super) fn insert_on_conflict_update(
     ttl_ms: u64,
     updates: &[(String, UpdateValue)],
     surrogate: u32,
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvInsertOnConflictUpdate {
         collection: collection.to_owned(),
@@ -96,6 +115,8 @@ pub(super) fn insert_on_conflict_update(
         updates: updates.to_vec(),
         surrogate,
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        returning: encode_returning(returning.returning),
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -104,6 +125,7 @@ pub(super) fn batch_put(
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
     surrogates: &[Surrogate],
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvBatchPut {
         collection: collection.to_owned(),
@@ -111,6 +133,8 @@ pub(super) fn batch_put(
         ttl_ms,
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         resolved_now_ms: resolve_now_ms(ttl_ms),
+        returning: encode_returning(returning.returning),
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -185,12 +209,14 @@ pub(super) fn get_set(
     key: &[u8],
     new_value: &[u8],
     surrogate: u32,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::KvGetSet {
         collection: collection.to_owned(),
         key: key.to_vec(),
         new_value: new_value.to_vec(),
         surrogate,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 

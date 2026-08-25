@@ -11,9 +11,11 @@
 //! `None`. `write` is guaranteed by the caller to already be one of these
 //! variants — see `entry_document::decode_arm` for the trailing-arm contract.
 
+use super::super::decode_sync_engines::decode_returning;
 use super::super::types::ReplicatedWrite;
 use super::ctx::DecodeCtx;
 use super::kv;
+use super::kv::ReturningFields;
 use crate::bridge::envelope::PhysicalPlan;
 
 pub(super) fn decode_arm(
@@ -30,9 +32,22 @@ pub(super) fn decode_arm(
             ttl_ms,
             surrogate,
             resolved_now_ms: rn,
+            returning,
+            rls_filters,
         } => {
             resolved_now_ms = *rn;
-            kv::put(ctx, collection, key, value, *ttl_ms, *surrogate)?
+            kv::put(
+                ctx,
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                *surrogate,
+                ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            )?
         }
         ReplicatedWrite::KvDelete { collection, keys } => kv::delete(collection, keys),
         ReplicatedWrite::KvInsert {
@@ -42,9 +57,22 @@ pub(super) fn decode_arm(
             ttl_ms,
             surrogate,
             resolved_now_ms: rn,
+            returning,
+            rls_filters,
         } => {
             resolved_now_ms = *rn;
-            kv::insert(ctx, collection, key, value, *ttl_ms, *surrogate)?
+            kv::insert(
+                ctx,
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                *surrogate,
+                ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            )?
         }
         ReplicatedWrite::KvInsertIfAbsent {
             collection,
@@ -53,9 +81,22 @@ pub(super) fn decode_arm(
             ttl_ms,
             surrogate,
             resolved_now_ms: rn,
+            returning,
+            rls_filters,
         } => {
             resolved_now_ms = *rn;
-            kv::insert_if_absent(ctx, collection, key, value, *ttl_ms, *surrogate)?
+            kv::insert_if_absent(
+                ctx,
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                *surrogate,
+                ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            )?
         }
         ReplicatedWrite::KvInsertOnConflictUpdate {
             collection,
@@ -65,10 +106,24 @@ pub(super) fn decode_arm(
             updates,
             surrogate,
             resolved_now_ms: rn,
+            returning,
+            rls_filters,
         } => {
             resolved_now_ms = *rn;
             kv::insert_on_conflict_update(
-                ctx, collection, key, value, *ttl_ms, updates, *surrogate,
+                ctx,
+                collection,
+                kv::ConflictEntry {
+                    key,
+                    value,
+                    ttl_ms: *ttl_ms,
+                    updates,
+                    surrogate: *surrogate,
+                },
+                ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
             )?
         }
         ReplicatedWrite::KvBatchPut {
@@ -77,9 +132,21 @@ pub(super) fn decode_arm(
             ttl_ms,
             surrogates,
             resolved_now_ms: rn,
+            returning,
+            rls_filters,
         } => {
             resolved_now_ms = *rn;
-            kv::batch_put(ctx, collection, entries, *ttl_ms, surrogates)?
+            kv::batch_put(
+                ctx,
+                collection,
+                entries,
+                *ttl_ms,
+                surrogates,
+                ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            )?
         }
         ReplicatedWrite::KvExpire {
             collection,
@@ -120,7 +187,8 @@ pub(super) fn decode_arm(
             key,
             new_value,
             surrogate,
-        } => kv::get_set(ctx, collection, key, new_value, *surrogate)?,
+            rls_filters,
+        } => kv::get_set(ctx, collection, key, new_value, *surrogate, rls_filters)?,
         ReplicatedWrite::KvRegisterSortedIndex {
             collection,
             index_name,

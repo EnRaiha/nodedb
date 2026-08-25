@@ -33,6 +33,10 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             document_id,
             delta,
             peer_id,
+            // Unused downstream: the apply handler
+            // (`data/executor/dispatch/crdt.rs`) ignores it, and the sync DLQ
+            // path carries its own `mutation_id` from `DeltaPushMsg`, never
+            // this one.
             mutation_id: _,
             surrogate: _,
             provenance,
@@ -52,6 +56,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             document_id,
             delta,
             peer_id,
+            // See `Apply` above.
             mutation_id: _,
             surrogate: _,
             provenance,
@@ -110,22 +115,30 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             fields_json,
             surrogate,
             partial,
-            returning: _,
-            rls_filters: _,
+            returning,
+            rls_filters,
         } => doc_upsert(
             collection,
             document_id,
             surrogate.as_u32(),
             fields_json,
             *partial,
+            super::entry::encode_returning(returning),
+            rls_filters,
         ),
         CrdtOp::DocDelete {
             collection,
             document_id,
             surrogate,
-            returning: _,
-            rls_filters: _,
-        } => doc_delete(collection, document_id, surrogate.as_u32()),
+            returning,
+            rls_filters,
+        } => doc_delete(
+            collection,
+            document_id,
+            surrogate.as_u32(),
+            super::entry::encode_returning(returning),
+            rls_filters,
+        ),
         CrdtOp::SetConstraints {
             collection,
             constraint_version,
@@ -269,6 +282,8 @@ pub(super) fn doc_upsert(
     surrogate: u32,
     fields_json: &str,
     partial: bool,
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::CrdtDocUpsert {
         collection: collection.to_owned(),
@@ -276,13 +291,23 @@ pub(super) fn doc_upsert(
         surrogate,
         fields_json: fields_json.to_owned(),
         partial,
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 
-pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) -> ReplicatedWrite {
+pub(super) fn doc_delete(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
+) -> ReplicatedWrite {
     ReplicatedWrite::CrdtDocDelete {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         surrogate,
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }

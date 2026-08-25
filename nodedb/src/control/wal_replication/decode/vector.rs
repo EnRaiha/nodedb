@@ -134,6 +134,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             quantization,
             storage_dtype,
             payload_indexes,
+            returning,
+            rls_filters,
         } => direct_upsert(
             ctx,
             DirectUpsertFields {
@@ -145,6 +147,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
                 quantization: *quantization,
                 storage_dtype: *storage_dtype,
                 payload_indexes,
+                returning: decode_sync_engines::decode_returning(returning)?,
+                rls_filters,
             },
         ),
         _ => Err(crate::Error::Internal {
@@ -381,6 +385,8 @@ pub(super) struct DirectUpsertFields<'a> {
     pub(super) quantization: nodedb_types::VectorQuantization,
     pub(super) storage_dtype: nodedb_types::VectorStorageDtype,
     pub(super) payload_indexes: &'a [(String, nodedb_types::PayloadIndexKind)],
+    pub(super) returning: Option<nodedb_physical::physical_plan::ReturningSpec>,
+    pub(super) rls_filters: &'a [u8],
 }
 
 pub(super) fn direct_upsert(ctx: &DecodeCtx, f: DirectUpsertFields) -> crate::Result<PhysicalPlan> {
@@ -397,9 +403,9 @@ pub(super) fn direct_upsert(ctx: &DecodeCtx, f: DirectUpsertFields) -> crate::Re
         quantization: f.quantization,
         storage_dtype: f.storage_dtype,
         payload_indexes: f.payload_indexes.to_vec(),
-        // Replication applies a leader's write on a follower; there is no
-        // client session to answer with rows.
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — a replay re-executes this write for the
+        // originating request, not just for the follower's own state.
+        returning: f.returning,
+        rls_filters: f.rls_filters.to_vec(),
     }))
 }

@@ -224,8 +224,10 @@ pub enum CrdtOp {
         fields_json: String,
         surrogate: Surrogate,
         partial: bool,
-        /// Response-only RETURNING projection; None for a plain write. NOT
-        /// persisted/replicated — WAL/replication reconstruct with None.
+        /// When `Some`, return the STORED post-image of the upserted row —
+        /// projected per spec. Carried across replication so a replay
+        /// re-executes this write for the originating request, not just for
+        /// the follower's own state.
         #[serde(default)]
         returning: Option<ReturningSpec>,
         /// RLS read filters gating the rows `returning` emits. The write is
@@ -242,8 +244,9 @@ pub enum CrdtOp {
         collection: String,
         document_id: String,
         surrogate: Surrogate,
-        /// Response-only RETURNING projection; None for a plain write. NOT
-        /// persisted/replicated — WAL/replication reconstruct with None.
+        /// When `Some`, return the STORED pre-image of the deleted row —
+        /// projected per spec. Carried across replication — see
+        /// `DocUpsert::returning`.
         #[serde(default)]
         returning: Option<ReturningSpec>,
         /// RLS read filters gating the rows `returning` emits — same contract

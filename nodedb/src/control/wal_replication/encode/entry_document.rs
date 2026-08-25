@@ -9,6 +9,8 @@
 
 use super::super::types::ReplicatedWrite;
 use super::document;
+use super::document::{SumFields, WireReturning};
+use super::entry::encode_returning;
 use nodedb_physical::physical_plan::DocumentOp;
 
 /// Encode a `DocumentOp` write variant into its `ReplicatedWrite` wire shape,
@@ -20,11 +22,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             document_id,
             value,
             surrogate,
+            // Decode re-derives this from `document_id.as_bytes()`, same value.
             pk_bytes: _,
-            // The replicated record carries the row, not the projection: a
-            // follower re-applies the write, it does not answer the client.
-            returning: _,
-            rls_filters: _,
+            returning,
+            rls_filters,
             // Resolved against the proposing node's catalog at plan time, and
             // copied onto the record: the applier re-executes this write and
             // maintains the derived total itself, but cannot resolve the target
@@ -36,6 +37,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             surrogate.as_u32(),
             resolved_sum_targets,
+            encode_returning(returning),
+            rls_filters,
         ),
         DocumentOp::PointInsert {
             collection,
@@ -43,8 +46,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             if_absent,
             surrogate,
-            returning: _,
-            rls_filters: _,
+            returning,
+            rls_filters,
             // See `PointPut`.
             resolved_sum_targets,
             deferred_sum_targets,
@@ -54,36 +57,60 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             *if_absent,
             surrogate.as_u32(),
-            resolved_sum_targets,
-            deferred_sum_targets,
+            SumFields {
+                resolved: resolved_sum_targets,
+                deferred: deferred_sum_targets,
+            },
+            WireReturning {
+                returning: encode_returning(returning),
+                rls_filters,
+            },
         ),
         DocumentOp::PointDelete {
             collection,
             document_id,
             surrogate,
+            // Decode re-derives this from `document_id.as_bytes()`, same value.
+            pk_bytes: _,
+            returning,
+            rls_filters,
+            // A follower has no writing identity; decode stamps
+            // `already_decided_elsewhere()`.
+            rls_write_check: _,
             // See `PointPut`.
             resolved_sum_targets,
-            ..
         } => document::point_delete(
             collection,
             document_id,
             surrogate.as_u32(),
             resolved_sum_targets,
+            encode_returning(returning),
+            rls_filters,
         ),
         DocumentOp::PointUpdate {
             collection,
             document_id,
-            updates,
             surrogate,
+            // Decode re-derives this from `document_id.as_bytes()`, same value.
+            pk_bytes: _,
+            updates,
+            returning,
+            rls_filters,
+            // A follower has no writing identity; decode stamps
+            // `already_decided_elsewhere()`.
+            rls_write_check: _,
             // See `PointPut`.
             resolved_sum_targets,
-            ..
         } => document::point_update(
             collection,
             document_id,
             updates,
             surrogate.as_u32(),
             resolved_sum_targets,
+            WireReturning {
+                returning: encode_returning(returning),
+                rls_filters,
+            },
         ),
         DocumentOp::Upsert {
             collection,
@@ -94,8 +121,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // The leader already decided this row against the write policy; the
             // replicated record carries the row, not the policy.
             rls_write_check: _,
-            returning: _,
-            rls_filters: _,
+            returning,
+            rls_filters,
             // See `PointPut`.
             resolved_sum_targets,
         } => document::upsert(
@@ -105,31 +132,51 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             on_conflict_updates,
             surrogate.as_u32(),
             resolved_sum_targets,
+            WireReturning {
+                returning: encode_returning(returning),
+                rls_filters,
+            },
         ),
         DocumentOp::BulkDelete {
             collection,
             filters,
-            returning: _,
+            returning,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
-            rls_filters: _,
+            rls_filters,
+            // The leader already decided every matched row against the write
+            // policy; the replicated record carries the predicate, not it.
             rls_write_check: _,
             // See `PointPut`. The predicate's MATCHES are re-derived by every
             // replica; the identity of the targets they credit is not.
             resolved_sum_targets,
-        } => document::bulk_delete(collection, filters, resolved_sum_targets),
+        } => document::bulk_delete(
+            collection,
+            filters,
+            resolved_sum_targets,
+            encode_returning(returning),
+            rls_filters,
+        ),
         DocumentOp::BulkUpdate {
             collection,
             filters,
             updates,
-            returning: _,
+            returning,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
-            rls_filters: _,
+            rls_filters,
+            // See `BulkDelete`.
             rls_write_check: _,
             // See `BulkDelete`.
             resolved_sum_targets,
-        } => document::bulk_update(collection, filters, updates, resolved_sum_targets),
+        } => document::bulk_update(
+            collection,
+            filters,
+            updates,
+            resolved_sum_targets,
+            encode_returning(returning),
+            rls_filters,
+        ),
         DocumentOp::InsertSelect {
             target_collection,
             source_collection,
@@ -146,8 +193,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             collection,
             documents,
             surrogates,
-            returning: _,
-            rls_filters: _,
+            returning,
+            rls_filters,
             // See `PointPut`.
             resolved_sum_targets,
             deferred_sum_targets,
@@ -157,6 +204,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             surrogates,
             resolved_sum_targets,
             deferred_sum_targets,
+            encode_returning(returning),
+            rls_filters,
         ),
 
         // Known replication gaps: genuine writes not yet wired to a

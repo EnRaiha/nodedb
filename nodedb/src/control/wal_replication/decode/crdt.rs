@@ -6,7 +6,7 @@ use super::super::decode_sync_engines;
 use super::super::types::ConstraintChangeOp;
 use super::ctx::{DecodeCtx, assign_or_zero};
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::CrdtOp;
+use nodedb_physical::physical_plan::{CrdtOp, ReturningSpec};
 
 pub(super) struct ApplyArgs<'a> {
     pub(super) collection: &'a str,
@@ -171,6 +171,8 @@ pub(super) fn doc_upsert(
     surrogate: u32,
     fields_json: &str,
     partial: bool,
+    returning: Option<ReturningSpec>,
+    rls_filters: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
         collection: collection.to_owned(),
@@ -178,20 +180,29 @@ pub(super) fn doc_upsert(
         fields_json: fields_json.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
         partial,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — a replay re-executes this write for the
+        // originating request, not just for the follower's own state.
+        returning,
+        rls_filters: rls_filters.to_vec(),
     })
 }
 
 /// Reconstruct `CrdtOp::DocDelete` from its wire intent. See [`doc_upsert`]
 /// for the surrogate note.
-pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
+pub(super) fn doc_delete(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    returning: Option<ReturningSpec>,
+    rls_filters: &[u8],
+) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::DocDelete {
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `doc_upsert`.
+        returning,
+        rls_filters: rls_filters.to_vec(),
     })
 }
 

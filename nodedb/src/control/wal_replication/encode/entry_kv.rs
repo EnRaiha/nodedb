@@ -9,6 +9,7 @@
 
 use super::super::types::ReplicatedWrite;
 use super::kv;
+use super::kv::WireReturning;
 use nodedb_physical::physical_plan::KvOp;
 
 /// Encode a `KvOp` write variant into its `ReplicatedWrite` wire shape, or
@@ -21,15 +22,29 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             value,
             ttl_ms,
             surrogate,
-            ..
-        } => kv::put(collection, key, value, *ttl_ms, surrogate.as_u32()),
-        // The compiled RLS predicates and the RETURNING projection every write
-        // below carries are properties of the requesting session, not of the
-        // row: they are deliberately absent from the durable record, so a
-        // replay re-applies the write that was already admitted rather than
-        // re-deciding it — and answers no client, so it projects nothing.
+            returning,
+            rls_filters,
+        } => kv::put(
+            collection,
+            key,
+            value,
+            *ttl_ms,
+            surrogate.as_u32(),
+            WireReturning {
+                returning,
+                rls_filters,
+            },
+        ),
+        // The compiled RLS predicate is a property of the requesting session,
+        // not of the row: it is deliberately absent from the durable record,
+        // so a replay re-applies the write that was already admitted rather
+        // than re-deciding it. `Delete` has no RETURNING to carry.
         KvOp::Delete {
-            collection, keys, ..
+            collection,
+            keys,
+            // A follower has no writing identity; decode stamps
+            // `already_decided_elsewhere()`.
+            rls_write_check: _,
         } => kv::delete(collection, keys),
         KvOp::Insert {
             collection,
@@ -37,16 +52,38 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             value,
             ttl_ms,
             surrogate,
-            ..
-        } => kv::insert(collection, key, value, *ttl_ms, surrogate.as_u32()),
+            returning,
+            rls_filters,
+        } => kv::insert(
+            collection,
+            key,
+            value,
+            *ttl_ms,
+            surrogate.as_u32(),
+            WireReturning {
+                returning,
+                rls_filters,
+            },
+        ),
         KvOp::InsertIfAbsent {
             collection,
             key,
             value,
             ttl_ms,
             surrogate,
-            ..
-        } => kv::insert_if_absent(collection, key, value, *ttl_ms, surrogate.as_u32()),
+            returning,
+            rls_filters,
+        } => kv::insert_if_absent(
+            collection,
+            key,
+            value,
+            *ttl_ms,
+            surrogate.as_u32(),
+            WireReturning {
+                returning,
+                rls_filters,
+            },
+        ),
         KvOp::InsertOnConflictUpdate {
             collection,
             key,
@@ -54,7 +91,11 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             ttl_ms,
             updates,
             surrogate,
-            ..
+            // A follower has no writing identity; decode stamps
+            // `already_decided_elsewhere()`.
+            rls_write_check: _,
+            returning,
+            rls_filters,
         } => kv::insert_on_conflict_update(
             collection,
             key,
@@ -62,14 +103,28 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             *ttl_ms,
             updates,
             surrogate.as_u32(),
+            WireReturning {
+                returning,
+                rls_filters,
+            },
         ),
         KvOp::BatchPut {
             collection,
             entries,
             ttl_ms,
             surrogates,
-            ..
-        } => kv::batch_put(collection, entries, *ttl_ms, surrogates),
+            returning,
+            rls_filters,
+        } => kv::batch_put(
+            collection,
+            entries,
+            *ttl_ms,
+            surrogates,
+            WireReturning {
+                returning,
+                rls_filters,
+            },
+        ),
         KvOp::Expire {
             collection,
             key,
@@ -107,8 +162,11 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             key,
             new_value,
             surrogate,
-            ..
-        } => kv::get_set(collection, key, new_value, surrogate.as_u32()),
+            rls_filters,
+            // A follower has no writing identity; decode stamps
+            // `already_decided_elsewhere()`.
+            rls_write_check: _,
+        } => kv::get_set(collection, key, new_value, surrogate.as_u32(), rls_filters),
         KvOp::RegisterSortedIndex {
             collection,
             index_name,

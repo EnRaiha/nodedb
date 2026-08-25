@@ -25,6 +25,8 @@ fn replicated_entry_roundtrip() {
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
             resolved_sum_target_bindings: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         },
     );
     let original_key = entry.idempotency_key;
@@ -46,6 +48,8 @@ fn replicated_entry_roundtrip() {
             surrogate,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => {
             assert_eq!(collection, "users");
             assert_eq!(document_id, "u1");
@@ -53,6 +57,8 @@ fn replicated_entry_roundtrip() {
             assert_eq!(surrogate, 1);
             assert!(resolved_sum_targets.is_empty());
             assert!(resolved_sum_target_bindings.is_empty());
+            assert_eq!(returning, None);
+            assert!(rls_filters.is_empty());
         }
         other => panic!("expected PointPut, got {other:?}"),
     }
@@ -124,6 +130,8 @@ fn all_write_variants_serialize() {
                 join_value: "acc-1".into(),
                 surrogate: 4242,
             }],
+            returning: None,
+            rls_filters: Vec::new(),
         },
         ReplicatedWrite::PointDelete {
             collection: "c".into(),
@@ -131,6 +139,8 @@ fn all_write_variants_serialize() {
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
             resolved_sum_target_bindings: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         },
         ReplicatedWrite::VectorInsert {
             collection: "v".into(),
@@ -446,6 +456,8 @@ fn a_record_without_target_collections_decodes_as_untargeted() {
             surrogate: 900,
             resolved_sum_targets: vec![("acc-1".into(), 4242)],
             resolved_sum_target_bindings: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         },
     );
     let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
@@ -1413,6 +1425,215 @@ fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
     }
 }
 
+/// Pins the class of bug fixed for the document engine in
+/// `entry_document.rs` / `decode/document.rs`: encode bound `returning` /
+/// `rls_filters` to `_` on every document write, and decode hardcoded
+/// `returning: None`, `rls_filters: Vec::new()`. Because the LEADER re-derives
+/// its own executed plan from the committed Raft entry, this silently dropped
+/// `RETURNING` for the ORIGINATING request, not just for followers.
+#[test]
+fn document_point_put_returning_and_rls_filters_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Document(DocumentOp::PointPut {
+        collection: "users".into(),
+        document_id: "u1".into(),
+        value: b"alice".to_vec(),
+        surrogate: Surrogate::new(1),
+        pk_bytes: b"u1".to_vec(),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+        resolved_sum_targets: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("PointPut should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::PointPut {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING insert must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Document(PointPut), got {other:?}"),
+    }
+}
+
+/// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+/// `DocumentOp::PointUpdate`.
+#[test]
+fn document_point_update_returning_and_rls_filters_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Named(vec![ReturningItem {
+            name: "balance".into(),
+            alias: None,
+        }]),
+    };
+    let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
+        collection: "accounts".into(),
+        document_id: "a1".into(),
+        surrogate: Surrogate::new(2),
+        pk_bytes: b"a1".to_vec(),
+        updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        resolved_sum_targets: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("PointUpdate should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::PointUpdate {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING update must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Document(PointUpdate), got {other:?}"),
+    }
+}
+
+/// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+/// `DocumentOp::PointDelete`.
+#[test]
+fn document_point_delete_returning_and_rls_filters_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+        collection: "accounts".into(),
+        document_id: "a1".into(),
+        surrogate: Surrogate::new(3),
+        pk_bytes: b"a1".to_vec(),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        resolved_sum_targets: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("PointDelete should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::PointDelete {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING delete must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Document(PointDelete), got {other:?}"),
+    }
+}
+
+/// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+/// `DocumentOp::Upsert` (`INSERT ... ON CONFLICT DO UPDATE`).
+#[test]
+fn document_upsert_returning_and_rls_filters_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Document(DocumentOp::Upsert {
+        collection: "accounts".into(),
+        document_id: "a1".into(),
+        value: b"{}".to_vec(),
+        on_conflict_updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
+        surrogate: Surrogate::new(4),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+        resolved_sum_targets: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("Upsert should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::Upsert {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING upsert must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Document(Upsert), got {other:?}"),
+    }
+}
+
 #[test]
 fn fts_index_provenance_roundtrip() {
     let tenant = TenantId::new(1);
@@ -2148,6 +2369,8 @@ fn pre_database_id_entry_decodes_to_default_database() {
             surrogate: 1,
             resolved_sum_targets: Vec::new(),
             resolved_sum_target_bindings: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
         },
     };
     let bytes = zerompk::to_msgpack_vec(&legacy).expect("legacy entry encode failed");
@@ -2345,4 +2568,209 @@ fn representative_handled_writes_still_replicate() {
             .is_some(),
         "Kv::Put must still replicate"
     );
+}
+
+/// Pins the bug: `entry_kv::kv_write` used to drop `KvOp::Put::returning` /
+/// `rls_filters` via a bare `..`, and decode hardcoded `None` /
+/// `Vec::new()` — a `RETURNING` write replicated via Raft silently produced
+/// no rows, for the originating request too, since the leader re-derives
+/// its own executed plan from the committed entry.
+#[test]
+fn kv_put_returning_and_rls_filters_roundtrip() {
+    use nodedb_physical::physical_plan::KvOp;
+
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Kv(KvOp::Put {
+        collection: "kv".into(),
+        key: b"k1".to_vec(),
+        value: b"v1".to_vec(),
+        ttl_ms: 0,
+        surrogate: Surrogate::new(1),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
+        .expect("KvOp::Put should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::Put {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING write must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Kv(Put), got {other:?}"),
+    }
+}
+
+/// See `kv_put_returning_and_rls_filters_roundtrip`; same bug,
+/// `KvOp::InsertOnConflictUpdate`.
+#[test]
+fn kv_insert_on_conflict_update_returning_and_rls_filters_roundtrip() {
+    use nodedb_physical::physical_plan::KvOp;
+
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Named(vec![ReturningItem {
+            name: "balance".into(),
+            alias: None,
+        }]),
+    };
+    let plan = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+        collection: "accounts".into(),
+        key: b"a1".to_vec(),
+        value: b"v1".to_vec(),
+        ttl_ms: 0,
+        updates: vec![("balance".into(), UpdateValue::Literal(b"100".to_vec()))],
+        surrogate: Surrogate::new(2),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
+        .expect("KvOp::InsertOnConflictUpdate should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING write must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Kv(InsertOnConflictUpdate), got {other:?}"),
+    }
+}
+
+/// Pins the bug: `entry_vector::encode` used to drop
+/// `VectorOp::DirectUpsert::returning` / `rls_filters` via named
+/// `returning: _` / `rls_filters: _`, and decode hardcoded `None` /
+/// `Vec::new()` — a `RETURNING` vector-primary upsert replicated via Raft
+/// silently produced no rows.
+#[test]
+fn vector_direct_upsert_returning_and_rls_filters_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
+        collection: "vecs".into(),
+        field: "emb".into(),
+        surrogate: Surrogate::new(3),
+        vector: vec![0.5, 0.6],
+        payload: vec![1, 2, 3],
+        quantization: VectorQuantization::RaBitQ,
+        storage_dtype: VectorStorageDtype::F16,
+        payload_indexes: vec![("tenant_id".into(), PayloadIndexKind::Equality)],
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
+        .expect("VectorOp::DirectUpsert should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING upsert must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Vector(DirectUpsert), got {other:?}"),
+    }
+}
+
+/// Pins the bug: `entry_crdt::encode` used to drop
+/// `CrdtOp::DocUpsert::returning` / `rls_filters` via named `returning: _`
+/// / `rls_filters: _`, and decode hardcoded `None` / `Vec::new()` — a
+/// `RETURNING` CRDT document upsert replicated via Raft silently produced
+/// no rows.
+#[test]
+fn crdt_doc_upsert_returning_and_rls_filters_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+        collection: "docs".into(),
+        document_id: "d1".into(),
+        fields_json: "{}".into(),
+        surrogate: Surrogate::new(4),
+        partial: false,
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("encode must not error")
+        .expect("CrdtOp::DocUpsert should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING upsert must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Crdt(DocUpsert), got {other:?}"),
+    }
 }

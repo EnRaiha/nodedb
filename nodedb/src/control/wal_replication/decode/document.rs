@@ -28,7 +28,16 @@
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::wal_replication::types::ReplicatedSumTarget;
-use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, UpdateValue};
+use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, ReturningSpec, UpdateValue};
+
+/// A decoded RETURNING projection spec plus the read filters gating it — see
+/// `ReplicatedWrite::PointPut::returning`. Bundled into a struct — plain
+/// positional arguments here exceed clippy's arity lint once every point op
+/// carries it.
+pub(super) struct ReturningFields<'a> {
+    pub returning: Option<ReturningSpec>,
+    pub rls_filters: &'a [u8],
+}
 
 /// The two slots a record carries its materialized-sum resolution in.
 ///
@@ -88,6 +97,7 @@ pub(super) fn point_put(
     value: &[u8],
     surrogate: u32,
     resolved_sum_targets: &WireSumResolution<'_>,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -107,10 +117,10 @@ pub(super) fn point_put(
         value: value.to_vec(),
         surrogate,
         pk_bytes,
-        // A replay re-applies the row; it answers no client, so it projects
-        // nothing and needs no read gate — see `point_delete`.
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — a replay re-executes this write for the
+        // originating request, not just for the follower's own state.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
@@ -131,6 +141,14 @@ pub(super) struct SumDecisions<'a> {
     pub deferred: &'a [String],
 }
 
+/// `point_insert`'s materialized-sum decisions plus its RETURNING pair,
+/// bundled together — plain positional arguments there exceed clippy's arity
+/// lint once `returning` joins the signature.
+pub(super) struct PointInsertOptions<'a> {
+    pub sums: SumDecisions<'a>,
+    pub returning: ReturningFields<'a>,
+}
+
 pub(super) fn point_insert(
     ctx: &DecodeCtx,
     collection: &str,
@@ -138,8 +156,9 @@ pub(super) fn point_insert(
     value: &[u8],
     if_absent: bool,
     surrogate: u32,
-    sums: SumDecisions<'_>,
+    options: PointInsertOptions<'_>,
 ) -> crate::Result<PhysicalPlan> {
+    let PointInsertOptions { sums, returning } = options;
     let SumDecisions {
         resolved: resolved_sum_targets,
         deferred: deferred_sum_targets,
@@ -162,9 +181,9 @@ pub(super) fn point_insert(
         value: value.to_vec(),
         if_absent,
         surrogate,
-        // Replay projects nothing back — see `point_delete`.
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(&resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
@@ -177,6 +196,7 @@ pub(super) fn point_delete(
     document_id: &str,
     surrogate: u32,
     resolved_sum_targets: &WireSumResolution<'_>,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -186,8 +206,9 @@ pub(super) fn point_delete(
         document_id: document_id.to_owned(),
         surrogate,
         pk_bytes,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // No predicate here: this node is a follower applying an
         // already-committed write. The writing identity is not available on
         // this node. The leader enforces RLS before proposing the write.
@@ -204,6 +225,7 @@ pub(super) fn point_update(
     updates: &[(String, UpdateValue)],
     surrogate: u32,
     resolved_sum_targets: &WireSumResolution<'_>,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
@@ -214,13 +236,22 @@ pub(super) fn point_update(
         surrogate,
         pk_bytes,
         updates: updates.to_vec(),
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // No predicate on replay — see `point_delete`.
         rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
+}
+
+/// `doc_upsert`'s materialized-sum resolution plus its RETURNING pair,
+/// bundled together — plain positional arguments there exceed clippy's arity
+/// lint once `returning` joins the signature.
+pub(super) struct UpsertExtras<'a> {
+    pub resolved_sum_targets: &'a WireSumResolution<'a>,
+    pub returning: ReturningFields<'a>,
 }
 
 pub(super) fn doc_upsert(
@@ -230,8 +261,12 @@ pub(super) fn doc_upsert(
     value: &[u8],
     on_conflict_updates: &[(String, UpdateValue)],
     surrogate: u32,
-    resolved_sum_targets: &WireSumResolution<'_>,
+    extras: UpsertExtras<'_>,
 ) -> crate::Result<PhysicalPlan> {
+    let UpsertExtras {
+        resolved_sum_targets,
+        returning,
+    } = extras;
     let pk_bytes = document_id.as_bytes().to_vec();
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, &pk_bytes, carried)?;
@@ -243,8 +278,9 @@ pub(super) fn doc_upsert(
         surrogate,
         // No predicate on replay — see `point_delete`.
         rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
     }))
@@ -263,6 +299,7 @@ pub(super) fn batch_insert(
     surrogates: &[u32],
     resolved_sum_targets: &WireSumResolution<'_>,
     deferred_sum_targets: &[String],
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     // `zip` below stops at the shorter side, so a record that lost surrogates
     // would decode into a plan whose rows have no cross-engine identity — the
@@ -301,9 +338,9 @@ pub(super) fn batch_insert(
         collection: collection.to_owned(),
         documents: documents.to_vec(),
         surrogates: resolved,
-        // Replay projects nothing back — see `point_delete`.
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
@@ -324,6 +361,7 @@ pub(super) fn bulk_dml(
     is_update: bool,
     updates: &[(String, UpdateValue)],
     resolved_sum_targets: &WireSumResolution<'_>,
+    returning: ReturningFields<'_>,
 ) -> PhysicalPlan {
     // The MATCHES are re-derived locally (same log position ⇒ same rows); the
     // identity of the targets those matches credit is read off the record — see
@@ -334,10 +372,11 @@ pub(super) fn bulk_dml(
             collection: collection.to_owned(),
             filters: filters.to_vec(),
             updates: updates.to_vec(),
-            returning: None,
+            // Carried on the record — see `point_put`.
+            returning: returning.returning,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
-            rls_filters: Vec::new(),
+            rls_filters: returning.rls_filters.to_vec(),
             // No predicate on replay — see `point_delete`.
             rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             resolved_sum_targets,
@@ -346,10 +385,11 @@ pub(super) fn bulk_dml(
         PhysicalPlan::Document(DocumentOp::BulkDelete {
             collection: collection.to_owned(),
             filters: filters.to_vec(),
-            returning: None,
+            // Carried on the record — see `point_put`.
+            returning: returning.returning,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
-            rls_filters: Vec::new(),
+            rls_filters: returning.rls_filters.to_vec(),
             // No predicate on replay — see `point_delete`.
             rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
             resolved_sum_targets,

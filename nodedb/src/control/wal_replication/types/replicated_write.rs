@@ -69,6 +69,17 @@ pub enum ReplicatedWrite {
         /// log across the upgrade.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
+        /// same way `ColumnarIngest::returning` is. `None` for a record
+        /// written before this field existed, and for any write with no
+        /// RETURNING clause.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// Read filters gating what `returning` may show back — see
+        /// `DocumentOp::PointPut::rls_filters`. Empty for a record written
+        /// before this field existed.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     PointInsert {
         collection: String,
@@ -93,6 +104,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     PointDelete {
         collection: String,
@@ -104,6 +121,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     PointUpdate {
         collection: String,
@@ -116,6 +139,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     DocUpsert {
         collection: String,
@@ -129,6 +158,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     DocBatchInsert {
         collection: String,
@@ -143,6 +178,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     VectorInsert {
         collection: String,
@@ -225,6 +266,12 @@ pub enum ReplicatedWrite {
         quantization: VectorQuantization,
         storage_dtype: VectorStorageDtype,
         payload_indexes: Vec<(String, PayloadIndexKind)>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     CrdtApply {
         collection: String,
@@ -374,6 +421,12 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         /// Leader-resolved expiry clock; `None` when `ttl_ms == 0`.
         resolved_now_ms: Option<u64>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvDelete {
         collection: String,
@@ -388,6 +441,12 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvInsertIfAbsent {
         collection: String,
@@ -397,6 +456,12 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvInsertOnConflictUpdate {
         collection: String,
@@ -407,6 +472,12 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvBatchPut {
         collection: String,
@@ -415,6 +486,12 @@ pub enum ReplicatedWrite {
         surrogates: Vec<u32>,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvExpire {
         collection: String,
@@ -454,6 +531,11 @@ pub enum ReplicatedWrite {
         key: Vec<u8>,
         new_value: Vec<u8>,
         surrogate: u32,
+        /// Read filters gating the OLD value this op hands back — see
+        /// `KvOp::GetSet::rls_filters`. `GetSet` has no RETURNING projection,
+        /// only this read gate.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     KvRegisterSortedIndex {
         collection: String,
@@ -529,6 +611,12 @@ pub enum ReplicatedWrite {
         /// See `PointPut::resolved_sum_target_bindings`.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     ColumnarBulkDml {
         collection: String,
@@ -573,11 +661,23 @@ pub enum ReplicatedWrite {
         surrogate: u32,
         fields_json: String,
         partial: bool,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     CrdtDocDelete {
         collection: String,
         document_id: String,
         surrogate: u32,
+        /// See `ReplicatedWrite::PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `ReplicatedWrite::PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     CalvinReadResult {
         epoch: u64,

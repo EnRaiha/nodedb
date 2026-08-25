@@ -12,10 +12,11 @@
 //! the full enum, mirroring how `vector::decode_arm` guards the same
 //! dispatch contract.
 
+use super::super::decode_sync_engines::decode_returning;
 use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
 use super::ctx::DecodeCtx;
 use super::document;
-use super::document::WireSumResolution;
+use super::document::{PointInsertOptions, ReturningFields, UpsertExtras, WireSumResolution};
 use crate::bridge::envelope::PhysicalPlan;
 
 /// Pair a record's two materialized-sum resolution slots.
@@ -40,6 +41,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogate,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::point_put(
             ctx,
             collection,
@@ -47,6 +50,10 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             value,
             *surrogate,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
+            ReturningFields {
+                returning: decode_returning(returning)?,
+                rls_filters,
+            },
         ),
         ReplicatedWrite::PointInsert {
             collection,
@@ -57,6 +64,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             resolved_sum_targets,
             deferred_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::point_insert(
             ctx,
             collection,
@@ -64,9 +73,15 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             value,
             *if_absent,
             *surrogate,
-            document::SumDecisions {
-                resolved: sums(resolved_sum_target_bindings, resolved_sum_targets),
-                deferred: deferred_sum_targets,
+            PointInsertOptions {
+                sums: document::SumDecisions {
+                    resolved: sums(resolved_sum_target_bindings, resolved_sum_targets),
+                    deferred: deferred_sum_targets,
+                },
+                returning: ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
             },
         ),
         ReplicatedWrite::PointDelete {
@@ -75,12 +90,18 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogate,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::point_delete(
             ctx,
             collection,
             document_id,
             *surrogate,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
+            ReturningFields {
+                returning: decode_returning(returning)?,
+                rls_filters,
+            },
         ),
         ReplicatedWrite::PointUpdate {
             collection,
@@ -89,6 +110,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogate,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::point_update(
             ctx,
             collection,
@@ -96,6 +119,10 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             updates,
             *surrogate,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
+            ReturningFields {
+                returning: decode_returning(returning)?,
+                rls_filters,
+            },
         ),
         ReplicatedWrite::DocUpsert {
             collection,
@@ -105,6 +132,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogate,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::doc_upsert(
             ctx,
             collection,
@@ -112,7 +141,13 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             value,
             on_conflict_updates,
             *surrogate,
-            &sums(resolved_sum_target_bindings, resolved_sum_targets),
+            UpsertExtras {
+                resolved_sum_targets: &sums(resolved_sum_target_bindings, resolved_sum_targets),
+                returning: ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            },
         ),
         ReplicatedWrite::DocBatchInsert {
             collection,
@@ -121,6 +156,8 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             resolved_sum_targets,
             deferred_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => document::batch_insert(
             ctx,
             collection,
@@ -128,6 +165,10 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogates,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
             deferred_sum_targets,
+            ReturningFields {
+                returning: decode_returning(returning)?,
+                rls_filters,
+            },
         ),
         ReplicatedWrite::DocTruncate {
             collection,
@@ -146,12 +187,18 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             updates,
             resolved_sum_targets,
             resolved_sum_target_bindings,
+            returning,
+            rls_filters,
         } => Ok(document::bulk_dml(
             collection,
             filters,
             *is_update,
             updates,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
+            ReturningFields {
+                returning: decode_returning(returning)?,
+                rls_filters,
+            },
         )),
         ReplicatedWrite::InsertSelect {
             target_collection,

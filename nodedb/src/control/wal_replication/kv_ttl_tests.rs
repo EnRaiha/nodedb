@@ -39,6 +39,8 @@ fn kv_put_resolved_now_ms_roundtrips_verbatim_not_a_fresh_clock_read() {
             ttl_ms,
             surrogate: 1,
             resolved_now_ms: Some(resolved_now_ms),
+            returning: None,
+            rls_filters: Vec::new(),
         },
     );
     let bytes = entry.to_bytes();
@@ -83,6 +85,8 @@ fn kv_put_ttl_zero_carries_no_resolved_now_ms() {
             ttl_ms: 0,
             surrogate: 1,
             resolved_now_ms: None,
+            returning: None,
+            rls_filters: Vec::new(),
         },
     );
     let bytes = entry.to_bytes();

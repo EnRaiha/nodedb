@@ -7,6 +7,7 @@
 //! guaranteed by the caller to already be one of these variants — see
 //! `entry_document::decode_arm` for the trailing-arm contract.
 
+use super::super::decode_sync_engines::decode_returning;
 use super::super::types::ReplicatedWrite;
 use super::crdt;
 use super::ctx::DecodeCtx;
@@ -127,18 +128,30 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             surrogate,
             fields_json,
             partial,
+            returning,
+            rls_filters,
         } => Ok(crdt::doc_upsert(
             collection,
             document_id,
             *surrogate,
             fields_json,
             *partial,
+            decode_returning(returning)?,
+            rls_filters,
         )),
         ReplicatedWrite::CrdtDocDelete {
             collection,
             document_id,
             surrogate,
-        } => Ok(crdt::doc_delete(collection, document_id, *surrogate)),
+            returning,
+            rls_filters,
+        } => Ok(crdt::doc_delete(
+            collection,
+            document_id,
+            *surrogate,
+            decode_returning(returning)?,
+            rls_filters,
+        )),
         ReplicatedWrite::ConstraintChange {
             collection,
             op,

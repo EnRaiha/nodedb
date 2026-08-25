@@ -16,6 +16,22 @@ use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
 use nodedb_physical::physical_plan::{ResolvedSumTarget, UpdateValue};
 use nodedb_types::Surrogate;
 
+/// `resolved_sum_targets` + `deferred_sum_targets` bundled for `point_insert`
+/// — plain positional arguments there exceed clippy's arity lint once
+/// `returning` joins the signature.
+pub(super) struct SumFields<'a> {
+    pub resolved: &'a [ResolvedSumTarget],
+    pub deferred: &'a [String],
+}
+
+/// The RETURNING wire pair, already msgpack-encoded by `encode_returning` /
+/// left raw for `rls_filters` — see `ReplicatedWrite::PointPut::returning`.
+/// Bundled for the same arity reason as `SumFields`.
+pub(super) struct WireReturning<'a> {
+    pub returning: Option<Vec<u8>>,
+    pub rls_filters: &'a [u8],
+}
+
 /// Flatten a plan's resolution into the AUTHORITATIVE wire shape.
 ///
 /// `Surrogate` is a newtype over `u32` and every other identity on this wire
@@ -67,6 +83,8 @@ pub(super) fn point_put(
     value: &[u8],
     surrogate: u32,
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointPut {
         collection: collection.to_owned(),
@@ -75,6 +93,8 @@ pub(super) fn point_put(
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 
@@ -84,8 +104,8 @@ pub(super) fn point_insert(
     value: &[u8],
     if_absent: bool,
     surrogate: u32,
-    resolved_sum_targets: &[ResolvedSumTarget],
-    deferred_sum_targets: &[String],
+    sums: SumFields<'_>,
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointInsert {
         collection: collection.to_owned(),
@@ -93,9 +113,11 @@ pub(super) fn point_insert(
         value: value.to_vec(),
         if_absent,
         surrogate,
-        resolved_sum_targets: wire_targets(resolved_sum_targets),
-        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
-        deferred_sum_targets: deferred_sum_targets.to_vec(),
+        resolved_sum_targets: wire_targets(sums.resolved),
+        resolved_sum_target_bindings: wire_target_bindings(sums.resolved),
+        deferred_sum_targets: sums.deferred.to_vec(),
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -104,6 +126,8 @@ pub(super) fn point_delete(
     document_id: &str,
     surrogate: u32,
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointDelete {
         collection: collection.to_owned(),
@@ -111,6 +135,8 @@ pub(super) fn point_delete(
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 
@@ -120,6 +146,7 @@ pub(super) fn point_update(
     updates: &[(String, UpdateValue)],
     surrogate: u32,
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::PointUpdate {
         collection: collection.to_owned(),
@@ -128,6 +155,8 @@ pub(super) fn point_update(
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -138,6 +167,7 @@ pub(super) fn upsert(
     on_conflict_updates: &[(String, UpdateValue)],
     surrogate: u32,
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::DocUpsert {
         collection: collection.to_owned(),
@@ -147,6 +177,8 @@ pub(super) fn upsert(
         surrogate,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }
 }
 
@@ -156,6 +188,8 @@ pub(super) fn batch_insert(
     surrogates: &[Surrogate],
     resolved_sum_targets: &[ResolvedSumTarget],
     deferred_sum_targets: &[String],
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::DocBatchInsert {
         collection: collection.to_owned(),
@@ -164,6 +198,8 @@ pub(super) fn batch_insert(
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 
@@ -196,6 +232,8 @@ pub(super) fn bulk_delete(
     collection: &str,
     filters: &[u8],
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::BulkDml {
         collection: collection.to_owned(),
@@ -204,6 +242,8 @@ pub(super) fn bulk_delete(
         updates: Vec::new(),
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 
@@ -212,6 +252,8 @@ pub(super) fn bulk_update(
     filters: &[u8],
     updates: &[(String, UpdateValue)],
     resolved_sum_targets: &[ResolvedSumTarget],
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::BulkDml {
         collection: collection.to_owned(),
@@ -220,6 +262,8 @@ pub(super) fn bulk_update(
         updates: updates.to_vec(),
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 

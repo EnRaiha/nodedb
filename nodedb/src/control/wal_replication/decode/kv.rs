@@ -4,8 +4,16 @@
 
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::KvOp;
+use nodedb_physical::physical_plan::{KvOp, ReturningSpec};
 use nodedb_types::RlsWriteCheck;
+
+/// A decoded RETURNING projection spec plus the read filters gating it — see
+/// `ReplicatedWrite::KvPut::returning`. Bundled — plain positional arguments
+/// exceed clippy's arity lint once every KV write function carries it.
+pub(super) struct ReturningFields<'a> {
+    pub returning: Option<ReturningSpec>,
+    pub rls_filters: &'a [u8],
+}
 
 pub(super) fn put(
     ctx: &DecodeCtx,
@@ -14,6 +22,7 @@ pub(super) fn put(
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = match ctx.assigner {
@@ -26,8 +35,10 @@ pub(super) fn put(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — a replay re-executes this write for the
+        // originating request, not just for the follower's own state.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }))
 }
 
@@ -52,6 +63,7 @@ pub(super) fn insert(
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = match ctx.assigner {
@@ -64,8 +76,9 @@ pub(super) fn insert(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }))
 }
 
@@ -76,6 +89,7 @@ pub(super) fn insert_if_absent(
     value: &[u8],
     ttl_ms: u64,
     surrogate: u32,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = match ctx.assigner {
@@ -88,20 +102,34 @@ pub(super) fn insert_if_absent(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }))
+}
+
+/// The stored entry an `INSERT ... ON CONFLICT DO UPDATE` record carries.
+pub(super) struct ConflictEntry<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ttl_ms: u64,
+    pub updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
+    pub surrogate: u32,
 }
 
 pub(super) fn insert_on_conflict_update(
     ctx: &DecodeCtx,
     collection: &str,
-    key: &[u8],
-    value: &[u8],
-    ttl_ms: u64,
-    updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
-    surrogate: u32,
+    entry: ConflictEntry<'_>,
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
+    let ConflictEntry {
+        key,
+        value,
+        ttl_ms,
+        updates,
+        surrogate,
+    } = entry;
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = match ctx.assigner {
         Some(a) => a.bind(ctx.database_id, ctx.tenant_id, collection, key, carried)?,
@@ -114,9 +142,11 @@ pub(super) fn insert_on_conflict_update(
         ttl_ms,
         updates: updates.to_vec(),
         surrogate,
+        // No predicate on replay — see `delete`.
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }))
 }
 
@@ -126,6 +156,7 @@ pub(super) fn batch_put(
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
     surrogates: &[u32],
+    returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
     let resolved = entries
         .iter()
@@ -143,8 +174,9 @@ pub(super) fn batch_put(
         entries: entries.to_vec(),
         ttl_ms,
         surrogates: resolved,
-        returning: None,
-        rls_filters: Vec::new(),
+        // Carried on the record — see `put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
     }))
 }
 
@@ -229,6 +261,7 @@ pub(super) fn get_set(
     key: &[u8],
     new_value: &[u8],
     surrogate: u32,
+    rls_filters: &[u8],
 ) -> crate::Result<PhysicalPlan> {
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
@@ -237,7 +270,10 @@ pub(super) fn get_set(
         key: key.to_vec(),
         new_value: new_value.to_vec(),
         surrogate,
-        rls_filters: Vec::new(),
+        // Carried on the record — the old value this op hands back is gated
+        // by the same read filters the originating request carried.
+        rls_filters: rls_filters.to_vec(),
+        // No predicate on replay — see `delete`.
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
