@@ -32,9 +32,7 @@
 //! replay, since the Binary Tuple re-encode needs the schema) that is outside
 //! this fix's scope.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// Create a schemaless `bitemporal=true` document collection with an explicit
 /// `id` primary key and a `value` column.

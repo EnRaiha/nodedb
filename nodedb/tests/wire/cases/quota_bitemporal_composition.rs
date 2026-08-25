@@ -9,9 +9,7 @@
 //! queries, then attempts two more AS-OF queries. The 4th overall request must
 //! be rejected by the rate limiter regardless of whether it uses AS OF.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// AS OF queries are not rate-limit exempt.
 ///

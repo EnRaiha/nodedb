@@ -5,8 +5,7 @@
 //! Covers: CREATE ARRAY DDL, INSERT INTO ARRAY, ARRAY_SLICE TVF query,
 //! wrong-DDL rejection (engine='array' must be rejected), and WAL durability.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn create_array_and_insert() {

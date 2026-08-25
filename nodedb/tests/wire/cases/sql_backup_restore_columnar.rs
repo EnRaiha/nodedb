@@ -19,8 +19,7 @@
 //! and rows 5–8 stay in the fresh in-memory memtable at backup time
 //! (unflushed-memtable path) — covering BOTH code paths.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 use bytes::Bytes;
 use futures::SinkExt;

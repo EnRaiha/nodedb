@@ -18,8 +18,7 @@
 //! leaves rows 5–8 in the fresh memtable (unflushed-memtable path) — so the
 //! restore + restart exercises BOTH paths.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 use bytes::Bytes;
 use futures::SinkExt;

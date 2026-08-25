@@ -6,9 +6,7 @@
 //! too-high count after rows are removed. Covers both the single-row point
 //! delete path and the predicate-driven bulk delete path.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 async fn create_table(server: &TestServer) {
     server

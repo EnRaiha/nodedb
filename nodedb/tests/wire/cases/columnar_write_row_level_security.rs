@@ -23,9 +23,7 @@
 //!   columnar ops, so it inherits the same enforcement.
 //! - A collection with no write policy behaves exactly as before.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "columnar-write-rls-secret-42";
 

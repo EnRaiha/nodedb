@@ -5,9 +5,7 @@
 //! Exercises the `AS OF SYSTEM TIME <ms>` and `AS OF VALID TIME <ms>`
 //! qualifiers on `ARRAY_SLICE` and `ARRAY_AGG` queries.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// Parse the `attrs` array from a slice result row's JSON.
 ///

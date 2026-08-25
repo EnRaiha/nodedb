@@ -11,9 +11,7 @@
 //! - with_database helper
 //! - bootstrap idempotency
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// Helper: create a database with a unique name and return it.
 async fn create_database(server: &TestServer, name: &str) {
