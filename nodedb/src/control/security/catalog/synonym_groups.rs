@@ -2,7 +2,7 @@
 
 //! Synonym group metadata operations for the system catalog.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::types::{SYNONYM_GROUPS, SystemCatalog, catalog_err};
@@ -76,7 +76,7 @@ impl SystemCatalog {
 
         let mut groups = Vec::new();
         let mut range = table
-            .range::<&str>(prefix.as_str()..)
+            .range(prefix.as_str()..)
             .map_err(|e| catalog_err("range synonym_groups", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if !key.value().starts_with(&prefix) {
@@ -101,7 +101,7 @@ impl SystemCatalog {
 
         let mut groups = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range synonym_groups", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<StoredSynonymGroup>(value.value()) {

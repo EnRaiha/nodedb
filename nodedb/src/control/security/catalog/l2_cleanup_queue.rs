@@ -81,7 +81,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open l2_cleanup_queue", e))?;
         let mut out = Vec::new();
         for item in table
-            .range::<(u64, u64, &str)>(..)
+            .range(..)
             .map_err(|e| catalog_err("range l2_cleanup", e))?
         {
             let (_, v) = item.map_err(|e| catalog_err("read l2_cleanup", e))?;

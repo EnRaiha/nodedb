@@ -5,7 +5,7 @@
 use super::types::{CHANGE_STREAMS, SystemCatalog, catalog_err};
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::types::DatabaseId;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store a change stream definition.
@@ -113,7 +113,7 @@ impl SystemCatalog {
 
         let mut streams = std::collections::HashMap::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range change_streams", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if let Ok(mut def) = zerompk::from_msgpack::<ChangeStreamDef>(value.value()) {

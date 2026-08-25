@@ -11,7 +11,7 @@
 //! Conversions: [`StoredRlsPolicy::from_runtime`] for serialization,
 //! [`StoredRlsPolicy::to_runtime`] for replay on apply / boot.
 
-use redb::{ReadableDatabase, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::control::security::deny::DenyMode;
 use crate::control::security::predicate::{PolicyMode, RlsPredicate};
@@ -213,7 +213,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open rls_policies", e))?;
         let mut out = Vec::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range rls_policies", e))?
         {
             let (_, value) = entry.map_err(|e| catalog_err("read rls", e))?;

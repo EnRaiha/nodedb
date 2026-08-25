@@ -3,7 +3,7 @@
 //! Scope catalog operations (redb persistence).
 
 use super::types::{SCOPE_GRANTS, SCOPES, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Serializable scope definition for redb storage.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -121,7 +121,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open scopes", e))?;
         let mut scopes = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range scopes", e))?
         {
             let (_, val) = item.map_err(|e| catalog_err("read scope", e))?;
@@ -196,7 +196,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open scope_grants", e))?;
         let mut grants = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range grants", e))?
         {
             let (_, val) = item.map_err(|e| catalog_err("read grant", e))?;

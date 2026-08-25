@@ -5,7 +5,7 @@
 #![cfg(test)]
 
 use nodedb_types::{DatabaseId, TenantId};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
     EdgeRef, EdgeValuePayload, GDPR_ERASURE_SENTINEL, TOMBSTONE_SENTINEL, versioned_edge_key,

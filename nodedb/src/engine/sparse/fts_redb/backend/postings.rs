@@ -4,7 +4,7 @@
 //! keyed by `(database_id, tenant_id, collection, term)`.
 
 use nodedb_fts::posting::Posting;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::core::RedbFtsBackend;
 use super::shared::{MAX_SUBKEY, redb_err};

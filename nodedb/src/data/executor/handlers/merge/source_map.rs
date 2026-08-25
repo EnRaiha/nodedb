@@ -9,7 +9,7 @@
 //! across files is how they drift, and a source map that differs by even one
 //! key silently reclassifies matched rows as NOT MATCHED.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;

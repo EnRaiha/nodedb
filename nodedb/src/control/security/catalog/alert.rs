@@ -4,7 +4,7 @@
 
 use super::types::{ALERT_RULES, SystemCatalog, catalog_err};
 use crate::event::alert::types::AlertDef;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store an alert rule definition.
@@ -68,7 +68,7 @@ impl SystemCatalog {
 
         let mut rules = Vec::new();
         let mut range = table
-            .range::<(u64, &str)>(..)
+            .range(..)
             .map_err(|e| catalog_err("range alert_rules", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<AlertDef>(value.value()) {

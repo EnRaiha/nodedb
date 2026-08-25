@@ -155,7 +155,7 @@ impl SystemCatalog {
 
         let mut groups = HashMap::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range consumer_groups", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if let Some(mut def) = decode_consumer_group(value.value()) {

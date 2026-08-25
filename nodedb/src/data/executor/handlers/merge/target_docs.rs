@@ -9,7 +9,7 @@
 //! identical target set or the classification they agree on is meaningless, so
 //! there is exactly one place that decides what "the target" is.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::data::executor::core_loop::CoreLoop;
 

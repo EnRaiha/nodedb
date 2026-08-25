@@ -90,7 +90,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open pending_reclaim", e))?;
         let mut out = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range pending_reclaim", e))?
         {
             let (_, v) = item.map_err(|e| catalog_err("read pending_reclaim", e))?;

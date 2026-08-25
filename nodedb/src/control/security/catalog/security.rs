@@ -6,7 +6,7 @@ use super::types::{
     API_KEYS, OWNERS, PERMISSIONS, ROLES, StoredApiKey, StoredOwner, StoredPermission, StoredRole,
     SystemCatalog, catalog_err, owner_key,
 };
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     // ── API Key operations ──────────────────────────────────────────
@@ -45,7 +45,7 @@ impl SystemCatalog {
 
         let mut keys = Vec::new();
         let range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range api_keys", e))?;
         for entry in range {
             let (_, value) = entry.map_err(|e| catalog_err("read entry", e))?;
@@ -142,10 +142,7 @@ impl SystemCatalog {
             .open_table(ROLES)
             .map_err(|e| catalog_err("open roles", e))?;
         let mut roles = Vec::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range roles", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range roles", e))? {
             let (_, value) = entry.map_err(|e| catalog_err("read role", e))?;
             roles.push(
                 zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser role", e))?,
@@ -210,10 +207,7 @@ impl SystemCatalog {
             .open_table(PERMISSIONS)
             .map_err(|e| catalog_err("open perms", e))?;
         let mut perms = Vec::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range perms", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range perms", e))? {
             let (_, value) = entry.map_err(|e| catalog_err("read perm", e))?;
             perms.push(
                 zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser perm", e))?,
@@ -281,7 +275,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open owners", e))?;
         let mut owners = Vec::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range owners", e))?
         {
             let (_, value) = entry.map_err(|e| catalog_err("read owner", e))?;

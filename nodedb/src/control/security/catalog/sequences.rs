@@ -4,7 +4,7 @@
 
 use super::sequence_types::{SequenceState, StoredSequence};
 use super::types::{SEQUENCE_STATE, SEQUENCES, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store a sequence definition.
@@ -95,7 +95,7 @@ impl SystemCatalog {
 
         let mut sequences = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range sequences", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if key.value().starts_with(&prefix)
@@ -119,7 +119,7 @@ impl SystemCatalog {
 
         let mut sequences = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range sequences", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(seq) = zerompk::from_msgpack::<StoredSequence>(value.value()) {

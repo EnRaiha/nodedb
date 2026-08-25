@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use nodedb_types::{DatabaseId, TenantId};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::store::{Direction, Edge, EdgeStore, REVERSE_EDGES, redb_err};
 use super::temporal::{

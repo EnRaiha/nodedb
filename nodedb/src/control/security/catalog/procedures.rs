@@ -4,7 +4,7 @@
 use super::procedure_types::StoredProcedure;
 use super::types::{PROCEDURES, SystemCatalog, catalog_err};
 use nodedb_types::id::DatabaseId;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 impl SystemCatalog {
@@ -133,7 +133,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open procedures", e))?;
         let mut rows = HashMap::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range procedures", e))?
         {
             let (_key, value) = entry.map_err(|e| catalog_err("read procedure", e))?;

@@ -12,7 +12,7 @@
 //! Conversions: [`StoredRedactionPolicy::from_runtime`] for serialization,
 //! [`StoredRedactionPolicy::to_runtime`] for replay on apply / boot.
 
-use redb::{ReadableDatabase, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::control::security::redaction::{RedactionPolicy, RedactionRule};
 
@@ -157,7 +157,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open redaction_policies", e))?;
         let mut out = Vec::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range redaction_policies", e))?
         {
             let (_, value) = entry.map_err(|e| catalog_err("read redaction", e))?;

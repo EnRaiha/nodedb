@@ -2,7 +2,7 @@
 
 //! Streaming MV metadata operations for the system catalog.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 use crate::event::streaming_mv::StreamingMvDef;
@@ -104,7 +104,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open streaming_mvs", e))?;
         let mut mvs = HashMap::new();
         let range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range streaming_mvs", e))?;
         for entry in range {
             let (key, value) = entry.map_err(|e| catalog_err("read streaming_mv", e))?;

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -220,7 +220,7 @@ impl MigrationStateTable {
             .map_err(|e| ClusterError::Storage {
                 detail: format!("migration_state open_table: {e}"),
             })?;
-        let range = table.range::<&str>(..).map_err(|e| ClusterError::Storage {
+        let range = table.range(..).map_err(|e| ClusterError::Storage {
             detail: format!("migration_state range: {e}"),
         })?;
         for entry in range {

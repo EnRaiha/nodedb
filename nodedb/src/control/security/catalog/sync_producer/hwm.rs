@@ -5,7 +5,7 @@
 //! uses `u32`).
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Singleton high-watermark for the producer-id allocator.
 ///

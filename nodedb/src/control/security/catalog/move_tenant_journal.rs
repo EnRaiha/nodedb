@@ -9,7 +9,7 @@
 use super::move_tenant_journal_types::{MOVE_TENANT_JOURNAL, MoveTenantJournalEntry};
 use super::system_catalog::SystemCatalog;
 use super::types::catalog_err;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Load the journal entry for `tenant_id`, if one exists.
@@ -94,7 +94,7 @@ impl SystemCatalog {
         };
         let mut entries = Vec::new();
         for result in table
-            .range::<u64>(..)
+            .range(..)
             .map_err(|e| catalog_err("range move_tenant_journal", e))?
         {
             let (_, value) = result.map_err(|e| catalog_err("iter move_tenant_journal", e))?;

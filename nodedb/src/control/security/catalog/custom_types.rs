@@ -5,7 +5,7 @@
 //! Persists `CREATE TYPE` definitions (enum and composite) via the
 //! `_system.custom_types` redb table. Key: `"{tenant_id}:{name}"`.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::types::{CUSTOM_TYPES, SystemCatalog, catalog_err};
@@ -122,7 +122,7 @@ impl SystemCatalog {
 
         let mut types = Vec::new();
         let mut range = table
-            .range::<&str>(prefix.as_str()..)
+            .range(prefix.as_str()..)
             .map_err(|e| catalog_err("range custom_types", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if !key.value().starts_with(&prefix) {
@@ -147,7 +147,7 @@ impl SystemCatalog {
 
         let mut types = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range custom_types", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<StoredCustomType>(value.value()) {

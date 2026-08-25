@@ -234,7 +234,7 @@ impl SystemCatalog {
         let canonical = format!("topic:{name}");
         let mut names = std::collections::BTreeSet::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range consumer_groups", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read consumer_group", e))?;
@@ -301,7 +301,7 @@ impl SystemCatalog {
             let canonical = format!("topic:{name}");
             let mut keys = Vec::new();
             for entry in groups
-                .range::<&str>(..)
+                .range(..)
                 .map_err(|e| catalog_err("range consumer_groups", e))?
             {
                 let (key, value) = entry.map_err(|e| catalog_err("read consumer_group", e))?;
@@ -342,7 +342,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open topics_ep", e))?;
         let mut topics = HashMap::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range topics_ep", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read topic", e))?;
@@ -380,7 +380,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open topic_messages", e))?;
         let mut messages = Vec::new();
         for entry in table
-            .range::<&[u8]>(..)
+            .range(..)
             .map_err(|e| catalog_err("range topic_messages", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;
@@ -478,7 +478,7 @@ fn prune_topic_messages(
     let cutoff = current_time_ms().saturating_sub(def.retention.max_age_secs.saturating_mul(1_000));
     let mut messages = Vec::new();
     for entry in table
-        .range::<&[u8]>(..)
+        .range(..)
         .map_err(|e| catalog_err("range topic_messages", e))?
     {
         let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;
@@ -531,7 +531,7 @@ fn scoped_message_keys(
 ) -> crate::Result<Vec<Vec<u8>>> {
     let mut keys = Vec::new();
     for entry in table
-        .range::<&[u8]>(..)
+        .range(..)
         .map_err(|e| catalog_err("range topic_messages", e))?
     {
         let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;

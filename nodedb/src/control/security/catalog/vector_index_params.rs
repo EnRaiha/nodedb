@@ -6,7 +6,7 @@
 //! `_system.vector_index_params`. Key format: `"{tenant_id}:{collection}:{field_name}"`.
 
 use nodedb_types::StoredVectorIndexParams;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{SystemCatalog, VECTOR_INDEX_PARAMS, catalog_err};
 
@@ -110,7 +110,7 @@ pub(super) fn list_all_vector_index_params_in(
 
     let mut entries = Vec::new();
     for item in table
-        .range::<&str>(..)
+        .range(..)
         .map_err(|e| catalog_err("range vector index params", e))?
     {
         let (_, value) = item.map_err(|e| catalog_err("read vector index params", e))?;

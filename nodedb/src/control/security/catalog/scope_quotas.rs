@@ -3,7 +3,7 @@
 //! Per-scope token quota catalog operations (redb persistence).
 
 use super::types::{SCOPE_QUOTAS, StoredScopeQuota, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Insert or update a scope quota definition.
@@ -64,7 +64,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open scope quotas", e))?;
         let mut quotas = Vec::new();
         let range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range scope quotas", e))?;
         for item in range {
             let (_, value) = item.map_err(|e| catalog_err("read scope quota", e))?;

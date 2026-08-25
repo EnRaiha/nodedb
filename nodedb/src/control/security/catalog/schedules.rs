@@ -2,7 +2,7 @@
 
 //! Schedule metadata operations for the system catalog.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 use nodedb_types::id::DatabaseId;
@@ -143,7 +143,7 @@ impl SystemCatalog {
         // iteration order.
         let mut rows: HashMap<(u64, u64, String), (bool, ScheduleDef)> = HashMap::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range schedules", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read schedule", e))?;

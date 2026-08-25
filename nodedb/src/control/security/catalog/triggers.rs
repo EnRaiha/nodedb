@@ -4,7 +4,7 @@
 use super::trigger_types::StoredTrigger;
 use super::types::{SystemCatalog, TRIGGERS, catalog_err};
 use nodedb_types::id::DatabaseId;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 impl SystemCatalog {
@@ -126,7 +126,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open triggers", e))?;
         let mut rows = HashMap::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range triggers", e))?
         {
             let (_key, value) = entry.map_err(|e| catalog_err("read trigger", e))?;

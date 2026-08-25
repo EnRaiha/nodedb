@@ -6,7 +6,7 @@
 //! Covers in-place renames and cross-database moves of the document table, the
 //! secondary-index table, and the collection's persisted hash-chain head.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use tracing::debug;
 
 use super::engine::SparseEngine;
@@ -48,7 +48,7 @@ impl SparseEngine {
                 .map_err(|e| redb_err("open docs", e))?;
             let mut out = Vec::new();
             for entry in table
-                .range::<&str>(old_prefix.as_str()..old_end.as_str())
+                .range(old_prefix.as_str()..old_end.as_str())
                 .map_err(|e| redb_err("range docs", e))?
             {
                 let (k, v) = entry.map_err(|e| redb_err("scan doc row", e))?;
@@ -67,7 +67,7 @@ impl SparseEngine {
                 .map_err(|e| redb_err("open indexes", e))?;
             let mut out = Vec::new();
             for entry in table
-                .range::<&str>(old_prefix.as_str()..old_end.as_str())
+                .range(old_prefix.as_str()..old_end.as_str())
                 .map_err(|e| redb_err("range indexes", e))?
             {
                 let (k, _) = entry.map_err(|e| redb_err("scan idx row", e))?;

@@ -4,7 +4,7 @@
 //! keyed by `(database_id, tenant_id, collection, surrogate_u32)`.
 
 use nodedb_types::Surrogate;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::core::RedbFtsBackend;
 use super::shared::redb_err;

@@ -7,7 +7,7 @@
 
 use super::types::{DEPENDENCIES, SystemCatalog, catalog_err};
 use nodedb_types::id::DatabaseId;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use std::collections::HashMap;
 
 /// A single dependency edge: the source object references the target.
@@ -116,10 +116,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open dependencies", e))?;
 
         let mut lists = HashMap::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range deps", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range deps", e))? {
             let (key, value) = entry.map_err(|e| catalog_err("read dep", e))?;
             let Some((is_v2, source_type, entry_tid, entry_db, source_name)) =
                 parse_dep_key(key.value())

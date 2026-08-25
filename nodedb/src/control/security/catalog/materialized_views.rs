@@ -3,7 +3,7 @@
 //! Materialized view metadata operations for the system catalog.
 
 use super::types::{MATERIALIZED_VIEWS, StoredMaterializedView, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store a materialized view record.
@@ -63,10 +63,7 @@ impl SystemCatalog {
             .open_table(MATERIALIZED_VIEWS)
             .map_err(|e| catalog_err("open materialized_views", e))?;
         let mut views = Vec::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range scan", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range scan", e))? {
             let (_key, val) = entry.map_err(|e| catalog_err("read entry", e))?;
             let view: StoredMaterializedView = zerompk::from_msgpack(val.value())
                 .map_err(|e| catalog_err("deser materialized_view", e))?;
@@ -89,10 +86,7 @@ impl SystemCatalog {
             .open_table(MATERIALIZED_VIEWS)
             .map_err(|e| catalog_err("open materialized_views", e))?;
         let mut views = Vec::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range scan", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range scan", e))? {
             let (key, val) = entry.map_err(|e| catalog_err("read entry", e))?;
             if key.value().starts_with(&prefix)
                 && let Ok(view) = zerompk::from_msgpack::<StoredMaterializedView>(val.value())

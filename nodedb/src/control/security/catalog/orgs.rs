@@ -104,10 +104,7 @@ impl SystemCatalog {
             .open_table(ORGS)
             .map_err(|e| catalog_err("open orgs", e))?;
         let mut orgs = Vec::new();
-        for item in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range orgs", e))?
-        {
+        for item in table.range(..).map_err(|e| catalog_err("range orgs", e))? {
             let (_, val) = item.map_err(|e| catalog_err("read org", e))?;
             if let Ok(org) = zerompk::from_msgpack::<StoredOrg>(val.value()) {
                 orgs.push(org);
@@ -185,7 +182,7 @@ impl SystemCatalog {
                 .open_table(ORG_MEMBERS)
                 .map_err(|e| catalog_err("open org_members", e))?;
             let keys: Vec<String> = table
-                .range::<&str>(..)
+                .range(..)
                 .map_err(|e| catalog_err("range members", e))?
                 .filter_map(|item| item.ok())
                 .map(|(k, _)| k.value().to_string())
@@ -220,7 +217,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open org_members", e))?;
         let mut members = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range members", e))?
         {
             let (key, val) = item.map_err(|e| catalog_err("read member", e))?;
@@ -244,7 +241,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open org_members", e))?;
         let mut memberships = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range members", e))?
         {
             let (key, val) = item.map_err(|e| catalog_err("read member", e))?;

@@ -3,7 +3,7 @@
 //! Column statistics for query optimizer (ANALYZE).
 
 use super::types::{COLUMN_STATS, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Per-column statistics collected by ANALYZE.
 ///
@@ -68,7 +68,7 @@ impl SystemCatalog {
 
         let mut stats = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range column_stats", e))?;
         while let Some(Ok((key, value))) = range.next() {
             if key.value().starts_with(&prefix)

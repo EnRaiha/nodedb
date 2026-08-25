@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::debug;
 
 use crate::types::Lsn;

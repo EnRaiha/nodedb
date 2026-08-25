@@ -8,7 +8,7 @@
 //! that consumes these methods.
 
 use super::types::{SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Redb table: singleton `"global"` -> highest allocated surrogate (`u32`).
 pub const SURROGATE_HWM: redb::TableDefinition<&str, u32> =

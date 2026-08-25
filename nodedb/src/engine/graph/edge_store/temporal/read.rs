@@ -8,7 +8,7 @@ use super::keys::{
 };
 use super::payload::EdgeValuePayload;
 use crate::engine::graph::edge_store::store::{EDGES, Edge, EdgeStore, redb_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl EdgeStore {
     /// Resolve the Ceiling: the latest version of

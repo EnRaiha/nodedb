@@ -3,7 +3,7 @@
 //! User CRUD operations for the system catalog.
 
 use super::types::{METADATA, StoredUser, SystemCatalog, USERS, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Load all active users from the catalog.
@@ -17,9 +17,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open users", e))?;
 
         let mut users = Vec::new();
-        let range = table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range users", e))?;
+        let range = table.range(..).map_err(|e| catalog_err("range users", e))?;
         for entry in range {
             let (_, value) = entry.map_err(|e| catalog_err("read entry", e))?;
             let user: StoredUser = zerompk::from_msgpack(value.value())

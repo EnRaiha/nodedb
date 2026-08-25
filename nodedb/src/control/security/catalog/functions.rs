@@ -104,7 +104,7 @@ impl SystemCatalog {
             {
                 let mut still_referenced = false;
                 for entry in functions
-                    .range::<&str>(..)
+                    .range(..)
                     .map_err(|e| catalog_err("scan functions", e))?
                 {
                     let (_, value) = entry.map_err(|e| catalog_err("read function", e))?;
@@ -272,7 +272,7 @@ impl SystemCatalog {
                 .collect();
             let mut referenced_hashes = HashSet::new();
             for row in functions
-                .range::<&str>(..)
+                .range(..)
                 .map_err(|e| catalog_err("scan functions", e))?
             {
                 let (_, value) = row.map_err(|e| catalog_err("read function", e))?;
@@ -349,7 +349,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open functions", e))?;
         let mut dedup = HashMap::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range functions", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read function", e))?;

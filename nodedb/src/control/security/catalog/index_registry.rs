@@ -10,7 +10,7 @@
 
 use super::index_record::{IndexKind, StoredIndexRecord};
 use super::types::{INDEX_REGISTRY, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Key of one index record.
 fn index_key(database_id: u64, tenant_id: u64, name: &str) -> String {
@@ -172,7 +172,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open index_registry", e))?;
         let mut out = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range index_registry", e))?
         {
             let (_, value) = item.map_err(|e| catalog_err("read index record", e))?;

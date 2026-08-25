@@ -219,7 +219,7 @@ impl SparseEngine {
             Err(_) => return 0,
         };
         let mut total: u64 = 0;
-        let range = match table.range::<&str>(prefix.as_str()..end.as_str()) {
+        let range = match table.range(prefix.as_str()..end.as_str()) {
             Ok(r) => r,
             Err(_) => return 0,
         };

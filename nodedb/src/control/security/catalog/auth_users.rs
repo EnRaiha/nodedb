@@ -3,7 +3,7 @@
 //! Auth user catalog operations (redb persistence for JIT-provisioned users).
 
 use super::types::{AUTH_USERS, StoredAuthUser, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Insert or update a JIT-provisioned auth user.
@@ -79,7 +79,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open auth_users", e))?;
         let mut users = Vec::new();
         let range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range auth_users", e))?;
         for item in range {
             let (_, value) = item.map_err(|e| catalog_err("read auth user", e))?;

@@ -3,7 +3,7 @@
 //! Blacklist catalog operations (redb persistence).
 
 use super::types::{BLACKLIST, StoredBlacklistEntry, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Insert or update a blacklist entry.
@@ -60,7 +60,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open blacklist", e))?;
         let mut entries = Vec::new();
         let range = table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range blacklist", e))?;
         for item in range {
             let (_, value) = item.map_err(|e| catalog_err("read blacklist entry", e))?;

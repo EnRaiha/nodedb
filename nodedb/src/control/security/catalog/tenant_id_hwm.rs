@@ -53,7 +53,7 @@ impl SystemCatalog {
                     .open_table(TENANTS)
                     .map_err(|e| catalog_err("open tenants", e))?;
                 for entry in tenants
-                    .range::<&str>(..)
+                    .range(..)
                     .map_err(|e| catalog_err("range tenants", e))?
                 {
                     let (key, _) = entry.map_err(|e| catalog_err("read tenant", e))?;

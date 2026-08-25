@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase};
+use redb::{Database, ReadableDatabase, ReadableTable};
 use tracing::info;
 
 use super::types::*;

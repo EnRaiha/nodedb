@@ -4,7 +4,7 @@
 
 use super::types::{RETENTION_POLICIES, SystemCatalog, catalog_err};
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store a retention policy definition.
@@ -68,7 +68,7 @@ impl SystemCatalog {
 
         let mut policies = Vec::new();
         let mut range = table
-            .range::<(u64, &str)>(..)
+            .range(..)
             .map_err(|e| catalog_err("range retention_policies", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<RetentionPolicyDef>(value.value()) {

@@ -79,10 +79,7 @@ impl SystemCatalog {
             // Two-pass: collect keys to delete, then delete. redb's
             // iterators don't permit concurrent mutation on the same table.
             let mut to_delete: Vec<(u64, u64, String)> = Vec::new();
-            for entry in table
-                .range::<(u64, u64, &str)>(..)
-                .map_err(|e| catalog_err("gc range", e))?
-            {
+            for entry in table.range(..).map_err(|e| catalog_err("gc range", e))? {
                 let (key, value) = entry.map_err(|e| catalog_err("gc read", e))?;
                 if value.value() < min_retained_lsn {
                     let (db, tid, name) = key.value();
@@ -113,7 +110,7 @@ pub(super) fn load_wal_tombstones_in(
         .map_err(|e| catalog_err("open wal_tombstones", e))?;
     let mut set = nodedb_wal::TombstoneSet::new();
     for entry in table
-        .range::<(u64, u64, &str)>(..)
+        .range(..)
         .map_err(|e| catalog_err("range wal_tombstones", e))?
     {
         let (key, value) = entry.map_err(|e| catalog_err("read wal_tombstone", e))?;

@@ -2,7 +2,7 @@
 
 //! Table scanning and import/export methods for `SparseEngine`.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use tracing::debug;
 
 use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err, tenant_prefix};
@@ -328,9 +328,7 @@ impl SparseEngine {
             .open_table(DOCUMENTS)
             .map_err(|e| redb_err("open docs", e))?;
         let mut pairs = Vec::new();
-        let iter = table
-            .range::<&str>(..)
-            .map_err(|e| redb_err("iter docs", e))?;
+        let iter = table.range(..).map_err(|e| redb_err("iter docs", e))?;
         for entry in iter {
             let entry = entry.map_err(|e| redb_err("read doc entry", e))?;
             pairs.push((entry.0.value().to_string(), entry.1.value().to_vec()));
@@ -345,9 +343,7 @@ impl SparseEngine {
             .open_table(INDEXES)
             .map_err(|e| redb_err("open indexes", e))?;
         let mut pairs = Vec::new();
-        let iter = table
-            .range::<&str>(..)
-            .map_err(|e| redb_err("iter indexes", e))?;
+        let iter = table.range(..).map_err(|e| redb_err("iter indexes", e))?;
         for entry in iter {
             let entry = entry.map_err(|e| redb_err("read index entry", e))?;
             pairs.push((entry.0.value().to_string(), entry.1.value().to_vec()));

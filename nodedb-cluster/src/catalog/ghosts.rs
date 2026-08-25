@@ -3,7 +3,7 @@
 //! Ghost stub refcount persistence — survives restarts so ghost
 //! edges aren't counted twice after a crash.
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::error::Result;
 use crate::ghost::GhostTable;
@@ -52,7 +52,7 @@ impl ClusterCatalog {
         let table = txn.open_table(GHOST_TABLE).map_err(catalog_err)?;
 
         let mut results = Vec::new();
-        let range = table.range::<&str>(..).map_err(catalog_err)?;
+        let range = table.range(..).map_err(catalog_err)?;
         for entry in range {
             let (key, value) = entry.map_err(catalog_err)?;
             let key_str = key.value();

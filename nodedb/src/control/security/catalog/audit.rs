@@ -2,7 +2,7 @@
 
 //! Audit log operations for the system catalog.
 
-use redb::{ReadableDatabase, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use super::types::{AUDIT_LOG, StoredAuditEntry, SystemCatalog, catalog_err};
 
@@ -19,10 +19,7 @@ impl SystemCatalog {
                 .open_table(AUDIT_LOG)
                 .map_err(|e| catalog_err("open audit", e))?;
             let mut keys = Vec::new();
-            for entry in table
-                .range::<&[u8]>(..)
-                .map_err(|e| catalog_err("range audit", e))?
-            {
+            for entry in table.range(..).map_err(|e| catalog_err("range audit", e))? {
                 let (key, value) = entry.map_err(|e| catalog_err("read audit", e))?;
                 let stored: StoredAuditEntry = match zerompk::from_msgpack(value.value()) {
                     Ok(s) => s,
@@ -103,9 +100,7 @@ impl SystemCatalog {
         // Audit log keys are u64 big-endian, so the last entry in
         // iteration order is the highest.
         let mut max_seq = 0u64;
-        let range = table
-            .range::<&[u8]>(..)
-            .map_err(|e| catalog_err("range audit", e))?;
+        let range = table.range(..).map_err(|e| catalog_err("range audit", e))?;
         for entry in range {
             let (key, _) = entry.map_err(|e| catalog_err("read audit key", e))?;
             let key_bytes: &[u8] = key.value();
@@ -133,10 +128,7 @@ impl SystemCatalog {
 
         // Read all entries, then take the last `limit` (since redb iterates in key order = seq order).
         let mut all = Vec::new();
-        for entry in table
-            .range::<&[u8]>(..)
-            .map_err(|e| catalog_err("range audit", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range audit", e))? {
             let (_, value) = entry.map_err(|e| catalog_err("read audit", e))?;
             let stored: StoredAuditEntry =
                 zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser audit", e))?;
@@ -176,7 +168,7 @@ impl SystemCatalog {
             let mut last_hash = String::new();
             let mut first_kept_seq = 0u64;
             for (idx, entry) in table
-                .range::<&[u8]>(..)
+                .range(..)
                 .map_err(|e| catalog_err("range audit", e))?
                 .enumerate()
             {

@@ -12,7 +12,7 @@ use super::keys::{parse_versioned_edge_key, versioned_edge_key};
 use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
 use nodedb_types::TenantId;
 use nodedb_types::temporal::ms_to_ordinal_upper;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl EdgeStore {
     /// Purge superseded versions for `(tid, collection)` whose

@@ -23,7 +23,7 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::doc_id_to_surrogate;
 use crate::engine::sparse::btree::DOCUMENTS;
 use crate::types::{DatabaseId, TenantId};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl CoreLoop {
     /// Execute a cursor-paginated raw document scan for the clone materializer.

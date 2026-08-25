@@ -8,7 +8,7 @@
 //! in sync on every failure and success event.
 
 use super::types::{LOCKOUT_STATE, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Re-export the table definition so `system_catalog.rs` can open it during
 /// catalog initialization without reaching into `types` directly.
@@ -99,7 +99,7 @@ impl SystemCatalog {
 
         let mut out = Vec::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range lockout_state", e))?
         {
             let (key, value) = entry.map_err(|e| catalog_err("read lockout", e))?;
@@ -137,7 +137,7 @@ impl SystemCatalog {
 
             let mut keys = Vec::new();
             for entry in table
-                .range::<&str>(..)
+                .range(..)
                 .map_err(|e| catalog_err("range lockout_state gc", e))?
             {
                 let (key, value) = entry.map_err(|e| catalog_err("read lockout gc", e))?;

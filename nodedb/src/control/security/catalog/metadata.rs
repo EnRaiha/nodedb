@@ -282,7 +282,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("open tenants", e))?;
         let mut tenants = Vec::new();
         for entry in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range tenants", e))?
         {
             let (_, value) = entry.map_err(|e| catalog_err("read tenant", e))?;

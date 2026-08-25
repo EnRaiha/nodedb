@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::debug;
 
 use super::types::PartitionOffset;
@@ -81,7 +81,7 @@ impl OffsetStore {
                 engine: "event_plane".into(),
                 detail: format!("open_table: {e}"),
             })?;
-            let mut range = table.range::<&str>(..).map_err(|e| crate::Error::Storage {
+            let mut range = table.range(..).map_err(|e| crate::Error::Storage {
                 engine: "event_plane".into(),
                 detail: format!("range: {e}"),
             })?;

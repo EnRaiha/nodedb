@@ -3,7 +3,7 @@
 //! Continuous-aggregate metadata operations for the system catalog.
 
 use super::types::{CONTINUOUS_AGGREGATES, StoredContinuousAggregate, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
     /// Store a continuous-aggregate record.
@@ -68,10 +68,7 @@ impl SystemCatalog {
             .open_table(CONTINUOUS_AGGREGATES)
             .map_err(|e| catalog_err("open continuous_aggregates", e))?;
         let mut caggs = Vec::new();
-        for entry in table
-            .range::<(u64, &str)>(..)
-            .map_err(|e| catalog_err("range scan", e))?
-        {
+        for entry in table.range(..).map_err(|e| catalog_err("range scan", e))? {
             let (_key, val) = entry.map_err(|e| catalog_err("read entry", e))?;
             let cagg: StoredContinuousAggregate = zerompk::from_msgpack(val.value())
                 .map_err(|e| catalog_err("deser continuous_aggregate", e))?;

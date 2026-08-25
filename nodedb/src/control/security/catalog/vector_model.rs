@@ -6,7 +6,7 @@
 //! Key format: `"{tenant_id}:{collection}:{column}"`.
 
 use nodedb_types::VectorModelEntry;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{SystemCatalog, VECTOR_MODEL_METADATA, catalog_err};
 
@@ -71,7 +71,7 @@ impl SystemCatalog {
 
         let mut entries = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range vector models", e))?
         {
             let (key, value) = item.map_err(|e| catalog_err("read vector model", e))?;
@@ -96,7 +96,7 @@ impl SystemCatalog {
 
         let mut entries = Vec::new();
         for item in table
-            .range::<&str>(..)
+            .range(..)
             .map_err(|e| catalog_err("range vector models", e))?
         {
             let (_, value) = item.map_err(|e| catalog_err("read vector model", e))?;
