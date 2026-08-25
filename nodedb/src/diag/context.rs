@@ -61,6 +61,52 @@ impl DomainContext for MetadataApplyWedged<'_> {
     }
 }
 
+/// A `catalog_entry::apply_to` call left redb with a parent-replicated
+/// primary row missing its `StoredOwner` row (or vice versa) — the
+/// `verify_redb_integrity` `OrphanRow` class, detected right after the
+/// entry that created it was applied.
+pub(super) struct CatalogApplyOrphanRow<'a> {
+    /// The `CatalogEntry` variant whose apply produced the orphan.
+    pub entry_kind: &'a str,
+    /// Object kind of the first orphan found (`collection`, `function`, ...).
+    pub orphan_kind: &'a str,
+    /// How many orphan rows this apply call left behind.
+    pub orphan_count: usize,
+}
+
+impl DomainContext for CatalogApplyOrphanRow<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.catalog_apply_orphan_row"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The entry variant and the orphaned object kind name the bug — a
+        // `Put*` applier that forgot the owner-row write. The orphan count is
+        // the occurrence: a replayed batch hitting the same missing call
+        // would otherwise file one report per row instead of one per cause.
+        format!("entry={};orphan_kind={}", self.entry_kind, self.orphan_kind)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "entry_kind": self.entry_kind,
+            "orphan_kind": self.orphan_kind,
+            "orphan_count": self.orphan_count,
+            "why_fatal": "the OWNERS redb table is the persistent backing for the in-memory \
+                          PermissionStore.owners map; a primary row written without its \
+                          owner row (or the reverse) is invisible until the next restart, \
+                          when PermissionStore::load_from rebuilds from redb and silently \
+                          drops the object's ownership — degrading permission checks with \
+                          no error anywhere",
+            "operator_action": "the named CatalogEntry variant's apply/<type>.rs::put is \
+                                 missing its owner::put_parent_owner(_in_database) call, or a \
+                                 sibling delete path is missing the matching removal; fix the \
+                                 applier so the primary and owner rows are written or deleted \
+                                 in lockstep",
+        })
+    }
+}
+
 /// How a terminating ILP connection's already-accepted lines fared.
 ///
 /// A stable class, never a count: it names the shape of the failure so a

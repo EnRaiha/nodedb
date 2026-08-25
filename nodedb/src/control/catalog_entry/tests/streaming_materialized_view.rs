@@ -47,7 +47,8 @@ fn delete_is_scoped_to_database_and_removes_matching_owner() {
             name: "orders_summary".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply delete_streaming_materialized_view");
 
     let remaining = catalog.load_all_streaming_mvs().unwrap();
     assert_eq!(remaining.len(), 1);

@@ -19,6 +19,8 @@
 //! matching owner write, so the orphan-row class is unrepresentable
 //! by construction.
 
+use tracing::warn;
+
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::state::SharedState;
 
@@ -28,17 +30,26 @@ use super::apply_to;
 /// node's redb catalog reflects the DDL. No-op when `log_index > 0`
 /// (the Raft applier has already run, or will).
 ///
-/// Returns `Ok(())` whether the apply succeeded or not — family
+/// Always returns, whether the apply succeeded or not — family
 /// handlers warn-and-continue on per-table redb errors to match the
-/// Raft applier's "best effort, replay on restart" semantics. A
-/// release-mode catalog write failure is logged; a debug-mode one
-/// trips the orphan-row `debug_assert!` inside [`apply_to`]. Both
-/// are caught at the next startup by the integrity repair pass in
-/// `recovery_check::verify_and_repair`.
+/// Raft applier's "best effort, replay on restart" semantics, and a
+/// release-mode catalog write failure is caught at the next startup
+/// by the integrity repair pass in `recovery_check::verify_and_repair`.
+/// A debug-mode orphan-row violation from [`apply_to`] is logged
+/// here rather than propagated, for the same reason; `apply_to`
+/// already files a `faultbox` report at the point of detection, so
+/// the failure is not silently lost even though this caller does
+/// not raise it.
 pub fn apply_locally_if_needed(state: &SharedState, entry: &CatalogEntry, log_index: u64) {
     if log_index != 0 {
         return;
     }
     let catalog = state.credentials.catalog();
-    apply_to(entry, catalog);
+    if let Err(e) = apply_to(entry, catalog) {
+        warn!(
+            kind = entry.kind(),
+            error = %e,
+            "catalog_entry: apply_locally_if_needed: apply_to failed"
+        );
+    }
 }

@@ -46,13 +46,21 @@ use crate::control::security::catalog::SystemCatalog;
 /// materialized-view definition + target deletion) fail closed by panicking
 /// the applying node.
 ///
-/// Debug builds run the full referential-integrity verifier after
-/// every apply and panic on any violation. This catches the
-/// "forgot-to-write-the-owner-row" class of bug on the first DDL a
-/// developer runs instead of deferring to the next restart, so
-/// reviewers don't need to rely on a user report to surface
-/// half-finished sync work. Release builds skip the check.
-pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> bool {
+/// Debug builds run the full referential-integrity verifier after every
+/// apply and fail closed with [`crate::Error::CatalogIntegrityViolation`] on
+/// any violation. This catches the "forgot-to-write-the-owner-row" class of
+/// bug on the first DDL a developer runs instead of deferring to the next
+/// restart, so reviewers don't need to rely on a user report to surface
+/// half-finished sync work.
+///
+/// Release builds skip the check. `verify_redb_integrity` re-scans the
+/// WHOLE catalog on every call (`load_all_collections_across_databases` and
+/// siblings), not just the entry just applied, so turning it on
+/// unconditionally would let a pre-existing orphan from before this build's
+/// fix — not anything the current apply did — wedge `raft_tick_loop` on a
+/// node that starts from old state. Keep it debug-only until the check is
+/// scoped to the entry's own object.
+pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<bool, crate::Error> {
     let applied = match entry {
         CatalogEntry::PutTenantWithAdmin { tenant, admin } => {
             tenant::put_with_admin(tenant, admin, catalog)
@@ -63,7 +71,7 @@ pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> bool {
         }
     };
     if !applied {
-        return false;
+        return Ok(false);
     }
     #[cfg(debug_assertions)]
     {
@@ -79,17 +87,21 @@ pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> bool {
                 .into_iter()
                 .filter(|d| matches!(d.kind, DivergenceKind::OrphanRow { .. }))
                 .collect();
-        assert!(
-            orphans.is_empty(),
-            "catalog_entry::apply_to({}) left the catalog in a state \
-             that fails verify_redb_integrity — every parent-replicated \
-             Put* variant must write both the primary row and the \
-             StoredOwner row. Orphan violations: {:?}",
-            entry.kind(),
-            orphans,
-        );
+        if let Some(first) = orphans.first() {
+            let DivergenceKind::OrphanRow { kind, .. } = &first.kind else {
+                unreachable!("filtered to OrphanRow above");
+            };
+            crate::diag::catalog_apply_orphan_row(entry.kind(), kind, orphans.len());
+            return Err(crate::Error::CatalogIntegrityViolation {
+                entry_kind: entry.kind().to_string(),
+                detail: format!(
+                    "every parent-replicated Put* variant must write both the primary row \
+                     and the StoredOwner row; orphan violations: {orphans:?}"
+                ),
+            });
+        }
     }
-    true
+    Ok(true)
 }
 
 fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {

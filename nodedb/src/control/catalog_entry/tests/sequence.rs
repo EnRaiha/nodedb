@@ -45,7 +45,7 @@ fn apply_put_then_delete_sequence() {
     let catalog = credentials.catalog();
 
     let seq = StoredSequence::new(1, "orders_id_seq".into(), "alice".into());
-    apply_to(&CatalogEntry::PutSequence(Box::new(seq)), catalog);
+    apply_to(&CatalogEntry::PutSequence(Box::new(seq)), catalog).expect("apply put_sequence");
 
     let loaded = catalog
         .get_sequence(1, "orders_id_seq")
@@ -59,7 +59,8 @@ fn apply_put_then_delete_sequence() {
             name: "orders_id_seq".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply delete_sequence");
 
     assert!(catalog.get_sequence(1, "orders_id_seq").unwrap().is_none());
 }

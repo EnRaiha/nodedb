@@ -107,7 +107,7 @@ impl MetadataCommitApplier {
         }
 
         debug!(kind = stamped.kind(), "catalog_entry: applying to redb");
-        if !catalog_entry::apply::apply_to(&stamped, catalog) {
+        if !catalog_entry::apply::apply_to(&stamped, catalog)? {
             // A `Put*` that wrote nothing (e.g. an if-absent create for a
             // descriptor that already exists) still concludes its DDL.
             self.clear_implicit_drain(&stamped);

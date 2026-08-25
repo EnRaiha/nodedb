@@ -48,6 +48,10 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         // side changes while the applier is stopped, so the comparison yields
         // the same verdict on every re-delivery, forever.
         crate::Error::DescriptorVersionAnomaly { .. } => ApplyFailureClass::Permanent,
+        // The orphan is a pure function of the entry's own writes and the
+        // applier code that ran them; re-delivery replays the same writes
+        // and finds the same orphan every time.
+        crate::Error::CatalogIntegrityViolation { .. } => ApplyFailureClass::Permanent,
         // The bytes being encoded/decoded are fixed by the committed entry, so
         // a codec rejection is reproducible.
         crate::Error::Serialization { .. } | crate::Error::Codec { .. } => {

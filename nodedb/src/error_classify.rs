@@ -192,6 +192,7 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::Internal { detail } => NodeDbError::internal(detail),
         Error::RemoteTyped { code, message } => NodeDbError::remote_typed(*code, message.clone()),
         Error::DescriptorVersionAnomaly { .. } => NodeDbError::internal(e.to_string()),
+        Error::CatalogIntegrityViolation { .. } => NodeDbError::internal(e.to_string()),
         Error::Promql(promql_err) => NodeDbError::bad_request(promql_err.to_string()),
         Error::DependentObjectsExist {
             tenant_id: _,

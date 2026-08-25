@@ -5,6 +5,7 @@
 use tracing::warn;
 
 use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::database_types::DatabaseDescriptor;
 use nodedb_types::DatabaseId;
 
@@ -127,13 +128,21 @@ pub fn clone_apply(
         coll.clone_status = nodedb_types::CloneStatus::Shadowed;
         // Reset versioning so the new clone descriptor starts fresh.
         coll.descriptor_version = 0;
-        if let Err(e) = catalog.put_collection(child, &coll) {
-            warn!(
+        match catalog.put_collection(child, &coll) {
+            Ok(()) => super::owner::put_parent_owner_in_database(
+                object_type::COLLECTION,
+                child.as_u64(),
+                coll.tenant_id,
+                &coll.name,
+                &coll.owner,
+                catalog,
+            ),
+            Err(e) => warn!(
                 target_db_id = child.as_u64(),
                 collection = %coll.name,
                 error = %e,
                 "catalog_entry: clone_database: failed to stamp shadow collection"
-            );
+            ),
         }
     }
 }

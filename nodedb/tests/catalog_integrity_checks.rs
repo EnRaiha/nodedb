@@ -131,36 +131,44 @@ fn apply_all_put_entries_produces_clean_redb_integrity() {
     apply_to(
         &CatalogEntry::PutCollection(Box::new(make_collection("orders"))),
         &catalog,
-    );
+    )
+    .expect("apply put_collection");
     apply_to(
         &CatalogEntry::PutFunction(Box::new(make_function("f1"))),
         &catalog,
-    );
+    )
+    .expect("apply put_function");
     apply_to(
         &CatalogEntry::PutProcedure(Box::new(make_procedure("p1"))),
         &catalog,
-    );
+    )
+    .expect("apply put_procedure");
     apply_to(
         &CatalogEntry::PutTrigger(Box::new(make_trigger("t1", "orders"))),
         &catalog,
-    );
+    )
+    .expect("apply put_trigger");
     // MV source must match an existing collection or Check 6 will flag it.
     apply_to(
         &CatalogEntry::PutMaterializedView(Box::new(make_mv_sourced("mv1", "orders"))),
         &catalog,
-    );
+    )
+    .expect("apply put_materialized_view");
     apply_to(
         &CatalogEntry::PutSequence(Box::new(make_sequence("s1"))),
         &catalog,
-    );
+    )
+    .expect("apply put_sequence");
     apply_to(
         &CatalogEntry::PutSchedule(Box::new(make_schedule("sch1"))),
         &catalog,
-    );
+    )
+    .expect("apply put_schedule");
     apply_to(
         &CatalogEntry::PutChangeStream(Box::new(make_stream("cs1"))),
         &catalog,
-    );
+    )
+    .expect("apply put_change_stream");
 
     let violations = verify_redb_integrity(&catalog);
     assert!(

@@ -378,6 +378,14 @@ pub enum Error {
         prior: u64,
     },
 
+    /// A `catalog_entry::apply_to` call left redb with a `Put*` primary row
+    /// that has no matching `StoredOwner` row, or vice versa — the
+    /// `verify_redb_integrity` `OrphanRow` class. Fails the metadata apply
+    /// closed rather than persisting the orphan and leaving it for the next
+    /// restart's boot-time verifier to find.
+    #[error("catalog_entry::apply_to({entry_kind}) left an orphaned catalog row: {detail}")]
+    CatalogIntegrityViolation { entry_kind: String, detail: String },
+
     /// Typed Data-Plane error preserves deterministic cross-plane classification.
     #[error("data plane error: {0:?}")]
     DataPlane(crate::bridge::envelope::ErrorCode),

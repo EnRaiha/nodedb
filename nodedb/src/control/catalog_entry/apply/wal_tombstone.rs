@@ -50,7 +50,7 @@ mod tests {
             collection: "users".into(),
             purge_lsn: 100,
         };
-        apply_to(&entry, catalog);
+        apply_to(&entry, catalog).expect("apply record_wal_tombstone");
 
         let set = catalog.load_wal_tombstones().expect("load");
         assert_eq!(
@@ -66,7 +66,7 @@ mod tests {
             collection: "users".into(),
             purge_lsn: 50,
         };
-        apply_to(&entry_lower, catalog);
+        apply_to(&entry_lower, catalog).expect("apply record_wal_tombstone (lower)");
         let set = catalog.load_wal_tombstones().expect("load after lower");
         assert_eq!(
             set.purge_lsn(7, 1, "users"),
@@ -81,7 +81,7 @@ mod tests {
             collection: "users".into(),
             purge_lsn: 200,
         };
-        apply_to(&entry_higher, catalog);
+        apply_to(&entry_higher, catalog).expect("apply record_wal_tombstone (higher)");
         let set = catalog.load_wal_tombstones().expect("load after higher");
         assert_eq!(
             set.purge_lsn(7, 1, "users"),

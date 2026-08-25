@@ -267,6 +267,29 @@ pub fn data_plane_response_lost(core_id: usize, write: context::LostResponseWrit
     .emit();
 }
 
+/// Report a `catalog_entry::apply_to` call that left redb with an orphaned
+/// parent-replicated row (a primary row with no matching `StoredOwner`, or
+/// the reverse).
+///
+/// Called only from `catalog_entry::apply::apply_to`, the one site that runs
+/// `verify_redb_integrity` right after an entry applies and can attribute the
+/// orphan to the entry that just created it. Not re-emitted anywhere above
+/// it: the caller only ever sees a typed `CatalogIntegrityViolation`.
+pub fn catalog_apply_orphan_row(entry_kind: &str, orphan_kind: &str, orphan_count: usize) {
+    let ctx = context::CatalogApplyOrphanRow {
+        entry_kind,
+        orphan_kind,
+        orphan_count,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "catalog_entry::apply_to left an orphaned parent-replicated catalog row",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a Calvin cross-shard transaction whose completion wait timed out.
 ///
 /// Called from the completion-timeout arm of

@@ -4,6 +4,7 @@
 
 use tracing::warn;
 
+use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::{
     StoredCollection, StoredTenant, StoredUser, SystemCatalog,
 };
@@ -74,6 +75,14 @@ pub fn move_cutover(
             );
             continue;
         }
+        super::owner::put_parent_owner_in_database(
+            object_type::COLLECTION,
+            tgt.as_u64(),
+            coll.tenant_id,
+            &coll.name,
+            &coll.owner,
+            catalog,
+        );
         // Delete from source database using the collection's own tenant_id,
         // which is the actual storage key component.
         if let Err(e) = catalog.delete_collection(src, coll.tenant_id, &coll.name) {
@@ -84,5 +93,15 @@ pub fn move_cutover(
                 "move_cutover: delete_collection from source failed"
             );
         }
+        // Remove the stale source owner row so it does not outlive the
+        // collection it was for — the primary row is already gone from
+        // `src` above.
+        super::owner::delete_parent_owner_in_database(
+            object_type::COLLECTION,
+            src.as_u64(),
+            coll.tenant_id,
+            &coll.name,
+            catalog,
+        );
     }
 }

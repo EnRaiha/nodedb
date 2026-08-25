@@ -89,7 +89,12 @@ pub async fn run(
     // Clustered path: the entry was applied after quorum commit.
     if proposed == 0 {
         let catalog = state.credentials.catalog();
-        apply_to(&entry, catalog);
+        apply_to(&entry, catalog).map_err(|e| {
+            NodeDbError::move_tenant_cutover_failed(
+                tenant_id.as_u64().to_string(),
+                format!("catalog apply: {e}"),
+            )
+        })?;
     }
 
     // Dispatch physical storage re-keying to the Data Plane for each moved

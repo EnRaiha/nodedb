@@ -77,7 +77,8 @@ pub(super) async fn propose_and_apply_async(
             crate::control::catalog_entry::apply::apply_to(&entry, &catalog)
         })
         .await
-        .map_err(|e| err("XX000", format!("catalog apply join: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog apply join: {e}")))?
+        .map_err(|e| err("XX000", format!("catalog apply: {e}")))?;
     }
     Ok(log_index)
 }

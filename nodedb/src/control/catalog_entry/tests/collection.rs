@@ -53,7 +53,8 @@ fn apply_put_collection_writes_redb() {
     let catalog = credentials.catalog();
 
     let stored = StoredCollection::new(1, "widgets", "carol");
-    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog);
+    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
+        .expect("apply put_collection");
 
     let loaded = catalog
         .get_collection(DatabaseId::DEFAULT, 1, "widgets")
@@ -74,7 +75,8 @@ fn apply_deactivate_collection_preserves_record() {
     // trip the debug-build integrity check on an orphan
     // collection left over from the direct `put_collection`.
     let stored = StoredCollection::new(1, "archived", "carol");
-    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog);
+    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
+        .expect("apply put_collection");
 
     apply_to(
         &CatalogEntry::DeactivateCollection {
@@ -83,7 +85,8 @@ fn apply_deactivate_collection_preserves_record() {
             name: "archived".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply deactivate_collection");
 
     let loaded = catalog
         .get_collection(DatabaseId::DEFAULT, 1, "archived")
@@ -99,8 +102,9 @@ fn purge_collection_is_scoped_to_database() {
     let default = StoredCollection::new(1, "shared", "default_owner");
     let mut other = StoredCollection::new(1, "shared", "other_owner");
     other.database_id = DatabaseId::new(9);
-    apply_to(&CatalogEntry::PutCollection(Box::new(default)), catalog);
-    apply_to(&CatalogEntry::PutCollection(Box::new(other)), catalog);
+    apply_to(&CatalogEntry::PutCollection(Box::new(default)), catalog)
+        .expect("apply put_collection");
+    apply_to(&CatalogEntry::PutCollection(Box::new(other)), catalog).expect("apply put_collection");
 
     // A `PurgeCollection` apply only deactivates the catalog row (the
     // crash-durable same-name barrier); the row/owner/surrogate deletion is the
@@ -113,7 +117,8 @@ fn purge_collection_is_scoped_to_database() {
             name: "shared".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply purge_collection");
     crate::control::catalog_entry::apply::collection::finalize_purge(9, 1, "shared", catalog)
         .expect("finalize purge for database 9");
 
@@ -145,7 +150,8 @@ fn apply_deactivate_missing_is_noop() {
             name: "ghost".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply deactivate_collection on missing row is a no-op, not an error");
     assert!(
         catalog
             .get_collection(DatabaseId::DEFAULT, 1, "ghost")

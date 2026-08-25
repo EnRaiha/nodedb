@@ -166,7 +166,8 @@ async fn verify_and_repair_recovers_orphan_trigger() {
     apply_to(
         &CatalogEntry::PutCollection(Box::new(make_collection("orders"))),
         catalog,
-    );
+    )
+    .expect("apply put_collection");
     catalog
         .put_trigger(&make_trigger("orphan_trg", "orders"))
         .unwrap();
@@ -191,7 +192,8 @@ async fn verify_and_repair_recovers_orphan_materialized_view() {
     apply_to(
         &CatalogEntry::PutCollection(Box::new(make_collection("mv_src"))),
         catalog,
-    );
+    )
+    .expect("apply put_collection");
     catalog
         .put_materialized_view(&make_mv_sourced("orphan_mv", "mv_src"))
         .unwrap();

@@ -292,7 +292,8 @@ fn reassign_one(
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s.clone()));
             if propose(state, &entry)? == 0 {
-                crate::control::catalog_entry::apply::apply_to(&entry, catalog);
+                crate::control::catalog_entry::apply::apply_to(&entry, catalog)
+                    .map_err(|e| ddl_err(format!("catalog apply: {e}")))?;
                 state.mv_registry.register(s);
                 persist_owner_local_in_database(
                     state,

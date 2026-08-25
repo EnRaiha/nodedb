@@ -26,11 +26,13 @@ fn delete_is_scoped_to_database() {
     apply_to(
         &CatalogEntry::PutContinuousAggregate(Box::new(stored(0, "default_owner"))),
         catalog,
-    );
+    )
+    .expect("apply put_continuous_aggregate");
     apply_to(
         &CatalogEntry::PutContinuousAggregate(Box::new(stored(9, "other_owner"))),
         catalog,
-    );
+    )
+    .expect("apply put_continuous_aggregate");
 
     apply_to(
         &CatalogEntry::DeleteContinuousAggregate {
@@ -39,7 +41,8 @@ fn delete_is_scoped_to_database() {
             name: "shared".into(),
         },
         catalog,
-    );
+    )
+    .expect("apply delete_continuous_aggregate");
 
     assert!(
         catalog
