@@ -37,6 +37,8 @@ use nodedb_types::DatabaseId;
 use std::time::{Duration, Instant};
 use tokio::runtime::RuntimeFlavor;
 
+use super::clock::{WallClock, RealWallClock};
+
 use nodedb_cluster::{DescriptorId, DescriptorKind, MetadataEntry, encode_entry};
 use nodedb_types::Hlc;
 
@@ -188,7 +190,7 @@ fn wait_for_lease_drain(
 ) -> Result<(), Error> {
     let deadline = Instant::now() + max_wait;
     loop {
-        let remaining = count_matching_leases(shared, id, up_to_version);
+        let remaining = count_matching_leases(shared, id, up_to_version, &RealWallClock);
         if remaining == 0 {
             return Ok(());
         }
@@ -229,8 +231,13 @@ fn wait_for_lease_drain(
 /// idle cluster is precisely the case where a crashed node's leases are the
 /// only ones left. `expires_at.wall_ns` was computed from real wall time when
 /// the lease was stamped, so both sides of the comparison stay in one frame.
-fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version: u64) -> usize {
-    let now_wall_ns = super::wall_now_ns();
+fn count_matching_leases(
+    shared: &SharedState,
+    id: &DescriptorId,
+    up_to_version: u64,
+    clock: &dyn WallClock,
+) -> usize {
+    let now_wall_ns = clock.now_ns();
     let cache = shared
         .metadata_cache
         .read()
@@ -551,6 +558,7 @@ mod tests {
         StoredProcedure, StoredTrigger,
     };
     use crate::wal::WalManager;
+    use super::super::clock::MockClock;
 
     #[tokio::test]
     async fn in_flight_admission_reservation_blocks_drain_count() {
@@ -564,9 +572,9 @@ mod tests {
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
         state.lease_refcount.increment(&descriptor, 1);
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 1);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 1);
         state.lease_refcount.decrement(&descriptor, 1);
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 0);
     }
 
     #[tokio::test]
@@ -581,7 +589,7 @@ mod tests {
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
         state.lease_refcount.increment(&descriptor, 2);
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 0);
         state.lease_refcount.decrement(&descriptor, 2);
     }
 
@@ -643,6 +651,13 @@ mod tests {
         )
     }
 
+    /// Drive `count_matching_leases` with a wall clock pinned to the moment the
+    /// test starts. Keeps the original real-wall-time behaviour for the existing
+    /// tests; the three `MockClock` tests below override the clock directly.
+    fn clock_now() -> MockClock {
+        MockClock::new(super::super::wall_now_ns())
+    }
+
     #[tokio::test]
     async fn non_member_lease_does_not_block_drain_count() {
         let directory = tempfile::tempdir().expect("create drain count test directory");
@@ -660,7 +675,7 @@ mod tests {
         // Holder 99 is not in the topology (crashed node): its lease must not
         // block the drain count.
         insert_lease(&state, &descriptor, 99, 1, unexpired());
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 0);
     }
 
     #[tokio::test]
@@ -679,7 +694,7 @@ mod tests {
 
         // Holder 1 is a member but its lease is already past expiry.
         insert_lease(&state, &descriptor, 1, 1, expired());
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 0);
     }
 
     /// A lease whose expiry has passed in REAL time must stop blocking the
@@ -715,7 +730,7 @@ mod tests {
 
         insert_lease(&state, &descriptor, 1, 1, expired());
         assert_eq!(
-            count_matching_leases(&state, &descriptor, 1),
+            count_matching_leases(&state, &descriptor, 1, &clock_now()),
             0,
             "an expired lease must not block the drain, however stale the HLC is"
         );
@@ -750,7 +765,7 @@ mod tests {
 
         insert_lease(&state, &descriptor, 1, 1, unexpired());
         assert_eq!(
-            count_matching_leases(&state, &descriptor, 1),
+            count_matching_leases(&state, &descriptor, 1, &clock_now()),
             1,
             "a lease that is live in wall time must keep blocking the drain"
         );
@@ -773,7 +788,99 @@ mod tests {
         // A live member's unexpired lease still blocks the drain — the
         // membership/expiry filters must never mask real holds.
         insert_lease(&state, &descriptor, 1, 1, unexpired());
-        assert_eq!(count_matching_leases(&state, &descriptor, 1), 1);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock_now()), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // `WallClock` trait: the clock source is now injected, so expiry can be
+    // driven deterministically instead of depending on `SystemTime` or the
+    // frozen `HlcClock::peek`. These pin the clock and prove the comparison
+    // uses the injected wall clock, not the HLC.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wall_clock_expired_lease_is_dropped() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Pin "now" to a fixed instant; lease expired one ns before it.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(999_999_999_999_999, 0),
+        );
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 0);
+    }
+
+    #[tokio::test]
+    async fn wall_clock_live_lease_is_counted() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Pin "now"; lease valid one ns after it.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(1_000_000_000_000_001, 0),
+        );
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 1);
+    }
+
+    #[tokio::test]
+    async fn wall_clock_ignores_skewed_hlc() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Drag the HLC an hour ahead of wall time; the comparison must still use
+        // the injected wall clock, so a live lease is not dropped.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        state.hlc_clock.update(nodedb_types::Hlc::new(
+            1_000_000_000_000_000 + 3_600_000_000_000,
+            0,
+        ));
+        assert!(state.hlc_clock.peek().wall_ns > 1_000_000_000_000_000);
+
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(1_000_000_000_000_001, 0),
+        );
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 1);
     }
 
     fn function(database_id: DatabaseId) -> StoredFunction {

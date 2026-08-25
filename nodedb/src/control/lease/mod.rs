@@ -36,6 +36,7 @@ pub mod release;
 pub mod renewal;
 pub mod shutdown_release;
 mod wall_time;
+mod clock;
 
 pub(super) use wall_time::wall_now_ns;
 
