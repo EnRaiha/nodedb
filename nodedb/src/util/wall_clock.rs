@@ -13,6 +13,7 @@
 //! drive expiry deterministically with a [`MockClock`] instead of mocking
 //! `SystemTime` or depending on `HlcClock::peek`.
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A source of nanoseconds since the Unix epoch.
@@ -25,19 +26,19 @@ pub struct RealWallClock;
 
 impl WallClock for RealWallClock {
     fn now_ns(&self) -> u64 {
-        super::wall_now_ns()
+        crate::control::lease::wall_now_ns()
     }
 }
 
 /// Deterministic clock for tests. Set it explicitly so expiry assertions do not
 /// depend on `SystemTime` or on `HlcClock::peek` (which never advances on its
 /// own and would make every lease look unexpired).
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub struct MockClock {
     now: AtomicU64,
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 impl MockClock {
     pub fn new(ns: u64) -> Self {
         Self {
@@ -50,7 +51,7 @@ impl MockClock {
     }
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 impl WallClock for MockClock {
     fn now_ns(&self) -> u64 {
         self.now.load(Ordering::Relaxed)

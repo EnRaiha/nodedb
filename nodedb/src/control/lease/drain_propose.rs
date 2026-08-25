@@ -37,7 +37,7 @@ use nodedb_types::DatabaseId;
 use std::time::{Duration, Instant};
 use tokio::runtime::RuntimeFlavor;
 
-use super::clock::{WallClock, RealWallClock};
+use crate::util::wall_clock::{WallClock, RealWallClock};
 
 use nodedb_cluster::{DescriptorId, DescriptorKind, MetadataEntry, encode_entry};
 use nodedb_types::Hlc;
@@ -558,7 +558,7 @@ mod tests {
         StoredProcedure, StoredTrigger,
     };
     use crate::wal::WalManager;
-    use super::super::clock::MockClock;
+    use crate::util::wall_clock::MockClock;
 
     #[tokio::test]
     async fn in_flight_admission_reservation_blocks_drain_count() {
