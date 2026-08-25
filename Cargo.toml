@@ -179,10 +179,13 @@ chrono = { version = "0.4", features = ["std"], default-features = false }
 
 # MessagePack
 rmpv = "1"
-# Fork pending upstream nuskey8/zerompk#61: the derived codecs are
+# Pinned to upstream main, past the 0.7.1 tag. The derived codecs were
 # `inline(always)`, which folds whole codec trees into one function and makes
-# large plan enums cost minutes to compile. Drop the git source once released.
-zerompk = { version = "0.7", git = "https://github.com/farhan-syah/zerompk", rev = "bb3156cf17b399b0dc2dd90895133a169a29cac0", features = [
+# large plan enums cost minutes to compile; the fix is merged upstream but was
+# not in 0.7.1. Drop the git source for a plain version once a release carries
+# it — note that a published build resolves the registry version regardless, so
+# until then only local builds get the faster compile.
+zerompk = { version = "0.7", git = "https://github.com/nuskey8/zerompk", rev = "75d527ff8930341c859a757866b0e07f03d09ef8", features = [
   "std",
   "derive",
 ] }
@@ -206,7 +209,17 @@ half = { version = "2", features = ["bytemuck"] }
 tokio-tungstenite = "0.30"
 
 # Storage
-redb = "4"
+# `experimental_cursor` (which pulls in `experimental-api-5`) exposes the cursor
+# API we contributed upstream, and api-5 reshapes `range`/`get`/`extract_from_if`
+# across the whole workspace.
+#
+# The requirement is `~4.2`, not `4`, precisely BECAUSE these surfaces are
+# labelled experimental: redb is free to change them in any minor release, and a
+# floating `4` would pull that in on the next `cargo update` and break the build
+# — or worse, change iteration semantics under a published release. `~4.2` still
+# takes patch fixes. Widen it deliberately, after re-reading redb's changelog for
+# api-5 changes, never as a routine bump.
+redb = { version = "~4.2", features = ["experimental_cursor"] }
 
 # Temp files (external sort spill)
 tempfile = "3"

@@ -6085,9 +6085,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "4.1.0"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
 dependencies = [
  "libc",
 ]
@@ -8729,7 +8729,7 @@ dependencies = [
 [[package]]
 name = "zerompk"
 version = "0.7.1"
-source = "git+https://github.com/farhan-syah/zerompk?rev=bb3156cf17b399b0dc2dd90895133a169a29cac0#bb3156cf17b399b0dc2dd90895133a169a29cac0"
+source = "git+https://github.com/nuskey8/zerompk?rev=75d527ff8930341c859a757866b0e07f03d09ef8#75d527ff8930341c859a757866b0e07f03d09ef8"
 dependencies = [
  "zerompk_derive",
 ]
@@ -8737,7 +8737,7 @@ dependencies = [
 [[package]]
 name = "zerompk_derive"
 version = "0.7.1"
-source = "git+https://github.com/farhan-syah/zerompk?rev=bb3156cf17b399b0dc2dd90895133a169a29cac0#bb3156cf17b399b0dc2dd90895133a169a29cac0"
+source = "git+https://github.com/nuskey8/zerompk?rev=75d527ff8930341c859a757866b0e07f03d09ef8#75d527ff8930341c859a757866b0e07f03d09ef8"
 dependencies = [
  "proc-macro2",
  "quote",
