@@ -51,6 +51,13 @@ use crate::error::Error;
 /// to check whether the in-flight leases have drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Maximum tolerated wall-clock skew between nodes (5 minutes). Lease expiry
+/// is only respected beyond this window: a lease that looks slightly expired
+/// may still be live on a holder whose clock is behind ours, so it is kept
+/// while `expires_at > now - MAX_SKEW`. The trade-off (safety-first, per #246)
+/// is that a genuinely-dead lease drains up to `MAX_SKEW` later.
+const MAX_SKEW_NS: u64 = 300_000_000_000;
+
 /// Grace period added on top of the configured lease duration
 /// when computing the `expires_at` stamped onto a drain entry.
 /// `is_draining` does not read this value (see `lease::drain`) —
@@ -238,6 +245,11 @@ fn count_matching_leases(
     clock: &dyn WallClock,
 ) -> usize {
     let now_wall_ns = clock.now_ns();
+    // Keep a lease inside the MAX_SKEW window even if its expiry is slightly
+    // in the past: the holder's clock may legitimately be behind ours, and
+    // dropping a live hold lets the DDL proceed underneath a holder still
+    // using the descriptor (the correctness bug #246 refuses to trade for).
+    let live_threshold = now_wall_ns.saturating_sub(MAX_SKEW_NS);
     let cache = shared
         .metadata_cache
         .read()
@@ -248,7 +260,7 @@ fn count_matching_leases(
         .filter(|((lid, holder), l)| {
             lid == id
                 && l.version <= up_to_version
-                && l.expires_at.wall_ns > now_wall_ns
+                && l.expires_at.wall_ns > live_threshold
                 && lease_holder_is_member(shared, *holder)
         })
         .count();
@@ -643,10 +655,13 @@ mod tests {
         )
     }
 
-    /// A lease expiry a minute in the past, in REAL wall time.
+    /// A lease expiry far enough in the PAST to sit past the MAX_SKEW window —
+    /// i.e. definitely dead even under the largest tolerated clock skew.
+    /// An expiry inside the window is still treated as live; see the clamp in
+    /// `count_matching_leases`.
     fn expired() -> nodedb_types::Hlc {
         nodedb_types::Hlc::new(
-            super::super::wall_now_ns().saturating_sub(60_000_000_000),
+            super::super::wall_now_ns().saturating_sub(MAX_SKEW_NS.saturating_add(60_000_000_000)),
             0,
         )
     }
@@ -812,14 +827,15 @@ mod tests {
             .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // Pin "now" to a fixed instant; lease expired one ns before it.
+        // Pin "now" to a fixed instant; lease expired 400s before it — beyond
+        // the MAX_SKEW window, so definitely dead.
         let clock = MockClock::new(1_000_000_000_000_000);
         insert_lease(
             &state,
             &descriptor,
             1,
             1,
-            nodedb_types::Hlc::new(999_999_999_999_999, 0),
+            nodedb_types::Hlc::new(1_000_000_000_000_000 - 400_000_000_000, 0),
         );
         assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 0);
     }
@@ -879,6 +895,96 @@ mod tests {
             1,
             1,
             nodedb_types::Hlc::new(1_000_000_000_000_001, 0),
+        );
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // MAX_SKEW clamp: a lease whose expiry is slightly in the PAST must stay
+    // live (the holder's clock may be behind ours), and only a lease expired
+    // beyond the window is dropped. This is the reverse-direction guard for
+    // the #246 wedge.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn max_skew_keeps_lease_expired_within_window() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Expiry 100ms in the past: inside the MAX_SKEW window — a holder
+        // whose clock is 100ms behind ours would still hold this live.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(1_000_000_000_000_000 - 100_000_000, 0),
+        );
+        assert_eq!(
+            count_matching_leases(&state, &descriptor, 1, &clock),
+            1,
+            "a lease expired within MAX_SKEW must not be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_skew_drops_lease_expired_beyond_window() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Expiry 400s in the past: beyond MAX_SKEW, definitely dead.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(1_000_000_000_000_000 - 400_000_000_000, 0),
+        );
+        assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 0);
+    }
+
+    #[tokio::test]
+    async fn max_skew_keeps_lease_far_in_future() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("wc.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        Arc::get_mut(&mut state)
+            .expect("single owner in test")
+            .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        // Expiry 400s in the future: clearly live.
+        let clock = MockClock::new(1_000_000_000_000_000);
+        insert_lease(
+            &state,
+            &descriptor,
+            1,
+            1,
+            nodedb_types::Hlc::new(1_000_000_000_000_000 + 400_000_000_000, 0),
         );
         assert_eq!(count_matching_leases(&state, &descriptor, 1, &clock), 1);
     }
