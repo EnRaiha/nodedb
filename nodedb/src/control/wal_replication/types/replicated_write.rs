@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Append-only Raft write wire ABI; variants must never be reordered.
 
-use super::aliases::{default_ivf_cells, default_ivf_nprobe, default_pq_m};
+use super::aliases::{
+    default_columnar_ingest_format, default_columnar_insert_intent, default_ivf_cells,
+    default_ivf_nprobe, default_pq_m,
+};
 use super::wire_shapes::{
     ColumnarResolvedRow, ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget,
 };
+use nodedb_physical::physical_plan::{ColumnarInsertIntent, UpdateValue};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
 
 #[derive(
@@ -242,6 +246,31 @@ pub enum ReplicatedWrite {
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// "json", "msgpack", or "ilp" — see `ColumnarOp::Insert::format`.
+        /// Defaulted for a record written before this field existed: the sync
+        /// path has only ever produced MessagePack payloads.
+        #[serde(default = "default_columnar_ingest_format")]
+        format: String,
+        /// INSERT / INSERT IF ABSENT / UPSERT distinction — see
+        /// `ColumnarInsertIntent`. Defaulted to plain `Insert` for a record
+        /// written before this field existed.
+        #[serde(default = "default_columnar_insert_intent")]
+        intent: ColumnarInsertIntent,
+        /// `ON CONFLICT (pk) DO UPDATE SET field = expr` assignments — see
+        /// `ColumnarOp::Insert::on_conflict_updates`. Empty for a record
+        /// written before this field existed.
+        #[serde(default)]
+        on_conflict_updates: Vec<(String, UpdateValue)>,
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
+        /// same way `provenance` above is. `None` for a record written before
+        /// this field existed, and for any write with no RETURNING clause.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// Read filters (MessagePack `Vec<ScanFilter>`) gating what
+        /// `returning` may show back — see `ColumnarOp::Insert::rls_filters`.
+        /// Empty for a record written before this field existed.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     TimeseriesIngest {
         collection: String,
@@ -252,6 +281,16 @@ pub enum ReplicatedWrite {
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
+        /// same way `provenance` above is. `None` for a record written before
+        /// this field existed, and for any write with no RETURNING clause.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// Read filters (MessagePack `Vec<ScanFilter>`) gating what
+        /// `returning` may show back — see `TimeseriesOp::Ingest::rls_filters`.
+        /// Empty for a record written before this field existed.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
     FtsIndex {
         collection: String,

@@ -15,6 +15,7 @@
 //! [`DecodeCtx`]: super::ctx::DecodeCtx
 
 use super::super::decode_sync_engines;
+use super::super::decode_sync_engines::ColumnarIngestWire;
 use super::super::types::ReplicatedWrite;
 use super::columnar;
 use crate::bridge::envelope::PhysicalPlan;
@@ -27,21 +28,39 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             schema_bytes,
             surrogates,
             provenance,
-        } => decode_sync_engines::columnar_ingest(
+            format,
+            intent,
+            on_conflict_updates,
+            returning,
+            rls_filters,
+        } => decode_sync_engines::columnar_ingest(ColumnarIngestWire {
             collection,
             payload,
+            format,
+            intent: *intent,
+            on_conflict_updates,
             schema_bytes,
             surrogates,
-            provenance,
-        ),
+            prov_bytes: provenance,
+            returning_bytes: returning,
+            rls_filters,
+        }),
         ReplicatedWrite::TimeseriesIngest {
             collection,
             payload,
             format,
             surrogates,
             provenance,
+            returning,
+            rls_filters,
         } => decode_sync_engines::timeseries_ingest(
-            collection, payload, format, surrogates, provenance,
+            collection,
+            payload,
+            format,
+            surrogates,
+            provenance,
+            returning,
+            rls_filters,
         ),
         ReplicatedWrite::FtsIndex {
             collection,

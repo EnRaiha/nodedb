@@ -4,21 +4,38 @@
 //! sync-engine variants into `ReplicatedWrite`.
 
 use super::super::types::ReplicatedWrite;
+use nodedb_physical::physical_plan::{ColumnarInsertIntent, UpdateValue};
 use nodedb_types::Surrogate;
 
-pub(super) fn columnar_ingest(
-    collection: &str,
-    payload: &[u8],
-    surrogates: &[Surrogate],
-    schema_bytes: &[u8],
-    provenance: Option<Vec<u8>>,
-) -> ReplicatedWrite {
+/// Fields the leader knows about a `ColumnarOp::Insert` that must cross the
+/// wire so a follower re-derives the SAME executed plan, not a
+/// re-hardcoded one. Bundled into a struct — plain positional arguments here
+/// exceed clippy's arity lint.
+pub(super) struct ColumnarIngestFields<'a> {
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub format: &'a str,
+    pub intent: ColumnarInsertIntent,
+    pub on_conflict_updates: &'a [(String, UpdateValue)],
+    pub surrogates: &'a [Surrogate],
+    pub schema_bytes: &'a [u8],
+    pub provenance: Option<Vec<u8>>,
+    pub returning: Option<Vec<u8>>,
+    pub rls_filters: &'a [u8],
+}
+
+pub(super) fn columnar_ingest(fields: ColumnarIngestFields<'_>) -> ReplicatedWrite {
     ReplicatedWrite::ColumnarIngest {
-        collection: collection.to_owned(),
-        payload: payload.to_vec(),
-        schema_bytes: schema_bytes.to_vec(),
-        surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
-        provenance,
+        collection: fields.collection.to_owned(),
+        payload: fields.payload.to_vec(),
+        schema_bytes: fields.schema_bytes.to_vec(),
+        surrogates: fields.surrogates.iter().map(|s| s.as_u32()).collect(),
+        provenance: fields.provenance,
+        format: fields.format.to_owned(),
+        intent: fields.intent,
+        on_conflict_updates: fields.on_conflict_updates.to_vec(),
+        returning: fields.returning,
+        rls_filters: fields.rls_filters.to_vec(),
     }
 }
 
@@ -28,6 +45,8 @@ pub(super) fn timeseries_ingest(
     format: &str,
     surrogates: &[Surrogate],
     provenance: Option<Vec<u8>>,
+    returning: Option<Vec<u8>>,
+    rls_filters: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::TimeseriesIngest {
         collection: collection.to_owned(),
@@ -35,6 +54,8 @@ pub(super) fn timeseries_ingest(
         format: format.to_owned(),
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         provenance,
+        returning,
+        rls_filters: rls_filters.to_vec(),
     }
 }
 

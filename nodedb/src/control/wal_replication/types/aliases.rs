@@ -67,6 +67,18 @@ pub type RaftAppliedIndexSink =
 pub(crate) fn default_pq_m() -> usize {
     crate::engine::vector::index_config::DEFAULT_PQ_M
 }
+/// Default `ColumnarIngest::intent` for a record written before that field
+/// existed: a plain `INSERT`, matching the value `decode_sync_engines` used to
+/// hardcode.
+pub(crate) fn default_columnar_insert_intent()
+-> nodedb_physical::physical_plan::ColumnarInsertIntent {
+    nodedb_physical::physical_plan::ColumnarInsertIntent::Insert
+}
+/// Default `ColumnarIngest::format` for a record written before that field
+/// existed: the sync path has only ever produced MessagePack payloads.
+pub(crate) fn default_columnar_ingest_format() -> String {
+    "msgpack".to_owned()
+}
 pub(crate) fn default_ivf_cells() -> usize {
     crate::engine::vector::index_config::DEFAULT_IVF_CELLS
 }

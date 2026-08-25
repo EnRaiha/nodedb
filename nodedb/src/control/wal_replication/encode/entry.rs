@@ -38,6 +38,19 @@ pub(super) fn encode_provenance(
         .map(|p| zerompk::to_msgpack_vec(p).expect("SyncProvenance serialization is infallible"))
 }
 
+/// Serialize an optional RETURNING projection spec into the cross-node wire
+/// shape. `ReturningSpec` is a plain serializable struct — same infallible
+/// encode contract as `encode_provenance` above. A follower that receives
+/// `None` here reports no rows for the write, so an encode failure must fail
+/// loud rather than silently degrade a RETURNING request to an empty result.
+pub(super) fn encode_returning(
+    returning: &Option<nodedb_physical::physical_plan::ReturningSpec>,
+) -> Option<Vec<u8>> {
+    returning
+        .as_ref()
+        .map(|r| zerompk::to_msgpack_vec(r).expect("ReturningSpec serialization is infallible"))
+}
+
 /// Encode a write-side `PhysicalPlan` into a `ReplicatedEntry` for Raft
 /// proposal, `Ok(None)` for a plan that is not a replicated write, or an
 /// error when the plan cannot be replicated safely (see

@@ -10,7 +10,9 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use super::super::types::ReplicatedWrite;
-use super::{columnar, entry::encode_provenance};
+use super::columnar;
+use super::columnar::ColumnarIngestFields;
+use super::entry::{encode_provenance, encode_returning};
 use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TextOp, TimeseriesOp};
 
 /// Encode a `ColumnarOp` write variant into its `ReplicatedWrite` wire shape,
@@ -24,20 +26,41 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
         ColumnarOp::Insert {
             collection,
             payload,
+            format,
+            intent,
+            on_conflict_updates,
             surrogates,
             schema_bytes,
             provenance,
-            // wal_lsn is omitted from the wire envelope; followers allocate
-            // their own LSN at apply time. intent and on_conflict_updates are
-            // always Insert/empty on the sync path and are hardcoded on decode.
-            ..
-        } => columnar::columnar_ingest(
-            collection,
-            payload,
-            surrogates,
-            schema_bytes,
-            encode_provenance(provenance),
-        ),
+            // wal_lsn is omitted from the wire envelope: a follower allocates
+            // its own LSN at apply time, so the leader's value would be
+            // meaningless there.
+            wal_lsn: _,
+            // A plain insert carries every row it persists, so the policy
+            // decided it at plan time and no follower re-decides it. Decode
+            // stamps `already_decided_elsewhere()`.
+            //
+            // `ON CONFLICT DO UPDATE` defers instead: its merged row exists
+            // only in the handler. Replicating it would drop the predicate and
+            // leave that row ungoverned, so the guard below refuses it.
+            rls_write_check,
+            returning,
+            rls_filters,
+        } => {
+            refuse_governed_merge(collection, on_conflict_updates, rls_write_check)?;
+            columnar::columnar_ingest(ColumnarIngestFields {
+                collection,
+                payload,
+                format,
+                intent: *intent,
+                on_conflict_updates,
+                surrogates,
+                schema_bytes,
+                provenance: encode_provenance(provenance),
+                returning: encode_returning(returning),
+                rls_filters,
+            })
+        }
         // The compiled RLS predicate is deliberately not replicated when NO
         // write policy restricts this collection: there is nothing for a
         // follower to decide either way, so re-scanning the predicate at each
@@ -94,6 +117,31 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
     }))
 }
 
+/// Refuse an `INSERT ... ON CONFLICT DO UPDATE` on a governed collection.
+///
+/// Its merged row exists only in the handler, so the policy travels as a
+/// compiled predicate — and that predicate cannot cross the wire, since a
+/// follower has no writing identity to evaluate it against.
+///
+/// A plain insert is unaffected: the policy decided its rows at plan time.
+fn refuse_governed_merge(
+    collection: &str,
+    on_conflict_updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
+    rls_write_check: &nodedb_types::RlsWriteCheck,
+) -> crate::Result<()> {
+    if on_conflict_updates.is_empty() || !rls_write_check.has_predicate() {
+        return Ok(());
+    }
+    Err(crate::Error::PlanError {
+        detail: format!(
+            "INSERT ... ON CONFLICT DO UPDATE on '{collection}' cannot be replicated because it \
+             carries an RLS write policy: the merged row exists only where it is persisted, and a \
+             follower has no writing identity to evaluate the policy against. It must be resolved \
+             to a concrete row set before it is proposed."
+        ),
+    })
+}
+
 /// Refuse a predicate `UPDATE` / `DELETE` on a collection that carries an RLS
 /// write policy — see [`columnar_write`]'s `Delete` / `Update` arms for the
 /// full reasoning.
@@ -122,15 +170,25 @@ pub(super) fn timeseries_write(op: &TimeseriesOp) -> Option<ReplicatedWrite> {
             collection,
             payload,
             format,
+            // wal_lsn is omitted: a follower allocates its own LSN at apply
+            // time.
+            wal_lsn: _,
             surrogates,
             provenance,
-            ..
+            // Not replicated for the same reason as `ColumnarOp::Insert`'s
+            // `rls_write_check` above: a follower has no writing identity to
+            // re-decide it against.
+            rls_write_check: _,
+            returning,
+            rls_filters,
         } => columnar::timeseries_ingest(
             collection,
             payload,
             format,
             surrogates,
             encode_provenance(provenance),
+            encode_returning(returning),
+            rls_filters,
         ),
 
         // Not a write — reads / scans.

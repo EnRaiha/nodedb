@@ -4,8 +4,9 @@ use super::*;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
-    ColumnarInsertIntent, ColumnarOp, CrdtOp, DocumentOp, GraphOp, ResolvedSumTarget, SpatialOp,
-    TextOp, TimeseriesOp, VectorOp,
+    ColumnarInsertIntent, ColumnarOp, CrdtOp, DocumentOp, GraphOp, ResolvedSumTarget,
+    ReturningColumns, ReturningItem, ReturningSpec, SpatialOp, TextOp, TimeseriesOp, UpdateValue,
+    VectorOp,
 };
 use nodedb_types::geometry::Geometry;
 use nodedb_types::sync::wire::SyncProvenance;
@@ -1132,6 +1133,281 @@ fn timeseries_ingest_provenance_roundtrip() {
             assert_eq!(surrogates, vec![nodedb_types::Surrogate::new(99)]);
             assert_eq!(provenance, Some(prov));
             assert_eq!(wal_lsn, None, "wal_lsn must be None on decode");
+        }
+        other => panic!("expected Timeseries(Ingest), got {other:?}"),
+    }
+}
+
+/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
+/// hardcode `on_conflict_updates: Vec::new()` on decode: an `ON CONFLICT DO
+/// UPDATE` replicated to followers as a plain overwrite, a lost update.
+#[test]
+fn columnar_ingest_on_conflict_updates_roundtrip() {
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+        collection: "metrics".into(),
+        payload: b"[{}]".to_vec(),
+        format: "msgpack".into(),
+        intent: ColumnarInsertIntent::Put,
+        on_conflict_updates: vec![("count".into(), UpdateValue::Literal(b"5".to_vec()))],
+        surrogates: vec![nodedb_types::Surrogate::new(1)],
+        schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: None,
+        rls_filters: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("ColumnarIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Columnar(ColumnarOp::Insert {
+            on_conflict_updates,
+            ..
+        }) => {
+            assert_eq!(
+                on_conflict_updates,
+                vec![("count".to_owned(), UpdateValue::Literal(b"5".to_vec()))],
+                "ON CONFLICT DO UPDATE assignments must survive replication"
+            );
+        }
+        other => panic!("expected Columnar(Insert), got {other:?}"),
+    }
+}
+
+/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
+/// hardcode `intent: ColumnarInsertIntent::Insert`: an `ON CONFLICT DO
+/// NOTHING` insert silently became a plain insert on replication.
+#[test]
+fn columnar_ingest_intent_roundtrip() {
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+        collection: "metrics".into(),
+        payload: b"[{}]".to_vec(),
+        format: "msgpack".into(),
+        intent: ColumnarInsertIntent::InsertIfAbsent,
+        on_conflict_updates: Vec::new(),
+        surrogates: vec![nodedb_types::Surrogate::new(1)],
+        schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: None,
+        rls_filters: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("ColumnarIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Columnar(ColumnarOp::Insert { intent, .. }) => {
+            assert_eq!(
+                intent,
+                ColumnarInsertIntent::InsertIfAbsent,
+                "ON CONFLICT DO NOTHING must not degrade to a plain insert on replication"
+            );
+        }
+        other => panic!("expected Columnar(Insert), got {other:?}"),
+    }
+}
+
+/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
+/// hardcode `format: "msgpack".to_owned()`: a native-protocol JSON payload
+/// was mis-tagged and misparsed on replication.
+#[test]
+fn columnar_ingest_json_format_roundtrip() {
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+        collection: "metrics".into(),
+        payload: b"[{}]".to_vec(),
+        format: "json".into(),
+        intent: ColumnarInsertIntent::Insert,
+        on_conflict_updates: Vec::new(),
+        surrogates: vec![nodedb_types::Surrogate::new(1)],
+        schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: None,
+        rls_filters: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("ColumnarIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Columnar(ColumnarOp::Insert { format, .. }) => {
+            assert_eq!(
+                format, "json",
+                "a JSON payload must not be mis-tagged as msgpack on replication"
+            );
+        }
+        other => panic!("expected Columnar(Insert), got {other:?}"),
+    }
+}
+
+/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
+/// hardcode `returning: None`: a `RETURNING` insert silently yielded no rows
+/// once the write was replicated.
+#[test]
+fn columnar_ingest_returning_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Named(vec![ReturningItem {
+            name: "id".into(),
+            alias: None,
+        }]),
+    };
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+        collection: "metrics".into(),
+        payload: b"[{}]".to_vec(),
+        format: "msgpack".into(),
+        intent: ColumnarInsertIntent::Insert,
+        on_conflict_updates: Vec::new(),
+        surrogates: vec![nodedb_types::Surrogate::new(1)],
+        schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: Some(spec.clone()),
+        rls_filters: Vec::new(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("ColumnarIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Columnar(ColumnarOp::Insert { returning, .. }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING request must not silently yield no rows on replication"
+            );
+        }
+        other => panic!("expected Columnar(Insert), got {other:?}"),
+    }
+}
+
+/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
+/// hardcode `rls_filters: Vec::new()`: once `returning` is fixed, an
+/// unreplicated read policy would let a `RETURNING` row set exceed what a
+/// `SELECT` by the same principal may see.
+#[test]
+fn columnar_ingest_rls_filters_roundtrip() {
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+        collection: "metrics".into(),
+        payload: b"[{}]".to_vec(),
+        format: "msgpack".into(),
+        intent: ColumnarInsertIntent::Insert,
+        on_conflict_updates: Vec::new(),
+        surrogates: vec![nodedb_types::Surrogate::new(1)],
+        schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: None,
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("ColumnarIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Columnar(ColumnarOp::Insert { rls_filters, .. }) => {
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
+        }
+        other => panic!("expected Columnar(Insert), got {other:?}"),
+    }
+}
+
+/// Pins the same `returning` / `rls_filters` bug as the columnar tests above,
+/// on the `TimeseriesOp::Ingest` sibling.
+#[test]
+fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
+    let spec = ReturningSpec {
+        columns: ReturningColumns::Star,
+    };
+    let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+        collection: "temps".into(),
+        payload: b"data".to_vec(),
+        format: "ilp".into(),
+        wal_lsn: None,
+        surrogates: vec![nodedb_types::Surrogate::new(99)],
+        provenance: None,
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        returning: Some(spec.clone()),
+        rls_filters: b"rls-predicate".to_vec(),
+    });
+    let entry = to_replicated_entry(
+        TenantId::new(1),
+        DatabaseId::DEFAULT,
+        VShardId::new(0),
+        &plan,
+    )
+    .expect("encode must not error")
+    .expect("TimeseriesIngest should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            returning,
+            rls_filters,
+            ..
+        }) => {
+            assert_eq!(
+                returning,
+                Some(spec),
+                "a RETURNING request must not silently yield no rows on replication"
+            );
+            assert_eq!(
+                rls_filters,
+                b"rls-predicate".to_vec(),
+                "the RETURNING read-policy filter must survive replication"
+            );
         }
         other => panic!("expected Timeseries(Ingest), got {other:?}"),
     }
