@@ -13,7 +13,7 @@
 //! can answer either question locally.
 
 use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
-use nodedb_physical::physical_plan::{ResolvedSumTarget, UpdateValue};
+use nodedb_physical::physical_plan::{DocumentResolvedMutation, ResolvedSumTarget, UpdateValue};
 use nodedb_types::Surrogate;
 
 /// `resolved_sum_targets` + `deferred_sum_targets` bundled for `point_insert`
@@ -283,6 +283,60 @@ pub(super) fn insert_select(
         source_collection: source_collection.to_owned(),
         source_filters: source_filters.to_vec(),
         source_limit,
+    }
+}
+
+/// Encode a resolved document write: every row mutation the Control Plane
+/// decided, plus the reply it decided alongside them.
+///
+/// Nothing is re-derived here. The bodies are the pre-encode MessagePack the
+/// resolve computed and the preconditions are the raw stored bytes it read, so
+/// every replica writes the same row and refuses the same drift.
+pub(super) fn resolved_write(
+    mutations: &[DocumentResolvedMutation],
+    response_payload: &[u8],
+) -> ReplicatedWrite {
+    use super::super::types::DocumentResolvedMutationWire as W;
+
+    ReplicatedWrite::DocumentResolvedWrite {
+        mutations: mutations
+            .iter()
+            .map(|m| match m {
+                DocumentResolvedMutation::Put {
+                    collection,
+                    document_id,
+                    surrogate,
+                    // Decode re-derives this from `document_id.as_bytes()`.
+                    pk_bytes: _,
+                    value,
+                    precondition,
+                    resolved_sum_targets,
+                } => W::Put {
+                    collection: collection.clone(),
+                    document_id: document_id.clone(),
+                    surrogate: surrogate.as_u32(),
+                    value: value.clone(),
+                    precondition: precondition.clone(),
+                    resolved_sum_targets: wire_target_bindings(resolved_sum_targets),
+                },
+                DocumentResolvedMutation::Delete {
+                    collection,
+                    document_id,
+                    surrogate,
+                    // Decode re-derives this from `document_id.as_bytes()`.
+                    pk_bytes: _,
+                    precondition,
+                    resolved_sum_targets,
+                } => W::Delete {
+                    collection: collection.clone(),
+                    document_id: document_id.clone(),
+                    surrogate: surrogate.as_u32(),
+                    precondition: precondition.clone(),
+                    resolved_sum_targets: wire_target_bindings(resolved_sum_targets),
+                },
+            })
+            .collect(),
+        response_payload: response_payload.to_vec(),
     }
 }
 

@@ -352,6 +352,9 @@ impl CoreLoop {
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::MaterializeScan { .. }
+            // Autocommit-then-Raft by construction: a governed write inside a
+            // transaction is decided by the Data Plane gate, never resolved.
+            | DocumentOp::ResolvedWrite { .. }
             | DocumentOp::ApplyBalanceDelta { .. } => self.stage_not_point_write(task),
         }
     }

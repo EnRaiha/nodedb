@@ -226,6 +226,18 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         // they are intentionally not encoded here.
         DocumentOp::BulkDelete { .. } | DocumentOp::BulkUpdate { .. } => return None,
 
+        // The verdict is already on the plan
+        // (`RlsWriteCheck::DecidedEarlierInRequest`), so unlike the predicate
+        // arms above there is nothing to re-decide here.
+        DocumentOp::ResolvedWrite {
+            mutations,
+            response_payload,
+            // Decode stamps `decided_earlier_in_request()`: the decision this
+            // slot carries was made before the entry was proposed, and the
+            // record is what proves it.
+            rls_write_check: _,
+        } => document::resolved_write(mutations, response_payload),
+
         DocumentOp::ApplyBalanceDelta {
             collection,
             document_id,

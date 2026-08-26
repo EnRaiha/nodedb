@@ -256,6 +256,9 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        // Carries decided rows, not a predicate: its resolution was settled on
+        // the plan the resolve pass read.
+        | DocumentOp::ResolvedWrite { .. }
         // A derived balance write names its target row directly; it is not a
         // predicate-driven statement and drives no binding of its own.
         | DocumentOp::ApplyBalanceDelta { .. } => None,
@@ -298,6 +301,7 @@ fn set_predicate_resolution(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => {}
     }
 }

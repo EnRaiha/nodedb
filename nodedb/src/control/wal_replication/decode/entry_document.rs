@@ -228,6 +228,10 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             join_column,
             join_value,
         )),
+        ReplicatedWrite::DocumentResolvedWrite {
+            mutations,
+            response_payload,
+        } => document::resolved_write(ctx, mutations, response_payload),
         _ => Err(crate::Error::Internal {
             detail: "entry_document::decode_arm called with a non-Document ReplicatedWrite \
                 variant (dispatch bug in decode/entry.rs's grouped Document match arm)"

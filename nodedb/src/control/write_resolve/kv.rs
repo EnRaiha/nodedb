@@ -212,13 +212,15 @@ impl EngineWriteResolver for KvWriteResolver {
                 response_payload,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             })),
-            ResolvedRows::Update(_) | ResolvedRows::Delete(_) => Err(crate::Error::Internal {
-                detail: format!(
-                    "kv write resolver for '{}' was handed a columnar row resolution; \
-                     resolver_for_plan dispatched the wrong engine",
-                    self.collection
-                ),
-            }),
+            ResolvedRows::Update(_) | ResolvedRows::Delete(_) | ResolvedRows::Document { .. } => {
+                Err(crate::Error::Internal {
+                    detail: format!(
+                        "kv write resolver for '{}' was handed another engine's resolution; \
+                         resolver_for_plan dispatched the wrong engine",
+                        self.collection
+                    ),
+                })
+            }
         }
     }
 }

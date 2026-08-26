@@ -72,7 +72,9 @@ fn document_is_write(op: &DocumentOp) -> bool {
         // is precisely the task that has to enter the write-key set: without it
         // the pair it belongs to classifies as single-shard and the source
         // write commits without the balance.
-        | DocumentOp::ApplyBalanceDelta { .. } => true,
+        | DocumentOp::ApplyBalanceDelta { .. }
+        // Mutates the rows its mutation list names, like any other write.
+        | DocumentOp::ResolvedWrite { .. } => true,
         // Read-only: it reports what the wrapped write would apply and mutates
         // nothing.
         DocumentOp::ResolveWrite(_)

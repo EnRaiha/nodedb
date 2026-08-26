@@ -143,6 +143,49 @@ pub enum KvResolvedMutationWire {
     },
 }
 
+/// One mutation of a `DocumentResolvedWrite` in the cross-node wire shape.
+///
+/// Mirrors `nodedb_physical::physical_plan::DocumentResolvedMutation`, with the
+/// surrogate as a bare `u32` rather than the `Surrogate` newtype — the same
+/// convention every other identity on this wire uses. Decode binds it through
+/// the surrogate assigner, so a follower addresses the row the leader did.
+///
+/// `value` is the PRE-ENCODE MessagePack body for both storage modes; the
+/// applying node encodes a strict collection's Binary Tuple on the way to disk.
+/// `precondition` is RAW STORED bytes and is the drift check, not business
+/// logic: `None` means the row must be ABSENT at apply time, `Some(bytes)` that
+/// it must hold exactly those bytes.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum DocumentResolvedMutationWire {
+    Put {
+        collection: String,
+        document_id: String,
+        surrogate: u32,
+        value: Vec<u8>,
+        precondition: Option<Vec<u8>>,
+        /// `(target collection, join value)` -> target surrogate, resolved by
+        /// the proposing node. Carried for the same reason every other document
+        /// record carries it: no applying node can resolve it locally.
+        resolved_sum_targets: Vec<ReplicatedSumTarget>,
+    },
+    Delete {
+        collection: String,
+        document_id: String,
+        surrogate: u32,
+        precondition: Option<Vec<u8>>,
+        /// See `Put::resolved_sum_targets`.
+        resolved_sum_targets: Vec<ReplicatedSumTarget>,
+    },
+}
+
 /// Whether a `ConstraintChange` installs (`Set`) or removes (`Drop`) a
 /// collection's constraint set on every replica.
 #[derive(

@@ -152,6 +152,33 @@ async fn update_producing_a_violating_row_is_rejected_and_writes_nothing() {
         before,
         "a rejected update must leave every stored row exactly as it was"
     );
+
+    // A CONFORMING update of the same shape must still apply and land. Without
+    // this the test passes on a blanket refusal of every governed update — the
+    // policy would look enforced while nothing worked.
+    try_exec_as(
+        &server,
+        user,
+        "UPDATE w_rls_upd SET note = 'touched' WHERE id = 'r_mine'",
+    )
+    .await
+    .expect("an update whose post-image satisfies the policy must apply");
+    assert_eq!(
+        stored(&server, "w_rls_upd").await,
+        vec![
+            vec![
+                "r_mine".to_string(),
+                user.to_string(),
+                "touched".to_string()
+            ],
+            vec![
+                "r_theirs".to_string(),
+                "alice".to_string(),
+                "before".to_string()
+            ],
+        ],
+        "the conforming update must write the owned row and leave the other alone"
+    );
 }
 
 /// An `UPDATE` whose post-image stays inside the policy's scope applies
@@ -231,6 +258,21 @@ async fn deleting_a_row_the_policy_excludes_is_rejected() {
         rows.len(),
         2,
         "a rejected predicate delete must remove nothing: {rows:?}"
+    );
+
+    // A CONFORMING delete must still remove its row. Without this the test
+    // passes on a blanket refusal of every governed delete.
+    try_exec_as(&server, user, "DELETE FROM w_rls_del WHERE id = 'r_mine'")
+        .await
+        .expect("deleting a row the policy admits must apply");
+    assert_eq!(
+        stored(&server, "w_rls_del").await,
+        vec![vec![
+            "r_theirs".to_string(),
+            "alice".to_string(),
+            "before".to_string()
+        ]],
+        "the conforming delete must remove exactly the owned row"
     );
 }
 

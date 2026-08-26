@@ -162,7 +162,11 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             // the same level as any other document write. It is never issued
             // by a client: the planner appends it after the statement that
             // caused it has already cleared its own authorization.
-            | DocumentOp::ApplyBalanceDelta { .. },
+            | DocumentOp::ApplyBalanceDelta { .. }
+            // Mutates the rows its mutation list names. Never issued by a
+            // client: the write-resolve orchestrator builds it after the
+            // intercepted statement cleared its own authorization.
+            | DocumentOp::ResolvedWrite { .. },
         ) => Permission::Write,
 
         PhysicalPlan::Graph(

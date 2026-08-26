@@ -2,8 +2,8 @@
 
 //! Permission-tree resolution for document-engine operations.
 
-use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::document::MergeActionOp;
+use nodedb_physical::physical_plan::{DocumentOp, DocumentResolvedMutation};
 
 use super::context::{PermCtx, PermTreeLevel};
 
@@ -171,6 +171,19 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
         // and the rows it classifies are the rows that write persists, so it
         // narrows at exactly that write's level.
         DocumentOp::ResolveWrite(inner) => apply_document(ctx, inner),
+
+        // Blanket per mutation: each names the row it writes directly, and a
+        // `Delete` mutation is a removal, so it takes the delete level.
+        DocumentOp::ResolvedWrite { mutations, .. } => {
+            for mutation in mutations {
+                let level = match mutation {
+                    DocumentResolvedMutation::Put { .. } => PermTreeLevel::Write,
+                    DocumentResolvedMutation::Delete { .. } => PermTreeLevel::Delete,
+                };
+                ctx.authorize(mutation.collection(), level)?;
+            }
+            Ok(())
+        }
 
         // No-op: index DDL and collection registration. These describe the
         // collection rather than acting on its rows, and are authorized as

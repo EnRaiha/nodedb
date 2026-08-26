@@ -12,6 +12,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use nodedb_physical::physical_plan::DocumentOp;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -119,8 +120,11 @@ impl CoreLoop {
 
     /// Run the read-only RESOLVE pass over the op `ResolveWrite` wraps.
     ///
-    /// Only the two join-driven DML ops resolve; anything else is a
-    /// Control-Plane construction bug, not a client error.
+    /// Two answers, two shapes. The join-driven ops report a classification the
+    /// Control-Plane expander turns into point ops. The five point/bulk ops
+    /// report a `DocumentResolveOutcome` the Control Plane proposes as a
+    /// `DocumentOp::ResolvedWrite`. Anything else is a Control-Plane
+    /// construction bug, not a client error.
     pub(super) fn dispatch_document_resolve_write(
         &mut self,
         task: &ExecutionTask,
@@ -132,12 +136,19 @@ impl CoreLoop {
                 self.dispatch_update_from_join(task, tid, inner, true)
             }
             DocumentOp::Merge { .. } => self.dispatch_merge(task, tid, inner, true),
-            _ => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: "ResolveWrite wraps an op with no resolve pass".into(),
+            other => match self.resolve_document_point_write(task, tid, other) {
+                Some(Ok(outcome)) => match response_codec::encode(&outcome) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => self.response_error(task, e),
                 },
-            ),
+                Some(Err(code)) => self.response_error(task, code),
+                None => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: "ResolveWrite wraps an op with no resolve pass".into(),
+                    },
+                ),
+            },
         }
     }
 }

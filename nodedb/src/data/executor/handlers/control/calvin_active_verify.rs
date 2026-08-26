@@ -119,6 +119,9 @@ impl CoreLoop {
                     | DocumentOp::Merge { .. }
                     | DocumentOp::ResolveWrite(_)
                     | DocumentOp::MaterializeScan { .. }
+                    // Carries decided rows, not a predicate to re-verify: each
+                    // mutation's own content precondition is the drift check.
+                    | DocumentOp::ResolvedWrite { .. }
                     | DocumentOp::ApplyBalanceDelta { .. } => continue,
                 };
             let Some(predicted) = predicted_surrogates.as_deref() else {

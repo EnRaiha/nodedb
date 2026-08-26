@@ -463,3 +463,79 @@ pub(super) fn apply_balance_delta(
         join_value: join_value.to_owned(),
     })
 }
+
+/// Reconstruct a resolved document write plan (`DocumentOp::ResolvedWrite`).
+///
+/// Every mutation's surrogate is bound through the assigner against its own
+/// `(collection, primary key)`, so a follower addresses the rows the leader
+/// did. Nothing else is re-derived: the bodies, the preconditions, the reply
+/// and the materialized-sum resolution all travel on the record — see this
+/// module's doc for why re-resolving is not open to an applying node.
+pub(super) fn resolved_write(
+    ctx: &DecodeCtx,
+    mutations: &[super::super::types::DocumentResolvedMutationWire],
+    response_payload: &[u8],
+) -> crate::Result<PhysicalPlan> {
+    use super::super::types::DocumentResolvedMutationWire as W;
+    use nodedb_physical::physical_plan::DocumentResolvedMutation as M;
+
+    let decoded = mutations
+        .iter()
+        .map(|m| -> crate::Result<M> {
+            Ok(match m {
+                W::Put {
+                    collection,
+                    document_id,
+                    surrogate,
+                    value,
+                    precondition,
+                    resolved_sum_targets,
+                } => {
+                    let pk_bytes = document_id.as_bytes().to_vec();
+                    let carried = nodedb_types::Surrogate::new(*surrogate);
+                    M::Put {
+                        surrogate: bind_or_lookup(ctx, collection, &pk_bytes, carried)?,
+                        collection: collection.clone(),
+                        document_id: document_id.clone(),
+                        pk_bytes,
+                        value: value.clone(),
+                        precondition: precondition.clone(),
+                        resolved_sum_targets: plan_targets(&WireSumResolution {
+                            bindings: resolved_sum_targets,
+                            legacy: &[],
+                        }),
+                    }
+                }
+                W::Delete {
+                    collection,
+                    document_id,
+                    surrogate,
+                    precondition,
+                    resolved_sum_targets,
+                } => {
+                    let pk_bytes = document_id.as_bytes().to_vec();
+                    let carried = nodedb_types::Surrogate::new(*surrogate);
+                    M::Delete {
+                        surrogate: bind_or_lookup(ctx, collection, &pk_bytes, carried)?,
+                        collection: collection.clone(),
+                        document_id: document_id.clone(),
+                        pk_bytes,
+                        precondition: precondition.clone(),
+                        resolved_sum_targets: plan_targets(&WireSumResolution {
+                            bindings: resolved_sum_targets,
+                            legacy: &[],
+                        }),
+                    }
+                }
+            })
+        })
+        .collect::<crate::Result<Vec<M>>>()?;
+
+    Ok(PhysicalPlan::Document(DocumentOp::ResolvedWrite {
+        mutations: decoded,
+        response_payload: response_payload.to_vec(),
+        // The decision was made before this entry was proposed; the record is
+        // what proves it.
+        rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
+    }))
+}

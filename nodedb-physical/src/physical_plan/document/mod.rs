@@ -6,6 +6,7 @@ pub mod enforcement_types;
 pub mod merge_types;
 pub mod ollp_edge;
 pub mod op;
+pub mod resolved_mutation;
 pub mod sum_target;
 pub mod timeseries_schema;
 pub mod types;
@@ -17,6 +18,7 @@ pub use enforcement_types::{
 pub use merge_types::{MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp};
 pub use ollp_edge::OllpPredictedEdge;
 pub use op::DocumentOp;
+pub use resolved_mutation::{DocumentResolveOutcome, DocumentResolvedMutation};
 pub use sum_target::{ResolvedSumTarget, SumTargetKey, resolved_sum_surrogate};
 pub use timeseries_schema::TimeseriesSchema;
 pub use types::{

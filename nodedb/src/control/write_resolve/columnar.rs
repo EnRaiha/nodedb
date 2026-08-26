@@ -140,11 +140,11 @@ impl EngineWriteResolver for ColumnarWriteResolver {
                 pks,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             },
-            ResolvedRows::Kv { .. } => {
+            ResolvedRows::Kv { .. } | ResolvedRows::Document { .. } => {
                 return Err(crate::Error::Internal {
                     detail: format!(
-                        "columnar write resolver for '{}' was handed a KV resolution; \
-                         resolver_for_plan dispatched the wrong engine",
+                        "columnar write resolver for '{}' was handed another engine's \
+                         resolution; resolver_for_plan dispatched the wrong engine",
                         self.collection
                     ),
                 });

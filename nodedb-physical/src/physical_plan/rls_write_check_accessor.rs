@@ -73,6 +73,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Document(DocumentOp::Merge {
                 rls_write_check, ..
             })
+            | PhysicalPlan::Document(DocumentOp::ResolvedWrite {
+                rls_write_check, ..
+            })
             | PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
                 rls_write_check, ..
             })

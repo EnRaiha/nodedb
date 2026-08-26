@@ -69,7 +69,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::ResolveWrite(_)
             // Appended by the planner AFTER statement admission and dispatched
             // as its own task; it never reaches the transaction write buffer.
-            | DocumentOp::ApplyBalanceDelta { .. },
+            | DocumentOp::ApplyBalanceDelta { .. }
+            // Built by the write-resolve orchestrator on the autocommit path and
+            // proposed straight through Raft; it never reaches the buffer.
+            | DocumentOp::ResolvedWrite { .. },
         ) => false,
 
         // Buffered. Neither `Merge` nor `UpdateFromJoin` reaches this predicate in

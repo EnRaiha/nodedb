@@ -271,7 +271,7 @@ fn rmpv_row_to_json(row: &rmpv::Value) -> serde_json::Value {
 /// Tuples; a body that fails to decode fails the statement rather than
 /// degrading to a bare `{id}` row, which would report a row the client never
 /// wrote and hide that the stored body is unreadable.
-fn build_stored_rows_payload(
+pub(in crate::data::executor) fn build_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
     strict_schema: Option<&StrictSchema>,

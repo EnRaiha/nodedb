@@ -415,6 +415,18 @@ impl CoreLoop {
                 self.dispatch_document_resolve_write(task, tid, inner)
             }
 
+            DocumentOp::ResolvedWrite {
+                mutations,
+                response_payload,
+                rls_write_check,
+            } => self.execute_document_resolved_write(
+                task,
+                tid,
+                mutations,
+                response_payload,
+                rls_write_check,
+            ),
+
             DocumentOp::BackfillIndex {
                 collection,
                 path,

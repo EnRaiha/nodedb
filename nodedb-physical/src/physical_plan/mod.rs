@@ -33,10 +33,11 @@ pub use cluster_event::{ClusterEventOp, MAX_REMOTE_CDC_COMMITTED_OFFSETS};
 pub use columnar::{ColumnarInsertIntent, ColumnarOp};
 pub use crdt::CrdtOp;
 pub use document::{
-    BalancedDef, DocumentOp, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding,
-    OllpPredictedEdge, PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ResolvedSumTarget,
-    ReturningColumns, ReturningItem, ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema,
-    UpdateValue, resolved_sum_surrogate,
+    BalancedDef, DocumentOp, DocumentResolveOutcome, DocumentResolvedMutation, EnforcementOptions,
+    GeneratedColumnSpec, MaterializedSumBinding, OllpPredictedEdge, PeriodLockConfig,
+    RegisteredIndex, RegisteredIndexState, ResolvedSumTarget, ReturningColumns, ReturningItem,
+    ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema, UpdateValue,
+    resolved_sum_surrogate,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{

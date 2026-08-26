@@ -7,8 +7,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, KvResolvedMutation, MetaOp,
-    TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, DocumentResolvedMutation, KvOp,
+    KvResolvedMutation, MetaOp, TimeseriesOp, VectorOp,
 };
 
 /// Extract write metadata from a physical plan for change event publishing.
@@ -115,6 +115,27 @@ pub(super) fn extract_write_metadata(
             "*".into(),
             ChangeOperation::Update,
         )],
+        // A resolved governed write reports one event per mutation: it names
+        // every row it touches, so nothing here has to be collapsed to
+        // `document_id="*"`. The precondition is what the resolve found stored:
+        // a row that was absent is an insert, one that was present an update.
+        PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) => mutations
+            .iter()
+            .map(|mutation| {
+                let operation = match mutation {
+                    DocumentResolvedMutation::Delete { .. } => ChangeOperation::Delete,
+                    DocumentResolvedMutation::Put { precondition, .. } => match precondition {
+                        Some(_) => ChangeOperation::Update,
+                        None => ChangeOperation::Insert,
+                    },
+                };
+                (
+                    mutation.collection().to_string(),
+                    mutation.document_id().to_string(),
+                    operation,
+                )
+            })
+            .collect(),
         // Remaining DocumentOp variants (PointGet, Scan, RangeScan, Register,
         // IndexLookup, IndexedFetch, DropIndex, BackfillIndex, EstimateCount,
         // MaterializeScan, ResolveWrite) are reads or catalog/schema DDL — no

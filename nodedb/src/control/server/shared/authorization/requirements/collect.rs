@@ -137,8 +137,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 ));
             }
             // Read-only probe over exactly the rows the wrapped write reads.
-            PhysicalPlan::Document(DocumentOp::ResolveWrite(inner)) => {
-                if let DocumentOp::UpdateFromJoin {
+            PhysicalPlan::Document(DocumentOp::ResolveWrite(inner)) => match inner.as_ref() {
+                DocumentOp::UpdateFromJoin {
                     target_collection,
                     source_collection,
                     ..
@@ -147,10 +147,47 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                     target_collection,
                     source_collection,
                     ..
-                } = inner.as_ref()
-                {
+                } => {
                     add_collection_requirement(target_collection, Permission::Read, out);
                     add_collection_requirement(source_collection, Permission::Read, out);
+                }
+                // The five point/bulk writes read exactly one collection: the
+                // one they would write.
+                DocumentOp::PointUpdate { collection, .. }
+                | DocumentOp::PointDelete { collection, .. }
+                | DocumentOp::Upsert { collection, .. }
+                | DocumentOp::BulkUpdate { collection, .. }
+                | DocumentOp::BulkDelete { collection, .. } => {
+                    add_collection_requirement(collection, Permission::Read, out);
+                }
+                // No other op is ever wrapped. Adding nothing leaves the
+                // requirement set empty, which the tenant fallback below turns
+                // into a tenant-wide check — fail-closed, not a bypass.
+                // Enumerated so a newly wrapped op is a compile error here.
+                DocumentOp::PointGet { .. }
+                | DocumentOp::PointPut { .. }
+                | DocumentOp::PointInsert { .. }
+                | DocumentOp::Scan { .. }
+                | DocumentOp::BatchInsert { .. }
+                | DocumentOp::RangeScan { .. }
+                | DocumentOp::Register { .. }
+                | DocumentOp::IndexLookup { .. }
+                | DocumentOp::IndexedFetch { .. }
+                | DocumentOp::DropIndex { .. }
+                | DocumentOp::BackfillIndex { .. }
+                | DocumentOp::Truncate { .. }
+                | DocumentOp::EstimateCount { .. }
+                | DocumentOp::InsertSelect { .. }
+                | DocumentOp::MaterializeScan { .. }
+                | DocumentOp::ApplyBalanceDelta { .. }
+                | DocumentOp::ResolveWrite(_)
+                | DocumentOp::ResolvedWrite { .. } => {}
+            },
+            // Per-mutation: the mutation list names every row this write
+            // touches, and `PhysicalPlan::collection` reports none of them.
+            PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) => {
+                for mutation in mutations {
+                    add_collection_requirement(mutation.collection(), Permission::Write, out);
                 }
             }
             // Read-only probe over exactly the rows the wrapped write reads.

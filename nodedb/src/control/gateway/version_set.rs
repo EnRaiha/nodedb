@@ -218,6 +218,11 @@ fn document_touched_collections(
         // The wrapped op is the intercepted write verbatim, so it reads
         // exactly the collections that write touches.
         ResolveWrite(inner) => document_touched_collections(inner, out),
+
+        // Per-mutation: a resolved bulk write spans every row it matched.
+        ResolvedWrite { mutations, .. } => {
+            out.extend(mutations.iter().map(|m| m.collection().to_owned()));
+        }
     }
 }
 

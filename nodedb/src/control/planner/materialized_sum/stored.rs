@@ -206,6 +206,8 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::MaterializeScan { .. }
+        // Already resolved on the plan the resolve pass read.
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => None,
     }
 }

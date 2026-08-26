@@ -200,6 +200,10 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        // Spans N rows across a resolved mutation list, which this single-tuple
+        // shape cannot name. Its trigger intent is the intercepted statement's,
+        // already reported before the resolve ran.
+        | DocumentOp::ResolvedWrite { .. }
         // A derived balance write carries no user DML intent: the statement
         // that caused it already fired its own triggers on the source row.
         | DocumentOp::ApplyBalanceDelta { .. } => None,

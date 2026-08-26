@@ -232,6 +232,9 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::MaterializeScan { .. }
+        // Already resolved: the resolve pass copied the intercepted plan's own
+        // resolution onto every mutation it produced.
+        | DocumentOp::ResolvedWrite { .. }
         // Already resolved: this op IS the resolution, carrying the target
         // row's surrogate the Control Plane looked up when it appended it.
         | DocumentOp::ApplyBalanceDelta { .. } => None,
@@ -285,6 +288,7 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => {}
     }
 }

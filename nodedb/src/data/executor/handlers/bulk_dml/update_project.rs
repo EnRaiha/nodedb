@@ -20,30 +20,30 @@ use crate::data::executor::doc_format;
 use crate::types::{DatabaseId, TenantId};
 
 /// One matched row and everything the apply loop needs to land it.
-pub(super) struct ProjectedUpdateRow {
+pub(in crate::data::executor) struct ProjectedUpdateRow {
     /// Storage key (the surrogate hex).
-    pub(super) doc_id: String,
+    pub(in crate::data::executor) doc_id: String,
     /// The row as stored before the update — the `old_value` of the emitted
     /// event and the old side of the secondary-index diff.
-    pub(super) current_bytes: Vec<u8>,
+    pub(in crate::data::executor) current_bytes: Vec<u8>,
     /// Pre-mutation image, captured before any field changed.
-    pub(super) old_doc: serde_json::Value,
+    pub(in crate::data::executor) old_doc: serde_json::Value,
     /// Post-update image, with assignments and regenerated columns applied.
-    pub(super) doc: serde_json::Value,
+    pub(in crate::data::executor) doc: serde_json::Value,
     /// The post-update image encoded in the collection's storage mode.
-    pub(super) updated_bytes: Vec<u8>,
+    pub(in crate::data::executor) updated_bytes: Vec<u8>,
 }
 
 /// Inputs to [`CoreLoop::project_bulk_update_rows`].
-pub(super) struct ProjectUpdateRows<'a> {
-    pub(super) database_id: u64,
-    pub(super) tid: u64,
-    pub(super) collection: &'a str,
+pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
+    pub(in crate::data::executor) database_id: u64,
+    pub(in crate::data::executor) tid: u64,
+    pub(in crate::data::executor) collection: &'a str,
     /// The settled apply set, in statement order.
-    pub(super) doc_ids: &'a [String],
-    pub(super) updates: &'a [(String, UpdateValue)],
+    pub(in crate::data::executor) doc_ids: &'a [String],
+    pub(in crate::data::executor) updates: &'a [(String, UpdateValue)],
     /// `Some` for a strict collection, whose bodies are Binary Tuples.
-    pub(super) strict_schema: Option<&'a StrictSchema>,
+    pub(in crate::data::executor) strict_schema: Option<&'a StrictSchema>,
 }
 
 impl CoreLoop {
@@ -56,7 +56,7 @@ impl CoreLoop {
     /// collection, an assignment expression that cannot be evaluated) is an
     /// error, because silently skipping it would report a smaller affected
     /// count as the truth.
-    pub(super) fn project_bulk_update_rows(
+    pub(in crate::data::executor) fn project_bulk_update_rows(
         &self,
         p: ProjectUpdateRows<'_>,
     ) -> crate::Result<Vec<ProjectedUpdateRow>> {

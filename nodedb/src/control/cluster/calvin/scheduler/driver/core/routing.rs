@@ -107,6 +107,11 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
+        // Never scheduled: the write-resolve orchestrator proposes it through
+        // Raft directly, on the vshard of the collection it resolved.
+        DocumentOp::ResolvedWrite { .. } => PlanRouting::Unroutable(
+            "resolved governed write: proposed directly by the write-resolve orchestrator",
+        ),
         DocumentOp::InsertSelect {
             target_collection, ..
         } => PlanRouting::Vshards(vec![collection_vshard_in_database(

@@ -271,6 +271,10 @@ fn document_write_collection(op: &DocumentOp) -> String {
         // reaches this builder; the routing oracle names them `Unroutable` for
         // the same reason.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => String::new(),
+        // Proposed directly through Raft by the write-resolve orchestrator, so
+        // no plan of this shape reaches this builder — the routing oracle names
+        // it `Unroutable` for the same reason.
+        DocumentOp::ResolvedWrite { .. } => String::new(),
         // Reads and index DDL: the caller skips every plan `is_write_plan`
         // rejects before it gets here.
         DocumentOp::ResolveWrite(_)

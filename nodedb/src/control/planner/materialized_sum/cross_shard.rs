@@ -224,6 +224,9 @@ fn settleable_insert(op: &DocumentOp) -> crate::Result<Option<SettleableInsert<'
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        // Already resolved: the resolve pass copied the plan's own
+        // `resolved_sum_targets` onto every mutation it produced.
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => Ok(None),
     }
 }
@@ -264,6 +267,8 @@ fn defer_binding(plan: &mut PhysicalPlan, target_collection: String) {
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        // See `settleable_insert`.
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => return,
     };
     if !deferred.contains(&target_collection) {

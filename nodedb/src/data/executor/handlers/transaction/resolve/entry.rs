@@ -406,6 +406,13 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. } => Ok(()),
 
+        // Resolve-before-propose is an autocommit path: the resolution is
+        // decided against committed state and proposed directly, never staged
+        // into a transaction overlay, so no row-level redo shape carries it.
+        DocumentOp::ResolvedWrite { .. } => Err(crate::Error::PlanError {
+            detail: "document resolved write is not supported in transaction resolve".to_string(),
+        }),
+
         // Join/merge/batch DML is never staged: `UpdateFromJoin` and `Merge`
         // resolve a multi-row cross-collection effect that has no
         // per-surrogate absolute post-image, and `BatchInsert` rides the

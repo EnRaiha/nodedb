@@ -99,7 +99,8 @@ fn to_physical_plan(
         | ReplicatedWrite::DocTruncate { .. }
         | ReplicatedWrite::BulkDml { .. }
         | ReplicatedWrite::InsertSelect { .. }
-        | ReplicatedWrite::ApplyBalanceDelta { .. } => {
+        | ReplicatedWrite::ApplyBalanceDelta { .. }
+        | ReplicatedWrite::DocumentResolvedWrite { .. } => {
             Ok((entry_document::decode_arm(ctx, write)?, None))
         }
         // The full `Vector*` variant family (original four write shapes plus

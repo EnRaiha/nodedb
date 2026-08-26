@@ -9,5 +9,6 @@ pub mod apply_balance_delta;
 pub mod index_fetch;
 pub mod index_maintenance;
 pub mod read;
+pub mod resolve;
 pub mod sort;
 pub mod write;

@@ -113,6 +113,11 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
         // Multi-row and cross-collection writes have no single point identity;
         // they route to the deterministic scheduler, which owns their ordering.
         DocumentOp::BatchInsert { .. }
+        // N rows, each with its own identity — and it is never admitted through
+        // this gate: the write-resolve orchestrator proposes it directly, and
+        // each mutation's content precondition is what orders it against a
+        // concurrent write.
+        | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }

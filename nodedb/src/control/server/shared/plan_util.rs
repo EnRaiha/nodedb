@@ -176,6 +176,12 @@ pub(crate) fn metered_collections(plan: &PhysicalPlan) -> Vec<String> {
         }
         return out;
     }
+    if let PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) = plan {
+        for mutation in mutations {
+            push_distinct(&mut out, mutation.collection());
+        }
+        return out;
+    }
     // Every other plan identifies one collection at most, and
     // `extract_collection` is itself exhaustive over `PhysicalPlan`, so this
     // stays exhaustive without restating that match.

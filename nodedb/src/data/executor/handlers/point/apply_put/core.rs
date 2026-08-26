@@ -9,8 +9,7 @@ use redb::WriteTransaction;
 use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::generated;
-use crate::data::executor::{doc_format, strict_format};
+use crate::data::executor::doc_format;
 
 use super::enforce::PutEnforcement;
 use super::types::{PointPutOutcome, PointPutParams};
@@ -84,36 +83,11 @@ impl CoreLoop {
             enforce,
             wal_lsn,
         } = params;
-        // Evaluate generated columns before encoding.
         let config_key = (
             crate::types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        let value = if let Some(config) = self.doc_configs.get(&config_key)
-            && !config.enforcement.generated_columns.is_empty()
-        {
-            // Incoming body, per the invariant above: a body with no readable
-            // fields has no column for a generated expression to read or write,
-            // so it is stored as supplied rather than rejected.
-            if let Ok(mut doc) = doc_format::decode_document(value) {
-                if let Err(e) = generated::evaluate_generated_columns(
-                    &mut doc,
-                    &config.enforcement.generated_columns,
-                ) {
-                    return Err(crate::Error::Storage {
-                        engine: "generated".into(),
-                        detail: format!("generated column evaluation failed: {e:?}"),
-                    });
-                }
-                doc_format::encode_to_msgpack(&doc)
-            } else {
-                value.to_vec()
-            }
-        } else {
-            doc_format::canonicalize_document_for_storage(value)
-        };
-        let value = &value;
 
         // A resolve-time stamp carried in `active_bitemporal_stamps` (present on
         // the commit-time base install and on WAL replay of an 8-tuple document
@@ -139,61 +113,20 @@ impl CoreLoop {
                 ),
             };
 
-        // Strict (Binary Tuple) encoding pipeline. Runs in two steps under
-        // a single doc-config lookup:
-        //   (1) When the schema has an auto-generated `_rowid` primary key
-        //       (injected by `build_strict_schema` when no explicit PK is
-        //       declared), the client INSERT payload won't contain it.
-        //       Inject it from the surrogate before encoding so the NOT NULL
-        //       constraint is satisfied.
-        //   (2) Encode the (possibly-injected) MessagePack into Binary Tuple.
-        // Downstream indexing reads the rebound `value` so it sees the
-        // injected `_rowid` alongside the user's fields.
-        let value_with_rowid: Vec<u8>;
-        let (value, stored): (&[u8], Vec<u8>) = if let Some(config) =
-            self.doc_configs.get(&config_key)
-            && let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                config.storage_mode
-        {
-            let encoded_input: &[u8] = if schema
-                .columns
-                .first()
-                .is_some_and(|c| c.name == "_rowid" && !c.nullable)
-                && let Ok(mut decoded) = nodedb_types::json_from_msgpack(value)
-                && let serde_json::Value::Object(ref mut obj) = decoded
-                && !obj.contains_key("_rowid")
-            {
-                obj.insert(
-                    "_rowid".to_string(),
-                    serde_json::Value::Number((surrogate.0 as i64).into()),
-                );
-                value_with_rowid =
-                    nodedb_types::json_to_msgpack(&decoded).unwrap_or_else(|_| value.to_vec());
-                &value_with_rowid
-            } else {
-                value
-            };
-
-            let stored = if bitemporal && schema.bitemporal {
-                strict_format::bytes_to_binary_tuple_bitemporal(
-                    encoded_input,
-                    schema,
-                    sys_from_ms,
-                    valid_from_ms,
-                    valid_until_ms,
-                )
-            } else {
-                strict_format::bytes_to_binary_tuple(encoded_input, schema)
-            }
-            .map_err(|e| crate::Error::Serialization {
-                format: "binary_tuple".into(),
-                detail: e.to_string(),
-            })?;
-
-            (encoded_input, stored)
-        } else {
-            (value, value.to_vec())
-        };
+        // Generated columns, `_rowid` injection, and the strict Binary Tuple
+        // encode — the one place that answer is computed, shared with the
+        // governed-write RESOLVE pass.
+        let body = self.build_stored_body(super::stored_body::StoredBodyInput {
+            config_key: &config_key,
+            surrogate,
+            value,
+            bitemporal,
+            sys_from_ms,
+            valid_from_ms,
+            valid_until_ms,
+        })?;
+        let stored = body.stored;
+        let value: &[u8] = &body.value;
 
         // Read the prior stored value before the write lands, but only when
         // something downstream actually needs it: bitemporal collections

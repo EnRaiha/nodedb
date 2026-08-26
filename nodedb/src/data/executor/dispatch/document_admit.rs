@@ -34,6 +34,7 @@ pub(super) fn is_document_write(op: &DocumentOp) -> bool {
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::ApplyBalanceDelta { .. }
+            | DocumentOp::ResolvedWrite { .. }
     )
 }
 

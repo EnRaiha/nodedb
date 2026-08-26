@@ -770,8 +770,16 @@ pub enum DocumentOp {
     /// a write set, or emitting events. The Control-Plane expander turns that
     /// answer into concrete, surrogate-carrying point ops.
     ///
-    /// Only [`DocumentOp::Merge`] and [`DocumentOp::UpdateFromJoin`] are valid
-    /// inner ops; the Data Plane rejects any other.
+    /// Only [`DocumentOp::Merge`], [`DocumentOp::UpdateFromJoin`],
+    /// [`DocumentOp::PointUpdate`], [`DocumentOp::PointDelete`],
+    /// [`DocumentOp::Upsert`], [`DocumentOp::BulkUpdate`] and
+    /// [`DocumentOp::BulkDelete`] are valid inner ops; the Data Plane rejects
+    /// any other.
+    ///
+    /// The two join-driven ops report a classification the Control-Plane
+    /// expander turns into point ops. The five point/bulk ops report a
+    /// [`DocumentResolveOutcome`](super::resolved_mutation::DocumentResolveOutcome)
+    /// that becomes a [`DocumentOp::ResolvedWrite`] proposed through Raft.
     ///
     /// Carries NO check slot of its own: it persists nothing, so no write gate
     /// applies. The wrapped op still holds the injected write predicate, and
@@ -779,4 +787,29 @@ pub enum DocumentOp {
     /// point op. Classified as a READ everywhere — permission, write class,
     /// lock keys, CDC, Calvin routing.
     ResolveWrite(Box<DocumentOp>),
+
+    /// Apply exactly the mutations a [`DocumentOp::ResolveWrite`] reported,
+    /// then return the reply it reported alongside them.
+    ///
+    /// The one shape every governed point/bulk document write resolves to. A
+    /// `PointUpdate` / `Upsert` / each matched `BulkUpdate` row becomes a
+    /// [`DocumentResolvedMutation::Put`](super::resolved_mutation::DocumentResolvedMutation::Put);
+    /// a `PointDelete` / each matched `BulkDelete` row becomes a `Delete`. A
+    /// bulk op produces N mutations in one vector, which is what lets it share
+    /// this shape rather than needing a second wire form.
+    ///
+    /// Every mutation's `precondition` is checked BEFORE the first mutation
+    /// runs; any mismatch fails the whole write with
+    /// `ErrorCode::OllpRetryRequired` and mutates nothing.
+    ResolvedWrite {
+        mutations: Vec<super::resolved_mutation::DocumentResolvedMutation>,
+        /// The statement's reply, decided at resolve time. Every replica
+        /// returns it unchanged rather than recomputing it from state that has
+        /// moved on.
+        response_payload: Vec<u8>,
+        /// Always `RlsWriteCheck::DecidedEarlierInRequest`: this same request
+        /// already admitted these exact row images. The slot stays so the apply
+        /// path runs the same write gate every other write path runs.
+        rls_write_check: RlsWriteCheck,
+    },
 }

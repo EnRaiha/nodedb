@@ -282,6 +282,13 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         // A derived balance write answers no client: it reports an affected
         // count to the planner that appended it and shapes no row.
         | PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. })
+        // A resolved governed write never reaches this classifier: the
+        // write-resolve orchestrator returns the response itself, and the
+        // caller shapes it from the INTERCEPTED plan — the `PointUpdate` /
+        // `Upsert` / bulk op whose `returning` slot says whether rows come
+        // back. Shaping from this plan would decide that from a shape that no
+        // longer carries the clause.
+        | PhysicalPlan::Document(DocumentOp::ResolvedWrite { .. })
 
         // Default: opaque execution result. The specific arms above take
         // precedence; these inner wildcards catch every unmatched op of each

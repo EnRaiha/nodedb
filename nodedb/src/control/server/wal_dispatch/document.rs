@@ -128,7 +128,10 @@ pub(super) fn wal_append_document_op(
         // Durability comes from the post-apply write-set redo, which names the
         // TARGET collection and re-derives its vShard per entry — the same
         // route the co-resident derived write already takes.
-        | DocumentOp::ApplyBalanceDelta { .. } => None,
+        | DocumentOp::ApplyBalanceDelta { .. }
+        // Durable as the committed Raft entry that carries it; the per-row redo
+        // shapes here cannot express a mutation list.
+        | DocumentOp::ResolvedWrite { .. } => None,
         // DurableElsewhere — row is redb-synchronous-durable; secondary-vector-index
         // restart fidelity would need an apply-time per-row Put/Delete record —
         // tracked, not built here

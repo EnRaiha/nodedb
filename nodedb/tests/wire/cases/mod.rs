@@ -40,6 +40,7 @@ mod define_field_type_update;
 mod dml_returning_columnar;
 mod dml_returning_columnar_policies;
 mod dml_returning_row_level_security;
+mod dml_write_rls_deferred_ops;
 mod dml_write_row_level_security;
 mod drop_consumer_group_if_exists;
 mod drop_recreate_bitemporal_no_resurrection;

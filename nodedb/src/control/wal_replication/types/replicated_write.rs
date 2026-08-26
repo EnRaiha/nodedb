@@ -6,8 +6,8 @@ use super::aliases::{
     default_ivf_nprobe, default_pq_m,
 };
 use super::wire_shapes::{
-    ColumnarResolvedRow, ConstraintChangeOp, KvResolvedMutationWire, ReplicatedBatchEdge,
-    ReplicatedSumTarget,
+    ColumnarResolvedRow, ConstraintChangeOp, DocumentResolvedMutationWire, KvResolvedMutationWire,
+    ReplicatedBatchEdge, ReplicatedSumTarget,
 };
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, UpdateValue};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
@@ -864,5 +864,23 @@ pub enum ReplicatedWrite {
         collection: String,
         /// Serialized `Vec<ScanFilter>`. Empty matches every row.
         filters: Vec<u8>,
+    },
+
+    /// Resolved form of a deferred document write — `PointUpdate`,
+    /// `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete` — on a collection
+    /// carrying a write policy. Appended last to preserve the positional ABI.
+    ///
+    /// The Control Plane already read the rows the write depends on, computed
+    /// every post-image, and decided the policy against them while the writing
+    /// identity was live — so this carries the mutations and the reply, not an
+    /// operation to re-derive. A follower has no writing identity to decide a
+    /// predicate against, and the leader re-derives its plan from this entry, so
+    /// a predicate here would be judged against whatever policy catalog the
+    /// applying node holds.
+    DocumentResolvedWrite {
+        mutations: Vec<DocumentResolvedMutationWire>,
+        /// The statement's reply, decided at resolve time. Every replica returns
+        /// it unchanged rather than recomputing it from state that has moved on.
+        response_payload: Vec<u8>,
     },
 }

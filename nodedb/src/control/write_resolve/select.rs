@@ -5,6 +5,7 @@
 use crate::bridge::envelope::PhysicalPlan;
 
 use super::columnar::resolver_for_columnar_op;
+use super::document::resolver_for_document_op;
 use super::kv::resolver_for_kv_op;
 use super::resolver::EngineWriteResolver;
 
@@ -18,9 +19,9 @@ pub fn resolver_for_plan(plan: &PhysicalPlan) -> Option<Box<dyn EngineWriteResol
     match plan {
         PhysicalPlan::Columnar(op) => resolver_for_columnar_op(op),
         PhysicalPlan::Kv(op) => resolver_for_kv_op(op),
+        PhysicalPlan::Document(op) => resolver_for_document_op(op),
         PhysicalPlan::Vector(_)
         | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Document(_)
         | PhysicalPlan::Text(_)
         | PhysicalPlan::Timeseries(_)
         | PhysicalPlan::Spatial(_)

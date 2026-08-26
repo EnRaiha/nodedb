@@ -19,7 +19,22 @@ use crate::data::executor::strict_format;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::UpdateValue;
 
+/// The post-update row, before it is committed to a storage encoding.
+///
+/// Its own type because the two encodings the row can end up in — the stored
+/// body and the pre-encode MessagePack body a resolved write ships — must come
+/// from ONE computation. Recomputing the assignments per encoding is how a
+/// resolve and its apply start disagreeing about which row the policy admitted.
+pub(in crate::data::executor) enum PointUpdateBody {
+    /// Schemaless fast path: fields merged at the binary level, already the
+    /// MessagePack the collection stores.
+    Msgpack(Vec<u8>),
+    /// Decoded, mutated, generated-columns-recomputed document.
+    Document(serde_json::Value),
+}
+
 /// Inputs to [`CoreLoop::build_point_update_image`].
+#[derive(Clone, Copy)]
 pub(in crate::data::executor) struct PointUpdateImage<'a> {
     pub(in crate::data::executor) config_key: &'a (DatabaseId, TenantId, String),
     /// The row as currently stored (Binary Tuple for a strict collection,
@@ -40,6 +55,65 @@ impl CoreLoop {
         &self,
         params: PointUpdateImage<'_>,
     ) -> Result<Vec<u8>, ErrorCode> {
+        let body = self.compute_point_update_body(params)?;
+        self.encode_point_update_body(params, &body)
+    }
+
+    /// Encode `body` in the collection's storage mode.
+    pub(in crate::data::executor) fn encode_point_update_body(
+        &self,
+        params: PointUpdateImage<'_>,
+        body: &PointUpdateBody,
+    ) -> Result<Vec<u8>, ErrorCode> {
+        let PointUpdateImage {
+            config_key,
+            is_strict,
+            bitemporal,
+            sys_from_ms,
+            ..
+        } = params;
+        let doc = match body {
+            PointUpdateBody::Msgpack(bytes) => return Ok(bytes.clone()),
+            PointUpdateBody::Document(doc) => doc,
+        };
+        if !is_strict {
+            return Ok(doc_format::encode_to_msgpack(doc));
+        }
+        let Some(config) = self.doc_configs.get(config_key) else {
+            return Err(ErrorCode::Internal {
+                detail: "strict config missing during re-encode".into(),
+            });
+        };
+        let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+            config.storage_mode
+        else {
+            return Err(ErrorCode::Internal {
+                detail: "strict config missing during re-encode".into(),
+            });
+        };
+        let ndb_val: nodedb_types::Value = doc.clone().into();
+        let result = if bitemporal && schema.bitemporal {
+            strict_format::value_to_binary_tuple_bitemporal(
+                &ndb_val,
+                schema,
+                sys_from_ms,
+                i64::MIN,
+                i64::MAX,
+            )
+        } else {
+            strict_format::value_to_binary_tuple(&ndb_val, schema)
+        };
+        result.map_err(|e| ErrorCode::Internal {
+            detail: format!("strict re-encode: {e}"),
+        })
+    }
+
+    /// Apply the assignments and recompute generated columns, touching no
+    /// store, no index, and no transaction.
+    pub(in crate::data::executor) fn compute_point_update_body(
+        &self,
+        params: PointUpdateImage<'_>,
+    ) -> Result<PointUpdateBody, ErrorCode> {
         let PointUpdateImage {
             config_key,
             current_bytes,
@@ -47,8 +121,8 @@ impl CoreLoop {
             is_strict,
             has_generated,
             has_expr,
-            bitemporal,
-            sys_from_ms,
+            bitemporal: _,
+            sys_from_ms: _,
         } = params;
 
         // Fast path: non-strict, no generated columns, all literal — merge at binary level.
@@ -61,9 +135,8 @@ impl CoreLoop {
                     UpdateValue::Expr(_) => None,
                 })
                 .collect();
-            return Ok(nodedb_query::msgpack_scan::merge_fields(
-                &base_mp,
-                &update_pairs,
+            return Ok(PointUpdateBody::Msgpack(
+                nodedb_query::msgpack_scan::merge_fields(&base_mp, &update_pairs),
             ));
         }
 
@@ -143,37 +216,18 @@ impl CoreLoop {
             return Err(e);
         }
 
-        // Re-encode.
-        if is_strict {
-            if let Some(config) = self.doc_configs.get(config_key)
-                && let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                    config.storage_mode
-            {
-                let ndb_val: nodedb_types::Value = doc.clone().into();
-                let result = if bitemporal && schema.bitemporal {
-                    strict_format::value_to_binary_tuple_bitemporal(
-                        &ndb_val,
-                        schema,
-                        sys_from_ms,
-                        i64::MIN,
-                        i64::MAX,
-                    )
-                } else {
-                    strict_format::value_to_binary_tuple(&ndb_val, schema)
-                };
-                match result {
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(ErrorCode::Internal {
-                        detail: format!("strict re-encode: {e}"),
-                    }),
-                }
-            } else {
-                Err(ErrorCode::Internal {
-                    detail: "strict config missing during re-encode".into(),
-                })
-            }
-        } else {
-            Ok(doc_format::encode_to_msgpack(&doc))
-        }
+        Ok(PointUpdateBody::Document(doc))
+    }
+}
+
+/// The post-update row as pre-encode MessagePack.
+///
+/// The form the document write path takes for BOTH storage modes, so a resolved
+/// write ships one body shape and the apply encodes the strict Binary Tuple on
+/// the way to disk exactly as a direct write does.
+pub(in crate::data::executor) fn point_update_body_to_msgpack(body: &PointUpdateBody) -> Vec<u8> {
+    match body {
+        PointUpdateBody::Msgpack(bytes) => bytes.clone(),
+        PointUpdateBody::Document(doc) => doc_format::encode_to_msgpack(doc),
     }
 }

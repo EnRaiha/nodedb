@@ -223,6 +223,11 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         // reason the co-resident derived write runs with `enforce: false`.
         DocumentOp::ApplyBalanceDelta { .. } => Ok(()),
 
+        // No-op: the write policy was already decided against these exact row
+        // images, by the resolve pass this write came from. Injecting again
+        // would replace a verdict with a predicate no applying node can decide.
+        DocumentOp::ResolvedWrite { .. } => Ok(()),
+
         // Inject into the wrapped op: it is the intercepted write verbatim, and
         // the expander decides the resolved images against the check injected
         // there.
