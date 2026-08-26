@@ -1,66 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Graph serializer for transaction resolve.
-//!
-//! Turns the graph edge post-images a transaction staged into its
-//! [`GraphTxnOverlay`] into the engine-native WAL sub-record shapes the graph
-//! redo replay path decodes (`wal_replay_redo_graph.rs`) — the SAME shapes the
-//! autocommit graph WAL path produces, extended with the two endpoint
-//! surrogates a redo PUT carries and an autocommit PUT does not:
-//!
-//! * A staged edge put → `RecordType::Put`, payload
-//!   [`crate::wal::EdgePutRedo`]. Replay's `execute_edge_put` repopulates the
-//!   CSR node→surrogate map from the two endpoint surrogates, so they must be
-//!   present and correct.
-//! * A staged edge tombstone → `RecordType::Delete`, payload
-//!   [`crate::wal::EdgeDeleteRedo`]. `execute_edge_delete` needs no surrogate.
-//!
-//! Both payloads are named structs shared by every encode/decode site (a single
-//! definition, not a positional tuple re-declared per site) so the field set is
-//! a compile-time invariant that cannot silently drift in arity.
-//!
-//! ## Where the endpoint surrogates come from
-//!
-//! [`GraphTxnOverlay`] does NOT carry endpoint surrogates: `stage_edge_put`
-//! stores only the identity `(src, label, dst)` and the properties blob (see
-//! `stage_write::stage_graph::execute_stage_graph`, which destructures
-//! `GraphOp::EdgePut` with `..` and drops `src_surrogate` / `dst_surrogate`
-//! before calling `stage_edge_put`). The surrogates are NOT lost, though —
-//! they were resolved once, at physical-plan construction time, and still
-//! live on the `GraphOp::EdgePut` / `GraphOp::EdgePutBatch` plan nodes
-//! themselves (`nodedb-physical/src/physical_plan/graph/op.rs` documents
-//! `src_surrogate` / `dst_surrogate` as "resolved at construction time").
-//! `entry.rs` collects them into an `edge_surrogates` map while classifying
-//! the transaction's plans and passes that map in here, so this module reads
-//! post-image identity + properties from the overlay and the matching
-//! surrogate pair from that map — never inventing one.
-//!
-//! ## Node-label ops
-//!
-//! `SetNodeLabels` / `RemoveNodeLabels` stage a delta (`NodeLabelDelta`:
-//! disjoint added/removed sets) under the fixed sentinel collection key
-//! `GRAPH_LABEL_COLL_KEY` (`stage_write::stage_graph`), not an absolute
-//! post-image. That delta maps directly onto the AUTOCOMMIT payload shape —
-//! `RecordType::GraphNodeLabelSet` / `GraphNodeLabelRemove`, `(node_id,
-//! labels)` where `labels` is applied additively / subtractively
-//! (`wal_replay_graph_labels.rs`) — because `added` and `removed` are each
-//! already exactly the touched-label list for their direction. So
-//! [`serialize_node_label_deltas`] reuses the SAME record types and the
-//! SAME `encode_graph_node_label_payload` encoder the autocommit path uses,
-//! emitting one `GraphNodeLabelSet` sub-record per node with a non-empty
-//! `added` set and one `GraphNodeLabelRemove` sub-record per node with a
-//! non-empty `removed` set. No new `RedoSubRecord` shape or decoder is
-//! needed: `try_replay_graph_node_label` already decodes this exact payload
-//! for the autocommit path and is reused verbatim for redo replay
-//! (`wal_replay_redo_graph.rs`'s `replay_graph_node_labels_redo`).
-//!
-//! ## Determinism
-//!
-//! The overlay keys edges (and node-label deltas) in `HashMap`/`HashSet`s, so
-//! entries are collected into `BTreeMap`/`BTreeSet`s keyed by edge identity —
-//! or, for labels, by node id with each label set sorted into a `Vec` — before
-//! emitting. Two replicas resolving the same transaction produce
-//! byte-identical redo ops.
+//! Graph serializer for transaction resolve. Turns staged edge post-images
+//! into the same WAL sub-record shapes the autocommit path produces, plus
+//! the two endpoint surrogates a redo put needs but the overlay doesn't
+//! carry (`entry.rs` collects those from the plan nodes). Overlay entries
+//! are `HashMap`/`HashSet`-keyed, so they're sorted before emitting so
+//! replicas produce identical ops.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,18 +19,14 @@ use crate::data::executor::handlers::transaction::overlay::{
 use crate::wal::RedoSubRecord;
 
 /// Edge identity key: `(collection, src_id, label, dst_id)`. Scoped by
-/// collection (unlike the overlay's own per-collection accessors) because
-/// `entry.rs` collects surrogates for every graph collection the transaction
-/// touched into one map before calling this serializer per collection.
+/// collection because `entry.rs` collects surrogates for every touched
+/// collection into one map before calling this serializer per collection.
 pub(super) type EdgeIdentityKey = (String, String, String, String);
 
 /// Append the redo sub-records for every graph edge post-image staged in
 /// `overlay` for `coll_key` to `ops`, in deterministic edge-identity order.
-///
-/// `edge_surrogates` maps `(collection, src_id, label, dst_id)` to the
-/// `(src_surrogate, dst_surrogate)` pair `entry.rs` collected from the
-/// transaction's `EdgePut` / `EdgePutBatch` plan nodes — the overlay itself
-/// carries no surrogates (see module docs).
+/// `edge_surrogates` maps identity to the `(src, dst)` surrogate pair
+/// `entry.rs` collected from the plan nodes — the overlay carries none.
 pub(super) fn serialize_graph_collection(
     overlay: &GraphTxnOverlay,
     coll_key: &GraphCollKey,
@@ -164,20 +105,10 @@ pub(super) fn serialize_graph_collection(
 }
 
 /// Append the redo sub-records for every staged node-label delta in
-/// `overlay` for the label sentinel collection `label_coll_key` to `ops`, in
-/// deterministic node-id order.
-///
-/// `NodeLabelDelta.added` / `.removed` are disjoint by construction (see
-/// `GraphTxnOverlay::stage_node_labels_set` / `stage_node_labels_remove`), so
-/// each maps directly onto the autocommit `(node_id, labels)` payload shape:
-/// one `GraphNodeLabelSet` sub-record for a non-empty `added` set, one
-/// `GraphNodeLabelRemove` sub-record for a non-empty `removed` set. Reuses
-/// `encode_graph_node_label_payload` so this producer and the autocommit
-/// producer never drift on shape.
-///
-/// Each label set is a `HashSet<String>` (nondeterministic iteration order),
-/// so it is sorted into a `Vec` before encoding — two replicas resolving the
-/// same transaction must produce byte-identical redo payloads.
+/// `overlay` under `label_coll_key`, in deterministic node-id order.
+/// `added`/`removed` are disjoint by construction, mapping directly onto
+/// the autocommit `(node_id, labels)` payload shape. Each `HashSet` is
+/// sorted into a `Vec` first, so replicas produce byte-identical payloads.
 pub(super) fn serialize_node_label_deltas(
     overlay: &GraphTxnOverlay,
     label_coll_key: &GraphCollKey,
@@ -214,15 +145,11 @@ fn sorted_labels(labels: &std::collections::HashSet<String>) -> Vec<String> {
     sorted
 }
 
-/// Classify a Graph op for transaction resolve: collect the collection of a
-/// staged edge write into `collections` (so the serializer walks its
-/// overlay), collect the endpoint surrogates of every staged edge PUT into
-/// `edge_surrogates` (the overlay itself carries only identity + properties,
-/// not surrogates — see this module's doc comment), skip read-only
-/// traversal/algorithm ops, and skip node-label ops — their staged deltas
-/// live in the graph overlay under a fixed sentinel collection key
-/// (`GRAPH_LABEL_COLL_KEY`) and are serialized unconditionally by
-/// `resolve_txn_ops`, not collected here.
+/// Classify a Graph op for transaction resolve: collect a staged edge
+/// write's collection, collect edge-put endpoint surrogates into
+/// `edge_surrogates`, skip read-only ops, and skip node-label ops — their
+/// deltas live under a fixed sentinel key, serialized unconditionally by
+/// `resolve_txn_ops`.
 pub(super) fn classify_graph_op(
     op: &GraphOp,
     collections: &mut BTreeSet<String>,
@@ -301,11 +228,8 @@ pub(super) fn classify_graph_op(
         | GraphOp::TemporalAlgorithm { .. }
         | GraphOp::Stats { .. } => Ok(()),
 
-        // Node-label mutations stage a delta (added/removed sets) under the
-        // fixed sentinel collection key, not a per-collection post-image, so
-        // there is nothing to collect here — `resolve_txn_ops` serializes
-        // every staged node-label delta unconditionally via
-        // `serialize_node_label_deltas` (see this module's doc comment).
+        // Node-label deltas live under the fixed sentinel key, not a
+        // per-collection post-image — nothing to collect here.
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => Ok(()),
     }
 }

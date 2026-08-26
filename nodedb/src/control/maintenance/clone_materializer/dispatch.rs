@@ -2,13 +2,9 @@
 
 //! Local-data-plane dispatch helper used by the clone materializer.
 //!
-//! Mirrors the shape of `clone_write_dispatch::dispatch_data_plane_raw` but
-//! is exposed in the maintenance module so the walker can issue scans and
-//! writes against source/target collections without going through pgwire.
-//! The materializer runs on a Tokio blocking thread (DDL handlers via
-//! `spawn_blocking`, background sweep via `spawn_blocking`); it uses
-//! [`tokio::runtime::Handle::block_on`] to drive these futures synchronously
-//! from sync call sites.
+//! Lets the walker issue scans and writes against source/target collections
+//! without pgwire. The materializer runs on a Tokio blocking thread and uses
+//! [`tokio::runtime::Handle::block_on`] to drive these futures synchronously.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -22,21 +18,14 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 /// Dispatch a `PhysicalPlan` to the local Data Plane and await the response.
 ///
-/// Bypasses WAL replication coordination: the WAL append still happens inside
-/// the engine handler when the plan mutates state. Read plans take the
-/// standard read path. This is used by the materializer for both source-side
-/// scans and target-side writes — both target the local node directly because
-/// every shard the materializer touches is owned locally (vshard-affinity is
-/// preserved by `VShardId::from_collection_in_database`).
+/// Bypasses WAL replication coordination (the engine handler still appends
+/// the WAL on mutation). Used for both source scans and target writes; every
+/// shard the materializer touches is owned locally.
 ///
-/// `txn_id` stamps the dispatched request with the transaction whose staging
-/// overlay the Data Plane handler must fold into its read. Autocommit callers
-/// (the clone materializer, `run_merge` / `run_update_from_join`, the
-/// `INSERT ... SELECT` orchestrator) pass `None` — no overlay exists, so the
-/// handler reads base storage exactly as before. The COMMIT-time MERGE /
-/// `UPDATE ... FROM` expanders pass the transaction's id so the RESOLVE pass
-/// (and its source scan) observes rows staged by earlier statements in the
-/// same transaction.
+/// `txn_id` stamps the request with the transaction whose staging overlay
+/// the handler must fold in. Autocommit callers pass `None`; COMMIT-time
+/// MERGE / `UPDATE ... FROM` expanders pass the transaction id so the
+/// RESOLVE pass sees rows staged earlier in the same transaction.
 pub(crate) async fn dispatch_local(
     state: &SharedState,
     tenant_id: TenantId,

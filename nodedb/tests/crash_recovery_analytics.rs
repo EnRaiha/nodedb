@@ -13,13 +13,9 @@ mod crash_harness;
 
 use crash_harness::CrashHarness;
 
-/// `SELECT COUNT(*) AS n FROM <collection>`, as a number.
-///
-/// Recovery tests assert on an exact count rather than on a row's presence.
-/// A presence check ("the row reads back") passes just as happily when replay
-/// has appended the row a SECOND time, and timeseries ingest is an append —
-/// nothing upserts the duplicate away. A count is the only assertion that can
-/// tell "restored" from "restored twice".
+/// `SELECT COUNT(*) AS n FROM <collection>`, as a number. Recovery tests
+/// assert an exact count, not presence — a presence check passes just as
+/// happily when replay appended the row a second time.
 async fn count_rows(h: &CrashHarness, collection: &str) -> u64 {
     let rows = h
         .query_col_idx(&format!("SELECT COUNT(*) FROM {collection}"), 0)
@@ -147,12 +143,8 @@ async fn array_cell_survives_kill_9() {
     h.exec("INSERT INTO ARRAY crash_arr COORDS (3) VALUES (42.0)")
         .await;
 
-    // Live sanity BEFORE the crash: the cell aggregates pre-restart, so any
-    // post-restart failure is attributable to recovery, not test setup. The
-    // scalar reducer path always emits a single `result` column (see
-    // `data/executor/dispatch/array/aggregate.rs`), so this reads back
-    // without depending on the ARRAY_SLICE/ARRAY_PROJECT column-naming
-    // shape (which varies by query form).
+    // Live sanity before the crash. The scalar reducer path always emits a
+    // single `result` column, independent of query form.
     let live = h
         .query_col("SELECT * FROM ARRAY_AGG('crash_arr', 'v', 'sum')", "result")
         .await;
@@ -189,44 +181,21 @@ async fn array_cell_survives_kill_9() {
 // A partial-record flush must not make replay duplicate the record
 // ---------------------------------------------------------------------------
 
-/// Distinct tag values one timeseries memtable generation may hold.
-///
-/// Four is enough to exhaust with four rows. This is the ONLY reason the test
-/// is affordable: the shipped ceiling is 100k distinct tag values, and a test
-/// that had to write 100k of them through pgwire to reach this path would not
-/// be written — which is how a partition stamped with the wrong WAL LSN
-/// survived under a green suite.
+/// Distinct tag values one timeseries memtable generation may hold. Four is
+/// enough to exhaust with four rows, instead of the shipped 100k ceiling.
 const TS_TAG_CARDINALITY: &str = "4";
 
 fn cardinality_harness() -> CrashHarness {
     CrashHarness::new().with_env("NODEDB_TS_MAX_TAG_CARDINALITY", TS_TAG_CARDINALITY)
 }
 
-/// A record that cannot be ingested whole must be flushed AROUND, never
-/// through: the rows already on disk must not come back a second time on
-/// replay.
-///
-/// The mechanics this pins down:
-///
-///   * `flush_ts_collection` stamps the partition it writes with the
-///     collection's max ingested WAL LSN, and that LSN is recorded only once a
-///     record is FULLY ingested. So a flush fired from between two rows of
-///     record L writes a partition holding part of L but stamped L-1.
-///   * Boot replay skips records at or below the highest stamp it finds. L-1
-///     does not cover L, so L replays — on top of the rows of L that the
-///     partition already holds. Timeseries ingest appends; nothing masks it.
-///
-/// Statement 2 is the trigger. Its four rows alternate a new host with an
-/// already-known one against a full tag dictionary, so ingest used to stop
-/// partway through it, flush, and retry — and that flush is the illegal one.
-///
-/// Both counts are load-bearing and they are deliberately different questions.
-/// The count BEFORE the crash is 8 either way: whatever the ingest path did
-/// internally, it acknowledged eight rows and eight are readable. Only the
-/// count AFTER the restart separates the two, because only replay consults the
-/// partition's stamp. That is also the shape of the user-visible damage — the
-/// rows are real rows in a sealed partition, so `COUNT`, `SUM` and `AVG` all
-/// inflate together and no read path filters them out.
+/// A record that cannot be ingested whole must be flushed around, never
+/// through: rows already on disk must not come back on replay. If a flush
+/// fires between two rows of record L, the partition holds part of L but is
+/// stamped L-1, so replay (which skips at-or-below its stamp) redundantly
+/// replays L on top of what the partition already holds. The pre-crash count
+/// is 8 either way; only the post-restart count separates the two cases,
+/// since only replay consults the partition's stamp.
 #[tokio::test(flavor = "multi_thread")]
 async fn timeseries_partial_record_flush_does_not_duplicate_on_replay() {
     let mut h = cardinality_harness();
@@ -261,9 +230,7 @@ async fn timeseries_partial_record_flush_does_not_duplicate_on_replay() {
     )
     .await;
 
-    // Live sanity BEFORE the crash: all eight rows are present pre-restart, so
-    // any post-restart discrepancy is attributable to recovery, not to the
-    // ingest having dropped rows on the way in.
+    // Live sanity: all eight rows present pre-restart, ruling out ingest drop.
     let live = count_rows(&h, "crash_card").await;
     assert_eq!(
         live, 8,

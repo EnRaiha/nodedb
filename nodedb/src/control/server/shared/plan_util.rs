@@ -25,10 +25,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
-        // A vector-primary collection stores its row HERE and nowhere else, so
-        // this op is the only source a RETURNING projection over it can name.
-        // Reporting `None` left those rows with no collection to key a
-        // redaction policy on, and the masking pass ran inert.
+        // A vector-primary collection stores its row here and nowhere else, so this
+        // op is the only source a RETURNING projection can key a redaction policy on.
         | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::Delete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. })
@@ -59,11 +57,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { collection, .. })
         | PhysicalPlan::Text(TextOp::SetTextConfig { collection, .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { collection, .. })
-        // The shuffle map-side producer scans the named collection exactly like
-        // `PartialAggregate`; `collection` stays populated even when `input` is
-        // set. Reporting `None` hid it from every caller that keys on the read
-        // collection — including the clone resolver, which then treated a
-        // shadowed-clone aggregate as a non-clone read.
+        // Scans the named collection like `PartialAggregate`; `collection` stays
+        // populated even when `input` is set.
         | PhysicalPlan::Query(QueryOp::PartialAggregateState { collection, .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
@@ -73,12 +68,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
             target_collection: collection,
             ..
         })
-        // The joined source is read, but every row these two write — and every
-        // row their RETURNING clause surfaces — belongs to the TARGET, so the
-        // target is the collection whose policies and write version apply.
-        // Reporting `None` here left their RETURNING rows with no source
-        // collection to key a redaction policy on, so the masking pass ran
-        // inert and shipped the rows in the clear.
+        // The source is read, but every written/RETURNING row belongs to the
+        // target — that's the collection whose policies and write version apply.
         | PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: collection,
             ..
@@ -125,8 +116,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Graph(GraphOp::WccSuperstep(_)) => None,
         // Exchange: recurse into the child plan to extract the collection.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
-        // PostProcess: recurse into the materialized child (twin of
-        // `PhysicalPlan::collection`).
+        // PostProcess: recurse into the materialized child.
         PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => extract_collection(input),
         // ProviderScan is a catalog/constant source — no user collection.
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
@@ -139,11 +129,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
             }
             TimeseriesOp::ResolveIngest(_) => None,
         },
-        // All remaining ops carry no extractable user collection here: the
-        // specific arms above take precedence; these inner wildcards catch the
-        // unmatched ops of each engine plus the engines with no arms at all
-        // (Array, ClusterArray). Exhaustive so a new PhysicalPlan variant
-        // forces a decision rather than silently returning None.
+        // Remaining ops carry no extractable collection. Exhaustive so a new
+        // variant forces a decision rather than silently returning None.
         PhysicalPlan::Document(_)
         | PhysicalPlan::Vector(_)
         | PhysicalPlan::Graph(_)
@@ -159,13 +146,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
 }
 
 /// Every collection a plan's work must be metered against, first-seen order,
-/// no duplicates.
-///
-/// [`extract_collection`] answers "which ONE collection identifies this
-/// plan" and reports `None` for a KV `ResolvedWrite`, whose mutations may
-/// span two collections. Metering needs all of them: `TransferItem` and the
-/// `ResolvedWrite` it resolves to move rows between two collections in one
-/// plan. Every other plan yields exactly what [`extract_collection`] reports.
+/// no duplicates. [`extract_collection`] answers "which one collection" and
+/// reports `None` for a `ResolvedWrite`/`TransferItem`, which can span two.
 pub(crate) fn metered_collections(plan: &PhysicalPlan) -> Vec<String> {
     let mut out = Vec::new();
     if let PhysicalPlan::Kv(KvOp::TransferItem {
@@ -190,9 +172,7 @@ pub(crate) fn metered_collections(plan: &PhysicalPlan) -> Vec<String> {
         }
         return out;
     }
-    // Every other plan identifies one collection at most, and
-    // `extract_collection` is itself exhaustive over `PhysicalPlan`, so this
-    // stays exhaustive without restating that match.
+    // Every other plan identifies one collection at most.
     out.extend(extract_collection(plan).map(str::to_string));
     out
 }
@@ -227,44 +207,9 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
     }
 }
 
-/// Classify a read plan's observed identity for the transaction read-set.
-///
-/// `found` reports whether the point read actually observed a present row
-/// (`true` on a hit, `false` on a miss / absent row). It is meaningful only for
-/// single-row keyed lookups; scans and predicate reads ignore it.
-///
-/// Secondary-index reads whose observation is confined to one indexed
-/// dimension always record the narrower `IndexEq` / `IndexRange` variants:
-/// `DocumentOp::IndexedFetch` / `IndexLookup` (equality) and
-/// `DocumentOp::RangeScan` (range). These validate identically to the
-/// collection floor today; per-value comparison lands later.
-///
-/// Single-row keyed lookups whose identity maps to exactly one [`KeyRepr`]
-/// record [`ReadKey::Point`]:
-/// - `DocumentOp::PointGet` that HIT — the row's cross-engine surrogate.
-/// - `KvOp::Get` / `KvOp::FieldGet` — the raw KV key bytes (on hit AND miss).
-///
-/// A `DocumentOp::PointGet` that MISSED records [`ReadKey::Predicate`] instead.
-/// A document surrogate is allocated from a monotonic counter unrelated to the
-/// `document_id`, so the placeholder surrogate an absent read carries never
-/// coincides with the fresh surrogate a concurrent INSERT of that `document_id`
-/// will receive — a `Point` key would never collide with the phantom insert and
-/// the stale read would be wrongly judged current. Degrading the miss to the
-/// collection-scoped predicate makes any insert into the read collection advance
-/// the floor and abort the reader (collection-granular phantom safety). KV is
-/// unaffected: a KV read key IS the literal byte key any future write reuses, so
-/// an absent-key read collides correctly — it keeps its precise `Point` key.
-///
-/// Everything else records [`ReadKey::Predicate`] (collection-scoped, phantom-
-/// safe). This deliberately includes keyed ops whose observation cannot be
-/// captured by a single `KeyRepr` without under-approximating — `KvOp::BatchGet`
-/// (many keys). A single-key repr for those would MISS the other keys / rows
-/// they observed, which is the one thing phantom safety forbids; the coarse
-/// collection floor over-aborts instead, which is always safe. Secondary-index
-/// reads are the one exception carved out above: their observation IS confined
-/// to the indexed dimension, so `IndexEq` / `IndexRange` capture it precisely
-/// without under-approximating. The match is total over [`PhysicalPlan`] so a
-/// new variant forces a classification.
+/// Classify a read plan's observed identity for the transaction read-set. A
+/// `PointGet` miss degrades to [`ReadKey::Predicate`] (can't catch a phantom
+/// INSERT); a KV miss keeps `Point` — its key IS the future write's key.
 pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => {
@@ -281,11 +226,8 @@ pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
                 repr: KeyRepr::KvKey(key.clone().into_boxed_slice()),
             }
         }
-        // Secondary-index equality: the observation is confined to the indexed
-        // dimension, so record the indexed field + canonical stringified value.
-        // `filters` (the residual compound predicate) is ignored: validating
-        // the indexed dimension is sound (it never under-approximates the rows
-        // a concurrent write must conflict against).
+        // Observation is confined to the indexed dimension; `filters` (the residual
+        // compound predicate) is ignored — validating the indexed dimension is sound.
         PhysicalPlan::Document(
             DocumentOp::IndexedFetch { path, value, .. }
             | DocumentOp::IndexLookup { path, value, .. },
@@ -293,9 +235,8 @@ pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
             field: path.clone(),
             value: value.clone(),
         },
-        // Secondary-index range: the bound bytes are interpreted as UTF-8
-        // exactly as the scan itself interprets them. One-sided ranges keep the
-        // present bound and leave the other `None`.
+        // Bound bytes interpreted as UTF-8, same as the scan. One-sided ranges
+        // leave the absent bound `None`.
         PhysicalPlan::Document(DocumentOp::RangeScan {
             field,
             lower,

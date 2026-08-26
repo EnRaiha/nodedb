@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Construction of the MERGE source side: `join_val → source_document`.
-//!
-//! Separate from the target scan and from every apply pass because this is the
-//! one place two physically different sources — a local storage read and rows
-//! shipped across cores by the Control Plane — must be proven to produce the
-//! same map. Both go through a single decode closure here; splitting them
-//! across files is how they drift, and a source map that differs by even one
-//! key silently reclassifies matched rows as NOT MATCHED.
+//! Construction of the MERGE source side: `join_val → source_document`. The
+//! one place a local storage read and rows shipped cross-core by the Control
+//! Plane are proven to produce the same map, through a single decode closure
+//! — splitting them across files is how they'd drift and misclassify rows.
 
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -41,17 +37,10 @@ impl CoreLoop {
         })
     }
 
-    /// Build the source join map `join_val → document`.
-    ///
-    /// Two sources of source rows, selected by `source_rows`:
-    /// - `Some(rows)` (cross-core): the Control Plane scanned the source on its
-    ///   OWN Data-Plane core and shipped the bodies here, already normalized to
-    ///   standard msgpack by the source handler — so they decode without the
-    ///   source's strict schema and yield the same map a co-resident local read
-    ///   produces.
-    /// - `None` (legacy co-resident / in-txn buffered replay): read the source
-    ///   from this core's local storage, whose rows are still in stored form
-    ///   (a Binary Tuple for a strict source) and need the schema.
+    /// Build the source join map `join_val → document`. `Some(rows)`
+    /// (cross-core): Control-Plane-shipped bodies, already normalized to
+    /// standard msgpack, decode without the source's strict schema.
+    /// `None`: read local storage, still in stored form, needs the schema.
     pub(in crate::data::executor) fn build_merge_source_map(
         &self,
         database_id: u64,
@@ -75,14 +64,8 @@ impl CoreLoop {
             }
         });
 
-        // Decode one source document and extract its non-empty join key.
-        // `schema` states the encoding of the bytes handed in: `Some` for a
-        // stored Binary Tuple, `None` for an already-normalized body.
-        //
-        // `Ok(None)` is the domain answer "this source row has no usable join
-        // key"; a body that will not decode is not that answer. Dropping it
-        // silently would leave its key unmatched, so the MERGE would classify
-        // matched target rows as NOT MATCHED and insert duplicates.
+        // `Ok(None)` means "no usable join key"; a body that fails to decode
+        // is an error, not that — dropping it silently misclassifies matches.
         let decode_and_key = |value_bytes: &[u8],
                               schema: Option<&nodedb_types::columnar::StrictSchema>|
          -> crate::Result<Option<(String, serde_json::Value)>> {
@@ -174,11 +157,8 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    /// Cross-core MERGE source-shipping: the join-map the Data Plane builds from
-    /// Control-Plane-shipped source rows on a core that does NOT hold the source
-    /// locally is IDENTICAL to the map a co-resident local read produces — and
-    /// WITHOUT the shipped rows that same non-owning core reads an empty map,
-    /// which is exactly the silent-wrong-result the source-ship path fixes.
+    /// The join-map built from shipped source rows on a non-owning core must
+    /// equal a co-resident local read's map; without shipping it reads empty.
     #[test]
     fn shipped_source_rows_match_local_join_map() {
         let dir_a = tempfile::tempdir().unwrap();

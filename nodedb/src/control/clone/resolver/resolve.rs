@@ -66,15 +66,10 @@ pub fn resolve_read(
         return Ok(None);
     };
 
-    // Clone resolution is a READ protocol: it augments the task set with
-    // source-database reads and merges the two halves. A write must instead
-    // reach `dispatch_task_loop`, whose pre-dispatch hook owns the
-    // copy-on-write protocol (copy-up / tombstone). A write answered here
-    // writes only the target and records no suppression, so the superseded
-    // source row survives the next read.
-    //
-    // The gate runs before any collection name is extracted so the invariant
-    // holds whatever plan shapes `extract_collection` learns to recognize.
+    // Clone resolution is a READ protocol; a write must reach
+    // `dispatch_task_loop`'s copy-on-write hook instead, or the superseded
+    // source row survives the next read. Gate runs before collection
+    // extraction so the invariant holds for any plan shape.
     if tasks
         .iter()
         .any(|t| required_permission(&t.plan) != Permission::Read)
@@ -87,12 +82,9 @@ pub fn resolve_read(
     // Retrieve catalog for lookup.
     let catalog = state.credentials.catalog();
 
-    // Extract the collection name from the first read-type task.
-    //
-    // The shared extractor is the only one that sees through the
-    // `Exchange` / `PostProcess` wrappers the converter puts over every
-    // sharded read; a clone-local copy drifted out of sync with it and read
-    // those plans as "not a clone".
+    // The shared extractor sees through the `Exchange` / `PostProcess`
+    // wrappers the converter puts over every sharded read; a clone-local
+    // copy would drift out of sync and misread those as "not a clone".
     let Some(raw_coll) = extract_collection(&first_task.plan) else {
         return Ok(None);
     };
@@ -170,13 +162,9 @@ pub fn resolve_read(
     // Convert effective_source_lsn to wall-ms for the engine.
     let effective_source_ms = state.ms_to_lsn_inverse(effective_source_lsn);
 
-    // Build source-side tasks for every ancestor in the clone chain.
-    //
-    // Walk from the immediate source upward until `cloned_from = None` or the
-    // collection is `Materialized` (at which point the stored data is complete
-    // and no further indirection is needed). MAX_CLONE_DEPTH is enforced at
-    // clone-create time so the chain is bounded; the loop still caps at 8 as
-    // a belt-and-suspenders guard against catalog corruption.
+    // Walk source-side tasks up the clone chain until `cloned_from = None`
+    // or `Materialized`. `MAX_CLONE_DEPTH` bounds the chain at create time;
+    // the loop still caps at 8 as a guard against catalog corruption.
     let mut augmented_tasks = tasks.clone();
     let source_start_idx = augmented_tasks.len();
 
@@ -186,11 +174,9 @@ pub fn resolve_read(
     let mut cur_origin = origin.clone();
     let mut cur_effective_ms = effective_source_ms;
 
-    // Tasks from the previous level that serve as templates for the next
-    // rewrite.  Initialized to the original target tasks; after each level is
-    // added, updated to the tasks that were just pushed so the next iteration
-    // rewrites those (which carry the correct collection qualified name for
-    // that level) rather than always rewriting the original target tasks.
+    // Templates for the next rewrite; after each level, updated to the
+    // tasks just pushed so the next iteration rewrites the correct
+    // per-level qualified name rather than the original target tasks.
     let mut prev_level_tasks: Vec<PhysicalTask> = tasks.clone();
 
     const MAX_WALK: u32 = 8;

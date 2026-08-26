@@ -2,16 +2,10 @@
 
 //! Write handlers for [`DataPlaneArrayExecutor`] — put and delete.
 //!
-//! These run on the shard OWNER after the coordinator has RPC-routed a cell
-//! batch to it. When the owner hosts a data-Raft proposer (multi-node cluster)
-//! the write is proposed to the owning shard's data group — `to_replicated_entry`
-//! encodes it as `ReplicatedWrite::ArrayCellPut` / `ArrayCellDelete` and every
-//! replica re-executes it through the distributed apply loop (which opens the
-//! array and dispatches to its local Data Plane). When no proposer exists
-//! (single-node) the owner applies the write itself — through the shared
-//! Control-Plane write funnel, which mints the redo record this write's only
-//! durability rests on: the array engine is a memtable, so an array cell whose
-//! `ArrayPut` record was never appended is simply gone after a restart.
+//! Run on the shard OWNER after coordinator RPC-routing. Multi-node: proposed
+//! to the owning shard's data Raft group as `ReplicatedWrite::ArrayCellPut` /
+//! `ArrayCellDelete`. Single-node: applied via the Control-Plane write funnel,
+//! whose redo record is the array engine's only durability (it's a memtable).
 
 use nodedb_array::types::ArrayId;
 use nodedb_cluster::distributed_array::wire::{ArrayShardDeleteReq, ArrayShardPutReq};
@@ -31,10 +25,9 @@ impl DataPlaneArrayExecutor {
                 detail: format!("array_id decode in exec_put: {e}"),
             })?;
 
-        // The coordinator encodes cells as `Vec<Vec<u8>>` (a blob-vec where
-        // each inner bytes is a separately-encoded `ArrayPutCell`). The Data
-        // Plane handler expects `Vec<ArrayPutCell>` encoded as a flat msgpack
-        // array. Decode the outer blob-vec, parse each blob, and re-encode.
+        // Coordinator encodes cells as a blob-vec of separately-encoded
+        // `ArrayPutCell`s; the Data Plane wants a flat msgpack array. Decode
+        // the outer blob-vec, parse each blob, re-encode.
         let cell_blobs: Vec<Vec<u8>> =
             zerompk::from_msgpack(&req.cells_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("cell blob-vec decode in exec_put: {e}"),
@@ -92,13 +85,10 @@ impl DataPlaneArrayExecutor {
     }
 
     /// Replicate `plan` to the owning shard's data Raft group when a proposer
-    /// exists; otherwise (single-node) apply it locally through the shared
-    /// Control-Plane write funnel. Returns the `applied_lsn` the coordinator
-    /// acks with.
-    ///
-    /// Both branches use the vShard from the validated RPC envelope. The Raft
-    /// entry, the single-node bridge request, and WAL replay must retain this
-    /// identity so they all select the same Data Plane core.
+    /// exists; otherwise apply it locally through the write funnel. Returns
+    /// the `applied_lsn` the coordinator acks with. Both branches use the
+    /// vShard from the validated RPC envelope so all paths select the same
+    /// Data Plane core.
     async fn propose_or_dispatch(
         &self,
         array_id: &ArrayId,
@@ -131,21 +121,15 @@ impl DataPlaneArrayExecutor {
                 .map_err(|e| ClusterError::Storage {
                     detail: format!("{op_label} raft propose: {e}"),
                 })?;
-            // On this branch no LSN exists to report: each replica mints its own
-            // redo at apply, none of them is authoritative for the others, and
-            // the proposer never sees any of them. The request's `wal_lsn` is
-            // echoed back verbatim — it is what the coordinator sent, not a
-            // claim about what was recorded.
+            // No LSN exists to report here: each replica mints its own redo,
+            // none authoritative. `wal_lsn` is echoed back verbatim — what
+            // the coordinator sent, not a claim about what was recorded.
             return Ok(wal_lsn);
         }
 
-        // Single-node: no data-Raft group, so this node's WAL is the write's
-        // only durability. The funnel appends the redo under write admission,
-        // stamps the minted LSN into the plan (the array engine versions its
-        // tiles from it, and replay re-stamps from the record header — the two
-        // must name the same record), and fsyncs it before this ack returns.
-        // This is a fresh originating write, not a Raft-committed entry, so its
-        // ordering is decided HERE by the gate.
+        // Single-node: this node's WAL is the write's only durability. The
+        // funnel appends the redo, stamps the minted LSN into the plan, and
+        // fsyncs before this ack returns. Ordering is decided HERE by the gate.
         let outcome: SubmitOutcome = submit_write(
             &self.state,
             single_node_submit(array_id, VShardId::new(local_vshard_id), plan),
@@ -167,10 +151,8 @@ impl DataPlaneArrayExecutor {
             });
         }
 
-        // Ack with the LSN the funnel actually minted. `Put` and `Delete` both
-        // append a record, so `None` here would mean the funnel classified this
-        // plan as appending nothing — a wiring bug, not a durable write, and it
-        // must not be acked as one.
+        // Ack with the LSN the funnel actually minted. `None` would mean the
+        // funnel classified this as appending nothing — a wiring bug.
         outcome
             .wal_lsn
             .map(|lsn| lsn.as_u64())

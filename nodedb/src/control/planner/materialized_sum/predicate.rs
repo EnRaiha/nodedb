@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Control-Plane resolution of materialized-sum targets for the PREDICATE-driven
-//! write plans.
+//! Control-Plane resolution of materialized-sum targets for
+//! PREDICATE-driven writes (`BulkUpdate`, `BulkDelete`, `TRUNCATE`): no body
+//! to read a join key off at plan time, so this resolves from a recon scan
+//! of the same predicate instead, like the OLLP dependent-predicate path.
 //!
-//! `BulkUpdate`, `BulkDelete` and `TRUNCATE` name their rows by predicate. The
-//! rows are matched in the Data Plane, so at plan time there is no body to read
-//! a join key off — which is why the body-driven pass
-//! ([`super::resolve::resolve_materialized_sum_targets`]) deliberately skips
-//! them. They are resolved here instead, from a reconnaissance scan of the SAME
-//! predicate, exactly as the OLLP dependent-predicate path predicts its write
-//! set before execution.
-//!
-//! # The gate comes first
-//!
-//! A collection driving no materialized-sum binding must not pay for a recon
-//! scan — that scan is the entire cost of this path, and nearly every collection
-//! drives nothing. [`super::resolve::source_drives_bindings`] is therefore
-//! checked BEFORE the scan is issued: a collection with no binding costs one
-//! cached index probe and nothing else.
-//!
-//! # The prediction is verified before it is written
-//!
-//! The scan happens before execution, so the matched set can move underneath it.
-//! The Data-Plane leader recomputes the join-key set from the rows it actually
-//! matched and returns `ErrorCode::OllpRetryRequired` — before writing anything —
-//! when the resolution carried here does not cover it. Nothing is written on a
-//! divergence, which is the whole point: a divergence written silently is a
-//! stored total that disagrees with the `SUM(...)` over the source rows.
+//! [`super::resolve::source_drives_bindings`] gates the scan BEFORE it
+//! runs, since nearly every collection drives no binding. The Data-Plane
+//! leader then re-verifies the join-key set against the rows it actually
+//! matched, returning `OllpRetryRequired` before writing on any drift — a
+//! silent divergence would leave a stored total that disagrees with
+//! `SUM(...)` over the source rows.
 
 use std::sync::Arc;
 

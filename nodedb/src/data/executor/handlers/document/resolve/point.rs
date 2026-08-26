@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the keyed document writes: `PointUpdate`, `PointDelete`.
-//!
-//! Each reads the row through the same current-state view its live handler
-//! uses, computes the post-image with the same
-//! [`CoreLoop::compute_point_update_body`] the live handler calls, and decides
-//! the write policy with the same gate — then reports the mutation instead of
-//! applying it. Reusing those functions is what stops the resolve and the apply
-//! diverging on which row image the policy admitted.
+//! Each reads the row and computes the post-image via the same functions the
+//! live handler calls, then reports the mutation instead of applying it —
+//! reuse is what stops resolve and apply diverging on the admitted image.
 
 use nodedb_physical::physical_plan::{
     DocumentResolveOutcome, ResolvedSumTarget, ReturningSpec, UpdateValue,
@@ -81,10 +77,8 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        // The same two refusals `execute_point_update` makes before it reads
-        // anything, in the same order. Raised HERE so a refused statement never
-        // reaches Raft: a refusal discovered at apply time is discovered after
-        // commit, on every replica.
+        // Same refusals as `execute_point_update`, raised here so a refused
+        // statement never reaches Raft (apply-time refusal is post-commit).
         if let Some(config) = self.doc_configs.get(&config_key) {
             crate::data::executor::handlers::generated::check_generated_readonly(
                 updates,
@@ -96,9 +90,7 @@ impl CoreLoop {
             )?;
         }
 
-        // A row that is gone reports `{"affected": 0}` even under a `RETURNING`
-        // clause — verbatim what `execute_point_update` answers for the same
-        // input.
+        // A gone row reports `{"affected": 0}`, same as `execute_point_update`.
         let Some(current_bytes) = self.doc_resolve_read(&ctx, collection, row_key)? else {
             return Ok(DocumentResolveOutcome {
                 mutations: Vec::new(),
@@ -117,9 +109,7 @@ impl CoreLoop {
                     &c.enforcement.generated_columns,
                 )
         });
-        // Stamped as the live handler stamps it. The stored image is what the
-        // policy decides and `RETURNING` projects; the apply mints its own
-        // version stamp when it writes.
+        // Stamped as the live handler stamps it; apply mints its own on write.
         let sys_from_ms = if ctx.bitemporal {
             self.bitemporal_now_ms()
         } else {
@@ -170,11 +160,9 @@ impl CoreLoop {
         })
     }
 
-    /// Resolve a `PointDelete` to the one row removal it would apply.
-    ///
-    /// The pre-image is the only image a delete has, so it is both what the
-    /// policy decides and what `RETURNING` projects — the same pairing the live
-    /// handler makes.
+    /// Resolve a `PointDelete` to the one row removal it would apply. The
+    /// pre-image is the only image a delete has, so it is both what the
+    /// policy decides and what `RETURNING` projects.
     pub(super) fn resolve_point_delete(
         &self,
         task: &ExecutionTask,

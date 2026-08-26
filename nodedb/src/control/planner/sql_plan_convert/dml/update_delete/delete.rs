@@ -101,11 +101,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         }]);
     }
 
-    // CRDT GATE: a DELETE on a `crdt = true` document collection routes to
-    // `CrdtOp::DocDelete` (tombstone + sparse-store removal). Only a PK-targeted
-    // DELETE is representable; a predicate (non-PK) DELETE is rejected — there is
-    // NO silent fallthrough to a `DocumentOp`, which would bypass CRDT
-    // convergence. Read the flag ONCE, before the PK loop.
+    // CRDT gate: a `crdt = true` collection routes to `CrdtOp::DocDelete`.
+    // Only a PK-targeted DELETE is representable; a predicate DELETE is
+    // rejected — no silent fallthrough that would bypass CRDT convergence.
     let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
     if is_crdt && target_keys.is_empty() {
         return Err(crate::Error::BadRequest {
@@ -116,16 +114,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         });
     }
 
-    // EDGE-BEARING GATE: a PK-equality delete on a schemaless-document
-    // collection that carries implicit edges must NOT lower to a static
-    // `PointDelete` — that op bypasses the dependent-predicate (OLLP) path
-    // and leaks the implicit edge. Route it as a `BulkDelete` with an
-    // equivalent filter so `execute.rs`'s edge-bearing gate sends it through
-    // the Calvin/OLLP coordinator, which derives + drift-validates the routed
-    // `EdgeDelete` (reusing all of O3a + O3a-drift). Non-edge-bearing
-    // collections keep the fast `PointDelete` path below. Reached only for
-    // document engines (the KV case returned above); strict/columnar/etc.
-    // never set `has_implicit_edges`, so the flag naturally scopes this.
+    // Edge-bearing gate: a PK-equality delete on a collection with implicit
+    // edges must not lower to a static `PointDelete` — that bypasses OLLP
+    // and leaks the edge. Route as `BulkDelete` instead so the edge-bearing
+    // gate sends it through the Calvin/OLLP coordinator. Non-edge-bearing
+    // collections keep the fast `PointDelete` path below.
     if !is_crdt && !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)?
     {
         let effective_filter = delete_effective_filter(filters, target_keys)?;

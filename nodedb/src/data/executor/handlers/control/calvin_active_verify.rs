@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Stage-time OLLP predicate verification for the dependent-read ACTIVE Calvin
-//! path.
-//!
-//! The STATIC path detects conflict via the LSN-versioned read-set vote
-//! (`read_set_still_current`) and runs NO OLLP check at stage time. The ACTIVE
-//! (dependent-read) path carries no versioned read-set — its conflict detector
-//! is the leader-only OLLP predicate re-check (`actual != predicted` →
-//! `OllpRetryRequired`) that the single-shot apply used to run inside
-//! `execute_transaction_batch`. Converting ACTIVE to stage → resolve → redo →
-//! flush moves that apply to FLUSH, which is AFTER the redo is WAL-appended and
-//! where a flush-time `OllpRetryRequired` is swallowed as a degraded shard. So
-//! the check must run HERE, before any staging, so drift surfaces on the stage
-//! response (where the scheduler releases locks and re-recons) and nothing is
-//! staged, resolved, or WAL-appended on a mismatch.
-//!
-//! On a follower (`ollp_is_group_leader == false`) every prediction is accepted
-//! verbatim — identical to the bulk-DML apply handlers — so all replicas stage
-//! the same predicted set (Calvin determinism).
-//!
-//! The op set verified here mirrors the `BulkDelete` / `BulkUpdate` arms of
-//! [`CoreLoop::stage_calvin_overlay`]: those are the only plans that carry an
-//! OLLP prediction. A new predicate-DML variant that carries a prediction must
-//! gain an arm in BOTH places (and the bulk-DML handlers).
+//! path, which carries no versioned read-set. The leader-only `actual !=
+//! predicted` re-check must run HERE, before staging — at flush time a
+//! mismatch is swallowed as a degraded shard instead. Mirrors the
+//! `BulkDelete`/`BulkUpdate` arms of [`CoreLoop::stage_calvin_overlay`].
 
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
@@ -35,14 +17,8 @@ use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
     /// Leader-only OLLP verification of every predicate-DML plan in a
-    /// dependent-read ACTIVE Calvin txn, BEFORE staging.
-    ///
-    /// Returns `Ok(true)` when every carried prediction still matches live
-    /// state (or this node is a follower, or no plan carries a prediction);
-    /// `Ok(false)` when any surrogate- or edge-set prediction drifted (the
-    /// caller returns `OllpRetryRequired` and stages nothing); `Err` on a scan
-    /// or filter-decode failure. Point ops and non-predicate plans carry no
-    /// prediction and are vacuously matching.
+    /// dependent-read ACTIVE Calvin txn, before staging. `Ok(false)` means a
+    /// prediction drifted; caller returns `OllpRetryRequired`, stages nothing.
     pub(in crate::data::executor) fn verify_calvin_active_ollp(
         &self,
         task: &ExecutionTask,
@@ -54,9 +30,8 @@ impl CoreLoop {
         }
         let database_id = task.request.database_id.as_u64();
         for plan in plans {
-            // Only the document engine carries an OLLP prediction. Listed
-            // exhaustively so a new `PhysicalPlan` variant forces a decision
-            // here rather than falling silently into "nothing to verify".
+            // Only the document engine carries an OLLP prediction; exhaustive
+            // so a new `PhysicalPlan` variant forces a decision here.
             let document_op = match plan {
                 PhysicalPlan::Document(op) => op,
                 PhysicalPlan::Vector(_)
@@ -95,9 +70,7 @@ impl CoreLoop {
                         ollp_predicted_edges,
                     ),
                     // Mirrors `stage_calvin_overlay`'s non-bulk arms: no OLLP
-                    // prediction to verify. Exhaustive so a new predicate-DML
-                    // variant that carries a prediction cannot be added without
-                    // being named here.
+                    // prediction to verify.
                     DocumentOp::PointGet { .. }
                     | DocumentOp::PointPut { .. }
                     | DocumentOp::PointInsert { .. }

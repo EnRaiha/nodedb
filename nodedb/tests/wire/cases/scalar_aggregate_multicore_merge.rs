@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Regression: a no-`GROUP BY` scalar aggregate on a single-vShard-homed
-//! collection must merge to ONE row on a multi-core server.
-//!
-//! A scalar aggregate with no `GROUP BY` plans as
-//! `QueryOp::Aggregate { input: None }` wrapped in `Exchange{Gather}`. In
-//! single-node mode the gather formerly BROADCAST the plan to every core; the
-//! collection's rows live on ONE owning core, so every other (empty) core
-//! seeded its own scalar-aggregate identity row and the coordinator merge is a
-//! passthrough — yielding N rows (N-1 identity rows + 1 real row) instead of
-//! one. The fix routes single-vShard-homed plans to their one owning core.
-//! A single-core harness masks the bug, so these tests drive an 8-core server.
+//! collection must merge to one row on a multi-core server. A gather that
+//! broadcasts to every core would seed identity rows on the empty cores and
+//! pass them through unmerged, yielding N rows instead of one. A single-core
+//! harness masks the bug, so these tests drive an 8-core server.
 
 use crate::harness::TestServer;
 
@@ -46,9 +40,8 @@ async fn scalar_count_star_merges_to_one_row_multicore() {
         "aliased scalar aggregate must be one row, got {rows:?}"
     );
     assert_eq!(rows[0][0], "3");
-    // `sum` over an INTEGER column renders as a float ("6.0"); the merge
-    // correctness this test guards is the single row + right value, so compare
-    // the value numerically rather than pinning its textual formatting.
+    // `sum` over an INTEGER column renders as a float; compare numerically
+    // rather than pinning textual formatting.
     assert_eq!(
         rows[0][1].parse::<f64>().expect("numeric sum"),
         6.0,

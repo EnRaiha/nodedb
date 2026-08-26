@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Source join-map construction for `DocumentOp::UpdateFromJoin`.
-//!
-//! Split out of `update_from_join.rs` to keep each file within the size limit.
-//! Builds `join_val → source document` from either Control-Plane-shipped source
-//! rows (cross-core `UPDATE ... FROM`) or a local scan of the source collection
-//! (co-resident / in-transaction buffered replay).
+//! Source join-map construction for `DocumentOp::UpdateFromJoin`. Builds
+//! `join_val → source document` from either Control-Plane-shipped source
+//! rows (cross-core) or a local scan of the source collection.
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -14,17 +11,9 @@ use redb::{ReadableDatabase, ReadableTable};
 pub(super) use super::merge_helpers::json_to_str as json_value_to_string;
 
 impl CoreLoop {
-    /// Build the source join map `join_val → source document`.
-    ///
-    /// Two sources of source rows, selected by `source_rows`:
-    /// - `Some(rows)` (cross-core): the Control Plane scanned the source on its
-    ///   OWN Data-Plane core and shipped the bodies here, already normalized to
-    ///   standard msgpack by the source handler — so they decode without the
-    ///   source's strict schema and yield the same map a co-resident local read
-    ///   produces.
-    /// - `None` (legacy co-resident / in-txn buffered replay): read the source
-    ///   from this core's local storage, whose rows are still in stored form
-    ///   (a Binary Tuple for a strict source) and need the schema.
+    /// Build the source join map `join_val → source document`. `Some(rows)`
+    /// (cross-core): already normalized to msgpack, decode without schema.
+    /// `None` (co-resident): read local storage, still in stored form.
     pub(in crate::data::executor) fn build_source_join_map(
         &self,
         database_id: u64,
@@ -49,15 +38,9 @@ impl CoreLoop {
             }
         });
 
-        // Decode one source document and extract its non-empty join key.
-        // `schema` states the encoding of the bytes handed in: `Some` for a
-        // stored Binary Tuple, `None` for an already-normalized body.
-        //
-        // `Ok(None)` is the domain answer "this source row has no usable join
-        // key"; a body that will not decode is not that answer. Dropping it
-        // silently would leave the row unmatched, so the UPDATE would skip
-        // every target row that should have joined to it and report a smaller
-        // affected count as the truth.
+        // `Ok(None)` means "this source row has no usable join key"; a body
+        // that fails to decode is not that answer and must propagate as `Err`,
+        // or the UPDATE would silently skip rows that should have joined.
         let decode_and_key = |value_bytes: &[u8],
                               schema: Option<&nodedb_types::columnar::StrictSchema>|
          -> crate::Result<Option<(String, serde_json::Value)>> {
@@ -78,9 +61,8 @@ impl CoreLoop {
 
         let mut map = std::collections::HashMap::new();
 
-        // Cross-core: build the map from the Control-Plane-shipped rows. This
-        // core does not hold the source's storage, so a local read would be
-        // empty; the shipped bytes are the source's on-disk rows verbatim.
+        // Cross-core: this core doesn't hold the source's storage, so a local
+        // read would be empty; use the shipped rows instead.
         if let Some(rows) = source_rows {
             for (_source_doc_id, value_bytes) in rows {
                 if let Some((key, doc)) = decode_and_key(value_bytes, None)? {
@@ -157,12 +139,9 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    /// Cross-core `UPDATE ... FROM` source-shipping: the join-map the Data Plane
-    /// builds from Control-Plane-shipped source rows on a core that does NOT
-    /// hold the source locally is IDENTICAL to the map a co-resident local read
-    /// produces — and WITHOUT the shipped rows that same non-owning core reads
-    /// an empty map, which is exactly the silent-wrong-result (nothing updated)
-    /// the source-ship path fixes.
+    /// Cross-core source-shipping: the join map built from shipped rows on a
+    /// non-owning core matches the map a co-resident local read produces —
+    /// without shipping, that core would read an empty map instead.
     #[test]
     fn shipped_source_rows_match_local_join_map() {
         let dir_a = tempfile::tempdir().unwrap();

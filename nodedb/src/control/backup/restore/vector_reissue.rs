@@ -2,17 +2,10 @@
 
 //! Durable re-issue of restored vector-engine rows.
 //!
-//! The snapshot-install path lands vector engine state in in-memory-only Data
-//! Plane maps with no WAL record and no Raft entry — lost on restart
-//! (single-node) and never replicated (cluster). RESTORE instead re-issues
-//! each restored vector as a durable `VectorOp::Insert`, branching on cluster
-//! vs single-node exactly like a normal write:
-//!
-//! - Cluster (`async_raft_proposer` present): build a `ReplicatedEntry` and
-//!   propose it through Raft (replicates to all replicas; recovery via Raft-log
-//!   re-apply).
-//! - Single-node: WAL-append the plan, then dispatch it into the Data Plane so
-//!   it is installed live (WAL makes it durable for restart replay).
+//! Snapshot-install lands vector state in in-memory-only Data Plane maps with
+//! no WAL record or Raft entry — lost on restart, never replicated. RESTORE
+//! re-issues each vector as a durable `VectorOp::Insert`: Raft-proposed on
+//! cluster, WAL-appended + dispatched on single-node.
 
 use std::time::Duration;
 

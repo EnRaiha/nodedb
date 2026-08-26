@@ -1,41 +1,23 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression coverage for bulk DML `WriteEvent` emission.
-//!
-//! `BulkUpdate`, `BulkDelete`, `UpdateFromJoin`, and `TRUNCATE` must each emit
-//! one `WriteEvent` per affected row to the Event Plane, exactly like their
-//! single-row counterparts (`PointUpdate`, `PointDelete`, `Upsert`). Without
-//! this, AFTER triggers and CDC/change-stream consumers silently never see
-//! rows touched by a multi-row UPDATE/DELETE/UPDATE-FROM/TRUNCATE.
-//!
-//! These tests target the **ASYNC / Event-Plane** trigger path (the default
-//! `CREATE TRIGGER`, no `SYNC` keyword) because that is the path the
-//! per-row `WriteEvent` emission fix actually feeds — `CREATE SYNC TRIGGER`
-//! fires from the Control Plane and bypasses `WriteEvent` emission entirely,
-//! so it cannot exercise this fix. Because the Event Plane is eventually
-//! consistent, each test **polls** the log collection (bounded timeout) after
-//! the statement returns rather than asserting immediately.
-//!
-//! Trigger bodies here are deliberately literal-only (no `NEW.*`/`OLD.*`
-//! references): binding `NEW`/`OLD` for bulk-DML AFTER-ROW triggers is a
-//! separate, larger, tracked gap. Proving that the trigger fires exactly once
-//! per affected row (via a row count in the log collection) is sufficient to
-//! prove per-row `WriteEvent` emission independent of that gap.
+//! Regression coverage for bulk DML `WriteEvent` emission. `BulkUpdate`,
+//! `BulkDelete`, `UpdateFromJoin`, and `TRUNCATE` must each emit one
+//! `WriteEvent` per affected row, like their single-row counterparts.
+//! Targets the async/Event-Plane trigger path, since `CREATE SYNC TRIGGER`
+//! bypasses `WriteEvent` emission entirely. Trigger bodies are
+//! literal-only; binding `NEW`/`OLD` for bulk DML is a separate gap.
 
 use std::time::Duration;
 
 use crate::harness::TestServer;
 
-/// How long to wait for asynchronous trigger dispatch to land. Generous
-/// because the suite runs several servers concurrently and the poll returns
-/// as soon as the count matches, so a high ceiling costs nothing except on a
-/// genuine failure.
+/// How long to wait for asynchronous trigger dispatch to land. Generous — the
+/// poll returns as soon as the count matches, so a high ceiling costs nothing.
 const FIRE_LOG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll `fire_log` until it holds exactly `expected` rows, or fail with the
-/// last observed count once `timeout` elapses. The Event Plane consumes
-/// `WriteEvent`s and dispatches ASYNC triggers asynchronously, so the log
-/// population lags the statement's return.
+/// last observed count once `timeout` elapses — async trigger dispatch lags
+/// the statement's return.
 async fn wait_for_fire_log_count(server: &TestServer, expected: usize, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {

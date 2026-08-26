@@ -107,23 +107,16 @@ impl PhysicalPlan {
     /// distributed across all Data Plane cores and whose results must be
     /// gathered and merged on the coordinator.
     pub fn is_sharded_source(&self) -> bool {
-        // Aggregate and HashJoin are sharded ONLY when at least one of their
-        // leaves reads a real per-shard collection. A pure-catalog plan (whose
-        // only leaves are coordinator-materialized `ProviderScan` nodes) is
-        // coordinator-local: it must run EXACTLY once. Broadcasting a
-        // pure-catalog COUNT(*) to N cores would N×-overcount, and a
-        // pure-catalog join would duplicate every row N times.
+        // Sharded only if a leaf reads a real per-shard collection — a
+        // pure-catalog plan must run exactly once (broadcasting overcounts).
         match self {
-            // Aggregate over a sub-plan (catalog): inherit the child's
-            // sharded-ness. Aggregate with no sub-plan: legacy per-shard scan
-            // of the named collection → always sharded.
+            // Catalog sub-plan: inherit child's sharded-ness. No sub-plan:
+            // legacy per-shard scan → always sharded.
             PhysicalPlan::Query(QueryOp::Aggregate { input, .. }) => match input {
                 Some(child) => child.is_sharded_source(),
                 None => true,
             },
-            // HashJoin is sharded iff at least one side reads a real
-            // per-shard collection. Catalog⋈catalog → false (coordinator-local);
-            // any side touching a real collection → true.
+            // Sharded iff at least one side reads a real per-shard collection.
             PhysicalPlan::Query(QueryOp::HashJoin {
                 left_collection,
                 right_collection,
@@ -140,32 +133,12 @@ impl PhysicalPlan {
         }
     }
 
-    /// Whether a fanned-out plan can be streamed to the client as an unordered
-    /// union of per-source row batches, rather than fully materialized and
-    /// merged on the coordinator first.
-    ///
-    /// Returns `true` ONLY for a plain full-collection scan that imposes no
-    /// global ordering, distinctness, offset, or aggregation across the union —
-    /// i.e. one whose rows from any source can be emitted in any interleaving
-    /// without changing the result:
-    ///
-    /// - `Document::Scan` — empty `sort_keys`, `distinct == false`, `offset == 0`,
-    ///   and no window functions (a window over the union needs the full set).
-    /// - `Kv::Scan` — empty `sort_keys`.
-    /// - `Columnar::Scan` — empty `sort_keys`.
-    /// - `Timeseries::Scan` — empty `sort_keys` (none today), and no aggregation:
-    ///   empty `group_by`, empty `aggregates`, `bucket_interval_ms == 0`.
-    /// - `ProviderScan` — empty `sort_keys`, `distinct == false`, `offset == 0`.
-    ///
-    /// Everything else — aggregates, joins, recursive / lateral / facet ops,
-    /// vector / text / graph / array / spatial reads, and any sorted, distinct,
-    /// offset, windowed, or aggregating scan — returns `false`. The match is
-    /// exhaustive so a new plan variant forces an explicit streamability
-    /// decision.
-    ///
-    /// `limit` is intentionally NOT a disqualifier: a global take-N is applied
-    /// by the streaming coordinator (it stops pulling once `limit` rows have
-    /// been emitted), so a limited scan still streams correctly.
+    /// Whether a fanned-out plan can stream to the client as an unordered
+    /// union of per-source batches, rather than merged on the coordinator
+    /// first. `true` only for a scan with no ordering, distinctness, offset,
+    /// or aggregation across the union — any interleaving is safe. Match is
+    /// exhaustive: a new variant forces an explicit decision. `limit` is not
+    /// a disqualifier — the coordinator applies a global take-N while streaming.
     pub fn is_streamable_unordered_scan(&self) -> bool {
         match self {
             PhysicalPlan::Document(document::DocumentOp::Scan {
@@ -215,13 +188,10 @@ impl PhysicalPlan {
         }
     }
 
-    /// Global take-N to apply when streaming an unordered scan.
-    ///
-    /// Returns the scan's row cap (`usize::MAX` for an effectively-unlimited
-    /// scan) so the streaming coordinator can stop after that many rows across
-    /// the union. Returns `usize::MAX` for any plan that is not a streamable
-    /// scan — callers gate on [`PhysicalPlan::is_streamable_unordered_scan`]
-    /// first, so the fallthrough is never the deciding factor.
+    /// Global take-N to apply when streaming an unordered scan (row cap, or
+    /// `usize::MAX` if unlimited). Callers gate on
+    /// [`PhysicalPlan::is_streamable_unordered_scan`] first, so the
+    /// non-streamable fallthrough is never the deciding factor.
     pub fn streamable_scan_limit(&self) -> usize {
         match self {
             PhysicalPlan::Document(document::DocumentOp::Scan { limit, .. }) => *limit,
@@ -235,16 +205,13 @@ impl PhysicalPlan {
         }
     }
 
-    /// Primary read/target collection this plan touches, if it maps to exactly
-    /// one user collection.
+    /// Primary read/target collection this plan touches, if it maps to
+    /// exactly one user collection.
     ///
-    /// This is the plane-neutral twin of the Control-Plane
-    /// `crate::control::server::shared::plan_util::extract_collection`
-    /// (in the `nodedb` core crate). The two MUST stay in sync: the selection
-    /// logic below mirrors that function's arms exactly so both planes agree on
-    /// which collection a plan reads. `extract_collection` lives in the core
-    /// crate (which depends on `nodedb-physical`, not the reverse), so its logic
-    /// is replicated here rather than called.
+    /// Plane-neutral twin of the Control-Plane
+    /// `crate::control::server::shared::plan_util::extract_collection` — the
+    /// two MUST stay in sync (logic replicated, not called, since the core
+    /// crate depends on `nodedb-physical`, not the reverse).
     pub fn collection(&self) -> Option<&str> {
         match self {
             PhysicalPlan::Document(DocumentOp::PointGet { collection, .. })
@@ -257,10 +224,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
-            // A vector-primary collection stores its row HERE and nowhere else,
-            // so this op is the only source a RETURNING projection over it can
-            // name. Reporting `None` left those rows with no collection to key
-            // a redaction policy on, and the masking pass ran inert.
+            // A vector-primary row lives here only; `None` left it with no
+            // collection to key a redaction policy on.
             | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::Delete { collection, .. })
             | PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. })
@@ -352,11 +317,8 @@ impl PhysicalPlan {
             PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
             // KV ops carry their own collection (sorted-index-only ops → None).
             PhysicalPlan::Kv(op) => op.collection(),
-            // All remaining ops carry no extractable user collection here: the
-            // specific arms above take precedence; these inner wildcards catch
-            // the unmatched ops of each engine plus the engines with no arms at
-            // all (Array, ClusterArray). Exhaustive so a new variant forces a
-            // decision rather than silently returning None.
+            // Remaining ops carry no extractable collection. Exhaustive so a
+            // new variant forces a decision rather than silently returning None.
             PhysicalPlan::Document(_)
             | PhysicalPlan::Vector(_)
             | PhysicalPlan::Graph(_)
@@ -405,17 +367,9 @@ impl PhysicalPlan {
 }
 
 /// Whether one side of a `HashJoin` reads a real per-shard collection (and so
-/// makes the join a sharded source that must be fanned to all cores).
-///
-/// Side shapes, per the converter:
-/// - `input: Some(child)` — a resolved sub-plan. A catalog side lowers to a
-///   `ProviderScan` (coordinator-local → not sharded); an Exchange-wrapped or
-///   otherwise-sharded child propagates its sharded-ness. Recurse.
-/// - `input: None` + non-empty `collection` — a real collection scanned
-///   locally by name → sharded.
-/// - `input: None` + empty `collection` — no real read on this side.
-/// - `bitmap: Some(..)` — a bitmap producer over a real collection
-///   (`IndexedFetch`) → that side touches a real collection → sharded.
+/// makes the join a sharded source fanned to all cores). `input: Some` child
+/// recurses; `input: None` + non-empty `collection` is sharded; `bitmap:
+/// Some` (`IndexedFetch`) is sharded.
 fn hash_join_side_is_sharded(
     collection: &str,
     input: &Option<Box<PhysicalPlan>>,

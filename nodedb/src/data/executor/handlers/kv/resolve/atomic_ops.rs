@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Resolvers for the KV atomics: `Incr`, `IncrFloat`, `Cas`, `GetSet`.
-//!
-//! The post-image of each comes from `engine_atomic_compute`, the same pure
-//! functions `KvEngine::{incr, incr_float, cas, getset}` call. Recomputing the
-//! arithmetic here would let a resolve and its apply disagree, which is the
-//! one failure this protocol exists to rule out.
+//! Resolvers for the KV atomics: `Incr`, `IncrFloat`, `Cas`, `GetSet`. Each
+//! post-image comes from `engine_atomic_compute`, the same pure functions
+//! `KvEngine::{incr, incr_float, cas, getset}` call — recomputing here would
+//! let resolve and apply disagree.
 
 use nodedb_physical::physical_plan::KvResolveOutcome;
 
@@ -43,11 +41,8 @@ fn atomic_error_code(error: crate::engine::kv::AtomicError, collection: &str) ->
 }
 
 impl CoreLoop {
-    /// Resolve `INCR`.
-    ///
-    /// `ttl_ms > 0` installs a fresh expiry; `ttl_ms == 0` preserves whatever
-    /// the key already carries, which is what `atomic_put` does and what a
-    /// plain `KvEngine::put` would not.
+    /// Resolve `INCR`. `ttl_ms > 0` installs a fresh expiry; `ttl_ms == 0`
+    /// preserves the existing one, matching `atomic_put` (not `KvEngine::put`).
     pub(super) fn resolve_kv_incr(
         &self,
         ctx: KvAtomicCtx<'_>,
@@ -130,11 +125,9 @@ impl CoreLoop {
         ))
     }
 
-    /// Resolve `CAS`.
-    ///
-    /// A mismatch resolves to ZERO mutations and a reply that reports the
-    /// failure. The write still goes through the propose loop as a no-op
-    /// entry, so leader and followers agree on a statement that wrote nothing.
+    /// Resolve `CAS`. A mismatch resolves to zero mutations and a reply
+    /// reporting failure; it still goes through the propose loop as a no-op
+    /// entry so replicas agree on a statement that wrote nothing.
     pub(super) fn resolve_kv_cas(
         &self,
         ctx: KvAtomicCtx<'_>,
@@ -153,9 +146,8 @@ impl CoreLoop {
         if self.kv_engine.is_over_budget() {
             return Err(ErrorCode::ResourcesExhausted);
         }
-        // Decided before the swap is even attempted, exactly where
-        // `execute_kv_cas` decides it: `new_value` is caller-supplied, so the
-        // row a successful swap would leave behind is known up front.
+        // Decided before the swap, same as `execute_kv_cas`: `new_value` is
+        // caller-supplied, so the post-swap row is known up front.
         admit_kv_row(rls_write_check, new_value, key, tid, collection)?;
 
         let now_ms = self.kv_atomic_now_ms();
@@ -187,11 +179,8 @@ impl CoreLoop {
         ))
     }
 
-    /// Resolve `GETSET`.
-    ///
-    /// The old value handed back is gated by `rls_filters` here, where the
-    /// read policy is still evaluable — a row the policy hides comes back
-    /// absent, the same convention `execute_kv_getset` uses.
+    /// Resolve `GETSET`. The old value is gated by `rls_filters` here — a row
+    /// the policy hides comes back absent, matching `execute_kv_getset`.
     pub(super) fn resolve_kv_getset(
         &self,
         ctx: KvAtomicCtx<'_>,

@@ -25,18 +25,16 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ..
         } => ctx.filter_into(collection, PermTreeLevel::Read, filters),
 
-        // Filter: the indexed equality resolves doc ids, then every fetched
-        // body is tested against `filters` — the residual post-filter slot the
-        // subtree filter ANDs into.
+        // Filter: fetched bodies are tested against the residual
+        // post-filter slot the subtree filter ANDs into.
         DocumentOp::IndexedFetch {
             collection,
             filters,
             ..
         } => ctx.filter_into(collection, PermTreeLevel::Read, filters),
 
-        // Filter: no storage pushdown slot, so the handler evaluates the
-        // subtree filter on the rows it fetched. A row outside the subtree
-        // reads back as absent, indistinguishable from a missing key.
+        // Filter: no pushdown slot, so the handler evaluates post-fetch.
+        // A row outside the subtree reads back as absent.
         DocumentOp::PointGet {
             collection,
             rls_filters,
@@ -56,43 +54,36 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
              to evaluate against",
         ),
 
-        // Refuse: an HLL cardinality estimate counts rows across the whole
-        // collection, including the ones outside the caller's subtree, and a
-        // scalar count carries no resource column to filter on.
+        // Refuse: a scalar count spans the whole collection, no column to
+        // filter on.
         DocumentOp::EstimateCount { collection, .. } => ctx.refuse_if_tree(
             collection,
             "the estimate is a row count, which the subtree filter cannot be evaluated against",
         ),
 
-        // Refuse: the clone materializer streams raw `(id, surrogate, value)`
-        // triples with no filter slot, so every stored body would be copied
-        // regardless of the tree.
+        // Refuse: streams raw triples with no filter slot — every body
+        // would copy regardless of the tree.
         DocumentOp::MaterializeScan { collection, .. } => ctx.refuse_if_tree(
             collection,
             "the materializing scan streams raw stored bodies through a cursor payload that \
              carries no subtree filter",
         ),
 
-        // Filter (write level, blanket): these name the rows they write
-        // directly, so there is nothing to narrow — the identity must instead
-        // hold write access somewhere in the tree. Unlike the RLS pass, which
-        // defers writes to a separate write-path check, the permission tree
-        // has its own write level and enforces it here.
+        // Blanket write level: names the row directly, nothing to narrow.
+        // Unlike RLS, the permission tree enforces its own write level here.
         DocumentOp::PointPut { collection, .. }
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
-        // Named directly like the point writes above. The balance column is
-        // maintained by the engine, not chosen by the writer, but the row it
-        // lands on is still a row of the target collection.
+        // Named directly like the point writes; its row is still a row of
+        // the target collection.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {
             ctx.authorize(collection, PermTreeLevel::Write)
         }
 
-        // Filter (write level): the bulk update selects its rows through
-        // `filters`, so the subtree narrows which rows are written in addition
-        // to the blanket level check.
+        // Write level: `filters` also narrows which rows are written, in
+        // addition to the blanket check.
         DocumentOp::BulkUpdate {
             collection,
             filters,
@@ -108,8 +99,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.authorize(collection, PermTreeLevel::Delete)
         }
 
-        // Filter (delete level): the bulk delete selects its rows through
-        // `filters`, so the subtree narrows what is removed.
+        // Delete level: `filters` narrows what is removed.
         DocumentOp::BulkDelete {
             collection,
             filters,
@@ -119,9 +109,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.filter_into(collection, PermTreeLevel::Delete, filters)
         }
 
-        // Filter, both sides: the target is written blind to the tree, while
-        // the source is scanned through `source_filters` and narrows to the
-        // readable subtree.
+        // Target writes blind to the tree; source narrows via `source_filters`.
         DocumentOp::InsertSelect {
             target_collection,
             source_collection,
@@ -132,9 +120,8 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.filter_into(source_collection, PermTreeLevel::Read, source_filters)
         }
 
-        // Filter and refuse: the target is selected through `target_filters`,
-        // so the subtree narrows what is updated; the joined source has no
-        // slot at all and is refused when a tree governs it.
+        // Target narrows via `target_filters`; joined source has no slot,
+        // refused when a tree governs it.
         DocumentOp::UpdateFromJoin {
             target_collection,
             source_collection,
@@ -146,10 +133,8 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.filter_into(target_collection, PermTreeLevel::Write, target_filters)
         }
 
-        // Filter and refuse: the merge matches target rows by join key rather
-        // than by a predicate, so the target gets the blanket check — at the
-        // delete level too when any arm deletes — and the joined source is
-        // refused for the same reason as `UpdateFromJoin`.
+        // Target matches by join key, not predicate, so it gets the blanket
+        // check (delete level too, if any arm deletes); source refused as above.
         DocumentOp::Merge {
             target_collection,
             source_collection,
@@ -167,9 +152,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             Ok(())
         }
 
-        // Resolve against the wrapped op: it is the intercepted write verbatim,
-        // and the rows it classifies are the rows that write persists, so it
-        // narrows at exactly that write's level.
+        // Recurse: the wrapped op is the intercepted write verbatim.
         DocumentOp::ResolveWrite(inner) => apply_document(ctx, inner),
 
         // Blanket per mutation: each names the row it writes directly, and a
@@ -185,9 +168,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             Ok(())
         }
 
-        // No-op: index DDL and collection registration. These describe the
-        // collection rather than acting on its rows, and are authorized as
-        // DDL rather than against a permission level.
+        // No-op: DDL describes the collection, authorized separately.
         DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => Ok(()),

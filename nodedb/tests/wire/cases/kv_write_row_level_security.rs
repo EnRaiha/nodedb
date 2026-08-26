@@ -1,25 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Row-level security over KV writes whose post-image is resolved on the
-//! Control Plane before the mutation is proposed.
-//!
-//! A KV `UPDATE`/`DELETE`/`INSERT ... ON CONFLICT DO UPDATE` has no post-image
-//! until the stored value is read, so the write policy is decided against the
-//! merged result, not the incoming row (`control/write_resolve/kv.rs`).
-//!
-//! Every test asserts both directions: a conforming write SUCCEEDS with the
-//! correct computed state, a violating write is REFUSED with state UNCHANGED.
-//! Asserting only the refusal would also pass a path refusing everything.
-//!
-//! Four SQL surfaces carry a state-dependent post-image: `UPDATE ... SET col
-//! = <literal>` (`KvOp::FieldSet`), `INSERT ... ON CONFLICT DO UPDATE`
-//! (`KvOp::InsertOnConflictUpdate`, assignments may be arithmetic against the
-//! existing row), and predicate `UPDATE`/`DELETE` when `WHERE` has no primary
-//! key (`KvOp::PredicateUpdate` / `PredicateDelete`). `Incr`, `IncrFloat`,
-//! `Cas`, `GetSet`, `Transfer`, `TransferItem`, `Expire`, `Persist` have no
-//! SQL surface, so their TTL trap is not exercised here: `put` clears TTL on
-//! `ttl_ms == 0`, `atomic_put` preserves it. `FieldSet` and
-//! `InsertOnConflictUpdate` always pass an explicit `ttl_ms`, so neither hits it.
+//! Control Plane before the mutation is proposed, since these ops have no
+//! post-image until the stored value is read. Every test asserts both
+//! directions: a conforming write succeeds with the correct state, a
+//! violating write is refused with state unchanged.
 
 use crate::harness::TestServer;
 
@@ -52,11 +37,8 @@ async fn write_policy(server: &TestServer, policy: &str, collection: &str) {
 }
 
 /// Run `sql` as `user`, returning the server's error message on failure.
-///
-/// The message is read off the attached `DbError`, never off the
-/// `tokio_postgres::Error` wrapper: that wrapper's `Display` is the fixed
-/// string "db error", which would make every refusal below indistinguishable
-/// from every other failure.
+/// Reads the message off the attached `DbError`, since
+/// `tokio_postgres::Error`'s own `Display` is always "db error".
 async fn run_as(server: &TestServer, user: &str, sql: &str) -> Result<(), String> {
     let (client, handle) = server
         .connect_as(user, PASSWORD)
@@ -106,10 +88,8 @@ async fn seed(server: &TestServer, collection: &str, user: &str) {
     create_user(server, user).await;
 }
 
-/// A literal `UPDATE` — the only RHS shape KV accepts on a plain `UPDATE` —
-/// lowers to `KvOp::FieldSet`, whose merged body is decided against the write
-/// policy. A post-image that leaves scope is refused; one that stays inside
-/// applies and only the targeted row changes.
+/// A literal `UPDATE` lowers to `KvOp::FieldSet`, whose merged body is
+/// decided against the write policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn field_set_update_is_gated_both_directions() {
     let server = TestServer::start().await;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Grouped decode arm for `ReplicatedWrite` variants that produce
-//! `PhysicalPlan::Kv`.
-//!
-//! Delegated from `decode/entry.rs`'s single grouped match arm. Unlike the
-//! other engine groups this one returns `(PhysicalPlan, Option<u64>)`: the
-//! seven TTL-bearing `Kv*` variants stamp `resolved_now_ms` from their wire
-//! field so every replica installs the identical `expire_at_ms` instead of
-//! reading its own wall clock at apply time. Every non-TTL arm leaves it
-//! `None`. `write` is guaranteed by the caller to already be one of these
-//! variants — see `entry_document::decode_arm` for the trailing-arm contract.
+//! `PhysicalPlan::Kv`. Returns `(PhysicalPlan, Option<u64>)`: TTL-bearing
+//! `Kv*` variants stamp `resolved_now_ms` so every replica installs the same
+//! `expire_at_ms`. See `entry_document::decode_arm` for the trailing-arm contract.
 
 use super::super::decode_sync_engines::decode_returning;
 use super::super::types::ReplicatedWrite;

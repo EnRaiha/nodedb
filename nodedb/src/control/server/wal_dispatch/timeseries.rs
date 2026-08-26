@@ -11,15 +11,9 @@ use crate::control::security::credential::CredentialStore;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 
-/// Append the WAL record for a single `TimeseriesOp`, returning the allocated
-/// LSN for the ingest write (`Some`), `None` for `Scan`, and `None` when the
-/// collection is configured `wal=false` (WAL bypass).
-///
-/// The match over [`TimeseriesOp`] is **exhaustive** (`wildcard_enum_match_arm`
-/// is denied), so a future write variant cannot silently become non-durable.
-///
-/// `credentials` is threaded through solely for the per-collection WAL-bypass
-/// check on `Ingest`; it is `None` on paths that never bypass.
+/// Append the WAL record for a `TimeseriesOp`: LSN for ingest, `None` for
+/// `Scan` or a `wal=false` collection. `credentials` is threaded through
+/// solely for the per-collection bypass check.
 pub(super) fn wal_append_timeseries_op(
     wal: &WalManager,
     tenant_id: TenantId,
@@ -48,8 +42,7 @@ pub(super) fn wal_append_timeseries_op(
                 // WAL bypassed — acceptable data loss of last flush interval on crash.
                 None
             } else {
-                // Provenance is appended last; older 3-element decoders ignore
-                // the trailing field via their arity-fallback paths.
+                // Provenance appended last; older 3-element decoders ignore it via arity fallback.
                 let wal_payload =
                     encode_timeseries_batch_payload(collection, payload, provenance.as_ref())?;
                 Some(wal.append_timeseries_batch(
@@ -60,20 +53,15 @@ pub(super) fn wal_append_timeseries_op(
                 )?)
             }
         }
-        // NotAWrite — reads / query ops / DDL that produces no engine mutation
-        // here, plus the read-only resolve pass.
+        // Reads / read-only resolve pass — no engine mutation here.
         TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => None,
     };
     Ok(appended)
 }
 
-/// Encode the payload of a `TimeseriesBatch` WAL record for a timeseries
-/// ingest.
-///
+/// Encode the payload of a `TimeseriesBatch` WAL record for a timeseries ingest.
 /// Produces the legacy 4-element tuple `("timeseries", collection, payload,
-/// provenance)`. New transaction redo must instead use
-/// [`encode_timeseries_batch_payload_with_format`] so replay retains the
-/// format discriminator; this encoder remains for backward-compatible callers.
+/// provenance)`. New transaction redo must use [`encode_timeseries_batch_payload_with_format`].
 pub(crate) fn encode_timeseries_batch_payload(
     collection: &str,
     payload: &[u8],
@@ -87,11 +75,8 @@ pub(crate) fn encode_timeseries_batch_payload(
     })
 }
 
-/// Encode the format-preserving 5-element timeseries WAL/redo tuple.
-///
-/// The final format field is required for transaction redo because payload
-/// bytes alone cannot distinguish canonical ILP MessagePack from ordinary row
-/// MessagePack. Replay decodes this shape before all legacy tuple forms.
+/// Encode the format-preserving 5-element timeseries WAL/redo tuple. The format
+/// field is required because payload bytes alone can't distinguish ILP from row MessagePack.
 pub(crate) fn encode_timeseries_batch_payload_with_format(
     collection: &str,
     payload: &[u8],
@@ -107,13 +92,8 @@ pub(crate) fn encode_timeseries_batch_payload_with_format(
 }
 
 /// Encode the payload of a `TimeseriesBatch` WAL record for a columnar batch.
-///
-/// Produces the map-shaped [`nodedb_types::columnar::ColumnarWalRecord`] with
-/// `kind = "columnar"`, carrying the per-row cross-engine surrogates. The map
-/// encoding is distinct from the timeseries tuple, so `decode_batch_record`
-/// routes it to `replay_columnar_payload`. The ONE encoder for this shape:
-/// the autocommit `ColumnarOp::Insert` arm, `wal_append_columnar`, and the
-/// transaction-resolve serializer all call it.
+/// Produces the map-shaped `ColumnarWalRecord` (`kind = "columnar"`), distinct
+/// from the timeseries tuple so `decode_batch_record` routes correctly.
 pub(crate) fn encode_columnar_batch_payload(
     collection: &str,
     payload: &[u8],
@@ -133,10 +113,8 @@ pub(crate) fn encode_columnar_batch_payload(
     })
 }
 
-/// Stable routing and collection scope for a timeseries WAL append.
-///
-/// Keeping these fields together prevents callers from accidentally mixing the
-/// authenticated database or tenant with a payload from another scope.
+/// Stable routing and collection scope for a timeseries WAL append. Keeps these
+/// fields together so callers can't mix the authenticated scope with another's payload.
 pub(crate) struct TimeseriesWalAppendContext<'a> {
     pub tenant_id: TenantId,
     pub vshard_id: VShardId,
@@ -144,14 +122,9 @@ pub(crate) struct TimeseriesWalAppendContext<'a> {
     pub collection: &'a str,
 }
 
-/// Append a timeseries batch to WAL and return the assigned LSN.
-///
-/// Used by the ILP listener and the sync timeseries handler to propagate the
-/// WAL LSN to the Data Plane for proper dedup tracking and `flush_wal_lsn` in
-/// partition metadata. Returns `None` if WAL is bypassed for this collection.
-///
-/// `provenance` is `None` for the ILP direct-ingest path; the sync path passes
-/// the frame's `SyncProvenance` so the WAL record carries full idempotency context.
+/// Append a timeseries batch to WAL and return the assigned LSN. Used by the ILP
+/// listener and sync handler for dedup tracking and `flush_wal_lsn`.
+/// Returns `None` if WAL is bypassed.
 pub(crate) fn wal_append_timeseries(
     wal: &WalManager,
     context: TimeseriesWalAppendContext<'_>,
@@ -183,17 +156,8 @@ pub(crate) fn wal_append_timeseries(
 }
 
 /// Encode the payload of a `TimeseriesBatch` WAL record for a columnar
-/// predicate DML (`ColumnarOp::Update` / `ColumnarOp::Delete`).
-///
-/// Produces the map-shaped [`nodedb_types::columnar::ColumnarDmlWalRecord`]
-/// with `kind = "columnar_dml"`, carrying the predicate (filters) and, for an
-/// update, the field assignments — NOT row post-images (the matching set is
-/// only known once the Data Plane re-scans current state at apply time). The
-/// `columnar_dml` kind is disjoint from both the row-payload `"columnar"` map
-/// shape and the legacy tuple shapes (see the type's doc comment), so
-/// `decode_batch_record` cannot mis-route between them. The ONE encoder for
-/// this shape: the autocommit `ColumnarOp::Update` / `ColumnarOp::Delete` arms
-/// call it directly.
+/// predicate DML. Produces `ColumnarDmlWalRecord` carrying the predicate and
+/// field assignments — not row post-images, since matches are re-scanned at apply.
 pub(crate) fn encode_columnar_dml_payload(
     collection: &str,
     is_update: bool,
@@ -214,14 +178,8 @@ pub(crate) fn encode_columnar_dml_payload(
 }
 
 /// Encode the payload of a `TimeseriesBatch` WAL record for a columnar
-/// resolved-row-set DML (`ColumnarOp::ResolvedUpdate` /
-/// `ColumnarOp::ResolvedDelete`).
-///
-/// Produces the map-shaped
-/// [`nodedb_types::columnar::ColumnarResolvedDmlWalRecord`] with `kind =
-/// "columnar_resolved_dml"`, carrying the concrete row images the Control
-/// Plane already resolved and decided against the write policy — never a
-/// predicate. `updates` carries `Vec::new()` for a delete row.
+/// resolved-row-set DML. Produces `ColumnarResolvedDmlWalRecord` carrying concrete
+/// row images already resolved — never a predicate. `updates` empty for a delete row.
 pub(crate) fn encode_columnar_resolved_dml_payload(
     collection: &str,
     is_update: bool,
@@ -265,11 +223,8 @@ pub(crate) fn encode_columnar_resolved_dml_payload(
     })
 }
 
-/// Record-level fields for a columnar WAL append.
-///
-/// Groups the collection identity, row payload, sync provenance, and
-/// cross-engine surrogates that together describe a single columnar batch
-/// write, reducing the call-site argument count on [`wal_append_columnar`].
+/// Record-level fields for a columnar WAL append. Groups collection identity,
+/// row payload, provenance, and surrogates, reducing [`wal_append_columnar`]'s argument count.
 pub struct ColumnarWalAppendArgs<'a> {
     pub collection: &'a str,
     pub payload: &'a [u8],
@@ -280,16 +235,9 @@ pub struct ColumnarWalAppendArgs<'a> {
     pub surrogates: &'a [nodedb_types::Surrogate],
 }
 
-/// Append a columnar batch to WAL and return the assigned LSN.
-///
-/// Mirrors `wal_append_timeseries` but encodes a map-shaped
-/// [`nodedb_types::columnar::ColumnarWalRecord`] (kind `"columnar"`) so the
-/// WAL replay decoder routes to `replay_columnar_payload` and can restore the
-/// per-row cross-engine surrogates. The map encoding is distinct from the
-/// legacy 4-tuple array, so old records still decode via the replay fallback
-/// path.
-/// Returns `None` if WAL is bypassed (columnar collections do not currently
-/// support `wal=false`, so this always returns `Some`).
+/// Append a columnar batch to WAL and return the assigned LSN. Mirrors
+/// `wal_append_timeseries` but encodes `ColumnarWalRecord` so replay restores
+/// per-row surrogates. Always returns `Some` — columnar has no `wal=false`.
 pub fn wal_append_columnar(
     wal: &WalManager,
     tenant_id: TenantId,

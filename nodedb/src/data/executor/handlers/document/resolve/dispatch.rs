@@ -17,11 +17,8 @@ use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
     /// Resolve `inner` to the mutations it would apply, or `None` when it is
-    /// not one of the five point/bulk write ops.
-    ///
-    /// `None` is not a refusal: the two join-driven ops resolve to a
-    /// classification the Control-Plane expander consumes, and their dispatch
-    /// handles them.
+    /// not one of the five point/bulk write ops. `None` is not a refusal —
+    /// the two join-driven ops resolve to a classification instead.
     pub(in crate::data::executor) fn resolve_document_point_write(
         &self,
         task: &ExecutionTask,
@@ -101,10 +98,8 @@ impl CoreLoop {
                     resolved_sum_targets,
                 },
             ),
-            // The OLLP prediction slots are deliberately ignored: resolving
-            // replaces surrogate-set drift detection with a stronger per-row
-            // content precondition, and the resolved write is proposed
-            // single-shard rather than through Calvin.
+            // OLLP prediction ignored: resolving uses a per-row content
+            // precondition instead, proposed single-shard, not via Calvin.
             DocumentOp::BulkUpdate {
                 collection,
                 filters,

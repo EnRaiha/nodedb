@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Wire-level coverage for the session-handle resolver's missing
-//! hygiene layer: rate limiting + visibility on miss.
-//!
-//! Today, `SET LOCAL nodedb.auth_session = '<handle>'` on a pgwire connection
-//! silently tries to resolve the handle with no per-connection throttle and
-//! no observable signal on miss — a misconfigured client or a stolen-handle
-//! probe can hammer the resolver indefinitely. Acceptance specifies:
-//!
-//! > simulate 100 failed `SET LOCAL nodedb.auth_session` calls → connection
-//! > closed with pgwire error; audit event recorded.
-//!
-//! This file encodes that acceptance at the wire boundary — no assumption
-//! about internal API names, method signatures, or struct fields. The test
-//! compiles against today's code, fails today (server silently accepts all
-//! 100 attempts), and passes once the rate-limit + audit plumbing lands,
-//! regardless of how the fix is shaped internally.
+//! Wire-level coverage for the session-handle resolver's missing hygiene
+//! layer: rate limiting + visibility on miss. `SET LOCAL
+//! nodedb.auth_session = '<handle>'` currently resolves with no
+//! per-connection throttle and no observable signal on miss. Acceptance: 100
+//! failed calls must close the connection with a pgwire error and record an
+//! audit event, encoded here with no assumption about internal API shape.
 
 use crate::harness::TestServer;
 
@@ -24,8 +14,7 @@ async fn set_local_auth_session_flood_closes_connection() {
     let server = TestServer::start().await;
 
     // 100 distinct bogus handles so each is a genuine resolve-miss, not a
-    // short-circuit on a repeated value. Each attempt is individually valid
-    // SQL; only the count + failure rate should matter.
+    // short-circuit on a repeated value.
     let mut closed = false;
     let mut attempts_before_close = 0usize;
     for i in 0..100 {

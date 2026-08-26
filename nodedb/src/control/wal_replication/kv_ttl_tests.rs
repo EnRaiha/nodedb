@@ -2,19 +2,10 @@
 
 //! Raft-replicated KV TTL determinism.
 //!
-//! These pin the fix for a real-world clock-divergence bug: every replica
-//! applying a committed KV TTL write independently read its own wall clock at
-//! apply time (`CoreLoop::kv_ttl_now_ms`'s wall-clock fallback), so a key's
-//! `expire_at_ms` could differ across replicas by the replication latency.
-//! `ReplicatedWrite`'s TTL-bearing `Kv*` variants now carry the instant the
-//! proposing node resolved before proposing to Raft; `decode::from_replicated_entry`
-//! must hand that exact instant back as `resolved_now_ms`, never a fresh clock
-//! read, so every replica installs byte-identical `expire_at_ms`.
-//!
-//! A resolved instant of `1_000` is used deliberately: real wall-clock ms
-//! since epoch is enormously larger, so a decoder that (re)computes `now_ms`
-//! instead of decoding the wire value fails these assertions loudly rather
-//! than passing by coincidence.
+//! TTL-bearing `Kv*` variants carry the proposing node's resolved instant; decode
+//! must hand it back verbatim as `resolved_now_ms`, never a fresh clock read.
+//! `1_000` is used as the instant since real wall-clock ms is much larger, so a
+//! decoder that recomputes `now_ms` fails loudly instead of passing by luck.
 
 use super::*;
 use crate::bridge::envelope::PhysicalPlan;
@@ -109,9 +100,7 @@ fn kv_put_ttl_zero_carries_no_resolved_now_ms() {
 
 #[test]
 fn kv_expire_resolved_now_ms_is_always_present() {
-    // `EXPIRE` has no "no TTL" sentinel: `ttl_ms == 0` is a legitimate
-    // "expire now" request, so the resolved instant is always `Some`, unlike
-    // the `Put` family's `None`-on-zero-TTL convention.
+    // `ttl_ms == 0` is a legitimate "expire now" request, so resolved instant is always `Some`.
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let ttl_ms = 0u64;
@@ -201,10 +190,8 @@ fn kv_incr_resolved_now_ms_only_when_ttl_positive() {
 
 #[test]
 fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
-    // Exercises the real encode path (`encode::to_replicated_entry`), not a
-    // hand-built `ReplicatedWrite`, so this pins that the leader-side encoder
-    // itself populates `resolved_now_ms` for TTL-bearing writes -- the
-    // preceding tests pin the wire round-trip / decode side.
+    // Exercises the real encode path, not a hand-built `ReplicatedWrite` — pins
+    // that the leader-side encoder itself populates `resolved_now_ms`.
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
 

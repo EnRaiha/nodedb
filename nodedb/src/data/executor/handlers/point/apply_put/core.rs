@@ -16,56 +16,17 @@ use super::types::{PointPutOutcome, PointPutParams};
 use super::unique::{UniqueCheck, check_unique_constraints};
 
 impl CoreLoop {
-    /// Apply a PointPut within an externally-owned WriteTransaction.
+    /// Apply a PointPut within an externally-owned WriteTransaction. Stores
+    /// the document, auto-indexes text, updates stats, populates the doc
+    /// cache. Does NOT commit — on `Err` the caller MUST drop `txn`
+    /// uncommitted, or a row publishes with indexes nothing re-derives.
     ///
-    /// Stores the document, auto-indexes text fields, updates column stats,
-    /// and populates the document cache. Does NOT commit the transaction.
-    ///
-    /// `surrogate` is the stable numeric identity for this document, used
-    /// to key the inverted index. `document_id` is the hex-encoded form of
-    /// the surrogate (the redb storage key).
-    ///
-    /// On `Err` the caller MUST drop `txn` without committing. Every
-    /// side-effect this writes — row body, inverted index, secondary and
-    /// versioned indexes — goes into `txn`, so abandoning it is what keeps
-    /// them one all-or-nothing unit. Committing after an error would publish
-    /// a row whose indexes are missing entries nothing later re-derives.
-    ///
-    /// Returns a [`PointPutOutcome`] capturing the prior stored bytes (present
-    /// when this put replaced an existing row) plus the bitemporal system time
-    /// and versioned index tuples written, so a transactional caller can build
-    /// a fully-reversible undo entry. Autocommit callers read only
-    /// `prior_value` and thread it into `emit_write_event` so the Event Plane's
-    /// `WriteOp` tag reflects the actual mutation.
-    ///
-    /// # `value` is an incoming body, so failing to read it as a document is an answer
-    ///
-    /// `value` always arrives WITH the write — a client PointPut / PointInsert
-    /// body, an UPSERT body, a batch-insert row, a MERGE arm's post-image, a
-    /// staged sub-plan body, a CRDT-sync delta, or a WAL redo post-image. It is
-    /// never a row this function read back out of the store in order to
-    /// reconcile something against it. Its only guaranteed property is that the
-    /// collection accepts it: a schemaless MessagePack/JSON map, a strict
-    /// collection's pre-encode MessagePack, or an opaque body that is neither —
-    /// notably a strict row's Binary Tuple during WAL redo replay, where
-    /// `doc_configs` is empty and `doc_format::decode_document` cannot read a
-    /// Binary Tuple without the schema by design.
-    ///
-    /// That is why the `if let Ok(doc) = decode_document(value)` guards below
-    /// are not swallowed errors. Each one gates a per-FIELD derivation —
-    /// generated columns, FTS text, column statistics, secondary/UNIQUE index
-    /// values, geometry detection — and a body with no readable fields yields
-    /// nothing for any of them, so skipping produces the same state as running
-    /// them. Where a decode is instead load-bearing, this path already fails:
-    /// the strict encode below rejects a body it cannot read, and the staged
-    /// UNIQUE pre-check (`stage_write::stage_point_document`) propagates rather
-    /// than admitting an unchecked row.
-    ///
-    /// This reasoning stops holding the moment `value` becomes stored state. A
-    /// stored row that will not decode is corruption, and skipping a side
-    /// effect for it leaves an index asserting entries that nothing re-derives
-    /// — which is why every decode of STORED bytes on this path (`old_value`
-    /// for the secondary-index diff, the enforcement pre-image) propagates.
+    /// `value` always arrives WITH the write (never a row read back to
+    /// reconcile), so a `decode_document(value)` guard below that fails
+    /// quietly is an intentional "no fields to derive from", not a swallowed
+    /// error — except once `value` becomes STORED state (`old_value`,
+    /// enforcement pre-image), where a decode failure is corruption and
+    /// propagates instead.
     pub(in crate::data::executor) fn apply_point_put(
         &mut self,
         txn: &WriteTransaction,
@@ -89,14 +50,10 @@ impl CoreLoop {
             collection.to_string(),
         );
 
-        // A resolve-time stamp carried in `active_bitemporal_stamps` (present on
-        // the commit-time base install and on WAL replay of an 8-tuple document
-        // redo) forces the versioned branch at the EXACT stamp the redo carries,
-        // independent of `doc_configs` — which is empty during WAL replay. This
-        // is what keeps a normal restart from writing a SECOND version of the
-        // row and a crash-window restart from landing it on the plain table.
-        // Absent an override, keep the autocommit behavior: derive bitemporality
-        // from config and mint a fresh monotonic stamp.
+        // A stamp in `active_bitemporal_stamps` (WAL redo replay) forces the
+        // versioned branch at the EXACT redo stamp, independent of
+        // `doc_configs` (empty during replay); absent an override, derive
+        // bitemporality from config and mint a fresh stamp.
         let (bitemporal, sys_from_ms, valid_from_ms, valid_until_ms) =
             match self.active_bitemporal_stamps.get(&surrogate.as_u32()) {
                 Some(stamp) => (
@@ -113,9 +70,7 @@ impl CoreLoop {
                 ),
             };
 
-        // Generated columns, `_rowid` injection, and the strict Binary Tuple
-        // encode — the one place that answer is computed, shared with the
-        // governed-write RESOLVE pass.
+        // Shared with the governed-write RESOLVE pass.
         let body = self.build_stored_body(super::stored_body::StoredBodyInput {
             config_key: &config_key,
             surrogate,
@@ -128,19 +83,9 @@ impl CoreLoop {
         let stored = body.stored;
         let value: &[u8] = &body.value;
 
-        // Read the prior stored value before the write lands, but only when
-        // something downstream actually needs it: bitemporal collections
-        // always need the current version (it becomes `prior` below), and
-        // enforcement-configured collections need it to feed the stateless
-        // PUT checks. The common case (non-bitemporal, no put-enforcement
-        // configured) skips this read entirely — `prior` for that case
-        // comes solely from `put_in_txn`'s own return value.
-        //
-        // The plain (non-bitemporal) secondary-index diff also needs the old
-        // bytes: an UPDATE that changes an indexed field must drop the stale
-        // index entry, which requires knowing the prior value. So read the old
-        // value whenever the collection has index paths — exactly the case that
-        // would otherwise leak stale entries.
+        // Read the prior value only when needed: bitemporal (always), an
+        // enforcement-configured collection (stateless PUT checks), or a
+        // collection with index paths (drop the stale entry on UPDATE).
         let need_old = bitemporal
             || (enforce
                 && self
@@ -159,19 +104,12 @@ impl CoreLoop {
         } else {
             None
         };
-        // Decode the pre-write document for the non-bitemporal secondary-index
-        // SET diff. Borrowed here (before `old_value` may be moved into `prior`
-        // on the bitemporal branch below); bitemporal reverses via versioned
-        // index tuples instead, so it needs no old-doc diff.
-        // Strict collections store the old row as a Binary Tuple, which
-        // `doc_format::decode_document` cannot decode without the schema —
-        // route through the storage-mode-aware helper so strict UPDATEs also
-        // compute their real old index values (and thus drop stale entries).
-        // `None` here means "there is no prior row to diff against" — an INSERT,
-        // a bitemporal collection (which reverses via versioned index tuples
-        // instead), or an unregistered collection with no index paths. A prior
-        // row that exists but will not decode is NOT that case: it would leave
-        // the row's old index entries asserted forever, so it fails the write.
+        // Pre-write doc for the non-bitemporal secondary-index SET diff;
+        // bitemporal reverses via versioned index tuples instead. Routed
+        // through the storage-mode-aware helper so a strict row's Binary
+        // Tuple decodes too. `None` means "no prior row" (INSERT, bitemporal,
+        // or no index paths) — a prior row that exists but fails to decode
+        // fails the write instead, or its old index entries leak forever.
         let old_doc_for_index: Option<serde_json::Value> = if bitemporal {
             None
         } else {
@@ -181,10 +119,8 @@ impl CoreLoop {
             }
         };
 
-        // Admission runs on the pre-image and the incoming body, before any
-        // store or index is touched, so a refusal leaves nothing behind.
-        // `value` is already the MessagePack form for both storage modes by
-        // this point (strict encodes to its tuple separately, into `stored`).
+        // Runs before any store or index is touched, so a refusal leaves
+        // nothing behind.
         self.check_stateless_put_enforcement(
             enforce,
             PutEnforcement {
@@ -198,10 +134,7 @@ impl CoreLoop {
             },
         )?;
 
-        // Bitemporal collections version every write: append a new version
-        // at `sys_from = now()`, returning the current (pre-write) version
-        // read above as the `prior` slot. Non-bitemporal collections use
-        // the legacy overwrite path, returning the old bytes redb replaced.
+        // Bitemporal appends a new version; non-bitemporal overwrites in place.
         let prior = if bitemporal {
             self.sparse.versioned_put_in_txn(
                 txn,
@@ -226,37 +159,20 @@ impl CoreLoop {
         // transactional caller can restore the exact prior stats on rollback.
         let mut stats_prior: Vec<crate::engine::sparse::stats::StatsPreImage> = Vec::new();
 
-        // Text indexing and stats use the original JSON input, not the stored
-        // bytes — Binary Tuple requires a schema to decode, and the input JSON
-        // is already available here regardless of storage mode.
-        //
-        // Incoming body, per the invariant above: a body that is not a readable
-        // document contributes no indexable text and no per-column statistics,
-        // so there is nothing for this block to do. Note the contrast one level
-        // in — once the document IS readable, an inverted-index write that
-        // fails is a real failure and rejects the write.
+        // Text indexing and stats use the JSON input, not the stored bytes —
+        // Binary Tuple needs a schema to decode. A body with no readable
+        // fields contributes nothing here; once it IS readable, an
+        // inverted-index write failure is real and rejects the write.
         if let Ok(doc) = doc_format::decode_document(value) {
-            // Shared extraction: the DELETE-rollback re-index path recomputes
-            // the exact same text from the restored body via this helper.
+            // Shared with the DELETE-rollback re-index path.
             let text_content = crate::data::executor::fts_text::extract_fts_text(&doc);
-            // Empty text is NOT skipped: an update that strips a document of
-            // every indexable word must take it out of the index, and only
-            // the index side knows whether a prior version put it in.
+            // Empty text is NOT skipped — stripping every indexable word
+            // must still remove the document from the index.
             if index_text {
-                // The index write lands in the CALLER'S transaction — the very
-                // one the row body was written into above (the inverted index
-                // is opened on `sparse.db()`, so both are the same redb
-                // database). Propagating therefore makes row + index one
-                // all-or-nothing durable unit: every caller returns before
-                // `txn.commit()`, redb rolls the uncommitted transaction back
-                // on drop, and neither the row nor its postings land.
-                //
-                // Swallowing it would be permanent, not transient: this path
-                // emits no `FtsIndex` WAL record, so replay cannot re-derive
-                // the missing postings; the next write to the document indexes
-                // only the NEW text; and no query can tell the gap apart from a
-                // document that genuinely does not match. The row would stay
-                // invisible to full-text search until a manual reindex.
+                // Lands in the caller's transaction, so propagating an error
+                // rolls row + index back together as one unit. Swallowing it
+                // would be permanent: no WAL record to replay, so the gap
+                // stays invisible to full-text search until a manual reindex.
                 if let Err(e) = self.inverted.index_document_in_txn(
                     txn,
                     crate::engine::sparse::inverted::IndexDocScope {
@@ -267,10 +183,8 @@ impl CoreLoop {
                     },
                     &text_content,
                 ) {
-                    // Recorded here, at the detection site, and never
-                    // re-emitted as the error propagates: a log line is gone at
-                    // the next restart, the capture is an fsync'd report that
-                    // survives it and names which collection's index refused.
+                    // Recorded here, at the detection site — an fsync'd
+                    // report survives a restart, unlike a log line.
                     crate::diag::fts_index_update_failed(&e, collection, surrogate.as_u32());
                     warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index update failed; rejecting the write");
                     return Err(e);
@@ -293,19 +207,11 @@ impl CoreLoop {
         self.doc_cache
             .put(database_id, tid, collection, document_id, &stored);
 
-        // Secondary index extraction: if this collection has registered
-        // index paths, extract values and write them into the INDEXES redb
-        // B-Tree inside the CALLER'S write txn. Using the non-_in_txn
-        // variant here would deadlock — `execute_point_put` already owns
-        // the only writer.
-        //
-        // UNIQUE enforcement runs first: for every `unique: true` path we
-        // check whether the incoming value already belongs to a different
-        // document and reject with a typed constraint error. The check
-        // uses the sparse engine's read API, which opens a separate read
-        // transaction (redb MVCC) — the read view won't see our outer
-        // write txn but that's precisely the semantics we want for the
-        // "does another row already hold this value" question.
+        // Secondary index extraction into the caller's write txn — the
+        // non-_in_txn variant would deadlock since `execute_point_put`
+        // already owns the only writer. UNIQUE enforcement runs first,
+        // reading via a separate MVCC read txn that can't see our own writes
+        // — exactly the semantics "does another row already hold this value" needs.
         let mut bitemporal_index_tuples: Vec<(String, String)> = Vec::new();
         let mut secondary_index_added: Vec<(String, String)> = Vec::new();
         let mut secondary_index_removed: Vec<(String, String)> = Vec::new();
@@ -314,18 +220,13 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        // Incoming body, per the invariant above. `extract_index_values` reads
-        // named paths out of a decoded document, so a body that is not one
-        // yields no index values — and therefore no UNIQUE candidate to
-        // conflict with and no entry to write. Skipping is the same outcome as
-        // running both, not a check quietly waived.
+        // A body that isn't a document yields no index values, same outcome
+        // as running the check and finding none.
         if let Some(config) = self.doc_configs.get(&config_key)
             && let Ok(doc) = doc_format::decode_document(value)
         {
             let paths = config.index_paths.clone();
-            // UNIQUE enforcement is a CORE side-effect: it must run in both the
-            // autocommit and transactional paths (a violation rejects the write
-            // before commit).
+            // Must run in both autocommit and transactional paths.
             check_unique_constraints(UniqueCheck {
                 sparse: &self.sparse,
                 database_id,
@@ -337,11 +238,8 @@ impl CoreLoop {
                 bitemporal,
             })?;
             if bitemporal {
-                // Versioned index entries are keyed at the SAME system time as
-                // the primary version row written above (`sys_from_ms`), so a
-                // single `bitemporal_sys_from_ms` in the undo entry reverses
-                // both together. These are CORE (undoable via the captured
-                // tuples).
+                // Keyed at the same `sys_from_ms` as the primary version row,
+                // so one `bitemporal_sys_from_ms` in the undo entry reverses both.
                 for path in &paths {
                     if let Some(ref pred) = path.predicate
                         && !pred.evaluate_json(&doc)
@@ -374,11 +272,9 @@ impl CoreLoop {
                     }
                 }
             } else {
-                // Non-bitemporal secondary index write. The
                 // SET diff against `old_doc_for_index` inserts new values and
-                // removes stale ones (fixing the leaked-entry-on-UPDATE bug).
-                // The (added, removed) tuples are captured so a transactional
-                // caller can reverse them on rollback.
+                // removes stale ones; (added, removed) let a transactional
+                // caller reverse them on rollback.
                 let (added, removed) = self.apply_secondary_indexes_in_txn(
                     txn,
                     crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
@@ -409,9 +305,7 @@ impl CoreLoop {
                 wal_lsn: wal_lsn.map(|l| l.as_u64()).unwrap_or(0),
             },
         )?;
-        // Sparse inverted-index maintenance mirrors the dense-vector side-effect
-        // above: a no-op unless the strict schema declares a `SparseVector`
-        // column, so non-sparse collections are byte-identical to before.
+        // No-op unless the strict schema declares a `SparseVector` column.
         self.apply_point_put_sparse_indexes(database_id, tid, collection, document_id, value);
 
         Ok(PointPutOutcome {
@@ -453,13 +347,8 @@ mod tests {
     /// inverted index, so this document has real text to index.
     const BODY: &[u8] = br#"{"title":"alpha bravo charlie"}"#;
 
-    /// A table sharing `DOC_LENGTHS`'s redb name but with incompatible
-    /// key/value types.
-    ///
-    /// Installing it is how these tests obtain a deterministic, structural
-    /// inverted-index failure with no mock layer: the very first thing
-    /// `index_document_in_txn` does is open `DOC_LENGTHS`, which then fails
-    /// with a table-type mismatch on every attempt.
+    /// A table sharing `DOC_LENGTHS`'s redb name but incompatible key/value
+    /// types, so `index_document_in_txn` fails deterministically with no mock.
     const POISONED_DOC_LENGTHS: TableDefinition<u64, u64> =
         TableDefinition::new("text.doc_lengths");
 
@@ -511,10 +400,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Control: with a healthy index the write commits AND the document is
-    /// counted into the corpus. Without this, a passing failure test could not
-    /// distinguish "the poison caused the rejection" from "this document was
-    /// never writable in the first place".
+    /// Control: a healthy index commits and counts the document, so a
+    /// failure test can tell poison-caused-rejection from never-writable.
     #[test]
     fn healthy_index_commits_the_row_and_indexes_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -545,11 +432,8 @@ mod tests {
         assert_eq!(doc_count, 1, "the committed row must be in the FTS corpus");
     }
 
-    /// The defect this guards: an inverted-index failure used to be logged and
-    /// stepped over, leaving a committed row that full-text search could never
-    /// see and that nothing — not WAL replay, not the next write — would ever
-    /// re-index. The write must now be rejected outright, with no row left
-    /// behind in the store or in the read-through document cache.
+    /// An inverted-index failure must reject the write outright, with no row
+    /// left in the store or the document cache.
     #[test]
     fn index_failure_rejects_the_write_and_leaves_no_row() {
         let dir = tempfile::tempdir().unwrap();
@@ -591,11 +475,8 @@ mod tests {
         );
     }
 
-    /// The same guarantee stated at the helper level, because every caller of
-    /// `apply_point_put` (autocommit put/insert, upsert, batch write, merge,
-    /// transactional sub-plan, WAL redo) depends on it: the error surfaces
-    /// instead of being absorbed, so the caller's transaction is dropped
-    /// un-committed and the row never lands.
+    /// Every caller of `apply_point_put` depends on the error surfacing
+    /// instead of being absorbed, so its transaction drops uncommitted.
     #[test]
     fn apply_point_put_propagates_index_failure_instead_of_absorbing_it() {
         let dir = tempfile::tempdir().unwrap();

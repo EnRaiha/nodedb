@@ -40,17 +40,8 @@ fn engine_tag_str(tag: EngineTag) -> &'static str {
 }
 
 /// Map a physical plan to the metering `operation` cost-table key (see
-/// `MeteringConfig::operation_costs`).
-///
-/// Moved here from `shared::ddl::user_dispatch` so the rate-limiter's
-/// operation classification and the metering cost-table lookup share one
-/// mapping instead of two copies that could silently diverge and mis-bill.
-///
-/// This door carries only a handful of engine-specific DSL/TVF operations
-/// (CRDT read/merge, timeseries last-value, GraphRAG fusion, snapshot scan),
-/// so a coarse top-level match is enough to apply the right cost tier; an
-/// engine with no natural cost-table counterpart falls back to the default
-/// cost of 1.
+/// `MeteringConfig::operation_costs`). Shared with the rate-limiter's
+/// operation classification so the two never silently diverge and mis-bill.
 pub(crate) fn operation_for_plan(plan: &PhysicalPlan) -> &'static str {
     match plan {
         PhysicalPlan::Vector(_) => "vector_search",
@@ -71,31 +62,17 @@ pub(crate) fn operation_for_plan(plan: &PhysicalPlan) -> &'static str {
 }
 
 /// The metering-relevant shape of a [`PhysicalPlan`], captured before
-/// dispatch consumes the plan.
-///
-/// Callers that need to meter after dispatch (dispatch takes the plan by
-/// value to build the `PhysicalTask`, so the original plan is gone by the
-/// time the response comes back) extract this narrow shape instead of
-/// `plan.clone()`-ing the whole plan: a `PhysicalPlan` can carry large
-/// payloads (vector floats, row upserts, filter trees), while metering only
-/// ever reads the collection name, engine, and operation classification.
+/// dispatch consumes the plan by value. Avoids `plan.clone()`-ing payloads
+/// (vector floats, row upserts) that metering never reads.
 pub(crate) struct PlanMeteringInfo {
-    /// Every collection this dispatch attributes to, first-seen order, no
-    /// duplicates. Empty for cluster/algo/meta plans with no user-facing
-    /// collection. A KV `TransferItem` (and its resolved write) writes two
-    /// collections in one plan; attributing only the first would leave the
-    /// second unbilled and outside its cap.
+    /// First-seen order, no duplicates. A KV `TransferItem` writes two
+    /// collections in one plan; attributing only the first leaves it unbilled.
     collections: Vec<String>,
     engine: EngineTag,
     operation: &'static str,
-    /// The [`Permission`] this dispatch required, per
-    /// [`required_permission`]. Carried alongside `operation` rather than
-    /// re-derived from it at charge time: `operation` is a coarse metering
-    /// cost-table key (several plan shapes can share one, e.g. every
-    /// `Columnar`/`Timeseries`/`Spatial` scan maps to `"document_scan"`),
-    /// so it is the wrong input for deciding which scopes a request needs —
-    /// `required_permission` already computes that correctly from the plan
-    /// itself, once, at extraction time.
+    /// Carried alongside `operation` rather than re-derived: `operation` is a
+    /// coarse cost-table key several plan shapes share, the wrong input for
+    /// deciding which scopes a request needs.
     permission: Permission,
 }
 
@@ -111,11 +88,8 @@ impl PlanMeteringInfo {
         self.permission
     }
 
-    /// Extract `plan`'s metering shape.
-    ///
-    /// Call this only when `state.metering_config.enabled` — it clones the
-    /// collection name, which is wasted work otherwise (metering is
-    /// disabled by default).
+    /// Extract `plan`'s metering shape. Call only when metering is enabled —
+    /// it clones the collection name.
     pub(crate) fn extract(plan: &PhysicalPlan) -> Self {
         Self {
             collections: metered_collections(plan),
@@ -143,25 +117,9 @@ impl PlanMeteringInfo {
     }
 }
 
-/// Does `scope_name`'s resolved grant set cover a `permission` operation on
-/// `collection`?
-///
-/// A quota is a meter on an entitlement: a request consumes an entitlement
-/// only if that entitlement actually covers the request. A grant covers the
-/// request when its permission matches and its collection either names
-/// `collection` exactly or is the codebase-wide `"*"` wildcard already used
-/// for "all collections" elsewhere (`CREATE CHANGE STREAM ... ON *`,
-/// retention policies, `KV SORTED INDEX ... *`) — `DEFINE SCOPE` grammar
-/// (`control::server::shared::ddl::neutral::scope_ddl::define`) stores
-/// whatever raw token follows `ON` verbatim, so an admin writing
-/// `... AS READ ON *` already produces a `"*"` collection in the resolved
-/// grant; this is that same convention, not a new one.
-///
-/// Grant permission strings are parsed via
-/// [`parse_permission`](crate::control::security::permission::parse_permission)
-/// — the same parser `GRANT`/catalog-grant code uses — rather than compared
-/// as raw strings, so `"select"`/`"insert"`/`"update"`/`"delete"` aliases
-/// resolve to the same [`Permission`] a `PhysicalPlan` requires.
+/// Does `scope_name`'s grant set cover `permission` on `collection`? A grant
+/// covers it when permission matches and collection is exact or `"*"`.
+/// Permission strings parse via [`parse_permission`] for alias resolution.
 pub(crate) fn scope_covers_request(
     state: &SharedState,
     scope_name: &str,
@@ -177,25 +135,9 @@ pub(crate) fn scope_covers_request(
         })
 }
 
-/// Charge `tokens` against every quota scope `grantee_id` holds that
-/// actually **covers** this request — not every scope `grantee_id` merely
-/// holds.
-///
-/// A held scope with no grant covering `info`'s `(permission, collection)`
-/// is left untouched: holding a `vector:heavy` entitlement must never debit
-/// its quota for an unrelated KV point-get, and holding more entitlements
-/// must never cost a caller more for the same request. See
-/// [`scope_covers_request`] for the coverage rule.
-///
-/// When two held scopes both cover this request, **both** are charged the
-/// full `tokens` amount — this is deliberate, not a bug to dedupe. A data
-/// cap and a feature cap are separate meters on the same billable event;
-/// each scope's `QuotaDefinition` (if any) is its own independent ledger,
-/// so an event covered by two entitlements debits both ledgers.
-/// `QuotaManager::record_usage` is a no-op bookkeeping call for any scope
-/// with no `QuotaDefinition` registered, so charging every *covering* scope
-/// unconditionally (rather than filtering to scopes with a defined quota
-/// first) costs nothing extra.
+/// Charge `tokens` against every quota scope `grantee_id` holds that covers this
+/// request (see [`scope_covers_request`]). Two covering scopes are both charged
+/// the full amount — each is an independent ledger.
 fn charge_quota_for_held_scopes(
     state: &SharedState,
     auth: &AuthContext,
@@ -215,25 +157,8 @@ fn charge_quota_for_held_scopes(
 }
 
 /// Meter one completed [`PhysicalTask`](nodedb_physical::physical_task::PhysicalTask)
-/// dispatch against the caller's usage bucket.
-///
-/// Metering is per `PhysicalTask`, not per statement. A single statement can
-/// expand into several tasks — an implicit graph edge write alongside its
-/// node write, or an `INSERT ... SELECT`'s read and write halves — each
-/// dispatched and billed independently. There is no cross-task aggregation:
-/// the per-task unit is the natural one because each task is authorized,
-/// admitted, and executed as its own capability.
-///
-/// Callers MUST only call this on the success path. A denied, errored, or
-/// timed-out request performed no billable engine work; metering it would
-/// charge the caller for work that never happened.
-///
-/// Returns immediately when metering is disabled (the default) or when
-/// `scope` belongs to an internal-service identity (WAL replay, triggers,
-/// the scheduler, CRDT sync) — billing a tenant for server-owned work would
-/// be wrong. Plans with no extractable collection (cluster/algo/meta ops
-/// with no user-facing collection) are not metered: there is nothing to
-/// attribute the usage to.
+/// dispatch, per-task not per-statement. Call only on the success path;
+/// no-ops when disabled, internal-service, or the plan has no collection.
 pub(crate) fn meter_dispatch(
     state: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -278,27 +203,9 @@ pub(crate) fn meter_dispatch(
     }
 }
 
-/// Meter an in-transaction `Staged` write's dispatch, called from inside the
-/// closure `route_in_tx_write` invokes to apply the write to the
-/// per-transaction overlay (`staging_gate::stage_write`).
-///
-/// The closure's raw dispatch [`Response`] is the only point a `Staged`
-/// write's outcome is observable at this granularity: `route_in_tx_write`
-/// reduces it to a [`StagedWriteOutcome`](crate::control::server::shared::session::staging_gate::StagedWriteOutcome)
-/// before returning, so a caller that only sees `InTxnRoute::Staged` can no
-/// longer recover the raw response. The overlay write this response reports
-/// is real engine work performed right now (not a preview) — it is COMMIT
-/// that decides durability, not billability, so this is metered here rather
-/// than at COMMIT-time replay. Compare [`meter_buffered_write`], the sibling
-/// call for the non-stageable `Buffered` route, which performs no dispatch
-/// at all until COMMIT and so must be metered there instead.
-///
-/// Only meters `Status::Ok` — a staged write's statement-time constraint
-/// rejection (`StagingGateError::Rejected`, decided by the caller right
-/// after this returns) performed no billable work. `rows: None`: the
-/// affected-count decode happens in `stage_write` after this closure
-/// returns, and duplicating it here solely for a row count would double the
-/// per-write decode cost on every staged statement.
+/// Meter an in-transaction `Staged` write's dispatch. The overlay write is
+/// real engine work performed now — COMMIT decides durability, not
+/// billability, so this meters here, not at COMMIT replay. `rows: None`.
 pub(crate) fn meter_staged_write(
     state: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -313,16 +220,8 @@ pub(crate) fn meter_staged_write(
 }
 
 /// Meter one non-stageable buffered write, replayed durably at COMMIT.
-///
-/// `InTxnRoute::Buffered` performs no dispatch at statement time — the task
-/// is only pushed onto the session's write buffer (`route_in_tx_write`) — so
-/// there is nothing to meter until [`session::commit::run_commit`] actually
-/// replays it. This keeps the billing/durability line honest: a ROLLBACK
-/// after a buffered write means the work never happened and must never be
-/// billed, so this must only ever be called after the buffered batch's
-/// COMMIT dispatch has already succeeded.
-///
-/// [`session::commit::run_commit`]: crate::control::server::shared::session::commit::run_commit
+/// `InTxnRoute::Buffered` dispatches nothing until COMMIT replays it. Call
+/// only after the buffered batch's COMMIT dispatch succeeded.
 pub(crate) fn meter_buffered_write(
     state: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -335,19 +234,9 @@ pub(crate) fn meter_buffered_write(
     meter_dispatch(state, scope, &info, None);
 }
 
-/// A metering accumulator for a streaming response, live for the whole
-/// stream's lifetime and independent of how it ends.
-///
-/// The non-streaming [`meter_dispatch`] fires once, right after dispatch
-/// returns — but a streaming response (NDJSON, `ws_rpc` scan streams) writes
-/// rows to the client incrementally, and the client can disconnect before
-/// the last one. Billing must reflect rows the client actually received, not
-/// rows the plan would have produced had the stream run to completion. Rows
-/// are added as they are written via [`Self::add_rows`]; the accumulated
-/// total is recorded as a single usage event when this guard drops —
-/// whether that is normal stream completion, a mid-stream error, or an early
-/// client disconnect (dropping the response body future drops every local
-/// the stream generator holds, including this guard).
+/// A metering accumulator for a streaming response, live for the whole stream.
+/// Unlike [`meter_dispatch`], rows accumulate via [`Self::add_rows`] and are
+/// recorded as one usage event when this guard drops.
 pub(crate) struct DetachedMeterGuard {
     state: Arc<SharedState>,
     auth_user_id: String,
@@ -357,23 +246,15 @@ pub(crate) struct DetachedMeterGuard {
     engine: &'static str,
     operation: &'static str,
     rows: u64,
-    /// The quota scopes `auth_user_id` held **and that cover this request**
-    /// (see [`scope_covers_request`]) when this guard was built — filtered
-    /// once at construction rather than re-derived on drop, for the same
-    /// reason `meter_dispatch` derives them from the request-start `scope`:
-    /// consistent with the accepted as-of-request-start staleness this
-    /// metadata already carries. Coverage depends only on `info`'s
-    /// `(permission, collection)`, both fixed at construction, so filtering
-    /// here rather than on drop changes nothing about which scopes end up
-    /// charged.
+    /// Covering scopes (see [`scope_covers_request`]) filtered once at
+    /// construction — coverage depends only on `info`, fixed at construction,
+    /// so filtering here changes nothing about which scopes end up charged.
     quota_scopes: std::collections::HashSet<String>,
 }
 
 impl DetachedMeterGuard {
     /// Build a guard for `info`, or `None` when nothing should be metered —
-    /// mirrors [`meter_dispatch`]'s own gating (disabled config, internal
-    /// service identity, no extractable collection) so a streaming caller
-    /// gets identical gating without duplicating the checks.
+    /// mirrors [`meter_dispatch`]'s own gating.
     pub(crate) fn new(
         state: &Arc<SharedState>,
         scope: &RequestAuthScope<'_>,
@@ -382,8 +263,7 @@ impl DetachedMeterGuard {
         if !state.metering_config.enabled || scope.identity().is_internal_service() {
             return None;
         }
-        // A streamed response is a read scan, which reads exactly one
-        // collection; the multi-collection shapes are all KV writes.
+        // A streamed response reads exactly one collection; multi-collection shapes are KV writes.
         let collection = info.collections.first().cloned()?;
         let held = state
             .scope_grants
@@ -422,8 +302,7 @@ impl Drop for DetachedMeterGuard {
             .get(self.operation)
             .copied()
             .unwrap_or(1);
-        // Never charge zero: even a stream that closed before any row was
-        // written performed a lookup — see `meter_dispatch`'s identical rule.
+        // Never charge zero: a closed stream still performed a lookup.
         let tokens = operation_cost.saturating_mul(self.rows.max(1));
         let now_secs = crate::control::security::time::now_secs();
         for scope_name in &self.quota_scopes {
@@ -459,9 +338,8 @@ mod tests {
 
     use super::*;
 
-    /// Returns the state plus the backing `TempDir` guard — the caller must
-    /// keep the guard alive for as long as `state` is in use, or the WAL's
-    /// backing file is removed out from under it.
+    /// Caller must keep the `TempDir` guard alive, or the WAL's backing file
+    /// is removed out from under it.
     fn test_state() -> (Arc<SharedState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("create test directory");
         let wal = Arc::new(
@@ -511,10 +389,8 @@ mod tests {
         PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::CreateSnapshot)
     }
 
-    /// `metering_config` has no live-mutation path by design (see
-    /// `SharedState::metering_config`'s doc comment) — tests that need it
-    /// enabled reach in via `Arc::get_mut` while the test is still the sole
-    /// owner of the freshly constructed state, before any clone escapes.
+    /// `metering_config` has no live-mutation path by design; reach in via
+    /// `Arc::get_mut` while the test is the sole owner.
     fn enable_metering(state: &mut Arc<SharedState>) {
         Arc::get_mut(state)
             .expect("sole owner in test")
@@ -653,12 +529,8 @@ mod tests {
         assert_eq!(event.tokens, expected_cost * 3);
     }
 
-    /// The core gap this module closes: `QuotaManager::record_usage` had no
-    /// caller before this change, so `$auth.quota_remaining(...)` always
-    /// resolved to `None`. A metered dispatch by an identity holding a scope
-    /// whose grants cover the request, with a quota defined, must charge
-    /// that quota by the same `tokens` value `UsageCounter::record` gets, so
-    /// the two accounting structures cannot drift.
+    /// A metered dispatch by an identity holding a covering scope with a quota
+    /// defined must charge it the same `tokens` value `UsageCounter::record` gets.
     #[test]
     fn metered_dispatch_charges_quota_for_covering_held_scope() {
         use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
@@ -722,11 +594,8 @@ mod tests {
         assert_eq!(status.used_tokens, expected_cost);
     }
 
-    /// The defect this module now closes: a held scope whose grants do NOT
-    /// cover the request's `(permission, collection)` must not be charged —
-    /// holding a `vector:heavy` entitlement must never debit its quota for
-    /// an unrelated KV point-get, and holding more entitlements must never
-    /// cost a caller more for the same request.
+    /// A held scope whose grants do not cover the request's `(permission,
+    /// collection)` must not be charged.
     #[test]
     fn held_scope_not_covering_request_is_not_charged() {
         use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
@@ -735,8 +604,7 @@ mod tests {
         let (mut state, _dir) = test_state();
         enable_metering(&mut state);
         let identity = regular_identity(21);
-        // Held scope grants only vector search on a different collection —
-        // it does not cover a KV `Get` on "widgets".
+        // Held scope grants vector search only — doesn't cover a KV `Get` on "widgets".
         state
             .scope_defs
             .define(
@@ -1036,12 +904,9 @@ mod tests {
         assert_eq!(state.usage_counter.total_tokens(), 0);
     }
 
-    /// The whole point of the guard: a stream that writes some rows and then
-    /// drops early (client disconnect, mid-stream error) still bills exactly
-    /// what it wrote — not zero, and not what a full scan would have
-    /// produced. Dropping the guard mid-accumulation, without ever calling
-    /// a "finish" method, is the case that matters: it is what actually
-    /// happens when `async_stream::stream!`'s generator future is dropped.
+    /// A stream that drops early (disconnect, error) still bills exactly what
+    /// it wrote, not zero and not a full scan — the case that matters when
+    /// `async_stream::stream!`'s generator future drops.
     #[test]
     fn detached_guard_bills_rows_written_before_early_drop() {
         let (mut state, _dir) = test_state();
@@ -1055,8 +920,7 @@ mod tests {
                     .expect("metering enabled, collection present");
             guard.add_rows(3);
             guard.add_rows(4);
-            // Dropped here, mid-"stream", with no explicit finish call —
-            // simulates an early client disconnect after 7 rows were sent.
+            // Dropped mid-stream, simulating an early client disconnect after 7 rows.
         }
 
         let events = state.usage_counter.drain();
@@ -1154,12 +1018,8 @@ mod tests {
         assert_eq!(state.usage_counter.total_tokens(), 0);
     }
 
-    /// A non-stageable buffered write, replayed durably at COMMIT — the
-    /// sibling of `meter_staged_write` for the route that performs no
-    /// dispatch until COMMIT. Callers must only invoke this after the
-    /// buffered batch's COMMIT dispatch has already succeeded; this test
-    /// pins that the call itself records unconditionally (the success gate
-    /// lives in the caller, `session::commit::run_commit`).
+    /// Pins that the call records unconditionally — the success gate lives in
+    /// the caller, `session::commit::run_commit`.
     #[test]
     fn buffered_write_records_when_called() {
         let (mut state, _dir) = test_state();
@@ -1187,10 +1047,8 @@ mod tests {
         assert_eq!(state.usage_counter.total_tokens(), 0);
     }
 
-    /// Pins the ILP-ingest metering shape: `TimeseriesOp::Ingest` extracts
-    /// its `collection` and maps to the `timeseries` engine dimension, the
-    /// same way `ilp_batch::dispatch::flush_ilp_batch_inner` relies on
-    /// `PlanMeteringInfo::extract` to attribute each measurement group.
+    /// Pins the ILP-ingest metering shape: `TimeseriesOp::Ingest` extracts its
+    /// `collection` and maps to the `timeseries` engine dimension.
     #[test]
     fn timeseries_ingest_plan_extracts_collection_and_engine() {
         let plan = PhysicalPlan::Timeseries(nodedb_physical::physical_plan::TimeseriesOp::Ingest {

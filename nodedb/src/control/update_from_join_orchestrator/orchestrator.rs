@@ -2,33 +2,9 @@
 
 //! Control-Plane orchestrator for autocommit `UPDATE ... FROM <source>`.
 //!
-//! `UPDATE target SET ... FROM source WHERE target.col = source.col` reads the
-//! SOURCE collection and updates the TARGET. The source and target collection
-//! names hash to independent vShards that, on a multi-core node, can map to
-//! DIFFERENT Data-Plane cores. The Data-Plane handler builds its source
-//! join-map from the LOCAL core's store, so when the source's vShard lives on
-//! another core the handler reads an empty source and silently updates nothing.
-//!
-//! Unlike `MERGE`, `UPDATE ... FROM` only UPDATES rows that already exist in the
-//! target — it never inserts, so it needs no fresh-surrogate assignment and no
-//! resolve/apply two-phase round trip. This orchestrator is therefore a single
-//! pass:
-//!
-//! 1. **Source-ship**: scan `source_collection` to completion on its OWN core
-//!    via the shared `read_all_source_rows` source-scan primitive (which routes
-//!    by the source collection's vShard) and collect those rows.
-//! 2. **Dispatch**: build the `DocumentOp::UpdateFromJoin` plan with the shipped
-//!    rows threaded into `source_rows` and dispatch it to the TARGET's core via
-//!    `dispatch_local`. The Data Plane builds the join-map from the shipped rows
-//!    instead of a local read, so cross-core `UPDATE ... FROM` is correct.
-//!
-//! In-transaction `UPDATE ... FROM` never reaches this autocommit orchestrator:
-//! it is resolved + staged at STATEMENT time into concrete `PointPut` ops by
-//! [`super::expand_staged_update_from_join::resolve_and_emit_update_from_join_ops`]
-//! (driven from `control::server::shared::session::expander_stage`), so its
-//! writes land in the transaction's overlay immediately (read-your-own-writes)
-//! and commit atomically with sibling ops, indexing into every cross-engine
-//! index.
+//! A remote source silently updates nothing unless shipped into `source_rows`
+//! on the target's core. Never inserts. In-transaction resolves at statement
+//! time instead — see `expand_staged_update_from_join`.
 
 use nodedb_types::{DatabaseId, TenantId};
 
@@ -41,10 +17,8 @@ use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::expand_staged_update_from_join::decode_resolved_update_rows;
 use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, ReturningSpec, UpdateValue};
 
-/// Attempts an `UPDATE ... FROM` makes before a materialized-sum resolution that
-/// keeps drifting is reported rather than retried forever. Mirrors the MERGE
-/// orchestrator's bound, and for the same reason: the retry exists to absorb
-/// concurrent drift, not to mask a resolution that can never converge.
+/// Attempts before a drifting materialized-sum resolution is reported rather
+/// than retried forever. Mirrors the MERGE orchestrator's bound.
 const MAX_UPDATE_FROM_JOIN_RETRIES: u32 = 8;
 
 /// Bundled arguments for [`run_update_from_join`], mirroring the fields of the
@@ -60,15 +34,10 @@ pub struct UpdateFromJoinArgs<'a> {
     pub updates: &'a [(String, UpdateValue)],
     pub target_filters: &'a [u8],
     pub returning: Option<&'a ReturningSpec>,
-    /// Target-collection RLS read filters injected into the intercepted plan.
-    /// Carried onto the dispatched plan so the rows a `RETURNING` update shows
-    /// are gated exactly as a `SELECT` by the same principal would be.
+    /// Target RLS read filters, gating rows a `RETURNING` update shows.
     pub rls_filters: &'a [u8],
-    /// Target-collection RLS write predicate injected into the intercepted
-    /// plan. Carried onto the dispatched plan, which decides every matched
-    /// row's post-image against it before writing. A separate slot from
-    /// `rls_filters`: that one bounds what may be shown back, this one bounds
-    /// what may be written.
+    /// Target RLS write predicate, gating every matched row's post-image
+    /// before writing. Separate from `rls_filters` (shown vs. written).
     pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
@@ -90,8 +59,7 @@ pub async fn run_authorized_update_from_join(
         source_rows: _,
         rls_filters,
         rls_write_check,
-        // Unresolved on the way in: the orchestrator resolves the join keys of
-        // the matched target rows before it dispatches the write pass.
+        // Unresolved on the way in — resolved below before dispatch.
         resolved_sum_targets: _,
     }) = task.plan
     else {
@@ -120,20 +88,13 @@ pub async fn run_authorized_update_from_join(
 }
 
 /// Drive an autocommit `UPDATE ... FROM <source>` from the Control Plane.
-///
-/// Returns the `{"affected": N}` (or RETURNING-rows) response the Data-Plane
-/// handler produces, so the dispatch loops render the same command tag as a
-/// co-resident single-shard update.
+/// Returns the same response a co-resident single-shard update would produce.
 pub(crate) async fn run_update_from_join(
     state: &SharedState,
     args: UpdateFromJoinArgs<'_>,
 ) -> crate::Result<Response> {
-    // Whether the TARGET collection — the one whose rows this statement writes,
-    // and therefore the SOURCE of any materialized-sum binding — drives a
-    // binding at all. Checked ONCE, before anything else: a target driving
-    // nothing skips the RESOLVE round trip and the retry loop entirely, which is
-    // the difference between this being free for nearly every collection and
-    // being a tax on every `UPDATE ... FROM`.
+    // Checked once: a target driving no materialized-sum binding skips the
+    // RESOLVE round trip and retry loop entirely.
     let drives_bindings = source_drives_bindings(
         state,
         args.target_collection,
@@ -144,11 +105,8 @@ pub(crate) async fn run_update_from_join(
 
     let mut attempt: u32 = 0;
     loop {
-        // Read the SOURCE where it lives. Its vShard can map to a DIFFERENT
-        // Data-Plane core than the target's, so the target-core dispatch below
-        // cannot read the source from local storage. Scan it on its OWN core via
-        // the shared source-scan primitive (routes by the source collection's
-        // vShard) and ship the RAW stored rows into the plan.
+        // Source vShard can map to a different core than the target's, so the
+        // target-core dispatch below can't read it locally — scan and ship it.
         let source_rows = read_all_source_rows(
             state,
             args.tenant_id,
@@ -161,8 +119,7 @@ pub(crate) async fn run_update_from_join(
         let resolved_sum_targets = if drives_bindings {
             match resolve_matched_sum_targets(state, &args, source_rows.clone()).await? {
                 Some(resolved) => resolved,
-                // The RESOLVE pass failed on the Data Plane; its response is the
-                // statement's answer.
+                // RESOLVE pass failed on the Data Plane; its response is the answer.
                 None => {
                     return Err(crate::Error::Dispatch {
                         detail: "UPDATE ... FROM materialized-sum resolve pass failed".into(),
@@ -188,9 +145,8 @@ pub(crate) async fn run_update_from_join(
             resolved_sum_targets,
         });
 
-        // Dispatch to the TARGET's core: the join-map is now built from the
-        // shipped source rows, so the update lands correctly regardless of where
-        // the source collection's vShard lives.
+        // Join-map now built from the shipped rows, so this lands correctly
+        // regardless of where the source vShard lives.
         let resp = dispatch_local(
             state,
             args.tenant_id,
@@ -201,11 +157,8 @@ pub(crate) async fn run_update_from_join(
         )
         .await?;
 
-        // The write pass re-derived the join-key set of the rows it matched and
-        // found the resolution above no longer covers it — a concurrent write
-        // moved the match set or a join key between the RESOLVE pass and now. It
-        // wrote NOTHING, so re-resolving from a fresh pass and re-dispatching is
-        // the whole recovery.
+        // A concurrent write moved the match set between RESOLVE and now, so the
+        // write pass wrote nothing; re-resolve and re-dispatch to recover.
         if resp.error_code.as_deref() == Some(&ErrorCode::OllpRetryRequired) {
             attempt += 1;
             if attempt > MAX_UPDATE_FROM_JOIN_RETRIES {
@@ -216,14 +169,8 @@ pub(crate) async fn run_update_from_join(
             continue;
         }
 
-        // `dispatch_local` bypasses the pgwire autocommit funnel's post-apply
-        // redo minting, so an update landing on a vector-indexed target carries
-        // its per-row `Put` write-set (surrogate + post-image) back here
-        // unconsumed. Mint it now: without this durable redo, a WAL-only restart
-        // rebuilds the HNSW from the pre-update `Put` records and resurrects the
-        // stale embeddings (`sparse.put` reconciled storage + overlays but minted
-        // no WAL redo carrying the new body). Empty on non-vector targets, so
-        // this is a no-op there.
+        // `dispatch_local` bypasses redo minting; without it, WAL-only restart
+        // resurrects stale embeddings. No-op on non-vector targets.
         crate::control::server::wal_dispatch::mint_dispatch_local_redo(
             &state.wal,
             args.tenant_id,
@@ -237,20 +184,8 @@ pub(crate) async fn run_update_from_join(
 }
 
 /// Resolve the materialized-sum targets this statement's matched rows need.
-///
-/// Dispatches the shared read-only RESOLVE pass — the SAME classifier the write
-/// pass runs, so the two cannot disagree about which rows match — and resolves
-/// the join values of BOTH images of every matched row. Both sides are needed:
-/// an assignment that rewrites the join column debits the target the row leaves
-/// and credits the one it joins, so resolving post-images alone would leave the
-/// abandoned target permanently overstated.
-///
-/// Predicting from `target_filters` alone would be wrong in the other direction:
-/// a target row only matches when its join column names a SOURCE row, so a
-/// filter-only prediction resolves rows the statement never touches and fails
-/// the statement on any of them that names no target row.
-///
-/// `None` means the RESOLVE pass itself failed on the Data Plane.
+/// Resolves both images of every matched row (a join-column rewrite debits
+/// one target and credits another). `None` means RESOLVE failed.
 async fn resolve_matched_sum_targets(
     state: &SharedState,
     args: &UpdateFromJoinArgs<'_>,
@@ -267,15 +202,11 @@ async fn resolve_matched_sum_targets(
             target_filters: args.target_filters.to_vec(),
             returning: None,
             source_rows: Some(source_rows),
-            // The RESOLVE pass emits no rows to the client and writes nothing,
-            // so neither policy has anything to gate; the write pass below runs
-            // both against the rows it actually rewrites.
+            // Read-only: emits no rows, writes nothing, so neither policy gates here.
             rls_filters: Vec::new(),
-            // The statement's injected write predicate, carried unchanged. The
-            // wrapper is read-only, so no gate reads it here.
+            // Statement's injected write predicate, carried unchanged.
             rls_write_check: args.rls_write_check.clone(),
-            // A read-only pass folds no delta, so it needs no resolution of its
-            // own.
+            // Folds no delta, so needs no resolution of its own.
             resolved_sum_targets: Vec::new(),
         },
     )));

@@ -1,20 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The read-only RESOLVE pass of `MERGE` and `UPDATE ... FROM` must reach the
-//! Data Plane as a read.
-//!
-//! The pass classifies what the statement would write and returns it; the
-//! Control-Plane expander turns that answer into concrete point ops. It is
-//! dispatched as `DocumentOp::ResolveWrite`, which carries no RLS write-check
-//! slot: hand-stamping a check on a bare `Merge` / `UpdateFromJoin` instead made
-//! every one of these statements fail the un-injected-write guard with
-//! `internal invariant break: write plan reached the Data Plane before RLS
-//! injection ran`.
-//!
-//! Three entry points reach the pass, and each is asserted below: the
-//! in-transaction expander for both statements, and the autocommit
-//! `UPDATE ... FROM` orchestrator, which resolves the statement's
-//! materialized-sum targets before it writes.
+//! Data Plane as a read. Dispatched as `DocumentOp::ResolveWrite`, which
+//! carries no RLS write-check slot; hand-stamping a check on a bare
+//! `Merge`/`UpdateFromJoin` instead fails the un-injected-write guard.
+//! Three entry points are asserted below: both statements' in-transaction
+//! expanders, and the autocommit `UPDATE ... FROM` orchestrator.
 
 mod common;
 
@@ -32,11 +23,8 @@ const SUM_SOURCE: &str = "atm_entries";
 const JOIN_SOURCE: &str = "atm_adjust";
 
 /// The premise the autocommit sum test rests on: one core owns both bound
-/// collections, so the balance rides the source write's own transaction.
-///
-/// Split them apart and the seeding `INSERT` appends a second task homed on the
-/// target's vShard, which classifies as a cross-shard write and needs the Calvin
-/// sequencer a single-node harness has no deployment for.
+/// collections, so the balance rides the source write's own transaction —
+/// splitting them needs the Calvin sequencer this harness has no deployment for.
 #[test]
 fn materialized_sum_source_and_target_are_co_resident() {
     assert_eq!(
@@ -166,15 +154,10 @@ async fn in_transaction_update_from_join_resolves_and_applies() {
     );
 }
 
-/// An autocommit `UPDATE ... FROM` whose TARGET drives a materialized-sum
+/// An autocommit `UPDATE ... FROM` whose target drives a materialized-sum
 /// binding resolves that binding's targets through the same read-only pass
-/// before it writes, then folds the balance by the difference.
-///
-/// This is the orchestrator's own RESOLVE dispatch, which no other test reaches:
-/// a target driving no binding skips it entirely.
-///
-/// The bound pair is co-resident on purpose — see
-/// [`materialized_sum_source_and_target_are_co_resident`].
+/// before writing, then folds the balance by the difference — the
+/// orchestrator's own resolve dispatch, which no other test reaches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autocommit_update_from_join_on_a_sum_source_folds_the_balance() {
     let server = TestServer::start().await;

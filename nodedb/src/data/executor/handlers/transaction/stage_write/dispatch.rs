@@ -20,10 +20,8 @@ use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
-    /// Execute a `MetaOp::StageWrite` for an in-transaction point write.
-    ///
-    /// Only point-write `DocumentOp`s are valid here (the Control Plane only
-    /// builds `StageWrite` for those); anything else is an internal error.
+    /// Execute a `MetaOp::StageWrite` for an in-transaction point write. Only
+    /// point-write `DocumentOp`s are valid here; anything else is internal.
     pub(in crate::data::executor) fn execute_stage_write(
         &mut self,
         task: &ExecutionTask,
@@ -63,11 +61,8 @@ impl CoreLoop {
                     rls_write_check,
                 });
             }
-            // Predicate DELETE / UPDATE on a columnar collection staged at
-            // statement time — the affected surrogate set is resolved against
-            // the current BASE ∪ OVERLAY view and tombstoned (delete) or
-            // superseded (update). COMMIT replay of the buffered plan remains
-            // the sole durable apply.
+            // Predicate DELETE/UPDATE staged at statement time: the affected
+            // set resolves against base ∪ overlay; commit replay durably applies.
             PhysicalPlan::Columnar(ColumnarOp::Delete {
                 collection,
                 filters,
@@ -103,11 +98,8 @@ impl CoreLoop {
                 | ColumnarOp::MaterializeScan { .. }
                 | ColumnarOp::ResolveDml { .. },
             ) => return self.stage_not_point_write(task),
-            // Resolved-row-set forms of UPDATE/DELETE on a collection with a
-            // write policy: the Control Plane already resolved the predicate
-            // and decided the policy, so staging locates each shipped PK in
-            // the current BASE ∪ OVERLAY view rather than re-evaluating a
-            // predicate.
+            // Resolved-row-set UPDATE/DELETE: staging locates each shipped PK
+            // in base ∪ overlay rather than re-evaluating a predicate.
             PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
                 collection,
                 rows,
@@ -265,12 +257,8 @@ impl CoreLoop {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
                 self.stage_point_update(&ctx, updates, rls_write_check)
             }
-            // Predicate UPDATE staged at statement time — same treatment as a
-            // point update, resolved against the BASE ∪ OVERLAY matching set.
-            // A `RETURNING` clause does not change staging: the matched rows'
-            // post-images are staged identically; the clause only governs the
-            // client response shape, which the in-transaction path renders as
-            // an affected-count tag either way.
+            // Predicate UPDATE staged like a point update, resolved against
+            // base ∪ overlay. RETURNING doesn't change staging.
             DocumentOp::BulkUpdate {
                 collection,
                 filters,
@@ -280,9 +268,7 @@ impl CoreLoop {
                 ollp_predicted_edges: _,
                 rls_filters: _,
                 rls_write_check,
-                // The staged post-images become concrete point ops at COMMIT,
-                // and those carry their own resolution; a staged predicate
-                // write applies no delta of its own here.
+                // Staged post-images become concrete point ops at commit.
                 resolved_sum_targets: _,
             } => self.stage_bulk_update(StageBulkUpdateParams {
                 task,
@@ -294,10 +280,8 @@ impl CoreLoop {
                 rls_write_check,
             }),
 
-            // Predicate DELETE staged at statement time — same treatment as a
-            // point delete, resolved against the BASE ∪ OVERLAY matching set.
-            // As with `BulkUpdate`, a `RETURNING` clause does not change what
-            // is staged.
+            // Predicate DELETE staged like a point delete, resolved against
+            // base ∪ overlay. Same RETURNING behavior as `BulkUpdate`.
             DocumentOp::BulkDelete {
                 collection,
                 filters,
@@ -317,11 +301,9 @@ impl CoreLoop {
                 rls_write_check,
             }),
 
-            // `UPSERT INTO` staged at statement time -- resolve the current
-            // body under BASE ∪ OVERLAY and either insert or merge/apply
-            // `ON CONFLICT DO UPDATE SET`, mirroring the autocommit
-            // `execute_upsert` handler exactly. `Upsert` has no `RETURNING`
-            // variant, so it is always stageable (see `is_point_write`).
+            // `UPSERT INTO`: resolve the current body under base ∪ overlay,
+            // mirroring `execute_upsert`. No `RETURNING` variant exists, so
+            // it is always stageable.
             DocumentOp::Upsert {
                 collection,
                 document_id,
@@ -335,11 +317,8 @@ impl CoreLoop {
                 self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check)
             }
 
-            // `INSERT ... SELECT` is resolved + staged as concrete
-            // fresh-surrogate `PointInsert` ops at STATEMENT time on the
-            // Control Plane (`session::expander_stage` →
-            // `resolve_and_emit_insert_select_ops`); a raw `InsertSelect`
-            // plan never reaches `StageWrite`, so it is not a point write here.
+            // `INSERT ... SELECT` is resolved into concrete `PointInsert` ops
+            // at statement time; a raw `InsertSelect` never reaches here.
             DocumentOp::InsertSelect { .. }
             | DocumentOp::ResolveWrite(_)
             | DocumentOp::PointGet { .. }
@@ -372,12 +351,9 @@ impl CoreLoop {
         )
     }
 
-    // ── Shared helpers ──────────────────────────────────────────────────────
-    //
-    // The Document point-write staging methods (`stage_point_insert` /
-    // `stage_point_put` / `stage_point_delete` / `stage_point_update`) live in
-    // the sibling `stage_point_document` module; they call the `pub(super)`
-    // helpers below.
+    // ── Shared helpers ──
+    // The Document point-write staging methods live in `stage_point_document`
+    // and call the `pub(super)` helpers below.
 
     pub(super) fn stage_overlay_pk(&self, ctx: &StageCtx<'_>) -> OverlayPk {
         match self
@@ -392,17 +368,10 @@ impl CoreLoop {
     }
 
     /// Decide one staged row body against the compiled RLS write policy.
-    ///
-    /// Staging is where an in-transaction statement's row image is produced, so
-    /// it is where the write policy has to decide it: the COMMIT install writes
-    /// the overlay's bodies as they stand rather than re-deriving them, and the
-    /// Control-Plane injection pass never sees them at all. A rejected row fails
-    /// the statement, leaving the transaction to be rolled back — the overlay is
-    /// never durable, so nothing it holds survives that.
-    ///
-    /// `body` is the STORED form, so the decode resolves the collection's
-    /// storage mode; a strict collection's Binary Tuple read as MessagePack
-    /// would yield a document with no columns and reject permitted writes.
+    /// Staging must decide here since commit install writes the overlay's
+    /// bodies as-is. `body` is the stored form, so decode must resolve the
+    /// collection's storage mode — reading a strict Binary Tuple as
+    /// MessagePack would yield a columnless document.
     pub(in crate::data::executor) fn stage_admit_write(
         &self,
         rls_write_check: &nodedb_types::RlsWriteCheck,

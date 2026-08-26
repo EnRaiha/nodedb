@@ -15,13 +15,9 @@ use super::admission_guard::reject_unadmitted_crdt_apply;
 use super::outcome::SyncDispatchOutcome;
 use super::propose::propose_sync_write;
 
-/// Dispatch a sync write and return the apply payload plus what the CRDT
-/// admission measured about the delta on the way through.
-///
-/// Cluster path: proposes through Raft and returns the apply payload bytes.
-///
-/// Single-node path: falls through to
-/// [`crate::control::server::shared::ddl::sync_dispatch::dispatch_system_with_source`].
+/// Dispatch a sync write and return the apply payload plus what CRDT admission
+/// measured about the delta. Cluster path proposes through Raft; single-node
+/// falls through to `sync_dispatch::dispatch_system_with_source`.
 pub async fn dispatch_sync_bytes(
     state: &SharedState,
     collection: &str,
@@ -30,8 +26,7 @@ pub async fn dispatch_sync_bytes(
     event_source: EventSource,
     policy: &dyn crate::control::crdt_admission::CrdtPostImagePolicy,
 ) -> crate::Result<SyncDispatchOutcome> {
-    // The sync inbound envelope carries no session database yet, so the Lite
-    // sync path is scoped to the default database.
+    // Sync inbound envelope carries no session database, so scoped to the default database.
     if matches!(
         authorized.plan(),
         PhysicalPlan::Crdt(
@@ -56,9 +51,7 @@ pub async fn dispatch_sync_bytes(
             trimmed_ops: outcome.trimmed_ops,
         });
     }
-    // The CRDT delta path mints no redo of its own before this call — the
-    // admitted-apply path and the Raft entry own its durability — so it supplies
-    // no LSN.
+    // Mints no redo of its own — the admitted-apply path and Raft entry own durability.
     dispatch_write_replicated(state, collection, authorized, timeout, event_source, None)
         .await
         .map(SyncDispatchOutcome::untrimmed)
@@ -66,27 +59,8 @@ pub async fn dispatch_sync_bytes(
 
 /// Dispatch a write so it is quorum-durable when the node is clustered.
 ///
-/// Computes the vshard from `database_id` + `collection`, then applies the same
-/// proposer-gate-then-local-fallback policy used by every write that must not be
-/// lost on leader failover:
-///
-/// * Cluster path — when `async_raft_proposer` is set and `plan` maps to a
-///   `ReplicatedEntry`, the write is proposed through Raft and blocks until the
-///   entry is committed to a quorum and applied locally. This is what makes a
-///   `crdt_apply` durable across replicas: without it the delta lands only on the
-///   receiving node and is lost to every follower (and entirely on leader
-///   failover).
-/// * Single-node / non-replicated path — `async_raft_proposer` is `None` (or the
-///   plan has no replicated form), so the write goes straight to the local Data
-///   Plane and the tenant write-HLC is advanced on success.
-///
-/// `wal_lsn` names the redo record the caller appended for this write before
-/// calling, or `None` when it appended none. The single-node path waits on it
-/// before returning: the sync handlers turn this return value straight into the
-/// peer's "applied" ack, and a peer that reads that retires the batch forever.
-/// The Raft path does not need it — the committed entry is the durable record.
-///
-/// Returns the apply-payload bytes the caller can map to its own success shape.
+/// Cluster path proposes through Raft and blocks until applied locally. Single-node
+/// path waits on `wal_lsn` (the caller's already-appended redo) before returning.
 pub async fn dispatch_write_replicated(
     state: &SharedState,
     collection: &str,
@@ -158,9 +132,8 @@ pub async fn dispatch_write_replicated(
     };
 
     if resp.status != Status::Ok {
-        // Preserve the typed Data-Plane error code so the CRDT delta path can
-        // build a precise compensation hint by type instead of substring-matching
-        // a human message.
+        // Preserve the typed error code so the CRDT delta path builds a precise
+        // compensation hint instead of substring-matching a message.
         return Err(match resp.error_code {
             Some(code) => crate::Error::DataPlane(*code),
             None => crate::Error::Internal {
@@ -169,18 +142,13 @@ pub async fn dispatch_write_replicated(
         });
     }
 
-    // Durable-at-ack barrier for the single-node path. The system-task dispatch
-    // above hands the plan to the Data Plane directly, so the Control-Plane write
-    // funnel's own barrier never runs for it; the record the caller appended is
-    // still only buffered at this point. Every engine that reaches here rebuilds
-    // its state by WAL replay alone, so returning without this fsync acks a write
-    // a `kill -9` erases — and the peer, having seen "applied", never re-sends it.
+    // System-task dispatch bypasses the write funnel's own durable-at-ack barrier —
+    // without this fsync, `kill -9` erases an acked write.
     if let Some(lsn) = wal_lsn {
         state.wal.wait_durable(lsn).await?;
     }
 
-    // Mirror `dispatch_system_with_source`: advance the tenant write-HLC on the
-    // success path (the Response-returning core leaves this to the caller).
+    // Mirrors `dispatch_system_with_source`'s success-path write-HLC advance.
     state.advance_tenant_write_hlc(tenant_id.as_u64());
     Ok(resp.payload.to_vec())
 }
@@ -196,11 +164,8 @@ mod tests {
     use super::dispatch_write_replicated;
     use crate::event::EventSource;
 
-    /// The timeseries and columnar sync handlers append their redo and then ack
-    /// their peer off this return value. The single-node branch hands the plan
-    /// to the Data Plane directly, so the write funnel's own barrier never runs
-    /// for it — without the wait below the record is still only buffered when
-    /// the peer is told "applied", and it never re-sends.
+    /// Guards the single-node branch's durable-at-ack barrier: without the wait
+    /// below, the record is still only buffered when the peer hears "applied".
     #[tokio::test]
     async fn a_supplied_lsn_is_fsync_durable_before_the_payload_returns() {
         let (state, side, _directory) = fixture();

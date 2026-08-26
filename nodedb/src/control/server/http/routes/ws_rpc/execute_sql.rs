@@ -20,9 +20,8 @@ use crate::types::{DatabaseId, TraceId};
 
 /// Execute SQL and return result as JSON.
 ///
-/// Routes through the gateway when available (cluster-aware dispatch);
-/// falls back to direct local SPSC dispatch on single-node boot before
-/// the gateway is initialised.
+/// Routes through the gateway when available; falls back to local SPSC
+/// dispatch on single-node boot before the gateway is initialised.
 pub async fn execute_sql(
     shared: &Arc<SharedState>,
     query_ctx: &crate::control::planner::context::QueryContext,
@@ -39,28 +38,22 @@ pub async fn execute_sql(
     // Quota enforcement — reject before planning or dispatch.
     shared.check_tenant_quota(tenant_id)?;
 
-    // The RPC-selected database is authoritative for RLS variables — passed
-    // as the session database so `scope.database_id()` resolves to exactly
-    // `database_id` rather than falling back through `identity`'s default.
+    // RPC-selected database is authoritative for RLS; passed as the session
+    // database so `scope.database_id()` resolves to `database_id`.
     let request = RequestAuthScope::builder(identity, shared.auth_stores())
         .with_session_database(Some(database_id))
         .build_for_client(peer_addr);
 
-    // Request-admission gate: internal-service exemption, blacklist, account
-    // status, then rate limit — before any planning/dispatch, so load is
-    // shed before it is spent. WebSocket RPC has no HTTP response headers to
-    // attach `X-RateLimit-*` to, so the rate-limit outcome is discarded on
-    // success; a denial still fails the request closed via `?`.
+    // Admission gate runs before planning/dispatch. WebSocket has no headers for
+    // `X-RateLimit-*`, so the outcome is discarded on success; a denial still fails closed.
     crate::control::server::session_auth::check_request_admission(shared, &request, "sql")?;
 
     let (clean_sql, scope) = crate::control::server::session_auth::apply_per_query_on_deny(
         sql,
         request.into_resolved_scope(),
     );
-    // Planning and lease admission run as one retried unit so a descriptor
-    // drain starting between them is absorbed rather than surfaced. The scope
-    // is retained through every orchestrated or Data-Plane execution and
-    // response decode below.
+    // Planning and lease admission run as one retried unit so a descriptor drain
+    // between them is absorbed.
     let admission = plan_authorize_and_admit(PlanAdmissionRequest {
         state: shared,
         query_ctx,
@@ -75,35 +68,27 @@ pub async fn execute_sql(
 
     let _request = shared.tenant_request_guard(tenant_id);
 
-    // Resolved once per request from the tasks' plans and the caller's own
-    // roles, then reused (never re-derived) at every RETURNING/result decode
-    // site below — an `InsertSelect`/`Merge`/`UpdateFromJoin` row and a plain
-    // dispatch row must be redacted by the same policy snapshot.
+    // Resolved once and reused at every decode site — orchestrated rows and plain
+    // dispatch rows must be redacted by the same policy snapshot.
     let redaction =
         QueryRedaction::for_plans(tenant_id, scope.auth(), tasks.iter().map(|t| &t.plan));
 
     let mut results = Vec::new();
-    // Checked once rather than per task — metering is disabled by default,
-    // so this keeps the per-task extraction below (which clones the
-    // collection name) a true no-op on the hot path for every deployment
-    // that hasn't turned it on.
+    // Checked once, not per task: keeps per-task extraction a no-op when metering
+    // is disabled (the default).
     let metering_enabled = shared.metering_config.enabled;
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
-        // Extracted from `task.plan` before it's cloned/moved into any
-        // branch below — metering needs the collection/engine shape after
-        // this task's dispatch succeeds. `results.len()` before dispatch
-        // gives this task's row-count baseline for the delta metered below.
+        // Extracted before `task.plan` is cloned/moved; `results.len()` gives this
+        // task's row-count baseline for the delta metered below.
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
-        // A spent hard quota refuses the task before it runs; the charging
-        // calls below are all on the success path and so can never refuse
-        // anything themselves.
+        // A spent hard quota refuses the task before it runs; charging below is
+        // success-path only and never refuses.
         if let Some(info) = &plan_metering_info {
             admit_quota_for_dispatch(shared, &scope, info)?;
         }
         let rows_before = results.len();
-        // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh,
-        // registered surrogate per target row + atomic `BatchInsert`), never
-        // dispatched to the Data Plane as a single op.
+        // `INSERT ... SELECT` orchestrates on the Control Plane, never dispatched
+        // to the Data Plane as a single op.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
         ) = &task.plan
@@ -134,9 +119,8 @@ pub async fn execute_sql(
             continue;
         }
 
-        // Autocommit `MERGE` is orchestrated on the Control Plane (fresh,
-        // registered surrogate per NOT-MATCHED insert row + atomic apply),
-        // never dispatched to the Data Plane as a single op.
+        // Autocommit `MERGE` orchestrates on the Control Plane, never dispatched
+        // to the Data Plane as a single op.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::Merge {
                 target_collection: _,
@@ -177,10 +161,8 @@ pub async fn execute_sql(
             continue;
         }
 
-        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control
-        // Plane (source scanned on its own core + shipped into the plan), never
-        // dispatched to the Data Plane as a single op reading a possibly-
-        // non-resident source.
+        // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
+        // ships it into the plan, never dispatched as a single op.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
                 target_collection: _,
@@ -224,11 +206,8 @@ pub async fn execute_sql(
             continue;
         }
 
-        // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy
-        // + live Raft proposer) is resolved to a concrete row set on the
-        // Control Plane before it is proposed. On the local (non-Raft) path
-        // the predicate reaches the Data Plane gate intact and is enforced
-        // correctly there, so this intercept is skipped in that case.
+        // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
+        // before proposing; local (non-Raft) path skips this.
         if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
             && shared.async_raft_proposer().is_some()
         {
@@ -312,9 +291,8 @@ pub async fn execute_sql(
     }
 }
 
-/// Meter one task's dispatch, once its rows (if any) have already been
-/// pushed onto `results` — the row count is the delta since `rows_before`,
-/// so this must run after every push point for the task, never before.
+/// Meter one task's dispatch after its rows are pushed onto `results` —
+/// the row count is the delta since `rows_before`.
 fn meter_task(
     shared: &SharedState,
     scope: &RequestAuthScope<'_>,
@@ -365,12 +343,9 @@ mod tests {
         )
     }
 
-    /// Guards against the `peer_addr` thread regressing back to a hardcoded
-    /// placeholder (e.g. `"ws"`): a real client IP that has been
-    /// `BLACKLIST IP`'d must be rejected by `execute_sql`'s admission gate.
-    /// With a non-IP placeholder standing in for the peer address,
-    /// `normalize_peer_ip` can't parse it, `check_ip` silently matches
-    /// nothing, and this request would incorrectly succeed.
+    /// Guards `peer_addr` against regressing to a hardcoded placeholder: a
+    /// non-IP value can't be parsed by `normalize_peer_ip`, so `check_ip`
+    /// would silently match nothing and let a blacklisted client through.
     #[tokio::test]
     async fn blacklisted_peer_ip_is_rejected() {
         let (state, _dir) = test_state().await;
@@ -453,20 +428,17 @@ mod tests {
         RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)
     }
 
-    /// `meter_task` is called unconditionally after every dispatch branch in
-    /// `execute_sql` (see the source above — always right after `results` is
-    /// updated, never on the `Err(e) => return Err(e)` arms), so covering it
-    /// directly here exercises the same enabled/disabled and row-count
-    /// behavior every call site relies on.
+    /// `meter_task` runs unconditionally after every dispatch branch in
+    /// `execute_sql`, right after `results` updates — exercises the same
+    /// enabled/disabled and row-count behavior every call site relies on.
     #[tokio::test]
     async fn meter_task_disabled_by_default_records_nothing() {
         let (state, _dir) = test_state().await;
         assert!(!state.metering_config.enabled, "default is disabled");
         let identity = regular_identity(9201);
         let scope = scope_for(&identity, &state);
-        // `Some(...)` regardless of the disabled config, to prove
-        // `meter_dispatch`'s own internal enabled-check (not just the call
-        // site's `metering_enabled.then(...)` gate) protects this call.
+        // `Some(...)` regardless of config, to prove `meter_dispatch`'s own
+        // enabled-check protects this call, not just the caller's gate.
         let info = Some(PlanMeteringInfo::extract(&kv_get_plan()));
         let results = vec![serde_json::Value::Null; 3];
 

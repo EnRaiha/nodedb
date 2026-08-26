@@ -2,15 +2,10 @@
 
 //! Document format conversion between JSON and MessagePack.
 //!
-//! Documents enter the system as JSON (from SQL INSERT via DataFusion).
-//! They are stored in redb as MessagePack (compact binary, faster to
-//! deserialize, supports targeted field extraction).
-//!
-//! On read, documents are returned as `serde_json::Value` regardless of
-//! storage format. During migration, both JSON and MessagePack blobs may
-//! coexist in the same redb table — format is detected by inspecting the
-//! first byte (MessagePack maps start with 0x80-0x8F for fixmap, 0xDE for
-//! map16, 0xDF for map32; JSON objects start with `{` = 0x7B).
+//! Documents enter as JSON, are stored as MessagePack, and read back as
+//! `serde_json::Value` regardless of storage format. Both may coexist in the
+//! same redb table — format is detected from the first byte (MessagePack map
+//! headers are 0x80-0x8F/0xDE/0xDF; JSON objects start with `{`).
 
 use sonic_rs;
 
@@ -27,24 +22,17 @@ fn looks_like_msgpack_map(first: u8) -> bool {
     (0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF
 }
 
-/// Convert a document byte blob to `serde_json::Value`.
-///
-/// Auto-detects the format: MessagePack or JSON. Both readers require the
-/// input to be consumed in full, so a body with a stray suffix, a truncated
-/// body with another concatenated onto it, or two documents written into one
-/// slot are decode failures rather than a silent decode of the leading value.
-///
-/// Binary Tuple is NOT auto-detected here because decoding it requires the
-/// schema. For strict collections, callers must check
-/// `doc_configs.storage_mode` and use `strict_format::binary_tuple_to_json()`.
+/// Convert a document byte blob to `serde_json::Value`. Auto-detects
+/// MessagePack or JSON; a stray suffix or two concatenated documents fail
+/// rather than silently decode the leading value. Binary Tuple is NOT
+/// auto-detected — strict collections must use `binary_tuple_to_json()`.
 pub(super) fn decode_document(bytes: &[u8]) -> crate::Result<serde_json::Value> {
     if bytes.is_empty() {
         return Err(decode_err("document", "empty body"));
     }
 
-    // Detect MessagePack: maps start with 0x80-0x8F (fixmap), 0xDE (map16), 0xDF (map32).
-    // Those bytes cannot begin JSON text, so there is no second format to fall
-    // back to — reporting why the msgpack read failed beats re-guessing.
+    // Those header bytes cannot begin JSON, so a msgpack decode failure is
+    // reported directly rather than falling back to a JSON re-guess.
     if looks_like_msgpack_map(bytes[0]) {
         return nodedb_types::json_from_msgpack(bytes).map_err(|e| decode_err("msgpack", e));
     }
@@ -52,16 +40,9 @@ pub(super) fn decode_document(bytes: &[u8]) -> crate::Result<serde_json::Value> 
     sonic_rs::from_slice(bytes).map_err(|e| decode_err("json", e))
 }
 
-/// Decode a stored row that may be either schemaless (MessagePack/JSON) or a
-/// strict collection's Binary Tuple, dispatching on whether a schema was
-/// given.
-///
-/// This is the shape every "decode a row I don't yet know the storage mode
-/// of, by schema" call site converged on independently — the versioned scan
-/// predicate, MERGE's target-row classifier, and MERGE's source/target join
-/// key extractor. `context` names the caller in the error so each site keeps
-/// its own diagnostic (e.g. `"MERGE target row"`, `"versioned row body"`)
-/// while the decode + error-construction logic lives once.
+/// Decode a stored row that may be schemaless (MessagePack/JSON) or a strict
+/// collection's Binary Tuple, dispatching on whether a schema was given.
+/// `context` names the caller in the error message.
 pub(super) fn decode_document_or_binary_tuple(
     bytes: &[u8],
     strict_schema: Option<&nodedb_types::columnar::StrictSchema>,
@@ -81,13 +62,10 @@ pub(super) fn decode_document_or_binary_tuple(
     }
 }
 
-/// Convert a document byte blob to `nodedb_types::Value`.
-///
-/// Preserves all native types (Geometry, DateTime, Decimal, etc.) that
-/// would be lost when decoding to `serde_json::Value`.
-/// Auto-detects msgpack vs JSON, with the same full-consumption requirement as
-/// [`decode_document`]. Binary Tuple requires schema — callers should use
-/// `strict_format::binary_tuple_to_value` for strict collections.
+/// Convert a document byte blob to `nodedb_types::Value`, preserving native
+/// types lost when decoding to `serde_json::Value`. Same detection and
+/// full-consumption rules as [`decode_document`]; strict collections should
+/// use `strict_format::binary_tuple_to_value` instead.
 pub(super) fn decode_document_value(bytes: &[u8]) -> crate::Result<nodedb_types::Value> {
     if bytes.is_empty() {
         return Err(decode_err("document", "empty body"));
@@ -102,10 +80,8 @@ pub(super) fn decode_document_value(bytes: &[u8]) -> crate::Result<nodedb_types:
     Ok(nodedb_types::Value::from(json))
 }
 
-/// Encode a JSON value as MessagePack bytes for storage.
-///
-/// If encoding fails (should not happen for valid `serde_json::Value`),
-/// falls back to JSON bytes.
+/// Encode a JSON value as MessagePack bytes; falls back to JSON bytes if
+/// encoding fails.
 pub(super) fn encode_to_msgpack(value: &serde_json::Value) -> Vec<u8> {
     nodedb_types::json_to_msgpack(value).unwrap_or_else(|_| {
         // Fallback: store as JSON if MessagePack encoding fails.
@@ -113,35 +89,20 @@ pub(super) fn encode_to_msgpack(value: &serde_json::Value) -> Vec<u8> {
     })
 }
 
-/// Encode a resolved document to the standard schemaless document wire body.
-///
-/// This is the ONE body encoding a RESOLVE pass hands the Control Plane, for
-/// MERGE and `UPDATE ... FROM` alike: the Control Plane rewrites those arms into
-/// point ops whose bodies are re-encoded to stored form (Binary Tuple for a
-/// strict target) by the normal write path, so a stored-form body there is
-/// double-encoded and fails to decode.
-///
-/// The document store, the scan decoder, AND the vector-search result flattener
-/// (`from_msgpack::<HashMap<String, nodedb_types::Value>>`) all expect the
-/// `nodedb_types::Value` msgpack encoding that plain `INSERT` produces. Encoding
-/// via `json_to_msgpack` instead yields a JSON-flavoured map that the scan can
-/// still read but the vector flattener cannot decode — so a resolved row's
-/// non-key fields come back empty from a vector search.
+/// Encode a resolved document (MERGE / `UPDATE ... FROM`) to the standard
+/// schemaless wire body — the same `nodedb_types::Value` msgpack encoding
+/// plain `INSERT` produces. `json_to_msgpack` instead yields a JSON-flavoured
+/// map the vector-search flattener can't decode, so a resolved row's
+/// non-key fields would come back empty from a vector search.
 pub(super) fn encode_resolved_wire_body(doc: &serde_json::Value) -> Vec<u8> {
     let value: nodedb_types::Value = doc.clone().into();
     nodedb_types::value_to_msgpack(&value).unwrap_or_else(|_| encode_to_msgpack(doc))
 }
 
 /// Convert JSON bytes to MessagePack bytes, borrowing when nothing changes.
-///
-/// Handles three input formats:
-/// - Standard msgpack map (0x80–0x8F / 0xDE / 0xDF): borrowed as-is.
-/// - JSON bytes: parsed and re-encoded as standard msgpack map (owned).
-/// - Unknown bytes: borrowed as-is.
-///
-/// The common case on a scan is the first one, where the stored body is
-/// already the wanted encoding — borrowing there is what keeps a whole-scan
-/// normalization pass from being a per-row `memcpy` of every document body.
+/// A standard msgpack map or unknown bytes pass through borrowed; JSON is
+/// parsed and re-encoded (owned). Borrowing the common case is what keeps a
+/// whole-scan normalization pass from `memcpy`-ing every document body.
 pub(super) fn json_to_msgpack_cow(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     use std::borrow::Cow;
 
@@ -164,30 +125,16 @@ pub(super) fn json_to_msgpack_cow(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 
 /// Owning form of [`json_to_msgpack_cow`], for callers that must keep the
 /// result past the input's lifetime or hand it on as a `Vec`.
-///
-/// The rules live in the `_cow` form and only there; this is a one-line
-/// adapter so the two forms cannot disagree about what a given body decodes
-/// to.
 pub(super) fn json_to_msgpack(bytes: &[u8]) -> Vec<u8> {
     json_to_msgpack_cow(bytes).into_owned()
 }
 
-/// Convert a vector-primary metadata sidecar body to a standard MessagePack map.
-///
-/// A sidecar is `zerompk::to_msgpack_vec(&HashMap<String, nodedb_types::Value>)`
-/// — the TAGGED form, where each value is a `[tag, payload]` array
-/// (`Value::String("r1")` → `[4,"r1"]`) — stored verbatim by the vector upsert
-/// handler. Handing those bytes to a document decoder yields tag arrays where
-/// the client expects values, because the outer container is an ordinary
-/// MessagePack map and passes every "is this already msgpack?" guard.
-///
-/// This is why the choice is never made by inspecting bytes: it is made by the
-/// caller, from the collection's registered kind, and lands here.
-///
-/// Bytes that do not decode as a tagged map are returned unchanged rather than
-/// re-guessed — a sidecar that cannot be read as one is not something a second
-/// format guess can rescue. Those pass-through cases borrow; only the real
-/// transcode allocates.
+/// Convert a vector-primary metadata sidecar body (tagged msgpack, each value
+/// a `[tag, payload]` array) to a standard MessagePack map. A document
+/// decoder would return the tag arrays verbatim since the outer container
+/// still passes every "is this already msgpack?" guard — the caller must
+/// route by collection kind, never by inspecting bytes. Non-tagged bytes
+/// pass through unchanged (borrowed); only the real transcode allocates.
 pub(super) fn vector_sidecar_to_msgpack_cow(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     use std::borrow::Cow;
 
@@ -322,11 +269,8 @@ mod tests {
         assert!(nodedb_query::msgpack_scan::extract_field(&canonical, 0, "user_id").is_some());
     }
 
-    /// The sidecar normalizer must turn tagged values into real values.
-    ///
-    /// Passing the same bytes through `json_to_msgpack` returns them untouched
-    /// (its guard only reads the outer map header), which is exactly how
-    /// `[4,"alice"]` reached clients as a payload column value.
+    /// The sidecar normalizer must turn tagged values into real values;
+    /// `json_to_msgpack` alone returns them untouched (tag arrays leaking out).
     #[test]
     fn a_tagged_sidecar_decodes_to_values_not_tag_arrays() {
         let mut obj = std::collections::HashMap::new();

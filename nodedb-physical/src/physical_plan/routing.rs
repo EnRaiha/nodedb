@@ -2,40 +2,21 @@
 
 //! Cross-node routing predicates for physical plans.
 //!
-//! Predicates used by the coordinator to decide how to route a plan: whether
-//! a plan tree contains a genuinely cluster-partitioned leaf (graph / array)
-//! that requires a dedicated scatter-gather path, versus a single-vShard-homed
-//! source (document / kv / columnar / ts / spatial / vector / text) that can
-//! be routed directly to the owning vShard via the gateway's `other` arm.
+//! Decides whether a plan tree contains a cluster-partitioned leaf (graph /
+//! array, needing scatter-gather) versus a single-vShard-homed source
+//! (document / kv / columnar / ts / spatial / vector / text, routed directly).
 
 use super::{ExchangeOp, GraphOp, PhysicalPlan, QueryOp};
 
-/// Returns `true` if the plan tree contains a genuinely cluster-partitioned
-/// leaf — one where rows are distributed across vShards by node-id or tile-id
-/// rather than being wholly owned by a single vShard determined by collection
-/// name hash.
+/// `true` if the plan tree contains a leaf whose rows are distributed across
+/// vShards by node-id or tile-id (graph traversal, Array/ClusterArray),
+/// rather than wholly owned by one vShard hashed from the collection name.
 ///
-/// # Single-vShard-homed collections (returns `false`)
-///
-/// Standard collections (document, kv, columnar, timeseries, spatial, vector,
-/// text) are single-vShard-homed: all rows for a collection live on the one
-/// vShard whose id is `vshard_for_collection(database_id, &name)`.  Routing
-/// the bare plan to that vShard via the gateway's `other` arm returns exactly
-/// the right rows with no duplication.  Broadcasting to every vShard would
-/// return the full collection from the owning node on every route that lands
-/// there, multiplying rows by 1 024 ×.
-///
-/// # Cluster-partitioned sources (returns `true`)
-///
-/// Graph traversal ops (Hop, Neighbors, NeighborsMulti, Path, Subgraph,
-/// RagFusion, Algo, Match, TemporalNeighbors, TemporalAlgorithm, Stats) and
-/// Array / ClusterArray ops distribute data by graph node-id or array tile-id
-/// across vShards.  A cross-node gather for these sources requires a dedicated
-/// scatter-gather path; this function signals callers to take the appropriate
-/// fallback rather than silently producing wrong results.
-///
-/// The function recurses through wrapper ops the same way `is_sharded_source`
-/// does.
+/// Routing a single-vShard-homed plan (document/kv/columnar/ts/spatial/
+/// vector/text) via the gateway's `other` arm returns exactly the right rows;
+/// broadcasting a cluster-partitioned one would multiply rows across vShards
+/// — callers must take the scatter-gather path instead. Recurses through
+/// wrapper ops the same way `is_sharded_source` does.
 pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
     match plan {
         // Recurse through aggregate wrappers.

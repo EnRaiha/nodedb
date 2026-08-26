@@ -48,28 +48,8 @@ fn no_serving_leader() -> PgWireError {
 
 impl NodeDbPgHandler {
     /// Prove against a quorum that this node still leads `group_id`.
-    ///
-    /// The routing table said so, but it is a cached view: a partitioned
-    /// leader keeps its entry long after the rest of the cluster has elected
-    /// a successor. Reads served on that entry alone return state the new
-    /// leader has already moved past.
-    /// Refuse to coordinate work while this node is known to be behind the
-    /// cluster's topology generation.
-    ///
-    /// A peer's frame carried an epoch this node has not applied, so some
-    /// topology transition has committed that this node has not processed.
-    /// Its routing table, placement, and group membership are all derived from
-    /// the older generation, and any work planned against them is planned
-    /// against a superseded view of the cluster.
-    ///
-    /// A node judges only itself here. It knows exactly which generation it
-    /// has applied, and only ever guesses at where its peers are, so the sound
-    /// move is to stand down rather than to start rejecting others on the
-    /// strength of a number overheard on the wire.
-    ///
-    /// Self-clearing: the metadata group delivers the bump, the applied mark
-    /// catches up, and the next attempt proceeds. Raft traffic is never gated
-    /// this way — it is how the node catches up in the first place.
+    /// The routing table is a cached view — a partitioned leader keeps its
+    /// entry long after a successor is elected.
     fn refuse_if_topology_view_superseded(&self) -> PgWireResult<()> {
         let Some(epoch) = self.state.cluster_epoch.get() else {
             return Ok(());
@@ -82,9 +62,7 @@ impl NodeDbPgHandler {
 
     async fn confirm_local_leadership(&self, group_id: u64) -> PgWireResult<()> {
         let Some(gate) = self.state.raft_read_gate.get() else {
-            // Reached only if a clustered node routed here before `start_raft`
-            // published the gate. Refusing is retriable; serving would be
-            // the unproven read this exists to prevent.
+            // Reached only if routed here before `start_raft` published the gate.
             return Err(no_serving_leader());
         };
         use crate::control::cluster::read_index::ReadIndexRefusal;
@@ -144,9 +122,7 @@ impl NodeDbPgHandler {
                 result_formats,
                 auth,
             },
-            // The implicit-edge recon gate fires before any materialized-sum
-            // settlement is reachable on this path, so there is no settled
-            // image read to carry.
+            // No settled image read to carry — this fires before materialized-sum settlement.
             &[],
         )
         .await
@@ -155,8 +131,8 @@ impl NodeDbPgHandler {
 
     /// Forward an ordinary remote-leader task set through the gateway.
     ///
-    /// Unresolved multi-step DML remains local so its capability-bearing
-    /// orchestrator can resolve the final plans before authorization.
+    /// Unresolved multi-step DML stays local so its orchestrator can resolve
+    /// final plans before authorization.
     pub(super) async fn maybe_dispatch_tasks_via_gateway(
         &self,
         tasks: &[PhysicalTask],

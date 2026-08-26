@@ -13,10 +13,8 @@ use std::time::{Duration, Instant};
 
 use super::config_toml::{self, AuthMode};
 
-/// Bind an ephemeral port then release it, handing the number to a child
-/// process that will bind it itself. A second process can win the same port
-/// before the child binds — `crash_harness::free_port` already accepts this
-/// race, so this mirrors it rather than inventing a different scheme.
+/// Bind an ephemeral port then release it for a child process to bind
+/// itself. Mirrors `crash_harness::free_port`, which accepts the same race.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener
@@ -114,12 +112,8 @@ pub(super) struct SpawnedServer {
 }
 
 /// Spawn the real `nodedb` binary against `data_dir` and block until
-/// `/healthz` reports ready.
-///
-/// Retries with fresh ports when the server exits during startup: `free_port`
-/// releases the port before the child binds it, so a suite starting many
-/// servers at once can lose the race. A server that never starts still fails
-/// the test, with its log.
+/// `/healthz` reports ready. Retries with fresh ports when the server exits
+/// during startup, since `free_port` can lose the bind race.
 pub(super) fn spawn(
     data_dir: &Path,
     auth_mode: AuthMode,
@@ -194,10 +188,8 @@ fn try_spawn(
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl SpawnedServer {
-    /// Send `SIGTERM` and wait for the process to exit — the server's own
-    /// signal handler runs its graceful shutdown, which syncs the WAL (see
-    /// `src/bootstrap/signal.rs`). Falls back to `SIGKILL` if it does not
-    /// exit within the timeout.
+    /// Send `SIGTERM` and wait for exit — the signal handler runs graceful
+    /// shutdown (syncs the WAL). Falls back to `SIGKILL` on timeout.
     pub(super) async fn graceful_shutdown(mut self) {
         let Some(mut child) = self.child.take() else {
             return;

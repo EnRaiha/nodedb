@@ -191,9 +191,8 @@ fn document_touched_collections(
         | BulkUpdate { collection, .. }
         | BulkDelete { collection, .. }
         | MaterializeScan { collection, .. }
-        // The TARGET collection whose balance this derived write moves.
-        // It is the only collection the op touches — the source row that
-        // caused it rides a separate task on its own vShard.
+        // The only collection ApplyBalanceDelta touches — the causing
+        // source row rides a separate task on its own vShard.
         | ApplyBalanceDelta { collection, .. } => out.push(collection.clone()),
 
         InsertSelect {

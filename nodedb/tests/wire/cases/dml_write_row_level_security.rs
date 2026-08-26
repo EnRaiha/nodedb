@@ -1,26 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Row-level security over document writes whose row image is built where the
-//! row is persisted.
-//!
-//! An `INSERT` carries its whole new row in the plan, so a write policy decides
-//! it before dispatch. `UPDATE`, `DELETE`, `UPSERT`, and `MERGE` do not: the
-//! post-image of an update exists only after the stored row is read and the
-//! assignments are applied, and a delete's image only after the row being
-//! removed is read. The compiled predicate therefore travels with the plan and
-//! is evaluated in the storage engine against the exact bytes about to be
-//! written.
-//!
-//! What these tests pin:
-//!
-//! - A rejected row fails the WHOLE statement and leaves storage untouched. A
-//!   silently skipped row would report an affected count for a write that never
-//!   happened, and would leave a multi-row statement half applied.
-//! - The gate is the WRITE policy, not the read policy. A collection carrying
-//!   only a `FOR READ` policy must keep writing exactly as before.
-//! - `FOR ALL` decides both halves, from one `USING` clause.
-//! - An unresolvable `$auth.*` reference denies rather than compiling to an
-//!   allow-everything predicate.
+//! Row-level security over document writes whose row image is built where
+//! the row is persisted: `UPDATE`/`DELETE`/`UPSERT`/`MERGE` don't have a
+//! post-image until the stored row is read and assignments applied, so the
+//! compiled predicate travels with the plan and is evaluated in the storage
+//! engine. Pins: a rejected row fails the whole statement, the gate is the
+//! write policy not the read policy, `FOR ALL` decides both halves, and an
+//! unresolvable `$auth.*` reference denies rather than allowing everything.
 
 use crate::harness::TestServer;
 
@@ -153,9 +139,8 @@ async fn update_producing_a_violating_row_is_rejected_and_writes_nothing() {
         "a rejected update must leave every stored row exactly as it was"
     );
 
-    // A CONFORMING update of the same shape must still apply and land. Without
-    // this the test passes on a blanket refusal of every governed update — the
-    // policy would look enforced while nothing worked.
+    // A conforming update of the same shape must still apply, or a blanket
+    // refusal would look like enforcement.
     try_exec_as(
         &server,
         user,
@@ -393,11 +378,9 @@ async fn a_for_all_policy_gates_both_reads_and_writes() {
     .expect("a conforming write under FOR ALL must apply");
 }
 
-/// A write predicate naming a session variable the identity does not CARRY
-/// cannot be resolved. `$auth.org_id` is a valid variable — the policy parses —
-/// but a password-created user has no organization, so it resolves to nothing
-/// at query time. That must deny, not compile to an empty (allow-everything)
-/// gate: the fail-closed rule the read path already follows.
+/// `$auth.org_id` parses, but a password-created user has no organization,
+/// so it resolves to nothing at query time. Must deny, not compile to an
+/// allow-everything gate — the same fail-closed rule the read path follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unresolvable_auth_reference_denies_the_write() {
     let server = TestServer::start().await;

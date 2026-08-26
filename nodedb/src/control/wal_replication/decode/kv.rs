@@ -35,19 +35,15 @@ pub(super) fn put(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
-        // Carried on the record — a replay re-executes this write for the
-        // originating request, not just for the follower's own state.
+        // Carried on the record — a replay re-executes for the originating request.
         returning: returning.returning,
         rls_filters: returning.rls_filters.to_vec(),
     }))
 }
 
-/// Every plan reconstructed in this module carries
-/// `RlsWriteCheck::already_decided_elsewhere()`. The predicate is a property
-/// of the session that issued the write, not of the row, and the writing
-/// identity is not available on this node: a replay re-applies a write that
-/// was already admitted, so re-deciding it against the policies of whoever
-/// is connected at recovery time would make recovery non-deterministic.
+/// Every plan reconstructed here carries `RlsWriteCheck::already_decided_elsewhere()`
+/// — the writing identity isn't available on this node, so re-deciding at
+/// recovery time would make it non-deterministic.
 pub(super) fn delete(collection: &str, keys: &[Vec<u8>]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Delete {
         collection: collection.to_owned(),
@@ -295,8 +291,7 @@ pub(super) fn get_set(
         key: key.to_vec(),
         new_value: new_value.to_vec(),
         surrogate,
-        // Carried on the record — the old value this op hands back is gated
-        // by the same read filters the originating request carried.
+        // Carried on the record — gated by the originating request's read filters.
         rls_filters: rls_filters.to_vec(),
         // No predicate on replay — see `delete`.
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
@@ -336,10 +331,8 @@ pub(super) fn drop_sorted_index(index_name: &str) -> PhysicalPlan {
     })
 }
 
-/// Reconstruct a `RegisterIndex` plan. No surrogate binding — a secondary
-/// index carries no per-row identity; apply re-runs registration (and, if
-/// `backfill`, the scan of pre-existing rows) live on the follower, and the
-/// local WAL append makes it durable there.
+/// Reconstruct a `RegisterIndex` plan. No surrogate binding — apply re-runs
+/// registration (and, if `backfill`, the scan) live on the follower.
 pub(super) fn register_index(
     collection: &str,
     field: &str,
@@ -418,12 +411,8 @@ pub(super) fn truncate(collection: &str) -> PhysicalPlan {
     })
 }
 
-/// Reconstruct a resolved KV write plan (`KvOp::ResolvedWrite`).
-///
-/// Every `Put` mutation's surrogate is bound through the assigner against its
-/// own `(collection, key)`, so a follower addresses the same rows the leader
-/// did even though one write spans two collections. Nothing else is
-/// re-derived: expiry instants and the reply travel on the record.
+/// Reconstruct a resolved KV write plan (`KvOp::ResolvedWrite`). Every `Put`
+/// mutation's surrogate binds against its own `(collection, key)`.
 pub(super) fn resolved_write(
     ctx: &DecodeCtx,
     mutations: &[super::super::types::KvResolvedMutationWire],
@@ -475,8 +464,7 @@ pub(super) fn resolved_write(
                     collection: collection.clone(),
                     key: key.clone(),
                     ttl_ms: *ttl_ms,
-                    // Stamped from the wire, never from this node's clock —
-                    // mirrors the `KvExpire` arm, per mutation.
+                    // Stamped from the wire, mirroring the `KvExpire` arm.
                     resolved_now_ms: *resolved_now_ms,
                     precondition: precondition.clone(),
                 },
@@ -496,8 +484,7 @@ pub(super) fn resolved_write(
     Ok(PhysicalPlan::Kv(KvOp::ResolvedWrite {
         mutations: decoded,
         response_payload: response_payload.to_vec(),
-        // The decision was made before this entry was proposed; the record is
-        // what proves it — see `delete` for why nothing is re-decided here.
+        // Decided before this entry was proposed — see `delete` for why.
         rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
     }))
 }

@@ -55,10 +55,8 @@ async fn bitemporal_tx_insert_rollback_restores_pre_txn_absence() {
     );
 }
 
-/// ROLLBACK of a transactional DELETE on a bitemporal collection must
-/// restore the pre-transaction row exactly, both via a fresh point-lookup
-/// (not served a stale "deleted" state from any point-lookup cache) and via
-/// `AS OF SYSTEM TIME`.
+/// ROLLBACK of a transactional DELETE must restore the pre-transaction row,
+/// both via a fresh point-lookup and via `AS OF SYSTEM TIME`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bitemporal_tx_delete_rollback_restores_pre_txn_row() {
     let srv = TestServer::start().await;

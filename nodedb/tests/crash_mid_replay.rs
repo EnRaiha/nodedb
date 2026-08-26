@@ -1,44 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Replay idempotency when recovery itself is interrupted.
-//!
-//! Every other crash test crashes the server during normal operation and then
-//! lets recovery run once, to completion. That proves replay restores an
-//! acknowledged write; it says nothing about replay being *re-runnable*. A
-//! recovering server is exactly as crashable as a serving one — a power cut
-//! during boot lands mid-replay — and the next boot then replays the same WAL
-//! on top of whatever the interrupted attempt already made durable.
-//!
-//! That second replay has two ways to be wrong, and they point at opposite
-//! bugs:
-//!
-//! * **Rows missing** — replay treated some record as already applied (a
-//!   watermark advanced, a marker written) when the interrupted pass had not
-//!   actually made it durable. Acknowledged data is gone.
-//! * **Rows duplicated** — replay re-applied a record whose effect the
-//!   interrupted pass *had* made durable, and the effect is not an idempotent
-//!   overwrite. Timeseries ingest is an append: nothing upserts a second copy
-//!   away, so a double-apply is permanent.
-//!
-//! Presence checks cannot tell those apart, so every assertion here is on an
-//! exact count.
-//!
-//! The interruption point is unreachable from outside the process — the whole
-//! replay sequence finishes before the server ever opens a listener — so the
-//! crash is injected from within, via a `NODEDB_FAILPOINTS` `abort` armed for
-//! ONE boot only. Two points are covered, chosen to bracket the failure modes:
-//!
-//! * `replay::kv_mid_pass` — part way through a single engine's records, with
-//!   earlier engines' passes already complete.
-//! * `replay::between_standalone_and_redo` — every standalone engine pass done,
-//!   the redo-only document / graph arms not yet run.
-//!
-//! Writes span more than one engine (KV, document_strict, timeseries) because
-//! replay walks them in one globally LSN-ordered pass: an interruption part way
-//! through leaves *some* engines applied and others not, which is the state a
-//! single-engine test can never produce.
-//!
-//! Requires `--features failpoints`.
+//! Replay idempotency when recovery itself is interrupted: a power cut
+//! mid-replay means the next boot replays the same WAL on top of whatever
+//! the interrupted attempt already made durable. Two failure modes — rows
+//! missing or duplicated — so every assertion is an exact count. Crash
+//! injected via `NODEDB_FAILPOINTS` at `replay::kv_mid_pass` and
+//! `replay::between_standalone_and_redo`. Requires `--features failpoints`.
 
 #![cfg(feature = "failpoints")]
 
@@ -57,10 +24,8 @@ const ROWS: u32 = 6;
 /// panics rather than continuing.
 const CRASH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `SELECT COUNT(*)` as a number.
-///
-/// Counts, never presence: a presence check passes just as happily when replay
-/// applied the row twice, which is half of what this test exists to catch.
+/// `SELECT COUNT(*)` as a number. Counts, never presence — a presence check
+/// passes just as happily when replay applied the row twice.
 async fn count_rows(h: &CrashHarness, collection: &str) -> u64 {
     let rows = h
         .query_col_idx(&format!("SELECT COUNT(*) FROM {collection}"), 0)
@@ -71,13 +36,8 @@ async fn count_rows(h: &CrashHarness, collection: &str) -> u64 {
         .unwrap_or_else(|e| panic!("COUNT(*) for {collection} was not a number: {rows:?}: {e}"))
 }
 
-/// Assert a recovered row count is EXACTLY the acknowledged count, naming which
-/// fail point was armed and which direction the divergence went.
-///
-/// The two directions are different bugs — under-count means replay skipped
-/// work the interrupted pass had not durably done, over-count means replay
-/// redid work it already had — so they must never be reported with one
-/// undifferentiated message.
+/// Assert a recovered row count is exactly the acknowledged count. The two
+/// directions are different bugs, so never report them with one message.
 fn assert_exact_count(actual: u64, expected: u64, collection: &str, fail_point: &str) {
     if actual < expected {
         panic!(
@@ -111,15 +71,9 @@ fn report_counts(data_dir: &std::path::Path) -> BTreeMap<String, u64> {
 }
 
 /// Fail the test if the successful replay filed a new `InvariantViolation` or
-/// `Corruption` report.
-///
-/// Row counts alone can be right while the server knew something was wrong and
-/// papered over it — a dropped batch, a stalled watermark, a record it could
-/// not decode. Those are recorded as structured reports precisely because they
-/// are silent otherwise, so a "clean" recovery that filed one is not clean.
-/// Only reports that appeared (or recurred) since `before` count: the run
-/// leading up to this point deliberately crashes the server, and any report
-/// from that half is not what is being judged.
+/// `Corruption` report — row counts can be right while the server papered
+/// over a dropped batch or stalled watermark. Only reports since `before`
+/// count; the deliberate crash half is not what's being judged.
 fn assert_no_new_integrity_reports(
     data_dir: &std::path::Path,
     before: &BTreeMap<String, u64>,
@@ -208,11 +162,8 @@ async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
     h.spawn();
     h.await_self_crash(CRASH_TIMEOUT);
 
-    // `await_self_crash` only proves the process exited — it would also be
-    // satisfied by a boot that failed for an unrelated reason and never reached
-    // replay at all. The abort path prints its own line before calling
-    // `abort()`, so require it: without this, a test whose fail point silently
-    // stopped existing would keep passing while injecting nothing.
+    // `await_self_crash` only proves the process exited, not that replay was
+    // reached — require the abort path's own log line too.
     let abort_marker = format!("fail_point aborting process: {fail_point}");
     let log = h.server_log();
     assert!(
@@ -271,19 +222,16 @@ async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
     assert_no_new_integrity_reports(h.data_dir(), &reports_before, fail_point);
 }
 
-/// Crash part way through ONE engine's records, with earlier engines' passes
-/// already complete. The interrupted engine's own state and the engines
-/// replayed before it are at different points in the WAL when the next boot
-/// starts, which is the case a whole-replay-or-nothing model gets wrong.
+/// Crash part way through one engine's records, with earlier engines' passes
+/// already complete — the case a whole-replay-or-nothing model gets wrong.
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_is_idempotent_after_a_crash_mid_kv_pass() {
     replay_is_idempotent_when_interrupted_at("replay::kv_mid_pass").await;
 }
 
-/// Crash after every standalone engine pass but before the redo-only document /
-/// graph arms. Committed-transaction redo is an absolute overwrite applied on
-/// top of state the standalone passes just rebuilt, so re-running the whole
-/// sequence must land on the same result rather than compounding.
+/// Crash after every standalone engine pass but before the redo-only
+/// document/graph arms — redo is an absolute overwrite, so re-running the
+/// whole sequence must land on the same result, not compound.
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_is_idempotent_after_a_crash_between_standalone_and_redo() {
     replay_is_idempotent_when_interrupted_at("replay::between_standalone_and_redo").await;

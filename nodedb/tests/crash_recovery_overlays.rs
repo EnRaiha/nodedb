@@ -2,20 +2,10 @@
 
 //! Real process-kill WAL-durability regressions for the cross-engine
 //! overlays: Graph (edges + node labels), Full-Text Search, and Spatial.
-//!
-//! Both the Graph and FTS overlays sit on top of a base document collection
-//! rather than owning their own primary storage, so a `kill -9` must not just
-//! preserve the underlying document rows — it must also leave the
-//! overlay's own index (CSR adjacency for Graph, the inverted index for
-//! FTS) queryable again once the process reopens the same data
-//! directory and replays the WAL.
-//!
-//! The spatial case is the document-collection counterpart of the existing
-//! columnar-family `engine='spatial'` crash test in `crash_recovery.rs`. A
-//! geometry field on a DOCUMENT collection is served by `execute_spatial_scan`
-//! reading the durable `sparse` store, so an `ST_DWithin` predicate must still
-//! match the same rows after a hard crash + WAL replay repopulates the
-//! document `Put`s.
+//! Graph and FTS sit atop a base document collection, so `kill -9` must
+//! leave the overlay index (CSR adjacency, inverted index) queryable, not
+//! just the document rows. The spatial case covers a geometry field on a
+//! document collection, served by `execute_spatial_scan` reading `sparse`.
 
 mod crash_harness;
 
@@ -148,10 +138,8 @@ async fn spatial_document_geometry_survives_kill_9() {
     h.spawn();
     h.wait_ready();
 
-    // A DOCUMENT collection (NOT `engine='spatial'`, which is columnar-family):
-    // the geometry lives as a field of the stored document — no declared
-    // spatial index. This is the document-collection spatial path that the
-    // columnar-family `spatial_index_survives_kill_9` test does not exercise.
+    // A document collection, not `engine='spatial'` (columnar-family):
+    // geometry lives as a plain field, no declared spatial index.
     h.exec("CREATE COLLECTION crash_geo_doc WITH (engine='document_schemaless')")
         .await;
     h.exec(

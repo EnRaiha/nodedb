@@ -13,25 +13,9 @@ fn encode<T: zerompk::ToMessagePack>(context: &str, value: &T) -> crate::Result<
     })
 }
 
-/// Encode a `kv_put` WAL payload in the shape the KV replay path decodes:
-/// `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)`.
-///
-/// `expire_at_ms` is the absolute instant the Control Plane resolved, carried
-/// verbatim so replay need not recompute `now_ms + ttl_ms` (which would drift
-/// the expiry forward by the crash-to-restart delay); `None` means the write
-/// carried no TTL. `surrogate` is the row's stable cross-engine identity.
-///
-/// The surrogate travels in the record because replay runs on a Data Plane core
-/// with no Control Plane catalog handle: without it a replayed row lands with
-/// identity `0`, which `KvEngine::key_for_surrogate` cannot resolve and which
-/// the clone-snapshot visibility rule reads as "always visible". The KV
-/// checkpoint already persists real surrogates, so a crash would otherwise
-/// leave one table holding both kinds of row.
-///
-/// This seven-element shape is the only one written. Two shorter shapes remain
-/// decodable on replay because a WAL tail written before the surrogate was
-/// carried can still be retained across the upgrade; zerompk's strict
-/// array-length check means the three never alias.
+/// Encode a `kv_put` WAL payload: `("kv_put", collection, key, value, ttl_ms,
+/// expire_at_ms, surrogate)`. A row with no surrogate replays at identity `0`,
+/// read as "always visible" by clone-snapshot. Two shorter legacy shapes stay decodable.
 pub(crate) fn encode_kv_put(
     collection: &str,
     key: &[u8],
@@ -54,27 +38,9 @@ pub(crate) fn encode_kv_put(
     )
 }
 
-/// Encode a `kv_insert_on_conflict_update` WAL payload in the shape the KV
-/// replay path decodes.
-///
-/// This is a DELTA record, not a post-image: `value` is the pre-merge
-/// incoming (`EXCLUDED`) row and `updates` carries the `DO UPDATE SET`
-/// assignment inputs — the Control Plane cannot know the merged document
-/// before dispatch. Replay re-reads whatever value is present in the KV
-/// engine at that point in LSN order and re-runs the same
-/// `apply_on_conflict_updates` merge the live handler uses, rather than
-/// trusting a captured post-image. This is the same rationale as
-/// [`encode_kv_field_set`], applied to the `INSERT ... ON CONFLICT DO
-/// UPDATE` RMW instead of `HSET`-style field merge.
-///
-/// With `expire_at_ms = None` this produces the six-element tuple
-/// `("kv_insert_on_conflict_update", collection, key, value, ttl_ms,
-/// updates)`. With `Some(instant)` it appends the resolved absolute expiry
-/// as a seventh element — the same additive, trailing-field convention
-/// `encode_kv_put` uses — so replay installs the exact instant the Control
-/// Plane resolved instead of recomputing `now_ms + ttl_ms` (which would
-/// drift). zerompk's strict array-length check means the two shapes never
-/// alias.
+/// Encode a `kv_insert_on_conflict_update` WAL payload. Delta record: `value`
+/// is the pre-merge `EXCLUDED` row, `updates` carries `DO UPDATE SET` inputs;
+/// replay re-runs the merge. `expire_at_ms` appends a 7th element when `Some`.
 pub(crate) fn encode_kv_insert_on_conflict_update(
     collection: &str,
     key: &[u8],
@@ -124,12 +90,7 @@ pub(crate) struct KvTransferFields<'a> {
 
 /// Encode a `kv_transfer` delta WAL payload: `("kv_transfer", collection,
 /// source_key, dest_key, field, amount, debit_surrogate, credit_surrogate)`.
-///
-/// This is a DELTA record, not a post-image: replay re-executes
-/// `compute_transfer` against whatever source/dest values are present in the
-/// KV engine at that point in the replay's LSN order (deterministic full
-/// re-execution from empty), rather than trusting an absolute post-image
-/// captured before dispatch.
+/// Delta record: replay re-executes `compute_transfer`, not a captured post-image.
 pub(crate) fn encode_kv_transfer(f: KvTransferFields<'_>) -> crate::Result<Vec<u8>> {
     encode(
         "transfer",
@@ -147,11 +108,8 @@ pub(crate) fn encode_kv_transfer(f: KvTransferFields<'_>) -> crate::Result<Vec<u
 }
 
 /// Encode a `kv_transfer_item` delta WAL payload: `("kv_transfer_item",
-/// source_collection, dest_collection, item_key, dest_key, surrogate)`.
-///
-/// Same delta-record rationale as [`encode_kv_transfer`]: replay re-verifies
-/// source ownership and re-executes the delete+insert pair rather than
-/// trusting a captured post-image.
+/// source_collection, dest_collection, item_key, dest_key, surrogate)`. Replay
+/// re-verifies source ownership and re-executes the delete+insert pair.
 pub(crate) fn encode_kv_transfer_item(
     source_collection: &str,
     dest_collection: &str,
@@ -173,13 +131,8 @@ pub(crate) fn encode_kv_transfer_item(
 }
 
 /// Encode a `kv_cas` WAL payload: `("kv_cas", collection, key, expected,
-/// new_value, surrogate)`.
-///
-/// This is a post-image-independent record: it carries the CAS inputs
-/// (`expected`, `new_value`), not whether the compare succeeded live.
-/// Replay re-runs the compare against whatever value is present in the KV
-/// engine at that point in LSN order; a live-failed CAS replays to the same
-/// no-op, and a live-succeeded CAS replays to the same write.
+/// new_value, surrogate)`. Carries the CAS inputs, not the live result —
+/// replay re-runs the compare against whatever value is present.
 pub(crate) fn encode_kv_cas(
     collection: &str,
     key: &[u8],
@@ -194,11 +147,7 @@ pub(crate) fn encode_kv_cas(
 }
 
 /// Encode a `kv_incr_float` WAL payload: `("kv_incr_float", collection, key,
-/// delta, surrogate)`.
-///
-/// Delta record: replay re-runs `incr_float` against whatever value is
-/// present at that point in LSN order rather than trusting a captured
-/// post-image.
+/// delta, surrogate)`. Delta record: replay re-runs `incr_float` on the present value.
 pub(crate) fn encode_kv_incr_float(
     collection: &str,
     key: &[u8],
@@ -212,13 +161,8 @@ pub(crate) fn encode_kv_incr_float(
 }
 
 /// Encode a `kv_field_set` WAL payload: `("kv_field_set", collection, key,
-/// updates, surrogate)`.
-///
-/// Delta record: `updates` carries the field-level inputs, not the
-/// post-merge document. Replay re-reads whatever value is present in the KV
-/// engine at that point in LSN order and re-runs the same
-/// `merge_field_updates` computation the live handler uses, rather than
-/// trusting a captured post-image.
+/// updates, surrogate)`. Delta record: `updates` carries field-level inputs,
+/// not the post-merge document — replay re-runs `merge_field_updates`.
 pub(crate) fn encode_kv_field_set(
     collection: &str,
     key: &[u8],
@@ -250,14 +194,9 @@ pub(crate) fn encode_kv_delete(collection: &str, keys: &[Vec<u8>]) -> crate::Res
     encode("delete", &("kv_delete", collection, keys))
 }
 
-/// Encode a `kv_batch_put` WAL payload in the shape the KV replay path decodes:
-/// `("kv_batch_put", collection, entries, ttl_ms, expire_at_ms, surrogates)`.
-///
-/// `surrogates` is positional against `entries` — one stable cross-engine
-/// identity per entry, for the same reason [`encode_kv_put`] carries one. The
-/// two shorter shapes stay decodable on replay for a tail written before the
-/// surrogates were carried; zerompk's strict array-length check means the three
-/// never alias.
+/// Encode a `kv_batch_put` WAL payload: `("kv_batch_put", collection, entries,
+/// ttl_ms, expire_at_ms, surrogates)`. `surrogates` is positional against
+/// `entries`. Two shorter legacy shapes remain decodable.
 pub(crate) fn encode_kv_batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
@@ -279,16 +218,8 @@ pub(crate) fn encode_kv_batch_put(
 }
 
 /// Encode a `kv_expire` WAL payload: `("kv_expire", collection, key, ttl_ms,
-/// expire_at_ms)`.
-///
-/// Unlike `kv_put` / `kv_batch_put`, `kv_expire` has exactly one shape: `EXPIRE`
-/// has no "no TTL" sentinel value for `ttl_ms` — `ttl_ms == 0` is a legitimate,
-/// distinct request ("expire this key right now"), reachable through the
-/// native-protocol builder, not a flag meaning "skip resolving an instant". So
-/// the absolute instant is always resolved and always carried, and there was
-/// never a historical shape without it: `replay_kv_wal` had no `kv_expire`
-/// decode arm at all before this record gained one, so there is no prior
-/// on-disk shape to stay compatible with.
+/// expire_at_ms)`. `ttl_ms == 0` means "expire now", not "no TTL" — the
+/// instant is always resolved and carried.
 pub(crate) fn encode_kv_expire(
     collection: &str,
     key: &[u8],
@@ -307,13 +238,8 @@ pub(crate) fn encode_kv_persist(collection: &str, key: &[u8]) -> crate::Result<V
 }
 
 /// Encode a `kv_register_index` WAL payload: `("kv_register_index",
-/// collection, field, field_position, backfill)`.
-///
-/// `backfill` is a live-registration input, not a derivable fact: `true`
-/// scans existing rows at registration time and populates the index, `false`
-/// indexes only rows written afterwards. Replay must reproduce whichever the
-/// user chose, so `backfill` travels in the record rather than being
-/// inferred or defaulted at replay time.
+/// collection, field, field_position, backfill)`. `backfill` is not derivable —
+/// replay must reproduce whichever the user chose.
 pub(crate) fn encode_kv_register_index(
     collection: &str,
     field: &str,
@@ -338,20 +264,9 @@ pub(crate) fn encode_kv_drop_index(collection: &str, field: &str) -> crate::Resu
     encode("drop index", &("kv_drop_index", collection, field))
 }
 
-/// Encode a `kv_incr` WAL payload in the shape the KV replay path decodes.
-///
-/// With `expire_at_ms = None` this produces the historical six-element tuple
-/// `("kv_incr", collection, key, delta, ttl_ms, surrogate)` byte-for-byte —
-/// `ttl_ms == 0` means "preserve whatever TTL the key already had" (see
-/// `atomic_put`'s preserve branch), and there is no clock-derived instant to
-/// carry for that case. With `Some(instant)` it appends the resolved
-/// absolute expiry as a seventh element, the same additive trailing-field
-/// convention `encode_kv_put` uses — recorded only when the live write's
-/// `ttl_ms > 0`, so replay installs the exact instant the Control Plane
-/// resolved instead of recomputing `now_ms + ttl_ms` (which would drift by
-/// the crash-to-restart delay). Both shapes are genuinely produced in
-/// production (one per `ttl_ms` case), so replay must decode both; zerompk's
-/// strict array-length check means the two never alias.
+/// Encode a `kv_incr` WAL payload. `expire_at_ms = None` produces the six-element
+/// shape (`ttl_ms == 0` means "preserve existing TTL"); `Some(instant)` appends
+/// a 7th element so replay installs the exact resolved expiry.
 pub(crate) fn encode_kv_incr(
     collection: &str,
     key: &[u8],
@@ -423,12 +338,8 @@ pub(crate) fn encode_kv_drop_sorted_index(index_name: &str) -> crate::Result<Vec
 }
 
 /// Encode a `kv_predicate_update` WAL payload:
-/// `("kv_predicate_update", collection, filters, updates)`.
-///
-/// A DELTA record, not a post-image: which rows a predicate selects is only
-/// known once current state is scanned, so replay re-runs the predicate and
-/// the same `merge_field_updates` the live handler uses — the rationale
-/// [`encode_kv_field_set`] gives, applied to a row set instead of one key.
+/// `("kv_predicate_update", collection, filters, updates)`. Delta record —
+/// which rows match is only known once scanned, so replay re-runs the predicate.
 pub(crate) fn encode_kv_predicate_update(
     collection: &str,
     filters: &[u8],
@@ -789,9 +700,7 @@ mod tests {
 
     #[test]
     fn kv_expire_with_zero_ttl_still_carries_an_absolute_instant() {
-        // ttl_ms == 0 is a legitimate "expire right now" request for EXPIRE,
-        // not a "no TTL" sentinel the way it is for PUT — the shape must not
-        // special-case it away.
+        // ttl_ms == 0 means "expire right now" for EXPIRE, not "no TTL" as for PUT.
         let entry = encode_kv_expire("sessions", b"tok2", 0, 1_234).unwrap();
 
         let (disc, collection, key, ttl_ms, expire_at_ms) =

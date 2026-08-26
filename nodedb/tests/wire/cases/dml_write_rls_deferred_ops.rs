@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Row-level security over the governed document writes whose row image is
-//! decided where the row is persisted: `UPSERT`, bulk `UPDATE`, bulk `DELETE`.
-//!
-//! Every test here asserts BOTH directions, and asserts row COUNT and VALUE
-//! rather than only the absence of an error. A one-sided test — "the violating
-//! write is refused" — is satisfied just as well by a blanket refusal of every
-//! governed write of that shape, so it would report a working policy while the
-//! statement never worked at all.
-//!
-//! Under Raft these three are resolved on the Control Plane before they are
-//! proposed: the predicate cannot ride the wire, because a follower has no
-//! writing identity to decide it against and the leader re-derives its plan
-//! from the committed entry. What lands is the decided row set.
+//! Row-level security over governed document writes whose row image is
+//! decided where the row is persisted: `UPSERT`, bulk `UPDATE`, bulk
+//! `DELETE`. Every test asserts both directions and row count/value, not
+//! just absence of an error — a blanket refusal would pass a one-sided
+//! check. Under Raft these resolve on the Control Plane before proposing,
+//! since a follower has no writing identity to decide the predicate against.
 
 use crate::harness::TestServer;
 
@@ -90,11 +83,9 @@ fn row(id: &str, owner: &str, note: &str) -> Vec<String> {
     vec![id.to_string(), owner.to_string(), note.to_string()]
 }
 
-/// `UPSERT`, both branches and both directions.
-///
-/// The merge branch's image exists only after the stored row is read and the
-/// `ON CONFLICT` assignments run, and the insert branch's only after the row is
-/// found absent — neither is decidable at plan time.
+/// `UPSERT`, both branches and both directions. The merge branch's image
+/// exists only after the stored row is read and `ON CONFLICT` runs; the
+/// insert branch's only after the row is found absent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upsert_is_gated_in_both_directions() {
     let server = TestServer::start().await;
@@ -182,10 +173,8 @@ async fn an_upsert_is_gated_in_both_directions() {
     );
 }
 
-/// A predicate `UPDATE`, both directions.
-///
-/// Its row set is known only after committed state is scanned, and each matched
-/// row's post-image only after the assignments run against it.
+/// A predicate `UPDATE`, both directions. Row set is known only after
+/// committed state is scanned, post-image only after assignments run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bulk_update_is_gated_in_both_directions() {
     let server = TestServer::start().await;

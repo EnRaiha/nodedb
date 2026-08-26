@@ -29,11 +29,9 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
-    /// Spawn a single-core server in pgwire **password mode** (SCRAM-SHA-256)
+    /// Spawn a single-core server in pgwire password mode (SCRAM-SHA-256)
     /// with the credential lockout policy enabled (`5` failures -> `300s`).
-    ///
-    /// The harness user `nodedb` keeps password `nodedb`; the returned
-    /// client authenticates with it.
+    /// The harness user `nodedb` keeps password `nodedb`.
     pub async fn start_password() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let spawned = process::spawn(dir.path(), AuthMode::Password, None, 1);
@@ -49,13 +47,9 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
-    /// Open a server backed by an existing data directory.
-    ///
-    /// The WAL and catalog inside `dir` are reopened in place by the
-    /// subprocess, so any data written by a previous server is immediately
-    /// visible after boot. `dir` is NOT consumed: ownership stays with the
-    /// caller, who gets it back unchanged, exactly as
-    /// `nodedb-test-support::pgwire_harness::TestServer::open_on_path` does.
+    /// Open a server backed by an existing data directory, reopened in place
+    /// so a previous server's data is visible after boot. `dir` is not
+    /// consumed — ownership stays with the caller.
     pub async fn open_on_path(dir: TestDataDir) -> (Self, TestDataDir) {
         let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
@@ -77,9 +71,7 @@ impl TestServer {
     }
 
     /// Consume the data directory from a live server so it outlives the
-    /// server's lifetime. The server keeps running until dropped, but
-    /// ownership of the temp dir moves to the caller so the files survive
-    /// the `Drop` of `TestServer`.
+    /// server's lifetime, surviving the `Drop` of `TestServer`.
     pub fn take_dir(mut self) -> (Self, TestDataDir) {
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let original_dir = std::mem::replace(&mut self._dir, placeholder);
@@ -101,9 +93,7 @@ impl TestServer {
     }
 
     /// Connect the harness client to a just-spawned server and assemble the
-    /// `TestServer`. `dir` becomes the new `_dir` field (either the real
-    /// owned directory for a fresh `start*`, or a placeholder for
-    /// `open_on_path*`, whose real directory the caller keeps).
+    /// `TestServer`. `dir` becomes the new `_dir` field.
     async fn connect_and_build(
         spawned: SpawnedServer,
         dir: tempfile::TempDir,
@@ -119,9 +109,8 @@ impl TestServer {
                 spawned.ports.pgwire
             ),
         };
-        // The subprocess reports /healthz ready before the pgwire listener
-        // necessarily finishes its own startup gate; retry briefly rather
-        // than treating the first refused connection as fatal.
+        // /healthz reports ready before pgwire finishes its own startup gate;
+        // retry briefly rather than treating a refused connection as fatal.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (client, connection) = loop {
             match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {

@@ -27,8 +27,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::IndexedFetch { .. }
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::MaterializeScan { .. }
-            // Read-only: it reports what the wrapped write would apply and
-            // mutates nothing. The write it feeds is authorized on its own.
+            // Read-only: reports what the wrapped write would apply; that write is authorized separately.
             | DocumentOp::ResolveWrite(_),
         ) => Permission::Read,
 
@@ -50,8 +49,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         ) => Permission::Read,
 
         PhysicalPlan::Graph(
-            // Read-only: it decides what a governed delete would do and
-            // mutates nothing. The wrapped delete is authorized on its own.
+            // Read-only: decides what a governed delete would do; that delete is authorized separately.
             GraphOp::ResolveEdgeDelete(_)
             | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
@@ -91,9 +89,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // it only redistributes rows produced by the wrapped plan.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => required_permission(&op.child),
 
-        // PostProcess only reshapes rows produced by its child (sort / offset /
-        // distinct / limit / projection); its required permission is the
-        // child's — recurse rather than assume Read.
+        // PostProcess only reshapes child rows; permission is the child's — recurse, don't assume Read.
         PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => required_permission(input),
 
         PhysicalPlan::Text(
@@ -119,8 +115,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
-        // Read-only: it reports the lines a governed ingest would store and
-        // mutates nothing. The wrapped ingest is authorized on its own.
+        // Read-only: reports what a governed ingest would store; that ingest is authorized separately.
         PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
             Permission::Read
         }
@@ -165,14 +160,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Truncate { .. }
             | DocumentOp::Merge { .. }
-            // A derived balance write mutates a target row, so it is decided at
-            // the same level as any other document write. It is never issued
-            // by a client: the planner appends it after the statement that
-            // caused it has already cleared its own authorization.
+            // Never client-issued: planner appends it after the causing statement is authorized.
             | DocumentOp::ApplyBalanceDelta { .. }
-            // Mutates the rows its mutation list names. Never issued by a
-            // client: the write-resolve orchestrator builds it after the
-            // intercepted statement cleared its own authorization.
+            // Never client-issued: write-resolve orchestrator builds it post-authorization.
             | DocumentOp::ResolvedWrite { .. },
         ) => Permission::Write,
 
@@ -193,10 +183,8 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | ColumnarOp::Delete { .. }
             | ColumnarOp::ResolvedUpdate { .. }
             | ColumnarOp::ResolvedDelete { .. }
-            // Resolves and decides a write policy, so it requires the same
-            // Write permission the predicate it resolves requires — even
-            // though it is not itself a write-class plan for admission /
-            // replication purposes (see `write_class::columnar_is_write`).
+            // Requires the same Write the predicate it resolves requires, though it isn't
+            // itself write-class for admission/replication (see `write_class::columnar_is_write`).
             | ColumnarOp::ResolveDml { .. },
         ) => Permission::Write,
 
@@ -253,9 +241,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | MetaOp::DropTxnOverlay { .. },
         ) => Permission::Admin,
 
-        // Staging a point write into the per-transaction overlay is a write, as
-        // are the savepoint mark / rollback ops that operate on that overlay and
-        // resolving that overlay into a redo record at COMMIT.
+        // Staging a write, savepoint mark/rollback, and COMMIT redo resolution all mutate the overlay.
         PhysicalPlan::Meta(
             MetaOp::StageWrite { .. }
             | MetaOp::MarkSavepoint { .. }
@@ -263,9 +249,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | MetaOp::ResolveTxn { .. },
         ) => Permission::Write,
 
-        // Calvin's resolve mirrors `ResolveTxn`: dispatched internally by the
-        // Calvin scheduler's commit path and treated as Write, even though it
-        // does not itself mutate base state.
+        // Mirrors `ResolveTxn`: Calvin scheduler's commit path, treated as Write though it doesn't mutate base state.
         PhysicalPlan::Meta(MetaOp::CalvinResolve { .. }) => Permission::Write,
 
         // KV engine: read operations.
@@ -281,8 +265,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
-            // Read-only: it reports what a governed write would apply and
-            // mutates nothing. The wrapped write is authorized on its own.
+            // Read-only: reports what a governed write would apply; that write is authorized separately.
             | KvOp::ResolveWrite(_),
         ) => Permission::Read,
 
@@ -335,8 +318,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
-        // Array engine: query operators are reads, put/delete are
-        // writes, OpenArray is DDL, flush/compact are admin.
+        // Array engine: query ops are reads, put/delete are writes, OpenArray is DDL, flush/compact are admin.
         PhysicalPlan::Array(
             ArrayOp::Slice { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
@@ -365,8 +347,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         ) => Permission::Write,
         PhysicalPlan::ClusterEvent(_) => Permission::Read,
 
-        // Calvin cross-shard execution batches are write operations dispatched
-        // internally by the Calvin scheduler; treat as Write.
+        // Calvin cross-shard execution batches: dispatched internally, treated as Write.
         PhysicalPlan::Meta(
             MetaOp::CalvinExecuteStatic { .. }
             | MetaOp::CalvinExecutePassive { .. }

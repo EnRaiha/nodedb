@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! KV (and timeseries) DML whose `WHERE` resolves to no primary key.
-//!
-//! A KV collection has no document store, so `KvOp::PredicateUpdate` /
-//! `PredicateDelete` must do the row matching themselves. Every test asserts
-//! ROW COUNT and STORED VALUES, not just "no error" — a no-op that reports
-//! success would otherwise pass.
-//!
-//! Three shapes reach the predicate path: no `WHERE`, a `WHERE` on a
-//! non-key column, and a key-including conjunction (`AND` is not a shape
-//! `extract_point_keys` reduces to point keys).
+//! KV (and timeseries) DML whose `WHERE` resolves to no primary key. A KV
+//! collection has no document store, so `KvOp::PredicateUpdate`/
+//! `PredicateDelete` must do the row matching themselves. Every test
+//! asserts row count and stored values, not just "no error".
 
 use crate::harness::TestServer;
 

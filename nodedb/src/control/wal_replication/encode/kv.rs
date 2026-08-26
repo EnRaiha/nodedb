@@ -7,14 +7,9 @@ use super::entry::encode_returning;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
 use nodedb_types::Surrogate;
 
-/// Resolve the wall-clock instant for a TTL-bearing replicated KV write,
-/// exactly once, at Raft-proposal time -- the `Put` family's "no TTL"
-/// sentinel: `None` when `ttl_ms == 0`, so the write carries no instant to
-/// disagree about. Mirrors `wal_dispatch_kv::append::resolve_expiry`'s
-/// `now_ms` half; the corresponding `expire_at_ms` is computed by the Data
-/// Plane from `ttl_ms` at apply time via `CoreLoop::kv_ttl_now_ms`, using
-/// this same instant on every replica instead of one independent wall-clock
-/// read per replica per apply.
+/// Resolve the wall-clock instant for a TTL-bearing write once, at proposal
+/// time. `None` when `ttl_ms == 0`. Every replica computes `expire_at_ms`
+/// from this same instant instead of an independent wall-clock read.
 fn resolve_now_ms(ttl_ms: u64) -> Option<u64> {
     if ttl_ms == 0 {
         None
@@ -51,10 +46,8 @@ pub(super) fn put(
     }
 }
 
-/// Encode a KV predicate `UPDATE`: the predicate itself, never a row set.
-///
-/// Only reached for a collection with no write policy — see
-/// `entry_kv::refuse_governed_predicate_dml`.
+/// Encode a KV predicate `UPDATE`: the predicate itself, never a row set. Only
+/// reached for a collection with no write policy.
 pub(super) fn predicate_update(
     collection: &str,
     filters: &[u8],
@@ -163,9 +156,7 @@ pub(super) fn batch_put(
 }
 
 pub(super) fn expire(collection: &str, key: &[u8], ttl_ms: u64) -> ReplicatedWrite {
-    // `EXPIRE` has no "no TTL" sentinel (`ttl_ms == 0` is a legitimate
-    // "expire now" request), so the instant is always resolved -- mirrors
-    // `wal_dispatch_kv::append::wal_append_kv_op`'s `KvOp::Expire` arm.
+    // `ttl_ms == 0` is a legitimate "expire now" request, so the instant always resolves.
     ReplicatedWrite::KvExpire {
         collection: collection.to_owned(),
         key: key.to_vec(),
@@ -341,12 +332,8 @@ pub(super) fn truncate(collection: &str) -> ReplicatedWrite {
 }
 
 /// Encode a resolved KV write: every mutation the Control Plane decided, plus
-/// the reply it decided alongside them.
-///
-/// Nothing is re-derived here — no clock read, no expiry arithmetic. Each
-/// mutation already carries the absolute instant the resolving node resolved
-/// (`Put::expire_at_ms`, `Expire::resolved_now_ms`), so every replica installs
-/// the identical expiry.
+/// the reply. Nothing re-derived — each mutation carries the resolved absolute
+/// instant, so every replica installs identical expiry.
 pub(super) fn resolved_write(
     mutations: &[nodedb_physical::physical_plan::KvResolvedMutation],
     response_payload: &[u8],

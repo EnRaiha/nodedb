@@ -13,23 +13,12 @@ use nodedb_types::Surrogate;
 
 /// One storage mutation a resolved KV write applies.
 ///
-/// `collection` is per-mutation rather than hoisted onto the write:
-/// `KvOp::TransferItem` moves a row between two collections in a single
-/// resolved write.
+/// `collection` is per-mutation, not hoisted onto the write: `TransferItem`
+/// moves a row between two collections in one resolved write.
 ///
-/// ## Precondition
-///
-/// `precondition` is the drift check, NOT user-facing CAS business logic:
-///
-/// - `None` — the key must currently be ABSENT.
-/// - `Some(bytes)` — the key must currently hold EXACTLY `bytes`, the raw
-///   stored MessagePack, compared with `==`.
-///
-/// Deliberately not `KvOp::Cas`'s `expected` semantics, which match a typed
-/// map's first string field as a fallback and read an empty `expected` as
-/// "must be absent" — that conflates absent with present-and-empty, and it is
-/// the user's swap condition rather than a check that the state the resolve
-/// read is still the state the apply sees.
+/// `precondition` is the apply's drift check, not `KvOp::Cas`'s `expected`
+/// semantics: `None` requires the key absent, `Some(bytes)` requires it hold
+/// exactly `bytes` (`==`), never conflating absent with present-and-empty.
 #[derive(
     Debug,
     Clone,
@@ -48,16 +37,10 @@ pub enum KvResolvedMutation {
         /// TTL the originating op requested, carried for the durable record's
         /// shape only. `expire_at_ms` is what the apply installs.
         ttl_ms: u64,
-        /// Absolute expiry instant (ms since epoch) to install verbatim, or
-        /// `0` for none.
-        ///
-        /// Resolved once, on the resolving node, and applied identically on
-        /// every replica. It is a separate field from `ttl_ms` because the two
-        /// engine write paths a KV op can take disagree on what `ttl_ms == 0`
-        /// means: `KvEngine::put` clears a key's TTL, while the atomic path's
-        /// `atomic_put` preserves it. Deriving expiry from `ttl_ms` at apply
-        /// time would therefore silently drop the TTL of every key an `INCR` /
-        /// `CAS` / `GETSET` touches.
+        /// Absolute expiry instant (ms since epoch) to install verbatim, `0`
+        /// for none. Resolved once and applied identically on every replica —
+        /// separate from `ttl_ms` because `ttl_ms == 0` means "clear TTL" on
+        /// `KvEngine::put` but "preserve TTL" on the atomic path.
         expire_at_ms: u64,
         surrogate: Surrogate,
         precondition: Option<Vec<u8>>,

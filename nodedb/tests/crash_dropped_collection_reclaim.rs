@@ -1,28 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Pins whether `DROP COLLECTION` actually unlinks a vector/spatial
-//! collection's index checkpoint files, or only appears to.
-//!
-//! The write path shards checkpoints per Data Plane core and publishes each
-//! core's files as a generation:
-//! `{data_dir}/{vector,spatial}-ckpt/core-{core_id}/gen-{n}/...`, with a
-//! sibling `MANIFEST` naming the live generation. The reclaim helpers invoked
-//! by `DROP COLLECTION` have to walk that same shape — every core, then that
-//! core's live generation. A reclaim that reads the wrong level finds only
-//! directory entries, filters them out on the `.ckpt` extension check, and
-//! returns success having deleted nothing: the dropped collection's index then
-//! reloads at every subsequent boot.
-//!
-//! This test forces the server down a single core (the harness always sets
-//! `NODEDB_DATA_PLANE_CORES=1`), then proves whether the dropped collection's
-//! checkpoint file is still anywhere under the engine's checkpoint root after
-//! `DROP COLLECTION` and a restart.
-//!
-//! A SHORT checkpoint interval is used here — the opposite of most crash
-//! tests in this file family, which push the interval out to make a
-//! checkpoint impossible. Here a checkpoint must actually run before the
-//! drop, or there would be no on-disk file for the reclaim path to either
-//! delete or leak, and the test would prove nothing.
+//! collection's index checkpoint files, or only appears to. Checkpoints
+//! shard per core as `{data_dir}/{vector,spatial}-ckpt/core-{id}/gen-{n}/`,
+//! and a reclaim that reads the wrong level finds nothing to delete. Uses a
+//! short checkpoint interval, unlike most crash tests in this family, since
+//! a file must actually exist on disk before the drop for reclaim to prove
+//! anything.
 
 mod crash_harness;
 
@@ -61,10 +45,9 @@ fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Poll `root` (recursively) until at least one `*.ckpt` file exists,
-/// bounded by `CHECKPOINT_WAIT`. Panics with a message that names the
-/// premise being relied on, since a timeout here means the test can prove
-/// nothing about reclaim — there would be no file on disk either way.
+/// Poll `root` recursively until at least one `*.ckpt` file exists, bounded
+/// by `CHECKPOINT_WAIT`. A timeout means the test can prove nothing about
+/// reclaim, since there would be no file on disk either way.
 fn wait_for_any_ckpt_file(root: &std::path::Path, engine: &str) -> std::path::PathBuf {
     let deadline = Instant::now() + CHECKPOINT_WAIT;
     loop {
@@ -87,10 +70,8 @@ fn wait_for_any_ckpt_file(root: &std::path::Path, engine: &str) -> std::path::Pa
 }
 
 /// True if any file anywhere under `root` has `needle` in its file name.
-/// Filenames encode the collection name directly (`vector_checkpoint_filename`
-/// / `spatial_checkpoint_prefix`), so a substring match on a distinctive
-/// collection name is unambiguous without needing to know the exact
-/// database/tenant id the collection was created under.
+/// Filenames encode the collection name directly, so a substring match on a
+/// distinctive name is unambiguous without knowing the database/tenant id.
 fn any_file_name_contains(root: &std::path::Path, needle: &str) -> Option<std::path::PathBuf> {
     walk_files(root).into_iter().find(|p| {
         p.file_name()
@@ -170,13 +151,8 @@ async fn dropped_vector_collection_does_not_resurrect_after_restart() {
 
     h.exec(&format!("DROP COLLECTION {COLLECTION} PURGE")).await;
 
-    // The harness offers no graceful-shutdown restart, only a real `kill -9`
-    // followed by reopening the same data directory — so that is what proves
-    // the on-disk state, not an in-process pretend-restart. This is also the
-    // stronger form of the claim under test either way: a hard kill gives the
-    // reclaim path every chance to have already run (it executes synchronously
-    // as part of the DROP, before the kill), so a leaked file here cannot be
-    // blamed on an interrupted graceful shutdown.
+    // A hard kill gives the reclaim path every chance to have already run —
+    // it executes synchronously as part of DROP, before the kill.
     h.kill_9();
     h.reopen();
 
@@ -229,9 +205,7 @@ async fn dropped_spatial_collection_does_not_resurrect_after_restart() {
 
     h.exec(&format!("DROP COLLECTION {COLLECTION} PURGE")).await;
 
-    // Same rationale as the vector test above: the harness has no clean
-    // restart, and a hard kill only strengthens the claim since the
-    // synchronous reclaim inside DROP already had its chance to run.
+    // Same rationale as the vector test above.
     h.kill_9();
     h.reopen();
 

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Engine surface tests for sparse-vector search.
-//!
-//! A strict-schema collection (`CREATE TABLE`, document_strict) with a
-//! `SPARSEVECTOR` column maintains an inverted index on every INSERT. The
-//! `ORDER BY sparse_score(field, '{dim: weight, ...}') DESC LIMIT k` surface
-//! routes to `VectorOp::SparseSearch`, returning the `k` documents with the
-//! highest dot-product score against the query vector.
+//! Engine surface tests for sparse-vector search. A strict-schema collection
+//! with a `SPARSEVECTOR` column maintains an inverted index on every
+//! INSERT; `ORDER BY sparse_score(...) DESC LIMIT k` routes to
+//! `VectorOp::SparseSearch`.
 
 use crate::harness::TestServer;
 

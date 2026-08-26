@@ -2,11 +2,9 @@
 
 //! The single-task dispatch primitive the native SQL loop calls.
 //!
-//! Split out of `sql_loop.rs` so that file stays within the file-size limit;
-//! behavior is unchanged. Everything here decides HOW one already-planned task
-//! reaches an engine — Control-Plane orchestrators for the multi-arm writes,
-//! Exchange resolution, then the gateway — while `sql_loop.rs` decides what to
-//! do with the answers.
+//! Decides HOW one already-planned task reaches an engine — Control-Plane
+//! orchestrators, Exchange resolution, then the gateway — while `sql_loop.rs`
+//! decides what to do with the answers.
 
 use nodedb_types::TraceId;
 
@@ -19,19 +17,11 @@ use nodedb_physical::physical_task::PhysicalTask;
 use super::DispatchCtx;
 use super::sql_gateway::dispatch_task_via_gateway;
 
-/// Dispatch a single `PhysicalTask`, returning the response plus the per-shard
-/// watermark LSNs a single-node fan gather observed (one `(vshard, watermark)`
-/// per responding core).
+/// Dispatch a single `PhysicalTask`, returning the response plus per-shard
+/// watermark LSNs a single-node fan gather observed.
 ///
-/// `INSERT ... SELECT`, autocommit `MERGE` and autocommit `UPDATE ... FROM` are
-/// intercepted here and run by their Control-Plane orchestrators; `DROP ARRAY`
-/// fans out to every core. All other tasks flow through
-/// `dispatch_task_via_gateway`, which routes via the gateway when available or
-/// falls back to the local SPSC path on single-node boot.
-///
-/// The watermark list is empty for a non-gathered dispatch; the transactional
-/// read-recording seam in the caller's loop then falls back to the single
-/// response watermark.
+/// Multi-arm writes run via Control-Plane orchestrators; everything else
+/// routes through `dispatch_task_via_gateway`.
 pub(super) async fn dispatch_task(
     ctx: &DispatchCtx<'_>,
     mut task: PhysicalTask,
@@ -47,9 +37,7 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // Autocommit `MERGE` is orchestrated on the Control Plane
-    // (`control::merge_orchestrator`): each NOT-MATCHED insert row gets its OWN
-    // fresh, registered surrogate and all arms apply atomically.
+    // Autocommit `MERGE` orchestrates on the Control Plane (`control::merge_orchestrator`).
     if let crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::Merge {
             target_collection: _,
@@ -73,11 +61,8 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
-    // (`control::update_from_join_orchestrator`): the source is scanned on its
-    // OWN core and shipped into the plan so the target-core handler joins
-    // against it instead of a local read (the source's vShard can live on a
-    // different core).
+    // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
+    // ships it into the plan, since the source's vShard can live on a different core.
     if let crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
             target_collection: _,
@@ -103,11 +88,8 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy +
-    // live Raft proposer) is resolved to a concrete row set on the Control
-    // Plane before it is proposed (`control::write_resolve`). On the local
-    // (non-Raft) path the predicate reaches the Data Plane gate intact and is
-    // enforced correctly there.
+    // A governed predicate resolves to a concrete row set before proposing
+    // (`control::write_resolve`); local (non-Raft) path skips this.
     if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
         && ctx.state.async_raft_proposer().is_some()
     {
@@ -119,8 +101,7 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // Native DROP uses the same authorization and reversible all-core
-    // protocol as pgwire; it must never bypass the catalog transition.
+    // Native DROP uses the same reversible all-core protocol as pgwire.
     if matches!(
         task.plan,
         crate::bridge::envelope::PhysicalPlan::Array(
@@ -140,8 +121,7 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // Exchange resolution: materialize catalog providers and resolve any
-    // Exchange nodes (Gather/Broadcast) before dispatch.
+    // Materialize catalog providers and resolve Exchange nodes before dispatch.
     match resolve_and_materialize(
         ctx.state,
         ctx.identity,
@@ -160,17 +140,14 @@ pub(super) async fn dispatch_task(
             let resolved_plan = *resolved_plan;
             task.plan = resolved_plan;
         }
-        // Native path materializes the stream into a Response (it streams later
-        // in its own effort); preserves the existing gather-then-return shape.
+        // Native path materializes the stream into a Response, preserving gather-then-return.
         Resolved::Stream(s) => {
             let resp = crate::control::server::exchange::gather::stream_to_response(s).await?;
             return Ok((resp, Vec::new(), Vec::new()));
         }
     }
 
-    // All other tasks — point ops, writes, Raft-replicated writes — route
-    // through the gateway when available (cluster-aware routing + retry),
-    // or via the local SPSC path when the gateway is not yet wired.
+    // Everything else routes through the gateway when available, or local SPSC otherwise.
     let resp = dispatch_task_via_gateway(ctx, task).await?;
     Ok((resp, Vec::new(), Vec::new()))
 }

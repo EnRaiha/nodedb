@@ -18,39 +18,17 @@ use super::wcc::fan_wcc_all_cores;
 pub struct NodeLevelResult {
     pub payload: Vec<u8>,
     pub watermark_lsn: Lsn,
-    /// Max per-collection read-version LSN of the fanned read (the scanned
-    /// collection's `coll_write_lsn` at read time). `Lsn::ZERO` for non-read
-    /// node-level results. Distinct from the core-global `watermark_lsn`; the
-    /// sound comparand for cross-shard OCC read validation.
+    /// Max per-collection read-version LSN of the fanned read. `Lsn::ZERO` for
+    /// non-read results. Distinct from `watermark_lsn` — the comparand for
+    /// cross-shard OCC read validation.
     pub read_version_lsn: Lsn,
 }
 
 /// Fan `plan` across all local Data-Plane cores, merge per-core payloads, and
-/// return a [`NodeLevelResult`] in the same shape the plan's single-core handler
-/// produces.
+/// return a [`NodeLevelResult`] in the same shape a single-core handler produces.
 ///
-/// Dispatch semantics are plan-dependent:
-///
-/// - **MATCH / MatchContinuation**: calls [`broadcast_match_to_all_cores`] and
-///   re-encodes the `{rows, frontier}` envelope so the caller receives exactly
-///   the shape a single-core MATCH handler returns.
-/// - **BspSuperstep**: fans to all cores via the generic `gather_all_cores`
-///   prologue, decodes each core's `BspSuperstepResult`, merges them by field
-///   concatenation (owned-node sets are disjoint across cores), and re-encodes
-///   the merged result.
-/// - **Everything else**: delegates to [`gather_all_cores`] and wraps the
-///   `merged_array` payload.
-///
-/// At 1 core/node every branch is behaviour-identical to the prior single-core
-/// paths.
-///
-/// `txn_id` is the caller's active session transaction, if any. On the cluster
-/// receive path it comes from the incoming `ExecuteRequest.txn_id` so a MATCH
-/// leg (and the generic array gather) can stamp each core's request and resolve
-/// the transaction's staged overlay for read-your-own-writes. `None` is the
-/// autocommit / non-transactional path and is byte-identical to before. The
-/// graph-analytics fan-out (BSP / WCC / snapshot / single-blob) is not
-/// session-transaction-scoped, so it does not carry the id.
+/// `txn_id` stamps each core's request to resolve the staged overlay; `None` for
+/// autocommit. Graph-analytics fan-out is not transaction-scoped.
 pub(crate) async fn execute_plan_all_local_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -68,13 +46,7 @@ pub(crate) async fn execute_plan_all_local_cores(
                 use crate::control::server::graph_dispatch::match_broadcast::broadcast_match_to_all_cores;
                 use crate::data::executor::handlers::graph_match::encode_match_envelope_raw;
 
-                // Cross-node MATCH execution: this node received the plan from a
-                // remote coordinator and the forwarded `txn_id` is stamped on
-                // each core's request so the Data-Plane MATCH handler can resolve
-                // the transaction's staged overlay once it is present on this
-                // node. It is inert while `None` (autocommit) and while no
-                // overlay is staged for the id — staging/forwarding the overlay
-                // to the leader is a separate unit.
+                // Forwarded `txn_id` resolves the staged overlay once present on this node.
                 let outcome = broadcast_match_to_all_cores(
                     state,
                     tenant_id,
@@ -85,9 +57,8 @@ pub(crate) async fn execute_plan_all_local_cores(
                 )
                 .await?;
 
-                // Carry the truncation resume cursor(s) onto the cross-node
-                // wire inside the envelope bytes so a remote shard's truncation
-                // lands in the coordinator instead of being silently dropped.
+                // Carries truncation resume cursor(s) so a remote shard's truncation
+                // reaches the coordinator instead of being silently dropped.
                 let envelope = encode_match_envelope_raw(
                     outcome.rows_payload.as_ref(),
                     &outcome.frontier,
@@ -133,62 +104,34 @@ pub(crate) async fn execute_plan_all_local_cores(
             }
         },
 
-        // ── Meta ops: most return row arrays (→ generic gather); the
-        // per-node snapshot ops return ONE opaque per-node blob and must NOT
-        // be array-wrapped by the row gather/merge. ─────────────────────────
+        // Most Meta ops return row arrays (generic gather); per-node snapshot ops
+        // return one opaque per-node blob and must not be array-wrapped.
         PhysicalPlan::Meta(meta) => match meta {
-            // A `CreateTenantSnapshot` response is a single `#[msgpack(map)]`
-            // `TenantDataSnapshot` blob per core — NOT an array of rows. The
-            // row gather (`encode_msgpack_array(extract_msgpack_elements(..))`)
-            // would prepend a fixarray header to the map, corrupting the
-            // section so restore's `from_msgpack::<TenantDataSnapshot>` fails.
-            // Merge the per-core partial snapshots by typed field concatenation
-            // (the same disjoint-per-core merge pattern as BSP/WCC) and return
-            // one snapshot blob — identical in shape to the local
-            // `snapshot_self`/`dispatch_system` path. At 1 core/node this is the
-            // lone core's snapshot verbatim.
+            // Single `TenantDataSnapshot` map per core — the row gather would prepend a
+            // fixarray header, breaking restore's decode.
             MetaOp::CreateTenantSnapshot { .. } => {
                 fan_tenant_snapshot_all_cores(state, tenant_id, database_id, plan, trace_id).await
             }
-            // A `RestoreTenantSnapshot` response is a single JSON result object
-            // (`{tenant_id, documents_restored, ...}`), not an array of rows.
-            // Array-wrapping it is the same single-blob corruption class; return
-            // the lone core's payload verbatim so the restore caller's
-            // `success`-only check (and any future result inspection) sees the
-            // unwrapped object.
+            // Single JSON result object, not an array — same single-blob corruption
+            // class; return the lone core's payload verbatim.
             MetaOp::RestoreTenantSnapshot { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
             }
-            // A `ResolveTxn` response is a single `RedoRecord` blob (msgpack
-            // map), not an array of rows — same single-blob corruption class as
-            // the snapshot ops if array-wrapped. It is a single-core, single-txn
-            // op that never actually fans across cores, but is routed through
-            // `single_blob_gather` here so its payload is returned verbatim.
+            // Single `RedoRecord` blob, never actually fans across cores, but routed
+            // through `single_blob_gather` so the payload returns verbatim.
             MetaOp::ResolveTxn { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
             }
-            // `CalvinResolve` returns the same single `RedoRecord` blob shape as
-            // `ResolveTxn` (it reuses `execute_resolve_txn` internally) — same
-            // single-blob corruption class if array-wrapped.
+            // Same single `RedoRecord` blob shape as `ResolveTxn` (reuses it internally).
             MetaOp::CalvinResolve { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
             }
 
-            // A forwarded `StageWrite` / `DropTxnOverlay` (this node is the target
-            // vShard's leader) is a single-core, single-blob control op the
-            // Data-Plane handler keys purely by `txn_id`: route it through
-            // `single_blob_gather` so the handler's affected-count blob (or drop
-            // ack) is returned VERBATIM — the row gather would msgpack-array-wrap
-            // it, corrupting the coordinator's affected-count / tag extraction —
-            // and stamp the request `txn_id` so the leader stages into / reaps the
-            // correct per-transaction overlay.
+            // Row gather would array-wrap the affected-count blob, corrupting extraction.
             MetaOp::StageWrite { .. } | MetaOp::DropTxnOverlay { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
-            // Every other MetaOp either returns an array of rows / count payload
-            // (→ generic gather is correct) or is a single-core control op whose
-            // single-element wrap is harmless. Enumerated exhaustively (no
-            // `_ =>`) so a NEW single-blob MetaOp forces a decision here.
+            // Enumerated exhaustively (no `_ =>`) so a new single-blob MetaOp forces a decision.
             MetaOp::WalAppend { .. }
             | MetaOp::Cancel { .. }
             | MetaOp::TransactionBatch { .. }
@@ -262,9 +205,8 @@ async fn generic_gather(
 ) -> crate::Result<NodeLevelResult> {
     use crate::control::server::exchange::gather::gather_all_cores;
 
-    // Cluster RPC receiver path (remote-node local execution): the forwarded
-    // `txn_id` (if any) is stamped on each core's request so a transactional
-    // read honours its staged overlay. Inert when `None`.
+    // Forwarded `txn_id`, if any, is stamped on each core's request so a
+    // transactional read honours its staged overlay. Inert when `None`.
     let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await?;
     Ok(NodeLevelResult {
         payload: outcome.merged_array,
@@ -273,17 +215,11 @@ async fn generic_gather(
     })
 }
 
-/// Single-blob gather: fan the plan across all local cores but return the lone
-/// non-empty core's payload VERBATIM, with no row array-wrap.
+/// Single-blob gather: fan `plan` across all local cores but return the lone
+/// non-empty core's payload verbatim, with no row array-wrap.
 ///
-/// For a Meta op that returns one opaque per-node blob (e.g. a JSON result
-/// object), routing through the row gather would prepend a msgpack array header
-/// and corrupt the blob. The local single-core dispatch path returns the bytes
-/// unchanged; this mirrors that. At 1 core/node exactly one core responds and
-/// its payload is returned as-is; if more than one core returns a non-empty
-/// payload (a single-core control op fanned to many cores), the first is kept —
-/// these ops produce an identical per-core acknowledgement, so any one is the
-/// canonical node-level result.
+/// The row gather would prepend a msgpack array header and corrupt a Meta op's
+/// opaque blob. If more than one core returns non-empty, the first is kept.
 async fn single_blob_gather(
     state: &SharedState,
     tenant_id: TenantId,

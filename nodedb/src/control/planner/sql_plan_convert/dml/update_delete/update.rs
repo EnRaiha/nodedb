@@ -65,8 +65,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 ),
             });
         }
-        // A KV collection has no document store; a WHERE with no primary key
-        // must still route to the KV engine, not `DocumentOp::BulkUpdate`.
+        // No document store: a WHERE with no PK still routes to KV, not `DocumentOp::BulkUpdate`.
         if target_keys.is_empty() {
             let literal_updates: Vec<(String, Vec<u8>)> = assignments
                 .iter()
@@ -102,9 +101,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 })
                 .collect();
             let key_bytes = sql_value_to_bytes(key);
-            // Content-addressed cross-engine identity so the merged row keeps
-            // the surrogate its original insert assigned. `Surrogate::ZERO`
-            // only when no assigner is wired (test / embedded-without-catalog).
+            // Content-addressed identity: keeps the surrogate the original insert assigned.
+            // `Surrogate::ZERO` only when no assigner is wired (test / embedded-without-catalog).
             let surrogate = ctx.surrogate_for_pk(collection, &key_bytes)?;
             tasks.push(PhysicalTask {
                 tenant_id,
@@ -115,8 +113,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     key: key_bytes,
                     updates: field_updates,
                     surrogate,
-                    // Filled by the RLS injection pass, which runs after plan
-                    // conversion.
+                    // Filled by the RLS injection pass, after plan conversion.
                     rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 }),
                 post_set_op: PostSetOp::None,
@@ -126,9 +123,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         return Ok(tasks);
     }
 
-    // `TimeseriesRules::plan_update` already rejects this; this guard keeps
-    // the rejection true for any other caller, not a fall-through to
-    // `DocumentOp::BulkUpdate` over the empty document store.
+    // `TimeseriesRules::plan_update` already rejects this; guard keeps other
+    // callers from falling through to `DocumentOp::BulkUpdate`.
     if matches!(engine, EngineType::Timeseries) {
         return Err(crate::Error::BadRequest {
             detail: format!(
@@ -138,12 +134,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         });
     }
 
-    // Columnar and spatial engines have no document store; route to
-    // ColumnarOp::Update regardless of whether the WHERE reduces to PK keys.
+    // No document store: route to ColumnarOp::Update regardless of PK-reduced WHERE.
     if matches!(engine, EngineType::Columnar | EngineType::Spatial) {
-        // ColumnarOp::Update carries raw msgpack bytes per field; extract
-        // literals only (expressions require row-context eval not yet wired
-        // into the columnar mutation handler).
+        // Literals only: expressions need row-context eval, not wired into the columnar handler.
         use nodedb_physical::physical_plan::UpdateValue;
         let mut columnar_updates: Vec<(String, Vec<u8>)> = Vec::with_capacity(updates.len());
         for (field, update_val) in &updates {
@@ -161,9 +154,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 }
             }
         }
-        // When the planner resolved target_keys (PK-targeted WHERE), convert
-        // them to an Eq filter on the PK column so the columnar UPDATE handler
-        // can match and tombstone the right row.
+        // PK-targeted WHERE: convert target_keys to an Eq filter on the PK column.
         let effective_filter = pk_effective_filter(filter_bytes, target_keys)?;
         return Ok(vec![PhysicalTask {
             tenant_id,
@@ -180,14 +171,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         }]);
     }
 
-    // CRDT GATE: an UPDATE on a `crdt = true` document collection routes to
-    // `CrdtOp::DocUpsert` with `partial = true` (LWW-per-field). Only PK-targeted
-    // SET with literal RHS is representable. Predicate (non-PK) UPDATE and
-    // non-literal RHS are rejected — there is NO silent fallthrough to a
-    // `DocumentOp`, which would bypass CRDT convergence. `RETURNING` IS
-    // supported: the response-only projection is injected into the plan later
-    // and emitted by the Data Plane handler, exactly like `PointUpdate`. Read
-    // the flag ONCE.
+    // CRDT UPDATE never falls through to `DocumentOp`, which would bypass convergence.
     let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
     if is_crdt && target_keys.is_empty() {
         return Err(crate::Error::BadRequest {
@@ -197,8 +181,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             ),
         });
     }
-    // Partial-update payload for the CRDT path, built ONCE from the literal SET
-    // assignments (non-literal RHS rejected inside the builder).
+    // CRDT partial-update payload, built once from the literal SET assignments.
     let crdt_fields_json = if is_crdt {
         Some(super::super::crdt_gate::literal_assignments_to_fields_json(
             assignments,
@@ -207,26 +190,14 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         None
     };
 
-    // EDGE-BEARING GATE: an UPDATE on a schemaless-document collection that
-    // carries implicit edges must NOT lower to a static `PointUpdate` for a
-    // PK-equality WHERE — that op bypasses the dependent-predicate (OLLP) path
-    // and would leave the mirrored graph edge stale when `_from`/`_to`/`_type`
-    // change. Route it as a `BulkUpdate` with an equivalent filter so the
-    // Calvin/OLLP coordinator derives + drift-validates the routed edge
-    // reconciliation (mirroring the edge-bearing DELETE gate). Non-edge-bearing
-    // collections keep the fast `PointUpdate` path below. Reached only for
-    // document engines (KV / columnar / spatial returned above); strict/etc.
-    // never set `has_implicit_edges`, so the flag naturally scopes this.
+    // PK-equality UPDATE must not use `PointUpdate` here — it'd leave the mirrored edge stale.
     let edge_bearing = !is_crdt
         && !target_keys.is_empty()
         && document_collection_is_edge_bearing(ctx, collection)?;
 
     if edge_bearing {
-        // Reject `Expr` RHS to a reserved edge field: the edge reconciliation
-        // diffs against literal SET values (it cannot evaluate an expression
-        // against per-row state on the Control Plane). Mirrors the KV /
-        // columnar `Expr`-RHS rejection above. Expr to OTHER fields and literal
-        // assignments to edge fields are allowed.
+        // Reject `Expr` RHS to a reserved edge field: reconciliation diffs against
+        // literal SET values only (mirrors the KV/columnar `Expr`-RHS rejection).
         if let Some((field, _)) = assignments.iter().find(|(field, expr)| {
             matches!(field.as_str(), "_from" | "_to" | "_type")
                 && !matches!(expr, SqlExpr::Literal(_))
@@ -253,8 +224,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
-                // Filled in by the materialized-sum resolution pass, which
-                // recon-scans the rows this predicate matches.
+                // Filled in by the materialized-sum resolution pass.
                 resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
@@ -267,9 +237,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         for key in target_keys {
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
-            // Idempotent on `(db, tenant, collection, pk)`, so a task always
-            // exists: the write hook still runs, and an unbound row_key simply
-            // affects 0 rows in the Data Plane.
+            // Idempotent on `(db, tenant, collection, pk)`; unbound row_key affects 0 rows.
             let surrogate = ctx.surrogate_for_pk(collection, &pk_bytes)?;
             let plan = if let Some(fields_json) = crdt_fields_json.as_ref() {
                 PhysicalPlan::Crdt(CrdtOp::DocUpsert {
@@ -305,9 +273,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         }
         Ok(tasks)
     } else {
-        // Predicate (non-PK) UPDATE: also reject `Expr` RHS to reserved edge
-        // fields on an edge-bearing collection. `target_keys` is empty here so
-        // the gate above did not run; re-check via the catalog flag.
+        // target_keys is empty so the edge-bearing gate above didn't run; re-check via catalog.
         if document_collection_is_edge_bearing(ctx, collection)?
             && let Some((field, _)) = assignments.iter().find(|(field, expr)| {
                 matches!(field.as_str(), "_from" | "_to" | "_type")
@@ -335,8 +301,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 ollp_predicted_edges: None,
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
-                // Filled in by the materialized-sum resolution pass, which
-                // recon-scans the rows this predicate matches.
+                // Filled in by the materialized-sum resolution pass.
                 resolved_sum_targets: Vec::new(),
             }),
             post_set_op: PostSetOp::None,

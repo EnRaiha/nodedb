@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the two atomic transfers: `Transfer` (fungible balance move)
-//! and `TransferItem` (non-fungible row move between two collections).
-//!
-//! Both post-images come from `transfer_compute::compute_transfer` or from the
-//! stored row verbatim, and both decide every policy that governs them before
-//! producing a single mutation — a transfer is one write, so a rejection on
-//! either side must leave neither half resolved.
+//! and `TransferItem` (non-fungible row move between two collections). Both
+//! decide every governing policy before producing a single mutation — a
+//! transfer is one write, so a rejection on either side resolves neither half.
 
 use nodedb_physical::physical_plan::KvResolveOutcome;
 
@@ -120,13 +117,9 @@ impl CoreLoop {
         })
     }
 
-    /// Resolve an atomic non-fungible `TransferItem`.
-    ///
-    /// The moved bytes are two different images to two different policies —
-    /// the row leaving the source and the row arriving at the destination —
-    /// governed by two independently configured collections. Both are decided
-    /// here, where `execute_kv_transfer_item` decides them, because a follower
-    /// has no identity to decide either against.
+    /// Resolve an atomic non-fungible `TransferItem`. The row leaving the
+    /// source and the row arriving at the destination are two different
+    /// images governed by two independent collections — both decided here.
     pub(super) fn resolve_kv_transfer_item(&self, params: TransferItemParams<'_>) -> ResolveResult {
         let TransferItemParams {
             did,

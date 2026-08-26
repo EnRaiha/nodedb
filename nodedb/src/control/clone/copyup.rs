@@ -176,17 +176,13 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
             detail: format!("surrogate alloc failed: {e}"),
         })?;
 
-    // Catalog mapping is recorded BEFORE the KV put so that the catalog is
-    // always at least as informed as target storage. If the put fails we then
-    // compensate by removing the just-written mapping; this guarantees we
-    // never end up with an orphaned row in target (row present, no mapping)
-    // which would later cause duplicate surrogates on retry.
+    // Recorded BEFORE the KV put so the catalog is never less informed than
+    // target storage; a failed put compensates by removing the mapping,
+    // avoiding an orphaned target row that would cause duplicate surrogates.
     let catalog = state.credentials.catalog();
 
-    // Keyed by the TARGET collection: every reader — the materializer's
-    // already-copied skip, the read path's source-row suppression, and the
-    // post-materialization reaper — looks the mapping up under the clone it
-    // belongs to.
+    // Keyed by the TARGET collection: every reader looks the mapping up
+    // under the clone it belongs to.
     catalog
         .put_clone_copyup(
             &target_coll_qualified,
@@ -198,11 +194,9 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
             detail: format!("put_clone_copyup catalog write failed: {e}"),
         })?;
 
-    // Helper: roll the catalog mapping back if any subsequent step fails.
-    // Logged-but-not-fatal if the rollback itself fails — the mapping then
-    // points at a target row that does not exist; the read path treats a
-    // missing target row as "fall through to source", which is the same
-    // semantics as having no mapping at all.
+    // Rolls the catalog mapping back if a subsequent step fails. A failed
+    // rollback is logged, not fatal: the read path treats a missing target
+    // row as "fall through to source", same as no mapping at all.
     let rollback_mapping = |reason: &str| {
         if let Err(e) =
             catalog.delete_clone_copyup(&target_coll_qualified, source_surrogate.as_u32())

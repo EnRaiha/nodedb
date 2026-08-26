@@ -2,13 +2,10 @@
 
 //! Refusal of graph reads that column redaction cannot cover.
 //!
-//! A traversal or a pattern match returns graph topology — node ids and edge
-//! labels — not row bodies, so there are no columns in its result for a
-//! redaction rule to rewrite. What it does disclose is the shape of the data
-//! whose columns a policy protects, and the pattern's own `WHERE` can probe a
-//! redacted column value one predicate at a time. Both are refused while a
-//! rule exists, mirroring how RLS resolves the same shape (see
-//! `rls_injection::plan`).
+//! A traversal or pattern match returns graph topology, not row bodies —
+//! no columns to rewrite, but it can disclose data shape or probe a
+//! redacted value via `WHERE`. Both are refused while a rule exists,
+//! mirroring `rls_injection::plan`.
 
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -16,10 +13,8 @@ use super::lookup::RefusalCtx;
 
 pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
     match op {
-        // A traversal with no collection (`None`) is a tree-index walk scoped
-        // by edge label; no catalog record maps the index back to a
-        // collection, so there is no policy to consult — identical to how RLS
-        // treats the same shape.
+        // `None` is a tree-index walk scoped by edge label, no collection
+        // mapping — no policy to consult, same as RLS.
         GraphOp::Hop { collection, .. }
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
@@ -39,12 +34,9 @@ pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Resu
         | GraphOp::MatchContinuation { query, .. }
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
 
-        // Edge and label writes carry no read result; the algorithm,
-        // superstep, and stats ops return whole-graph scalars (ranks,
-        // component ids, counters) rather than a collection's columns, and
-        // RAG fusion returns document rows that the result-path redaction
-        // hook rewrites like any other scan. None of these has an
-        // unredactable column read to refuse.
+        // Writes carry no read result; algorithm/superstep/stats ops return
+        // whole-graph scalars, not columns; RAG fusion's document rows are
+        // rewritten by the result-path redaction hook like any scan.
         GraphOp::EdgePut { .. }
         | GraphOp::EdgePutBatch { .. }
         | GraphOp::EdgeDelete { .. }
@@ -73,17 +65,11 @@ pub(super) fn refuse_traversal(ctx: &RefusalCtx<'_>, collection: &str) -> crate:
     })
 }
 
-/// Refuse a pattern match whose target collection carries a rule.
-///
-/// The collection lives in the serialized `MatchQuery` — the plan node carries
-/// only the encoded query — so it is decoded here to keep the refusal narrow:
-/// a match scoped with `IN '<collection>'` to a collection with no rule for
-/// this identity still runs.
-///
-/// A query that names no collection may traverse any of the tenant's edges, and
-/// one that fails to decode cannot be shown to avoid a protected collection.
-/// Both fall back to the tenant-wide question — the plan is refused only when
-/// this identity actually holds a redaction rule somewhere.
+/// Refuse a pattern match whose target collection carries a rule. The
+/// collection lives in the serialized `MatchQuery`, decoded here to keep
+/// the refusal narrow. A query naming no collection, or one that fails to
+/// decode, falls back to the tenant-wide question: refused only when this
+/// identity holds a redaction rule somewhere.
 pub(super) fn refuse_match(ctx: &RefusalCtx<'_>, query: &[u8]) -> crate::Result<()> {
     let decoded: Result<crate::engine::graph::pattern::ast::MatchQuery, _> =
         zerompk::from_msgpack(query);

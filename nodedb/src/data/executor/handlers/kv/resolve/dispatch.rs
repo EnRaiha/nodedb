@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Data Plane handler for `KvOp::ResolveWrite`.
-//!
-//! Reports what the wrapped write would apply, and what it would reply, while
-//! mutating nothing. The Control Plane runs this before proposing a governed
-//! state-dependent KV write through Raft: a follower has no writing identity
-//! to evaluate the write predicate against, and a KV write whose image is
-//! computed from the stored row cannot be re-derived after commit without
-//! risking a different answer on every replica.
-//!
-//! Read-only, so this takes `&self`. The arms below are exactly the KV
-//! ops whose stored image depends on state the Control Plane cannot see; every
-//! other op either has no such dependence or is not a write.
+//! Data Plane handler for `KvOp::ResolveWrite`. Reports what the wrapped
+//! write would apply and reply, mutating nothing — run before proposing a
+//! governed state-dependent KV write, since a follower has no writing
+//! identity and re-deriving after commit risks a different answer per
+//! replica. Read-only, so this takes `&self`.
 
 use tracing::debug;
 
@@ -251,10 +244,7 @@ impl CoreLoop {
                 filters,
                 rls_write_check,
             } => self.resolve_kv_predicate_delete(did, tid, collection, filters, rls_write_check),
-            // Every other KV op either writes an image the Control Plane
-            // already holds (a plain `Put`), writes nothing, or is itself a
-            // resolve/resolved op. None of them is resolvable, and none is
-            // ever wrapped: `resolver_for_plan` selects the ops above.
+            // Every other op is unwrapped by `resolver_for_plan` already.
             other => Err(ErrorCode::Internal {
                 detail: format!(
                     "kv resolve-write wraps an op with no state-dependent image: {}",

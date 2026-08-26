@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! KV read-modify-write op execution for transaction batches.
-//!
-//! Split out of `sub_plan_kv_ops.rs` (the main `KvOp` dispatcher) once the
-//! TTL and sorted-index-DDL arms pushed that file over this crate's per-file
-//! line budget. Each handler here captures the prior value(s) before the
-//! write so a later sibling sub-plan's failure can restore them via
-//! `rollback_undo_log`.
+//! KV read-modify-write op execution for transaction batches. Each handler
+//! captures the prior value(s) before the write so a later sibling
+//! sub-plan's failure can restore them via `rollback_undo_log`.
 
 use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
@@ -18,10 +14,8 @@ use super::undo::UndoEntry;
 
 impl CoreLoop {
     /// Execute a KV read-modify-write operation in a transaction context.
-    ///
-    /// Only called for the `KvOp` write variants that capture-then-execute
-    /// (see `sub_plan_kv_ops::execute_tx_kv`'s dispatch arm); every other
-    /// variant is handled directly there.
+    /// Only called for the `KvOp` write variants that capture-then-execute;
+    /// every other variant is handled directly in `execute_tx_kv`.
     pub(super) fn execute_tx_kv_write(
         &mut self,
         task: &ExecutionTask,
@@ -271,9 +265,7 @@ impl CoreLoop {
                 Ok(resp)
             }
 
-            // The four read-modify-write atomics capture and restore their
-            // prior value identically, so they share one handler in the
-            // sibling `sub_plan_kv_atomics.rs`.
+            // The four atomics capture/restore identically, sharing one handler.
             KvOp::Incr { .. } | KvOp::IncrFloat { .. } | KvOp::Cas { .. } | KvOp::GetSet { .. } => {
                 self.execute_tx_kv_atomic(task, did, tid, op, undo_log)
             }

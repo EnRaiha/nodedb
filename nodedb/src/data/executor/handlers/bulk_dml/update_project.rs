@@ -2,15 +2,11 @@
 
 //! Turning a bulk UPDATE's matched row set into the post-images it will store.
 //!
-//! Split out from the apply loop because the two answer different questions:
-//! this decides WHAT each matched row becomes, and the loop decides when that
-//! becomes durable. Separating them is what lets a statement-wide constraint be
-//! judged before the first row is written — the apply loop commits one
-//! transaction per row, so a check that ran while it iterated could only report
-//! a violation the rows ahead of it had already made durable.
-//!
-//! Projecting a row is pure: it reads the stored body and computes the new one,
-//! writing nothing.
+//! Split from the apply loop so a statement-wide constraint can be judged
+//! before the first row is written — the apply loop commits one transaction
+//! per row, so a check running during iteration could only catch a violation
+//! after earlier rows were already durable. Projecting a row is pure: it
+//! reads the stored body and computes the new one, writing nothing.
 
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::columnar::StrictSchema;
@@ -47,15 +43,9 @@ pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
 }
 
 impl CoreLoop {
-    /// Compute the post-image of every matched row.
-    ///
-    /// A row that is gone, will not decode under its collection's storage mode,
-    /// or cannot be re-encoded is skipped — the same rows the apply loop always
-    /// skipped, and for the same reasons. A failure that means the STATEMENT is
-    /// wrong (a body that will not decode as MessagePack on a schemaless
-    /// collection, an assignment expression that cannot be evaluated) is an
-    /// error, because silently skipping it would report a smaller affected
-    /// count as the truth.
+    /// Compute the post-image of every matched row. A row that is gone or
+    /// cannot decode/re-encode is skipped, same as the apply loop. A failure
+    /// that means the statement itself is wrong is an error, not a skip.
     pub(in crate::data::executor) fn project_bulk_update_rows(
         &self,
         p: ProjectUpdateRows<'_>,
@@ -91,20 +81,14 @@ impl CoreLoop {
                         None => continue,
                     }
                 }
-                // A row skipped here is one the UPDATE silently leaves
-                // untouched while reporting a smaller affected count as the
-                // truth, so it fails the statement instead.
+                // Fails the statement rather than silently under-reporting affected.
                 None => doc_format::decode_document(&current_bytes)?,
             };
 
-            // Pre-mutation image, captured before any field is changed. Feeds
-            // the secondary-index SET diff so values the UPDATE drops are
-            // removed from the index atomically with the write.
+            // Feeds the secondary-index SET diff for values the UPDATE drops.
             let old_doc = doc.clone();
-            // Snapshot the current row for expression evaluation. All
-            // expression assignments see the pre-update state — multiple
-            // assignments in the same UPDATE do not observe each other,
-            // matching PostgreSQL semantics.
+            // All assignments see this pre-update snapshot — they don't
+            // observe each other, matching PostgreSQL semantics.
             let eval_doc: nodedb_types::Value = doc.clone().into();
             if let Some(obj) = doc.as_object_mut() {
                 for (field, update_val) in updates {
@@ -115,10 +99,8 @@ impl CoreLoop {
                             Err(_) => continue,
                         },
                         UpdateValue::Expr(expr) => {
-                            // A division/modulo-by-zero in an UPDATE assignment
-                            // fails the whole statement, unlike the
-                            // literal-decode failure above which skips just that
-                            // field.
+                            // Unlike the literal-decode skip above, a division/
+                            // modulo-by-zero here fails the whole statement.
                             let result: nodedb_types::Value = expr.eval(&eval_doc)?;
                             result.into()
                         }

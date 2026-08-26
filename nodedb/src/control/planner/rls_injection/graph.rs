@@ -2,19 +2,12 @@
 
 //! RLS resolution for graph-overlay operations.
 //!
-//! No graph read carries a row-filter slot the storage layer can honour: a
-//! traversal returns topology, an algorithm returns per-node scalars, a
-//! pattern match returns bindings, and RAG fusion returns fused document rows
-//! through the fusion envelope. Each therefore refuses while a read policy
-//! restricts the identity on the collection being read, rather than returning
-//! rows — or the shape of rows — the policy says are not the caller's to see.
-//!
-//! The redaction pass refuses the traversal and match shapes here for the same
-//! reason. It permits the algorithm, stats, and RAG-fusion shapes, because
-//! those disclose no column value a rule could mask; RLS still refuses them,
-//! because what a row policy restricts is the row set itself, and a rank
-//! vector, a counter, and a fused document row all derive from rows the policy
-//! hides.
+//! No graph read carries a row-filter slot: traversal returns topology,
+//! algorithms return per-node scalars, pattern match returns bindings, RAG
+//! fusion returns fused rows. Each refuses while a read policy restricts
+//! the collection, rather than return rows the policy hides — including
+//! algorithm/stats/RAG-fusion shapes the redaction pass permits, since RLS
+//! restricts the row set itself, not just column values.
 
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -33,17 +26,8 @@ const ALGORITHM_REASON: &str = "an algorithm returns per-node scalars computed o
 /// between injecting, refusing, and no-op.
 pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<()> {
     match op {
-        // Refuse: a traversal returns node ids and edge labels, not row bodies
-        // — the rows are fetched later through `DocumentOp::PointGet`, which
-        // applies the policy then. What the traversal itself discloses is
-        // topology: which nodes exist and how they connect. A read policy says
-        // some of those rows are not the caller's to see, and their edges are
-        // equally not.
-        //
-        // A traversal with no collection (`None`) is a tree-index walk scoped
-        // by edge label; no catalog record maps an index back to the
-        // collection it was built on, so there is no policy to consult, and
-        // the DDL that builds such an index is authorized separately.
+        // Refuse: discloses topology, not row bodies. `None` is a
+        // tree-index walk with no collection mapping — no policy to consult.
         GraphOp::Hop { collection, .. }
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
@@ -53,30 +37,24 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
             None => Ok(()),
         },
 
-        // Refuse: same shape as `Neighbors`. The bitemporal form always names
-        // its collection — the versioned edge key layout is collection-scoped.
+        // Refuse: same shape as `Neighbors`; always names its collection.
         GraphOp::TemporalNeighbors { collection, .. } => {
             ctx.refuse_if_policy(collection, TRAVERSAL_REASON)
         }
 
-        // Refuse: a pattern match returns variable bindings over topology with
-        // no row-filter slot, and its own `WHERE` can probe a hidden row's
-        // field one predicate at a time. The collection lives inside the
-        // serialized query rather than on the plan node.
+        // Refuse: returns bindings with no filter slot; its own `WHERE`
+        // could probe a hidden row's field one predicate at a time.
         GraphOp::Match { query, .. }
         | GraphOp::MatchContinuation { query, .. }
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
 
-        // Refuse: the algorithm runs over the whole CSR for the collection and
-        // returns ranks / component ids / counts derived from every row,
-        // including the ones the policy hides, through a payload with no row
-        // to filter.
+        // Refuse: runs over the whole CSR, returns scalars derived from
+        // every row (including hidden ones), no row to filter.
         GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => {
             ctx.refuse_if_policy(&params.collection, ALGORITHM_REASON)
         }
 
-        // Refuse: the distributed supersteps are the same algorithms one round
-        // at a time, carrying the target collection in their params.
+        // Refuse: same algorithm, one round at a time.
         GraphOp::BspSuperstep(plan) => {
             ctx.refuse_if_policy(&plan.params.collection, ALGORITHM_REASON)
         }
@@ -84,20 +62,16 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
             ctx.refuse_if_policy(&plan.params.collection, ALGORITHM_REASON)
         }
 
-        // Refuse: RAG fusion returns fused document rows, but the fusion
-        // envelope has no `rls_filters` slot and embeds no sub-plan to recurse
-        // into — the vector, text, and graph legs all run inside the handler.
-        // So the rows a policy hides would be ranked and returned.
+        // Refuse: the fusion envelope has no filter slot and no sub-plan
+        // to recurse into — hidden rows would be ranked and returned.
         GraphOp::RagFusion { collection, .. } => ctx.refuse_if_policy(
             collection,
             "fusion returns ranked document rows through a fused response shape that carries no \
              row filter",
         ),
 
-        // Refuse: the counters summarize the collection's edges, so they count
-        // rows the policy hides, and a counter carries no row to filter.
-        // `collection = None` reports every collection that has edges, so the
-        // narrow per-collection question cannot be asked.
+        // Refuse: counters over the collection's edges, no row to filter.
+        // `None` spans every collection, so no narrow question can be asked.
         GraphOp::Stats { collection, .. } => match collection.as_deref() {
             Some(collection) => ctx.refuse_if_policy(
                 collection,
@@ -110,46 +84,30 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
             ),
         },
 
-        // Admit: `GRAPH INSERT EDGE` carries its `PROPERTIES` clause on the
-        // plan as the JSON object the edge is about to store, so the policy
-        // decides the row that will exist after the write — the same plan-time
-        // admission a document insert with a full image gets. An edge written
-        // with no `PROPERTIES` carries no field the predicate can test and is
-        // denied rather than admitted by omission.
+        // Admit: `PROPERTIES` is the post-image, decided at plan time like a
+        // document insert. No `PROPERTIES` = no field to test = denied.
         //
-        // The mirrored edge a `_from`/`_to` document write produces is NOT
-        // decided here, and must not be: it is appended to the task set AFTER
-        // this pass runs, it targets the same collection as the `DocumentOp`
-        // write that produced it, and that write was already admitted against
-        // this same policy. Deciding it a second time would deny every governed
-        // document insert on the strength of its own mirror, whose property
-        // object holds an edge weight and none of the governed columns.
+        // The mirrored `_from`/`_to` edge is NOT decided here: appended
+        // after this pass, its source document write already admitted it.
         GraphOp::EdgePut {
             collection,
             properties,
             ..
         } => ctx.admit_write_json_image(collection, properties),
 
-        // Compile: a delete carries no image. The property object the policy
-        // decides is the stored one, readable only where the tombstone is
-        // written, so the predicate travels with the plan and the Data Plane
-        // evaluates it against the pre-image it reads back — the same shape a
-        // document DELETE uses.
+        // Ship the predicate: a delete carries no image; the stored property
+        // object is readable only where the tombstone is written.
         GraphOp::EdgeDelete {
             collection,
             rls_write_check,
             ..
         } => ctx.set_write_check(collection, rls_write_check),
 
-        // Recurse: the resolve pass carries the delete it is about to decide,
-        // and that delete's own slot is the one the policy fills.
+        // Recurse: the wrapped delete's own slot is the one the policy fills.
         GraphOp::ResolveEdgeDelete(inner) => inject_graph(ctx, inner),
 
-        // Refuse: the batch forms carry no property image at all — every edge
-        // in a batch is applied with empty properties — so there is nothing for
-        // the policy to be evaluated against. Each `BatchEdge` does name its
-        // collection, but a known collection with no row image still leaves the
-        // policy undecidable, so this falls back to the tenant-wide question.
+        // Refuse: every edge in a batch applies with empty properties, so
+        // there's no image to evaluate even though each names its collection.
         GraphOp::EdgePutBatch { .. } | GraphOp::EdgeDeleteBatch { .. } => {
             ctx.refuse_if_any_write_policy(EDGE_BATCH_REASON)
         }
@@ -162,16 +120,8 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
 }
 
 /// Refuse a pattern match whose target collection carries a read policy.
-///
-/// The collection lives in the serialized `MatchQuery` — the plan node carries
-/// only the encoded query — so it is decoded here to keep the refusal narrow:
-/// a match scoped with `IN '<collection>'` to a collection no policy restricts
-/// still runs.
-///
-/// A query that names no collection may traverse any of the tenant's edges,
-/// and one that fails to decode cannot be shown to avoid a protected
-/// collection. Both fall back to the tenant-wide question, exactly as the
-/// redaction pass does for the same shape.
+/// A query naming no collection, or one that fails to decode, falls back
+/// to the tenant-wide question.
 fn refuse_match(ctx: &RlsCtx<'_>, query: &[u8]) -> crate::Result<()> {
     let decoded: Result<crate::engine::graph::pattern::ast::MatchQuery, _> =
         zerompk::from_msgpack(query);
@@ -369,9 +319,7 @@ mod tests {
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
 
-        // Injection's only mark on a plan it finds no policy for is the write
-        // check itself. That stamp is what tells the Data Plane gate the pass
-        // ran, rather than having been skipped.
+        // Stamps `NoPolicyApplies` so the gate can tell the pass ran.
         assert_eq!(
             plan.rls_write_checks(),
             vec![&nodedb_types::RlsWriteCheck::NoPolicyApplies]

@@ -18,9 +18,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ..
         } => ctx.merge_into(collection, filters),
 
-        // Inject: no pushdown slot, so the handler evaluates the policy on the
-        // fetched value. An excluded row reads back as absent, which a caller
-        // cannot distinguish from a missing key.
+        // Inject: no pushdown slot, so the handler evaluates post-fetch. An
+        // excluded row reads back as absent, indistinguishable from missing.
         KvOp::Get {
             collection,
             rls_filters,
@@ -37,9 +36,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // Refuse: returns only the key's remaining lifetime. There is no row
-        // body to filter, and answering at all confirms that a row the policy
-        // hides exists.
+        // Refuse: no row body to filter, and answering discloses that a
+        // hidden row exists.
         KvOp::GetTtl { collection, .. } => ctx.refuse_if_policy(
             collection,
             "the reply is a TTL rather than a row body, so the row filter cannot be evaluated \
@@ -54,16 +52,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              carries no row filter",
         ),
 
-        // Refuse: a sorted-index read returns ranks, counts, and ranked keys
-        // drawn from the collection the index was built over, through a
-        // payload with no filter slot. The plan names only the index, so the
-        // narrow per-collection question cannot be asked here — this pass
-        // holds the policy store and the identity, not the catalog that binds
-        // an index name to its collection. The handler resolves that binding
-        // from the index registry and refuses on the owning collection; this
-        // pass asks the tenant-wide question instead, the same fallback every
-        // collection-less shape uses, so a plan reaching the Data Plane
-        // through any other route still fails closed.
+        // Refuse: plan names only the index, not its owning collection.
+        // Falls back to the tenant-wide question.
         KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
@@ -73,22 +63,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              and the plan names only the index",
         ),
 
-        // Admit the write image, then inject the read filter. The plan carries
-        // the whole post-image, so the write policy is evaluated against the
-        // exact row that will exist afterwards. A multi-column SQL write
-        // encodes its columns as a MessagePack map, so the predicate reads the
-        // same field names a `SELECT` would; a single-column `value` write
-        // stores one opaque scalar, which carries no field for the predicate to
-        // name and is therefore rejected by the same evaluation rather than by
-        // a carve-out.
-        //
-        // The read filter is not redundant with that admission. It gates a
-        // different thing: a `RETURNING` clause on these writes ships rows
-        // back, and that output is a read, so a row a read-only policy hides
-        // must not become visible just because the statement wrote it. The two
-        // policies are independent — a collection can carry a `FOR SELECT`
-        // policy and no write policy at all, in which case the write is
-        // unrestricted and the returned row set still shrinks.
+        // Admit now: a single-scalar `value` write has no field to name,
+        // so it fails the same evaluation rather than a carve-out.
         KvOp::Put {
             collection,
             value,
@@ -111,10 +87,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Admit every entry: one violating row fails the whole statement, since
-        // a silently dropped row would report a write that never happened. The
-        // read filter rides along for the same reason it does on the point
-        // writes above — `RETURNING` output is a read.
+        // Admit every entry: a silently dropped row would report a write
+        // that never happened.
         KvOp::BatchPut {
             collection,
             entries,
@@ -127,13 +101,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Ship the write predicate: the image these persist is produced where
-        // it is persisted, not here. The conflict branch stores a merge of the
-        // incoming row with the stored one; a delete's image is the row it
-        // removes; a TTL mutation leaves the body untouched, so the stored row
-        // is the image; a field merge exists only after the stored row is read.
-        // The Data Plane evaluates the predicate against those exact bytes just
-        // before persisting, and rejects the whole statement when one fails.
+        // Ship the predicate: the persisted image (merge, removed row,
+        // TTL body, field merge) exists only where it's persisted.
         KvOp::InsertOnConflictUpdate {
             collection,
             rls_write_check,
@@ -165,10 +134,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             rls_write_check,
             ..
         }
-        // The row set is resolved by the Data Plane scan, so the images the
-        // policy decides — each merged post-image, each removed pre-image —
-        // exist only where they are persisted, exactly as for the keyed
-        // shapes above. Mirrors `ColumnarOp::{Update, Delete}`.
+        // Row set resolved by the Data Plane scan; images exist only where
+        // persisted. Mirrors `ColumnarOp::{Update, Delete}`.
         | KvOp::PredicateUpdate {
             collection,
             rls_write_check,
@@ -180,11 +147,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ..
         } => ctx.set_write_check(collection, rls_write_check),
 
-        // Ship the write predicate, and refuse under a read policy: each of
-        // these replies with a value computed from the stored row — the new
-        // counter, the pre-swap value, the two balances — through a payload
-        // with no row-filter slot, so a policy that hides the row cannot be
-        // honored on the way out and the answer alone discloses it.
+        // Ship predicate, refuse under a read policy: the reply is computed
+        // from the stored row with no filter slot to hide it.
         KvOp::Incr {
             collection,
             rls_write_check,
@@ -209,11 +173,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_write_check(collection, rls_write_check)
         }
 
-        // Inject both policies: the old value this returns is a row body, so
-        // the read filter decides whether it may be shown — an excluded one
-        // comes back absent, indistinguishable from a key that did not exist —
-        // while the compiled write predicate decides `new_value`. The two slots
-        // stay separate because one bounds visibility and the other the write.
+        // Inject both: read filter gates the old value returned (excluded
+        // = absent), write predicate decides `new_value` separately.
         KvOp::GetSet {
             collection,
             rls_filters,
@@ -224,11 +185,8 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_write_check(collection, rls_write_check)
         }
 
-        // A move spans two collections with independent policies, so each side
-        // ships its own predicate: the source's decides the row being removed,
-        // the destination's the row being inserted. The read half refuses for
-        // the same reason as the atomics — a `NotFound` reply reports whether
-        // a row the policy hides exists.
+        // Two independent policies: each side ships its own predicate.
+        // Read half refuses for the same reason as the atomics above.
         KvOp::TransferItem {
             source_collection,
             dest_collection,
@@ -242,23 +200,18 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_write_check(dest_collection, dest_rls_write_check)
         }
 
-        // Refuse: a truncate removes every row without reading one, so there is
-        // no image the policy could be evaluated against — and a policy that
-        // restricts which rows this identity may write is precisely a statement
-        // that it may not remove all of them. The document engine's truncate
-        // refuses for the same reason.
+        // Refuse: removes every row without reading one, so no image
+        // exists to evaluate against. Mirrors the document engine's truncate.
         KvOp::Truncate { collection, .. } => ctx.refuse_if_write_policy(
             collection,
             "a truncate removes every row without reading one, so no row image is available",
         ),
 
-        // Inject into the wrapped op: it is the intercepted write verbatim,
-        // and resolution decides exactly the check injected there.
+        // Recurse: the wrapped op is the intercepted write verbatim.
         KvOp::ResolveWrite(inner) => inject_kv(ctx, inner),
 
-        // No-op: the write policy was already decided against every image
-        // this write persists, before it was proposed. Re-injecting would
-        // replace a verdict with a predicate no applying node can evaluate.
+        // No-op: already decided before this write was proposed;
+        // re-injecting would replace a verdict with an unevaluable predicate.
         KvOp::ResolvedWrite { .. } => Ok(()),
 
         // No-op: index DDL writes no user row, so no row policy restricts it.

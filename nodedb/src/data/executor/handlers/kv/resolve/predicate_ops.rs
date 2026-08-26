@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the KV predicate writes: `PredicateUpdate`,
-//! `PredicateDelete`.
-//!
-//! Each reads the row set through the same [`CoreLoop::kv_predicate_matches`]
-//! scan its live handler uses, computes each post-image with the same merge,
-//! and decides the write policy with the same gate — then reports the
-//! mutations instead of applying them.
+//! `PredicateDelete`. Each reads via the same [`CoreLoop::kv_predicate_matches`]
+//! scan the live handler uses, computes each post-image with the same merge,
+//! and reports the mutations instead of applying them.
 
 use nodedb_types::{RlsWriteCheck, Surrogate};
 
@@ -19,10 +16,8 @@ use crate::engine::kv::current_ms;
 use nodedb_physical::physical_plan::KvResolveOutcome;
 
 impl CoreLoop {
-    /// Resolve a predicate `UPDATE`.
-    ///
-    /// Each matched row's stored body becomes its mutation's `precondition`,
-    /// so a resolution that a concurrent write moved past applies nothing.
+    /// Resolve a predicate `UPDATE`. Each matched row's stored body becomes
+    /// its mutation's `precondition`, so a moved-past resolution applies nothing.
     pub(super) fn resolve_kv_predicate_update(
         &self,
         did: u64,

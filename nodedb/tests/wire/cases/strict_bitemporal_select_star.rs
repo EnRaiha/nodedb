@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression: a `document_strict` collection created `WITH (bitemporal=true)`
-//! carries three internal reserved temporal columns (`__system_from_ms`,
-//! `__valid_from_ms`, `__valid_until_ms`) prepended into its physical schema.
-//! These are engine bookkeeping — they must NOT leak into a user `SELECT *`.
-//! Before the fix the strict decode path iterated every schema column
-//! unconditionally, so `SELECT *` returned all three alongside the user's
-//! columns (and, being prepended, shifted the user columns). This test asserts
-//! the user-facing projection contains exactly the declared user columns.
+//! Regression: a bitemporal `document_strict` collection prepends three
+//! internal reserved temporal columns into its physical schema — engine
+//! bookkeeping that must not leak into a user `SELECT *`. Asserts the
+//! projection contains exactly the declared user columns.
 
 use crate::harness::TestServer;
 

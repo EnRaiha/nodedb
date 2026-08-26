@@ -1,42 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The ILP ingest path's admission gate must see the client's real socket
-//! address.
-//!
-//! `flush_authenticated_ilp_batch` resolves a request scope and runs
-//! `check_blacklist_and_status` before a single line is parsed. Both halves of
-//! that gate — the IP blacklist and the adaptive-auth risk stamp — parse the
-//! address they are handed and ignore anything that is not one. A scope built
-//! without the accepted socket's address, or with a fixed transport label in
-//! its place, therefore disables the blacklist and silently withholds every
-//! `REQUIRE IP` grant across the whole ingest surface (native ILP, OTLP, and
-//! PromQL remote write all enter through this function) while still appearing
-//! to call the gate.
-//!
-//! The blacklist is the observable half. An ILP connection sends no per-line
-//! acknowledgement, but a refused batch IS observable without polling: the
-//! handler returns on the failed flush and drops the stream, so the client
-//! sees EOF. Keying on that rather than on whether a row arrived is what makes
-//! these deterministic — an "the row landed within N seconds" poll measures
-//! ingest throughput, and under a loaded suite it reports starvation as a
-//! policy failure. One test below still asserts row arrival, because something
-//! has to prove ingest works at all; the two that assert the *policy* do not.
-//!
-//! Two details make the assertion precise:
-//!
-//! - The ILP client binds its source to `127.0.0.2` while the admin session
-//!   stays on `127.0.0.1`. Loopback is a `/8`, so both are the same host but
-//!   distinct addresses — the ban can name the ingest client exactly, and the
-//!   session that must observe the outcome is never caught by it. A test that
-//!   banned all of `127.0.0.0/8` would lock itself out of its own verification
-//!   query.
-//! - The connection authenticates BEFORE the ban is placed, so what is
-//!   measured is the per-batch admission gate rather than the connection's
-//!   authentication prelude.
-//!
-//! This runs against the real server binary rather than the in-process
-//! harness: ILP ingest is a Calvin-sequenced write, which the single-process
-//! harness does not run.
+//! address, or a scope built without it silently disables the blacklist and
+//! every `REQUIRE IP` grant. A refused batch is observable without polling
+//! since the handler drops the stream. Runs against the real server binary
+//! since ILP ingest is Calvin-sequenced.
 
 mod crash_harness;
 
@@ -50,9 +18,7 @@ use nodedb_test_support::ilp_client;
 const INGEST_WAIT: Duration = Duration::from_secs(15);
 
 /// How long to wait for the server to close a connection whose batch it
-/// refused. Generous, because it bounds a failure rather than a success: the
-/// close follows the refusal immediately, so overshooting costs nothing on the
-/// passing path.
+/// refused. Generous — it bounds a failure, so overshooting costs nothing.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
 /// How long an admitted connection must stay open to count as not-refused.
@@ -170,10 +136,8 @@ async fn blacklisted_client_ip_cannot_keep_ingesting_over_ilp() {
     );
 }
 
-/// Regression guard for the fix above: threading the real address must not
-/// turn every ILP batch into a refusal. The ban here names a different
-/// address, so this ingest is the same shape as the refused one and differs
-/// only in whether the client's own address matches.
+/// Regression guard: threading the real address must not turn every ILP
+/// batch into a refusal. Ban here names a different address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_ip_outside_the_blacklisted_range_is_not_refused_over_ilp() {
     let harness = start_ingest_server("ilp_allowed_rows").await;

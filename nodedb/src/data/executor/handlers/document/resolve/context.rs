@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Shared state reads and mutation constructors for resolving a governed
-//! document write.
-//!
-//! Every resolver in this module reads state and computes images; not one of
-//! them writes. The mutation each produces carries a `precondition` recording
-//! the exact stored bytes it read, so the apply can refuse a resolution that
-//! state has moved past.
+//! document write. Every resolver here reads state and computes images; none
+//! writes. Each mutation carries a `precondition` (the exact stored bytes
+//! read) so the apply can refuse a resolution state has moved past.
 
 use nodedb_physical::physical_plan::{
     DocumentResolveOutcome, DocumentResolvedMutation, ResolvedSumTarget, ReturningSpec, StorageMode,
@@ -24,11 +21,8 @@ use crate::engine::document::store::surrogate_to_doc_id;
 /// error the live handler would have returned for the same input.
 pub(super) type ResolveResult = Result<DocumentResolveOutcome, ErrorCode>;
 
-/// The per-collection facts every document resolver reads once.
-///
-/// Held rather than re-derived per row: the strict-schema probe is a
-/// `doc_configs` lookup and the bitemporal probe reads the same config, and a
-/// bulk resolve would otherwise pay both per matched row.
+/// The per-collection facts every document resolver reads once. Held rather
+/// than re-derived per row, or a bulk resolve pays both probes per match.
 pub(super) struct DocResolveCtx {
     pub database_id: u64,
     pub tid: u64,
@@ -66,11 +60,9 @@ impl CoreLoop {
         }
     }
 
-    /// The row's raw stored body, or `None` when it is absent.
-    ///
-    /// Reads through the same current-state view the live write path uses, so a
-    /// bitemporal collection resolves against its live version rather than a
-    /// superseded one. This value becomes the mutation's `precondition`.
+    /// The row's raw stored body, or `None` when absent. Reads through the
+    /// same current-state view the live write path uses; becomes the
+    /// mutation's `precondition`.
     pub(super) fn doc_resolve_read(
         &self,
         ctx: &DocResolveCtx,
@@ -80,9 +72,8 @@ impl CoreLoop {
         self.doc_current_bytes(ctx.database_id, ctx.tid, collection, row_key)
     }
 
-    /// The same current-state read, for a caller that holds no
-    /// [`DocResolveCtx`] — the apply path, which checks one precondition per
-    /// mutation and may span collections.
+    /// The same current-state read, for a caller with no [`DocResolveCtx`] —
+    /// the apply path, which checks one precondition per mutation.
     pub(in crate::data::executor) fn doc_current_bytes(
         &self,
         database_id: u64,
@@ -157,11 +148,9 @@ pub(super) fn affected_payload(affected: usize) -> Vec<u8> {
     payload
 }
 
-/// The reply a write returns, decided at resolve time.
-///
-/// Built through the same `RETURNING` projection the live handlers use, fed the
-/// STORED image the resolve computed, so the rows a resolved write reports are
-/// the rows a directly dispatched one reports.
+/// The reply a write returns, decided at resolve time — built through the
+/// same `RETURNING` projection live handlers use, over the stored image
+/// resolve computed.
 pub(super) fn resolved_response_payload(
     returning: Option<&ReturningSpec>,
     rls_filters: &[u8],

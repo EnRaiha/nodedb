@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Resolver for `Upsert`.
-//!
-//! Probes for the row exactly as `execute_upsert` does and takes the same two
-//! branches, computing each branch's body with the same merge helpers
-//! (`merge_values` / `apply_on_conflict_updates`) and deciding the same gate on
-//! the same bytes.
-//!
-//! The two branches differ in one thing the apply depends on: the merge branch
-//! resolves against a row that was PRESENT, so its precondition is that row's
-//! stored bytes; the insert branch resolves against a row that was ABSENT, so
-//! its precondition is `None` and the apply requires the row to still be gone.
+//! Resolver for `Upsert`. Probes for the row exactly as `execute_upsert` does
+//! and takes the same two branches. The merge branch's precondition is the
+//! present row's stored bytes; the insert branch's is `None`, requiring the
+//! row to still be gone at apply.
 
 use nodedb_physical::physical_plan::{
     DocumentResolveOutcome, ResolvedSumTarget, ReturningSpec, UpdateValue,
@@ -81,16 +74,12 @@ impl CoreLoop {
             None => (value.to_vec(), None),
         };
 
-        // Both branches decide the MessagePack body, which is what both live
-        // branches decide: the merge branch gates `merged_body`, the insert
-        // branch gates the submitted `value`, and neither passes a schema.
+        // Both live branches gate the MessagePack body, no schema passed.
         rls_write_gate::admit_stored_row(rls_write_check, &body, row_key, None, tid, collection)
             .map_err(ErrorCode::from)?;
 
-        // `RETURNING` projects the STORED image, through the same
-        // `build_stored_body` the apply runs — so the resolve reports the row
-        // that will land, generated columns and `_rowid` included, rather than
-        // the body it was handed.
+        // `RETURNING` projects the stored image via the same `build_stored_body`
+        // the apply runs, so the resolve reports the row that will actually land.
         let config_key = (
             task.request.database_id,
             crate::types::TenantId::new(tid),
@@ -128,10 +117,8 @@ impl CoreLoop {
         })
     }
 
-    /// The merged body an upsert's conflict branch stores, as MessagePack.
-    ///
-    /// The same decode → merge → encode `execute_upsert_overwrite` performs, so
-    /// a resolved upsert stores what a directly dispatched one stores.
+    /// The merged body an upsert's conflict branch stores, as MessagePack —
+    /// the same decode → merge → encode `execute_upsert_overwrite` performs.
     fn merge_upsert_body(
         &self,
         current_bytes: &[u8],
@@ -142,9 +129,7 @@ impl CoreLoop {
         let existing_val = match strict_schema {
             Some(schema) => match strict_format::binary_tuple_to_value(current_bytes, schema) {
                 Some(v) => v,
-                // Migration case: a row written before the collection became
-                // strict is still MessagePack. Same fallback the live branch
-                // takes.
+                // Migration case: a pre-strict row is still MessagePack.
                 None => nodedb_types::value_from_msgpack(current_bytes).map_err(|_| {
                     ErrorCode::Internal {
                         detail: "failed to decode document for upsert".into(),

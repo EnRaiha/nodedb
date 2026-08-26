@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Turning an incoming document body into the bytes storage will hold.
-//!
-//! Its own concern because two callers need the same answer from the same
-//! inputs: [`CoreLoop::apply_point_put`](super::core), which writes them, and
-//! the governed-write RESOLVE pass, which reports what a write WOULD store and
-//! projects `RETURNING` from it. Deriving the stored image twice is how the two
-//! start disagreeing about which row the policy admitted.
-//!
-//! Pure value computation: no store, no index, no transaction.
+//! Turning an incoming document body into the bytes storage will hold. Its
+//! own concern because two callers need the same answer:
+//! [`CoreLoop::apply_point_put`](super::core), which writes it, and the
+//! governed-write RESOLVE pass, which reports what a write WOULD store —
+//! deriving the image twice is how the two disagree. Pure: no store, no
+//! index, no transaction.
 
 use nodedb_types::Surrogate;
 
@@ -42,13 +39,8 @@ pub(in crate::data::executor) struct StoredBody {
 
 impl CoreLoop {
     /// Build the canonical body and the stored image for one incoming write.
-    ///
-    /// # `value` is an incoming body, so failing to read it as a document is an answer
-    ///
-    /// The generated-column step guards on a successful decode rather than
-    /// propagating: a body with no readable fields has no column for a
-    /// generated expression to read or write, so it is stored as supplied. The
-    /// strict encode below still rejects a body it cannot read.
+    /// A body with no readable fields skips generated-column evaluation and
+    /// stores as supplied; the strict encode below still rejects it.
     pub(in crate::data::executor) fn build_stored_body(
         &self,
         input: StoredBodyInput<'_>,
@@ -85,14 +77,9 @@ impl CoreLoop {
             doc_format::canonicalize_document_for_storage(value)
         };
 
-        // Strict (Binary Tuple) encoding pipeline. Runs in two steps under a
-        // single doc-config lookup:
-        //   (1) When the schema has an auto-generated `_rowid` primary key
-        //       (injected by `build_strict_schema` when no explicit PK is
-        //       declared), the client INSERT payload won't contain it. Inject it
-        //       from the surrogate before encoding so the NOT NULL constraint is
-        //       satisfied.
-        //   (2) Encode the (possibly-injected) MessagePack into Binary Tuple.
+        // Strict (Binary Tuple) pipeline: inject an auto-generated `_rowid`
+        // from the surrogate if the schema declares one and the client
+        // payload lacks it, then encode into Binary Tuple.
         let Some(config) = self.doc_configs.get(config_key) else {
             return Ok(StoredBody {
                 stored: value.clone(),

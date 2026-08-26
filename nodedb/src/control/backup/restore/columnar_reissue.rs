@@ -2,18 +2,11 @@
 
 //! Durable re-issue of restored plain-columnar rows.
 //!
-//! The snapshot-install path lands columnar engine state in in-memory-only Data
-//! Plane maps with no WAL record and no Raft entry — lost on restart
-//! (single-node) and never replicated (cluster). RESTORE instead re-issues each
-//! restored columnar collection's live rows as a durable `ColumnarOp::Insert`,
-//! branching on cluster vs single-node exactly like a normal write:
-//!
-//! - Cluster (`async_raft_proposer` present): build a `ReplicatedEntry` and
-//!   propose it through Raft (replicates to all replicas; recovery via Raft-log
-//!   re-apply; surrogates carried by `ReplicatedWrite::ColumnarIngest`).
-//! - Single-node: WAL-append the plan, then dispatch it into the Data Plane so
-//!   it is installed live (WAL makes it durable for restart replay; surrogates
-//!   carried by the `ColumnarWalRecord`).
+//! Snapshot-install lands columnar state in in-memory-only Data Plane maps
+//! with no WAL record or Raft entry — lost on restart, never replicated.
+//! RESTORE re-issues each collection's live rows as a durable
+//! `ColumnarOp::Insert`: Raft-proposed on cluster, WAL-appended + dispatched
+//! on single-node — the same branch a normal write takes.
 
 use std::collections::HashMap;
 use std::time::Duration;

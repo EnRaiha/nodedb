@@ -2,17 +2,10 @@
 
 //! Graph implementation of [`EngineWriteResolver`].
 //!
-//! Resolves a governed `GraphOp::EdgeDelete` by deciding the policy against the
-//! edge's stored property object, then rebuilds the same delete with a decided
-//! check.
-//!
-//! A delete names its edge in full on the plan — collection, endpoints, label —
-//! so nothing about the write itself has to be resolved. What cannot cross the
-//! wire is the predicate: the image a policy governs is the stored property
-//! object, which only the node holding the edge can read, and a follower has no
-//! writing identity to evaluate `$auth.*` against. So the resolve pass reads
-//! that image and decides it while the identity is live, and the proposed
-//! delete carries the verdict instead of the predicate.
+//! Resolves a governed `GraphOp::EdgeDelete` by deciding the policy against
+//! the edge's stored properties, then rebuilds the delete with the decided
+//! check. A follower has no writing identity to evaluate `$auth.*`, so the
+//! verdict travels on the wire instead of the predicate.
 
 use crate::types::VShardId;
 use async_trait::async_trait;
@@ -37,9 +30,7 @@ pub struct GraphWriteResolver {
 }
 
 /// The resolver for `op`, or `None` when it carries no live write predicate.
-///
-/// Exhaustive over `GraphOp`: a new graph op fails to compile here rather than
-/// silently skipping resolution.
+/// Exhaustive over `GraphOp` — a new op fails to compile here.
 pub(super) fn resolver_for_graph_op(op: &GraphOp) -> Option<Box<dyn EngineWriteResolver>> {
     let (collection, src_id) = match op {
         GraphOp::EdgeDelete {
@@ -53,11 +44,8 @@ pub(super) fn resolver_for_graph_op(op: &GraphOp) -> Option<Box<dyn EngineWriteR
             }
             (collection, src_id)
         }
-        // `EdgePut` carries its `PROPERTIES` image on the plan, so the policy
-        // already decided it at injection. The batch forms carry no image at
-        // all and RLS injection refuses them outright. Everything else is a
-        // read, a label write that names no collection, or the resolve pass
-        // itself.
+        // EdgePut is decided at injection; batch forms are refused outright
+        // by RLS injection. Everything else is a read or unrelated write.
         GraphOp::EdgePut { .. }
         | GraphOp::EdgePutBatch { .. }
         | GraphOp::EdgeDeleteBatch { .. }
@@ -102,10 +90,8 @@ impl EngineWriteResolver for GraphWriteResolver {
         PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(Box::new(self.op.clone())))
     }
 
-    /// An edge the Data Plane's write-policy gate refuses surfaces here as
-    /// `crate::Error::DataPlane(ErrorCode::RejectedAuthz { .. })` — the exact
-    /// error the direct delete already returns, because the resolve handler
-    /// runs the same `admit_edge_properties` gate against the same pre-image.
+    /// A refused edge surfaces as `DataPlane(RejectedAuthz)`, same as the
+    /// direct delete — the resolve handler runs the same gate.
     async fn resolve(
         &self,
         state: &SharedState,

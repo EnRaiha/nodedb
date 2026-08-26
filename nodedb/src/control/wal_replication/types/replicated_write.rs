@@ -26,59 +26,22 @@ pub enum ReplicatedWrite {
         document_id: String,
         value: Vec<u8>,
         surrogate: u32,
-        /// The materialized-sum resolution the PROPOSING node performed: each
-        /// join-key VALUE this write's rows carry, paired with the surrogate of
-        /// the target row that value names.
-        ///
-        /// Carried on the wire for the same reason `KvPut::resolved_now_ms` is:
-        /// it is resolved once, by the node that accepted the statement, and no
-        /// applying node may re-derive it. The pk → surrogate map lives in the
-        /// catalog of the vShard that OWNS the target's primary key
-        /// (`lookup_surrogate_routed` routes the probe to that vShard's leader),
-        /// so an applier holding only the SOURCE vShard's replica cannot answer
-        /// the question locally, and answering it remotely would put a network
-        /// round-trip — and another node's clock of committed state — inside the
-        /// apply loop. Shipping the answer makes the follower's derived total
-        /// identical to the leader's by construction.
-        ///
-        /// Empty for every write whose collection drives no binding, which is
-        /// nearly all of them.
-        ///
-        /// SUPERSEDED by `resolved_sum_target_bindings`, and retained only
-        /// because this enum is an append-only wire ABI: a peer running an
-        /// older binary reads this slot and behaves exactly as it does today.
-        /// New appliers read it only when `resolved_sum_target_bindings` is
-        /// empty — see there.
+        /// Join-key value → target surrogate, resolved by the proposing node.
+        /// No applying node can re-derive this from the source vShard alone.
+        /// SUPERSEDED by `resolved_sum_target_bindings`; kept for wire ABI compat.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
-        /// The same resolution, keyed on the `(target collection, join value)`
-        /// PAIR — the authoritative slot.
-        ///
-        /// `resolved_sum_targets` above cannot express the answer when a source
-        /// drives two bindings that read the SAME join column into DIFFERENT
-        /// target collections: one entry per join value means the second
-        /// binding's fold finds the first binding's target row and writes its
-        /// balance there. Both stored totals are then wrong and nothing reports
-        /// it.
-        ///
-        /// Appended rather than replacing the older slot, which is what this
-        /// wire ABI does with every added field. A record written before this
-        /// field existed carries an empty vec here and a populated vec above;
-        /// the decoder then lifts the older slot as untargeted entries, which
-        /// match any binding by value alone — exactly what that record meant
-        /// when it was written, and what lets a node replay its own committed
-        /// log across the upgrade.
+        /// Same resolution, keyed on `(target collection, join value)` — the
+        /// authoritative slot. Needed when a source drives two bindings on the
+        /// same join column into different targets; the untargeted slot above
+        /// can't tell those apart.
         #[serde(default)]
         resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
-        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
-        /// same way `ColumnarIngest::returning` is. `None` for a record
-        /// written before this field existed, and for any write with no
-        /// RETURNING clause.
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded.
+        /// `None` if pre-dating this field or no RETURNING clause.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters gating what `returning` may show back — see
-        /// `DocumentOp::PointPut::rls_filters`. Empty for a record written
-        /// before this field existed.
+        /// Read filters gating what `returning` may show back.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -93,13 +56,8 @@ pub enum ReplicatedWrite {
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
         /// Target collections whose delta the proposing node split onto its own
-        /// `ApplyBalanceDelta` entry because the target homes to a different
-        /// vShard.
-        ///
-        /// Travels with the write for the same reason the resolution does, and
-        /// with sharper consequences: an applier that did not read this list
-        /// would fold the delta locally AND receive the sibling entry, counting
-        /// the same amount twice.
+        /// `ApplyBalanceDelta` entry because the target lives on a different
+        /// vShard. Skipping this list double-counts the delta on apply.
         #[serde(default)]
         deferred_sum_targets: Vec<String>,
         /// See `PointPut::resolved_sum_target_bindings`.
@@ -302,28 +260,19 @@ pub enum ReplicatedWrite {
         #[serde(default)]
         provenance: Option<Vec<u8>>,
         /// "json", "msgpack", or "ilp" — see `ColumnarOp::Insert::format`.
-        /// Defaulted for a record written before this field existed: the sync
-        /// path has only ever produced MessagePack payloads.
+        /// Defaults to msgpack for a pre-field record.
         #[serde(default = "default_columnar_ingest_format")]
         format: String,
-        /// INSERT / INSERT IF ABSENT / UPSERT distinction — see
-        /// `ColumnarInsertIntent`. Defaulted to plain `Insert` for a record
-        /// written before this field existed.
+        /// INSERT / INSERT IF ABSENT / UPSERT — see `ColumnarInsertIntent`.
         #[serde(default = "default_columnar_insert_intent")]
         intent: ColumnarInsertIntent,
-        /// `ON CONFLICT (pk) DO UPDATE SET field = expr` assignments — see
-        /// `ColumnarOp::Insert::on_conflict_updates`. Empty for a record
-        /// written before this field existed.
+        /// `ON CONFLICT (pk) DO UPDATE SET field = expr` assignments.
         #[serde(default)]
         on_conflict_updates: Vec<(String, UpdateValue)>,
-        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
-        /// same way `provenance` above is. `None` for a record written before
-        /// this field existed, and for any write with no RETURNING clause.
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters (MessagePack `Vec<ScanFilter>`) gating what
-        /// `returning` may show back — see `ColumnarOp::Insert::rls_filters`.
-        /// Empty for a record written before this field existed.
+        /// Read filters (`Vec<ScanFilter>`) gating what `returning` may show.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -336,14 +285,10 @@ pub enum ReplicatedWrite {
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
-        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded the
-        /// same way `provenance` above is. `None` for a record written before
-        /// this field existed, and for any write with no RETURNING clause.
+        /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters (MessagePack `Vec<ScanFilter>`) gating what
-        /// `returning` may show back — see `TimeseriesOp::Ingest::rls_filters`.
-        /// Empty for a record written before this field existed.
+        /// Read filters (`Vec<ScanFilter>`) gating what `returning` may show.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -607,13 +552,9 @@ pub enum ReplicatedWrite {
         filters: Vec<u8>,
         is_update: bool,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
-        /// See `PointPut::resolved_sum_targets`.
-        ///
-        /// A predicate write re-derives its MATCHING rows on every replica, but
-        /// not the identity of the target rows those matches credit: that came
-        /// from a reconnaissance scan the proposing node ran against the target
-        /// collection's catalog. The matches are deterministic; the resolution
-        /// is not derivable.
+        /// See `PointPut::resolved_sum_targets`. A replica re-derives which rows
+        /// match, but not which target row each credits — that came from the
+        /// proposing node's scan of the target collection's catalog.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
         /// See `PointPut::resolved_sum_target_bindings`.
@@ -707,9 +648,8 @@ pub enum ReplicatedWrite {
     DocTruncate {
         collection: String,
         restart_identity: bool,
-        /// See `BulkDml::resolved_sum_targets` — a truncate names its rows by
-        /// the whole collection, and every one of them takes its contribution
-        /// back off a target the proposing node had to resolve.
+        /// See `BulkDml::resolved_sum_targets` — every row in the truncated
+        /// collection takes its contribution off a resolved target.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
         /// See `PointPut::resolved_sum_target_bindings`.
@@ -738,7 +678,7 @@ pub enum ReplicatedWrite {
         provenance: Option<Vec<u8>>,
     },
 
-    /// Fenced CRDT apply; appended to preserve legacy positional records.
+    /// Fenced CRDT apply.
     CrdtApplyFenced {
         collection: String,
         document_id: String,
@@ -772,84 +712,59 @@ pub enum ReplicatedWrite {
         surrogate: u32,
     },
 
-    /// Tear down one vector index on every replica — the counterpart of
-    /// `SetVectorParams`. Appended last to preserve the positional ABI.
+    /// Tear down one vector index on every replica — counterpart of
+    /// `SetVectorParams`.
     DropVectorIndex {
         collection: String,
         #[serde(default)]
         field_name: String,
     },
 
-    /// Move a materialized-sum balance on a TARGET row that does not share the
-    /// source write's vShard. Appended last to preserve the positional ABI.
-    ///
-    /// A DELTA on the wire, like `KvIncr`, not an absolute balance: the record
-    /// says what the statement did, and every replica applies it once under
-    /// exactly-once, LSN-ordered Raft apply. An absolute image would be the
-    /// leader's arithmetic imposed on the follower, which is only equivalent
-    /// while the two agree — and the point of replicating the delta is that it
-    /// stays correct even when a follower reaches this entry from a different
-    /// (earlier-committed) balance.
+    /// Moves a materialized-sum balance on a TARGET row on a different vShard
+    /// than the source write. A DELTA, not an absolute balance — every replica
+    /// applies it once under exactly-once, LSN-ordered Raft apply, so it stays
+    /// correct even if a follower reaches it from a different prior balance.
     ApplyBalanceDelta {
-        /// TARGET collection, db-qualified as the plan names it.
+        /// TARGET collection, db-qualified.
         collection: String,
-        /// Target row's storage key — the hex-encoded surrogate.
+        /// Target row's storage key — hex-encoded surrogate.
         document_id: String,
-        /// Target row's global identity. Surrogates are Raft-replicated, so the
-        /// follower addresses the same row the leader did.
+        /// Target row's global identity.
         surrogate: u32,
         /// The balance column this delta moves.
         column: String,
-        /// Signed amount, as an exact decimal string. `KvIncr` carries an `i64`
-        /// because a KV counter is integral; a balance is not, and a `f64` here
-        /// would lose precision the stored total deliberately keeps.
+        /// Signed amount as an exact decimal string (not `f64`, to keep the
+        /// precision a balance total needs).
         delta: String,
         /// Binding's join column, for the typed not-found error on apply.
         join_column: String,
-        /// Join value that resolved to `surrogate`, same purpose.
+        /// Join value that resolved to `surrogate`.
         join_value: String,
     },
 
     /// Resolved-row-set form of a columnar predicate `UPDATE` / `DELETE` on a
-    /// collection carrying a write policy. Appended last to preserve the
-    /// positional ABI.
-    ///
-    /// The Control Plane already resolved the predicate to a concrete row set
-    /// and decided the write policy against those exact row images while the
-    /// writing identity was live, so this carries the verdict, not a
-    /// predicate. A follower has no writing identity to decide a predicate
-    /// against — re-deciding after commit would let it reject what the
-    /// leader already committed, diverging the replicas — so every replica
-    /// applies exactly these rows and evaluates nothing.
+    /// write-policy collection. The Control Plane already resolved the rows
+    /// and decided the policy against them, so every replica applies exactly
+    /// these rows and evaluates nothing.
     ColumnarBulkDmlResolved {
         collection: String,
         is_update: bool,
         rows: Vec<ColumnarResolvedRow>,
     },
 
-    /// Resolved form of a state-dependent KV write on a collection carrying a
-    /// write policy. Appended last to preserve the positional ABI.
-    ///
-    /// The Control Plane already read the rows the write depends on, computed
-    /// every post-image, and decided the policy against them while the writing
-    /// identity was live — so this carries the mutations and the reply, not an
-    /// operation to re-derive. `mutations` may span two collections: a
-    /// resolved `TransferItem` moves a row from one to another.
+    /// Resolved form of a state-dependent KV write on a write-policy
+    /// collection: mutations and reply, already decided, not an operation to
+    /// re-derive. `mutations` may span two collections for `TransferItem`.
     KvResolvedWrite {
         mutations: Vec<KvResolvedMutationWire>,
-        /// The statement's reply, decided at resolve time. Every replica
-        /// returns it unchanged rather than recomputing it from state that
-        /// has moved on.
+        /// Statement reply decided at resolve time; every replica returns it
+        /// unchanged rather than recomputing from moved-on state.
         response_payload: Vec<u8>,
     },
 
-    /// KV predicate `UPDATE` on a collection with NO write policy. Appended
-    /// last to preserve the positional ABI.
-    ///
-    /// The predicate travels, not a row set: every replica re-scans it
-    /// against its own committed state (same contract as `ColumnarBulkDml`).
-    /// A collection WITH a write policy never reaches this shape —
-    /// `entry_kv` resolves it to `KvResolvedWrite` first.
+    /// KV predicate `UPDATE` on a collection with NO write policy — the
+    /// predicate travels and every replica re-scans it against its own state.
+    /// A write-policy collection never reaches this shape.
     KvPredicateUpdate {
         collection: String,
         /// Serialized `Vec<ScanFilter>`. Empty matches every row.
@@ -858,29 +773,21 @@ pub enum ReplicatedWrite {
     },
 
     /// KV predicate `DELETE` on a collection with NO write policy — see
-    /// [`ReplicatedWrite::KvPredicateUpdate`]. Appended last to preserve the
-    /// positional ABI.
+    /// [`ReplicatedWrite::KvPredicateUpdate`].
     KvPredicateDelete {
         collection: String,
         /// Serialized `Vec<ScanFilter>`. Empty matches every row.
         filters: Vec<u8>,
     },
 
-    /// Resolved form of a deferred document write — `PointUpdate`,
-    /// `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete` — on a collection
-    /// carrying a write policy. Appended last to preserve the positional ABI.
-    ///
-    /// The Control Plane already read the rows the write depends on, computed
-    /// every post-image, and decided the policy against them while the writing
-    /// identity was live — so this carries the mutations and the reply, not an
-    /// operation to re-derive. A follower has no writing identity to decide a
-    /// predicate against, and the leader re-derives its plan from this entry, so
-    /// a predicate here would be judged against whatever policy catalog the
-    /// applying node holds.
+    /// Resolved form of a deferred document write (`PointUpdate`,
+    /// `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete`) on a write-policy
+    /// collection: mutations and reply, already decided against the live
+    /// writing identity, not a predicate a follower could re-judge.
     DocumentResolvedWrite {
         mutations: Vec<DocumentResolvedMutationWire>,
-        /// The statement's reply, decided at resolve time. Every replica returns
-        /// it unchanged rather than recomputing it from state that has moved on.
+        /// Statement reply decided at resolve time; every replica returns it
+        /// unchanged.
         response_payload: Vec<u8>,
     },
 }

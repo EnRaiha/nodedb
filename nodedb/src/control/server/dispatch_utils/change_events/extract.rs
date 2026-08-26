@@ -13,18 +13,8 @@ use nodedb_physical::physical_plan::{
 
 /// Extract write metadata from a physical plan for change event publishing.
 ///
-/// Returns one `(collection, document_id, op)` tuple per logical row change
-/// in the plan (empty for reads, DDL/config ops, and index/overlay
-/// maintenance ops whose underlying data row already published its own
-/// event). Almost all write plans produce exactly one tuple; only
-/// `KvOp::TransferItem` and `KvOp::ResolvedWrite` span two distinct
-/// collections and so produce more than one.
-///
-/// The match is exhaustive over the top-level [`PhysicalPlan`] enum (no
-/// catch-all `_ =>`) so a new engine variant is a compile error here, not a
-/// silent CDC gap.
-///
-/// `_tenant_id` is reserved for future tenant-scoped change stream filtering.
+/// One `(collection, document_id, op)` tuple per row change; empty for reads/DDL.
+/// Exhaustive over [`PhysicalPlan`] — no catch-all — so a new variant is a compile error.
 pub(super) fn extract_write_metadata(
     plan: &PhysicalPlan,
     _tenant_id: TenantId,
@@ -57,10 +47,8 @@ pub(super) fn extract_write_metadata(
             document_id.clone(),
             ChangeOperation::Update,
         )],
-        // `PointInsert` is the plan `sql_plan_convert` emits for a plain SQL
-        // `INSERT INTO <document collection>` (see
-        // `dml/insert.rs::convert_insert`) — distinct from `PointPut`
-        // (unconditional overwrite, used by non-SQL write paths).
+        // `PointInsert` is plain SQL INSERT; distinct from `PointPut` (unconditional
+        // overwrite, used by non-SQL write paths).
         PhysicalPlan::Document(DocumentOp::PointInsert {
             collection,
             document_id,
@@ -105,9 +93,8 @@ pub(super) fn extract_write_metadata(
             "*".into(),
             ChangeOperation::Update,
         )],
-        // MERGE mixes INSERT/UPDATE/DELETE per matched arm; not individually
-        // addressable with today's single-tuple-per-plan shape, so — like
-        // `BulkUpdate` — it's reported as one `Update` covering the collection.
+        // MERGE mixes INSERT/UPDATE/DELETE per arm; not individually addressable, so
+        // reported as one `Update` like `BulkUpdate`.
         PhysicalPlan::Document(DocumentOp::Merge {
             target_collection, ..
         }) => vec![(
@@ -115,10 +102,8 @@ pub(super) fn extract_write_metadata(
             "*".into(),
             ChangeOperation::Update,
         )],
-        // A resolved governed write reports one event per mutation: it names
-        // every row it touches, so nothing here has to be collapsed to
-        // `document_id="*"`. The precondition is what the resolve found stored:
-        // a row that was absent is an insert, one that was present an update.
+        // Reports one event per mutation, naming every row touched — never collapses to "*".
+        // Precondition is what the resolve found stored: absent = insert, present = update.
         PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) => mutations
             .iter()
             .map(|mutation| {
@@ -136,16 +121,11 @@ pub(super) fn extract_write_metadata(
                 )
             })
             .collect(),
-        // Remaining DocumentOp variants (PointGet, Scan, RangeScan, Register,
-        // IndexLookup, IndexedFetch, DropIndex, BackfillIndex, EstimateCount,
-        // MaterializeScan, ResolveWrite) are reads or catalog/schema DDL — no
-        // row changed.
+        // Remaining DocumentOp variants are reads or catalog/schema DDL — no row changed.
         PhysicalPlan::Document(_) => Vec::new(),
 
-        // Timeseries ingest: batch write. CDC is opt-in for timeseries
-        // collections (high-cardinality metrics would flood the bus).
-        // The change event uses document_id="*" to indicate a batch.
-        // Consumers can subscribe with collection_filter to get these events.
+        // Batch write; document_id="*" indicates a batch. High-cardinality metrics
+        // would flood the bus otherwise — subscribe via collection_filter.
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Insert)]
         }
@@ -170,9 +150,7 @@ pub(super) fn extract_write_metadata(
             ChangeOperation::Insert,
         )],
         PhysicalPlan::Kv(KvOp::Delete { collection, .. })
-        // Which keys a predicate selects is decided in the Data Plane, so —
-        // like every other multi-row write in this match — it reports one
-        // event with `document_id = "*"`.
+        // Predicate keys are decided in the Data Plane, so this reports one event with "*".
         | PhysicalPlan::Kv(KvOp::PredicateDelete { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
         }
@@ -210,17 +188,13 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Kv(KvOp::Truncate { collection }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
         }
-        // Atomic fungible transfer: debits + credits two keys in the SAME
-        // collection in one Data Plane pass. Not individually addressable
-        // with today's single-`document_id` tuple, so it is reported the
-        // same way other multi-row batch ops in this match are (BatchPut,
-        // BulkUpdate, ...): one event, document_id="*".
+        // Debits + credits two keys in the same collection; not individually addressable,
+        // so reported as one event with document_id="*" like other batch ops.
         PhysicalPlan::Kv(KvOp::Transfer { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
         }
-        // Atomic item transfer spans TWO distinct collections (delete from
-        // source, insert at dest) — the only write in this match that can't
-        // be expressed as a single tuple, so it reports two.
+        // Spans two collections (delete source, insert dest) — the only write here
+        // that can't be a single tuple, so it reports two.
         PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection,
             dest_collection,
@@ -239,18 +213,14 @@ pub(super) fn extract_write_metadata(
                 ChangeOperation::Insert,
             ),
         ],
-        // A resolved governed write reports one event per mutation: it names
-        // every collection and key it touches, and those may span two
-        // collections (a resolved `TransferItem`), so nothing here has to be
-        // collapsed to `document_id="*"`.
+        // Reports one event per mutation, naming every collection/key touched — may
+        // span two collections (a resolved `TransferItem`).
         PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => mutations
             .iter()
             .map(|mutation| {
                 let operation = match mutation {
                     KvResolvedMutation::Delete { .. } => ChangeOperation::Delete,
-                    // The precondition is what the resolve found stored: a row
-                    // that was absent is an insert, one that was present is an
-                    // update.
+                    // Precondition: absent row = insert, present row = update.
                     KvResolvedMutation::Put { precondition, .. } => match precondition {
                         Some(_) => ChangeOperation::Update,
                         None => ChangeOperation::Insert,
@@ -267,16 +237,10 @@ pub(super) fn extract_write_metadata(
             })
             .collect(),
 
-        // Remaining KvOp variants (Get, Scan, GetTtl, BatchGet, secondary /
-        // sorted-index DDL and reads, MaterializeScan, ResolveWrite) are reads
-        // or catalog-only — no row changed.
+        // Remaining KvOp variants are reads or catalog-only — no row changed.
         PhysicalPlan::Kv(_) => Vec::new(),
 
-        // Columnar storage core: base `columnar` collections AND `spatial`
-        // collections (spatial rows are stored via the same `ColumnarOp`
-        // path — see `nodedb-sql`'s spatial engine rules / dml/insert.rs).
-        // Both are data-bearing peer engines, not index/overlay engines, so
-        // their writes need their own CDC event.
+        // `spatial` rows are stored via the same `ColumnarOp` path as `columnar`.
         PhysicalPlan::Columnar(ColumnarOp::Insert { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Insert)]
         }
@@ -286,9 +250,7 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Columnar(ColumnarOp::Delete { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
         }
-        // Resolved-row-set form of the same UPDATE/DELETE, taken by a
-        // collection with a write policy attached — same CDC event as the
-        // predicate arms above.
+        // Resolved-row-set form of the same UPDATE/DELETE — same CDC event as above.
         PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
         }
@@ -298,47 +260,23 @@ pub(super) fn extract_write_metadata(
         // Scan / MaterializeScan are reads — no row changed.
         PhysicalPlan::Columnar(_) => Vec::new(),
 
-        // Array engine: ND sparse cells are data-bearing rows in their own
-        // right (not an index over another engine's rows), so cell writes
-        // need CDC. `array_id.name` is the user-visible collection name.
+        // Array cells are data-bearing rows, not an index — need CDC.
+        // `array_id.name` is the user-visible collection name.
         PhysicalPlan::Array(ArrayOp::Put { array_id, .. }) => {
             vec![(array_id.name.clone(), "*".into(), ChangeOperation::Insert)]
         }
         PhysicalPlan::Array(ArrayOp::Delete { array_id, .. }) => {
             vec![(array_id.name.clone(), "*".into(), ChangeOperation::Delete)]
         }
-        // OpenArray/Slice/Project/Aggregate/Elementwise/Flush/Compact/
-        // SurrogateBitmapScan/DropArray are reads or maintenance — no
-        // user-data row changed by this event's semantics.
+        // Remaining ArrayOp variants are reads or maintenance — no user-data row changed.
         PhysicalPlan::Array(_) => Vec::new(),
 
-        // Graph edge writes (`EdgePut`/`EdgeDelete`/`EdgePutBatch`/
-        // `EdgeDeleteBatch`) do NOT emit a standalone CDC event here.
-        // Implicit edges (a document INSERT carrying `_from`/`_to`) are
-        // mirrored into a SEPARATE `GraphOp::EdgePut` task on the same
-        // collection (see `implicit_edges/insert.rs`), whose underlying
-        // `DocumentOp` write already published the change above — emitting
-        // again here would double-publish (the change stream does not
-        // dedup). Explicit `GRAPH INSERT EDGE` writes (no backing document)
-        // are the only case that legitimately has no other CDC source;
-        // surfacing those requires threading an implicit-vs-explicit
-        // distinction through the edge plan variants, which is a separate
-        // follow-up. Hop/Neighbors/NeighborsMulti/Path/Subgraph/RagFusion/
-        // Algo/Match*/Stats/superstep ops are reads. `SetNodeLabels`/
-        // `RemoveNodeLabels` ARE node-content writes but carry no
-        // `collection` field to key a `ChangeEvent` on (labels are addressed
-        // by `node_id` alone) — left uncovered here rather than guessing a
-        // collection; flagged as a known gap, not a read.
+        // Implicit edges mirror a document INSERT that already published the event.
+        // `GRAPH INSERT EDGE` and `SetNodeLabels`/`RemoveNodeLabels` are known CDC gaps.
         PhysicalPlan::Graph(_) => Vec::new(),
 
-        // Vector engine: normally a secondary index over a Document row —
-        // that row's own write already published its CDC event above, so
-        // publishing again here would duplicate it (Insert/BatchInsert/
-        // Delete/DeleteBySurrogate/Sparse*/MultiVector*/Search* all fall
-        // here). `DirectUpsert` is the one exception: it's the SOLE write
-        // for a vector-primary collection (`WITH (primary='vector', ...)`)
-        // — no parallel Document write exists for it to piggyback on — so it
-        // needs its own event.
+        // Vector is normally a Document secondary index — publishing here would duplicate.
+        // `DirectUpsert` is the exception: the sole write for a vector-primary collection.
         PhysicalPlan::Vector(VectorOp::DirectUpsert {
             collection,
             surrogate,
@@ -350,19 +288,14 @@ pub(super) fn extract_write_metadata(
         )],
         PhysicalPlan::Vector(_) => Vec::new(),
 
-        // Spatial R-tree writes are index maintenance for a document row
-        // that lives in the columnar store (see `SpatialOp::Insert`'s own
-        // doc comment) — that row's write already went through
-        // `PhysicalPlan::Columnar` above and published its event.
+        // Spatial R-tree writes are index maintenance for a row already published
+        // via `PhysicalPlan::Columnar` above.
         PhysicalPlan::Spatial(_) => Vec::new(),
 
-        // Full-text search writes (`FtsIndexDoc`/`FtsDeleteDoc`/analyzer
-        // config) are BM25 index maintenance for a document row that
-        // already published its own event.
+        // FTS writes are BM25 index maintenance for a row that already published its event.
         PhysicalPlan::Text(_) => Vec::new(),
 
-        // CRDT engine: data-bearing (Loro-backed document content), so its
-        // mutating ops need CDC like any other data engine.
+        // CRDT is data-bearing (Loro-backed content), so mutating ops need CDC.
         PhysicalPlan::Crdt(CrdtOp::Apply {
             collection,
             document_id,
@@ -408,8 +341,7 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
         }
-        // Document-row field-carrying ops: a full replace / partial-update is
-        // an Insert / Update respectively; a delete is a Delete.
+        // Full replace = Insert, partial update = Update.
         PhysicalPlan::Crdt(CrdtOp::DocUpsert {
             collection,
             document_id,
@@ -433,42 +365,29 @@ pub(super) fn extract_write_metadata(
             document_id.clone(),
             ChangeOperation::Delete,
         )],
-        // Read (Read/ReadConstraints/GetPolicy/ReadAtVersion/
-        // GetVersionVector/ExportDelta), history maintenance
-        // (CompactAtVersion), and config/DDL (SetConstraints/
-        // DropConstraints/SetPolicy) ops — no content row changed.
+        // Remaining CrdtOp variants are reads, history maintenance, or config/DDL.
         PhysicalPlan::Crdt(_) => Vec::new(),
 
-        // Query: joins, aggregates, and coordinator Exchange nodes are
-        // read-only.
+        // Query: joins, aggregates, coordinator Exchange nodes are read-only.
         PhysicalPlan::Query(_) => Vec::new(),
 
-        // A committed transaction batch publishes the same logical row events
-        // its constituent writes would have emitted under autocommit. Overlay
-        // and maintenance Meta operations remain event-free.
+        // Publishes the same events its constituent writes would emit under autocommit.
         PhysicalPlan::Meta(MetaOp::TransactionBatch { plans, .. }) => plans
             .iter()
             .flat_map(|plan| extract_write_metadata(plan, _tenant_id))
             .collect(),
         PhysicalPlan::Meta(_) => Vec::new(),
 
-        // Cluster-mode array ops: like their single-node `ArrayOp` counterparts
-        // (see the `PhysicalPlan::Array` arm above), `Put`/`Delete` are
-        // data-bearing cell writes that need their own CDC event. This match
-        // arm is never reached via the normal Data-Plane dispatch funnel (see
-        // `PhysicalPlan::ClusterArray`'s own doc comment) — the coordinator
-        // dispatch path in `routing/cluster_array.rs` calls this function
-        // directly via `publish_cluster_array_change_events` after a
-        // successful execute, so it IS load-bearing there.
+        // Never reached via normal dispatch — `routing/cluster_array.rs` calls this
+        // directly via `publish_cluster_array_change_events`, so it IS load-bearing there.
         PhysicalPlan::ClusterArray(op) => cluster_array_change_meta(op),
         PhysicalPlan::ClusterEvent(_) => Vec::new(),
     }
 }
 
 /// Map a `ClusterArrayOp` to its CDC change metadata. Shared by the
-/// `PhysicalPlan::ClusterArray` arm above and the coordinator dispatch path
-/// (`publish_cluster_array_change_events`), which holds the op by reference and
-/// must not clone the whole write batch just to read the array name.
+/// `PhysicalPlan::ClusterArray` arm and `publish_cluster_array_change_events`,
+/// which holds the op by reference to avoid cloning the write batch.
 pub(crate) fn cluster_array_change_meta(
     op: &ClusterArrayOp,
 ) -> Vec<(String, String, ChangeOperation)> {
@@ -491,12 +410,7 @@ mod tests {
     use nodedb_physical::physical_plan::{ColumnarInsertIntent, GraphOp};
     use nodedb_types::{Surrogate, VectorQuantization, VectorStorageDtype};
 
-    // Regression coverage for the C-CALLGRAPH CDC gap: `Columnar`, `Array`,
-    // and `Vector`(`DirectUpsert`) writes used to fall through the old
-    // blanket `_ => None` and emit no change event at all. `Graph` edge
-    // writes stay silent (see `graph_edge_put_emits_no_change_event`) to
-    // avoid double-publishing implicit-edge writes alongside their
-    // underlying `DocumentOp` event.
+    // Guards `Columnar`/`Array`/`Vector(DirectUpsert)` against a blanket `_ => None`.
 
     #[test]
     fn transaction_batch_emits_each_subplan_change_event() {
@@ -685,11 +599,8 @@ mod tests {
         assert!(extract_write_metadata(&agg, TenantId::new(1)).is_empty());
     }
 
-    // Graph edge writes must stay silent: implicit edges (a document INSERT
-    // carrying `_from`/`_to`) mirror into a separate `GraphOp::EdgePut` task
-    // on the same collection, and that write's underlying `DocumentOp`
-    // already published this row's event — emitting again here would
-    // double-publish (the change stream has no dedup).
+    // Implicit edges mirror into a separate `GraphOp::EdgePut`; the underlying
+    // `DocumentOp` already published the event — emitting here would double-publish.
     #[test]
     fn graph_edge_put_emits_no_change_event() {
         let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
@@ -730,10 +641,7 @@ mod tests {
         );
     }
 
-    // Vector's secondary-index maintenance ops (everything except
-    // `DirectUpsert`) must stay silent — the underlying Document write
-    // already published this row's event; a second event here would
-    // duplicate it.
+    // Non-`DirectUpsert` Vector ops stay silent — the Document write already published it.
     #[test]
     fn vector_secondary_index_insert_emits_no_change_event() {
         let plan = PhysicalPlan::Vector(VectorOp::Delete {

@@ -13,12 +13,9 @@ use crate::control::server::shared::plan_util::{extract_collection, plan_engine}
 
 /// Outcome of rewriting one target-side plan into its source-side twin.
 ///
-/// The two "no plan produced" cases must never share a value. A plan that does
-/// not read the cloned collection needs no source task; a plan that DOES read
-/// it but has no rewrite is a correctness hole. The first is
-/// [`SourceRewrite::NoSourceTask`]; the second is a typed error, so a query
-/// shape added to the planner tomorrow refuses loudly instead of inheriting the
-/// silent-empty bug.
+/// The two "no plan produced" cases never share a value: a plan not reading
+/// the cloned collection is [`SourceRewrite::NoSourceTask`]; one that reads
+/// it with no rewrite is a typed error, so a new query shape refuses loudly.
 pub enum SourceRewrite {
     /// Dispatch this plan against the source database.
     Task(Box<PhysicalPlan>),

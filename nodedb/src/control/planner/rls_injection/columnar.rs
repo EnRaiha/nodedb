@@ -26,26 +26,8 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
              no row filter",
         ),
 
-        // A plain insert carries every row it will persist, as one MessagePack
-        // array of per-row objects, so the write policy decides them here and
-        // the first violation fails the statement before anything is
-        // dispatched — no row of the batch can already be durable when the
-        // refusal happens.
-        //
-        // The conflict branch persists something the plan does not hold: the
-        // stored row with `on_conflict_updates` applied to it, which exists
-        // only after the handler has read that stored row. Admitting on the
-        // incoming body alone would clear a write whose actual post-image the
-        // policy never saw, so the compiled predicate travels with the plan and
-        // the handler decides the merged row just before persisting it.
-        //
-        // The read filter is not redundant with either of those. It gates a
-        // different thing: a `RETURNING` clause on this insert ships rows back,
-        // and that output is a read, so a row a read-only policy hides must not
-        // become visible just because the statement wrote it. The two policies
-        // are independent — a collection can carry a `FOR SELECT` policy and no
-        // write policy at all, in which case the write is unrestricted and the
-        // returned row set still shrinks.
+        // Plain insert: admit its rows now. Conflict branch: ship the
+        // predicate instead — its merged post-image doesn't exist yet.
         ColumnarOp::Insert {
             collection,
             payload,
@@ -62,11 +44,8 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Ship the write predicate: an update's post-image exists only after
-        // the handler has scanned the matching row and applied the assignments,
-        // and a delete's image only after it has read the row being removed.
-        // The handler evaluates the predicate against those exact rows and
-        // rejects the whole statement when one fails.
+        // Ship the predicate: the image exists only after the handler scans
+        // the row (update's post-image, delete's pre-image).
         ColumnarOp::Update {
             collection,
             rls_write_check,
@@ -78,18 +57,8 @@ pub(super) fn inject_columnar(ctx: &RlsCtx<'_>, op: &mut ColumnarOp) -> crate::R
             ..
         } => ctx.set_write_check(collection, rls_write_check),
 
-        // No injection: the Control Plane already resolved the predicate to
-        // a concrete row set and decided the write policy against those
-        // exact images while the writing identity was live. The check slot
-        // already carries `DecidedEarlierInRequest` from that resolve step,
-        // so overwriting it here would re-run a decision this op cannot
-        // repeat — the rows are already gone from the plan's view of the
-        // predicate.
-        // No injection: constructed internally by the columnar predicate DML
-        // orchestrator from an already-injected Update/Delete plan's
-        // `rls_write_check`, and dispatched straight to the Data Plane —
-        // never through this planning pipeline. Same reasoning as
-        // `ResolvedUpdate`/`ResolvedDelete`.
+        // No injection: already decided while the writing identity was
+        // live; the check slot already carries `DecidedEarlierInRequest`.
         ColumnarOp::ResolvedUpdate { .. }
         | ColumnarOp::ResolvedDelete { .. }
         | ColumnarOp::ResolveDml { .. } => Ok(()),
@@ -107,29 +76,8 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // Ship the write predicate, for every payload shape without exception.
-        //
-        // A timeseries row does not exist until the handler has normalized the
-        // payload into line protocol and parsed it — and that normalization
-        // changes values: a numeric-looking string is stored as a number, and
-        // the time column is rewritten into milliseconds under the collection's
-        // declared `TIME_KEY`. A structured MessagePack batch is carried in the
-        // plan in full, so it could be decided here, but only against the
-        // values as SUBMITTED. That is a different image from the one that will
-        // be stored, and a policy naming one of those columns would then be
-        // decided against a value the collection never holds. So the decision
-        // belongs at the one point every format funnels through, after
-        // normalization — where it also still fails the whole batch before any
-        // row reaches the memtable.
-        // The read filter is independent of that write predicate. A `RETURNING`
-        // clause on an ingest ships rows back, and that output is a read, so a
-        // row a read-only policy hides must not become visible just because the
-        // statement wrote it. A collection can carry a `FOR SELECT` policy and
-        // no write policy at all, in which case the ingest is unrestricted and
-        // only the returned row set shrinks. The raw ILP listener and the
-        // Prometheus remote-write endpoint reach this arm too — both run
-        // `inject_rls` over their tasks — and both carry no projection, so the
-        // filter they receive is simply never consulted.
+        // Ship the predicate: normalization retypes values, so the
+        // submitted body is not the image that gets stored.
         TimeseriesOp::Ingest {
             collection,
             rls_write_check,
@@ -157,13 +105,8 @@ pub(super) fn inject_spatial(ctx: &RlsCtx<'_>, op: &mut SpatialOp) -> crate::Res
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // Refuse: these carry a geometry and a surrogate and no column values
-        // at all, so a predicate naming columns has nothing to test. They are
-        // not user SQL — an `INSERT` / `UPDATE` / `DELETE` on a spatial-engine
-        // collection routes through `ColumnarOp::*`, which is gated. This is
-        // the edge-to-origin sync path for rows already decided by the policy
-        // where they are stored, so refusing here loses no user-facing write
-        // while keeping the pass from admitting an image it cannot see.
+        // Refuse: carries geometry + surrogate, not column values — edge
+        // sync, not user SQL, so refusing loses no user-facing write.
         SpatialOp::Insert { collection, .. } | SpatialOp::Delete { collection, .. } => ctx
             .refuse_if_write_policy(
                 collection,
@@ -271,12 +214,9 @@ mod tests {
         ));
     }
 
-    /// Deciding the rows here still has to be recorded in the slot.
-    ///
-    /// A plain insert is admitted at plan time, so nothing ships to the Data
-    /// Plane gate — but a slot left at `PendingInjection` reads as "injection
-    /// never ran" at the dispatch chokepoint, and the write is refused even
-    /// though the policy admitted it.
+    /// A plain insert is admitted at plan time, so nothing ships to the
+    /// Data Plane gate — but the slot must still record that injection ran,
+    /// or `PendingInjection` reads as "never ran" and the write is refused.
     #[test]
     fn a_plain_insert_records_that_its_rows_were_decided() {
         let store = store_with_write_policy("events");
@@ -380,11 +320,9 @@ mod tests {
         assert!(write_check(&delete).has_predicate());
     }
 
-    /// A structured MessagePack batch is NOT decided here even though the plan
-    /// carries its rows: the ingest handler retypes those values before storing
-    /// them, so a plan-time decision would judge an image the collection never
-    /// holds. The predicate ships instead, and the one gate after normalization
-    /// decides the stored rows.
+    /// Not decided here even though the plan carries its rows: the ingest
+    /// handler retypes values before storing, so the predicate ships and
+    /// the one post-normalization gate decides the stored rows.
     #[test]
     fn timeseries_msgpack_ingest_carries_the_write_predicate_rather_than_deciding_here() {
         let store = store_with_write_policy("metrics");
@@ -430,9 +368,7 @@ mod tests {
         let before = plan.clone();
         assert!(inject_without_policy(&mut plan).is_ok());
 
-        // The only change injection makes here is to stamp the write check.
-        // The plan goes in un-injected and comes out saying no policy applies,
-        // which is what tells the Data Plane gate that the pass actually ran.
+        // Stamps `NoPolicyApplies` so the gate can tell the pass ran.
         assert_eq!(
             write_check(&before),
             &nodedb_types::RlsWriteCheck::PendingInjection

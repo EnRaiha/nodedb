@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Real process-kill WAL-durability regressions.
-//!
-//! A write acknowledged by the server (an `INSERT` that returned) must
-//! survive a `kill -9`, because the write path acks the client only after
-//! the WAL append is persisted. Reopening the same data directory on a
-//! fresh process replays the WAL and must restore the row. Covers
-//! document_strict, KV, vector-index (HNSW rebuild from WAL), and spatial
-//! R-tree recovery.
+//! Real process-kill WAL-durability regressions. A write acknowledged by
+//! the server must survive `kill -9`, since the write path acks only after
+//! the WAL append is persisted. Covers document_strict, KV, vector-index
+//! (HNSW rebuild from WAL), and spatial R-tree recovery.
 
 mod crash_harness;
 
@@ -39,13 +35,9 @@ async fn committed_write_survives_kill_9() {
     );
 }
 
-/// After a hard crash and WAL replay, the primary-key point-lookup index and
-/// the sequential-scan surface must agree for a document_strict collection.
-/// The reported ghost tuples were rows the scan returned but no point-lookup
-/// (`WHERE id = ...`) nor `COUNT(*)` could reach — a PK-index-vs-tuple-store
-/// divergence that surfaced after restart cycles. A single kill -9 + reopen
-/// must never produce that split: every scan-visible row is reachable by its
-/// own primary key, and `COUNT(*)` equals the scanned row count.
+/// After a hard crash and WAL replay, the PK point-lookup index and the
+/// sequential-scan surface must agree: every scan-visible row is reachable
+/// by its own primary key, and `COUNT(*)` equals the scanned row count.
 #[tokio::test(flavor = "multi_thread")]
 async fn pk_index_and_scan_agree_after_kill_9() {
     let mut h = CrashHarness::new();
@@ -230,9 +222,8 @@ async fn spatial_index_survives_kill_9() {
     h.kill_9();
     h.reopen();
 
-    // The in-memory R-tree must be rebuilt from the durable document store on
-    // boot: the geometry documents survive in redb, so a kill -9 that emptied
-    // the WAL must not leave the spatial index empty.
+    // The in-memory R-tree must rebuild from the durable document store on
+    // boot, not stay empty after a kill -9 that emptied the WAL.
     let recovered = h.query_col(q, "name").await;
     assert_eq!(
         recovered,

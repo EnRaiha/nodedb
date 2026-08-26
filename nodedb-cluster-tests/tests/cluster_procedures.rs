@@ -249,13 +249,10 @@ fn delta_reject_with_custom_hint() {
 
 #[test]
 fn procedure_executes_on_coordinator() {
-    // Procedures execute on the node that received CALL (the coordinator).
-    // DML within the body dispatches to shard leaders via normal query path.
-    // The procedure itself does NOT migrate to a shard leader.
-    //
-    // This is validated by: ProcedureTransactionCtx buffers tasks locally,
-    // then flushes them to Data Plane via dispatch_to_data_plane.
-    // The dispatch path handles shard routing transparently.
+    // Procedures execute on the coordinator that received CALL, never
+    // migrating to a shard leader; body DML dispatches to shard leaders via
+    // the normal query path (ProcedureTransactionCtx buffers locally, then
+    // flushes via dispatch_to_data_plane).
     let mut ctx = ProcedureTransactionCtx::new();
     // Empty context = no migration state, executes locally.
     assert!(ctx.take_buffered_tasks().is_empty());

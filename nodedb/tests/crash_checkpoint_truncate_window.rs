@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Crash injection in the checkpoint's marker→truncate window.
-//!
-//! A checkpoint does two durable things in sequence: it writes a checkpoint
-//! marker to the WAL, then it deletes the sealed segments below the checkpoint
-//! LSN. Between those two points the log claims to be checkpointed while every
-//! byte it covers is still on disk and still needed.
-//!
-//! A crash in that window must not lose an acknowledged write. The danger is
-//! recovery reading the marker as proof that truncation already happened and
-//! skipping replay of the records the marker covers — the records that, by
-//! definition, are still sitting in the WAL precisely because the crash
-//! interrupted their deletion.
-//!
-//! The window is a few instructions wide and unreachable from outside the
-//! process, so the crash is injected from within: the server is spawned with
-//! the fail point armed to `abort`, which kills it at the exact instruction
-//! after the marker is durable. Requires `--features failpoints`.
+//! Crash injection in the checkpoint's marker→truncate window: a checkpoint
+//! writes its marker, then deletes sealed segments below the checkpoint LSN.
+//! A crash between them must not let recovery read the marker as proof
+//! truncation already ran and skip replay of records still on disk. Crash
+//! is injected via `NODEDB_FAILPOINTS` abort right after the marker is
+//! durable. Requires `--features failpoints`.
 
 #![cfg(feature = "failpoints")]
 
@@ -37,10 +26,8 @@ const CRASH_TIMEOUT: Duration = Duration::from_secs(60);
 async fn acknowledged_rows_survive_a_crash_between_checkpoint_marker_and_truncate() {
     let mut h = CrashHarness::new()
         .with_env("NODEDB_CHECKPOINT_INTERVAL_SECS", CHECKPOINT_INTERVAL_SECS)
-        // The harness captures server stdout/stderr and prints it when
-        // `await_self_crash` times out. Without checkpoint-manager logs at
-        // debug, a timeout is an unexplained hang; with them, the captured
-        // lines show whether a checkpoint even started and where it stopped.
+        // Checkpoint-manager logs at debug so a timeout shows whether a
+        // checkpoint even started and where it stopped.
         .with_env(
             "RUST_LOG",
             "warn,nodedb::control::checkpoint_manager=debug,nodedb::bootstrap=info",
@@ -93,20 +80,14 @@ async fn acknowledged_rows_survive_a_crash_between_checkpoint_marker_and_truncat
          — recovery treated the marker as proof of a truncation that never ran (got {recovered:?})"
     );
 
-    // A freshly-replayed core reports its checkpoint LSN as 0 until it takes a
-    // new write of its own — replay restores rows but does not re-derive a
-    // durable-LSN watermark from them. Without a write here, every checkpoint
-    // cycle on the restarted server logs "global checkpoint LSN is 0 — skipping"
-    // and returns before writing a marker, so the window under test never
-    // reopens and the second `await_self_crash` below times out. The key is
-    // deliberately outside `row%` so it cannot be mistaken for a canary.
+    // A freshly-replayed core reports checkpoint LSN 0 until its own new
+    // write, or every checkpoint cycle logs "skipping" and the window under
+    // test never reopens. Key is outside `row%` so it's not a canary.
     h.exec("INSERT INTO ckpt_window (k, v) VALUES ('trigger', 'post-restart')")
         .await;
 
-    // The restarted server must be able to checkpoint and keep serving: the
-    // interrupted cycle left no state that blocks the next one. The fail point
-    // is still armed, so it aborts again — proving the second cycle actually
-    // reached the same window rather than silently never running.
+    // The fail point is still armed, so it aborts again — proving the second
+    // cycle actually reached the same window.
     h.await_self_crash(CRASH_TIMEOUT);
     h.reopen();
 

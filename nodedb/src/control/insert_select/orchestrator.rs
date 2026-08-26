@@ -2,42 +2,18 @@
 
 //! Control-Plane orchestrator for `INSERT ... SELECT`.
 //!
-//! `INSERT ... SELECT` copies rows from a source collection into a target
-//! collection. Every target row must receive its OWN globally-unique surrogate
-//! (never the source row's), registered in the catalog so cross-engine search
-//! (vector / FTS) can resolve a hit back to the target row's identity. Because
-//! surrogate registration is Control-Plane-only (WAL-durable, under the registry
-//! lock) and the Data Plane never touches storage across planes, the copy runs
-//! as a DP→CP→DP round trip driven from here:
+//! Every target row gets its OWN registered surrogate, never the source
+//! row's, so cross-engine search resolves back to the target identity.
+//! Since surrogate registration is Control-Plane-only, the copy runs as a
+//! DP→CP→DP round trip: scan the source page-by-page
+//! (`DocumentOp::MaterializeScan`), assign each row a fresh target-keyed
+//! surrogate, write each page as one atomic `BatchInsert`.
 //!
-//! 1. **Scan** the source collection page-by-page via `DocumentOp::MaterializeScan`
-//!    (a consistent redb read snapshot per page), reusing the same cursor
-//!    primitive the clone materializer uses.
-//! 2. **Assign** a fresh, registered surrogate for each surviving source row,
-//!    keyed on the TARGET collection's primary key exactly as a plain `INSERT`
-//!    would (`assign` for a declared PK, `assign_fresh` for an auto-`_rowid`
-//!    target). The source surrogate is never inherited.
-//! 3. **Write** each page as ONE atomic `DocumentOp::BatchInsert` carrying the
-//!    pre-assigned surrogates, so the whole page lands or none of it does.
-//!
-//! ## Atomicity & visibility
-//!
-//! Each scan page is written as a single atomic `BatchInsert` (bounded by the
-//! source scan page size). A constraint violation aborts that entire page,
-//! leaving the target unchanged for it. Across pages the writes are separate
-//! transactions, so a multi-page copy has the same partial-visibility semantics
-//! `BatchInsert` already has — a later page's rows may commit while an earlier
-//! reader is in flight.
-//!
-//! ## Scan↔write isolation
-//!
-//! The source scan (phase 1) and the target write (phase 3) are distinct ops
-//! separated by the surrogate-assignment round trip, so concurrent writes to the
-//! SOURCE can interleave between a page's scan and its write. Each page's scan is
-//! a point-in-time redb snapshot, so a copied row is internally consistent, but
-//! the statement is NOT globally serializable against concurrent source mutation
-//! the way the old single-core-atomic op was. This is a deliberate, documented
-//! relaxation, not a silent regression.
+//! Each page is atomic (a violation aborts only that page); across pages
+//! writes are separate transactions with `BatchInsert`'s usual partial
+//! visibility. Source scan and target write are separated by the
+//! assignment round trip, so this is NOT globally serializable against
+//! concurrent source mutation — a deliberate, documented relaxation.
 
 use nodedb_types::{DatabaseId, Lsn, Surrogate, TenantId};
 
@@ -141,14 +117,10 @@ pub(crate) async fn run_insert_select(
                 documents.push((document_id, value));
                 surrogates.push(surrogate);
             }
-            // Resolve this page's materialized-sum targets. The orchestrator
-            // re-issues the copy as a `BatchInsert` through `dispatch_local`,
-            // which never passes through the statement-level resolution pass —
-            // so without this the page would ship an empty resolution and the
-            // Data-Plane fold would have no target to credit for rows the copy
-            // genuinely inserts. Resolved per PAGE because each page is its own
-            // atomic write; a page whose target collection drives no binding
-            // costs one cached index probe and issues no lookup.
+            // Resolve this page's sum targets: `dispatch_local` bypasses the
+            // statement-level resolution pass, so without this the fold has
+            // no target to credit. Resolved per page since each is its own
+            // atomic write.
             let page_bodies: Vec<&[u8]> =
                 documents.iter().map(|(_, body)| body.as_slice()).collect();
             let resolved_sum_targets =
@@ -184,13 +156,10 @@ pub(crate) async fn run_insert_select(
                 // rows did not land. Surface the DP error verbatim.
                 return Ok(resp);
             }
-            // `dispatch_local` bypasses the pgwire autocommit funnel's post-apply
-            // redo minting (`submit_to_data_plane`), so a page landing on a
-            // vector-indexed target carries its per-row `Put` write-set back here
-            // unconsumed. Mint it now: without this durable redo, a WAL-only
-            // restart rebuilds the HNSW from nothing for these rows (BatchInsert's
-            // own WAL path mints no redo — row durability is redb-synchronous) and
-            // the page's vectors are lost, not just stale.
+            // `dispatch_local` bypasses the funnel's post-apply redo minting,
+            // so a vector-indexed target's write-set arrives unconsumed. Mint
+            // it now — without it, a WAL-only restart rebuilds the HNSW from
+            // nothing for these rows: the vectors are lost, not just stale.
             crate::control::server::wal_dispatch::mint_dispatch_local_redo(
                 &state.wal,
                 tenant_id,

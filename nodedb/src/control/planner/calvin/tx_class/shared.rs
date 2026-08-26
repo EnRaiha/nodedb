@@ -15,18 +15,11 @@ use nodedb_physical::physical_plan::{
 /// Map the neutral session read-set into the replicated, LSN-versioned
 /// [`VersionedReadSet`] carried on the `TxClass`.
 ///
-/// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving the
-/// engine, collection, per-collection `read_version_lsn` (the read collection's
-/// write floor, a WAL LSN — the sound cross-shard OCC comparand, not the
-/// core-global `read_lsn`), and the point/predicate
-/// distinction. The entry's `(database_id, tenant_id)` scope is not re-carried
-/// per entry: the enclosing `TxClass` already scopes the tenant.
-///
-/// Own-overlay (read-your-own-write) exclusion is a capture-time concern (a
-/// read satisfied by the txn's own staged writes is never recorded, and a
-/// mixed committed-base + staged read records only the committed portion) — it
-/// cannot be reconstructed here from key identity alone, so this mapping is a
-/// faithful 1:1 projection of whatever the session captured.
+/// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving
+/// engine, collection, `read_version_lsn` (the collection's write floor —
+/// the sound OCC comparand, not the core-global `read_lsn`), and the
+/// point/predicate distinction. Own-overlay exclusion already happened at
+/// capture time, so this is a faithful 1:1 projection.
 pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
     VersionedReadSet::new(
         reads
@@ -54,30 +47,21 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
 }
 
 /// Build the routing/identity `read_set` for a Calvin `TxClass` from the
-/// neutral session read-set.
+/// neutral session read-set — the key-IDENTITY set for participant/routing,
+/// not the LSN-versioned OCC set ([`versioned_reads_from`]).
 ///
-/// This populates the key-IDENTITY set used for participant derivation and
-/// routing — NOT the LSN-versioned OCC validation set (`versioned_reads`, built
-/// separately by [`versioned_reads_from`]).
-///
-/// Each [`ReadSetEntry`] carries only `(engine, collection)` plus a
-/// point/predicate marker — no surrogate or byte-key identity — so it maps to a
-/// COLLECTION-homed [`EngineKeySet`] with an empty key vector, and its
-/// participating vShard is derived from the collection name. This intentionally
-/// over-approximates participants at collection granularity. For a graph/edge
-/// read it is REQUIRED and SAFE: a `ReadSetEntry` has no endpoint homes, so an
-/// `EngineKeySet::Edge` (which routes by key-hashed endpoint homes) cannot be
-/// built — collection-homing adds participant shards (more validation) and never
-/// drops one. A read with no extractable collection contributes no participant.
+/// A [`ReadSetEntry`] carries only `(engine, collection)`, no key identity,
+/// so it maps to a COLLECTION-homed [`EngineKeySet`] with an empty key
+/// vector — over-approximating participants, which is required and safe for
+/// a graph/edge read (no endpoint homes to build an `EngineKeySet::Edge`
+/// from): more validation, never a dropped participant.
 pub(super) fn read_set_from(reads: &[ReadSetEntry]) -> ReadWriteSet {
     use std::collections::BTreeSet;
 
-    // Dedup by (engine-variant, collection): identity is empty, so many reads on
-    // one collection collapse to a single keyset, keeping the read_set that
-    // rides the Raft log compact. Vector and KV reads keep their engine variant;
-    // every other engine (Document plus the graph / FTS / columnar / ... overlays
-    // and column-family engines) routes by collection name and is collection-homed
-    // via a Document keyset.
+    // Dedup by (engine-variant, collection): many reads on one collection
+    // collapse to a single keyset, keeping the Raft-log read_set compact.
+    // Vector/KV keep their engine variant; every other engine routes by
+    // collection name via a Document keyset.
     let mut vector_colls: BTreeSet<String> = BTreeSet::new();
     let mut kv_colls: BTreeSet<String> = BTreeSet::new();
     let mut doc_colls: BTreeSet<String> = BTreeSet::new();
@@ -198,18 +182,12 @@ pub(super) fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>
 
 /// Extract the collection name from a write plan.
 ///
-/// The name this returns is what the participant set is derived from
-/// ([`ReadWriteSet::participating_vshards_in_database`] hashes it), so a write
-/// whose name comes back EMPTY does not fail — it homes to whatever the empty
-/// string hashes to, which in the default database is vShard 0. The scheduler
-/// then enlists that shard, the routing oracle sends the plan to its real home,
-/// and the enlisted shard aborts the transaction with "homes no local write
-/// plans or reads". An op missing from this extractor is therefore a routing
-/// bug that surfaces nowhere near its cause.
-///
-/// The document arm is exhaustive for exactly that reason, mirroring the
-/// scheduler's own `plan_vshard` routing oracle: a new `DocumentOp` is a
-/// compile error here rather than a silent empty name.
+/// This name feeds the participant set (hashed by
+/// `participating_vshards_in_database`), so an empty name doesn't fail
+/// loudly — it hashes to vShard 0, gets enlisted, and aborts far from the
+/// real cause ("homes no local write plans or reads"). The document arm is
+/// exhaustive for exactly that reason: a new `DocumentOp` is a compile
+/// error here, not a silent empty name.
 pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Document(op) => document_write_collection(op),
@@ -257,26 +235,18 @@ fn document_write_collection(op: &DocumentOp) -> String {
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::Truncate { collection, .. }
-        // The derived balance write homes on the TARGET collection it names —
-        // the same collection the routing oracle sends it to. Leaving it out
-        // enlisted the empty name's vShard as a participant while the plan
-        // itself went to the target's, so the enlisted shard received nothing.
+        // Homes on the TARGET collection — same one the routing oracle uses.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => collection.clone(),
         DocumentOp::InsertSelect {
             target_collection, ..
         } => target_collection.clone(),
-        // Cross-collection writes whose source/target co-location nothing
-        // enforces. Their Control-Plane orchestrators resolve them into
-        // concrete point writes before dispatch, so no raw plan of either shape
-        // reaches this builder; the routing oracle names them `Unroutable` for
-        // the same reason.
+        // Cross-collection writes: Control-Plane orchestrators resolve them
+        // into concrete point writes before dispatch, so no raw plan reaches
+        // this builder; the routing oracle names them `Unroutable`.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => String::new(),
-        // Proposed directly through Raft by the write-resolve orchestrator, so
-        // no plan of this shape reaches this builder — the routing oracle names
-        // it `Unroutable` for the same reason.
+        // Proposed directly through Raft, so no plan reaches this builder.
         DocumentOp::ResolvedWrite { .. } => String::new(),
-        // Reads and index DDL: the caller skips every plan `is_write_plan`
-        // rejects before it gets here.
+        // Reads and index DDL: caller skips non-`is_write_plan` before here.
         DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
@@ -300,11 +270,8 @@ pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
             | DocumentOp::PointDelete { surrogate, .. }
             | DocumentOp::PointUpdate { surrogate, .. }
             | DocumentOp::Upsert { surrogate, .. }
-            // The TARGET row's identity, which is the row this write actually
-            // mutates — so two balance writes onto one row serialize and two
-            // onto different rows do not. Falling through to `0` locked every
-            // balance write against every other one, and against any write that
-            // also failed to report a surrogate.
+            // The TARGET row's identity — two balance writes onto one row
+            // serialize; falling through to `0` would lock all of them together.
             | DocumentOp::ApplyBalanceDelta { surrogate, .. },
         ) => surrogate.as_u32(),
         _ => 0,
@@ -312,11 +279,8 @@ pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
 }
 
 /// Lockstep proof that the write-admission gate and the Calvin scheduler
-/// derive IDENTICAL lock keys for the same op. `plan_lock_keys` (gate side)
-/// and `kv_write_keys`/`surrogate_from_plan` -> `EngineKeySet` (scheduler
-/// side, via `build_single_vshard_tx_class`) must never diverge — if they
-/// did, a gate-fenced write and a sequenced txn would lock different keys
-/// and the write-ordering fix this module exists for would be void.
+/// derive IDENTICAL lock keys for the same op — if they diverged, a
+/// gate-fenced write and a sequenced txn would lock different keys.
 #[cfg(test)]
 mod lockstep_tests {
     use super::*;
@@ -341,11 +305,10 @@ mod lockstep_tests {
         }
     }
 
-    /// Mirrors the scheduler driver's `expand_rw_set` `EngineKeySet` ->
-    /// `LockKey` mapping. This half is fixed, engine-tag-driven translation
-    /// that does not vary per op; the property under test is whether the
-    /// extractor threads the SAME `(collection, key/surrogate)` the gate's
-    /// `plan_lock_keys` uses, not this mapping itself.
+    /// Mirrors the scheduler's `expand_rw_set` `EngineKeySet` → `LockKey`
+    /// mapping (fixed translation). What's under test is whether the
+    /// extractor threads the same `(collection, key/surrogate)` as the
+    /// gate's `plan_lock_keys`, not this mapping.
     fn scheduler_lock_keys(sets: &[EngineKeySet]) -> BTreeSet<LockKey> {
         let mut keys = BTreeSet::new();
         for ks in sets {
@@ -449,20 +412,11 @@ mod lockstep_tests {
 }
 
 /// The participant set and the routing oracle must agree about where a plan
-/// lives.
-///
-/// These are two independent derivations of the same fact:
-/// [`collection_name_from_plan`] feeds the participant list the sequencer
-/// enlists, and the scheduler's `plan_vshard` oracle decides which participant
-/// actually receives the plan. When they disagree, a shard is enlisted and then
-/// handed nothing, and the whole transaction aborts with "homes no local write
-/// plans or reads for vshard N" — a message that names the enlisted shard and
-/// says nothing about the plan that caused it.
-///
-/// An op missing from the extractor produces an EMPTY collection name, and the
-/// empty name is not rejected anywhere: it simply hashes, landing on vShard 0 in
-/// the default database. So the failure is silent at the point of the bug and
-/// loud somewhere unrelated. These tests pin the agreement directly.
+/// lives: [`collection_name_from_plan`] feeds the participant list, the
+/// scheduler's `plan_vshard` oracle decides who actually gets the plan. A
+/// disagreement enlists a shard, hands it nothing, and aborts far from the
+/// cause. An op missing from the extractor silently hashes to vShard 0.
+/// These tests pin the agreement directly.
 #[cfg(test)]
 mod routing_agreement_tests {
     use super::*;
@@ -473,17 +427,15 @@ mod routing_agreement_tests {
 
     const TENANT: TenantId = TenantId::new(1);
     const DB: DatabaseId = DatabaseId::DEFAULT;
-    /// The source a materialized-sum binding drives, and the target its balance
-    /// lands on. Asserted to hash apart by
-    /// [`the_fixture_spans_two_vshards`] — a co-resident pair would never
+    /// The binding's source and its balance target. Asserted to hash apart
+    /// by [`the_fixture_spans_two_vshards`] — a co-resident pair would never
     /// produce the two-task plan this file is about.
     const SOURCE: &str = "route_entries";
     const TARGET: &str = "route_accounts";
 
-    /// Build a task homed the way PRODUCTION homes it — deliberately not by
-    /// asking [`collection_name_from_plan`], which is one of the two
-    /// derivations under test. Deriving the home from the extractor would make
-    /// the agreement true by construction and prove nothing.
+    /// Build a task homed the way PRODUCTION homes it, not by asking
+    /// [`collection_name_from_plan`] — that would make the agreement true
+    /// by construction and prove nothing.
     fn task(plan: PhysicalPlan, vshard_id: VShardId) -> PhysicalTask {
         PhysicalTask {
             tenant_id: TENANT,
@@ -543,30 +495,23 @@ mod routing_agreement_tests {
         );
     }
 
-    /// A balance write reports the TARGET collection it names.
-    ///
-    /// Reporting an empty name here is what enlisted vShard 0 as a participant
-    /// of every cross-shard materialized-sum statement while the plan itself
-    /// went to the target's shard.
+    /// A balance write reports the TARGET collection it names — an empty
+    /// name here enlisted vShard 0 while the plan went to the target's shard.
     #[test]
     fn a_balance_write_reports_the_collection_it_mutates() {
         assert_eq!(collection_name_from_plan(&balance_write()), TARGET);
     }
 
-    /// And the TARGET ROW's surrogate, so it locks the key a direct write of
-    /// that row would take. Falling through to `0` made every balance write
-    /// share one lock key.
+    /// And the TARGET ROW's surrogate; falling through to `0` made every
+    /// balance write share one lock key.
     #[test]
     fn a_balance_write_reports_the_target_rows_surrogate() {
         assert_eq!(surrogate_from_plan(&balance_write()), 271);
     }
 
-    /// The pair enlists exactly the two shards that hold work — the source's
-    /// and the target's — and no third one.
-    ///
-    /// This is the assertion the production failure would have caught: before
-    /// the extractor named `ApplyBalanceDelta`, the participants came back as
-    /// the source's shard plus vShard 0, and vShard 0 held no plan.
+    /// The pair enlists exactly the two shards that hold work — no third.
+    /// Before the extractor named `ApplyBalanceDelta`, this came back as
+    /// source-shard + vShard 0, and vShard 0 held no plan.
     #[test]
     fn the_pair_enlists_only_the_shards_that_hold_work() {
         let tasks = statement_tasks();

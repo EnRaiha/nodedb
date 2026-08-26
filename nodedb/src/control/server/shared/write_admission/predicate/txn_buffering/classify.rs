@@ -11,17 +11,9 @@ use nodedb_physical::physical_plan::{
     SpatialOp, TextOp, TimeseriesOp, VectorOp,
 };
 
-/// Whether an in-transaction statement's plan must be buffered for
-/// COMMIT-time replay (`true`) or may execute immediately as a read
-/// (`false`).
-///
-/// Mirrors `to_replicated_entry(..).is_some()`
-/// (`control/wal_replication/encode/entry.rs`) variant-for-variant —
-/// including the two payload-conditional `DocumentOp` bulk variants, whose
-/// OLLP-predicted-surrogate/edge fields the WAL encoder inspects before
-/// deciding whether to encode — EXCEPT for the documented set of
-/// write-but-was-unbuffered variants flipped to `true` below (see module
-/// doc): those return `true` here even though the oracle returns `false`.
+/// Whether an in-transaction statement's plan must be buffered for COMMIT-time
+/// replay (`true`) or may execute as a read (`false`). Mirrors
+/// `to_replicated_entry(..).is_some()`, except the flipped variants below.
 pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
     match plan {
         // ---- Document: encoded (buffered) ----
@@ -34,11 +26,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::InsertSelect { .. },
         ) => true,
 
-        // OLLP-predicted bulk plans: encoded ONLY when the executor has no
-        // predicted surrogate/edge set to verify against (the static-set,
-        // non-OLLP path). When either is `Some`, the plan routes via Calvin
-        // instead and is classified as a read here, exactly like
-        // `to_replicated_entry`.
+        // Encoded only when there's no predicted surrogate/edge set to verify against;
+        // when either is `Some`, it routes via Calvin and classifies as a read.
         PhysicalPlan::Document(DocumentOp::BulkDelete {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
@@ -64,54 +53,34 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::MaterializeScan { .. }
-            // Read-only classification pass issued by the Control-Plane
-            // expander itself; it writes nothing and buffers nothing.
+            // Read-only classification pass issued by the Control-Plane expander itself.
             | DocumentOp::ResolveWrite(_)
-            // Appended by the planner AFTER statement admission and dispatched
-            // as its own task; it never reaches the transaction write buffer.
+            // Appended by the planner after statement admission as its own task.
             | DocumentOp::ApplyBalanceDelta { .. }
-            // Built by the write-resolve orchestrator on the autocommit path and
-            // proposed straight through Raft; it never reaches the buffer.
+            // Built by write-resolve on the autocommit path, proposed straight through Raft.
             | DocumentOp::ResolvedWrite { .. },
         ) => false,
 
-        // Buffered. Neither `Merge` nor `UpdateFromJoin` reaches this predicate in
-        // a transaction: both are intercepted BEFORE `route_in_tx_write` and
-        // resolved + staged as concrete point ops at STATEMENT time by
-        // `control::server::shared::session::expander_stage` (so they commit
-        // indexed, replicated, undo-tracked point writes, not the passthrough);
-        // these arms remain only for the autocommit-classification callers and
-        // exhaustiveness. `BatchInsert` still replays through
-        // `exec_tx_passthrough`
-        // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT with
-        // no reject arm: `to_replicated_entry` has no encoder arm for it (a
-        // deliberate divergence from the oracle, see module doc). Buffering
-        // closes the prior atomicity gap (statement used to execute immediately
-        // and survive ROLLBACK) at the cost of RYOW loss + the no-undo gap
-        // (module doc) for `BatchInsert`.
+        // `Merge`/`UpdateFromJoin` never reach this — staged as point ops instead.
+        // `BatchInsert` replays via `exec_tx_passthrough` (oracle divergence, see module doc).
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::UpdateFromJoin { .. },
         ) => true,
 
-        // `Truncate` stays write-but-unbuffered: it is unverified whether
-        // `exec_tx_document`'s passthrough executes it correctly at COMMIT
-        // replay time, so a ROLLBACK inside an explicit transaction still
-        // does not undo it today. Not flipped in this change.
+        // `Truncate` stays write-but-unbuffered: unverified whether the passthrough
+        // executes it correctly at COMMIT replay, so ROLLBACK still doesn't undo it.
         PhysicalPlan::Document(DocumentOp::Truncate { .. }) => false,
 
         // ---- Vector: encoded (buffered) ----
         PhysicalPlan::Vector(
             VectorOp::Insert { .. } | VectorOp::BatchInsert { .. } | VectorOp::Delete { .. },
         ) => true,
-        // `SetParams` is `Permission::Alter` (DDL-shaped), but
-        // `to_replicated_entry` DOES encode it — it must be classified as a
-        // write here despite the DDL-like permission tier.
+        // `SetParams` is `Permission::Alter`, but `to_replicated_entry` encodes it —
+        // classified as a write despite the DDL-like permission tier.
         PhysicalPlan::Vector(VectorOp::SetParams { .. }) => true,
-        // `DropIndex` is the `SetParams` counterpart and replicates the same
-        // way: encoded, and rejected inside a transaction batch, so it is
-        // classified alongside it.
+        // `DropIndex` replicates the same way as `SetParams`.
         PhysicalPlan::Vector(VectorOp::DropIndex { .. }) => true,
 
         // ---- Vector: reads, not encoded ----
@@ -123,12 +92,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::MultiVectorScoreSearch { .. },
         ) => false,
 
-        // Buffered AND now encoded: `to_replicated_entry` used to have no
-        // encoder arm for these (the same divergence pattern documented for
-        // the remaining flipped variants in the module doc), but it now
-        // encodes all six (`control/wal_replication/encode/vector.rs`), so
-        // this is a plain oracle-matching write classification, not a
-        // divergence — see `vector_variants_match_oracle` below.
+        // `to_replicated_entry` encodes all six (`encode/vector.rs`) — a plain
+        // oracle-matching write, not a divergence. See `vector_variants_match_oracle`.
         PhysicalPlan::Vector(
             VectorOp::DeleteBySurrogate { .. }
             | VectorOp::SparseInsert { .. }
@@ -144,8 +109,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         ) => false,
 
         // ---- Crdt: encoded (buffered) ----
-        // Raw delta applies must pass serialized preview admission before any
-        // durable proposal, so they are rejected by `route_in_tx_write`.
+        // Raw delta applies need preview admission before proposal; `route_in_tx_write` rejects them.
         PhysicalPlan::Crdt(
             CrdtOp::ImportSnapshot { .. }
             | CrdtOp::ListInsert { .. }
@@ -168,15 +132,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | CrdtOp::ExportDelta { .. },
         ) => false,
 
-        // Buffered: `to_replicated_entry` has no encoder arm for these (a
-        // deliberate divergence from the oracle, see module doc), but each
-        // reaches `exec_tx_passthrough`
-        // (`data/executor/handlers/transaction/sub_plan.rs:286`) at COMMIT
-        // with no reject arm. Buffering closes the prior atomicity gap
-        // (statement used to execute immediately and survive ROLLBACK) at
-        // the cost of RYOW loss + the no-undo gap (module doc). For
-        // `SetConstraints` / `DropConstraints` retain their established
-        // buffered behavior; raw CRDT Apply is rejected before this classifier.
+        // No encoder arm here (see module doc); reaches `exec_tx_passthrough` at COMMIT
+        // with no reject arm, at the cost of RYOW loss + the no-undo gap.
         PhysicalPlan::Crdt(
             CrdtOp::SetConstraints { .. }
             | CrdtOp::DropConstraints { .. }
@@ -198,8 +155,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
         // ---- Graph: reads, not encoded ----
         PhysicalPlan::Graph(
-            // The resolve pass is read-only, so `to_replicated_entry` reports
-            // `None` for it — a read here as well.
+            // Resolve pass is read-only; `to_replicated_entry` reports `None`.
             GraphOp::ResolveEdgeDelete(_)
             | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
@@ -236,12 +192,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | KvOp::Transfer { .. }
             | KvOp::TransferItem { .. },
         ) => true,
-        // `Expire` / `Persist` ARE encoded (buffered) today, but the staged
-        // path's own executor (`execute_tx_kv`,
-        // `data/executor/handlers/transaction/sub_plan_kv_ops.rs:50-60`)
-        // rejects them inside a `TransactionBatch` — a COMMIT that replays a
-        // buffered `Expire`/`Persist` fails there regardless of this
-        // predicate. Not fixed here.
+        // `Expire`/`Persist` are encoded (buffered), but `execute_tx_kv` rejects
+        // them inside a `TransactionBatch` — a COMMIT replay fails there regardless.
         PhysicalPlan::Kv(KvOp::Expire { .. } | KvOp::Persist { .. }) => true,
 
         // ---- Kv: reads, not encoded ----
@@ -257,35 +209,22 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
             | KvOp::MaterializeScan { .. }
-            // Read-only: reports what a governed write would apply and
-            // mutates nothing, so `to_replicated_entry` encodes nothing.
+            // Read-only: reports what a governed write would apply; encodes nothing.
             | KvOp::ResolveWrite(_),
         ) => false,
 
         // ---- Kv: index / DDL / truncate — encoded, but autocommit-only ----
-        // A deliberate inverse divergence from the oracle: `to_replicated_entry`
-        // encodes all three (they replicate normally when executed autocommit),
-        // but transaction resolve rejects them outright
-        // (`data/executor/handlers/transaction/resolve/entry.rs:329-334`: "kv
-        // index/DDL/truncate op is not supported in transaction resolve"), so
-        // they are never stageable into the overlay and never need buffering.
-        // Pinned by `truncate_and_index_variants_are_encoded_but_not_buffered`.
+        // Inverse divergence: encoded, but transaction resolve rejects them.
         PhysicalPlan::Kv(
             KvOp::Truncate { .. } | KvOp::RegisterIndex { .. } | KvOp::DropIndex { .. },
         ) => false,
 
         // ---- Kv: resolved write — encoded, but autocommit-only ----
-        // Same inverse divergence as the three above: `to_replicated_entry`
-        // encodes it (that is the whole point — it is what a governed
-        // state-dependent KV write replicates as), but transaction resolve
-        // rejects it, so it is never stageable and never needs buffering.
+        // Same inverse divergence: encoded, but transaction resolve rejects it.
         PhysicalPlan::Kv(KvOp::ResolvedWrite { .. }) => false,
 
         // ---- Kv: predicate DML — encoded (buffered) ----
-        //
-        // `to_replicated_entry` encodes both, so the oracle says buffer.
-        // COMMIT-time resolve refuses them (`transaction/resolve/entry.rs`):
-        // autocommit is the supported path.
+        // Encoded; COMMIT-time resolve refuses them — autocommit is the supported path.
         PhysicalPlan::Kv(KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. }) => true,
 
         // ---- Columnar: encoded (buffered) ----
@@ -297,9 +236,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ColumnarOp::ResolvedDelete { .. },
         ) => true,
         // ---- Columnar: reads, not encoded ----
-        // `ResolveDml` mirrors the oracle too: `to_replicated_entry` returns
-        // `None` for it (see `entry_columnar_family::columnar_write`), so it
-        // is a read here as well.
+        // `ResolveDml` mirrors the oracle: `to_replicated_entry` returns `None` for it.
         PhysicalPlan::Columnar(
             ColumnarOp::Scan { .. }
                 | ColumnarOp::MaterializeScan { .. }
@@ -308,8 +245,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
         // ---- Timeseries ----
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => true,
-        // The resolve pass is read-only, so `to_replicated_entry` reports
-        // `None` for it — a read here as well.
+        // Resolve pass is read-only; `to_replicated_entry` reports `None`.
         PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
             false
         }
@@ -331,11 +267,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // ---- Spatial: reads, not encoded ----
         PhysicalPlan::Spatial(SpatialOp::Scan { .. }) => false,
 
-        // ---- Query: coordinator-side data movement / joins / aggregates.
-        // `to_replicated_entry` never matches `PhysicalPlan::Query(_)` — every
-        // variant falls to its `_ => None` tail, so every `QueryOp` is a read
-        // here. None require Write permission, so there is no
-        // write-but-unbuffered case in this engine.
+        // ---- Query: coordinator-side data movement / joins / aggregates — all reads.
         PhysicalPlan::Query(
             QueryOp::Exchange(_)
             | QueryOp::ProviderScan { .. }
@@ -355,17 +287,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | QueryOp::PostProcess { .. },
         ) => false,
 
-        // ---- Meta: control / maintenance / internal-mechanism ops.
-        // `to_replicated_entry` never matches `PhysicalPlan::Meta(_)` at all,
-        // so every `MetaOp` is a read here — including the ones that require
-        // Write permission (`WalAppend`, `TransactionBatch`, `PurgeTenant`,
-        // `StageWrite`, `MarkSavepoint`, `RollbackToSavepoint`, `ResolveTxn`,
-        // the `CalvinExecute*` / `CalvinFlush` / `CalvinDrop` / `CalvinResolve`
-        // family, and `RecordCalvinWriteVersions`). None of these ever appear as a
-        // client statement's `task.plan` at this call site — they are
-        // internal orchestration plans the Calvin scheduler and the COMMIT
-        // path dispatch directly — so this is today's behavior, not a gap
-        // this predicate introduces.
+        // ---- Meta: control / maintenance ops — internal orchestration, never a client `task.plan`.
         PhysicalPlan::Meta(
             MetaOp::WalAppend { .. }
             | MetaOp::Cancel { .. }
@@ -412,9 +334,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::ResolveTxn { .. },
         ) => false,
 
-        // ---- Array reads / DDL / Flush: `to_replicated_entry` returns `None`
-        // for these (not a write), so they classify `false` — matching the
-        // oracle.
+        // ---- Array reads / DDL / Flush: `to_replicated_entry` returns `None` — matches oracle.
         PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
             | ArrayOp::Slice { .. }
@@ -428,29 +348,16 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ArrayOp::RestoreArrayDrop { .. }
             | ArrayOp::PurgeArrayDrop { .. },
         ) => false,
-        // Buffered AND encoded — matches the oracle. `to_replicated_entry` now
-        // emits the Raft-native `ArrayCellPut` / `ArrayCellDelete` for these
-        // (`encode/entry_array.rs`), so they replicate to the shard's data
-        // group. Buffering also closes the in-transaction atomicity gap
-        // (statement used to execute immediately and survive ROLLBACK) at the
-        // cost of RYOW loss + the no-undo gap (module doc).
+        // Buffered and encoded — matches oracle. `to_replicated_entry` emits
+        // `ArrayCellPut`/`ArrayCellDelete`, at the cost of RYOW loss + the no-undo gap.
         PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => true,
 
-        // ---- ClusterArray: coordinator-only, never dispatched to the Data
-        // Plane and never touched by `to_replicated_entry`.
+        // ---- ClusterArray: coordinator-only, never touched by `to_replicated_entry`.
         PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. }) => {
             false
         }
-        // Write-but-unbuffered: Write permission, no encoder arm today, and
-        // NOT flipped in this change. Unlike `ArrayOp`, `ClusterArrayOp` is a
-        // Control-Plane-only construct (`control/cluster/array_cluster_exec/
-        // executor.rs` RPC-fans-out to per-shard `ArrayOp`); the Data Plane's
-        // `DataPlaneVisitor::cluster_array`
-        // (`data/executor/dispatch/visitor.rs:82-84`) is a hard
-        // `unreachable!()`. Buffering these would route them through
-        // `MetaOp::TransactionBatch` -> `exec_tx_passthrough` ->
-        // `self.execute(..)` at COMMIT, which reaches that `unreachable!()`
-        // and panics. Left `false` deliberately.
+        // Write-but-unbuffered: buffering would route through `TransactionBatch` to
+        // `DataPlaneVisitor::cluster_array`'s hard `unreachable!()` and panic.
         PhysicalPlan::ClusterArray(ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. }) => {
             false
         }
@@ -458,15 +365,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
     }
 }
 
-/// Equivalence regression: `plan_requires_txn_buffering` must return exactly
-/// what `to_replicated_entry(..).is_some()` returns, for a representative
-/// instance of every leaf op variant across every engine EXCEPT the flipped
-/// set documented in the module doc (those are pinned separately by
-/// `flipped_variants_are_buffered_and_unencoded` below, via
-/// `assert_buffered_but_unencoded`). This is the safety net for retiring the
-/// ad-hoc oracle over the remaining variants — if a future edit to either
-/// this predicate or the WAL encoder drifts the two apart, one of these
-/// assertions fails.
+/// Equivalence regression: `plan_requires_txn_buffering` must match
+/// `to_replicated_entry(..).is_some()` for every leaf variant except the
+/// flipped set (pinned separately via `assert_buffered_but_unencoded`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,12 +439,8 @@ mod tests {
         );
     }
 
-    /// Pin the deliberate divergence for a flipped variant (module doc): the
-    /// predicate now classifies it `true` (buffered — the atomicity fix),
-    /// while `to_replicated_entry` still has no encoder arm for it and
-    /// returns `None` (a separate, documented encoder omission, not fixed
-    /// here). Asserting both makes the divergence from `assert_matches_oracle`
-    /// intentional and visible instead of a silent drift.
+    /// Pin the deliberate divergence for a flipped variant (module doc): buffered
+    /// `true` here while `to_replicated_entry` still has no encoder arm.
     fn assert_buffered_but_unencoded(plan: &PhysicalPlan) {
         assert!(
             plan_requires_txn_buffering(plan),
@@ -557,13 +454,9 @@ mod tests {
         );
     }
 
-    /// Pin the inverse divergence (module doc) for an autocommit-only
-    /// Truncate variant: the predicate classifies it `false` (not
-    /// buffered) because it is rejected inside an explicit transaction
-    /// (`resolve/entry.rs`) and so never reaches this predicate for staging
-    /// in practice, while `to_replicated_entry` returns `Some` because it
-    /// replicates normally when executed autocommit. The inverse of
-    /// `assert_buffered_but_unencoded`.
+    /// Pin the inverse divergence (module doc): classified `false` since it's
+    /// rejected in an explicit transaction, while `to_replicated_entry` returns
+    /// `Some` since it replicates normally autocommit.
     fn assert_encoded_but_not_buffered(plan: &PhysicalPlan) {
         assert!(
             !plan_requires_txn_buffering(plan),
@@ -795,9 +688,7 @@ mod tests {
                 count: 0,
                 system_as_of_ms: None,
             }),
-            // `to_replicated_entry` now has an encoder arm for `BatchInsert`
-            // (used to be in the flipped/unencoded exception list, see module
-            // doc), so predicate `true` and encoder `Some` agree here.
+            // Predicate `true` and encoder `Some` agree for `BatchInsert`.
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "c".into(),
                 documents: Vec::new(),
@@ -902,10 +793,7 @@ mod tests {
                 ef_search: 0,
                 mode: String::new(),
             }),
-            // These six used to have no `to_replicated_entry` encoder arm
-            // (pinned separately by `flipped_variants_are_buffered_and_unencoded`);
-            // now that the encoder covers them, predicate `true` and encoder
-            // `Some` agree again, so they belong in the oracle-matching set.
+            // Encoder covers these six, so predicate and encoder agree — oracle-matching set.
             PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
                 collection: "c".into(),
                 surrogate: Surrogate::ZERO,
@@ -1031,10 +919,7 @@ mod tests {
                 to_index: 1,
                 surrogate: Surrogate::ZERO,
             }),
-            // `to_replicated_entry` now has encoder arms for `SetConstraints`
-            // / `DropConstraints` (used to be in the flipped/unencoded
-            // exception list, see module doc), so predicate `true` and
-            // encoder `Some` agree here.
+            // `to_replicated_entry` has encoder arms for these — predicate and encoder agree.
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
                 collection: "c".into(),
                 constraint_version: 0,
@@ -2020,11 +1905,8 @@ mod tests {
             PhysicalPlan::Array(ArrayOp::DropArray {
                 array_id: array_id.clone(),
             }),
-            // `ArrayOp::Put` / `Delete` now MATCH the oracle: both are buffered
-            // (`plan_requires_txn_buffering == true`, the atomicity fix) AND
-            // encoded (`to_replicated_entry` returns `Some` — the Raft-native
-            // `ArrayCellPut` / `ArrayCellDelete` cluster-write path), so they
-            // belong here rather than in `flipped_variants_are_buffered_and_unencoded`.
+            // `ArrayOp::Put`/`Delete` match the oracle: both buffered and encoded
+            // (Raft-native `ArrayCellPut`/`ArrayCellDelete`).
             PhysicalPlan::Array(ArrayOp::Put {
                 array_id: array_id.clone(),
                 cells_msgpack: Vec::new(),
@@ -2057,10 +1939,8 @@ mod tests {
                 system_as_of: None,
                 valid_at_ms: None,
             }),
-            // `ClusterArrayOp::Put` / `Delete` are NOT flipped (see their arm
-            // above): buffering them would panic at COMMIT via
-            // `DataPlaneVisitor::cluster_array`'s `unreachable!()`. They stay
-            // in the equivalence set, both sides `false`.
+            // Not flipped: buffering would panic at COMMIT via `cluster_array`'s
+            // `unreachable!()`. Both sides `false`.
             PhysicalPlan::ClusterArray(ClusterArrayOp::Put {
                 array_id: array_id.clone(),
                 array_id_msgpack: Vec::new(),
@@ -2081,15 +1961,8 @@ mod tests {
         }
     }
 
-    /// Pin the deliberate oracle divergence (module doc) for every remaining
-    /// flipped variant across the three still-affected engines (Document,
-    /// Crdt, Array): each classifies `true` (buffered — closes the
-    /// atomicity gap) while `to_replicated_entry` still has no encoder arm
-    /// and returns `None` (a separate, undone encoder-omission unit).
-    /// `VectorOp`'s six formerly-flipped variants are no longer here — see
-    /// `vector_variants_match_oracle`. `DocumentOp::BatchInsert` and
-    /// `CrdtOp::{SetConstraints, DropConstraints}` are no longer here either
-    /// — see `document_variants_match_oracle` / `crdt_variants_match_oracle`.
+    /// Pin the oracle divergence for flipped variants (Document, Crdt, Array):
+    /// classified `true` while `to_replicated_entry` has no encoder arm.
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
         let plans = vec![
@@ -2133,19 +2006,9 @@ mod tests {
         }
     }
 
-    /// Pin the inverse divergence (module doc): truncate and KV index/DDL ops
-    /// are autocommit-only — transaction resolve rejects them outright
-    /// (`data/executor/handlers/transaction/resolve/entry.rs:329-334` for the
-    /// KV arm, `:394-400` for the document arm), so
-    /// `plan_requires_txn_buffering` never needs to buffer them — while
-    /// `to_replicated_entry` encodes them all, since they replicate normally
-    /// when executed autocommit. The inverse of
-    /// `flipped_variants_are_buffered_and_unencoded`.
-    ///
-    /// These are deliberately excluded from `kv_variants_match_oracle`: they
-    /// are the KV variants that legitimately disagree with the oracle, and
-    /// pinning them here keeps that disagreement explicit rather than letting
-    /// the equivalence test fail on an intentional divergence.
+    /// Pin the inverse divergence: truncate and KV index/DDL ops are autocommit-only
+    /// (resolve rejects them, so buffering is never needed), while `to_replicated_entry`
+    /// encodes them all.
     #[test]
     fn truncate_and_index_variants_are_encoded_but_not_buffered() {
         let plans = vec![

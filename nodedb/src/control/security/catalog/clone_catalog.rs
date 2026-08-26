@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Catalog persistence for the clone CoW subsystem.
-//!
-//! Three redb tables are managed here:
-//!
-//! - `clone_copyups`   — maps `(target_collection_key, source_surrogate)` →
-//!   `target_surrogate` for rows that have been copy-up'd into the clone.
-//! - `clone_tombstones` — records `(target_collection_key, source_surrogate)`
-//!   for rows that have been deleted from the clone without ever being
-//!   materialised into it.
-//! - `clone_lineage`   — maps `source_database_id` → `Vec<child_database_id>`
-//!   for orphan-protection checks at DROP DATABASE time.
+//! Catalog persistence for the clone CoW subsystem: `clone_copyups` maps source
+//! surrogate → target surrogate; `clone_tombstones` records deleted source rows;
+//! `clone_lineage` maps source db → child db ids for DROP DATABASE checks.
 
 use nodedb_types::DatabaseId;
 use redb::{ReadableDatabase, ReadableTable};
@@ -67,13 +59,9 @@ impl SystemCatalog {
         Ok(val)
     }
 
-    /// Return the set of source surrogates that have been copied up into
-    /// `target_collection_key`.
-    ///
-    /// A copied-up row is present in the target under a fresh surrogate, so the
-    /// clone read path must suppress the source row it superseded — the same
-    /// role `list_clone_tombstones` plays for deletes. Returns an empty set
-    /// when nothing has been copied up (common case).
+    /// Source surrogates copied up into `target_collection_key`.
+    /// Clone reads must suppress the source row a copy-up superseded,
+    /// the same role `list_clone_tombstones` plays for deletes.
     pub fn list_clone_copyups(
         &self,
         target_collection_key: &str,
@@ -207,11 +195,8 @@ impl SystemCatalog {
         Ok(exists)
     }
 
-    /// Return the set of all tombstoned source surrogates for a collection.
-    ///
-    /// Used by the clone read path to filter source rows before merging them
-    /// into the target result set.  Returns an empty set when the collection
-    /// has no tombstones (common case).
+    /// All tombstoned source surrogates for a collection, used to filter
+    /// source rows before merging into the target result set.
     pub fn list_clone_tombstones(
         &self,
         target_collection_key: &str,
@@ -301,10 +286,8 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("clone_kv_tombstones commit", e))
     }
 
-    /// Return the set of all KV tombstoned keys for a clone collection.
-    ///
-    /// Used by the clone read path to filter source KV scan results before
-    /// merging them into the target result set.
+    /// All KV tombstoned keys for a clone collection, used to filter source
+    /// KV scan results before merging into the target result set.
     pub fn list_kv_clone_tombstones(
         &self,
         target_collection_key: &str,

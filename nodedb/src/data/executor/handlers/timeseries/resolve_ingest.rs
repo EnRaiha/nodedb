@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Read-only resolve pass for a governed `TimeseriesOp::Ingest`.
-//!
-//! A follower has no writing identity, so an ingest carrying a live write
-//! predicate cannot be replicated. This normalizes the payload into the line
-//! protocol the ingest handler would have stored, stamps every line's
-//! timestamp, decides the policy against those exact lines, and reports them
-//! back. The Control Plane then proposes an `ilp-msgpack` ingest carrying them
-//! with a decided check.
-//!
-//! Normalization belongs here and not in the Control Plane: the time column of
-//! a measurement with no DDL behind it comes from the resident memtable's
-//! schema, and the default timestamp comes from this core's clock — both
-//! Data-Plane state.
+//! Read-only resolve pass for a governed `TimeseriesOp::Ingest`. A follower
+//! has no writing identity, so this normalizes the payload into line
+//! protocol, stamps timestamps, decides the policy, and reports the lines
+//! back for the Control Plane to propose as a decided `ilp-msgpack` ingest.
+//! Normalization stays here, not the Control Plane, because the time column
+//! and default timestamp both come from this core's local state.
 
 use nodedb_physical::physical_plan::TimeseriesOp;
 
@@ -31,10 +24,8 @@ fn measurement_of(collection: &str) -> &str {
 }
 
 impl CoreLoop {
-    /// Resolve the wrapped ingest to the canonical lines it would store.
-    ///
-    /// Answers with a MessagePack `Vec<String>` — the same canonical shape the
-    /// `"ilp-msgpack"` format decodes — or the policy's own refusal.
+    /// Resolve the wrapped ingest to the canonical lines it would store, as a
+    /// MessagePack `Vec<String>` — the same shape `"ilp-msgpack"` decodes.
     pub(in crate::data::executor) fn execute_timeseries_resolve_ingest(
         &mut self,
         task: &ExecutionTask,
@@ -123,10 +114,8 @@ impl CoreLoop {
         }
     }
 
-    /// Rewrite `payload` into line protocol, whichever shape it arrived in.
-    ///
-    /// Mirrors the format dispatch the ingest handler runs, so the lines this
-    /// returns are the lines that ingest would have parsed.
+    /// Rewrite `payload` into line protocol, mirroring the ingest handler's
+    /// format dispatch so the lines returned are what ingest would parse.
     fn normalized_ilp_batch(
         collection: &str,
         payload: &[u8],

@@ -2,16 +2,11 @@
 
 //! Permission-tree resolution for graph-overlay operations.
 //!
-//! No graph read carries a slot the storage layer evaluates a resource-column
-//! predicate in: a traversal returns topology, an algorithm returns per-node
-//! scalars, a pattern match returns bindings, and RAG fusion returns fused
-//! document rows through the fusion envelope. Each therefore refuses while a
-//! permission tree governs the collection being read — the same verdicts the
-//! RLS pass reaches for the same shapes.
-//!
-//! Edge writes do carry a collection, and unlike the RLS pass — which leaves
-//! every write to a separate write-path check — this pass has write and delete
-//! levels of its own and applies them here.
+//! No graph read carries a slot to evaluate a resource-column predicate
+//! in, so each refuses while a permission tree governs the collection —
+//! same verdicts as the RLS pass. Unlike RLS (which leaves writes to a
+//! separate write-path check), this pass has its own write/delete levels
+//! and applies them here, since edge writes do carry a collection.
 
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -30,15 +25,8 @@ const MATCH_REASON: &str = "a pattern match returns bindings over graph topology
 /// between filtering, refusing, and no-op.
 pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> {
     match op {
-        // Refuse: a traversal returns node ids and edge labels, not row
-        // bodies. What it discloses is topology — which nodes exist and how
-        // they connect — and the edges of a resource outside the caller's
-        // subtree are as much out of reach as the resource itself.
-        //
-        // A traversal with no collection (`None`) is a tree-index walk scoped
-        // by edge label; no catalog record maps an index back to the
-        // collection it was built on, so there is no tree definition to
-        // consult.
+        // Refuse: discloses topology, not row bodies. `None` is a
+        // tree-index walk with no collection mapping — no tree to consult.
         GraphOp::Hop { collection, .. }
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
@@ -54,18 +42,14 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
             ctx.refuse_if_tree(collection, TRAVERSAL_REASON)
         }
 
-        // Refuse: a pattern match returns variable bindings over topology with
-        // no filter slot, and its own `WHERE` can probe a hidden row's field
-        // one predicate at a time. The collection lives inside the serialized
-        // query rather than on the plan node.
+        // Refuse: returns bindings with no filter slot; its own `WHERE`
+        // could probe a hidden row's field one predicate at a time.
         GraphOp::Match { query, .. }
         | GraphOp::MatchContinuation { query, .. }
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
 
-        // Refuse: the algorithm runs over the whole CSR for the collection and
-        // returns ranks / component ids / counts derived from every row,
-        // including the ones outside the subtree, through a payload with no
-        // resource column to filter on.
+        // Refuse: runs over the whole CSR, returns scalars derived from
+        // every row (including ones outside the subtree), no column to filter.
         GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => {
             ctx.refuse_if_tree(&params.collection, ALGORITHM_REASON)
         }
@@ -79,19 +63,16 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
             ctx.refuse_if_tree(&plan.params.collection, ALGORITHM_REASON)
         }
 
-        // Refuse: RAG fusion returns fused document rows, but the fusion
-        // envelope has no filter slot and embeds no sub-plan to recurse into —
-        // the vector, text, and graph legs all run inside the handler.
+        // Refuse: fusion envelope has no filter slot and no sub-plan to
+        // recurse into.
         GraphOp::RagFusion { collection, .. } => ctx.refuse_if_tree(
             collection,
             "fusion returns ranked document rows through a fused response shape that carries no \
              subtree filter",
         ),
 
-        // Refuse: the counters summarize the collection's edges, so they count
-        // rows outside the subtree, and a counter carries no resource column.
-        // `collection = None` reports every collection that has edges, so the
-        // narrow per-collection question cannot be asked.
+        // Refuse: counters over the collection's edges, no column to filter.
+        // `None` spans every collection, so no narrow question can be asked.
         GraphOp::Stats { collection, .. } => match collection.as_deref() {
             Some(collection) => ctx.refuse_if_tree(
                 collection,
@@ -133,16 +114,8 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
 }
 
 /// Refuse a pattern match whose target collection carries a permission tree.
-///
-/// The collection lives in the serialized `MatchQuery` — the plan node carries
-/// only the encoded query — so it is decoded here to keep the refusal narrow:
-/// a match scoped with `IN '<collection>'` to a collection no tree governs
-/// still runs.
-///
-/// A query that names no collection may traverse any of the tenant's edges,
-/// and one that fails to decode cannot be shown to avoid a governed
-/// collection. Both fall back to the tenant-wide question, exactly as the RLS
-/// pass does for the same shape.
+/// A query naming no collection, or one that fails to decode, falls back
+/// to the tenant-wide question, as the RLS pass does.
 fn refuse_match(ctx: &PermCtx<'_>, query: &[u8]) -> crate::Result<()> {
     let decoded: Result<crate::engine::graph::pattern::ast::MatchQuery, _> =
         zerompk::from_msgpack(query);

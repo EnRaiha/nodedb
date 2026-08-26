@@ -3,9 +3,7 @@
 //! Classify the columnar-storage-family engine ops (`ColumnarOp`,
 //! `TimeseriesOp`, `TextOp`, `SpatialOp`) into an optional `ReplicatedWrite`.
 //!
-//! Each function is exhaustive over its op enum (not a catch-all): a new
-//! variant is a compile error here, so no future write in these families is
-//! silently left un-replicated.
+//! Each function is exhaustive over its op enum: a new variant is a compile error.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -15,12 +13,9 @@ use super::columnar::ColumnarIngestFields;
 use super::entry::{encode_provenance, encode_returning};
 use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TextOp, TimeseriesOp};
 
-/// Encode a `ColumnarOp` write variant into its `ReplicatedWrite` wire shape,
-/// `Ok(None)` for scans, or an error when the op cannot be replicated safely.
-///
-/// `ColumnarOp::Update` / `ColumnarOp::Delete` refuse when
-/// `rls_write_check.has_predicate()` — see the arm below for why: a governed
-/// predicate DML must never cross the wire as a bare predicate.
+/// Encode a `ColumnarOp` write variant, `Ok(None)` for scans, or an error when
+/// the op cannot be replicated safely. `Update`/`Delete` refuse when
+/// `rls_write_check.has_predicate()` — see the arm below.
 pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<ReplicatedWrite>> {
     Ok(Some(match op {
         ColumnarOp::Insert {
@@ -32,17 +27,10 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             surrogates,
             schema_bytes,
             provenance,
-            // wal_lsn is omitted from the wire envelope: a follower allocates
-            // its own LSN at apply time, so the leader's value would be
-            // meaningless there.
+            // wal_lsn omitted: a follower allocates its own LSN at apply time.
             wal_lsn: _,
-            // A plain insert carries every row it persists, so the policy
-            // decided it at plan time and no follower re-decides it. Decode
-            // stamps `already_decided_elsewhere()`.
-            //
-            // `ON CONFLICT DO UPDATE` defers instead: its merged row exists
-            // only in the handler. Replicating it would drop the predicate and
-            // leave that row ungoverned, so the guard below refuses it.
+            // Plain insert: policy decided at plan time. ON CONFLICT DO UPDATE defers —
+            // its merged row exists only in the handler, so the guard below refuses it.
             rls_write_check,
             returning,
             rls_filters,
@@ -61,21 +49,8 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
                 rls_filters,
             })
         }
-        // The compiled RLS predicate is deliberately not replicated when NO
-        // write policy restricts this collection: there is nothing for a
-        // follower to decide either way, so re-scanning the predicate at each
-        // replica's own committed state is exactly the deterministic-replay
-        // behavior `ColumnarBulkDml` is built for.
-        //
-        // When a write policy DOES restrict this collection
-        // (`rls_write_check.has_predicate()`), shipping the bare predicate is
-        // the bug this refusal closes: a follower has no writing identity to
-        // decide the predicate against, so `ColumnarBulkDml` would either
-        // admit every row on every replica (silent bypass) or have the
-        // leader re-decide after commit and reject what followers already
-        // applied (divergence). A governed predicate DML must be resolved to
-        // a concrete row set (`ColumnarOp::ResolvedUpdate` /
-        // `ColumnarOp::ResolvedDelete`) before it reaches this encoder.
+        // A governed predicate needs a writing identity a follower lacks — must
+        // resolve to a concrete row set before reaching this encoder.
         ColumnarOp::Delete {
             collection,
             filters,
@@ -94,10 +69,8 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             columnar::bulk_update(collection, filters, updates)
         }
 
-        // The Control Plane already resolved these rows and decided the
-        // write policy against their exact images, so the wire shape carries
-        // the resolved row set — never a predicate — and needs no refusal
-        // check.
+        // Already resolved: the wire shape carries the row set, never a
+        // predicate, so no refusal check is needed.
         ColumnarOp::ResolvedUpdate {
             collection,
             rows,
@@ -109,21 +82,16 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             rls_write_check: _,
         } => columnar::bulk_resolved_delete(collection, pks),
 
-        // Not a write — reads / scans. `ResolveDml` is a read too: it mutates
-        // nothing, only reports the row set a predicate DML would touch.
+        // Not a write — reads/scans. `ResolveDml` only reports the row set a DML would touch.
         ColumnarOp::Scan { .. }
         | ColumnarOp::MaterializeScan { .. }
         | ColumnarOp::ResolveDml { .. } => return Ok(None),
     }))
 }
 
-/// Refuse an `INSERT ... ON CONFLICT DO UPDATE` on a governed collection.
-///
-/// Its merged row exists only in the handler, so the policy travels as a
-/// compiled predicate — and that predicate cannot cross the wire, since a
-/// follower has no writing identity to evaluate it against.
-///
-/// A plain insert is unaffected: the policy decided its rows at plan time.
+/// Refuse `INSERT ... ON CONFLICT DO UPDATE` on a governed collection: its
+/// merged row exists only in the handler, and a follower has no writing
+/// identity to evaluate the compiled predicate against.
 fn refuse_governed_merge(
     collection: &str,
     on_conflict_updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
@@ -170,14 +138,11 @@ pub(super) fn timeseries_write(op: &TimeseriesOp) -> Option<ReplicatedWrite> {
             collection,
             payload,
             format,
-            // wal_lsn is omitted: a follower allocates its own LSN at apply
-            // time.
+            // wal_lsn omitted: a follower allocates its own LSN at apply time.
             wal_lsn: _,
             surrogates,
             provenance,
-            // Not replicated for the same reason as `ColumnarOp::Insert`'s
-            // `rls_write_check` above: a follower has no writing identity to
-            // re-decide it against.
+            // Not replicated, same reason as `ColumnarOp::Insert` above.
             rls_write_check: _,
             returning,
             rls_filters,
@@ -221,8 +186,7 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
             encode_provenance(provenance),
         ),
 
-        // Not a write — BM25 / phrase / hybrid searches and the config-only
-        // analyzer binding (single-node, non-WAL-durable).
+        // Not a write — searches and the config-only analyzer binding.
         TextOp::Search { .. }
         | TextOp::BM25ScoreScan { .. }
         | TextOp::PhraseSearch { .. }

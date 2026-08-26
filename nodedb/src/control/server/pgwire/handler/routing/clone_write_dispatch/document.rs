@@ -2,18 +2,9 @@
 
 //! Document engine CoW write interception.
 //!
-//! Three shapes are intercepted on a `Shadowed` / `Materializing` clone:
-//!
-//! - UPDATE — copy the source row up into the clone, then let the update apply
-//!   to the copy.
-//! - DELETE — tombstone the source surrogate so the clone stops seeing it.
-//! - INSERT / PUT / UPSERT — the statement supplies the whole row, so no
-//!   copy-up is needed, but the source row carrying the same primary key must
-//!   still be hidden or the clone returns the key twice.
-//!
-//! Every suppression record is keyed by the SOURCE surrogate: each database
-//! maintains its own `(collection, pk_bytes)` → surrogate map, and the read
-//! path merges rows carrying source surrogates.
+//! On a `Shadowed`/`Materializing` clone: UPDATE copies the source row up then
+//! applies; DELETE tombstones the source surrogate; INSERT/PUT/UPSERT tombstones
+//! the same-key source row without a copy-up.
 
 use std::sync::Arc;
 
@@ -123,8 +114,7 @@ fn classify(plan: &PhysicalPlan) -> Option<DocWrite<'_>> {
 
 /// Resolve the surrogate the source database bound to `document_id`.
 ///
-/// `None` means the source never held that primary key, so there is nothing to
-/// copy up and nothing to hide.
+/// `None` means the source never held that primary key.
 fn source_surrogate(
     state: &SharedState,
     tenant_id: TenantId,
@@ -207,9 +197,8 @@ impl NodeDbPgHandler {
                     else {
                         continue;
                     };
-                    // A binding without a live row makes the tombstone a no-op
-                    // on reads, so the row probe it would take is not worth a
-                    // Data-Plane round trip per inserted key.
+                    // A binding without a live row makes the tombstone a read no-op —
+                    // not worth a probe round trip per inserted key.
                     perform_clone_tombstone(TombstoneParams {
                         state: &self.state,
                         target_db_id: db_id,
@@ -245,9 +234,8 @@ impl NodeDbPgHandler {
                     document_id,
                 )?;
 
-                // Tombstone whether or not the row lives in the target: after a
-                // DELETE the clone must never show the source copy again, and a
-                // target-resident row can shadow a source row of the same key.
+                // Tombstone regardless of target residency — after DELETE the clone
+                // must never show the source copy again.
                 if let Some(src) = src {
                     perform_clone_tombstone(TombstoneParams {
                         state: &self.state,
@@ -262,11 +250,8 @@ impl NodeDbPgHandler {
                     return Ok(CloneWriteOutcome::Passthrough);
                 }
 
-                // The delete is satisfied by hiding the source row, so the
-                // source read is what decides whether this statement removed a
-                // row (1) or nothing (0). A primary key resolving to a
-                // surrogate is not evidence the row exists — a surrogate
-                // outlives the row it was assigned to.
+                // The source read decides rows-affected (1 or 0) — a resolved surrogate
+                // is not evidence the row exists, since a surrogate outlives its row.
                 let source_row = match src {
                     Some(src) => fetch_source_row(
                         &self.state,

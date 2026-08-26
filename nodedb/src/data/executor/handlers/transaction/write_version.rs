@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Records the per-core last-write-LSN version for every key a committed
-//! transaction batch wrote.
-//!
-//! This is the transaction-batch funnel for the version index: it runs once,
-//! after the batch has committed, over the buffered sub-plans — covering both
-//! the single-shard fast-path commit and every Calvin apply (both delegate to
-//! `execute_transaction_batch`). One WAL LSN (the batch's single
-//! `append_transaction` LSN, threaded onto the task) applies to every key in
-//! the batch.
+//! transaction batch wrote. Runs once, after commit, over the buffered
+//! sub-plans, covering both the fast-path commit and every Calvin apply.
+//! One WAL LSN applies to every key in the batch.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::data::executor::core_loop::CoreLoop;
@@ -21,12 +16,9 @@ use nodedb_physical::physical_plan::{
 use nodedb_types::Surrogate;
 
 impl CoreLoop {
-    /// Record the version of every key written by a committed transaction batch.
-    ///
-    /// No-op when the task carries no WAL LSN (the version is not advanced with
-    /// a wrong value). Per-key engines record `KeyRepr`; engines whose per-key
-    /// identity is internal (columnar / timeseries / spatial / FTS) record only
-    /// the collection floor.
+    /// Record the version of every key written by a committed transaction
+    /// batch. No-op with no WAL LSN. Per-key engines record `KeyRepr`;
+    /// engines with internal per-key identity record only the collection floor.
     pub(in crate::data::executor) fn record_batch_write_versions(
         &mut self,
         task: &ExecutionTask,
@@ -145,18 +137,10 @@ impl CoreLoop {
     }
 
     /// Records the version of a vector-engine write within a committed
-    /// transaction batch.
-    ///
-    /// Mirrors the fork resolution the live write handlers apply (see
-    /// `handlers/vector*.rs`): surrogate-carrying ops record `KeyRepr::Surrogate`
-    /// per surrogate (a superset of the collection floor, since vector SEARCH
-    /// reads always record `ReadKey::Predicate`, the collection floor); sparse
-    /// ops (keyed by `doc_id: String`, no cross-engine surrogate) and
-    /// `Delete` (whose `vector_id` is the internal HNSW node id, NOT the
-    /// surrogate — recording it as `KeyRepr::Surrogate` would be a wrong
-    /// identity) record the collection floor only. Read/config/query ops
-    /// write nothing and are named explicitly below so the match stays
-    /// exhaustive.
+    /// transaction batch. Surrogate-carrying ops record `KeyRepr::Surrogate`
+    /// per surrogate; sparse ops (`doc_id`-keyed) and `Delete` (`vector_id`
+    /// is the internal HNSW node id, not the surrogate) record the
+    /// collection floor only.
     fn record_vector_version(
         &mut self,
         db: crate::types::DatabaseId,
@@ -228,9 +212,8 @@ impl CoreLoop {
                     self.note_write_lsn(db, tenant, collection, None, lsn);
                 }
             }
-            // Sparse (doc_id-keyed, no surrogate) and `Delete` (vector_id is
-            // the internal HNSW node id, not the surrogate): collection floor
-            // only.
+            // Sparse (doc_id-keyed) and `Delete` (vector_id isn't the
+            // surrogate): collection floor only.
             VectorOp::SparseInsert { collection, .. }
             | VectorOp::SparseDelete { collection, .. }
             | VectorOp::Delete { collection, .. } => {
@@ -380,9 +363,8 @@ impl CoreLoop {
                     );
                 }
             }
-            // Whole-collection mutations: the key set is either every row
-            // (`Truncate`) or one a predicate resolved at apply time, so the
-            // collection floor is the only version this can record.
+            // Whole-collection mutations: key set is every row or predicate-
+            // resolved at apply time, so only the collection floor applies.
             KvOp::Truncate { collection }
             | KvOp::PredicateUpdate { collection, .. }
             | KvOp::PredicateDelete { collection, .. } => {

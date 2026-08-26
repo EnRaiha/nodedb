@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Live (no-restart) regression coverage for the secondary vector index on a
-//! predicate (bulk) `DELETE`.
-//!
-//! A `DELETE ... WHERE <non-PK predicate>` routes to `execute_bulk_delete`,
-//! which cascades to the inverted (FTS) index, secondary indexes, and graph
-//! edges — but historically NOT the HNSW vector index. The deleted row's vector
-//! node therefore stayed live under its (now-orphaned) surrogate: a KNN search
-//! kept scoring the leaked vector, and because the catalog surrogate→PK mapping
-//! survives, the phantom hit still surfaced the deleted row's id — all in the
-//! same process with no restart.
-//!
-//! The assertion below fails on the pre-fix code: near the deleted row's point
-//! the leaked vector wins and the search returns the deleted `target` instead of
-//! the surviving `anchor`.
+//! Live regression coverage for the secondary vector index on a predicate
+//! (bulk) `DELETE`. `execute_bulk_delete` cascades to FTS, secondary
+//! indexes, and graph edges, but must also drop the HNSW vector node, or a
+//! KNN search keeps scoring the leaked vector and surfaces the deleted row.
 
 use crate::harness::TestServer;
 
@@ -31,9 +21,8 @@ async fn bulk_delete_removes_vector_same_process() {
         ))
         .await
         .unwrap();
-    // `target` sits EXACTLY at E1 and carries tag='del' (the predicate DELETE, a
-    // non-PK filter → bulk path, selects it). `anchor` sits at E2, orthogonal to
-    // E1, and is never deleted.
+    // `target` sits at E1 and carries tag='del'; `anchor` sits at E2 and is
+    // never deleted.
     for (id, tag, v) in [
         ("target", "del", [1.0f32, 0.0, 0.0, 0.0]),
         ("anchor", "keep", [0.0, 0.0, 0.0, 1.0]),
@@ -68,10 +57,7 @@ async fn bulk_delete_removes_vector_same_process() {
         .await
         .unwrap();
 
-    // Same process, no restart: a search near E1 must now return `anchor` — the
-    // only surviving row. Pre-fix the deleted target's [1,0,0,0] vector is still
-    // indexed (distance 0 to E1) and its surrogate still resolves to 'target' at
-    // the response boundary, so the leaked phantom wins — this fails.
+    // A search near E1 must now return `anchor`, the only surviving row.
     let near_e1 = server
         .query_text(
             "SELECT id FROM vec_bulk_del \

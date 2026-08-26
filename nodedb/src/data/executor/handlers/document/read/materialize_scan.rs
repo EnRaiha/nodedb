@@ -1,25 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cursor-paginated document scan for the clone materializer.
-//!
-//! Returns `(doc_id_hex, surrogate_u32, value_bytes)` triples plus the
-//! next-cursor in a single response so the Control Plane materializer can
-//! drive the scan to completion in O(N / count) round-trips.
-//!
-//! `value_bytes` is standard MessagePack for every source encoding: a strict
-//! Binary Tuple and a vector-primary sidecar are transcoded here, so a consumer
-//! can write the body into any target without re-deciding the source format.
-//!
-//! The `doc_id` returned here is the **hex-encoded surrogate** (the redb storage
-//! key, e.g. `"0000002a"`).  The Control Plane materializer recovers the
-//! user-visible PK via `catalog.get_pk_for_surrogate`.
-//!
-//! ## Response payload (msgpack)
-//! ```text
-//! [ next_cursor: bin,
-//!   entries: [ [doc_id: str, surrogate: u32, value_bytes: bin], ... ] ]
-//! ```
-//! `next_cursor` is empty when the scan is complete.
+//! Cursor-paginated document scan for the clone materializer. Returns
+//! `(doc_id_hex, surrogate_u32, value_bytes)` triples plus a next-cursor.
+//! `doc_id` is the hex-encoded surrogate; `value_bytes` is always standard
+//! MessagePack — Binary Tuple and vector-primary sidecar sources are
+//! transcoded here so consumers never re-decide the source format.
+//! Payload: `[next_cursor: bin, entries: [[doc_id, surrogate, value], ...]]`.
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
@@ -100,13 +86,10 @@ impl CoreLoop {
             }
         };
 
-        // When resolving inside a transaction (the COMMIT-time MERGE /
-        // `UPDATE ... FROM` source-ship), the caller needs the transaction's
-        // CURRENT source view = base ∪ overlay. The overlay merge supersedes /
-        // tombstones rows that can span pages, so it must apply to the WHOLE
-        // base set at once: collect every base row (ignoring the page cap) and
-        // return it in a single, un-paginated response. Autocommit callers
-        // (`txn_id == None`) keep the cursor-paginated base-only behavior.
+        // In-transaction callers need base ∪ overlay; since the overlay can
+        // tombstone/supersede rows spanning pages, collect the whole base set
+        // (ignoring the page cap) and return it un-paginated. Autocommit
+        // callers (`txn_id == None`) keep cursor-paginated base-only behavior.
         let txn_id = task.request.txn_id;
 
         let mut entries: Vec<(String, u32, Vec<u8>)> = Vec::with_capacity(count.min(256));
@@ -146,12 +129,9 @@ impl CoreLoop {
             entries.push((doc_id, surrogate, value));
         }
 
-        // Fold the transaction's staging overlay into the full base set: a
-        // staged tombstone hides its base row, a staged put replaces the base
-        // body, and a staged put absent from base is appended. Staged bodies are
-        // the same stored form as base bodies, so the normalization below covers
-        // both. The source ships ALL rows unfiltered, so the merge predicate is
-        // collect-all.
+        // Fold the staging overlay into the base set: a staged tombstone
+        // hides its row, a staged put replaces or appends. The source ships
+        // all rows unfiltered, so the merge predicate is collect-all.
         let next_cursor: Vec<u8> = if let Some(txn_id) = txn_id {
             let coll_key: (DatabaseId, TenantId, String) = (
                 task.request.database_id,
@@ -178,12 +158,8 @@ impl CoreLoop {
             last_doc_id.into_bytes()
         };
 
-        // Normalize every body — base and staged alike — to standard msgpack.
-        // The stored form is a Binary Tuple for a strict source and a tagged
-        // sidecar for a vector-primary one; a consumer that re-inserts either
-        // into a strict target would hand `bytes_to_binary_tuple` a body it
-        // cannot decode. Normalizing here is the one place that owns the source
-        // collection's format, so no consumer repeats the decision.
+        // Normalize every body to standard msgpack here — the one place that
+        // owns the source format — so no consumer repeats the decision.
         let body_format =
             self.sparse_body_format(task.request.database_id, TenantId::new(tid), collection);
         let format_ref = body_format.as_format_ref();

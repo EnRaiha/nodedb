@@ -1,41 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Protocol-neutral predicates for the in-transaction write-staging gate.
-//!
-//! Moved verbatim (decision logic only) from the pgwire handler's
-//! `plan.rs` / `plan_kv.rs` so the same staging decisions can be reused by
-//! any protocol's dispatch loop (pgwire SQL today; native and DSL/UPSERT in
-//! later units). No pgwire types are imported here.
+//! Shared by every protocol's dispatch loop; no pgwire types imported here.
 
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{
     ColumnarOp, DocumentOp, GraphOp, KvOp, SpatialOp, TimeseriesOp,
 };
 
-/// Allow-list of the plans the in-transaction path stages at statement time:
-/// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML),
-/// and `Upsert` (`UPSERT INTO`). Explicit match on the exact staged variants —
-/// KV point writes stay on the buffer path. Named for the point-write case
-/// historically; also covers bulk predicate DML and `Upsert` now that
-/// `stage_bulk_update` / `stage_bulk_delete` / `stage_document_upsert` stage the
-/// matched rows the same way.
-///
-/// `InsertSelect` (`INSERT ... SELECT`) is deliberately NOT here: an
-/// in-transaction `INSERT ... SELECT` is resolved + staged at STATEMENT time by
-/// [`resolve_and_emit_insert_select_ops`](crate::control::insert_select::
-/// resolve_and_emit_insert_select_ops) (driven from
-/// `session::expander_stage`), which emits concrete fresh-surrogate
-/// `PointInsert` ops that flow through this gate on their own — the raw
-/// `InsertSelect` never reaches the staging path.
-///
-/// A `RETURNING` clause does NOT change stageability. The `stage_*` handlers
-/// stage the matched rows' resolved post-images identically whether or not a
-/// `RETURNING` projection is attached; the clause only governs the client
-/// response shape (rows vs. a command tag). Inside a transaction the staged
-/// path renders an affected-count tag and the `RETURNING` rows are not
-/// projected back to the client — the same rows the pre-existing buffer path
-/// discarded — so staging a `RETURNING` DML op is strictly an upgrade of the
-/// response tag (`OK` -> `UPDATE n`), never a regression.
+/// Allow-list of plans the in-transaction path stages at statement time: Document
+/// point writes, predicate `BulkUpdate`/`BulkDelete`, and `Upsert`. `InsertSelect`
+/// is not here — it resolves into `PointInsert` ops that flow through on their own.
 pub fn is_point_write(plan: &PhysicalPlan) -> bool {
     matches!(
         plan,
@@ -51,25 +26,9 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
     )
 }
 
-/// Allow-list of plans the in-transaction path stages at statement time via
-/// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
-/// point writes, predicate `BulkUpdate` / `BulkDelete`, `Upsert`),
-/// plus the eleven stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
-/// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`,
-/// `KvOp::BatchPut`, `KvOp::Incr`, `KvOp::IncrFloat`, `KvOp::Cas`,
-/// `KvOp::GetSet`, `KvOp::Expire`, `KvOp::Persist`. KV is the first
-/// non-Document engine to stage at statement time; this predicate is the
-/// shared gate later engine units extend the same way. `Incr` / `IncrFloat`
-/// / `Cas` / `GetSet` / `BatchPut` stage only the computed VALUE bytes into
-/// the overlay -- a TTL carried on `Incr` / `BatchPut` is ALSO staged into
-/// the overlay's KV TTL delta map (`StagedTtl`, sibling to `Staged`, never
-/// consulted by non-KV engines) so a same-transaction `GetTtl` observes it.
-/// `Expire` / `Persist` stage directly into that same TTL delta map.
-/// `FieldSet` / `Transfer` / `TransferItem` are also stageable -- like the
-/// atomics they stage only the computed value bytes (`stage_kv_transfer.rs`).
-/// Every other `KvOp` (the sorted-index family, etc.) stays on the
-/// pre-existing buffer + "OK" deferral, same as any other non-stageable
-/// write.
+/// Allow-list of plans staged via `MetaOp::StageWrite`: [`is_point_write`] plus
+/// stageable KV/Columnar/Timeseries/Spatial/Graph writes. `Incr`/`Cas`/`GetSet`/
+/// `BatchPut` also stage TTL into the overlay so a same-txn `GetTtl` sees it.
 pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
     is_point_write(plan)
         || matches!(
@@ -120,21 +79,9 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
         )
 }
 
-/// Extract affected row count from a JSON or MessagePack payload.
-///
-/// Looks for `"affected"`, `"truncated"`, `"inserted"`, `"accepted"`, or
-/// `"deleted"` fields. The alias list exists because several count-bearing
-/// payloads are also read directly by non-SQL entry points under their own name
-/// (RESP `DEL` reads `"deleted"`, ingest paths read `"accepted"`); the count is
-/// the same number under a different key, so every name a write actually emits
-/// MUST appear here. A key that emits a count this function cannot see is
-/// indistinguishable from a write that reported no count at all.
-///
-/// `None` means "this payload carries no count" — it is NEVER a licence to
-/// substitute one. Callers rendering a DML command tag go through
-/// [`require_affected_count`] instead, which turns the absence into a typed
-/// error, because for a count-bearing plan the absence can only mean a handler
-/// stopped reporting.
+/// Extract affected row count from a JSON or MessagePack payload. Looks for
+/// `"affected"`, `"truncated"`, `"inserted"`, `"accepted"`, or `"deleted"` — every
+/// name a write emits must appear here. `None` is never a licence to default.
 pub fn extract_affected_count(payload: &[u8]) -> Option<u64> {
     if payload.is_empty() {
         return None;
@@ -150,14 +97,9 @@ pub fn extract_affected_count(payload: &[u8]) -> Option<u64> {
         .and_then(|n| n.as_u64())
 }
 
-/// The affected-row count a DML response MUST carry, or a typed error.
-///
-/// Use this wherever an affected count is about to be shown to a client. The
-/// count is a property of the mutation that ran, so a plan classified as
-/// count-bearing whose response has no count is a broken invariant in the
-/// handler that produced it — surfacing that loudly is the only way it stays
-/// fixed. Defaulting to `1` (or to a dispatcher's per-statement estimate) is
-/// what let a delete against an absent row report a removed row.
+/// The affected-row count a DML response must carry, or a typed error. A
+/// count-bearing plan whose response has no count is a broken handler
+/// invariant — surfacing it loudly beats defaulting to `1`.
 pub fn require_affected_count(payload: &[u8]) -> crate::Result<u64> {
     extract_affected_count(payload).ok_or_else(|| crate::Error::Internal {
         detail: "write response carried no affected-row count; the handler for this plan must \
@@ -167,9 +109,7 @@ pub fn require_affected_count(payload: &[u8]) -> crate::Result<u64> {
 }
 
 /// Extract the `"op"` field a staged `KvOp::InsertOnConflictUpdate` response
-/// payload carries (`"insert"` or `"update"`). `None` for any other payload
-/// shape (including every other staged KV write, which carries no `"op"`
-/// field at all).
+/// carries (`"insert"` or `"update"`). `None` for any other payload shape.
 pub fn extract_kv_conflict_op(payload: &[u8]) -> Option<String> {
     if payload.is_empty() {
         return None;
@@ -181,18 +121,8 @@ pub fn extract_kv_conflict_op(payload: &[u8]) -> Option<String> {
 }
 
 /// Neutral classification of the command a staged write resolved to, used to
-/// render a protocol-specific "command complete" tag (pgwire `Tag::new(..)`,
-/// or a native-protocol equivalent).
-///
-/// `KvUpsert` carries whether `KvOp::InsertOnConflictUpdate` resolved to an
-/// update (`true`) or an insert (`false`) -- the one staged write whose
-/// outcome cannot be decided from the plan shape alone; the stage handler
-/// signals it back via the `"op"` field in the response payload.
-///
-/// `DocUpsert` is `DocumentOp::Upsert`'s counterpart: like the autocommit
-/// handler (`handlers/upsert.rs`), the pgwire tag for `UPSERT INTO` is
-/// always the literal `UPSERT` command regardless of insert-vs-update
-/// outcome, so unlike `KvUpsert` it carries no outcome flag.
+/// render a protocol-specific "command complete" tag. `KvUpsert` carries whether
+/// it resolved to an update or insert — the one outcome the plan shape can't decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedTagKind {
     Insert,
@@ -202,28 +132,19 @@ pub enum StagedTagKind {
         updated: bool,
     },
     DocUpsert,
-    /// A statement-time in-transaction `MERGE`, staged as concrete
-    /// `PointInsert` / `PointPut` / `PointDelete` ops by the MERGE expander
-    /// (`session::expander_stage`). `affected` is the total across all arms;
-    /// pgwire renders the Postgres `MERGE <n>` command tag.
+    /// In-transaction `MERGE`, staged as concrete point ops; `affected` is the
+    /// total across arms. pgwire renders `MERGE <n>`.
     Merge,
-    /// A statement-time in-transaction `UPDATE ... FROM <source>`, staged as
-    /// concrete `PointPut` ops by the UPDATE-FROM expander
-    /// (`session::expander_stage`). `affected` is the total matched target rows;
-    /// pgwire renders the `UPDATE <n>` command tag.
+    /// In-transaction `UPDATE ... FROM <source>`, staged as `PointPut` ops;
+    /// pgwire renders `UPDATE <n>`.
     UpdateFromJoin,
-    /// The staged handler computed a value rather than an affected-row count
-    /// (`KvOp::Incr` / `IncrFloat` / `Cas` / `GetSet`). The caller forwards
-    /// [`StagedWriteOutcome::payload`](super::super::session::staging_gate::
-    /// StagedWriteOutcome::payload) to the client verbatim instead of
-    /// rendering a tag from `affected`.
+    /// The staged handler computed a value, not a row count (`Incr`/`IncrFloat`/
+    /// `Cas`/`GetSet`) — caller forwards the payload verbatim.
     RawPayload,
 }
 
-/// Decide the [`StagedTagKind`] for a staged write, given the plan and the
-/// stage handler's raw response payload.
-///
-/// Caller invariant: `plan` must have passed [`is_stageable_write`].
+/// Decide the [`StagedTagKind`] for a staged write, given the plan and the stage
+/// handler's raw response payload. Caller invariant: `plan` passed [`is_stageable_write`].
 pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
@@ -238,30 +159,23 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,
-        // Predicate `UPDATE ... WHERE` / `DELETE ... WHERE` on a columnar
-        // collection: same Update/Delete command tags the Document bulk
-        // predicate-DML arms above resolve to.
+        // Same Update/Delete tags as the Document bulk predicate-DML arms above.
         PhysicalPlan::Columnar(ColumnarOp::Update { .. }) => StagedTagKind::Update,
         PhysicalPlan::Columnar(ColumnarOp::Delete { .. }) => StagedTagKind::Delete,
-        // Same command tags as the predicate arms above -- these are the
-        // resolved-row-set form of the same UPDATE/DELETE statement, taken
-        // by a collection with a write policy attached.
+        // Resolved-row-set form of the same statement, same tags.
         PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { .. }) => StagedTagKind::Update,
         PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete { .. }) => StagedTagKind::Delete,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Delete { .. }) => StagedTagKind::Delete,
-        // GraphOp::EdgePut / EdgePutBatch add a new edge tuple -- Insert,
-        // matching the autocommit `execute_edge_put` path (which has no
-        // distinct update outcome; an edge either exists or it doesn't).
+        // Matches the autocommit `execute_edge_put` path: an edge either exists or it doesn't.
         PhysicalPlan::Graph(GraphOp::EdgePut { .. } | GraphOp::EdgePutBatch { .. }) => {
             StagedTagKind::Insert
         }
         PhysicalPlan::Graph(GraphOp::EdgeDelete { .. } | GraphOp::EdgeDeleteBatch { .. }) => {
             StagedTagKind::Delete
         }
-        // SetNodeLabels / RemoveNodeLabels mutate an existing node's label
-        // bitset in place -- Update, not Insert/Delete of a row.
+        // Mutates an existing node's label bitset in place, not a row Insert/Delete.
         PhysicalPlan::Graph(GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. }) => {
             StagedTagKind::Update
         }
@@ -272,14 +186,8 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
     }
 }
 
-/// Decide the [`StagedTagKind`] for a staged `KvOp` write.
-///
-/// Caller invariant: `op` must be one of the fourteen stageable KV writes --
-/// `Put`, `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete`,
-/// `BatchPut`, `Incr`, `IncrFloat`, `Cas`, `GetSet`, `FieldSet`, `Transfer`,
-/// `TransferItem`, `Expire`, `Persist` -- i.e. the enclosing plan already
-/// passed [`is_stageable_write`]. Every other `KvOp` variant is unreachable
-/// here because the staging dispatch never routes them through this path.
+/// Decide the [`StagedTagKind`] for a staged `KvOp` write. Caller invariant: `op`
+/// must be a stageable KV write — the enclosing plan already passed [`is_stageable_write`].
 fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
     match op {
         KvOp::Put { .. } | KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } => {
@@ -289,17 +197,8 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
             updated: extract_kv_conflict_op(payload).as_deref() == Some("update"),
         },
         KvOp::Delete { .. } => StagedTagKind::Delete,
-        // `BatchPut` reports an affected/inserted count, same shape as the
-        // other insert-style ops.
         KvOp::BatchPut { .. } => StagedTagKind::Insert,
-        // `Incr` / `IncrFloat` / `Cas` / `GetSet` return a computed value
-        // (`{"value": ..}` / `{"success": .., "current_value": ..}` /
-        // `{"old_value": ..}`), not a row count -- forward the payload
-        // verbatim. `FieldSet` (`{"fields_added": ..}`), `Transfer`
-        // (`{"source_key": .., "dest_key": .., "source_balance": ..,
-        // "dest_balance": ..}`), and `TransferItem` (`{"item_key": ..,
-        // "dest_key": .., ..}`) are the same shape of "computed result, not
-        // a row count" and forward the same way.
+        // These return a computed value, not a row count — forward the payload verbatim.
         KvOp::Incr { .. }
         | KvOp::IncrFloat { .. }
         | KvOp::Cas { .. }
@@ -307,8 +206,7 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::FieldSet { .. }
         | KvOp::Transfer { .. }
         | KvOp::TransferItem { .. } => StagedTagKind::RawPayload,
-        // `Expire` / `Persist` mutate an existing row's TTL metadata in
-        // place -- Update, not Insert/Delete of the row itself.
+        // Mutates TTL metadata in place, not Insert/Delete of the row itself.
         KvOp::Expire { .. } | KvOp::Persist { .. } => StagedTagKind::Update,
         KvOp::Get { .. }
         | KvOp::Scan { .. }
@@ -326,12 +224,10 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
         | KvOp::MaterializeScan { .. }
-        // Autocommit-only: transaction resolve rejects both, so neither is
-        // ever staged into the overlay.
+        // Autocommit-only: transaction resolve rejects both.
         | KvOp::ResolveWrite(_)
         | KvOp::ResolvedWrite { .. }
-        // Autocommit-only for the same reason: a predicate resolves its row
-        // set at apply time, so there is no post-image to stage.
+        // Autocommit-only: a predicate resolves its row set at apply time.
         | KvOp::PredicateUpdate { .. }
         | KvOp::PredicateDelete { .. } => unreachable!(
             "staged_kv_tag_kind called on a non-stageable KvOp; \
@@ -377,9 +273,7 @@ mod tests {
             })
         };
 
-        // A RETURNING clause no longer forces the buffer + "OK" path: these
-        // stage like any other point/bulk write and render an affected-count
-        // command tag (UPDATE n / DELETE n), never `unreachable!`.
+        // RETURNING doesn't force the buffer path: these stage and render an affected-count tag.
         let point_update = PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection: "c".into(),
             document_id: "d".into(),

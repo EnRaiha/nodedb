@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Regression coverage for a boot-time bug where document_strict collections
-//! read back blank (or as a raw `(id, data)` tuple) after a server restart.
-//!
-//! Root cause: the per-core in-memory schema registry used to decode Binary
-//! Tuple rows is populated only as a side effect of live DDL execution. On
-//! restart, WAL replay reconstructs row bytes but nothing re-populates that
-//! registry, so `SELECT *` on a strict collection degrades to an
-//! undecodable raw tuple instead of the typed columns that were inserted.
-//! The fix re-registers every active stored collection to all Data Plane
-//! cores during boot, before client connections are accepted. This test
-//! asserts that the original typed column values — not just the row count —
-//! survive a graceful shutdown + reopen of the same data directory.
+//! read back blank after a server restart: the per-core schema registry used
+//! to decode Binary Tuple rows was populated only by live DDL, so WAL replay
+//! left `SELECT *` decoding a raw tuple. Asserts the original typed column
+//! values survive a graceful shutdown + reopen.
 
 use crate::harness::TestServer;
 

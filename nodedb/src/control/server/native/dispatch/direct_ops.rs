@@ -35,8 +35,8 @@ pub(crate) async fn handle_direct_op(
     let vshard_id = ctx.vshard_for_key(vshard_key);
     let tenant_id = ctx.tenant_id();
 
-    // CRDT Apply allocates a surrogate while planning, so authorize the exact
-    // collection before any planner-side state or admission preview is touched.
+    // CRDT Apply allocates a surrogate while planning; authorize the exact
+    // collection first.
     if matches!(op, OpCode::CrdtApply) {
         let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
             &ctx.state.audit,
@@ -79,8 +79,7 @@ pub(crate) async fn handle_direct_op(
         return error_to_native_with_sqlstate(seq, "42501", &e);
     }
 
-    // Refuse what column redaction cannot cover (an aggregate over a redacted
-    // column, a graph traversal), before any orchestration observes the plan.
+    // Refuse what column redaction cannot cover (redacted-column aggregate, graph traversal).
     if let Err(e) = crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         tenant_id,
@@ -90,50 +89,28 @@ pub(crate) async fn handle_direct_op(
         return error_to_native_with_sqlstate(seq, "0A000", &e);
     }
 
-    // Extracted before `plan` is moved/cloned into any of the branches below
-    // — metering needs the collection/engine shape after dispatch succeeds,
-    // and only when metering is enabled (the default is disabled, so this is
-    // a no-op on the hot path for every caller that hasn't turned it on).
+    // Extracted before `plan` moves; a no-op when metering is disabled (the default).
     let plan_metering_info = ctx
         .state
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
 
-    // A spent hard quota refuses the op before it runs; the charges below are
-    // all on the success path and so can never refuse anything themselves.
-    // The branches that route through `dispatch_single_task` are gated there
-    // too, on the plan actually dispatched — harmless, since a scope already
-    // over its cap refuses either way.
+    // A spent hard quota refuses the op before it runs; charges below are success-path
+    // only. Branches through `dispatch_single_task` are also gated there — harmless.
     if let Some(info) = &plan_metering_info
         && let Err(e) = admit_quota_for_dispatch(ctx.state, &ctx.scope, info)
     {
         return error_to_native_with_sqlstate(seq, "53400", &e);
     }
 
-    // Whether the blanket metering call below (after the block) still needs
-    // to run. It does for every branch that dispatches directly (Control-
-    // Plane-orchestrated INSERT SELECT / MERGE / UPDATE FROM, and the
-    // implicit-edge MultiShard Calvin batch) — those never touch the
-    // in-transaction staging gate. It does NOT for a branch that routes
-    // through `dispatch_single_task`: that function now meters itself,
-    // correctly distinguishing a `Read`/`Staged` dispatch (real work,
-    // metered now) from a `Buffered` one (no dispatch yet, metered at COMMIT
-    // replay instead — see `session::commit::run_commit`); re-metering its
-    // response here with the ORIGINAL top-level plan would double-bill the
-    // former and wrongly bill the latter before its COMMIT/ROLLBACK is even
-    // known.
+    // False for `dispatch_single_task`, which meters itself — re-metering here
+    // would double-bill a `Staged` dispatch and wrongly bill a `Buffered` one.
     let mut needs_top_level_metering = true;
-    // The rest of the dispatch logic has several early-return branches
-    // (Control-Plane-orchestrated INSERT SELECT / MERGE / UPDATE FROM, the
-    // no-edge fast path, and the multi/single-shard implicit-edge paths).
-    // Wrapped in an async block (not the outer fn) so `return` inside each
-    // branch exits only this block, letting the metering call below run
-    // exactly once, after whichever branch actually dispatched, regardless
-    // of which one it was.
+    // Wrapped in an async block so `return` inside each branch exits only this
+    // block, letting the metering call below run exactly once regardless of branch.
     let response: NativeResponse = async {
-        // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh, registered
-        // surrogate per target row + atomic `BatchInsert`); it never reaches the
+        // `INSERT ... SELECT` orchestrates on the Control Plane; never reaches the
         // Data Plane as a single op.
         if matches!(
             &plan,
@@ -161,8 +138,7 @@ pub(crate) async fn handle_direct_op(
             };
         }
 
-        // Autocommit `MERGE` is orchestrated on the Control Plane (fresh, registered
-        // surrogate per NOT-MATCHED insert row + atomic apply); it never reaches the
+        // Autocommit `MERGE` orchestrates on the Control Plane; never reaches the
         // Data Plane as a single op.
         if matches!(
             &plan,
@@ -193,9 +169,8 @@ pub(crate) async fn handle_direct_op(
             };
         }
 
-        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
-        // (source scanned on its own core + shipped into the plan); it never reaches
-        // the Data Plane as a single op reading a possibly-non-resident source.
+        // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
+        // ships it into the plan; never reaches the Data Plane as a single op.
         if matches!(
             &plan,
             PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
@@ -227,11 +202,8 @@ pub(crate) async fn handle_direct_op(
             };
         }
 
-        // A governed columnar predicate `UPDATE`/`DELETE` (RLS write policy +
-        // live Raft proposer) is resolved to a concrete row set on the
-        // Control Plane before it is proposed — see `control::write_resolve`.
-        // On the local (non-Raft) path the predicate reaches the Data Plane
-        // gate intact and is enforced correctly there.
+        // A governed predicate resolves to a concrete row set before proposing — see
+        // `control::write_resolve`. Local (non-Raft) path skips this.
         if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&plan)
             && ctx.state.async_raft_proposer().is_some()
         {
@@ -258,21 +230,12 @@ pub(crate) async fn handle_direct_op(
             };
         }
 
-        // Stamp the connection's active transaction id (as the SQL path's
-        // `route_in_tx_write` does for in-transaction reads — see
-        // `staging_gate.rs::route_in_tx_write`) so the Data Plane can resolve this
-        // transaction's staging overlay for read-your-own-writes on direct-op
-        // reads (PointGet / RangeScan / VectorSearch) and give direct-op writes
-        // (KvBatchPut) a real transaction identity. `tx_id` is `None` outside a
-        // transaction block, so autocommit behavior is unchanged.
+        // Stamp the connection's active txn id so the Data Plane resolves the staging
+        // overlay for read-your-own-writes; `None` outside a transaction block.
         let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
 
-        // Implicit graph-edge extraction (pgwire / native-SQL parity): a schemaless
-        // document carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task.
-        // The common no-edge case leaves `tasks` at length 1 and runs the existing
-        // single-dispatch path byte-identically below; an edge-bearing insert
-        // augments the vec and routes through classify/Calvin like every other
-        // write surface.
+        // Implicit graph-edge extraction: a `_from`/`_to` document mirrors as a
+        // `GraphOp::EdgePut` task. No-edge case leaves `tasks` at length 1.
         let mut tasks = vec![PhysicalTask {
             tenant_id,
             vshard_id,
@@ -281,8 +244,8 @@ pub(crate) async fn handle_direct_op(
             post_set_op: PostSetOp::None,
             txn_id,
         }];
-        // Implicit-edge extraction marks catalog state and allocates surrogates.
-        // Authorize the original direct-op task before those side effects.
+        // Implicit-edge extraction allocates surrogates — authorize the direct-op
+        // task before those side effects.
         let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
             &ctx.state.audit,
         ));
@@ -308,10 +271,8 @@ pub(crate) async fn handle_direct_op(
             return error_to_native(seq, &e);
         }
 
-        // The entries cover the row images every cross-shard balance this pass
-        // settled was folded from; they travel on the dispatch read-set so
-        // Calvin's OCC check aborts rather than committing a total folded from
-        // an image that has since moved.
+        // Covers the row images each settled cross-shard balance was folded from,
+        // so Calvin's OCC check aborts on a total folded from a moved image.
         let sum_target_reads =
             match crate::control::planner::materialized_sum::resolve_materialized_sum_targets(
                 ctx.state,
@@ -326,8 +287,7 @@ pub(crate) async fn handle_direct_op(
                 Err(e) => return error_to_native(seq, &e),
             };
 
-        // Follows the resolution: it consumes the surrogates that pass bound,
-        // and issues no lookup of its own.
+        // Follows resolution: consumes the surrogates that passed bound, no lookup of its own.
         if let Err(e) = crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
             ctx.state,
             &mut tasks,
@@ -337,8 +297,7 @@ pub(crate) async fn handle_direct_op(
             return error_to_native(seq, &e);
         }
 
-        // The expanded set is the dispatch authorization boundary. The no-edge
-        // path retains its existing per-task capability consumption below.
+        // The expanded set is the dispatch authorization boundary.
         let authorized_tasks =
             match crate::control::server::shared::authorization::authorize_task_set(
                 ctx.identity,
@@ -352,9 +311,8 @@ pub(crate) async fn handle_direct_op(
             };
 
         if tasks.len() == 1 {
-            // No-edge fast path — behaviorally identical to the pre-migration
-            // single-plan dispatch. The local-path WAL append now lives inside
-            // `dispatch_single_task` so it is shared with the single-shard edge loop.
+            // No-edge fast path. Local-path WAL append lives inside `dispatch_single_task`,
+            // shared with the single-shard edge loop.
             let task = match authorized_tasks.into_tasks().into_iter().next() {
                 Some(task) => task,
                 None => {
@@ -370,16 +328,11 @@ pub(crate) async fn handle_direct_op(
             return dispatch_single_task(ctx, seq, task).await;
         }
 
-        // Edge-bearing insert: route the augmented task set the same way native SQL
-        // does. A cross-shard set goes through the Calvin sequencer atomically (which
-        // owns its own replicated durability); a single-shard set dispatches each
-        // task sequentially (matching pgwire / native-SQL single-shard multi-task),
-        // returning the document task's response. Local WAL durability for the
-        // single-shard path is handled inside `dispatch_single_task`.
+        // Cross-shard goes through Calvin atomically; single-shard dispatches each task
+        // sequentially, returning the document task's response.
         let _request = ctx.state.tenant_request_guard(tenant_id);
-        // Autocommit direct-ops dispatch: the only reads to widen with are the
-        // ones the materialized-sum settlement stamped on the source rows its
-        // shipped balances were folded from.
+        // Only reads to widen with are those materialized-sum settlement stamped
+        // on the source rows its shipped balances folded from.
         match classify_dispatch(
             &tasks,
             &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
@@ -396,9 +349,8 @@ pub(crate) async fn handle_direct_op(
                 )
                 .await
                 {
-                    // Edge-bearing INSERT: no RETURNING clause is possible here, so
-                    // the applied Response (if any) carries no rows — report one
-                    // row-affected per task.
+                    // No RETURNING possible here, so the Response carries no rows —
+                    // report one row-affected per task.
                     Ok(_apply) => {
                         let mut r = NativeResponse::ok(seq);
                         r.rows_affected = Some(tasks.len() as u64);
@@ -408,8 +360,7 @@ pub(crate) async fn handle_direct_op(
                 }
             }
             DispatchClass::SingleShard { .. } => {
-                // The document task is first; its response is the one returned to
-                // the caller. Edge tasks dispatch after it in order.
+                // Document task is first; its response is returned to the caller.
                 needs_top_level_metering = false;
                 let mut doc_response: Option<NativeResponse> = None;
                 let mut error: Option<NativeResponse> = None;
@@ -431,12 +382,8 @@ pub(crate) async fn handle_direct_op(
     }
     .await;
 
-    // Metered only on the success path, once per call, and only for a branch
-    // that dispatched directly rather than through `dispatch_single_task`
-    // (`needs_top_level_metering` — see its declaration above for why: that
-    // function now meters its own Read/Staged/Buffered routing correctly).
-    // `response.rows`/`rows_affected` are already computed by the branch
-    // above, so this adds no extra decode.
+    // Metered only on success, once, for a branch that dispatched directly —
+    // see `needs_top_level_metering`'s declaration above.
     if needs_top_level_metering
         && response.status != nodedb_types::protocol::ResponseStatus::Error
         && let Some(info) = &plan_metering_info

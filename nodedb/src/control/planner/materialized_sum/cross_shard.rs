@@ -3,40 +3,18 @@
 //! Append a task of its own for every materialized-sum target that does NOT
 //! share its source collection's vShard.
 //!
-//! A collection homes to one vShard, so a binding's source and target are
-//! generally served by different cores — co-residency is the exception. The
-//! co-resident case works because one core owns both rows: the derived write
-//! rides the source write's transaction and is atomic for free. Cross-shard it
-//! cannot, so the balance is shipped as a separate
-//! [`DocumentOp::ApplyBalanceDelta`] task homed on the target's vShard.
+//! Co-resident targets ride the source write's transaction for free;
+//! cross-shard ones ship as a separate [`DocumentOp::ApplyBalanceDelta`]
+//! task homed on the target's vShard — mirroring the implicit graph edge
+//! mechanism, so the pair goes multi-shard via the two tasks' own
+//! `vshard_id`s and Calvin commits them together or not at all.
 //!
-//! # This mirrors the implicit graph edge, deliberately
-//!
-//! [`append_implicit_edge_tasks`](crate::control::planner::implicit_edges::append_implicit_edge_tasks)
-//! already solves exactly this shape: a cross-collection write derived from a
-//! document write, resolved on the Control Plane at plan time, appended as its
-//! own task with its own home, and left to the downstream classifier to
-//! single-home or Calvin dual-home. Nothing here invents a second mechanism —
-//! the pair becomes multi-shard by the two tasks' own `vshard_id`s, exactly as
-//! an edge whose endpoints hash apart does, and
-//! [`classify_dispatch`](crate::control::planner::calvin::dispatch::classify_dispatch)
-//! routes it through the Calvin sequencer so the source row and the balance
-//! commit together or not at all.
-//!
-//! # Only the shapes whose delta the plan already settles
-//!
-//! The appended task carries a NUMBER, so this pass can only run where the plan
-//! determines that number by itself. `PointInsert` and `BatchInsert` do: their
-//! rows are new by construction — a duplicate primary key fails the statement —
-//! so the whole of each row's value is credited and there is no pre-image to
-//! subtract. Every other write shape's delta is a difference between two images,
-//! at least one of which the plan does not carry, and a difference guessed at
-//! plan time is a wrong balance. Those keep folding on the Data Plane from the
-//! real images, and their cross-shard targets are NOT deferred here.
-//!
-//! `if_absent` inserts are excluded for the same reason: a row the handler
-//! silently skips owes its target nothing, and the plan cannot know which rows
-//! will be skipped.
+//! Only runs where the plan determines the delta NUMBER by itself:
+//! `PointInsert`/`BatchInsert` (new rows, whole value credited, no
+//! pre-image to subtract). Every other shape's delta needs an image the
+//! plan doesn't carry, so it keeps folding on the Data Plane instead.
+//! `if_absent` inserts are excluded: a silently-skipped row owes nothing,
+//! and the plan can't know which rows will be skipped.
 
 use rust_decimal::Decimal;
 

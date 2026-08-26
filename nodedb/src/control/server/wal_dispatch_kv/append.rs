@@ -16,19 +16,9 @@ use super::encode::{
     encode_kv_truncate,
 };
 
-/// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN (if a durable
-/// record was appended) and, for a TTL-bearing write, the single wall-clock
-/// instant this call resolved.
-///
-/// `resolved_now_ms` is the one value the durable WAL record and the live
-/// Data-Plane apply must both use — resolving `now_ms` independently at WAL
-/// append time and again at apply time lets the two disagree by the dispatch
-/// latency (harmless day-to-day, but a crash between the two turns into
-/// "replay recomputes `now_ms` at restart time", pushing a TTL's expiry
-/// forward by the crash-to-restart delay). A plain struct rather than a
-/// `(Option<Lsn>, Option<u64>)` tuple: the two `Option<u64>`/`Option<Lsn>`
-/// fields are trivially swappable by position, and this outcome threads
-/// through several more call sites on its way to the Data Plane.
+/// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN and, for a TTL-bearing
+/// write, the wall-clock instant resolved. `resolved_now_ms` must be the one
+/// value the WAL record and the live apply both use — resolving independently risks a crash shifting a TTL's expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvAppendOutcome {
     /// WAL LSN allocated for this write, or `None` for read-only / non-WAL ops.
@@ -39,14 +29,9 @@ pub struct KvAppendOutcome {
     pub resolved_now_ms: Option<u64>,
 }
 
-/// Resolve `now_ms` and the absolute expiry for a TTL-bearing write, exactly
-/// once. Returns `(resolved_now_ms, expire_at_ms)`, both `None` when
-/// `ttl_ms == 0` so the caller's encode call preserves the historical
-/// no-TTL payload shape byte-for-byte.
-///
-/// `now_override` supplies the instant instead of this node's clock when it was
-/// decided elsewhere and the durable record must carry that exact value — see
-/// [`wal_append_kv_op`].
+/// Resolve `now_ms` and the absolute expiry for a TTL-bearing write, once.
+/// Both `None` when `ttl_ms == 0`. `now_override` supplies the instant when
+/// decided elsewhere — see [`wal_append_kv_op`].
 fn resolve_expiry(ttl_ms: u64, now_override: Option<u64>) -> (Option<u64>, Option<u64>) {
     if ttl_ms == 0 {
         (None, None)
@@ -56,18 +41,9 @@ fn resolve_expiry(ttl_ms: u64, now_override: Option<u64>) -> (Option<u64>, Optio
     }
 }
 
-/// Serialize a KV operation and append to the WAL.
-///
-/// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
-/// read-only / non-WAL KV ops, alongside the resolved TTL instant (if any) —
-/// see [`KvAppendOutcome`].
-///
-/// `now_override` pins a TTL-bearing write's `expire_at_ms` to an instant
-/// decided elsewhere instead of this node's clock. `Some` only when the durable
-/// record must carry that exact value: a Raft-committed entry carries the
-/// instant the proposing node resolved, and every replica's redo record — like
-/// every replica's live apply — must install it verbatim, or a replica's WAL
-/// replay resurrects a different `expire_at_ms` than its peers.
+/// Serialize a KV operation and append to the WAL — see [`KvAppendOutcome`].
+/// `now_override` pins `expire_at_ms` to an instant decided elsewhere (e.g. a
+/// Raft-committed entry), so every replica's redo installs it verbatim.
 pub fn wal_append_kv_op(
     wal: &WalManager,
     tenant_id: TenantId,
@@ -121,13 +97,9 @@ pub fn wal_append_kv_op(
             ttl_ms,
             updates,
             surrogate: _,
-            // The compiled RLS predicate is a property of the requesting
-            // session, not of the row, so it stays out of the durable record —
-            // a replay re-applies an already-admitted write.
+            // Compiled RLS predicate is a session property, not the row's — stays out.
             rls_write_check: _,
-            // The projection is answered from the Data Plane's response, not
-            // from the journal: a replay re-applies the row, it does not answer
-            // a client. Both slots stay out of the durable record.
+            // Projection is answered from the response, not the journal — stays out.
             returning: _,
             rls_filters: _,
         } => {
@@ -168,11 +140,8 @@ pub fn wal_append_kv_op(
             ttl_ms,
             ..
         } => {
-            // Unlike `Put`/`BatchPut`, `Expire` has no "no TTL" sentinel for
-            // `ttl_ms == 0` (see `encode_kv_expire`'s doc comment) — the
-            // absolute instant is always resolved, so this deliberately does
-            // not route through `resolve_expiry`, which returns `None` on
-            // `ttl_ms == 0` for the Put family's different semantics.
+            // `Expire` has no "no TTL" sentinel for `ttl_ms == 0`, so it deliberately
+            // skips `resolve_expiry` (which returns `None` for the Put family).
             let now_ms = now_override.unwrap_or_else(crate::engine::kv::current_ms);
             let expire_at_ms = now_ms + *ttl_ms;
             resolved_now_ms = Some(now_ms);
@@ -289,14 +258,12 @@ pub fn wal_append_kv_op(
             let entry = encode_kv_truncate(collection)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // The predicate is the durable record; replay re-executes it through
-        // the same computation the live handler runs.
+        // The predicate is the durable record; replay re-executes it via the live handler.
         KvOp::PredicateUpdate {
             collection,
             filters,
             updates,
-            // A per-request authorization input, not part of the image being
-            // made durable — the same reason every other KV arm drops it.
+            // Per-request authorization input, not part of the durable image.
             rls_write_check: _,
         } => {
             let entry = encode_kv_predicate_update(collection, filters, updates)?;
@@ -348,22 +315,12 @@ pub fn wal_append_kv_op(
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // Every mutation gets its own durable record, in apply order, through
-        // the same encoders the equivalent live op uses — so redo replay
-        // reconstructs exactly what the apply installed. The returned LSN is
-        // the LAST one appended: it is the point the whole resolved write is
-        // durable at.
-        //
-        // `resolved_now_ms` stays `None`: every instant this write installs
-        // already travels inside the mutation, so there is nothing for the
-        // caller to hand back to the Data Plane.
+        // Each mutation gets its own record; returned LSN is the last appended.
         KvOp::ResolvedWrite {
             mutations,
-            // The reply is decided per request, not per durable record: replay
-            // re-applies state, it does not answer a client.
+            // Reply is decided per request; replay re-applies state, not answers a client.
             response_payload: _,
-            // Already decided when the entry was proposed; a redo re-applies
-            // an admitted write rather than re-deciding it.
+            // Already decided when proposed; a redo re-applies rather than re-decides.
             rls_write_check: _,
         } => {
             let mut last: Option<crate::types::Lsn> = None;
@@ -379,8 +336,7 @@ pub fn wal_append_kv_op(
             last
         }
 
-        // Read-only or non-WAL KV ops. `ResolveWrite` reads the rows a
-        // governed write depends on and mutates nothing.
+        // Read-only ops. `ResolveWrite` reads rows a governed write depends on.
         KvOp::ResolveWrite(_)
         | KvOp::Get { .. }
         | KvOp::BatchGet { .. }
@@ -400,11 +356,8 @@ pub fn wal_append_kv_op(
     })
 }
 
-/// Append one mutation of a resolved KV write and return its LSN.
-///
-/// Each mutation maps onto the record class its live counterpart writes, with
-/// the absolute expiry instant the Control Plane already resolved — never a
-/// clock read here, so a redo installs the same expiry the apply did.
+/// Append one mutation of a resolved KV write and return its LSN. Uses the
+/// absolute expiry already resolved — no clock read here, so redo matches apply.
 fn append_kv_resolved_mutation(
     wal: &WalManager,
     tenant_id: TenantId,

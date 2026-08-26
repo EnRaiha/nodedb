@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Shared state reads and mutation constructors for resolving a governed KV
-//! write.
-//!
-//! Every resolver in this module reads state and computes images; not one of
-//! them writes. The mutation each produces carries a `precondition` recording
-//! exactly what it read, so the apply can refuse a resolution that state has
-//! moved past.
+//! write. Every resolver here reads state and computes images; none writes.
+//! Each mutation carries a `precondition` (exactly what it read) so the
+//! apply can refuse a resolution state has moved past.
 
 use nodedb_physical::physical_plan::{KvResolveOutcome, KvResolvedMutation};
 
@@ -18,11 +15,9 @@ use crate::data::executor::core_loop::CoreLoop;
 pub(super) type ResolveResult = Result<KvResolveOutcome, ErrorCode>;
 
 impl CoreLoop {
-    /// The stored body of `key`, or `None` when it is absent or expired.
-    ///
-    /// This value becomes the mutation's `precondition`: `Some(bytes)` means
-    /// the apply requires exactly these bytes, `None` that it requires the key
-    /// to still be absent.
+    /// The stored body of `key`, or `None` when absent or expired. Becomes
+    /// the mutation's `precondition`: `Some` requires exact bytes, `None`
+    /// requires the key to still be absent.
     pub(super) fn kv_resolve_read(
         &self,
         did: u64,
@@ -35,11 +30,8 @@ impl CoreLoop {
     }
 
     /// The absolute expiry instant `key` currently carries, or `0` for none.
-    ///
-    /// The atomic write path (`atomic_put`) preserves an existing TTL when the
-    /// op requests none, while `KvEngine::put` clears it. A resolved `Put`
-    /// installs an absolute instant, so the preserved one has to be read here
-    /// rather than inferred from a `ttl_ms` of zero at apply time.
+    /// `atomic_put` preserves an existing TTL where `KvEngine::put` clears
+    /// it, so a resolved `Put` must read it here, not infer from `ttl_ms == 0`.
     pub(super) fn kv_resolve_preserved_expiry(
         &self,
         did: u64,

@@ -30,11 +30,9 @@ struct SyncResponseDispatch {
     wal_lsn: Option<Lsn>,
 }
 
-/// `wal_lsn` is the LSN of the redo record the caller already appended for this
-/// write, or `None` when the caller minted none. It is threaded into the write
-/// funnel so the durable-at-ack barrier fsyncs that record before this call
-/// returns — the sync handlers ack their peer off this return value, and a peer
-/// that reads "applied" retires the batch and never re-sends it.
+/// `wal_lsn` is the caller's already-appended redo record, or `None`. Threaded
+/// into the write funnel so the durable-at-ack barrier fsyncs it before this
+/// returns — sync handlers ack their peer off this return value.
 pub async fn dispatch_authorized_sync_response(
     state: &SharedState,
     authorized: AuthorizedTask,
@@ -60,8 +58,7 @@ pub async fn dispatch_authorized_sync_response(
 
 /// Trusted-internal sync-shaped dispatch used by DDL index maintenance.
 ///
-/// These callers mint no redo of their own — the DDL that drives them is
-/// already durable — so they supply no LSN.
+/// These callers mint no redo of their own since the driving DDL is already durable.
 pub(crate) async fn dispatch_trusted_internal_sync_response(
     state: &SharedState,
     tenant_id: TenantId,
@@ -86,15 +83,9 @@ pub(crate) async fn dispatch_trusted_internal_sync_response(
     .await
 }
 
-/// Cluster path: proposes through Raft, then wraps the apply payload in a
-/// `Status::Ok` `Response`. The gate verdict is carried in the payload (as a
-/// zerompk-encoded `SyncAckResult`); `Status::Ok` is always correct here
-/// because a non-`Ok` status signals a protocol error, not an idempotency
-/// gate rejection.
-///
-/// Single-node path: falls through to the Control-Plane write funnel carrying
-/// `wal_lsn`, so the record the caller appended is fsync-durable before the
-/// response — and therefore the peer's ack — is produced.
+/// Cluster path: proposes through Raft, wraps the payload in `Status::Ok`. Gate
+/// verdict travels in the payload; non-`Ok` means a protocol error, not a gate
+/// rejection. Single-node path carries `wal_lsn` through the write funnel.
 async fn dispatch_sync_response_inner(
     state: &SharedState,
     params: SyncResponseDispatch,
@@ -143,31 +134,19 @@ async fn dispatch_sync_response_inner(
             trace_id,
             event_source,
             txn_id: None,
-            // The caller appended this write's redo before dispatching, so the
-            // funnel must not append a second one — it stamps this LSN onto the
-            // request and waits on it at the durable-at-ack barrier.
+            // Caller already appended this write's redo; funnel must not append a
+            // second one — stamps this LSN and waits at the durable-at-ack barrier.
             wal_lsn,
-            // No engine on this path resolves a wall-clock instant at append
-            // time; only a TTL-bearing KV write does, and KV has no sync handler.
+            // Only a TTL-bearing KV write resolves a wall-clock instant, and KV has no sync handler.
             resolved_now_ms: None,
         },
     )
     .await
 }
 
-/// Sync-path convenience over authorized sync dispatch: dispatches `plan`
-/// tagged [`EventSource::CrdtSync`] (so AFTER triggers are not re-fired on
-/// synced data) with a zero trace id, and returns just the apply-payload
-/// bytes — which carry the zerompk-encoded `SyncAckResult` the per-engine
-/// handlers decode for the gate verdict.
-///
-/// Every `SharedState*Dispatcher` funnels through here so the dispatch policy
-/// (event source, trace id, payload extraction) lives in exactly one place.
-///
-/// `wal_lsn` is the LSN of the redo the dispatcher appended for this write. It
-/// is not optional in spirit: these engines rebuild their state only by WAL
-/// replay, so acking the peer without waiting on that record loses an
-/// acknowledged write on `kill -9`.
+/// Sync-path convenience: dispatches `plan` tagged [`EventSource::CrdtSync`],
+/// returns just the payload bytes. `wal_lsn` isn't optional in spirit — these
+/// engines rebuild only by WAL replay, so acking without it loses a write on `kill -9`.
 pub async fn dispatch_sync_payload(
     state: &SharedState,
     authorized: AuthorizedTask,
@@ -185,11 +164,8 @@ pub async fn dispatch_sync_payload(
 }
 
 /// Build the loud error every `NoOp*Dispatcher` returns when a sync op reaches
-/// a path that lacks `SharedState`.
-///
-/// Such a path would ACK the Lite client while silently dropping the write, so
-/// the dispatcher fails loudly instead of no-op'ing. `op` names the operation
-/// for the diagnostic, e.g. `"vector insert"` or `"timeseries push"`.
+/// a path lacking `SharedState` — such a path would ACK the client while
+/// silently dropping the write. `op` names the operation for the diagnostic.
 pub fn noop_dispatch_error(op: &str) -> crate::Error {
     crate::Error::Internal {
         detail: format!(
@@ -208,11 +184,9 @@ mod tests {
     };
     use super::dispatch_sync_payload;
 
-    /// The defect this guards: the vector / FTS / spatial / columnar sync
-    /// handlers append their redo, dispatch, and ack the peer off this return
-    /// value. Those engines rebuild only from WAL replay, so returning while the
-    /// record is still buffered acks a write a `kill -9` erases — and the peer,
-    /// having read "applied", retires the batch and never re-sends it.
+    /// Guards against acking a peer while the redo is still buffered: those
+    /// engines rebuild only from WAL replay, so a `kill -9` would erase an
+    /// acked write the peer never re-sends.
     #[tokio::test]
     async fn a_supplied_lsn_is_fsync_durable_before_the_payload_returns() {
         let (state, side, _directory) = fixture();

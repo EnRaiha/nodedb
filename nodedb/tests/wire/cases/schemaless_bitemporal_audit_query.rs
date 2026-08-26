@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression twin of `strict_bitemporal_audit_query`: the `AS OF SYSTEM TIME
-//! NULL` (all-versions / audit-log) query on a `document_schemaless` collection
-//! created `WITH (bitemporal=true)` must surface the identical uniform triple of
-//! synthetic user-facing temporal columns (`_ts_system`, `_ts_valid_from`,
-//! `_ts_valid_until`) that the strict engine and columnar/timeseries emit, read
-//! from the row's real stored temporal data. User columns must survive and the
-//! raw reserved bitemporal columns must not leak into the audit output.
+//! Regression twin of `strict_bitemporal_audit_query`: `AS OF SYSTEM TIME
+//! NULL` on a `document_schemaless` collection must surface the same
+//! synthetic temporal columns (`_ts_system`, `_ts_valid_from`,
+//! `_ts_valid_until`) other engines emit, read from real stored data, with
+//! no raw reserved column leaking into the output.
 
 use crate::harness::TestServer;
 
@@ -56,9 +54,8 @@ async fn schemaless_bitemporal_audit_query_surfaces_uniform_temporal_columns() {
                 "synthetic temporal column '{ts}' must be present, got: {row:?}"
             );
         }
-        // Default insert carries no client valid-time, so the envelope stores
-        // the unbounded sentinels; the audit query surfaces them raw (proving
-        // valid-time comes from real storage, not a placeholder).
+        // Default insert carries no client valid-time, so the unbounded
+        // sentinels surface raw, proving they come from real storage.
         assert_eq!(
             row.get("_ts_valid_from").map(String::as_str),
             Some(i64::MIN.to_string().as_str()),

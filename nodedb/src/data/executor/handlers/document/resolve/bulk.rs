@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the predicate document writes: `BulkUpdate`, `BulkDelete`.
-//!
-//! Each scans the matched set through the same
-//! [`CoreLoop::scan_matching_documents`] its live handler uses, decides the
-//! write policy per matched row against the same image with the same gate, and
-//! reports one mutation per row.
-//!
-//! The matched set is resolved HERE and shipped, so no replica re-scans a
-//! predicate: the drift the re-scan would have to absorb is caught instead by
-//! each row's own content precondition.
+//! Each scans the matched set via [`CoreLoop::scan_matching_documents`],
+//! decides the write policy per row, and reports one mutation per row. The
+//! matched set is resolved and shipped here so no replica re-scans the
+//! predicate — drift is caught by each row's own content precondition instead.
 
 use nodedb_physical::physical_plan::{
     DocumentResolveOutcome, ResolvedSumTarget, ReturningSpec, UpdateValue,
@@ -117,9 +112,7 @@ impl CoreLoop {
             rls_write_gate::admit_row(rls_write_check, &doc, tid, collection)
                 .map_err(ErrorCode::from)?;
             let Some(surrogate) = doc_id_to_surrogate(&doc_id) else {
-                // A row whose storage key is not a surrogate hex has no
-                // identity to address on a replica. The live handler skips it
-                // for the same reason (`row_surrogate` is `None`).
+                // No surrogate identity to address on a replica; live handler skips too.
                 continue;
             };
             mutations.push(put_mutation(ResolvedPut {

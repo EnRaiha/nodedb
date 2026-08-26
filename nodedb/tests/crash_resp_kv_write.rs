@@ -1,27 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! An acknowledged write must survive a crash on every protocol, not just the
-//! one protocol that happens to be covered.
-//!
-//! RESP `SET` and HTTP `POST /v1/query` route their local writes through the
-//! gateway (`resp/gateway_dispatch.rs`, `http/routes/query/materialized.rs`),
-//! a different path from the pgwire writes covered by `crash_recovery.rs`.
-//! KV state is an in-memory hash table whose only durability is WAL replay or
-//! the periodic checkpoint, so it is the sharpest probe available: a write
-//! that never reached the WAL is simply gone after `kill -9`. These tests
-//! pin that both protocols' acknowledged writes are durable, so a future
-//! change to the gateway's dispatch or durability wiring cannot silently
-//! regress the guarantee.
-//!
-//! Reading a value back MUST use the same protocol that wrote it. A value
-//! written as a raw RESP blob does not project through a typed SQL column —
-//! a pgwire `SELECT` returns an empty string for a RESP-written key with no
-//! crash involved at all — so a cross-protocol read would report a
-//! projection mismatch as data loss.
-//!
-//! The checkpoint interval is pushed far beyond the test's runtime so a
-//! passing result can only mean the write was WAL-durable, never that a
-//! checkpoint happened to rescue it.
+//! An acknowledged write must survive a crash on every protocol. RESP `SET`
+//! and HTTP `POST /v1/query` route through the gateway, a different path
+//! from the pgwire writes `crash_recovery.rs` covers. Reading back must use
+//! the same protocol that wrote it — a pgwire `SELECT` returns an empty
+//! string for a RESP-written key with no crash involved, so a
+//! cross-protocol read would misreport a projection mismatch as data loss.
+//! The checkpoint interval is pushed beyond test runtime so a pass can only
+//! mean the write was WAL-durable.
 
 mod crash_harness;
 
@@ -32,28 +18,19 @@ use crash_harness::resp_client::{self, Reply};
 
 const PASSWORD: &str = "crash-resp-kv-secret-1";
 
-/// Checkpoints happen on a periodic timer, and a checkpoint that happens to
-/// land between the write and the kill would flush the in-memory KV state to
-/// disk independent of the WAL — a false pass that proves nothing about the
-/// durability bug under test. Pushing the interval out to an hour makes it
-/// physically impossible for a checkpoint to fire during a test that
-/// completes in seconds, so recovery can only come from WAL replay.
+/// A checkpoint landing between the write and the kill would flush KV state
+/// independent of the WAL, producing a false pass. An hour interval makes
+/// that impossible within test runtime.
 fn no_incidental_checkpoint() -> CrashHarness {
     CrashHarness::new().with_env("NODEDB_CHECKPOINT_INTERVAL_SECS", "3600")
 }
 
-/// The checkpoint interval override makes a mid-test checkpoint physically
-/// impossible; this bound is a second, cheap guard against the harness
-/// itself running slower than expected and accidentally crossing into
-/// checkpoint territory anyway.
+/// A cheap second guard against the harness itself running slower than
+/// expected and crossing into checkpoint territory anyway.
 const MAX_TEST_WALL_CLOCK: Duration = Duration::from_secs(60);
 
-// This test is RESP-write / RESP-read only: a value written as a raw RESP
-// blob does not read back through a typed pgwire SQL column as the same
-// string even with no crash involved (see `query_col` on `resp_kv_survive`
-// pre-crash — it returns `[""]`). A cross-protocol read would conflate that
-// projection mismatch with an actual durability failure, so RESP is used for
-// both the write and the sole read-back assertion here.
+// RESP-write / RESP-read only: a RESP blob doesn't read back through a
+// typed pgwire SQL column, even with no crash involved.
 #[tokio::test(flavor = "multi_thread")]
 async fn resp_kv_set_survives_kill_9() {
     let mut h = no_incidental_checkpoint();
@@ -85,9 +62,7 @@ async fn resp_kv_set_survives_kill_9() {
         "RESP SET must ack with +OK: {set:?}"
     );
 
-    // Pre-crash read-back over the SAME connection and protocol: rules out a
-    // false positive where SET silently no-ops and there was never anything
-    // to lose in the first place.
+    // Pre-crash read-back rules out a false positive where SET silently no-ops.
     let pre_crash = client.cmd(&["GET", "k1"]).await;
     assert_eq!(
         pre_crash,
@@ -103,11 +78,8 @@ async fn resp_kv_set_survives_kill_9() {
     h.kill_9();
     h.reopen();
 
-    // Primary durability check: read back over RESP, the same protocol that
-    // wrote the value, on a fresh connection (the pre-crash socket died with
-    // the killed process). This is the read path symmetric to the write
-    // path, so a match here is direct evidence the write survived kill -9 +
-    // WAL replay, with no cross-protocol projection in the way.
+    // Read back over RESP on a fresh connection — the pre-crash socket died
+    // with the killed process.
     let mut post_crash_client = resp_client::session(
         resp_addr(h.resp_port),
         "resp_kv_user",
@@ -137,10 +109,8 @@ async fn http_query_kv_write_survives_kill_9() {
     )
     .await;
 
-    // The HTTP query endpoint requires a bearer token even for the
-    // superuser (default AuthMode::Password); mint one via SQL rather than
-    // reaching into server internals, so the token comes from exactly the
-    // path a real client would use.
+    // HTTP requires a bearer token even for the superuser; mint one via SQL
+    // rather than reaching into server internals.
     let token = h
         .query_col("CREATE API KEY FOR nodedb", "api_key")
         .await
@@ -186,9 +156,8 @@ async fn http_query_kv_write_survives_kill_9() {
     h.kill_9();
     h.reopen();
 
-    // Read back over pgwire — a different protocol than the one that wrote
-    // the value — so recovery is proven independent of any HTTP-side read
-    // quirk and is really coming from the server's own durable state.
+    // Read back over pgwire, a different protocol, to rule out an HTTP-side
+    // read quirk.
     let recovered = h
         .query_col("SELECT val FROM http_kv_survive WHERE id = 'hk1'", "val")
         .await;

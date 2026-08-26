@@ -1,27 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Statement-time staging for the six stageable GRAPH writes: `EdgePut`,
+//! Statement-time staging for the six stageable graph writes: `EdgePut`,
 //! `EdgeDelete`, `EdgePutBatch`, `EdgeDeleteBatch`, `SetNodeLabels`,
-//! `RemoveNodeLabels`.
-//!
-//! Graph is the first engine whose unit-of-mutation is not a single
-//! surrogate-addressed row, so these stage into a dedicated
-//! [`GraphTxnOverlay`] (`self.graph_txn_overlays`) rather than the shared
-//! surrogate-keyed
-//! [`crate::data::executor::handlers::transaction::overlay::TxnOverlay`]
-//! every other engine uses. COMMIT durable replay is unchanged: the
-//! buffered `GraphOp` plan is still replayed through the real
-//! `execute_edge_put` / `execute_edge_delete` / `execute_edge_put_batch` /
-//! `execute_edge_delete_batch` handlers inside the COMMIT
-//! `TransactionBatch`. The `GraphTxnOverlay` entry staged here is purely
-//! in-memory read-your-own-writes plumbing for Neighbors / Hop, dropped at
-//! commit or rollback alongside the surrogate overlay
-//! (`MetaOp::DropTxnOverlay`).
-//!
-//! Every other `GraphOp` (Hop, Neighbors, Path, Subgraph, Algo, Match, ...)
-//! never reaches this file: `is_stageable_write` only routes the six ops
-//! above here; everything else stays on the pre-existing buffer + "OK"
-//! deferral via `stage_not_point_write`.
+//! `RemoveNodeLabels`. These stage into a dedicated [`GraphTxnOverlay`]
+//! rather than the shared surrogate-keyed `TxnOverlay`, purely as in-memory
+//! read-your-own-writes plumbing for Neighbors/Hop — commit durable replay
+//! still runs the buffered `GraphOp` plan through the real handlers.
 
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
 
@@ -33,27 +17,16 @@ use crate::data::executor::handlers::transaction::overlay::{
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 
-/// Sentinel collection key node-label deltas are staged under.
-/// `SetNodeLabels` / `RemoveNodeLabels` operate tenant-wide on the durable
-/// CSR partition (no collection argument on the plan), so the overlay --
-/// which keys everything per-collection like every other GRAPH op -- stores
-/// label deltas under this fixed key instead of a real collection name.
-///
-/// This is the storage half of the single node-label naming pair. Its leading
-/// NUL makes it un-nameable (and thus un-subscribable) by any SQL CDC
-/// subscriber -- deliberately, since it is an internal overlay key. The
-/// nameable CDC twin every node-label `WriteEvent` carries is
-/// [`crate::event::graph_cdc::GRAPH_LABEL_STREAM`] (`"__graph_node_labels__"` --
-/// same text without the NUL). Keep the sentinel as the storage/overlay key and
-/// the twin as the CDC `collection`; they are the two ends of one mapping.
+/// Sentinel collection key node-label deltas are staged under, since
+/// `SetNodeLabels`/`RemoveNodeLabels` operate tenant-wide with no collection
+/// argument. The leading NUL makes it un-nameable by any CDC subscriber; the
+/// nameable twin is [`crate::event::graph_cdc::GRAPH_LABEL_STREAM`].
 pub(in crate::data::executor) const GRAPH_LABEL_COLL_KEY: &str = "\0__graph_node_labels__";
 
 impl CoreLoop {
-    /// Route a stageable `GraphOp` to its staging handler.
-    ///
-    /// Caller invariant: `op` must be one of the six ops `is_stageable_write`
-    /// accepts. Every other `GraphOp` is unreachable here -- the Control
-    /// Plane never builds a `StageWrite` for them.
+    /// Route a stageable `GraphOp` to its staging handler. `op` must be one
+    /// of the six ops `is_stageable_write` accepts — every other `GraphOp`
+    /// is unreachable here.
     pub(in crate::data::executor) fn execute_stage_graph(
         &mut self,
         task: &ExecutionTask,

@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! End-to-end guard for the single-node pgwire streaming SELECT path.
-//!
-//! A `SELECT col FROM coll` with no ORDER BY / DISTINCT / OFFSET / aggregation
-//! on a single-node server is compiled to `Exchange{Gather{as_aggregate:false}}`
-//! over a plain scan and routed through the streaming fast path
-//! (`gather_all_cores_stream` → lazy `QueryResponse`). A scan whose row count
-//! exceeds the Data-Plane `stream_chunk_size` (default 1000) is emitted as
-//! several frames per core; the streaming path must surface EVERY row, never
-//! truncating to the first chunk.
-//!
-//! This is a regression guard: a prior bug truncated multi-chunk scans to
-//! `stream_chunk_size` rows because only the first frame was consumed.
+//! End-to-end guard for the single-node pgwire streaming SELECT path. A scan
+//! whose row count exceeds the Data-Plane `stream_chunk_size` (default 1000)
+//! is emitted as several frames per core; the streaming path must surface
+//! every row, never truncating to the first chunk.
 
 use crate::harness::TestServer;
 
@@ -50,9 +42,7 @@ async fn streaming_select_returns_all_rows_across_chunks() {
         "streaming SELECT must return all {ROW_COUNT} rows, not a truncated chunk"
     );
 
-    // The union is unordered; assert the full set of values is present exactly.
-    // Named-column projection re-encodes each row's `n` field as a bare integer
-    // text cell, so each row is a single column holding the integer.
+    // Unordered; assert the full set of values is present exactly.
     let seen: HashSet<i64> = rows
         .iter()
         .filter_map(|cols| cols.first())

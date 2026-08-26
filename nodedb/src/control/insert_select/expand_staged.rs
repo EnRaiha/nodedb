@@ -3,37 +3,17 @@
 //! Resolve + emit the concrete point ops for one in-transaction
 //! `INSERT ... SELECT`.
 //!
-//! Autocommit `INSERT ... SELECT` is intercepted before the transaction path
-//! and driven by [`crate::control::insert_select::run_insert_select`] (scan →
-//! fresh registered surrogate per row → atomic `BatchInsert`); only an
-//! `INSERT ... SELECT` executed INSIDE an explicit transaction block reaches
-//! here. For those, the raw `DocumentOp::InsertSelect` plan is NOT buffered for
-//! COMMIT-time replay. Instead it is resolved NOW — the source is scanned
-//! against base ∪ overlay (so it folds rows this transaction staged in earlier
-//! statements), and each copied row is assigned its OWN fresh, catalog-REGISTERED
-//! surrogate. The concrete `DocumentOp::PointInsert` ops it expands to are staged
-//! into the transaction's overlay (and buffered for COMMIT) through the exact
-//! same statement-time staging path a plain in-transaction point write uses
-//! ([`stage_write`](crate::control::server::shared::session::staging_gate::
-//! stage_write)).
+//! Only an in-transaction `INSERT ... SELECT` reaches here (autocommit uses
+//! `run_insert_select`'s scan → `BatchInsert` path instead). The plan is
+//! resolved NOW, not buffered for COMMIT: the source scans base ∪ overlay,
+//! each copied row gets its own fresh registered surrogate, and the
+//! resulting `PointInsert` ops stage into the overlay via the normal
+//! statement-time path — giving read-your-own-writes and a target-owned
+//! `(collection, surrogate)→pk` binding for cross-engine lookups.
 //!
-//! Doing this at statement time (rather than at COMMIT) gives read-your-own-
-//! writes: an in-transaction `SELECT` after the `INSERT ... SELECT` reads the
-//! copied rows, and a LATER statement in the same transaction resolves against an
-//! overlay that already holds them. Assigning each copied row a fresh registered
-//! surrogate (surrogate registration is Control-Plane-only, under the registry
-//! lock and WAL-durable) is what gives the target rows their OWN
-//! `(target_collection, surrogate)→pk` catalog binding, so cross-engine (vector /
-//! FTS) hits on the target resolve back to the target row's own primary key —
-//! fixing the stale-source-surrogate copy the COMMIT-time expander produced.
-//!
-//! `PointInsert` (not `BatchInsert`) is emitted deliberately: only `PointPut` /
-//! `PointInsert` / `PointDelete` have an undo-tracked arm in the transactional
-//! replay path; a `BatchInsert` there falls through to the passthrough handler
-//! with no undo capture, which would survive an atomic-rollback of a sibling op
-//! (partial commit). Mirrors
-//! [`crate::control::merge_orchestrator::expand_staged_merge`] and
-//! [`crate::control::update_from_join_orchestrator::expand_staged_update_from_join`].
+//! Emits `PointInsert`, not `BatchInsert`: only `PointPut`/`PointInsert`/
+//! `PointDelete` have an undo-tracked arm in transactional replay: a
+//! `BatchInsert` here would survive an atomic rollback (partial commit).
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
@@ -45,22 +25,13 @@ use crate::types::{TxnId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-/// Resolve one in-transaction `DocumentOp::InsertSelect` task into the concrete,
-/// fresh-surrogate `PointInsert` tasks its copied source rows expand to.
+/// Resolve one in-transaction `DocumentOp::InsertSelect` task into the
+/// concrete, fresh-surrogate `PointInsert` tasks its copied rows expand to.
 ///
-/// `task` must be an `InsertSelect` plan with `task.txn_id` set to the active
-/// transaction, so the source scan folds rows staged by earlier statements in the
-/// same transaction. Each copied row is assigned its OWN fresh, catalog-registered
-/// surrogate. The emitted point ops carry the same `txn_id` and target the TARGET
-/// collection's vShard (recomputed here so dispatch classification stays honest,
-/// exactly as the MERGE / `UPDATE ... FROM` expanders do). The caller stages +
-/// buffers each returned op.
-///
-/// Signature mirrors
-/// [`resolve_and_emit_merge_ops`](crate::control::merge_orchestrator::
-/// resolve_and_emit_merge_ops) /
-/// [`resolve_and_emit_update_from_join_ops`](crate::control::
-/// update_from_join_orchestrator::resolve_and_emit_update_from_join_ops).
+/// `task.txn_id` must be set to the active transaction so the scan folds
+/// earlier-staged rows. Emitted ops carry the same `txn_id` and a recomputed
+/// target vShard (as the MERGE / `UPDATE ... FROM` expanders do). The caller
+/// stages + buffers each returned op.
 pub(crate) async fn resolve_and_emit_insert_select_ops(
     state: &SharedState,
     tenant_id: TenantId,
@@ -79,8 +50,8 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         });
     };
 
-    // Scan the source (base ∪ overlay via the threaded `task.txn_id`) and assign
-    // each copied row its OWN fresh, catalog-registered surrogate.
+    // Scan the source (base ∪ overlay via `task.txn_id`), assign each row a
+    // fresh, catalog-registered surrogate.
     let rows = materialize_copy(
         state,
         MaterializeCopy {
@@ -95,18 +66,13 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
     )
     .await?;
 
-    // Concrete writes land on the TARGET collection's vShard — that is where the
-    // copied rows live. Recomputing it (rather than reusing the staged task's
-    // vShard) keeps dispatch classification honest, exactly as the MERGE /
-    // `UPDATE ... FROM` expanders do.
+    // Recompute the target vShard (rather than reusing the staged task's)
+    // to keep dispatch classification honest, as the MERGE expander does.
     let vshard_id = VShardId::from_collection_in_database(task.database_id, target_collection);
 
-    // Resolve the materialized-sum targets these copied rows credit. The point
-    // ops this expansion emits are staged directly and never pass through the
-    // statement-level resolution pass, so without this an in-transaction
-    // `INSERT ... SELECT` into a bound collection would fold against an empty
-    // resolution. Every op carries the whole resolution — a row is folded
-    // against the entry its own join value selects.
+    // Resolve materialized-sum targets: these ops stage directly, bypassing
+    // statement-level resolution, so without this a bound target collection
+    // would fold against an empty resolution.
     let sum_bodies: Vec<&[u8]> = rows.iter().map(|(_, value, _)| value.as_slice()).collect();
     let resolved_sum_targets =
         crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(

@@ -25,13 +25,8 @@ pub(super) enum ProposeOutcome {
 }
 
 /// Propose `plan` — a resolved write — through the live Raft proposer and
-/// await commit + apply.
-///
-/// Only reachable when `state.async_raft_proposer()` is `Some`: the
-/// interception via `super::resolver_for_plan` combined with the caller's own
-/// `async_raft_proposer().is_some()` check is what guarantees that. An absent
-/// proposer here is an internal invariant break, not a runtime condition to
-/// handle gracefully.
+/// await commit + apply. Only reachable when `async_raft_proposer()` is
+/// `Some`; an absent proposer here is an internal invariant break.
 pub(super) async fn propose_resolved(
     state: &SharedState,
     ctx: WriteResolveContext,

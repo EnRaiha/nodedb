@@ -5,12 +5,8 @@
 // ── Replicated write envelope ───────────────────────────────────────
 
 /// One edge of an `EdgePutBatch` / `EdgeDeleteBatch` in the cross-node wire
-/// shape. Mirrors `nodedb_physical::physical_plan::BatchEdge` but carries the
-/// endpoint surrogates as `u32` (not the `Surrogate` newtype) so the payload
-/// uses only trivially serializable types, exactly like the single `EdgePut`
-/// variant. Followers bind both surrogates verbatim on apply (never
-/// re-allocate), so the same `src_id`/`dst_id` resolves to the same identity
-/// on every replica.
+/// shape. Endpoint surrogates are bare `u32`, not `Surrogate`. Followers bind
+/// both verbatim on apply (never re-allocate).
 #[derive(
     Debug,
     Clone,
@@ -32,19 +28,10 @@ pub struct ReplicatedBatchEdge {
     pub dst_surrogate: u32,
 }
 
-/// One entry of a write's materialized-sum resolution, in the cross-node wire
-/// shape: which target row the binding's `(target collection, join value)` pair
-/// names.
-///
-/// The surrogate travels as a bare `u32` rather than the `Surrogate` newtype,
-/// like every other identity on this wire.
-///
-/// This shape supersedes the `(join_value, surrogate)` pairs the `*_sum_targets`
-/// slots carry. Those pairs cannot express a source that drives two bindings
-/// sharing a join column into different targets: the applier looks a value up,
-/// finds the FIRST binding's target row, and folds the second binding's balance
-/// into it. Both records travel — see
-/// `ReplicatedWrite::PointPut::resolved_sum_target_bindings`.
+/// One entry of a write's materialized-sum resolution: which target row a
+/// binding's `(target collection, join value)` pair names. Supersedes the
+/// `(join_value, surrogate)` pairs in `*_sum_targets`, which can't tell apart
+/// two bindings sharing a join column into different targets.
 #[derive(
     Debug,
     Clone,
@@ -65,13 +52,9 @@ pub struct ReplicatedSumTarget {
     pub surrogate: u32,
 }
 
-/// One row of a `ColumnarBulkDmlResolved` write: the Control Plane already
-/// resolved this row from the predicate and decided the write policy against
-/// its exact image, so the wire shape carries the image itself rather than
-/// anything a follower would need to re-derive.
-///
-/// `new_row_msgpack` is empty for a delete row — a delete needs only the
-/// primary key to remove the row.
+/// One row of a `ColumnarBulkDmlResolved` write: carries the resolved row
+/// image, not anything a follower would re-derive. `new_row_msgpack` is
+/// empty for a delete row.
 #[derive(
     Debug,
     Clone,
@@ -89,16 +72,10 @@ pub struct ColumnarResolvedRow {
     pub new_row_msgpack: Vec<u8>,
 }
 
-/// One mutation of a `KvResolvedWrite` in the cross-node wire shape.
-///
-/// Mirrors `nodedb_physical::physical_plan::KvResolvedMutation`, with the
-/// surrogate as a bare `u32` rather than the `Surrogate` newtype — the same
-/// convention every other identity on this wire uses. Decode binds it through
-/// the surrogate assigner, so a follower addresses the row the leader did.
-///
-/// `precondition` is the drift check, not a CAS condition: `None` means the
-/// key must be ABSENT at apply time, `Some(bytes)` that it must hold exactly
-/// those raw stored bytes.
+/// One mutation of a `KvResolvedWrite`. Surrogate is a bare `u32`; decode binds
+/// it through the surrogate assigner. `precondition` is a drift check, not a
+/// CAS condition: `None` means the key must be ABSENT, `Some(bytes)` that it
+/// must hold exactly those stored bytes.
 #[derive(
     Debug,
     Clone,
@@ -116,8 +93,7 @@ pub enum KvResolvedMutationWire {
         value: Vec<u8>,
         ttl_ms: u64,
         /// Absolute expiry instant resolved by the proposing node, `0` for
-        /// none. Carried for the same reason `KvPut::resolved_now_ms` is: no
-        /// applying node may re-derive it from its own clock.
+        /// none. No applying node may re-derive it from its own clock.
         expire_at_ms: u64,
         surrogate: u32,
         precondition: Option<Vec<u8>>,
@@ -143,18 +119,11 @@ pub enum KvResolvedMutationWire {
     },
 }
 
-/// One mutation of a `DocumentResolvedWrite` in the cross-node wire shape.
-///
-/// Mirrors `nodedb_physical::physical_plan::DocumentResolvedMutation`, with the
-/// surrogate as a bare `u32` rather than the `Surrogate` newtype — the same
-/// convention every other identity on this wire uses. Decode binds it through
-/// the surrogate assigner, so a follower addresses the row the leader did.
-///
-/// `value` is the PRE-ENCODE MessagePack body for both storage modes; the
-/// applying node encodes a strict collection's Binary Tuple on the way to disk.
-/// `precondition` is RAW STORED bytes and is the drift check, not business
-/// logic: `None` means the row must be ABSENT at apply time, `Some(bytes)` that
-/// it must hold exactly those bytes.
+/// One mutation of a `DocumentResolvedWrite`. Surrogate is a bare `u32`,
+/// bound via the surrogate assigner on decode. `value` is the pre-encode
+/// MessagePack body; a strict collection encodes its Binary Tuple on the way
+/// to disk. `precondition` is a drift check on raw stored bytes: `None` means
+/// the row must be ABSENT, `Some(bytes)` an exact match.
 #[derive(
     Debug,
     Clone,
@@ -172,8 +141,7 @@ pub enum DocumentResolvedMutationWire {
         value: Vec<u8>,
         precondition: Option<Vec<u8>>,
         /// `(target collection, join value)` -> target surrogate, resolved by
-        /// the proposing node. Carried for the same reason every other document
-        /// record carries it: no applying node can resolve it locally.
+        /// the proposing node; no applying node can resolve it locally.
         resolved_sum_targets: Vec<ReplicatedSumTarget>,
     },
     Delete {

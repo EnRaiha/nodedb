@@ -51,14 +51,9 @@ impl NodeDbPgHandler {
 
     /// Dispatch a single physical task and wait for the response.
     ///
-    /// In cluster mode, write operations are proposed to Raft first and only
-    /// executed on the Data Plane after quorum commit. Reads bypass Raft.
-    ///
-    /// `user_id` is forwarded to the `Request` for DML audit attribution.
-    /// Pass `None` for system-generated tasks (triggers, maintenance, etc.).
-    ///
-    /// `identity` is forwarded to the Exchange resolver and shared
-    /// authorization service. Every externally derived task must pass it.
+    /// In cluster mode, writes propose to Raft first and execute only after
+    /// quorum commit; reads bypass Raft. `identity` must be passed for every
+    /// externally derived task.
     pub(super) async fn dispatch_authorized_task(
         &self,
         task: PhysicalTask,
@@ -77,12 +72,9 @@ impl NodeDbPgHandler {
         .await
     }
 
-    /// Dispatch a single physical task and return the response, the per-shard
-    /// watermark LSNs a single-node fan gather observed (empty for a
-    /// non-gathered read), and the per-side read captures a distributed shuffle
-    /// JOIN produced (empty otherwise). Used by the transactional
-    /// read-recording seam so a multi-core fan read records one read-set entry
-    /// per participating shard, and a shuffle join records one per join side.
+    /// Dispatch a task and return the response, per-shard watermark LSNs a fan
+    /// gather observed, and per-side read captures a shuffle JOIN produced.
+    /// Used by the transactional read-recording seam.
     pub(super) async fn dispatch_authorized_task_with_watermarks(
         &self,
         task: PhysicalTask,
@@ -115,11 +107,8 @@ impl NodeDbPgHandler {
         let result = self
             .dispatch_task_inner(task, user_id, identity, shard_watermarks, distributed_reads)
             .await;
-        // Advance per-tenant observed write-HLC high-water on any
-        // successful dispatch (local, raft-replicated, or broadcast).
-        // Used by RESTORE's staleness gate. Backup captures envelope
-        // watermark AFTER its own fan-out, so envelope.wm dominates
-        // tenant_wm on a fresh backup.
+        // Advances per-tenant write-HLC on any successful dispatch; used by RESTORE's
+        // staleness gate. Backup captures its watermark after fan-out, so it dominates.
         if let Ok(ref resp) = result
             && resp.status == crate::bridge::envelope::Status::Ok
         {
@@ -136,11 +125,8 @@ impl NodeDbPgHandler {
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
         distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
-        // Reject user writes against a source database that is currently
-        // frozen by a clone materializer sweep.  Reads and DDL pass through
-        // unchanged.  The materializer uses `dispatch_local` (a free function
-        // in `clone_materializer/dispatch.rs`) and is never routed through
-        // this method, so there is no risk of blocking the materializer itself.
+        // Reject user writes against a database frozen by a clone materializer sweep.
+        // Reads/DDL pass through.
         use crate::control::security::identity::{Permission, required_permission};
         let perm = required_permission(&task.plan);
         if matches!(perm, Permission::Write | Permission::Admin)
@@ -151,14 +137,8 @@ impl NodeDbPgHandler {
             });
         }
 
-        // Mirror enforcement:
-        // - Writes are rejected on non-promoted mirrors (MIRROR_READ_ONLY).
-        // - Reads are gated by the session's ReadConsistency level:
-        //     Strong        → STALE_READ_NOT_LEADER (mirrors are never the source leader)
-        //     BoundedStaleness(d) → serve locally if lag ≤ d, else STALE_READ_NOT_LEADER
-        //     Eventual      → serve locally unconditionally
-        // The catalog lookup is skipped for the default database (id=0) to keep the
-        // hot path allocation-free in the single-database case.
+        // Mirror enforcement: writes reject on non-promoted mirrors; reads gate by
+        // ReadConsistency. Catalog lookup skipped for db id=0 to stay allocation-free.
         let catalog = self.state.credentials.catalog();
         if task.database_id.as_u64() != 0
             && let Ok(Some(descriptor)) = catalog.get_database(task.database_id)
@@ -174,9 +154,8 @@ impl NodeDbPgHandler {
             use crate::control::server::pgwire::ddl::database::{
                 MirrorReadOutcome, check_mirror_read_consistency,
             };
-            // Consistency defaults to Strong: mirrors are not the source leader,
-            // so reads are rejected unless the session has explicitly opted into
-            // BoundedStaleness or Eventual.
+            // Defaults to Strong: mirrors aren't the source leader, so reads reject
+            // unless the session opted into BoundedStaleness or Eventual.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or(std::time::Duration::ZERO)
@@ -211,12 +190,8 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // Autocommit `MERGE` is orchestrated on the Control Plane
-        // (`control::merge_orchestrator`): the source is scanned, each
-        // NOT-MATCHED insert row is assigned its OWN fresh, registered
-        // surrogate, and all arms apply atomically. In-transaction MERGE is
-        // buffered for COMMIT replay (`dispatch_task_no_wal`) and never reaches
-        // this method, so this intercept fires only for autocommit.
+        // Autocommit `MERGE` orchestrates on the Control Plane (`control::merge_orchestrator`).
+        // In-transaction MERGE buffers for COMMIT replay and never reaches this method.
         if matches!(
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
@@ -234,13 +209,8 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control
-        // Plane (`control::update_from_join_orchestrator`): the source is scanned
-        // on its OWN core and the raw rows are shipped into the plan so the
-        // target-core handler joins against them instead of a local read (the
-        // source's vShard can live on a different core). In-transaction
-        // `UPDATE ... FROM` is buffered for COMMIT replay and never reaches this
-        // method, so this intercept fires only for autocommit.
+        // Scans the source on its own core and ships raw rows into the plan (source's
+        // vShard can differ). In-transaction buffers for COMMIT replay instead.
         if matches!(
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
@@ -258,17 +228,8 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // A governed columnar predicate `UPDATE`/`DELETE` — a collection
-        // carrying an RLS write policy — cannot replicate a bare predicate
-        // over Raft (`wal_replication::encode::entry_columnar_family` refuses
-        // it): a follower has no writing identity to decide `$auth.*`
-        // against. `control::write_resolve` resolves the
-        // predicate to a concrete row set, decides the policy against those
-        // exact images while the writing identity is live, and proposes the
-        // resolved row set instead. Only routed here when a Raft proposer is
-        // actually live — on the single-node/local path the predicate
-        // reaches the Data Plane gate intact and is enforced correctly
-        // there, so resolving would only add cost.
+        // Can't replicate bare over Raft — a follower has no writing identity to decide
+        // `$auth.*` against. `write_resolve` resolves it while the identity is live.
         if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
             && self.state.async_raft_proposer().is_some()
         {
@@ -281,19 +242,16 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // `DROP ARRAY` must reach every Data-Plane core so each can release
-        // its per-core store and remove the on-disk segment dir; otherwise
-        // a follow-up `CREATE ARRAY` of the same name carries stale state.
+        // `DROP ARRAY` reaches every core so each releases its store and segment dir —
+        // otherwise a follow-up `CREATE ARRAY` carries stale state.
         if matches!(
             task.plan,
             crate::bridge::envelope::PhysicalPlan::Array(
                 nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
             )
         ) {
-            // Broadcast bypasses the normal write funnel, so it must acquire
-            // the same authorization capability before applying the Array DDL
-            // catalog transition. In particular, a denied DROP must not delete
-            // catalog rows or surrogate bindings.
+            // Broadcast bypasses the write funnel, so a denied DROP must not
+            // delete catalog rows or surrogate bindings.
             let authorized = self.authorize_for_dispatch(identity, &task)?;
             let task = authorized.into_physical_task();
             return crate::control::array_catalog::ddl::run_authorized_drop(
@@ -306,8 +264,7 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // Resolve derived Exchange plans before authorizing the exact task that
-        // will cross the dispatch boundary.
+        // Resolve derived Exchange plans before authorizing the dispatched task.
         match resolve_and_materialize(
             &self.state,
             identity,
@@ -357,18 +314,9 @@ impl NodeDbPgHandler {
     }
 
     /// Dispatch a write through Raft: propose → register waiter → await apply.
+    /// `ProposeTracker` is race-safe against an entry applying before register.
     ///
-    /// The `AsyncRaftProposer` handles propose + waiter registration in one
-    /// step. The `ProposeTracker` is race-safe: if the entry commits and
-    /// applies on this node before `register()` is called, the result is
-    /// stored and `register()` picks it up immediately.
-    ///
-    /// This is also the origin CDC publish site for a replicated write. It runs
-    /// on exactly one node — the one the client wrote to — and returns only
-    /// after the entry is committed and applied, which is precisely the
-    /// "acknowledged, committed, applied" point a change event names. The
-    /// replicas' apply loops deliberately publish nothing (see
-    /// `ChangeFeedOwner::Unowned`).
+    /// Also the origin CDC publish site; replicas publish nothing (`ChangeFeedOwner::Unowned`).
     async fn dispatch_replicated_write(
         &self,
         args: ReplicatedWrite<'_>,
@@ -384,14 +332,8 @@ impl NodeDbPgHandler {
         let plan = task.plan;
         let request_id = self.next_request_id();
 
-        // Propose through Raft with transparent leader-change retry. Shared with
-        // the durable RESTORE re-issue path so both replicate identically.
-        // `write_version` is the written collection's post-write
-        // `coll_write_lsn` as the applying replica recorded it — a WAL LSN, the
-        // single domain the read validator compares in. Surfacing it on the
-        // response lets the session record its own committed writes so a later
-        // transaction's read-set can be floored at them (read-your-writes floor
-        // for cross-shard OCC), instead of losing the version to `ZERO`.
+        // `write_version` is the post-write `coll_write_lsn`, surfaced so the session
+        // can floor a later read-set at it (read-your-writes for cross-shard OCC).
         let (payload, write_version) =
             crate::control::wal_replication::propose_replicated_entry(&self.state, proposer, entry)
                 .await?;
@@ -402,8 +344,7 @@ impl NodeDbPgHandler {
             attempt: 1,
             partial: false,
             payload: payload.into(),
-            // Replicated apply returns the authoritative participant WAL LSN.
-            // CDC ordering must use it rather than a synthetic zero watermark.
+            // Authoritative participant WAL LSN — CDC ordering must use it, not zero.
             watermark_lsn: write_version,
             error_code: None,
             read_set_valid: None,
@@ -411,8 +352,7 @@ impl NodeDbPgHandler {
             write_set: Vec::new(),
         };
 
-        // The propose returned, so the entry is committed and this node has
-        // applied it. Publish once, here, from the plan the entry encodes.
+        // Propose returned: entry is committed and applied. Publish once, from this plan.
         publish_origin_change_events(&self.state, tenant_id, database_id, &plan, &response);
 
         Ok(response)
@@ -420,11 +360,8 @@ impl NodeDbPgHandler {
 
     /// Dispatch a task directly to the local Data Plane (single-node or reads).
     ///
-    /// For write operations the WAL append is performed inside the shared write
-    /// funnel (`WalDurability::AppendHere`), under the write-admission guard and
-    /// immediately before the enqueue, so the minted LSN order equals the
-    /// Data-Plane apply order per key. Reads bypass the WAL entirely (the append
-    /// helper is a no-op for non-write plans).
+    /// WAL append happens inside the write funnel, under the admission guard just
+    /// before enqueue, so LSN order equals apply order. Reads bypass the WAL entirely.
     async fn dispatch_local(
         &self,
         authorized: crate::control::server::shared::authorization::AuthorizedTask,
@@ -440,24 +377,16 @@ impl NodeDbPgHandler {
 
     /// Dispatch a task to the Data Plane WITHOUT individual WAL append.
     ///
-    /// Used by COMMIT to dispatch buffered transaction tasks after the
-    /// entire transaction has been written as a single `RecordType::Transaction`
-    /// WAL record. Skipping per-task WAL avoids double-writing.
+    /// Used by COMMIT after the transaction is written as one `RecordType::Transaction`
+    /// record — per-task WAL would double-write.
     pub(super) async fn dispatch_task_no_wal(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
         wal_lsn: Option<crate::types::Lsn>,
     ) -> crate::Result<Response> {
-        // Same materialize-freeze gate as `dispatch_task_inner`. Without this,
-        // a transaction that began before the freeze could COMMIT writes
-        // *during* the freeze window — the materializer would already be
-        // mid-scan, so those committed rows would either leak into target
-        // (if scan hadn't reached them) or stay only in source (if past).
-        // Both outcomes break the as-of contract; reject with
-        // `SourceFrozen` so the client retries the COMMIT after the freeze
-        // releases. Pre-freeze transactions remain consistent because their
-        // staged tasks are buffered in the session, not yet visible to source.
+        // Without this, a transaction begun before the freeze could COMMIT mid-scan and
+        // break the as-of contract.
         use crate::control::security::identity::{Permission, required_permission};
         let perm = required_permission(&task.plan);
         if matches!(perm, Permission::Write | Permission::Admin)
@@ -469,10 +398,8 @@ impl NodeDbPgHandler {
         }
         reject_unadmitted_crdt_apply(&task.plan)?;
         let txn_id = task.txn_id;
-        // The transaction's writes were durably recorded under a single
-        // `RecordType::Transaction` WAL record at COMMIT; per-task WAL append is
-        // skipped here (would double-write). `wal_lsn` is that record's LSN,
-        // stamped so the Data Plane records the batch's write versions.
+        // Writes were durably recorded under one `RecordType::Transaction` record at
+        // COMMIT; per-task WAL append is skipped. `wal_lsn` stamps that record's LSN.
         self.submit_to_data_plane(SubmitArgs {
             tenant_id: task.tenant_id,
             vshard_id: task.vshard_id,
@@ -480,12 +407,8 @@ impl NodeDbPgHandler {
             plan: task.plan,
             user_id,
             txn_id,
-            // Durability was recorded at COMMIT under a single `Transaction`
-            // record whose LSN is `wal_lsn`, so the funnel must not append again.
-            // That batch record carries no per-task resolved TTL instant (see
-            // `flush_transaction_buffer`'s equivalent limitation), so a
-            // TTL-bearing KV write inside a multi-task COMMIT batch falls back to
-            // `epoch_system_ms` / the wall clock at apply time.
+            // No per-task TTL instant (see `flush_transaction_buffer`), so a TTL-bearing
+            // KV write falls back to `epoch_system_ms` at apply time.
             durability: WalDurability::CallerSupplied {
                 wal_lsn,
                 resolved_now_ms: None,
@@ -536,8 +459,7 @@ mod tests {
 
     #[test]
     fn dispatch_task_compile_check() {
-        // Confirm the dispatch module compiles without the old two-phase join
-        // and broadcast_scan helpers.
+        // Confirms the dispatch module compiles.
         let _: () = ();
     }
 }

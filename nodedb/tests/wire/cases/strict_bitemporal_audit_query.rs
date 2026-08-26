@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression: `AS OF SYSTEM TIME NULL` (the all-versions / audit-log query)
-//! on a `document_strict` collection created `WITH (bitemporal=true)` used to
-//! silently drop every user column. The audit-log scan handler treated the
-//! stored row body as MessagePack, but strict bitemporal rows store a Binary
-//! Tuple — decoding it as msgpack yields a non-object `Value`, which the old
-//! code silently swallowed into an empty object carrying only the synthetic
-//! `_ts_system` column. This test asserts the user columns survive and the
-//! raw reserved bitemporal columns do not leak into the audit output.
+//! Regression: `AS OF SYSTEM TIME NULL` on a `document_strict` collection
+//! used to silently drop every user column, since the audit-log scan
+//! decoded the stored Binary Tuple as MessagePack. Asserts user columns
+//! survive and raw reserved bitemporal columns don't leak.
 
 use crate::harness::TestServer;
 
@@ -57,9 +53,8 @@ async fn strict_bitemporal_audit_query_preserves_user_columns() {
                 "synthetic temporal column '{ts}' must be present, got: {row:?}"
             );
         }
-        // Default insert carries no client valid-time, so the envelope stores
-        // the unbounded sentinels; the audit query surfaces them raw (proving
-        // valid-time comes from real storage, not a placeholder).
+        // Default insert carries no client valid-time, so the unbounded
+        // sentinels surface raw, proving they come from real storage.
         assert_eq!(
             row.get("_ts_valid_from").map(String::as_str),
             Some(i64::MIN.to_string().as_str()),

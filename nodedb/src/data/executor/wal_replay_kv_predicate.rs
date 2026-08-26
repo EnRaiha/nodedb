@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! WAL replay for the KV predicate DML records (`kv_predicate_update`,
-//! `kv_predicate_delete`).
-//!
-//! `wal_append_kv_op` logs the predicate and assignments, never a row set,
-//! since `WHERE` selects rows only once current state is scanned. Replay
-//! re-resolves the row set with the same [`CoreLoop::kv_predicate_matches`]
-//! scan and `merge_field_updates` the live handlers use, so it cannot
-//! diverge from the original write.
-//!
-//! Records below the checkpoint floor are skipped; the rest apply in LSN
-//! order, so the predicate sees the state it saw when it first ran.
+//! `kv_predicate_delete`). The log carries only the predicate and
+//! assignments, never a row set, so replay re-resolves the row set with the
+//! same scan and merge the live handlers use.
 
 use tracing::warn;
 

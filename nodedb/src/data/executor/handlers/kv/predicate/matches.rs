@@ -20,11 +20,9 @@ const KV_PREDICATE_SCAN_BATCH: usize = 1024;
 pub(in crate::data::executor) type KvPredicateRow = (Vec<u8>, Vec<u8>);
 
 impl CoreLoop {
-    /// Every `(key, stored body)` in `collection` that `filters` matches.
-    ///
-    /// A malformed filter payload is an error, never an empty predicate: the
-    /// callers turn "no filters" into "every row", so a silent decode failure
-    /// would rewrite `WHERE owner = 'alice'` into a whole-collection write.
+    /// Every `(key, stored body)` in `collection` that `filters` matches. A
+    /// malformed filter payload is an error, never an empty predicate — a
+    /// silent decode failure would turn a `WHERE` into a whole-collection write.
     pub(in crate::data::executor) fn kv_predicate_matches(
         &self,
         did: u64,

@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression guard: a `GROUP BY` with a SELECT-list alias on the
-//! group KEY must preserve that alias as the output column name, keep the
-//! SELECT-list order, and return non-null, correct aggregate values.
-//!
-//! Pre-fix, `SELECT k AS label, COUNT(*) AS n FROM t GROUP BY k` reported the
-//! first column as `k` (the raw grouped column name) instead of the alias
-//! `label` — the group-key `AS label` was dropped. The aggregate-result alias
-//! (`n`) already worked; this guards the group-key alias, the column order,
-//! and the non-null count (the value must still resolve under the raw grouped
-//! column key).
+//! Regression guard: a `GROUP BY` with a SELECT-list alias on the group key
+//! must preserve that alias as the output column name, keep the SELECT-list
+//! order, and return non-null, correct aggregate values.
 
 use crate::harness::TestServer;
 
-/// `SELECT k AS label, COUNT(*) AS n FROM t GROUP BY k` must:
-/// - return the aliases `label` and `n` as the column NAMES (not `k`/`count`),
-/// - keep SELECT-list ORDER (`label` first, `n` second),
-/// - return non-null, correct `COUNT(*)` values (guards the null risk:
-///   the group-key value must still resolve under the raw grouped column key).
+/// `SELECT k AS label, COUNT(*) AS n FROM t GROUP BY k` must return the
+/// aliases as column names in SELECT-list order, with non-null counts.
 #[tokio::test]
 async fn group_by_alias_and_order_preserved() {
     let srv = TestServer::start().await;

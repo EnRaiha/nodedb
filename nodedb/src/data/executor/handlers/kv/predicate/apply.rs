@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Live handlers for `KvOp::PredicateUpdate` / `KvOp::PredicateDelete`.
-//!
-//! Both resolve their row set through [`CoreLoop::kv_predicate_matches`] and
-//! then reuse the keyed path verbatim: the update merges with
-//! `field_compute::merge_field_updates` (what `KvOp::FieldSet` calls) and the
-//! delete hands its resolved keys to `execute_kv_delete` (what `KvOp::Delete`
-//! runs). Re-deriving either here is how a predicate write drifts from the
-//! keyed one.
+//! Live handlers for `KvOp::PredicateUpdate` / `KvOp::PredicateDelete`. Both
+//! resolve their row set via [`CoreLoop::kv_predicate_matches`] and reuse the
+//! keyed path verbatim — re-deriving either here is how a predicate write
+//! would drift from the keyed one.
 
 use nodedb_types::{RlsWriteCheck, Surrogate};
 use tracing::debug;
@@ -30,12 +26,9 @@ pub(in crate::data::executor) struct KvPredicateCtx<'a> {
 }
 
 impl CoreLoop {
-    /// Merge `updates` into every row the predicate matches.
-    ///
-    /// Every post-image is computed and decided against the write policy
-    /// BEFORE the first row is written, so one rejected row leaves the whole
-    /// statement without effect — the same all-or-nothing contract
-    /// `execute_kv_delete` holds for a multi-key delete.
+    /// Merge `updates` into every row the predicate matches. Every post-image
+    /// is decided against the write policy before the first row is written,
+    /// so one rejected row leaves the whole statement without effect.
     pub(in crate::data::executor) fn execute_kv_predicate_update(
         &mut self,
         task: &ExecutionTask,
@@ -72,9 +65,7 @@ impl CoreLoop {
         }
 
         for (key, old_body, new_value) in &writes {
-            // `Surrogate::ZERO` leaves the row's bound identity alone: the row
-            // already exists, so its original insert's surrogate is the one
-            // that must survive a field merge.
+            // `Surrogate::ZERO` leaves the row's existing bound identity alone.
             self.kv_engine.put(KvPutParams {
                 database_id: did,
                 tenant_id: tid,
@@ -113,11 +104,9 @@ impl CoreLoop {
         }
     }
 
-    /// Delete every row the predicate matches.
-    ///
-    /// The resolved keys go through `execute_kv_delete`, so the write-policy
-    /// gate, the metrics, the change events, and the `{"deleted": n}` reply
-    /// are the keyed delete's, not a second copy of them.
+    /// Delete every row the predicate matches. Resolved keys go through
+    /// `execute_kv_delete`, so the gate, metrics, and reply are the keyed
+    /// delete's, not a second copy.
     pub(in crate::data::executor) fn execute_kv_predicate_delete(
         &mut self,
         task: &ExecutionTask,

@@ -8,15 +8,9 @@
 use super::op::KvOp;
 
 impl KvOp {
-    /// The user collection this op targets, if any. Sorted-index ops keyed only
-    /// by an index name (and no direct collection) return `None`; `TransferItem`
-    /// reports its source collection.
-    ///
-    /// `ResolvedWrite` returns `None` for the same reason the sorted-index ops
-    /// do: its mutations may span two collections (a resolved `TransferItem`
-    /// moves a row between them), so no single name is the answer. Its vShard,
-    /// its metering scope, and its lock keys all come from the Control Plane
-    /// resolver that built it, never from this accessor.
+    /// The user collection this op targets, if any. Sorted-index ops (keyed
+    /// only by index name) and `ResolvedWrite` (mutations may span two
+    /// collections) return `None`. `TransferItem` reports its source.
     pub fn collection(&self) -> Option<&str> {
         match self {
             KvOp::Get { collection, .. }

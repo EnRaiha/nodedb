@@ -2,15 +2,8 @@
 
 //! Encode `PhysicalPlan::Document` variants into `ReplicatedWrite`.
 //!
-//! # The materialized-sum resolution travels with the write
-//!
-//! Every document write that can maintain a derived total carries the
-//! resolution the proposing node made at plan time — the join-key VALUE → target
-//! row SURROGATE table — and, where the plan has one, the list of targets whose
-//! delta was split onto a sibling `ApplyBalanceDelta` entry. Both are copied
-//! onto the record here rather than left for the applier to re-derive: see
-//! `ReplicatedWrite::PointPut::resolved_sum_targets` for why no applying node
-//! can answer either question locally.
+//! A document write that maintains a derived total carries the join-key →
+//! target-surrogate resolution, copied onto the record so no applier re-derives it.
 
 use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
 use nodedb_physical::physical_plan::{DocumentResolvedMutation, ResolvedSumTarget, UpdateValue};
@@ -32,15 +25,9 @@ pub(super) struct WireReturning<'a> {
     pub rls_filters: &'a [u8],
 }
 
-/// Flatten a plan's resolution into the AUTHORITATIVE wire shape.
-///
-/// `Surrogate` is a newtype over `u32` and every other identity on this wire
-/// travels as the bare `u32`, so the resolution does too.
-///
-/// An entry that names no target collection cannot arise here: only the decoder
-/// mints those, when it lifts a record written before this slot existed. Such an
-/// entry is dropped rather than encoded with an invented collection name — a
-/// re-proposal that guessed the target would replicate a resolution nobody made.
+/// Flatten a plan's resolution into the authoritative wire shape (`Surrogate`
+/// travels as bare `u32`, like every other identity on this wire). An entry
+/// with no target collection is dropped rather than guessed at.
 fn wire_target_bindings(resolved: &[ResolvedSumTarget]) -> Vec<ReplicatedSumTarget> {
     resolved
         .iter()
@@ -57,15 +44,9 @@ fn wire_target_bindings(resolved: &[ResolvedSumTarget]) -> Vec<ReplicatedSumTarg
         .collect()
 }
 
-/// The same resolution in the SUPERSEDED `(join_value, surrogate)` shape, kept
-/// populated so a peer running an older binary reads the record and behaves
-/// exactly as it does today — see
-/// `ReplicatedWrite::PointPut::resolved_sum_targets`.
-///
-/// Derived from the authoritative slot rather than carried separately, so the
-/// two can never disagree. One entry per join value, first binding wins: that is
-/// precisely what the old resolver produced, and it is all the old shape can
-/// express.
+/// The superseded `(join_value, surrogate)` shape, kept populated so an older
+/// peer binary still reads it correctly. Derived from the authoritative slot,
+/// never carried separately, so the two can't disagree. First binding wins per join value.
 fn wire_targets(resolved: &[ResolvedSumTarget]) -> Vec<(String, u32)> {
     let mut legacy: Vec<(String, u32)> = Vec::with_capacity(resolved.len());
     for entry in resolved {
@@ -203,11 +184,9 @@ pub(super) fn batch_insert(
     }
 }
 
-/// `DocumentOp::Truncate` replicates as a plain `DocTruncate` entry: it is
-/// autocommit-only and clearing a collection is idempotent + deterministic,
-/// so every replica safely re-executes the clear on apply. No surrogate to
-/// carry — the whole collection is cleared, not a single row. The balance the
-/// cleared rows fed is not re-derivable, so its resolution rides along.
+/// Replicates as a plain `DocTruncate` entry: clearing is idempotent, so every
+/// replica safely re-executes it. The balance cleared rows fed isn't re-derivable,
+/// so its resolution rides along.
 pub(super) fn truncate(
     collection: &str,
     restart_identity: bool,
@@ -221,13 +200,9 @@ pub(super) fn truncate(
     }
 }
 
-/// Single-shard bulk predicate writes replicate as a plain `BulkDml` entry:
-/// each replica re-scans local state at the committed log position and
-/// applies the predicate deterministically (Raft log order ⇒ identical prior
-/// state ⇒ identical matching set). An OLLP-prepared bulk plan (carrying
-/// `ollp_predicted_surrogates` / `ollp_predicted_edges`) belongs to the
-/// cross-shard Calvin path and is NOT encoded here — the caller returns
-/// `None` for those and dispatches via Calvin instead.
+/// Single-shard bulk predicate writes replicate as a plain `BulkDml` entry: each
+/// replica re-scans local state at the committed log position and applies the
+/// predicate deterministically. An OLLP-prepared plan is Calvin's, not encoded here.
 pub(super) fn bulk_delete(
     collection: &str,
     filters: &[u8],
@@ -267,11 +242,8 @@ pub(super) fn bulk_update(
     }
 }
 
-/// `INSERT ... SELECT ... WHERE <predicate>` replicates as a plain
-/// `InsertSelect` entry: each replica re-scans the source at the committed
-/// log position and copies the predicate matches, reusing each source row's
-/// surrogate/doc_id. Deterministic by Raft log order ⇒ identical prior state
-/// ⇒ identical copied set.
+/// Replicates as a plain `InsertSelect` entry: each replica re-scans the source
+/// at the committed log position and copies matches, reusing each row's surrogate/doc_id.
 pub(super) fn insert_select(
     target_collection: &str,
     source_collection: &str,
@@ -287,11 +259,8 @@ pub(super) fn insert_select(
 }
 
 /// Encode a resolved document write: every row mutation the Control Plane
-/// decided, plus the reply it decided alongside them.
-///
-/// Nothing is re-derived here. The bodies are the pre-encode MessagePack the
-/// resolve computed and the preconditions are the raw stored bytes it read, so
-/// every replica writes the same row and refuses the same drift.
+/// decided, plus the reply. Nothing is re-derived — bodies are pre-encode
+/// MessagePack and preconditions are raw stored bytes, so every replica agrees.
 pub(super) fn resolved_write(
     mutations: &[DocumentResolvedMutation],
     response_payload: &[u8],
@@ -340,13 +309,9 @@ pub(super) fn resolved_write(
     }
 }
 
-/// `DocumentOp::ApplyBalanceDelta` replicates as the DELTA it is.
-///
-/// Modelled on `KvIncr`: the record says what the statement did, every replica
-/// applies it exactly once in log order, and the balance each replica ends up
-/// with is its own prior balance plus the same signed amount. The decimal
-/// travels as a string because a balance is not integral and `f64` is lossy
-/// past 15 significant digits — the same reason the stored total is a string.
+/// Replicates as the delta it is, modelled on `KvIncr`: each replica applies it
+/// once in log order onto its own prior balance. The decimal travels as a
+/// string because `f64` is lossy past 15 significant digits.
 pub(super) fn apply_balance_delta(
     collection: &str,
     document_id: &str,

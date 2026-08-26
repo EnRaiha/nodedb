@@ -2,10 +2,8 @@
 
 //! KV engine CoW insert interception.
 //!
-//! An INSERT into a `Shadowed` clone writes only the target. The source row
-//! carrying the same key stays visible, so the merged read returns the key
-//! twice. Recording a KV tombstone for each written key suppresses the source
-//! copy; the row the statement just wrote is target-resident and unaffected.
+//! An INSERT into a `Shadowed` clone writes only the target, leaving the
+//! same-key source row visible — a KV tombstone per written key suppresses it.
 
 use pgwire::error::PgWireResult;
 

@@ -2,33 +2,12 @@
 
 //! Durable re-issue of restored timeseries rows.
 //!
-//! The snapshot-install path lands timeseries engine state via a per-node
-//! DIRECT install: `restore_timeseries` rebuilds the memtable in-memory and
-//! `restore_flushed_ts_segments` writes partition directories straight to the
-//! local disk. Neither emits a WAL record nor a Raft entry, so on a multi-replica
-//! cluster the restored data lands on ONLY the restore-target node — querying any
-//! other replica returns zero rows.
-//!
-//! RESTORE instead re-issues each restored timeseries collection's live rows as a
-//! durable `TimeseriesOp::Ingest`, branching on cluster vs single-node exactly
-//! like a normal timeseries write (and exactly like the columnar reissue):
-//!
-//! - Cluster (`async_raft_proposer` present): build a `ReplicatedEntry` via
-//!   `to_replicated_entry` (which maps `TimeseriesOp::Ingest` →
-//!   `ReplicatedWrite::TimeseriesIngest`) and propose it through Raft. Replicates
-//!   to every replica; recovery via Raft-log re-apply.
-//! - Single-node: WAL-append the plan, then dispatch it into the Data Plane so it
-//!   is installed live (WAL makes it durable for restart replay).
-//!
-//! ## Identity
-//!
-//! Unlike columnar, the timeseries engine does NOT carry a per-row cross-engine
-//! surrogate sidecar: the memtable stores only the schema columns, the flushed
-//! segment files store only the schema columns, and the `"msgpack"` ingest format
-//! re-derives series identity from the tag columns. There is therefore no
-//! surrogate to preserve — the rows are re-issued with an empty surrogate list,
-//! identical to the live ILP / msgpack ingest path. This is not a loss of
-//! identity: timeseries simply has no surrogate sidecar to begin with.
+//! Snapshot-install writes memtable + partition state directly, with no WAL
+//! record or Raft entry — on a multi-replica cluster only the restore-target
+//! node gets the data. RESTORE re-issues each collection's rows as a durable
+//! `TimeseriesOp::Ingest` (Raft on cluster, WAL + dispatch on single-node).
+//! Surrogates are empty: timeseries has no surrogate sidecar, only series
+//! identity re-derived from tag columns.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -61,11 +40,8 @@ const TS_SYSTEM_COLUMN: &str = TS_SYSTEM;
 /// Decode the memtable section plus every flushed partition of one timeseries
 /// collection into live `Value::Object` rows (keyed by column name).
 ///
-/// `memtable_bytes` is the msgpack `MemtableSnapshot` captured at backup time
-/// (`None` when the collection had no resident memtable). `flushed` carries the
-/// raw flushed partition directories. `kek` is the timeseries segment encryption
-/// key (the WAL encryption key); `None` when at-rest encryption is not
-/// configured (plaintext segments).
+/// `memtable_bytes` is `None` when no resident memtable existed at backup
+/// time. `kek` is the segment encryption key, `None` if unconfigured.
 pub fn decode_timeseries_live_rows(
     collection: &str,
     memtable_bytes: Option<&[u8]>,

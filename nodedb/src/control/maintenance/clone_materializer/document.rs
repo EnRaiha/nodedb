@@ -2,27 +2,14 @@
 
 //! Document engine source-to-target row copy.
 //!
-//! Drives the source `DocumentOp::MaterializeScan` cursor to completion, and
-//! for each non-tombstoned, not-yet-copied surrogate dispatches a
-//! `DocumentOp::PointInsert { if_absent: true }` against target with a fresh
-//! surrogate.  Calls the reaper at the end to flip the collection status to
-//! `Materialized` and clear `cloned_from`.
+//! Drives the source `MaterializeScan` cursor to completion; for each
+//! non-tombstoned, not-yet-copied surrogate, dispatches a fresh-surrogate
+//! `PointInsert { if_absent: true }` against target. Calls the reaper at the
+//! end to flip status to `Materialized` and clear `cloned_from`.
 //!
-//! Scan bodies arrive as standard msgpack for every source encoding — the
-//! source handler normalizes them — so the insert carries them through
-//! unchanged and the target write handler re-encodes to its own format.
-//!
-//! ## Idempotency / restart-safety
-//!
-//! Resume after a crash works because every step is observable:
-//!   - Tombstones in `clone_tombstones` filter deleted source rows.
-//!   - Copy-up entries in `clone_copyups` (surrogate-keyed) filter rows that
-//!     were already copy-up'd by the CoW write path.
-//!   - `if_absent: true` on the target insert silently skips rows already
-//!     written by a prior materializer pass.
-//!
-//! The per-page progress checkpoint is best-effort (crash loses only that
-//! page's progress), but the per-key probes make restart safe regardless.
+//! Crash-restart-safe: tombstones filter deleted source rows, `clone_copyups`
+//! filters CoW-copied rows, and `if_absent` skips already-written rows — the
+//! per-page checkpoint is best-effort but the per-key probes cover it.
 
 use nodedb_types::{CloneStatus, DatabaseId, Lsn, Surrogate, TenantId};
 
@@ -132,10 +119,8 @@ pub(super) async fn materialize_document_collection(
                     ),
                 })?
                 .unwrap_or_else(|| {
-                    // If the surrogate has no PK binding (e.g. very old row), fall back
-                    // to using the hex doc_id as the key bytes. This is deterministic
-                    // and idempotent but may differ from the normal write path for
-                    // legacy rows that predate surrogate-pk binding.
+                    // No PK binding (e.g. very old row): fall back to the hex doc_id
+                    // as key bytes — deterministic but may differ from the write path.
                     doc_id_hex.as_bytes().to_vec()
                 });
 
@@ -252,11 +237,9 @@ pub(crate) type ScanPage = (Vec<(String, u32, Vec<u8>)>, Vec<u8>);
 
 /// Run one source-side `MaterializeScan` round-trip.
 ///
-/// `txn_id` is threaded into the dispatched `MaterializeScan` so that, when the
-/// scan runs inside a transaction (the COMMIT-time MERGE / `UPDATE ... FROM`
-/// expanders), the source handler folds the transaction's staging overlay into
-/// the returned rows — a source row staged by an earlier statement is visible.
-/// Autocommit callers pass `None` (base-only, unchanged).
+/// `txn_id`, when set (COMMIT-time MERGE / `UPDATE ... FROM` expanders),
+/// makes the source handler fold the transaction's staging overlay in.
+/// Autocommit callers pass `None` (base-only).
 pub(crate) async fn scan_source_page(
     state: &SharedState,
     tenant_id: TenantId,
@@ -293,22 +276,14 @@ pub(crate) async fn scan_source_page(
     parse_materialize_scan_payload(resp.payload.as_ref())
 }
 
-/// Scan a source collection to completion on its OWN Data-Plane core and
-/// collect every row as `(source_doc_id, msgpack_body)`.
+/// Scan a source collection to completion on its OWN Data-Plane core,
+/// collecting every row as `(source_doc_id, msgpack_body)`. Shared by the
+/// `MERGE` / `UPDATE ... FROM` orchestrators, which ship source rows into
+/// their plan so the Data Plane builds the join-map without a local read of
+/// a possibly-non-resident source.
 ///
-/// Drives the cursor-paginated [`scan_source_page`] primitive (which routes by
-/// the source collection's vShard, so the read lands on whichever core owns the
-/// source — the whole point of source-shipping) to the end. Shared by the
-/// `MERGE` and `UPDATE ... FROM` Control-Plane orchestrators: both ship the
-/// source rows into their plan so the Data Plane builds the join-map from the
-/// shipped bytes instead of a local read of a possibly-non-resident source.
-///
-/// `txn_id` selects the read view: `None` (autocommit `run_merge` /
-/// `run_update_from_join`) scans committed base storage only; `Some(txn)` (the
-/// statement-time staged expanders) folds the transaction's staging overlay for the
-/// SOURCE collection, so a source row inserted/updated by an earlier statement
-/// in the same transaction is shipped too — mirroring the target-side overlay
-/// fold the RESOLVE pass performs.
+/// `txn_id`: `None` scans committed base storage only; `Some(txn)` (staged
+/// expanders) folds the transaction's SOURCE-side staging overlay in too.
 pub(crate) async fn read_all_source_rows(
     state: &SharedState,
     tenant_id: TenantId,

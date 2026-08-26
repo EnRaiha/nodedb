@@ -40,10 +40,7 @@ async fn infinite_loop_trigger_terminates_within_budget() {
         .await;
     let elapsed = start.elapsed();
 
-    // The trigger should either:
-    // (a) error because the budget was exhausted, or
-    // (b) succeed but complete within a sane time bound.
-    // It must NOT hang for 3600 seconds.
+    // Must either error on budget exhaustion or succeed quickly — never hang.
     assert!(
         elapsed < Duration::from_secs(30),
         "infinite-loop trigger took {elapsed:?} — budget should cap execution well under 1 hour"

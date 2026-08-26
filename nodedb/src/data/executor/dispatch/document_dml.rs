@@ -118,13 +118,9 @@ impl CoreLoop {
         )
     }
 
-    /// Run the read-only RESOLVE pass over the op `ResolveWrite` wraps.
-    ///
-    /// Two answers, two shapes. The join-driven ops report a classification the
-    /// Control-Plane expander turns into point ops. The five point/bulk ops
-    /// report a `DocumentResolveOutcome` the Control Plane proposes as a
-    /// `DocumentOp::ResolvedWrite`. Anything else is a Control-Plane
-    /// construction bug, not a client error.
+    /// Run the read-only RESOLVE pass over the op `ResolveWrite` wraps. The
+    /// join-driven ops report a classification; the five point/bulk ops
+    /// report a `DocumentResolveOutcome`. Anything else is a construction bug.
     pub(super) fn dispatch_document_resolve_write(
         &mut self,
         task: &ExecutionTask,

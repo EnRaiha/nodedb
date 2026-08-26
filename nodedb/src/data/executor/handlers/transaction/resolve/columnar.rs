@@ -1,45 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Columnar + timeseries serializer for transaction resolve.
-//!
-//! Like the vector serializer, these are **plan-driven**: columnar and
-//! timeseries batch inserts are not staged as per-surrogate overlay
-//! post-images — they ride the buffered-plan path — and their redo replay
-//! re-runs the engine's native batch payload rather than a per-row shape
-//! (`replay_timeseries_wal` → `replay_columnar_payload` / `replay_timeseries_payload`).
-//! So this module reads the plan node directly and emits the SAME
-//! `RecordType::TimeseriesBatch` sub-record the autocommit path produces,
-//! reusing its encoders (`control::server::wal_dispatch`).
-//!
-//! ## One record type, two `kind` tags
-//!
-//! Both columnar and timeseries writes share `RecordType::TimeseriesBatch`.
-//! They are disambiguated on replay by the encoded payload:
-//!
-//! * Columnar `Insert` → a map-shaped [`nodedb_types::columnar::ColumnarWalRecord`]
-//!   with `kind = "columnar"`, carrying the per-row cross-engine surrogates.
-//!   `decode_batch_record` matches the msgpack map first and routes it to
-//!   `replay_columnar_payload`.
-//! * Timeseries `Ingest` → the format-preserving 5-element tuple
-//!   `("timeseries", collection, payload, provenance, format)`. The msgpack
-//!   array never matches the map form, so it falls through to the timeseries
-//!   replay path without relying on payload-byte heuristics.
-//!
-//! ## Predicate DML
-//!
-//! `ColumnarOp::Update` / `ColumnarOp::Delete` are predicate DML with no
-//! per-row post-image (the matching set is only known once the Data Plane
-//! re-scans current state). They serialize to the SAME predicate-carrying
-//! [`nodedb_types::columnar::ColumnarDmlWalRecord`] (`kind = "columnar_dml"`,
-//! under `RecordType::TimeseriesBatch`) the autocommit path appends via
-//! `encode_columnar_dml_payload`; replay re-executes the predicate through the
-//! live handler (`try_replay_columnar_predicate_dml`), so an in-tx columnar
-//! UPDATE/DELETE is restart-durable exactly like its autocommit twin.
-//!
-//! ## Determinism
-//!
-//! Emission is in plan order (a fixed `&[PhysicalPlan]`), which is already
-//! deterministic; each `Insert` / `Ingest` maps to exactly one sub-record.
+//! Columnar + timeseries serializer for transaction resolve. Plan-driven,
+//! like the vector serializer: these ops ride the buffered-plan path, not a
+//! per-surrogate overlay, so this reads the plan node directly and reuses the
+//! autocommit path's `RecordType::TimeseriesBatch` encoders
+//! (`control::server::wal_dispatch`). Columnar and timeseries share that one
+//! record type, disambiguated on replay by payload shape: a map (`kind =
+//! "columnar"`/`"columnar_dml"`) vs. the timeseries 5-tuple. Predicate DML
+//! (`Update`/`Delete`) uses the same `ColumnarDmlWalRecord` the autocommit
+//! path appends, so an in-tx UPDATE/DELETE is restart-durable identically.
+//! Emission is in plan order, already deterministic.
 
 use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
 use nodedb_wal::record::RecordType;
@@ -51,10 +21,8 @@ use crate::control::server::wal_dispatch::{
 use crate::wal::RedoSubRecord;
 
 /// Append the redo sub-record for a single columnar plan op to `ops`.
-///
-/// `Insert` serializes to a `TimeseriesBatch` sub-record tagged `"columnar"`;
-/// read ops emit nothing; predicate DML (`Update` / `Delete`) serializes to a
-/// `TimeseriesBatch` sub-record tagged `"columnar_dml"` (see module docs).
+/// `Insert` tags `"columnar"`; predicate DML tags `"columnar_dml"`; reads
+/// emit nothing (see module docs).
 pub(super) fn serialize_columnar_op(
     op: &ColumnarOp,
     ops: &mut Vec<RedoSubRecord>,
@@ -95,14 +63,9 @@ pub(super) fn serialize_columnar_op(
         | ColumnarOp::MaterializeScan { .. }
         | ColumnarOp::ResolveDml { .. } => Ok(()),
 
-        // Predicate DML: emit the SAME `ColumnarDmlWalRecord` (kind
-        // `"columnar_dml"`, carried under `RecordType::TimeseriesBatch`) the
-        // autocommit path appends via `encode_columnar_dml_payload`. Replay
-        // routes it back through `try_replay_columnar_predicate_dml`, which
-        // re-executes the predicate through the live handler — so an in-tx
-        // columnar UPDATE/DELETE is restart-durable exactly like its autocommit
-        // twin, rather than the redo record dropping it (and the commit
-        // failing) for lack of a per-row post-image.
+        // Same `ColumnarDmlWalRecord` the autocommit path appends; replay
+        // re-executes the predicate through the live handler, so an in-tx
+        // UPDATE/DELETE is restart-durable exactly like its autocommit twin.
         ColumnarOp::Update {
             collection,
             filters,
@@ -129,10 +92,8 @@ pub(super) fn serialize_columnar_op(
             Ok(())
         }
 
-        // Resolved-row-set DML: the Control Plane already resolved these rows
-        // and decided the write policy against them, so the redo record
-        // carries the exact images, never a predicate — same reasoning as
-        // the autocommit encoder (`encode_columnar_resolved_dml_payload`).
+        // Control Plane already resolved these rows, so the redo carries the
+        // exact images, never a predicate — same as the autocommit encoder.
         ColumnarOp::ResolvedUpdate {
             collection,
             rows,
@@ -161,9 +122,7 @@ pub(super) fn serialize_columnar_op(
 }
 
 /// Append the redo sub-record for a single timeseries plan op to `ops`.
-///
-/// `Ingest` serializes to a `TimeseriesBatch` sub-record tagged `"timeseries"`;
-/// the scan op emits nothing.
+/// `Ingest` tags `"timeseries"`; the scan op emits nothing.
 pub(super) fn serialize_timeseries_op(
     op: &TimeseriesOp,
     ops: &mut Vec<RedoSubRecord>,
@@ -177,9 +136,8 @@ pub(super) fn serialize_timeseries_op(
             surrogates: _,
             provenance,
             rls_write_check: _,
-            // The redo record carries the ingested payload, not the response
-            // shape a projection and its read gate would have produced for one
-            // caller. Replay reconstructs stored state; nobody is waiting on it.
+            // Redo carries the ingested payload, not one caller's projected
+            // response shape — replay reconstructs state, nothing else.
             returning: _,
             rls_filters: _,
         } => {

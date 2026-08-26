@@ -2,13 +2,9 @@
 
 //! Clone CoW read-path interception for the pgwire handler.
 //!
-//! Called from `execute_planned_sql_inner` after planning and before dispatch.
-//! For `Shadowed` / `Materializing` clones this produces an augmented task
-//! list (target + source) and then merges the source response with tombstone
-//! filtering applied.
-//!
-//! Non-cloned databases and fully `Materialized` clones return `None` —
-//! zero overhead for the common path.
+//! Runs after planning, before dispatch. For `Shadowed`/`Materializing` clones,
+//! builds an augmented task list and merges the source response with tombstone
+//! filtering. Non-cloned / fully `Materialized` databases return `None`.
 
 use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -37,21 +33,10 @@ use super::super::super::core::NodeDbPgHandler;
 use super::merge::{filter_kv_tombstoned_rows, merge_msgpack_arrays, wrap_single_map_as_array};
 use super::temporal::extract_system_as_of_ms;
 
-/// Meter one clone-read sub-task (target-database or source-database half),
-/// once its dispatch above has already returned success.
+/// Meter one clone-read sub-task after its dispatch returns success.
 ///
-/// Clone CoW reads bypass `dispatch_task_loop` entirely — `resolve_read`
-/// augments the task set with source-database reads and this function
-/// dispatches both halves directly via `dispatch_authorized_task` — so
-/// neither half is metered anywhere else. Mirrors
-/// `calvin_dispatch::meter_calvin_task` / `gateway_dispatch::meter_gateway_task`,
-/// the other doors that bypass the loop the same way.
-///
-/// `rows: None` — the target/source responses are merged and tombstone-
-/// filtered across several steps after dispatch before a final row count
-/// exists; decoding each raw payload solely to count rows here would
-/// duplicate that later work. `meter_dispatch` charges one unit for `None`,
-/// correct for the read that just happened.
+/// Clone CoW reads bypass `dispatch_task_loop`, so neither half is metered
+/// elsewhere; `rows: None` charges one unit rather than an early row count.
 fn meter_clone_task(
     state: &crate::control::state::SharedState,
     identity: &AuthenticatedIdentity,
@@ -69,9 +54,8 @@ fn meter_clone_task(
 
 /// Raise a Data-Plane error status as a pgwire error.
 ///
-/// A clone read dispatches both halves itself, so `dispatch_task_loop`'s status
-/// check never sees them. Without this an errored half is shaped into an
-/// ordinary empty result set and the client reads it as success.
+/// A clone read dispatches both halves itself, bypassing `dispatch_task_loop`'s
+/// status check — without this, an errored half looks like empty success.
 fn raise_clone_task_error(resp: &crate::bridge::envelope::Response) -> PgWireResult<()> {
     match response_status_to_sqlstate(resp.status, resp.error_code.as_deref()) {
         None => Ok(()),
@@ -84,11 +68,8 @@ fn raise_clone_task_error(resp: &crate::bridge::envelope::Response) -> PgWireRes
 }
 
 /// The source surrogate a rewritten document point-read fetches.
-///
-/// A point-get answers with the row body alone — no surrogate travels with it —
-/// so the row-level filter cannot tell which row the payload holds. Deciding
-/// suppression from the plan keeps point reads agreeing with scans, whose rows
-/// carry the hex surrogate as their `"id"`.
+/// A point-get answers with the row body alone, no surrogate — deciding
+/// suppression from the plan keeps it consistent with scans.
 fn point_read_surrogate(plan: &PhysicalPlan) -> Option<u32> {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => Some(surrogate.as_u32()),
@@ -99,11 +80,8 @@ fn point_read_surrogate(plan: &PhysicalPlan) -> Option<u32> {
 impl NodeDbPgHandler {
     /// Intercept read tasks for cloned collections.
     ///
-    /// Returns `Some(responses)` when clone resolution handled the dispatch
-    /// completely — the caller should return that directly.
-    ///
-    /// Returns `None` when the tasks do not target a cloned collection —
-    /// the caller should continue with normal dispatch.
+    /// `Some(responses)` when clone resolution handled dispatch completely —
+    /// return that directly. `None` when the task doesn't target a clone.
     pub(in crate::control::server::pgwire::handler::routing) async fn maybe_dispatch_clone_reads(
         &self,
         tasks: Vec<PhysicalTask>,
@@ -117,16 +95,11 @@ impl NodeDbPgHandler {
             projection,
             formats: result_formats,
         } = shaping;
-        // Resolved before `resolve_read` consumes `tasks`. A clone read merges
-        // source-database rows into the target's, so both branches' sources
-        // govern redaction.
+        // Resolved before `resolve_read` consumes `tasks` — a clone read merges
+        // source rows into the target's, so both branches' sources govern redaction.
         let redaction = QueryRedaction::for_plans(tenant_id, auth, tasks.iter().map(|t| &t.plan));
-        // Compute query LSN and wall-ms for the resolver.
-        //
-        // If the first task carries a `system_as_of_ms` (i.e. the query was
-        // written with `FOR SYSTEM_TIME AS OF <ms>`), derive query_lsn from
-        // that wall-clock time so the clone predation check works correctly.
-        // Otherwise fall back to the current WAL LSN (normal reads).
+        // If the first task carries `system_as_of_ms`, derive query_lsn from that
+        // wall-clock time; otherwise fall back to the current WAL LSN.
         let (query_lsn, query_ms) =
             if let Some(as_of_ms) = extract_system_as_of_ms(tasks.first().map(|t| &t.plan)) {
                 let lsn = self.state.ms_to_lsn(as_of_ms);
@@ -209,9 +182,7 @@ impl NodeDbPgHandler {
                     );
                 }
 
-                // Clone resolution adds source-database tasks after the initial
-                // authorization pass. Re-authorize the complete augmented set
-                // before either half can be dispatched.
+                // Re-authorize the augmented set (target + source) before dispatch.
                 let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
 
                 // Split tasks into target and source halves.
@@ -236,10 +207,8 @@ impl NodeDbPgHandler {
                     responses.push(resp);
                 }
 
-                // Load the suppressed source surrogates: rows deleted from the
-                // clone (tombstones) plus rows copied up into it. A copy-up
-                // leaves the superseded source row in place, so merging it back
-                // in would return the row twice — once stale, once updated.
+                // Suppressed source surrogates: tombstones plus copy-ups (a copy-up
+                // leaves the superseded source row in place, so merging it back would double it).
                 let mut tombstoned = self
                     .state
                     .credentials
@@ -283,14 +252,8 @@ impl NodeDbPgHandler {
                         )))
                     })?;
 
-                // Dispatch source tasks, filter tombstoned rows, merge into target responses.
-                //
-                // For a single-level clone there is one source task per target task.
-                // For a multi-level clone chain the resolver emits one source task per
-                // ancestor level per original target task, so source_tasks.len() may be
-                // a multiple of target_tasks.len().  All source tasks that correspond to
-                // the same original query task (index = source_idx % target_tasks.len())
-                // must be merged into the same target response slot.
+                // A multi-level clone chain emits one source task per ancestor per target task;
+                // tasks sharing `source_idx % target_tasks.len()` share a response slot.
                 let target_count = target_tasks.len().max(1);
                 for (source_idx, source_task) in source_tasks.iter().enumerate() {
                     if point_read_surrogate(&source_task.plan)
@@ -313,23 +276,16 @@ impl NodeDbPgHandler {
                     raise_clone_task_error(&source_resp)?;
                     meter_clone_task(&self.state, identity, source_task);
 
-                    // For KvOp::Get: inject the primary key field into the raw map response
-                    // so that projection and column-name assertions work correctly.
+                    // KvOp::Get: inject the primary key field for projection/column checks.
                     let normalized_payload =
                         apply_kv_wrap(&source_task.plan, source_resp.payload.as_ref());
 
-                    // KvOp::Get responses arrive as a single msgpack map (not an array).
-                    // Normalize to a 1-element array so tombstone filters and merge work
-                    // uniformly across scan and point-get shapes.
+                    // KvOp::Get responses arrive as a single map; normalize to a 1-element
+                    // array so tombstone filters and merge work uniformly.
                     let normalized_payload = wrap_single_map_as_array(normalized_payload);
 
-                    // Apply surrogate tombstone filter (document engine rows).
-                    // `filter_tombstoned_rows` returns `None` only when its input
-                    // is not a well-formed msgpack array. Post-normalization
-                    // (`wrap_single_map_as_array`) the input is guaranteed to be
-                    // an empty slice or a valid array, so `None` here signals
-                    // upstream corruption — log loudly and pass through unchanged
-                    // rather than masking with `unwrap_or`.
+                    // Post-normalization the input is always a valid array, so `None`
+                    // signals upstream corruption — log and pass through unchanged.
                     let source_payload = match filter_tombstoned_rows(
                         &normalized_payload,
                         &tombstoned,
@@ -360,9 +316,7 @@ impl NodeDbPgHandler {
                         source_payload
                     };
 
-                    // Merge source rows into the corresponding target response.
-                    // `response_idx` maps multi-level ancestor tasks back to the
-                    // original query-task slot they serve.
+                    // `response_idx` maps ancestor tasks back to their original query-task slot.
                     if response_idx < responses.len() {
                         // Normalize target payload to array shape for uniform merge.
                         let target_payload = wrap_single_map_as_array(

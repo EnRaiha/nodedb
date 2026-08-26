@@ -1,18 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `ALTER DATABASE clone MATERIALIZE` refuses when an RLS policy applies.
-//!
-//! The clone materializer writes without an `AuthenticatedIdentity` (see
-//! `dispatch_local` in `clone_materializer/dispatch.rs`), so a `$auth.*`
-//! predicate has nothing to evaluate against. `materialize_one` gates every
-//! engine on this before a single row is streamed: a policy on either the
-//! source (read) or the target (write) side must refuse the whole
-//! materialization, and no rows may land.
-//!
-//! Covers a columnar case (one of the two sites a pre-existing dispatch
-//! guard already caught) and a KV case (one of the two "silent" sites —
-//! `KvOp::Put` carries no `rls_write_check` field at all, so nothing but
-//! this gate protects it).
+//! The materializer writes without an `AuthenticatedIdentity`, so a `$auth.*`
+//! predicate has nothing to evaluate against; `materialize_one` gates every
+//! engine on this before a row streams. Covers a columnar case and a KV
+//! case, where `KvOp::Put` carries no `rls_write_check` field at all.
 
 use crate::harness::TestServer;
 
@@ -109,10 +101,8 @@ async fn target_write_policy_blocks_columnar_materialize() {
         .query_rows("SELECT id FROM rows")
         .await
         .expect("select from clone target");
-    // The clone is still shadowed, so this SELECT reads through to the source:
-    // 0 target-local rows + 5 source rows. The merge concatenates without
-    // dedup, so a materialization that leaked its 5 rows into the target shows
-    // up here as 10, and 0 would mean read-through itself is broken.
+    // Shadowed clone reads through to the source: 5 is read-through, 10
+    // would be leaked target rows, 0 would mean read-through is broken.
     assert_eq!(
         rows.len(),
         5,
@@ -156,10 +146,8 @@ async fn source_read_policy_blocks_columnar_materialize() {
         .query_rows("SELECT id FROM rows")
         .await
         .expect("select from clone target");
-    // The clone is still shadowed, so this SELECT reads through to the source:
-    // 0 target-local rows + 5 source rows. The merge concatenates without
-    // dedup, so a materialization that leaked its 5 rows into the target shows
-    // up here as 10, and 0 would mean read-through itself is broken.
+    // Shadowed clone reads through to the source: 5 is read-through, 10
+    // would be leaked target rows, 0 would mean read-through is broken.
     assert_eq!(
         rows.len(),
         5,
@@ -168,10 +156,9 @@ async fn source_read_policy_blocks_columnar_materialize() {
     );
 }
 
-/// The KV engine is one of the two "silent" write sites: `KvOp::Put` carries
-/// no `rls_write_check` field at all, so nothing but the gate in
-/// `materialize_one` protects it. A write policy on the clone target must
-/// still refuse the whole materialization before any key lands.
+/// `KvOp::Put` carries no `rls_write_check` field, so nothing but the gate
+/// in `materialize_one` protects it. A target write policy must still
+/// refuse the whole materialization before any key lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn target_write_policy_blocks_kv_materialize() {
     let server = TestServer::start().await;
@@ -214,10 +201,8 @@ async fn target_write_policy_blocks_kv_materialize() {
         .query_rows("SELECT key FROM rows")
         .await
         .expect("select from clone target");
-    // The clone is still shadowed, so this SELECT reads through to the source:
-    // 0 target-local rows + 5 source rows. The merge concatenates without
-    // dedup, so a materialization that leaked its 5 rows into the target shows
-    // up here as 10, and 0 would mean read-through itself is broken.
+    // Shadowed clone reads through to the source: 5 is read-through, 10
+    // would be leaked target rows, 0 would mean read-through is broken.
     assert_eq!(
         rows.len(),
         5,

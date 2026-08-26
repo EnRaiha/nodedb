@@ -3,47 +3,18 @@
 //! Exhaustive, compile-enforced classification: does a `PhysicalPlan` mutate
 //! base state in a way that needs a Calvin write-key / lock?
 //!
-//! This is the single chokepoint `dispatch::classify_dispatch` and
-//! `tx_class::build_static_tx_class` use to decide whether a plan
-//! participates in Calvin's write-key set. Mirrors the technique used by
-//! `plan_vshard` (`control/cluster/calvin/scheduler/driver/core/routing.rs`):
-//! every op variant inside the eight write-capable engine families (Document,
-//! Kv, Vector, Graph, Timeseries, Columnar, Crdt, Array) is matched
-//! explicitly as `true` or `false` — no wildcard arm — so a newly added op
-//! variant is a compile error here, not a silently-`false` write
-//! classification. Text, Spatial, Query, and Meta plans never carry a
-//! Calvin-lockable write in `plan_vshard` (each is a single blanket
-//! `NotAWrite` there), so they stay a single blanket `false` arm each at the
-//! `PhysicalPlan` level — that match is still exhaustive over every
-//! `PhysicalPlan` variant, it just doesn't drill into their payload.
+//! The chokepoint `classify_dispatch` and `build_static_tx_class` use to
+//! decide write-key-set membership. Mirrors `plan_vshard`: every op in the
+//! eight write-capable engines is matched explicitly `true`/`false` (no
+//! wildcard), so a new op variant is a compile error here. Text/Spatial/
+//! Query/Meta stay one blanket `false` arm each (`NotAWrite` in
+//! `plan_vshard`), still exhaustive over `PhysicalPlan`.
 //!
-//! # Why this does NOT delegate to `plan_is_write`
-//!
-//! `write_admission::predicate::plan_is_write` answers a different question
-//! — "does this plan require `Permission::Write`?", derived from the
-//! security tier's exhaustive `required_permission` oracle. Several op
-//! variants answer yes there while carrying no vshard to lock on in
-//! `plan_vshard`, so naively deriving from `Permission::Write` would
-//! misclassify them as Calvin writes:
-//!
-//! - `VectorOp::{SetParams, Seal, CompactIndex, Rebuild}` are
-//!   `Permission::Alter`, not `Write` at all.
-//! - `KvOp::{RegisterIndex, DropIndex, RegisterSortedIndex,
-//!   DropSortedIndex}` are `Permission::Write` but `NotAWrite` in
-//!   `plan_vshard` (index metadata, not key-value state).
-//! - `DocumentOp::Merge`, `KvOp::TransferItem` and `KvOp::ResolvedWrite` are
-//!   `Permission::Write` but `Unroutable` in `plan_vshard` (cross-collection
-//!   writes with no enforced co-location).
-//! - `TextOp::{FtsIndexDoc, FtsDeleteDoc}` and `SpatialOp::{Insert, Delete}`
-//!   are `Permission::Write` but their whole families are blanket
-//!   `NotAWrite` in `plan_vshard`.
-//! - Most `MetaOp` writes (`WalAppend`, `TransactionBatch`,
-//!   `CalvinExecute*`, ...) are `Permission::Write` but the whole `Meta`
-//!   family is blanket `NotAWrite` in `plan_vshard` — these are Calvin's own
-//!   internal dispatch/commit plans, not user writes to classify.
-//!
-//! Widening `is_write_plan` for any of the above would turn a routing gap
-//! into an aborted transaction (a write key with no vshard to lock).
+//! Does NOT delegate to `plan_is_write` (`Permission::Write`): several
+//! `Permission::Write` variants carry no vshard to lock in `plan_vshard`
+//! (index-metadata ops, cross-collection writes like `Merge`/`TransferItem`,
+//! Text/Spatial write ops, most `MetaOp` writes) and would misclassify as
+//! Calvin writes, turning a routing gap into an aborted transaction.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -62,21 +33,16 @@ fn document_is_write(op: &DocumentOp) -> bool {
         | DocumentOp::Upsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
-        // Pre-existing: `UpdateFromJoin` is `Unroutable` in `plan_vshard`
-        // (source/target co-location is not enforced) yet is already
-        // classified `true` here upstream of this change; left as-is, out
-        // of this task's scope, since `plan_vshard` is not being changed.
+        // `UpdateFromJoin` is `Unroutable` in `plan_vshard` (no enforced
+        // co-location) but is already classified `true` here.
         | DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Truncate { .. }
-        // A balance write mutates a row like any other document write, and it
-        // is precisely the task that has to enter the write-key set: without it
-        // the pair it belongs to classifies as single-shard and the source
-        // write commits without the balance.
+        // Without this in the write-key set, the pair classifies as
+        // single-shard and the source write commits without the balance.
         | DocumentOp::ApplyBalanceDelta { .. }
         // Mutates the rows its mutation list names, like any other write.
         | DocumentOp::ResolvedWrite { .. } => true,
-        // Read-only: it reports what the wrapped write would apply and mutates
-        // nothing.
+        // Read-only: reports what the wrapped write would apply, mutates nothing.
         DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
@@ -89,35 +55,23 @@ fn document_is_write(op: &DocumentOp) -> bool {
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. }
         // `Merge` is `Permission::Write` but `Unroutable` in `plan_vshard`
-        // (cross-collection write, no enforced co-location) — kept `false`
-        // here so it never enters Calvin's write-key set with no vshard to
-        // lock on.
+        // (no enforced co-location) — kept `false` so it never enters the
+        // write-key set with no vshard to lock on.
         | DocumentOp::Merge { .. } => false,
     }
 }
 
-/// Whether `plan` is a DERIVED side effect rather than the user's own write.
+/// Whether `plan` is a DERIVED side effect (a `GraphOp` edge write mirroring
+/// a document, or an [`DocumentOp::ApplyBalanceDelta`] whose target differs
+/// from the source's vShard) rather than the user's own write.
 ///
-/// Two shapes qualify, and they are the same shape: a cross-collection write
-/// the Control Plane appends alongside a statement it did not appear in.
-///
-/// * a `GraphOp` edge write mirroring a document that carries `_from`/`_to`;
-/// * a [`DocumentOp::ApplyBalanceDelta`] moving a materialized-sum balance
-///   whose target does not share the source's vShard.
-///
-/// Both are real writes and both must enter Calvin's write-key set — they are
-/// what makes the pair multi-shard and commit atomically. What they must NOT do
-/// is answer the client. A statement's `CommandComplete` tag is shaped from ONE
-/// applied response, and a derived participant's response describes a row the
-/// user's statement never named: shaping `INSERT` from it reports a count that
-/// belongs to a different write.
-///
-/// The distinction is named here, once, rather than spelled as an inline
-/// negation at the place the responses are folded. It was an inline
-/// `!matches!(plan, PhysicalPlan::Graph(_))` in
-/// `plans_have_primary_write`, so the balance write — added later, and
-/// deliberately modelled on the implicit graph edge — never inherited it and
-/// raced the source write to deposit the statement's applied response.
+/// Both are real writes that must enter Calvin's write-key set — what they
+/// must NOT do is answer the client: a derived participant's response
+/// describes a row the statement never named, so shaping `CommandComplete`
+/// from it would report the wrong count. Named once here rather than as an
+/// inline negation, after the balance write (modelled on the implicit graph
+/// edge) failed to inherit an ad hoc `!matches!` check and raced the source
+/// write to deposit the statement's response.
 pub fn is_derived_side_effect(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Graph(_) => true,
@@ -262,10 +216,8 @@ fn columnar_is_write(op: &ColumnarOp) -> bool {
         | ColumnarOp::Delete { .. }
         | ColumnarOp::ResolvedUpdate { .. }
         | ColumnarOp::ResolvedDelete { .. } => true,
-        // Read-only: resolves a predicate to the rows it would touch and
-        // decides the write policy against them, but mutates nothing. Not a
-        // Calvin write-key: there is no vshard lock to take for a plan that
-        // writes no base state.
+        // Read-only: decides the write policy but mutates nothing, so no
+        // vshard lock to take.
         ColumnarOp::Scan { .. }
         | ColumnarOp::MaterializeScan { .. }
         | ColumnarOp::ResolveDml { .. } => false,
@@ -300,10 +252,9 @@ fn crdt_is_write(op: &CrdtOp) -> bool {
 
 fn array_is_write(op: &ArrayOp) -> bool {
     match op {
-        // Pre-existing: `Put`/`Delete`/`Flush` are `Unroutable` in
-        // `plan_vshard` (tile->vshard needs catalog tile_extents not present
-        // on the plan) yet are already classified `true` here upstream of
-        // this change; left as-is, out of this task's scope.
+        // `Put`/`Delete`/`Flush` are `Unroutable` in `plan_vshard` (tile→vshard
+        // needs catalog tile_extents not present on the plan) but are
+        // already classified `true` here.
         ArrayOp::Put { .. } | ArrayOp::Delete { .. } | ArrayOp::Flush { .. } => true,
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }

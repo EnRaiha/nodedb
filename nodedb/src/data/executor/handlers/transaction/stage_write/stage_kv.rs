@@ -1,41 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Statement-time staging for the stageable KV point puts: `Put`, `Insert`,
-//! `InsertIfAbsent`, plus the [`CoreLoop::execute_stage_kv`] router all
-//! fourteen stageable `KvOp`s enter through. `InsertOnConflictUpdate`
-//! itself stages in the sibling `stage_kv_conflict.rs` (split out to stay
-//! under the file-size limit) -- its match arm here just builds the
-//! [`StageCtx`] and calls into it.
-//!
-//! KV is the first non-Document engine to stage into the transaction
-//! overlay -- it reuses the exact same overlay ([`TxnOverlay`],
-//! [`Staged`]) and the same [`StageCtx`] routing bundle the Document point
-//! writes use. The only new piece is identity: a KV row's real key is
-//! arbitrary bytes, but the overlay's doc-id index is `String`-keyed, so a
-//! KV row's overlay doc-id is the lowercase-hex encoding of its key
-//! ([`hex_key`]), applied symmetrically here (stage) and in the read-merge
-//! paths (`overlay_point_lookup`, `merge_overlay_into_scan`). The
-//! surrogate is the plan's own KV identity for every op staged here; `Delete`
-//! carries none on the plan and has to resolve one, which is part of why it
-//! lives in the sibling `stage_kv_delete.rs`.
-//!
-//! `ttl_ms` on `Put` / `Insert` / `InsertIfAbsent` / `InsertOnConflictUpdate`
-//! lives outside the value body (`KvEntry.expire_at_ms`), so a non-zero
-//! `ttl_ms` is also recorded in the overlay's KV TTL delta map via
-//! [`CoreLoop::stage_kv_ttl_side_effect`] (`stage_kv_atomic.rs`), the same
-//! helper `Incr` / `BatchPut` reuse -- so a same-transaction read observes
-//! the staged expiry instead of treating the row as persistent until COMMIT.
-//!
-//! `Incr` / `IncrFloat` / `Cas` / `GetSet` / `BatchPut` are also stageable,
-//! but their handlers live in the sibling `stage_kv_atomic.rs` (kept
-//! separate to stay under the file-size limit) -- see that module's doc for
-//! their surrogate-resolution and value-computation reuse. `FieldSet` /
-//! `Transfer` / `TransferItem` are stageable too, in the sibling
-//! `stage_kv_transfer.rs`. `Expire` / `Persist` are stageable too, in the
-//! sibling `stage_kv_ttl.rs`, and `Delete` in `stage_kv_delete.rs`. Every
-//! other `KvOp` (the sorted-index family,
-//! etc.) is out of scope: it never reaches this file because
-//! `is_stageable_write` only routes the fourteen ops above here.
+//! Statement-time staging for KV point puts: `Put`, `Insert`,
+//! `InsertIfAbsent`. Sibling files stage the rest of the fourteen
+//! stageable `KvOp`s. A KV row's overlay doc-id is the lowercase-hex
+//! encoding of its raw key ([`hex_key`]), applied symmetrically here and
+//! in the read-merge paths.
 
 use nodedb_physical::physical_plan::KvOp;
 use nodedb_types::Surrogate;
@@ -49,11 +18,8 @@ use crate::engine::kv::current_ms;
 use crate::types::TxnId;
 
 /// Lowercase-hex encode a raw KV key for use as the overlay's doc-id.
-///
-/// Applied symmetrically: every staging path in this file calls it to build
-/// the `StageCtx.document_id` passed to the shared overlay helpers, and the
-/// read-merge paths (`overlay_point_lookup`, `merge_overlay_into_scan`) call
-/// it the same way to resolve a KV key back to its overlay entry.
+/// Applied symmetrically here (stage) and in the read-merge paths that
+/// resolve a KV key back to its overlay entry.
 pub(in crate::data::executor) fn hex_key(key: &[u8]) -> String {
     let mut s = String::with_capacity(key.len() * 2);
     for b in key {
@@ -62,10 +28,8 @@ pub(in crate::data::executor) fn hex_key(key: &[u8]) -> String {
     s
 }
 
-/// Decode a lowercase-hex KV overlay doc-id back to the raw key bytes --
-/// the inverse of [`hex_key`]. Returns `None` for malformed hex (never
-/// produced by `hex_key` itself, but the overlay's doc-id map is a plain
-/// `String`, so the scan-merge caller stays defensive rather than panicking).
+/// Decode a lowercase-hex KV overlay doc-id back to raw key bytes, the
+/// inverse of [`hex_key`]. Returns `None` for malformed hex.
 pub(in crate::data::executor) fn unhex_key(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -81,11 +45,9 @@ pub(in crate::data::executor) fn unhex_key(s: &str) -> Option<Vec<u8>> {
 }
 
 impl CoreLoop {
-    /// Route a stageable `KvOp` to its staging handler.
-    ///
-    /// Caller invariant: `op` must be one of the five ops `is_stageable_write`
-    /// accepts. Every other `KvOp` is unreachable here -- the Control Plane
-    /// never builds a `StageWrite` for them.
+    /// Route a stageable `KvOp` to its staging handler. `op` must be one of
+    /// the ops `is_stageable_write` accepts — every other `KvOp` is
+    /// unreachable here.
     pub(in crate::data::executor) fn execute_stage_kv(
         &mut self,
         task: &ExecutionTask,
@@ -228,9 +190,8 @@ impl CoreLoop {
         key: &[u8],
         surrogate: Surrogate,
     ) -> StageCtx<'a> {
-        // `StageCtx.document_id` is `Cow<str>` precisely so a KV row's
-        // overlay doc-id can be an owned hex string here, with no borrow
-        // from `task` and no leak.
+        // `StageCtx.document_id` is `Cow<str>` so a KV row's overlay doc-id
+        // can be an owned hex string here, with no borrow from `task`.
         StageCtx::new(task, tid, txn_id, collection, hex_key(key), surrogate)
     }
 
@@ -296,13 +257,9 @@ impl CoreLoop {
 
     // ── Shared KV constraint / resolution helpers ───────────────────────────
 
-    /// True when `key` is present under BASE ∪ OVERLAY (mirrors
-    /// `stage_pk_present`, but against the KV engine rather than the
-    /// document sparse store).
-    ///
-    /// `pub(super)` so the sibling `stage_kv_ttl.rs` reuses the exact same
-    /// BASE ∪ OVERLAY presence check `Expire` / `Persist` need to decide
-    /// found-vs-not-found, matching the base handlers' `NotFound` semantics.
+    /// True when `key` is present under base ∪ overlay (mirrors
+    /// `stage_pk_present`, but against the KV engine). `pub(super)` so
+    /// `stage_kv_ttl.rs` reuses this for `Expire`/`Persist` found checks.
     pub(super) fn stage_kv_pk_present(&self, ctx: &StageCtx<'_>, key: &[u8]) -> bool {
         match self.stage_overlay_pk(ctx) {
             super::constraint::OverlayPk::Present => true,
@@ -316,13 +273,9 @@ impl CoreLoop {
         }
     }
 
-    /// Resolve the current value for `key` under BASE ∪ OVERLAY, preferring
-    /// a staged put/tombstone over the base KV engine.
-    ///
-    /// `pub(super)` (rather than private) so the atomic-op staging handlers
-    /// in `stage_kv_atomic.rs` reuse this exact resolution instead of
-    /// re-deriving it -- a staged `Incr`/`Cas`/`GetSet` reads the same
-    /// BASE ∪ OVERLAY current value a staged `InsertOnConflictUpdate` does.
+    /// Resolve the current value for `key` under base ∪ overlay, preferring
+    /// a staged put/tombstone over the base KV engine. `pub(super)` so
+    /// `stage_kv_atomic.rs` reuses this instead of re-deriving it.
     pub(super) fn resolve_kv_current(&self, ctx: &StageCtx<'_>, key: &[u8]) -> Option<Vec<u8>> {
         match self
             .txn_overlays
@@ -356,10 +309,8 @@ mod tests {
     use crate::data::executor::task::ExecutionTask;
     use crate::types::*;
 
-    /// A minimal read-only `ExecutionTask`, `txn_id` set to whatever the
-    /// caller passes in -- everything else about the plan is irrelevant to
-    /// KV staging / overlay lookups, which route entirely on the explicit
-    /// `tid` / `txn_id` / `collection` / `key` arguments, not on `task.plan`.
+    /// A minimal read-only `ExecutionTask`; KV staging routes entirely on
+    /// the explicit `tid`/`txn_id`/`collection`/`key` args, not `task.plan`.
     fn make_task(txn_id: Option<TxnId>) -> ExecutionTask {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: "x".into(),
@@ -445,17 +396,13 @@ mod tests {
 
     #[test]
     fn staged_put_ttl_is_visible_to_a_same_transaction_read() {
-        // Read-your-own-writes regression: a `Put ... WITH ttl` staged this
-        // transaction must be visible to a `Get` later in the SAME
-        // transaction, via the exact production overlay-read path
-        // (`execute_kv_get`), not a hand-rolled predicate.
+        // Read-your-own-writes: a `Put ... WITH ttl` staged this transaction
+        // must be visible to a `Get` later in the same transaction, via
+        // `execute_kv_get`, not a hand-rolled predicate.
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
-        // `stage_kv_put` derives its expiry from `epoch_system_ms`; set it far
-        // in the past so the staged expiry is already behind the real
-        // wall-clock `execute_kv_get` compares against -- deterministically
-        // proving the staged TTL was recorded and is consulted, without
-        // sleeping past a real TTL.
+        // Set expiry far in the past so it's already behind wall-clock,
+        // proving the TTL was recorded without sleeping past a real TTL.
         core.epoch_system_ms = Some(1_000);
 
         let txn_id = TxnId::new(1);
@@ -464,9 +411,7 @@ mod tests {
         let put_resp = core.stage_kv_put(&ctx, b"v1", 5_000);
         assert_eq!(put_resp.status, Status::Ok);
 
-        // Same-transaction read: `txn_id` set on the request so
-        // `execute_kv_get` consults the staging overlay before the base
-        // engine.
+        // `txn_id` set so `execute_kv_get` consults the overlay first.
         let read_task = make_task(Some(txn_id));
         let resp = core.execute_kv_get(
             &read_task,
@@ -492,9 +437,8 @@ mod tests {
 
     #[test]
     fn staged_put_with_no_ttl_remains_readable_same_transaction() {
-        // Sibling to the regression test above: ttl_ms == 0 must still round
-        // -trip the staged VALUE through the same-transaction read (no
-        // StagedTtl entry means "persistent", not "invisible").
+        // ttl_ms == 0 must still round-trip the staged value (no StagedTtl
+        // entry means "persistent", not "invisible").
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         core.epoch_system_ms = Some(1_000_000);

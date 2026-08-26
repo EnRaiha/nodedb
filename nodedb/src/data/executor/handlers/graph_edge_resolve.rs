@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Read-only resolve pass for a governed `GraphOp::EdgeDelete`.
-//!
-//! A follower has no writing identity, so a delete carrying a live write
-//! predicate cannot be replicated. This reads the edge's stored property
-//! object — the image the policy governs — decides the policy against it, and
-//! writes nothing. Success means the Control Plane may propose the same delete
-//! with a decided check; a refusal is the same authorization error the direct
-//! delete returns, and the edge stays in place either way.
+//! Read-only resolve pass for a governed `GraphOp::EdgeDelete`. Reads the
+//! edge's stored property object, decides the policy against it, and writes
+//! nothing. Success lets the Control Plane propose the delete with a
+//! decided check; a refusal matches the direct delete's error.
 
 use nodedb_physical::physical_plan::GraphOp;
 

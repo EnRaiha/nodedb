@@ -2,29 +2,12 @@
 
 //! The decided mutation set a governed document write resolved to.
 //!
-//! A document `UPDATE` / `DELETE` / `UPSERT` on a collection carrying an RLS
-//! write policy cannot cross the Raft wire carrying the live predicate: a
-//! follower has no writing identity to decide it against, and the leader
-//! re-derives its plan from the committed entry, so the predicate would be
-//! judged against whatever policy catalog the applying node holds. The Control
-//! Plane resolves the write against the rows the Data Plane holds, decides the
-//! policy there, and ships the mutations themselves.
-//!
-//! ## Body form — one form per field, both sides agree
-//!
-//! - `value` is the PRE-ENCODE MessagePack body, the same form
-//!   [`DocumentOp::PointPut::value`](super::op::DocumentOp::PointPut) carries
-//!   and the only form the document write path takes for BOTH storage modes.
-//!   A strict collection's Binary Tuple is encoded on the way to disk, by the
-//!   write path, from this body. Never JSON, never `serde_json::Value` on the
-//!   wire.
-//! - `precondition` is RAW STORED bytes — a Binary Tuple for `document_strict`,
-//!   MessagePack for schemaless — because it is compared byte-for-byte with
-//!   what storage currently holds.
-//!
-//! The two differ deliberately, and each is fixed: shipping a stored-form body
-//! into the write path re-encodes a Binary Tuple as if it were MessagePack and
-//! fails; comparing a pre-encode body against stored bytes never matches.
+//! An RLS-governed write can't cross Raft carrying the live predicate — a
+//! follower has no writing identity to judge it against. The Control Plane
+//! resolves the write and policy against the rows the Data Plane holds, then
+//! ships the mutations themselves. `value` is always pre-encode MessagePack;
+//! `precondition` is always raw stored bytes (Binary Tuple or MessagePack).
+//! Swapping the two forms fails silently or never matches — never mix them.
 
 use nodedb_types::Surrogate;
 
@@ -32,19 +15,11 @@ use super::sum_target::ResolvedSumTarget;
 
 /// One row mutation a resolved document write applies.
 ///
-/// ## Precondition
-///
-/// `precondition` is the drift check between resolve and apply, NOT user-facing
-/// business logic:
-///
-/// - `None` — the row must currently be ABSENT.
-/// - `Some(bytes)` — the row must currently hold EXACTLY `bytes`, the raw
-///   stored body, compared with `==`.
-///
-/// A surrogate-existence check would not do: it proves only that the row was
-/// not deleted, and is blind to a concurrent write that changed the row's
-/// CONTENT between resolve and apply. That is the lost update the policy
-/// decision was made to prevent.
+/// `precondition` is the resolve→apply drift check, not business logic:
+/// `None` requires the row absent, `Some(bytes)` requires it hold exactly
+/// `bytes` (`==`). A surrogate-existence check would miss a concurrent write
+/// that changed content without deleting the row — the lost update this
+/// precondition prevents.
 #[derive(
     Debug,
     Clone,
@@ -68,10 +43,8 @@ pub enum DocumentResolvedMutation {
         value: Vec<u8>,
         /// Raw stored bytes the resolve read, or `None` for an absent row.
         precondition: Option<Vec<u8>>,
-        /// `(target collection, join value)` → target row surrogate for this
-        /// collection's materialized-sum bindings, resolved on the Control
-        /// Plane. The Data Plane cannot derive it: the PK→surrogate map lives
-        /// in the catalog redb, which is Control-Plane state.
+        /// `(target collection, join value)` → target row surrogate,
+        /// resolved by the Control Plane (Data Plane has no PK→surrogate map).
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
     /// Remove `document_id`.

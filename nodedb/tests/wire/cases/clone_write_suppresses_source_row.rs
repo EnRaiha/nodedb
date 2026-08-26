@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! A write in a shadowed clone must leave exactly one visible row per key.
-//!
-//! The clone read path concatenates the target's rows with the source's, so
-//! every write that supersedes a source row has to record a suppression entry
-//! for it — a tombstone for a delete or an insert over the same key, a copy-up
-//! mapping for an update. Without one the superseded source row is merged back
-//! in and the key comes back twice.
-//!
-//! Each test asserts the ROW COUNT. Merge order puts target rows first, so a
-//! first-column assertion alone reports the right value while hiding the
-//! duplicate behind it.
+//! The clone read path concatenates target and source rows, so a write that
+//! supersedes a source row must record a suppression entry (tombstone or
+//! copy-up mapping) or the key comes back twice. Each test asserts row
+//! count — merge order puts target rows first, so a first-column assertion
+//! alone would hide a duplicate.
 
 use crate::harness::TestServer;
 

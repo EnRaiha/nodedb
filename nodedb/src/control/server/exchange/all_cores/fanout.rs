@@ -15,27 +15,11 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 
-/// Shared per-core fan for a graph BSP/WCC superstep plan: eagerly dispatch the
-/// plan to every local core (scoping each core's `owned_vshards` to the vShards
-/// round-robin homed on that core), gather the bounded responses, drop
-/// `NotFound`/empty-CSR cores, and return the successful [`Response`]s for the
-/// caller to decode and merge.
+/// Shared per-core fan for a BSP/WCC superstep plan: dispatch to every local
+/// core, gather bounded responses, drop `NotFound`/empty-CSR cores.
 ///
-/// CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
-/// on THAT core (`vshard % num_cores == core_id`, mirroring
-/// `VShardRouter::round_robin`). The plan arrives carrying the NODE's full
-/// owned-vShard set; if every core received the full set, each core would claim
-/// ownership of any node appearing in its local CSR — including nodes physically
-/// homed on a SIBLING core (they appear as cross-core edge endpoints). That node
-/// would then be emitted by two cores, duplicating it in the merged result.
-/// Per-core scoping makes the owned sets genuinely disjoint (each graph node is
-/// owned by exactly its home core), so the field-concat merge is correct with no
-/// dedup, and cross-core edges become ordinary ghosts / boundary edges.
-/// `txn_id` is stamped on every core's request so a session-transaction-scoped
-/// single-blob op (a forwarded `MetaOp::StageWrite` / `MetaOp::DropTxnOverlay`,
-/// which the leader's Data-Plane handler keys purely by `txn_id`) reaches its
-/// per-transaction overlay. `None` for the graph BSP/WCC/snapshot fans, which
-/// carry no transaction context.
+/// Must scope `owned_vshards` to `vshard % num_cores == core_id`, or every core
+/// claims sibling-homed nodes in its local CSR, duplicating them in the merge.
 pub(super) async fn gather_graph_op_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -57,12 +41,8 @@ pub(super) async fn gather_graph_op_all_cores(
         .unwrap_or_else(|p| p.into_inner())
         .num_cores();
 
-    // Eager dispatch: register a tracker receiver and dispatch to each core
-    // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
-    // prologue.
-    // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
-    // on THAT core (`vshard % num_cores == core_id`) so owned sets are genuinely
-    // disjoint across cores. See function-level doc for details.
+    // Eager dispatch: register + dispatch to each core before awaiting any response.
+    // Scope owned_vshards to `vshard % num_cores == core_id` — see doc above.
     let receivers =
         eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |core_id| {
             let mut core_plan = plan.clone();
@@ -76,10 +56,8 @@ pub(super) async fn gather_graph_op_all_cores(
                         wcc.owned_vshards
                             .retain(|v| (*v as usize) % num_cores == core_id);
                     }
-                    // All other graph ops carry no per-core-owned vShard set —
-                    // fanned verbatim. Enumerated exhaustively (no `_ =>`) so a new
-                    // graph-superstep variant forces a compile error here and the
-                    // developer must decide whether it needs per-core scoping.
+                    // No per-core vShard set — fanned verbatim. Exhaustive (no `_ =>`) so a
+                    // new superstep variant forces a scoping decision here.
                     GraphOp::Match { .. }
                     | GraphOp::MatchContinuation { .. }
                     | GraphOp::MatchVarLenResume { .. }
@@ -101,9 +79,7 @@ pub(super) async fn gather_graph_op_all_cores(
                     | GraphOp::TemporalAlgorithm { .. }
                     | GraphOp::Stats { .. } => {}
                 },
-                // All non-graph plans are fanned verbatim (no per-core-owned vShard
-                // field). Enumerated exhaustively (no `_ =>`) so a new PhysicalPlan
-                // variant forces a compile error here.
+                // Non-graph plans fanned verbatim. Exhaustive (no `_ =>`) to force a decision.
                 PhysicalPlan::Vector(_)
                 | PhysicalPlan::Document(_)
                 | PhysicalPlan::Kv(_)

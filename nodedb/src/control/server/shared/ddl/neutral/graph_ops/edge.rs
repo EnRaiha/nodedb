@@ -3,9 +3,8 @@
 //! Edge mutation handlers: GRAPH INSERT EDGE, GRAPH DELETE EDGE,
 //! GRAPH LABEL / GRAPH UNLABEL.
 //!
-//! Each function receives already-parsed typed fields from
-//! `nodedb_sql::ddl_ast::NodedbStatement`. Raw-SQL tokenising lives
-//! in the AST parser — handlers never touch `&str` parse paths.
+//! Each function receives already-parsed typed fields; handlers never touch
+//! `&str` parse paths.
 
 use nodedb_sql::ddl_ast::GraphProperties;
 
@@ -25,9 +24,7 @@ use super::support::{data_plane_verdict, ddl_err};
 
 /// `GRAPH INSERT EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>' [PROPERTIES '<json>' | { ... }]`
 ///
-/// The edge identity (`collection`/`src`/`dst`/`label`) is bundled in [`EdgeRef`]
-/// so this stays within the argument budget without an `#[allow]`, matching
-/// [`delete_edge`].
+/// Edge identity is bundled in [`EdgeRef`] to stay within the argument budget.
 pub async fn insert_edge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -55,9 +52,8 @@ pub async fn insert_edge(
     let properties_json = properties_to_json(properties)?;
     let tenant_id = identity.tenant_id;
 
-    // Flag the collection edge-bearing so a later predicate DELETE on it routes
-    // through OLLP (which derives the matching `EdgeDelete`) instead of the
-    // single-shard fast path. Idempotent; skips the Raft write once already set.
+    // Flags the collection edge-bearing so a later predicate DELETE routes through
+    // OLLP instead of the fast path. Idempotent.
     crate::control::planner::implicit_edges::mark_collection_edge_bearing(
         state,
         database_id,
@@ -67,12 +63,8 @@ pub async fn insert_edge(
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    // Dual-home routing (F1b-dualhome): an edge is reachable from BOTH endpoints
-    // (forward from src, reverse from dst), so a cross-shard edge must be written
-    // on the home vShard of src AND dst — otherwise reverse/IN traversal that
-    // scatters to `from_key(dst)` never finds it. `vsrc`/`vdst` are those two home
-    // vShards. Each endpoint's surrogate is resolved by its OWNING leader
-    // (F1b-rpc routed assign) so both homes agree on the same global identity.
+    // Dual-home: a cross-shard edge must be written on the home vShard of both src
+    // and dst, or reverse/IN traversal never finds it.
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
@@ -99,10 +91,8 @@ pub async fn insert_edge(
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    // The write policy decides the edge's `PROPERTIES` image before anything is
-    // staged or dispatched: this handler builds its plan by hand and dispatches
-    // it as trusted internal work, so nothing downstream will resolve a policy
-    // for it.
+    // Write policy decides the `PROPERTIES` image before staging: this handler
+    // dispatches as trusted internal work, so nothing downstream resolves a policy.
     let edge_put = super::edge_rls::resolve_edge_write_rls(
         state,
         identity,
@@ -118,26 +108,14 @@ pub async fn insert_edge(
         },
     )?;
 
-    // Calvin cross-shard atomicity is only operational in cluster mode with a
-    // wired sequencer. In single-node (no cluster transport) every vShard is
-    // local, so the F1a single-home write already lands BOTH the EDGES and
-    // REVERSE_EDGES rows on this node — there is nothing to dual-home and Calvin
-    // is not available. Gating here keeps single-node edge inserts on the F1a
-    // fast path (no regression) and routes only genuine cross-shard cluster edges
-    // through Calvin.
+    // Calvin cross-shard atomicity needs cluster mode with a wired sequencer. In
+    // single-node, one write already lands both EDGES and REVERSE_EDGES locally.
     let calvin_available =
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
     let single_home = vsrc == vdst || !calvin_available;
 
-    // Inside an explicit transaction block an edge insert stages into the
-    // per-transaction `GraphTxnOverlay` through the neutral gate instead of
-    // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
-    // observes the edge as present (read-your-own-writes), COMMIT replays the
-    // buffered `EdgePut`, and ROLLBACK discards the overlay. A cross-shard
-    // (dual-home) edge stages into BOTH endpoint overlays via
-    // `stage_edge_dual_home` so RYOW works from either endpoint; a single-home
-    // edge stages once. This is the write-side complement to the `delete_edge`
-    // staging below. Autocommit is untouched.
+    // In a transaction, an insert stages into `GraphTxnOverlay` instead of applying now
+    // (COMMIT replays, ROLLBACK discards); a cross-shard edge stages into both endpoints.
     if txn_ctx.sessions.transaction_state(txn_ctx.session_id) == TransactionState::InBlock {
         super::edge_stage::stage_edge_dual_home(
             state,
@@ -159,9 +137,7 @@ pub async fn insert_edge(
     }
 
     if single_home {
-        // F1a fast path (unchanged): both endpoints share one home vShard (or we
-        // are single-node), so a single-home Raft write to `vsrc` covers both
-        // forward and reverse traversal — EDGES + REVERSE_EDGES land together.
+        // F1a fast path: single-home write to `vsrc` covers both forward and reverse.
         let plan = PhysicalPlan::Graph(edge_put);
         let response =
             crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
@@ -177,12 +153,8 @@ pub async fn insert_edge(
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
         data_plane_verdict(&response)?;
     } else {
-        // Cross-shard edge: dual-home it ATOMICALLY via Calvin. `build_static_tx_class`
-        // enumerates {vsrc, vdst} as the participating vShards (the dh-1 substrate),
-        // each running the SAME EdgePut with identical pre-resolved surrogates →
-        // EDGES on `vsrc`, REVERSE_EDGES on `vdst`, committed atomically. The
-        // submit-and-await is routed to the SEQUENCER-GROUP leader (Cv1) so the
-        // transaction is actually sequenced and acked from any coordinator.
+        // Cross-shard: dual-home atomically via Calvin. `build_static_tx_class` enumerates
+        // {vsrc, vdst}, each running the same EdgePut with identical surrogates.
         let task = PhysicalTask {
             tenant_id,
             vshard_id: vsrc,
@@ -207,10 +179,8 @@ pub async fn insert_edge(
     }])
 }
 
-/// A parsed edge identity: the collection, endpoints, and label a
-/// `GRAPH INSERT EDGE` / `GRAPH DELETE EDGE` statement addresses. Bundled so
-/// [`insert_edge`] and [`delete_edge`] each stay within the argument budget
-/// without an `#[allow]`.
+/// A parsed edge identity: collection, endpoints, and label. Bundled so
+/// [`insert_edge`] and [`delete_edge`] stay within the argument budget.
 pub struct EdgeRef {
     pub collection: String,
     pub src: String,
@@ -218,13 +188,9 @@ pub struct EdgeRef {
     pub label: String,
 }
 
-/// The home vShard(s) an edge resolves to. An edge is reachable from BOTH
-/// endpoints (forward from `src`, reverse from `dst`), so a cross-shard edge
-/// (`!single_home`) has two distinct homes: `vsrc` holds the forward row and
-/// `vdst` holds the reverse row. `single_home` is true when both endpoints share
-/// one vShard, or when Calvin is unavailable (single-node) so one write covers
-/// both. Bundled so [`stage_edge_dual_home`](super::edge_stage::stage_edge_dual_home)
-/// stays within the argument budget.
+/// The home vShard(s) an edge resolves to: `vsrc` holds the forward row, `vdst`
+/// the reverse row. `single_home` is true when both share one vShard or Calvin
+/// is unavailable. Bundled for [`stage_edge_dual_home`](super::edge_stage::stage_edge_dual_home).
 pub struct EdgeHomes {
     pub vsrc: VShardId,
     pub vdst: VShardId,
@@ -257,14 +223,8 @@ pub async fn delete_edge(
     validate_edge_label(&label)?;
     let tenant_id = identity.tenant_id;
 
-    // Dual-home routing (F1b-dualhome): a cross-shard edge is stored forward on
-    // `from_key(src)` (EDGES + CSR) and reverse on `from_key(dst)` (REVERSE_EDGES),
-    // so a delete must tombstone BOTH homes — otherwise reverse/IN traversal that
-    // scatters to `from_key(dst)` keeps finding the deleted edge. `vsrc`/`vdst`
-    // are those two home vShards. Surrogates are resolved via the same routed
-    // get-or-assign as insert (existing node surrogates are returned), giving
-    // Calvin its participant shards and the lock identity that serializes against
-    // a concurrent EdgePut of the same edge.
+    // Dual-home: stored forward on `from_key(src)` and reverse on `from_key(dst)`,
+    // so delete must tombstone both homes.
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
@@ -291,10 +251,8 @@ pub async fn delete_edge(
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    // A delete carries no image, so the policy is compiled into the plan's
-    // write-gate slot here and decided in the Data Plane against the edge's
-    // stored properties — this handler dispatches trusted internal work that
-    // nothing downstream resolves a policy for.
+    // A delete carries no image, so the policy compiles into the plan's write-gate
+    // slot and is decided in the Data Plane against the edge's stored properties.
     let edge_delete = super::edge_rls::resolve_edge_write_rls(
         state,
         identity,
@@ -310,20 +268,14 @@ pub async fn delete_edge(
         },
     )?;
 
-    // Calvin cross-shard atomicity is only operational in cluster mode with a
-    // wired sequencer. In single-node every vShard is local, so the F1a
-    // single-home delete already tombstones BOTH the EDGES and REVERSE_EDGES
-    // rows on this node — nothing to dual-home and Calvin is not available.
+    // Calvin needs cluster mode with a wired sequencer; single-node already
+    // tombstones both EDGES and REVERSE_EDGES in one write.
     let calvin_available =
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
     let single_home = vsrc == vdst || !calvin_available;
 
-    // Inside an explicit transaction block an edge delete stages into the
-    // per-transaction `GraphTxnOverlay` through the neutral gate instead of
-    // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
-    // observes the edge as removed (read-your-own-writes), COMMIT replays the
-    // buffered `EdgeDelete`, and ROLLBACK discards the overlay. Autocommit is
-    // untouched.
+    // Inside a transaction, an edge delete stages into `GraphTxnOverlay` instead of
+    // applying now, so RYOW sees it removed; COMMIT replays it, ROLLBACK discards it.
     if txn_ctx.sessions.transaction_state(txn_ctx.session_id) == TransactionState::InBlock {
         super::edge_stage::stage_edge_dual_home(
             state,
@@ -344,12 +296,8 @@ pub async fn delete_edge(
         }]);
     }
 
-    // A governed delete cannot be proposed carrying its predicate: a follower
-    // has no writing identity to decide it. Resolve it against the edge's
-    // stored properties here, while the identity is live, and propose the
-    // decided delete. Only when a Raft proposer is actually live — on the
-    // single-node path the predicate reaches the Data Plane gate intact and is
-    // enforced correctly there, so resolving would only add cost.
+    // A governed delete can't be proposed with its predicate — a follower has no
+    // writing identity to decide it. Resolve against stored properties while it's live.
     if let Some(resolver) =
         crate::control::write_resolve::resolver_for_plan(&PhysicalPlan::Graph(edge_delete.clone()))
         && state.async_raft_proposer().is_some()
@@ -368,9 +316,7 @@ pub async fn delete_edge(
     }
 
     if single_home {
-        // F1a fast path (unchanged): both endpoints share one home vShard (or we
-        // are single-node), so a single-home write to `vsrc` tombstones both the
-        // forward and reverse rows together.
+        // F1a fast path: single-home write to `vsrc` tombstones both rows together.
         let plan = PhysicalPlan::Graph(edge_delete);
         let response =
             crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
@@ -386,12 +332,8 @@ pub async fn delete_edge(
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
         data_plane_verdict(&response)?;
     } else {
-        // Cross-shard edge: dual-home the delete ATOMICALLY via Calvin, mirroring
-        // the insert path. `build_static_tx_class` enumerates {vsrc, vdst} as the
-        // participating vShards, each running the SAME EdgeDelete with identical
-        // surrogates → forward tombstone on `vsrc`, REVERSE_EDGES tombstone on
-        // `vdst`, committed atomically and conflict-serialized against a
-        // concurrent EdgePut of the same edge.
+        // Cross-shard edge: dual-home the delete atomically via Calvin, mirroring
+        // the insert path — {vsrc, vdst} each run the same EdgeDelete.
         let task = PhysicalTask {
             tenant_id,
             vshard_id: vsrc,
@@ -444,21 +386,8 @@ pub async fn set_node_labels(
         PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels })
     };
 
-    // A node label is single-keyed on `node_id`, so it is SINGLE-HOME: route the
-    // write to the node's home vShard `from_key(node_id)` and replicate via Raft,
-    // exactly like the edge F1a single-home fast path. Calvin is not involved —
-    // there is only one home vShard.
-    //
-    // The node-label bitset has no redb-backed durability of its own (unlike
-    // edges, which survive via redb's synchronous commit at apply time and are
-    // rebuilt from there at startup) — a WAL record is its only durable
-    // backing. `dispatch_sync_response`'s single-node fallback dispatches
-    // straight to the Data Plane with no WAL append of its own, so this write
-    // is appended to the local WAL here, unconditionally and before dispatch —
-    // mirroring the spatial/FTS sync handlers' pattern of always appending
-    // locally even when a Raft proposer is wired: Raft replication and this
-    // node's own crash-recovery replay are independent concerns, and the local
-    // WAL is what the graph node-label replay pass reads on restart.
+    // Single-keyed on `node_id`, so single-home: route to `from_key(node_id)`.
+    // No redb durability — a WAL record is the bitset's only backing.
     crate::control::server::wal_dispatch::wal_append_if_write(
         &state.wal,
         tenant_id,

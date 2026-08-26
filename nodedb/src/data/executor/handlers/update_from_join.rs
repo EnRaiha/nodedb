@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Handler for `DocumentOp::UpdateFromJoin`: implements the two-phase
-//! `UPDATE target SET ... FROM src WHERE target.col = src.col` execution.
-//!
-//! Phase 1: scan the source collection to build a lookup map keyed by the
-//!          equi-join value (`source[source_join_col]`).
-//! Phase 2: scan the target collection; for each row whose join-column value
-//!          matches a source row, build a merged document and evaluate the
-//!          assignments to produce the post-image (shared classifier in
-//!          `update_from_join_collect::collect_update_from_join_rows`).
-//! Phase 3: either write each post-image back (`resolve_only == false`,
-//!          delegated to [`update_from_join_write`]) or, on the COMMIT-time
-//!          RESOLVE pass (`resolve_only == true`), return the matched rows as
-//!          `(doc_id, Option<surrogate>, post_image_body)` for the expander to
-//!          rewrite into concrete `PointPut` ops — WITHOUT writing,
-//!          re-indexing, accumulating a write-set, or emitting events.
+//! Handler for `DocumentOp::UpdateFromJoin`: build a source join map, scan
+//! the target and evaluate assignments into post-images, then write them or,
+//! on the commit-time resolve pass, return matched rows for the expander to
+//! rewrite into concrete `PointPut` ops without writing.
 
 use tracing::debug;
 
@@ -135,10 +124,8 @@ impl CoreLoop {
             }
         };
 
-        // Phase 3: Scan the target, join each row against the source, evaluate
-        // the SET assignments, and encode the post-image — WITHOUT writing. This
-        // classification is shared verbatim by both the RESOLVE pass and the
-        // write path so the two cannot diverge on match set or post-image.
+        // Scan the target, join, evaluate assignments, encode the post-image —
+        // without writing. Shared by both the resolve pass and write path.
         let rows = match self.collect_update_from_join_rows(
             super::update_from_join_collect::CollectUpdateRows {
                 task,
@@ -170,18 +157,11 @@ impl CoreLoop {
             return self.encode_resolved_update_rows(task, rows, strict_schema.as_ref());
         }
 
-        // Materialized-sum coverage verification (LEADER-ONLY, mirroring the
-        // bulk-DML OLLP checks): the resolution carried in the plan was derived
-        // by the Control-Plane orchestrator from a RESOLVE pass taken before this
-        // write pass. The join map, the target scan, or a matched row's join key
-        // can all have moved since. Both images of every matched row are handed
-        // in — the stored pre-image and the post-image just classified — because a
-        // rewritten join key debits the target the row leaves and credits the one
-        // it joins, so a resolution covering one side only leaves the other's
-        // total wrong. `updates` is deliberately empty here: the post-images are
-        // supplied rather than re-derived, so the assignments must not be applied
-        // a second time. On a shortfall this returns OllpRetryRequired WITHOUT
-        // writing and the orchestrator re-resolves.
+        // Materialized-sum coverage check (leader-only): the plan's resolution
+        // was derived from a resolve pass taken before this write pass, so the
+        // join map or a row's join key may have moved since. Both images are
+        // handed in, since a rewritten join key debits one target and credits
+        // another. `updates` is empty: post-images are supplied, not re-derived.
         let sum_check = SumTargetCheck {
             database_id: task.request.database_id.as_u64(),
             tid,
@@ -204,12 +184,8 @@ impl CoreLoop {
             }
         }
 
-        // Gate every matched target row on the TARGET's write policy before any
-        // write, so a rejected row cannot leave the rows ahead of it rewritten.
-        // `row.doc` carries the assignments and any regenerated columns already
-        // applied, so it is the row that would exist afterwards. The RESOLVE
-        // pass returns above without writing; the Control-Plane expander that
-        // consumes it gates the point ops it emits.
+        // Gate every matched row on the target's write policy before any write,
+        // so a rejected row can't leave rows ahead of it rewritten.
         if !matches!(
             rls_write_check.decision(),
             nodedb_types::WriteGateDecision::AdmitAll
@@ -223,18 +199,14 @@ impl CoreLoop {
             }
         }
 
-        // Gate secondary-vector maintenance once for the whole statement so a
-        // non-vector target collection pays nothing. When a vector field is
-        // present, a joined UPDATE that rewrites an embedding must re-index the
-        // row's HNSW vectors, or KNN search keeps scoring the stale embedding.
+        // Gate vector maintenance once so a non-vector target pays nothing;
+        // a rewritten embedding must re-index or KNN scores stale vectors.
         let database_id = task.request.database_id.as_u64();
         let has_vectors = self.collection_has_vectors(database_id, tid, target_collection);
 
-        // BALANCED over the whole resolved set, BEFORE the first row is
-        // written: each row below commits in its own transaction, so a check
-        // after the loop could only report a violation the rows ahead of it had
-        // already made durable. Both images are already carried on every
-        // resolved row, so nothing is re-read.
+        // Checked over the whole resolved set before the first row is written —
+        // each row commits in its own transaction, so a check after the loop
+        // could only report a violation already made durable.
         let balanced_entries = {
             let images: Vec<(&[u8], &[u8])> = rows
                 .iter()
@@ -301,24 +273,9 @@ impl CoreLoop {
         response
     }
 
-    /// Encode the RESOLVE pass payload: a msgpack `Vec<(doc_id,
-    /// Option<surrogate_u32>, post_image_body, pre_image_body)>` the
-    /// statement-time expander decodes and rewrites into concrete `PointPut` ops
-    /// (see
-    /// `control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops`).
-    ///
-    /// The PRE-image travels alongside the post-image because the Control Plane
-    /// resolves this statement's materialized-sum targets from it: a delta is
-    /// the DIFFERENCE between the two images, and an assignment that rewrites
-    /// the join column moves value between TWO targets, neither of which the
-    /// post-image alone identifies.
-    ///
-    /// Both images travel in the standard schemaless wire body form, the same
-    /// shape the MERGE RESOLVE pass emits. `ResolvedUpdateRow` carries STORED
-    /// bodies (a Binary Tuple for a strict target) because the write pass
-    /// persists them verbatim; the point ops the expander emits are re-encoded
-    /// to stored form by the write path, so shipping stored bodies here
-    /// double-encodes them.
+    /// Encode the resolve pass payload the expander rewrites into concrete
+    /// `PointPut` ops. The pre-image travels too, since materialized-sum
+    /// resolution needs the delta between images.
     fn encode_resolved_update_rows(
         &self,
         task: &ExecutionTask,

@@ -2,11 +2,9 @@
 
 //! Landing one already-decided document mutation.
 //!
-//! Each arm runs the same write the live handler runs for the same row —
-//! `apply_point_put` / `apply_point_delete` inside a transaction this function
-//! owns, image-folding enforcement inside that same transaction, then the event
-//! and the index write-versions once it commits. Nothing here recomputes an
-//! image or re-decides a policy: both were settled by the resolve pass.
+//! Each arm runs the same write the live handler runs for the same row, then
+//! the event and index write-versions once it commits. Nothing here
+//! recomputes an image or re-decides a policy — both were settled by resolve.
 
 use nodedb_physical::physical_plan::ResolvedSumTarget;
 use nodedb_types::Surrogate;
@@ -62,9 +60,8 @@ impl CoreLoop {
         let row_key = row_key.as_str();
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
 
-        // The surrogate is stable across an overwrite and the HNSW insert
-        // APPENDS rather than replaces, so the prior embedding comes out before
-        // the new one goes in — otherwise KNN keeps scoring both.
+        // HNSW insert appends rather than replaces, so the prior embedding
+        // must come out first or KNN keeps scoring both.
         if has_vectors && precondition.is_some() {
             self.remove_document_vector_indexes(database_id, tid, collection, row_key);
         }
@@ -87,9 +84,7 @@ impl CoreLoop {
         ) {
             Ok(outcome) => outcome,
             Err(e) => {
-                // Some rejections land after the row was cached; dropping `txn`
-                // reverses the durable write but not that entry, which would
-                // then serve a body that never committed.
+                // Dropping `txn` reverses the write but not the cache entry.
                 self.doc_cache
                     .invalidate(database_id, tid, collection, row_key);
                 return Err(ErrorCode::from(e));
@@ -136,9 +131,7 @@ impl CoreLoop {
         })?;
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
-        // Record the touched secondary-index values into the per-index
-        // write-value substrate (added ∪ removed ∪ bitemporal tuples) — the
-        // same bookkeeping `execute_point_update` runs after its commit.
+        // Same post-commit index bookkeeping `execute_point_update` runs.
         if let Some(lsn) = task.wal_lsn() {
             let mut tuples = std::mem::take(&mut outcome.secondary_index_added);
             tuples.append(&mut outcome.secondary_index_removed);
@@ -157,8 +150,7 @@ impl CoreLoop {
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
 
         let mut write_set = Vec::new();
-        // The autocommit WAL path mints no redo carrying the new body, so
-        // without this a WAL-only restart rebuilds the HNSW from the pre-write
+        // Without this a WAL-only restart rebuilds HNSW from the pre-write
         // body and resurrects the old embedding.
         if has_vectors {
             write_set.push(WriteSetEntry {

@@ -7,50 +7,29 @@ use nodedb_types::Value;
 
 /// Concrete rows a governed predicate `UPDATE`/`DELETE` resolved to, after the
 /// Data Plane decided the write policy against each one's exact image.
-///
-/// Native `nodedb_types::Value` throughout. `Value::from(serde_json::Value)`
-/// is documented-lossy for `Bytes`, `Uuid`, `Ulid`, `Regex`, `DateTime`,
-/// `NaiveDateTime`, `Duration`, `Range` and `Record`, so a policy decided
-/// against JSON-roundtripped rows would be decided against a value the
-/// collection never holds.
+/// Native `nodedb_types::Value` throughout — `Value::from(serde_json::Value)`
+/// is lossy for several types, so a JSON-roundtripped row is not the row.
 pub enum ResolvedRows {
     /// `(primary key, full post-image)` for every row the policy admitted.
     Update(Vec<(Value, Vec<Value>)>),
     /// Primary key of every row the policy admitted for removal.
     Delete(Vec<Value>),
-    /// KV: every mutation this resolved write applies, plus the exact response
-    /// payload to hand back once they all apply cleanly.
-    ///
-    /// A KV write is not row-set shaped: one statement can put, delete, and
-    /// move TTL across two collections. The mutation list is the decided form,
-    /// and the payload travels with it because a `CAS` that did not match owes
-    /// the caller a reply while writing nothing at all.
+    /// KV mutations plus the exact response payload — not row-set shaped, so
+    /// e.g. a `CAS` miss owes a reply while writing nothing.
     Kv {
         mutations: Vec<KvResolvedMutation>,
         response_payload: Vec<u8>,
     },
-    /// Document: every row mutation this resolved write applies, plus the exact
-    /// response payload to hand back once they all apply cleanly.
-    ///
-    /// One shape for all five governed deferred document writes. A point op
-    /// resolves to one mutation, a bulk op to N in the same vector. The payload
-    /// travels with them because a `RETURNING` projection is decided against
-    /// the images the resolve read, not against state that has since moved on.
+    /// One shape for all five governed deferred document writes: a point op
+    /// resolves to one mutation, a bulk op to N, plus the reply payload.
     Document {
         mutations: Vec<DocumentResolvedMutation>,
         response_payload: Vec<u8>,
     },
-    /// Timeseries: the canonical line-protocol lines the governed ingest
-    /// resolved to, every timestamp stamped.
-    ///
-    /// An ingest is not row-set shaped either: its rows exist only after the
-    /// payload is rewritten into line protocol, and that rewrite is what the
-    /// policy was decided against. The lines travel back so the proposed write
-    /// carries the exact images the decision covered.
+    /// Canonical line-protocol lines a governed ingest resolved to, every
+    /// timestamp stamped — an ingest has no rows until rewritten to lines.
     Timeseries { lines: Vec<String> },
-    /// Graph: the governed edge delete's pre-image satisfied the policy.
-    ///
-    /// A delete names its edge in full on the plan, so nothing has to travel
-    /// back — the verdict is the whole resolution.
+    /// The governed edge delete's pre-image satisfied the policy; the delete
+    /// already names its edge in full, so nothing else travels back.
     GraphEdgeDeleteAdmitted,
 }

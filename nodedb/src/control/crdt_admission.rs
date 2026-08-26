@@ -51,13 +51,9 @@ pub struct CrdtAdmissionOutcome {
     pub payload: Vec<u8>,
     pub write_version: crate::types::Lsn,
     /// Operations the admitted delta encoded that the target document already
-    /// knew, measured by the preview that fenced this apply.
-    ///
-    /// The apply payload says what the server decided; this says what the delta
-    /// carried. A delta whose operations were all already present produces the
-    /// same successful payload as one that wrote a row, so without this the
-    /// caller has no way to tell a client whose writes are landing from one
-    /// whose writes are being absorbed.
+    /// knew, measured by the preview that fenced this apply. Distinguishes a
+    /// client whose writes land from one whose writes are being absorbed —
+    /// both otherwise produce the same successful payload.
     pub trimmed_ops: u64,
 }
 

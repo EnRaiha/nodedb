@@ -25,11 +25,8 @@ async fn tx_duplicate_pk_insert_raises_unique_violation() {
 
     server.exec("BEGIN").await.unwrap();
 
-    // In-transaction point writes execute at STATEMENT time (staged into the
-    // per-transaction overlay), so a duplicate primary key is rejected with
-    // SQLSTATE 23505 AT THE OFFENDING STATEMENT — as PostgreSQL does — rather
-    // than deferred to COMMIT. The correctness property is unchanged: UNIQUE is
-    // enforced inside a transaction and the duplicate is never applied.
+    // In-transaction point writes execute at statement time, so a duplicate
+    // primary key is rejected at the offending statement, not deferred to commit.
     match server
         .client
         .simple_query("INSERT INTO tx_dup (id, n) VALUES ('dup', 2)")

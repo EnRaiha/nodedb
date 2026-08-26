@@ -28,13 +28,10 @@ use super::super::query_stream::{NdjsonBody, ndjson_body_stream, try_open_stream
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
 
-/// POST /v1/query/stream — execute SQL and return results as NDJSON (newline-delimited JSON).
+/// POST /v1/query/stream — execute SQL, return results as NDJSON.
 ///
-/// Each result row is a separate JSON line terminated by `\n`.
-/// Content-Type: application/x-ndjson
-///
-/// This is suitable for streaming large result sets without buffering
-/// the entire response. Clients can process each line as it arrives.
+/// Each row is a separate JSON line (`\n`-terminated), Content-Type
+/// `application/x-ndjson`, so clients can process large result sets unbuffered.
 pub async fn query_ndjson(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -82,15 +79,8 @@ pub async fn query_ndjson(
 
     let query_ctx = &state.query_ctx;
 
-    // The request-selected database is authoritative for RLS variables while
-    // retaining verified JWT/session enrichment from authentication: passing
-    // it as the session database makes `scope.database_id()` resolve to
-    // exactly `database_id`, and the verified JWT (when this request
-    // authenticated via JWT bearer) reproduces the same claim-derived
-    // enrichment `resolve_auth` would have given an `AuthContext`.
-    //
-    // NDJSON does not extract a per-query `ON DENY` clause (unlike the
-    // materialized `/v1/query` route) — that is pre-existing behavior.
+    // Passing database as the session database makes `scope.database_id()` resolve to it.
+    // NDJSON does not extract a per-query `ON DENY` clause (unlike `/v1/query`).
     let request = build_request_scope(
         &identity,
         verified_jwt.as_ref(),
@@ -100,12 +90,8 @@ pub async fn query_ndjson(
         peer.as_str(),
     );
 
-    // Request-admission gate: internal-service exemption, blacklist, account
-    // status, then rate limit — before any planning/dispatch, so load is
-    // shed before it is spent. `Some(result)` carries the rate-limit outcome
-    // this handler surfaces as `X-RateLimit-*` response headers below. The
-    // accepted socket's address is what makes the IP-blacklist and risk
-    // halves of that gate live on this route.
+    // Admission gate (exemption, blacklist, account status, rate limit) runs
+    // before planning/dispatch, so load sheds before it's spent.
     let rate_limit_result = match crate::control::server::session_auth::check_request_admission(
         &state.shared,
         &request,
@@ -118,12 +104,8 @@ pub async fn query_ndjson(
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 
-    // Planning and lease admission run as one retried unit so a descriptor
-    // drain starting between them is absorbed rather than surfaced. Admission
-    // still follows authorization inside the unit, so denied requests never
-    // acquire a descriptor lease. A lazy body takes ownership of the scope
-    // below; the materialized path retains it lexically through all dispatch
-    // and NDJSON shaping.
+    // Planning and lease admission run as one retried unit; a denied request never
+    // acquires a lease.
     let admission = match plan_authorize_and_admit(PlanAdmissionRequest {
         state: &state.shared,
         query_ctx,
@@ -145,10 +127,8 @@ pub async fn query_ndjson(
 
     let _request = state.shared.tenant_request_guard(tenant_id);
 
-    // Authorization and admission above intentionally precede stream dispatch.
-    // `Body::from_stream` then polls the data-plane stream under normal HTTP
-    // backpressure while its captured lease scope remains alive until body
-    // completion or client disconnect.
+    // `Body::from_stream` polls the data-plane stream under normal HTTP backpressure
+    // while its captured lease scope stays alive until body completion or disconnect.
     match try_open_stream(&state, &tasks, &identity, database_id, trace_id).await {
         Ok(Some((stream, limit))) => {
             let Some(lease_scope) = lease_scope.take() else {
@@ -157,13 +137,8 @@ pub async fn query_ndjson(
                 })
                 .into_response();
             };
-            // Built only once the streaming path is confirmed taken — `tasks`
-            // is a single-task slice here (`try_open_stream` requires exactly
-            // one task to return `Some`). The streaming body below owns the
-            // resulting guard for its whole polling lifetime, so rows
-            // actually sent to the client (not rows planned) are what gets
-            // billed; see `DetachedMeterGuard`'s docs. `None` when metering
-            // is disabled (the default).
+            // Streaming body owns the guard, so only rows actually sent are billed;
+            // see `DetachedMeterGuard`.
             let stream_meter_guard = if state.shared.metering_config.enabled
                 && let [task] = tasks.as_slice()
             {
@@ -179,9 +154,7 @@ pub async fn query_ndjson(
                         stream,
                         limit,
                         projection: Some(output_schema.clone()),
-                        // `try_open_stream` only returns `Some` for a
-                        // single-task plan, so the first task IS the stream's
-                        // source; resolved here, once, before any line ships.
+                        // `try_open_stream` returns `Some` only for a single-task plan.
                         redaction: tasks.first().map(|task| {
                             QueryRedaction::for_plan(tenant_id, scope.auth(), &task.plan)
                         }),
@@ -202,27 +175,19 @@ pub async fn query_ndjson(
 
     let _lease_scope = lease_scope;
     let mut ndjson = String::new();
-    // Checked once rather than per task — metering is disabled by default,
-    // so this keeps the per-task extraction below (which clones the
-    // collection name) a true no-op on the hot path for every deployment
-    // that hasn't turned it on. This fallback path fully materializes the
-    // NDJSON body before returning it (unlike the true streaming path
-    // above), so there is no early-client-disconnect case to account for
-    // here — it meters like the materialized `/v1/query` route.
+    // Checked once, not per task: keeps per-task extraction a no-op when metering is
+    // disabled. This fallback fully materializes the body, so it meters like `/v1/query`.
     let metering_enabled = state.shared.metering_config.enabled;
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
-        // Captured before dispatch moves `task.plan` — needed by the
-        // protocol-neutral shaping core below.
+        // Captured before dispatch moves `task.plan` — needed by shaping below.
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
         // Resolved once per task, reused for every payload it produced.
         let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
 
-        // A spent hard quota refuses the task before it runs; the charging
-        // call at the end of this loop is on the success path and so can
-        // never refuse anything itself. Reported as an error line and the
-        // task skipped, matching how this stream reports a dispatch error.
+        // A spent hard quota refuses the task before it runs; reported as an error
+        // line and the task skipped, matching this stream's error reporting.
         if let Some(info) = &plan_metering_info
             && let Err(e) = admit_quota_for_dispatch(&state.shared, &scope, info)
         {
@@ -273,12 +238,8 @@ pub async fn query_ndjson(
         } else if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
             && state.shared.async_raft_proposer().is_some()
         {
-            // A governed columnar predicate `UPDATE`/`DELETE` (RLS write
-            // policy + live Raft proposer) is resolved to a concrete row set
-            // on the Control Plane before it is proposed. On the local
-            // (non-Raft) path the predicate reaches the Data Plane gate
-            // intact and is enforced correctly there, so this branch is
-            // skipped in that case.
+            // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
+            // before proposing; local (non-Raft) path skips this branch.
             crate::control::write_resolve::run_authorized_write_resolve(
                 &state.shared,
                 authorized_task,
@@ -309,10 +270,8 @@ pub async fn query_ndjson(
 
         match dispatch_result {
             Ok(payloads) => {
-                // This task's own row count, for metering below — the
-                // dispatch itself already succeeded here (that is this
-                // `match` arm), so a per-row shaping error doesn't change
-                // whether the task is billed, only how many rows it counts.
+                // Row count for metering below — a per-row shaping error doesn't
+                // change whether the task is billed, only how many rows count.
                 let mut task_rows: u64 = 0;
                 for payload in &payloads {
                     if payload.is_empty() {

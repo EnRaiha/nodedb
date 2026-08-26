@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `MetaOp::ResolveTxn` handler: turn a committing transaction's staged
-//! post-images into ONE replayable [`RedoRecord`], WITHOUT mutating base.
-//!
-//! Resolve reads the per-transaction staging overlay (`CoreLoop::txn_overlays`)
-//! by shared reference and emits, for every staged KV post-image, the
-//! engine-native WAL sub-record shape that engine's autocommit path already
-//! produces. The Control Plane appends the returned bytes as a single
-//! `RecordType::TransactionRedo` record; a later install phase replays them. No
-//! base engine is touched here.
-//!
-//! Two serializer families live in this module. The overlay-driven family (KV,
-//! Document, Graph) reads resolved per-surrogate post-images from the staging
-//! overlay. The plan-driven family (Vector, Array, Columnar, Timeseries,
-//! Spatial) is not staged into any overlay for redo purposes — vector
-//! post-images are inexpressible, array / columnar / timeseries batches ride
-//! the buffered-plan path re-running the engine-native batch payload, and
-//! spatial `Insert` / `Delete` plan nodes already carry their complete
-//! absolute post-image (the overlay `stage_spatial` writes into exists only
-//! for same-transaction read-your-own-writes, not for redo — see
-//! `resolve/spatial.rs` module docs) — so all four serialize directly from
-//! the plan node. Every writing op either serializes to its engine-native
-//! sub-record or raises a typed error; none is silently omitted, since
-//! dropping an op class would lose those rows on install.
+//! `MetaOp::ResolveTxn`: turns a committing transaction's staged post-images
+//! into one replayable [`RedoRecord`], without mutating base. Overlay-driven
+//! serializers (KV, Document, Graph) read post-images from the staging
+//! overlay; plan-driven serializers (Vector, Array, Columnar, Timeseries,
+//! Spatial) are unstaged and serialize from the plan node instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -66,13 +48,8 @@ impl CoreLoop {
     }
 
     /// Build the ordered redo sub-records for a transaction's staged
-    /// post-images.
-    ///
-    /// The plan set is walked once to (a) classify every op exhaustively and
-    /// (b) collect the distinct KV collections whose overlay entries must be
-    /// serialized. Serialization is overlay-driven: the resolved absolute
-    /// post-image (value, tombstone, absolute expiry) lives in the overlay, not
-    /// the plan.
+    /// post-images. Walks the plan once to classify every op and collect
+    /// the touched KV collections; serializes from the overlay, not the plan.
     fn resolve_txn_ops(
         &mut self,
         task: &ExecutionTask,
@@ -85,11 +62,8 @@ impl CoreLoop {
         let mut graph_collections: BTreeSet<String> = BTreeSet::new();
         let mut edge_surrogates: BTreeMap<EdgeIdentityKey, (u32, u32)> = BTreeMap::new();
 
-        // Plan-driven serializers (vector / array / columnar / timeseries) emit
-        // directly from the plan node into `ops` during this walk, in plan
-        // order. Overlay-driven serializers (KV / document / graph) only
-        // collect their touched collections here and are serialized from the
-        // overlay in the second phase below. Both append to the same `ops`.
+        // Plan-driven serializers emit into `ops` during this walk; overlay-driven
+        // serializers only collect collections here, serialized in phase two below.
         let mut ops: Vec<RedoSubRecord> = Vec::new();
 
         for plan in plans {
@@ -98,18 +72,12 @@ impl CoreLoop {
                 // skipped; row-level writes contribute their collection.
                 PhysicalPlan::Kv(op) => classify_kv_op(op, &mut kv_collections)?,
 
-                // Document: overlay-backed serializer. Staged point/bulk writes
-                // contribute their collection; read-only ops stage nothing;
-                // RETURNING variants and join/merge DML have no overlay
-                // post-image and raise a typed error.
+                // Document: staged point/bulk writes contribute their collection;
+                // join/merge DML has no overlay post-image and errors.
                 PhysicalPlan::Document(op) => classify_document_op(op, &mut doc_collections)?,
 
-                // Graph: overlay-backed serializer for edge puts/deletes. The
-                // overlay carries edge identity + properties but not the
-                // endpoint surrogates a redo put must emit, so those are
-                // collected here from the plan nodes themselves (resolved at
-                // plan-construction time) into `edge_surrogates`. Node-label
-                // deltas have no redo shape and raise a typed error.
+                // Graph: overlay carries edge identity/properties but not the
+                // endpoint surrogates a redo put needs, so those come from the plan.
                 PhysicalPlan::Graph(op) => {
                     graph::classify_graph_op(op, &mut graph_collections, &mut edge_surrogates)?
                 }
@@ -126,27 +94,15 @@ impl CoreLoop {
                 // maintenance ops carry no persisted post-image.
                 PhysicalPlan::Query(_) | PhysicalPlan::Meta(_) => {}
 
-                // Plan-driven serializers. These engines are not staged into a
-                // transaction overlay (vector post-images are inexpressible;
-                // array / columnar / timeseries batches ride the buffered-plan
-                // path), and their redo replay re-runs the engine-native batch
-                // payload rather than a per-row shape. So they serialize
-                // directly from the plan node in plan order. Each op either
-                // emits its engine-native sub-record, skips (reads /
-                // maintenance), or raises a typed error (writes with no redo
-                // shape — e.g. `Columnar::{Update, Delete}` predicate DML).
+                // Plan-driven: these engines are not staged into an overlay, so
+                // each op serializes from the plan node, skips, or errors.
                 PhysicalPlan::Vector(op) => vector::serialize_vector_op(op, &mut ops)?,
                 PhysicalPlan::Array(op) => array::serialize_array_op(op, &mut ops)?,
                 PhysicalPlan::Columnar(op) => columnar::serialize_columnar_op(op, &mut ops)?,
                 PhysicalPlan::Timeseries(op) => columnar::serialize_timeseries_op(op, &mut ops)?,
 
-                // Spatial `Insert` / `Delete` plan nodes already carry the
-                // complete absolute post-image (collection, field, surrogate,
-                // geometry, provenance), so — like vector — they serialize
-                // directly from the plan node rather than an overlay walk.
-                // `Scan` is a read and emits nothing; either write with no
-                // sync provenance raises a typed error (see
-                // `resolve/spatial.rs` module docs).
+                // Spatial `Insert`/`Delete` plan nodes carry the complete absolute
+                // post-image, so they serialize from the plan node, not an overlay.
                 PhysicalPlan::Spatial(op) => spatial::serialize_spatial_op(op, &mut ops)?,
 
                 // Coordinator-only op; never legal on the Data Plane.
@@ -159,16 +115,9 @@ impl CoreLoop {
             }
         }
 
-        // Assign the resolve-time bitemporal stamp for every staged `Put` in a
-        // `bitemporal=true` document collection, ONCE, and store it in the
-        // overlay sidecar. `serialize_document_collection` emits it in the redo
-        // 8-tuple and the commit-time base install reads it back out of the same
-        // sidecar, so redo and install agree on the version key (a divergent
-        // stamp would write a second version on a normal restart). Stamps are
-        // assigned in deterministic (collection, doc-id) order so replicas
-        // resolving the same transaction produce identical version keys. The
-        // monotonic `bitemporal_now_ms` lives on the core, so this is the one
-        // place the stamp can be pinned before both the redo and the install.
+        // Pin the resolve-time bitemporal stamp once, in the overlay sidecar, so
+        // redo and install read the same version key. Deterministic (collection,
+        // doc-id) order keeps replicas resolving the same txn in sync.
         for collection in &doc_collections {
             if !self.is_bitemporal(task.request.database_id.as_u64(), tid, collection) {
                 continue;
@@ -258,10 +207,8 @@ impl CoreLoop {
                     &mut ops,
                 )?;
             }
-            // Node-label deltas live under the fixed sentinel collection key,
-            // not one of `graph_collections` (a transaction may stage ONLY
-            // label mutations with no edge writes at all), so this is called
-            // unconditionally whenever the transaction has a graph overlay.
+            // Node-label deltas live under the fixed sentinel key, not
+            // `graph_collections`, so this runs whenever a graph overlay exists.
             let label_coll_key = (
                 task.request.database_id,
                 TenantId::new(tid),
@@ -323,16 +270,14 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
         // nothing.
         | KvOp::ResolveWrite(_) => Ok(()),
 
-        // Resolve-before-propose is an autocommit path: the resolution is
-        // decided against committed state and proposed directly, never staged
-        // into a transaction overlay, so no row-level redo shape carries it.
+        // Resolve-before-propose is an autocommit path: never staged into an
+        // overlay, so no row-level redo shape carries it.
         KvOp::ResolvedWrite { .. } => Err(crate::Error::PlanError {
             detail: "kv resolved write is not supported in transaction resolve".to_string(),
         }),
 
-        // Predicate DML resolves its row set from committed state at apply
-        // time; the per-row KV redo shapes cannot express that. Autocommit
-        // is the supported path.
+        // Predicate DML resolves its row set from committed state at apply time;
+        // per-row KV redo shapes can't express that. Autocommit is the supported path.
         KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. } => {
             Err(crate::Error::PlanError {
                 detail: "kv predicate UPDATE/DELETE is not supported in transaction resolve"
@@ -340,11 +285,8 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
             })
         }
 
-        // TTL-only writes: `Expire` / `Persist` stage a TTL delta with NO value
-        // post-image (`stage_kv_ttl.rs`). The KV redo shapes carry a TTL only as
-        // the sixth element of a value put, so a standalone TTL change on a base
-        // row has no redo representation. Rejecting is deliberate — silently
-        // skipping would drop the change from the install path.
+        // A standalone TTL delta has no value post-image, and KV redo carries
+        // TTL only as part of a value put, so rejecting avoids a silent drop.
         KvOp::Expire { .. } | KvOp::Persist { .. } => Err(crate::Error::PlanError {
             detail: "kv EXPIRE/PERSIST is not supported in transaction resolve".to_string(),
         }),
@@ -366,14 +308,9 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
 /// the writes that leave no overlay post-image.
 fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> crate::Result<()> {
     match op {
-        // Staged writes (`is_point_write`): the resolved post-image (value or
-        // tombstone) is in the overlay, keyed by the user primary key. A
-        // `RETURNING` clause does not affect staging — the `stage_*` handlers
-        // record the matched rows' post-images identically whether or not one
-        // is present — so these serialize from the overlay like any other
-        // point/bulk write. The RETURNING projection itself is a
-        // response-shape concern the Control Plane already discards inside a
-        // transaction; it leaves no separate post-image to carry here.
+        // Staged writes: the resolved post-image is in the overlay, keyed by the
+        // user primary key. RETURNING doesn't affect staging, so these serialize
+        // from the overlay like any other point/bulk write.
         DocumentOp::PointPut { collection, .. }
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
@@ -406,19 +343,14 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. } => Ok(()),
 
-        // Resolve-before-propose is an autocommit path: the resolution is
-        // decided against committed state and proposed directly, never staged
-        // into a transaction overlay, so no row-level redo shape carries it.
+        // Resolve-before-propose is an autocommit path: never staged into an
+        // overlay, so no row-level redo shape carries it.
         DocumentOp::ResolvedWrite { .. } => Err(crate::Error::PlanError {
             detail: "document resolved write is not supported in transaction resolve".to_string(),
         }),
 
-        // Join/merge/batch DML is never staged: `UpdateFromJoin` and `Merge`
-        // resolve a multi-row cross-collection effect that has no
-        // per-surrogate absolute post-image, and `BatchInsert` rides the
-        // buffered-plan path rather than the overlay. The overlay holds no
-        // post-image for them, so rejecting keeps their rows out of a silently
-        // lossy redo record. This is permanent — not "not yet supported".
+        // Join/merge have no per-surrogate post-image; `BatchInsert` rides the
+        // buffered-plan path. None is staged, so rejecting avoids a lossy redo.
         DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::BatchInsert { .. } => Err(crate::Error::PlanError {
@@ -555,7 +487,7 @@ mod tests {
         let txn = TxnId::new(1);
 
         // Two Incrs in one transaction: 0 + 40, then + 2 = 42. The overlay slot
-        // holds the resolved ABSOLUTE value (42), not either delta.
+        // holds the resolved absolute value (42), not either delta.
         for delta in [40i64, 2] {
             let resp = core.execute_stage_kv(
                 &task,
@@ -707,7 +639,7 @@ mod tests {
         let txn = TxnId::new(5);
         let now = crate::engine::kv::current_ms();
 
-        // Seed a base KV row, then stage a DIFFERENT value for the same key.
+        // Seed a base KV row, then stage a different value for the same key.
         core.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: DatabaseId::DEFAULT.as_u64(),
             tenant_id: TID,
@@ -747,11 +679,8 @@ mod tests {
         let txn = TxnId::new(6);
         let surrogate = 4u32;
 
-        // A DELETE ... RETURNING is now staged like any other point delete: the
-        // overlay holds a tombstone, so resolve serializes it from the overlay
-        // instead of raising the old typed error. (The RETURNING projection is a
-        // response-shape concern the Control Plane already discards inside a
-        // transaction; it leaves no separate post-image to preserve.)
+        // A DELETE ... RETURNING stages like any other point delete: the overlay
+        // holds a tombstone, and resolve serializes it from there.
         core.txn_overlay_mut(txn)
             .insert_tombstone(coll_key("notes"), surrogate, "gone");
 
@@ -984,8 +913,7 @@ mod tests {
             overlay.insert_put(coll_key("notes"), 2, "u2", schemaless_body("bob"));
         }
 
-        // Previously this plan raised a typed error in `classify_document_op`;
-        // now it serializes the staged post-images from the overlay.
+        // Serializes the staged post-images from the overlay.
         let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
             collection: "notes".to_string(),
             filters: Vec::new(),
@@ -1038,10 +966,8 @@ mod tests {
         let task = make_task();
         let txn = TxnId::new(45);
 
-        // These ops leave no per-surrogate overlay post-image (join/merge are
-        // multi-row cross-collection effects; batch insert rides the buffered
-        // plan), so resolve must still raise a typed error rather than silently
-        // drop their rows.
+        // These ops leave no per-surrogate overlay post-image, so resolve
+        // raises a typed error rather than silently dropping their rows.
         let plans = [
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: "t".to_string(),
@@ -1093,11 +1019,9 @@ mod tests {
         }
     }
 
-    /// The inverse of `join_merge_batch_dml_still_yield_typed_error`: the five
-    /// extended vector writes (`DirectUpsert`, `MultiVectorInsert`,
-    /// `MultiVectorDelete`, `SparseInsert`, `SparseDelete`) used to raise a
-    /// typed error in `serialize_vector_op`; they now resolve to redo
-    /// sub-records so an in-transaction vector write is not silently lost.
+    /// The five extended vector writes (`DirectUpsert`, `MultiVectorInsert`,
+    /// `MultiVectorDelete`, `SparseInsert`, `SparseDelete`) must resolve to
+    /// redo sub-records, not a typed error.
     #[test]
     fn extended_vector_writes_now_resolve_ok() {
         let (mut core, _dir) = make_core();
@@ -1177,10 +1101,7 @@ mod tests {
     }
 
     /// Resolve a `DirectUpsert`, wrap it into a `TransactionRedo` record, and
-    /// replay into a fresh core — the vector-primary row must survive. Before
-    /// the resolve/replay wiring this was rejected at resolve and, even if
-    /// resolved, would not be decoded (only `replay_vector_extended_wal`
-    /// decodes it, and the redo path never called it).
+    /// replay into a fresh core — the vector-primary row must survive.
     #[test]
     fn resolved_direct_upsert_replays_into_fresh_engine() {
         let (mut src, _src_dir) = make_core();
@@ -1401,10 +1322,8 @@ mod tests {
             .expect("encode binary tuple")
     }
 
-    /// A schemaless document body in the form staging and the document store
-    /// hold it: the canonical storage encoding, not the raw `Value` encoding.
-    /// `apply_point_put` canonicalizes on write, so a body in any other shape
-    /// would not survive a byte-for-byte round-trip through replay.
+    /// A schemaless document body in canonical storage encoding, not the raw
+    /// `Value` encoding — `apply_point_put` canonicalizes on write.
     fn schemaless_body(name: &str) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert(
@@ -1447,11 +1366,8 @@ mod tests {
 
     #[test]
     fn strict_document_put_replays_correctly() {
-        // The strict-mode regression: the overlay holds a Binary Tuple. Resolve
-        // must decode it to MessagePack so the document redo replay path (which
-        // re-encodes via `bytes_to_binary_tuple`) restores the row. Emitting the
-        // Binary Tuple verbatim would make replay's decode fail and drop the row
-        // — this test would then FAIL, which is the whole point of the unit.
+        // Overlay holds a Binary Tuple; resolve must decode it to MessagePack
+        // so the redo replay path can re-encode it via `bytes_to_binary_tuple`.
         let (mut src, _src_dir) = make_core();
         register_strict(&mut src, "sdocs");
         let task = make_task();
@@ -1946,12 +1862,9 @@ mod tests {
 
     #[test]
     fn graph_edge_put_without_matching_plan_surrogates_yields_typed_error() {
-        // The overlay stages a put for `a-knows->b`, but the only `EdgePut`
-        // plan in this resolve names a DIFFERENT edge identity in the same
-        // collection. `graph_collections` still names "g" (so the staged
-        // `a-knows->b` post-image IS walked), but `edge_surrogates` has no
-        // entry for it: resolve must raise a typed error rather than invent a
-        // surrogate pair for an edge no plan node accounts for.
+        // Overlay stages a put for `a-knows->b`, but the plan's `EdgePut` names a
+        // different edge identity, so `edge_surrogates` has no entry for it —
+        // resolve must error rather than invent a surrogate pair.
         let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(32);
@@ -2004,12 +1917,9 @@ mod tests {
         assert_eq!(decoded.dst_id, "b");
         assert!(decoded.system_from.is_some_and(|s| s > 0));
 
-        // Seed the pre-existing edge in a fresh core at a system-time ordinal
-        // EARLIER than the delete's frozen `system_from`. In production the
-        // edge's own (earlier) put is replayed before the delete, so the
-        // tombstone is the newer version and hides it; freezing the seed here
-        // reproduces that ordering rather than stamping the seed with a fresh
-        // `next_ordinal` that would (incorrectly) post-date the tombstone.
+        // Seed the edge at a system-time ordinal earlier than the delete's
+        // frozen `system_from`, matching production replay order — a fresh
+        // `next_ordinal` seed would incorrectly post-date the tombstone.
         let (mut dst_core, _dst_dir) = make_core();
         dst_core.active_graph_system_from =
             Some(decoded.system_from.expect("delete froze a system_from") - 1);
@@ -2213,11 +2123,8 @@ mod tests {
         core.execute_resolve_txn(task, TID, txn, &[PhysicalPlan::Graph(op.clone())])
     }
 
-    /// Inverse of the old typed-error regression: `SetNodeLabels` staged
-    /// alone must now resolve to a `GraphNodeLabelSet` sub-record and the
-    /// label must survive a redo replay into a fresh engine (simulating a
-    /// crash between WAL append and install — the fresh core never sees the
-    /// original core's base state, only the wrapped redo bytes).
+    /// `SetNodeLabels` staged alone must resolve to a `GraphNodeLabelSet`
+    /// sub-record and survive a redo replay into a fresh engine.
     #[test]
     fn graph_set_node_labels_resolves_and_replays_into_fresh_engine() {
         let (mut src, _src_dir) = make_core();
@@ -2328,9 +2235,7 @@ mod tests {
         );
         assert_eq!(remove_resp.status, Status::Ok);
 
-        // Pass both ops through resolve exactly as the Control Plane would
-        // (the full staged transaction's op list), proving the label
-        // serialization fires from a realistic call, not a contrived one.
+        // Pass both ops through resolve as the full staged transaction op list.
         let plans = [
             PhysicalPlan::Graph(GraphOp::SetNodeLabels {
                 node_id: "n1".to_string(),
@@ -2371,11 +2276,9 @@ mod tests {
         );
     }
 
-    /// Crash-before-install: the fresh destination core never installs
-    /// anything itself — the wrapped `TransactionRedo` bytes travel alone
-    /// (as they would from the WAL after a crash right after append), and
-    /// `replay_transaction_redo_wal` must reconstruct the label from those
-    /// bytes with no other state present.
+    /// Crash-before-install: the fresh destination core installs nothing
+    /// itself; `replay_transaction_redo_wal` must reconstruct the label
+    /// from the wrapped `TransactionRedo` bytes alone.
     #[test]
     fn graph_node_label_crash_before_install_replays_from_wal_only() {
         let (mut src, _src_dir) = make_core();
@@ -2434,9 +2337,7 @@ mod tests {
     // ── Plan-driven serializers (vector / array / columnar / timeseries) ──
 
     /// A vector `Insert` plan resolves to a `VectorPut` sub-record and replays
-    /// into a FRESH engine such that the vector is present in the rebuilt HNSW
-    /// index (post-images are inexpressible; the redo logs the insert and
-    /// replay rebuilds).
+    /// into a fresh engine, rebuilding the HNSW index from the logged insert.
     #[test]
     fn vector_insert_resolves_and_replays_queryable() {
         let (mut src, _src_dir) = make_core();
@@ -2723,11 +2624,8 @@ mod tests {
         assert_eq!(dictionary.1.get_id("west,1"), Some(0));
     }
 
-    /// `Columnar::Update` / `Columnar::Delete` are predicate DML: resolve emits
-    /// the SAME `columnar_dml` (`TimeseriesBatch`) sub-record the autocommit path
-    /// appends, carrying the predicate (and, for update, the assignments), so an
-    /// in-tx columnar UPDATE/DELETE is restart-durable exactly like its
-    /// autocommit twin.
+    /// `Columnar::Update`/`Delete` are predicate DML: resolve emits the same
+    /// `columnar_dml` sub-record the autocommit path appends.
     #[test]
     fn columnar_update_and_delete_emit_columnar_dml_sub_record() {
         use nodedb_types::columnar::ColumnarDmlWalRecord;
@@ -2770,9 +2668,7 @@ mod tests {
     }
 
     /// An array `Put` plan resolves to a version-tagged `ArrayPut` sub-record
-    /// (decodable by the exact function replay uses) and replays into a fresh
-    /// engine, respecting the `ArrayFlush` watermark discipline. A flushed,
-    /// non-empty put yields at least one scannable tile.
+    /// and replays into a fresh engine, respecting `ArrayFlush` watermarks.
     #[test]
     fn array_put_resolves_and_replays() {
         use crate::engine::array::wal::{ArrayPutCell, decode_put_with_version};
@@ -2953,11 +2849,9 @@ mod tests {
         );
     }
 
-    // ── Spatial resolve tests ────────────────────────────────────────────────
-    //
-    // Spatial `Insert` / `Delete` plan nodes carry the complete post-image
-    // directly (see `resolve/spatial.rs`), so these mirror the vector/columnar
-    // plan-driven tests above rather than the KV/document overlay tests.
+    // ── Spatial resolve tests ──
+    // Spatial `Insert`/`Delete` plan nodes carry the complete post-image
+    // directly, mirroring the vector/columnar plan-driven tests above.
 
     use nodedb_physical::physical_plan::SpatialOp;
     use nodedb_types::geometry::Geometry;

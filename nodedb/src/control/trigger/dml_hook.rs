@@ -2,16 +2,9 @@
 
 //! DML trigger hook: intercepts write dispatches to fire BEFORE/AFTER/INSTEAD OF triggers.
 //!
-//! Sits between the Control Plane query router and the Data Plane dispatch.
-//! For each DML write task:
-//! 1. Classify the operation (INSERT/UPDATE/DELETE) and extract collection + doc ID
-//! 2. Fetch OLD row data for UPDATE/DELETE (needed for OLD.* bindings)
-//! 3. Fire INSTEAD OF triggers — if handled, skip normal dispatch
-//! 4. Fire BEFORE triggers — may abort the DML via RAISE EXCEPTION
-//! 5. Dispatch to Data Plane (normal write path)
-//! 6. Fire SYNC AFTER triggers (same logical transaction)
-//!
-//! ASYNC AFTER triggers are handled by the Event Plane via WriteEvents — not here.
+//! Sits between the Control Plane router and Data Plane dispatch: classify the
+//! op, fetch OLD row data, fire INSTEAD OF/BEFORE/SYNC AFTER triggers. ASYNC
+//! AFTER triggers run on the Event Plane via WriteEvents, not here.
 
 use std::collections::HashMap;
 
@@ -35,36 +28,22 @@ pub struct DmlWriteInfo {
     pub collection: String,
     /// Document ID (for point operations). None for bulk operations.
     pub document_id: Option<String>,
-    /// DML event type.
-    ///
-    /// For UPSERT the initial value is a best guess — the true event is
-    /// not known until the routing layer probes the pre-write row via
-    /// `fetch_old_row`. When `needs_existence_probe` is set, routing
-    /// overrides this field based on probe results before firing
-    /// post-dispatch triggers.
+    /// DML event type. For UPSERT this is a best guess; routing overrides it
+    /// after probing the pre-write row via `fetch_old_row`.
     pub event: DmlEvent,
     /// NEW row fields extracted from the write plan. None for DELETE.
     pub new_fields: Option<HashMap<String, nodedb_types::Value>>,
-    /// True when the operation's real event type depends on whether the
-    /// target row already exists (currently: UPSERT / INSERT ... ON
-    /// CONFLICT). Routing uses this flag to force a pre-dispatch
-    /// existence probe so the correct AFTER INSERT vs AFTER UPDATE
-    /// triggers fire — otherwise an UPSERT onto an existing row would
-    /// silently fire AFTER INSERT, which is the wrong trigger class.
+    /// True when the real event type depends on row existence (UPSERT / INSERT
+    /// ... ON CONFLICT), forcing a pre-dispatch existence probe.
     pub needs_existence_probe: bool,
 }
 
-/// Attempt to classify a PhysicalPlan as a document DML write.
-///
-/// Returns `None` for non-write operations (reads, DDL, scans, etc.)
-/// and for non-document engines (vector, graph, etc. — those emit WriteEvents
-/// for ASYNC triggers but don't participate in the BEFORE/SYNC AFTER path).
+/// Attempt to classify a PhysicalPlan as a document DML write. `None` for
+/// non-write ops and non-document engines (those use WriteEvents only).
 pub fn classify_dml_write(plan: &crate::bridge::envelope::PhysicalPlan) -> Option<DmlWriteInfo> {
     match plan {
         crate::bridge::envelope::PhysicalPlan::Document(doc_op) => classify_document_op(doc_op),
-        // KV, Vector, Graph, etc. writes emit WriteEvents for ASYNC triggers
-        // but don't participate in BEFORE/SYNC AFTER trigger hooks.
-        // Those engines handle triggers via Event Plane only.
+        // KV/Vector/Graph writes emit WriteEvents for ASYNC triggers only.
         _ => None,
     }
 }
@@ -98,10 +77,8 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             value,
             ..
         } => {
-            // UPSERT's event type depends on whether the primary key
-            // already exists — routing must probe before firing
-            // post-dispatch SYNC triggers. `event` starts at Insert as a
-            // harmless default; the probe result overrides it.
+            // Depends on whether the PK already exists; `event` starts at Insert
+            // as a harmless default, the probe result overrides it.
             let new_fields = deserialize_value_to_fields(value);
             Some(DmlWriteInfo {
                 collection: collection.clone(),
@@ -200,12 +177,11 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         | DocumentOp::BackfillIndex { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
-        // Spans N rows across a resolved mutation list, which this single-tuple
-        // shape cannot name. Its trigger intent is the intercepted statement's,
-        // already reported before the resolve ran.
+        // Spans N rows across a resolved mutation list this single-tuple shape can't name;
+        // trigger intent was already reported by the intercepted statement.
         | DocumentOp::ResolvedWrite { .. }
-        // A derived balance write carries no user DML intent: the statement
-        // that caused it already fired its own triggers on the source row.
+        // A derived balance write carries no user DML intent — the causing
+        // statement already fired its own triggers on the source row.
         | DocumentOp::ApplyBalanceDelta { .. } => None,
     }
 }
@@ -229,10 +205,8 @@ fn deserialize_value_to_fields(value: &[u8]) -> HashMap<String, nodedb_types::Va
 }
 
 /// Patch a `PhysicalTask` with mutated fields from a BEFORE trigger.
-///
-/// Serializes the mutated fields to MessagePack and replaces the value
-/// payload in the underlying `PointPut` or `Upsert` operation.
-/// For `PointUpdate`, the updates are re-derived from the mutated fields.
+/// Replaces the value payload in `PointPut`/`Upsert`; for `PointUpdate`,
+/// updates are re-derived from the mutated fields.
 pub fn patch_task_with_mutated_fields(
     task: &mut nodedb_physical::physical_task::PhysicalTask,
     mutated: &HashMap<String, nodedb_types::Value>,
@@ -256,9 +230,7 @@ pub fn patch_task_with_mutated_fields(
             *value = new_bytes;
         }
         PhysicalPlan::Document(DocumentOp::PointUpdate { updates, .. }) => {
-            // Re-derive field-level updates from the full mutated row. Trigger
-            // mutations are fully-evaluated post-trigger values, so they ship
-            // as `UpdateValue::Literal`.
+            // Trigger mutations are fully-evaluated values, so they ship as `Literal`.
             *updates = mutated
                 .iter()
                 .filter_map(|(k, v)| {
@@ -276,12 +248,8 @@ pub fn patch_task_with_mutated_fields(
 }
 
 /// Fetch the current document as a field map (for OLD row bindings).
-///
-/// This is a user-derived read, even when it is performed as part of a write
-/// hook. It therefore authorizes `READ` before touching surrogate/catalog state,
-/// injects the session's RLS predicate, and dispatches only an exact authorized
-/// task. An empty map means the surrogate or row is genuinely absent; all other
-/// failures propagate so callers cannot misclassify them as an absent OLD row.
+/// Authorizes `READ` before touching catalog state, injects RLS. An empty map
+/// means the row is absent; other failures propagate.
 pub async fn fetch_old_row(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -372,8 +340,7 @@ pub async fn fetch_old_row(
         return Ok(HashMap::new());
     }
 
-    // Decode the response payload (MessagePack or JSON). A non-object payload
-    // is a transport/protocol failure, not evidence that the row is absent.
+    // A non-object payload is a transport failure, not evidence the row is absent.
     let bytes = resp.payload.as_ref();
     if let Ok(serde_json::Value::Object(map)) = nodedb_types::json_from_msgpack(bytes) {
         return Ok(map

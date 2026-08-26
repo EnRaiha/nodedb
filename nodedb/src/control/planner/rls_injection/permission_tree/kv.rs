@@ -18,9 +18,8 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ..
         } => ctx.filter_into(collection, PermTreeLevel::Read, filters),
 
-        // Filter: no pushdown slot, so the handler evaluates the subtree on
-        // the fetched value. A row outside the subtree reads back as absent,
-        // which a caller cannot distinguish from a missing key.
+        // Filter: no pushdown slot, so the handler evaluates post-fetch.
+        // A row outside the subtree reads back as absent.
         KvOp::Get {
             collection,
             rls_filters,
@@ -37,9 +36,8 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ..
         } => ctx.filter_into(collection, PermTreeLevel::Read, rls_filters),
 
-        // Refuse: returns only the key's remaining lifetime. There is no row
-        // body carrying the resource column, and answering at all confirms
-        // that a key outside the caller's subtree exists.
+        // Refuse: no row body to filter, and answering discloses that a
+        // hidden key exists.
         KvOp::GetTtl { collection, .. } => ctx.refuse_if_tree(
             collection,
             "the reply is a TTL rather than a row body, so the subtree filter cannot be evaluated \
@@ -54,11 +52,8 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              carries no subtree filter",
         ),
 
-        // Filter (write level, blanket): every one of these writes a value at
-        // a key it names directly — including the read-modify-write atomics,
-        // whose reply is derived from the value they just wrote. There is no
-        // predicate to narrow, so the identity must hold write access
-        // somewhere in the tree.
+        // Blanket write level: each writes a value at a key named directly,
+        // no predicate to narrow.
         KvOp::Put { collection, .. }
         | KvOp::Insert { collection, .. }
         | KvOp::InsertIfAbsent { collection, .. }
@@ -84,9 +79,7 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
         | KvOp::PredicateDelete { collection, .. }
         | KvOp::Truncate { collection } => ctx.authorize(collection, PermTreeLevel::Delete),
 
-        // Filter (both levels, blanket): the item leaves the source collection
-        // and lands in the destination, so it is a delete on one and a write
-        // on the other.
+        // Blanket both levels: delete on source, write on destination.
         KvOp::TransferItem {
             source_collection,
             dest_collection,
@@ -96,14 +89,8 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.authorize(dest_collection, PermTreeLevel::Write)
         }
 
-        // Refuse: a sorted-index read returns ranked keys, a rank, or a count
-        // taken from the rows of the collection the index was built over, and
-        // the reply carries no slot the subtree filter could go in. The plan
-        // names only the index, and this pass holds the permission cache
-        // rather than the catalog that binds an index name to its collection,
-        // so it asks the tenant-wide question — the same call the RLS pass
-        // makes for these shapes. The handler resolves the binding from the
-        // index registry and refuses on the owning collection.
+        // Refuse: plan names only the index, not its owning collection.
+        // Falls back to the tenant-wide question, as RLS does.
         KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
@@ -117,9 +104,8 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
         // verbatim, so it authorizes at exactly the level that write does.
         KvOp::ResolveWrite(inner) => apply_kv(ctx, inner),
 
-        // Authorize every collection the resolved mutations touch. A resolved
-        // `TransferItem` spans two, so one blanket call on a hoisted
-        // collection would leave the other side unauthorized.
+        // Authorize every touched collection: a resolved `TransferItem`
+        // spans two, so one blanket call would leave a side unauthorized.
         KvOp::ResolvedWrite { mutations, .. } => {
             for mutation in mutations.iter() {
                 let level = match mutation {

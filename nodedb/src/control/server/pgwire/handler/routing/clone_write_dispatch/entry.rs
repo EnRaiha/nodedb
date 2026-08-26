@@ -25,11 +25,8 @@ pub(in crate::control::server::pgwire::handler::routing) enum CloneWriteOutcome 
 impl NodeDbPgHandler {
     /// Intercept a single write task for a cloned collection.
     ///
-    /// Must be called for every write task before normal dispatch — an insert
-    /// as much as an update or a delete: an insert of a key the source already
-    /// holds needs the source row suppressed or the clone returns that key
-    /// twice. Returns `Passthrough` when the collection is not a
-    /// Shadowed/Materializing clone (zero overhead for non-clone paths).
+    /// Call before every write dispatch — an insert of a key the source already
+    /// holds needs the source row suppressed too.
     pub(in crate::control::server::pgwire::handler::routing) async fn maybe_intercept_clone_write(
         &self,
         task: &PhysicalTask,

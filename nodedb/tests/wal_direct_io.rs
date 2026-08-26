@@ -1,25 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The WAL's production `O_DIRECT` default, end to end through the real
-//! binary.
-//!
-//! Direct I/O is the WAL's durability contract: writes bypass the page cache,
-//! so an acknowledged record does not depend on kernel writeback and WAL
-//! traffic cannot evict the mmapped indexes it shares a machine with. Two
-//! properties have to hold for that default to mean anything:
-//!
-//!   1. A server started with no WAL overrides at all boots on a normal
-//!      direct-I/O-capable filesystem, and a write it acknowledges survives a
-//!      hard crash and comes back after replay.
-//!   2. On a filesystem that cannot do `O_DIRECT`, the server fails to start
-//!      with a message naming the directory and both ways out — it never
-//!      quietly reopens the WAL buffered, because that would retire the
-//!      guarantee above with nothing to observe.
-//!
-//! The second property is driven by a fail point rather than by hunting for an
-//! incapable mount: `O_DIRECT` works on tmpfs from Linux 6.1 onward, so a test
-//! that waits for the local filesystem to refuse the flag reports success
-//! without ever running the code it names.
+//! binary. Two properties must hold: a normal boot survives `kill -9` and
+//! replay, and on a filesystem that can't do `O_DIRECT`, startup fails with
+//! a message naming both remedies rather than silently reopening buffered.
+//! The second is driven by a fail point, since `O_DIRECT` works on tmpfs
+//! from Linux 6.1 onward and waiting for an incapable mount proves nothing.
 
 #![cfg(target_os = "linux")]
 
@@ -79,20 +65,15 @@ async fn production_direct_io_default_boots_and_survives_restart() {
     );
 }
 
-/// When the WAL's `O_DIRECT` open is refused, startup fails and says so —
-/// naming the WAL directory and both remedies. A silent downgrade to buffered
-/// I/O would be the worst outcome: the server would look healthy while the
-/// durability property it advertises had been dropped.
-///
-/// The refusal is injected at the segment-open call site, so the test exercises
-/// the real `WalError::DirectIoUnsupported` → startup-abort chain no matter
-/// what the local filesystem is capable of. Requires `--features failpoints`.
+/// When the WAL's `O_DIRECT` open is refused, startup fails and names both
+/// remedies rather than silently downgrading to buffered I/O. Injected at
+/// the segment-open call site, exercising the real `WalError::DirectIoUnsupported`
+/// chain regardless of local filesystem capability. Requires `--features failpoints`.
 #[cfg(feature = "failpoints")]
 #[test]
 fn unsupported_filesystem_fails_startup_with_both_remedies() {
-    // `with_direct_io_wal` pins direct I/O on regardless of the probe: the
-    // injection only fires on the direct-I/O open path, and a harness that
-    // opted out would boot happily and prove nothing.
+    // Pins direct I/O on regardless of the probe: a harness that opted out
+    // would boot happily and prove nothing.
     let mut h = CrashHarness::new()
         .with_direct_io_wal()
         .with_env(

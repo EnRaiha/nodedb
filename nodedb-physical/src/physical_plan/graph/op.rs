@@ -22,11 +22,9 @@ use super::wcc::WccSuperstepPlan;
 pub enum GraphOp {
     /// Insert a graph edge with properties.
     ///
-    /// `src_surrogate` / `dst_surrogate` carry the global row identity for
-    /// the two endpoints, resolved at construction time. The string `src_id`
-    /// / `dst_id` remain user-visible identifiers (used by the CSR partition
-    /// for label interning and by the edge store for keying), while the
-    /// surrogates are the cross-engine join currency.
+    /// `src_surrogate` / `dst_surrogate` carry global row identity; `src_id`
+    /// / `dst_id` stay user-visible (CSR label interning, edge-store keying).
+    /// Surrogates are the cross-engine join currency.
     EdgePut {
         collection: String,
         src_id: String,
@@ -44,11 +42,10 @@ pub enum GraphOp {
 
     /// Delete a graph edge.
     ///
-    /// Carries `src_surrogate` / `dst_surrogate` mirroring `EdgePut` so a
-    /// cross-shard delete can be dual-homed atomically via Calvin: the
-    /// surrogate pair gives the static-tx class its participant shards
-    /// (`from_key(src)` / `from_key(dst)`) AND the lock identity that
-    /// conflict-serializes against a concurrent `EdgePut` of the same edge.
+    /// `src_surrogate` / `dst_surrogate` mirror `EdgePut` so a cross-shard
+    /// delete dual-homes atomically via Calvin — same pair gives the tx
+    /// class its participant shards and the lock identity that serializes
+    /// against a concurrent `EdgePut` of the same edge.
     EdgeDelete {
         collection: String,
         src_id: String,
@@ -56,25 +53,17 @@ pub enum GraphOp {
         dst_id: String,
         src_surrogate: Surrogate,
         dst_surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate, or the reason no
-        /// predicate is attached.
-        ///
-        /// The image a write policy decides for an edge is the edge's stored
-        /// property object, which the plan does not carry — it exists only
-        /// where the tombstone is written. So the predicate travels with the
-        /// plan and the Data Plane evaluates it against the pre-image it reads
-        /// back, exactly as a document DELETE does.
+        /// Write predicate, or the reason none is attached. The plan carries
+        /// no property object to decide it against, so the Data Plane
+        /// evaluates it against the pre-image it reads back — as a document
+        /// DELETE does.
         rls_write_check: RlsWriteCheck,
     },
 
-    /// Read-only resolve pass for a governed [`GraphOp::EdgeDelete`].
-    ///
-    /// A follower has no writing identity, so a delete carrying a live
-    /// `RlsWriteCheck::Predicate` cannot be replicated. This wraps that exact
-    /// delete, reads the edge's stored property object, and decides the policy
-    /// against it. It writes nothing: a refusal comes back as the same
-    /// authorization error the direct delete returns, and success means the
-    /// wrapped delete may be proposed with a decided check.
+    /// Read-only resolve pass for a governed [`GraphOp::EdgeDelete`]. A
+    /// follower can't judge a live `RlsWriteCheck::Predicate`, so this reads
+    /// the edge's property object and decides the policy without writing.
+    /// Success means the wrapped delete may be proposed with a decided check.
     ResolveEdgeDelete(Box<GraphOp>),
 
     /// Batched edge delete: used to revert a partial `EdgePutBatch` on
@@ -83,18 +72,10 @@ pub enum GraphOp {
 
     /// Graph hop traversal: BFS from start nodes via label, bounded by depth.
     Hop {
-        /// Collection whose edges this traversal is scoped to.
-        ///
-        /// The CSR partition is keyed `(database, tenant)` with a shared node
-        /// space and per-edge collection ids, so a traversal that names a
-        /// collection reads only that collection's edges — and that name is
-        /// what authorization and RLS resolve against.
-        ///
-        /// `None` means the traversal is scoped by edge label alone: tree-index
-        /// BFS walks edges labelled with an index name, and no catalog record
-        /// maps an index back to the collection it was built on. Such a
-        /// traversal cannot be collection-authorized; the DDL that builds the
-        /// index is authorized instead.
+        /// Collection this traversal is scoped to (the CSR partition is
+        /// `(database, tenant)`-keyed with per-edge collection ids). `None`
+        /// scopes by edge label alone — a tree-index BFS with no catalog
+        /// mapping back to a collection, authorized via the index DDL instead.
         collection: Option<String>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
@@ -110,18 +91,7 @@ pub enum GraphOp {
 
     /// Immediate 1-hop neighbors lookup.
     Neighbors {
-        /// Collection whose edges this traversal is scoped to.
-        ///
-        /// The CSR partition is keyed `(database, tenant)` with a shared node
-        /// space and per-edge collection ids, so a traversal that names a
-        /// collection reads only that collection's edges — and that name is
-        /// what authorization and RLS resolve against.
-        ///
-        /// `None` means the traversal is scoped by edge label alone: tree-index
-        /// BFS walks edges labelled with an index name, and no catalog record
-        /// maps an index back to the collection it was built on. Such a
-        /// traversal cannot be collection-authorized; the DDL that builds the
-        /// index is authorized instead.
+        /// See `Hop::collection`.
         collection: Option<String>,
         node_id: String,
         edge_label: Option<String>,
@@ -140,18 +110,7 @@ pub enum GraphOp {
     /// wide hop cannot allocate past the caller's budget. `0` means
     /// unbounded (use with care).
     NeighborsMulti {
-        /// Collection whose edges this traversal is scoped to.
-        ///
-        /// The CSR partition is keyed `(database, tenant)` with a shared node
-        /// space and per-edge collection ids, so a traversal that names a
-        /// collection reads only that collection's edges — and that name is
-        /// what authorization and RLS resolve against.
-        ///
-        /// `None` means the traversal is scoped by edge label alone: tree-index
-        /// BFS walks edges labelled with an index name, and no catalog record
-        /// maps an index back to the collection it was built on. Such a
-        /// traversal cannot be collection-authorized; the DDL that builds the
-        /// index is authorized instead.
+        /// See `Hop::collection`.
         collection: Option<String>,
         node_ids: Vec<String>,
         edge_label: Option<String>,
@@ -163,18 +122,7 @@ pub enum GraphOp {
 
     /// Shortest path between two nodes.
     Path {
-        /// Collection whose edges this traversal is scoped to.
-        ///
-        /// The CSR partition is keyed `(database, tenant)` with a shared node
-        /// space and per-edge collection ids, so a traversal that names a
-        /// collection reads only that collection's edges — and that name is
-        /// what authorization and RLS resolve against.
-        ///
-        /// `None` means the traversal is scoped by edge label alone: tree-index
-        /// BFS walks edges labelled with an index name, and no catalog record
-        /// maps an index back to the collection it was built on. Such a
-        /// traversal cannot be collection-authorized; the DDL that builds the
-        /// index is authorized instead.
+        /// See `Hop::collection`.
         collection: Option<String>,
         src: String,
         dst: String,
@@ -190,18 +138,7 @@ pub enum GraphOp {
 
     /// Materialize a subgraph as edge tuples.
     Subgraph {
-        /// Collection whose edges this traversal is scoped to.
-        ///
-        /// The CSR partition is keyed `(database, tenant)` with a shared node
-        /// space and per-edge collection ids, so a traversal that names a
-        /// collection reads only that collection's edges — and that name is
-        /// what authorization and RLS resolve against.
-        ///
-        /// `None` means the traversal is scoped by edge label alone: tree-index
-        /// BFS walks edges labelled with an index name, and no catalog record
-        /// maps an index back to the collection it was built on. Such a
-        /// traversal cannot be collection-authorized; the DDL that builds the
-        /// index is authorized instead.
+        /// See `Hop::collection`.
         collection: Option<String>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
@@ -235,9 +172,9 @@ pub enum GraphOp {
         /// embedded vector column (e.g. `INSERT INTO col (id, embedding) VALUES …`).
         vector_field: String,
         options: GraphTraversalOptions,
-        /// BM25 query string for the text leg of three-source fusion. `None` = two-source.
+        /// BM25 query for the text leg of three-source fusion. `None` = two-source.
         bm25_query: Option<String>,
-        /// Document field on which BM25 scoring is applied. Required when `bm25_query` is set.
+        /// Document field scored by BM25. Required when `bm25_query` is set.
         bm25_field: Option<String>,
     },
 
@@ -251,34 +188,24 @@ pub enum GraphOp {
     Match {
         /// Serialized `MatchQuery` (MessagePack).
         query: Vec<u8>,
-        /// Optional surrogate prefilter restricting which nodes are eligible
-        /// as pattern anchors. `None` = no restriction.
+        /// Surrogate prefilter restricting eligible pattern anchors.
         frontier_bitmap: Option<SurrogateBitmap>,
-        /// When `true`, the Data Plane emits every bound zero-degree source as
-        /// a cross-shard frontier candidate (it has no routing knowledge, so
-        /// the Control Plane filters them precisely in B2). When `false` (the
-        /// single-node default) no frontier is emitted and the unwrapped rows
-        /// payload is byte-identical to a non-cluster MATCH. B2 sets this true
-        /// for cluster orchestration.
+        /// `true` emits every bound zero-degree source as a cross-shard
+        /// frontier candidate for Control-Plane filtering (cluster
+        /// orchestration). `false` (default) matches non-cluster MATCH output.
         cluster_mode: bool,
     },
 
-    /// Cross-shard MATCH continuation (resume a pattern on this shard).
-    ///
-    /// Dispatched to the shard that owns `source_node` after another shard
-    /// emitted an `UnresolvedExpansion` for it. The receiving shard resumes
-    /// the SAME (already-optimized) pattern from `resume_triple_idx`, seeded
-    /// with `partial_row` plus `source_binding -> source_node`. The query is
-    /// carried already-optimized and MUST NOT be re-optimized on resume —
-    /// `resume_triple_idx` indexes the originating shard's triple order.
-    ///
-    /// Phase A returns ROWS ONLY — identical response format to `Match`.
+    /// Cross-shard MATCH continuation: resumes the SAME already-optimized
+    /// pattern from `resume_triple_idx` on the shard owning `source_node`,
+    /// after another shard emitted an `UnresolvedExpansion` for it. Must not
+    /// be re-optimized — the index is the originating shard's triple order.
     MatchContinuation {
         /// Serialized (already-optimized) `MatchQuery` (MessagePack).
         query: Vec<u8>,
-        /// Within-chain triple index to resume from (originating shard's order).
+        /// Triple index to resume from (originating shard's order).
         resume_triple_idx: usize,
-        /// Serialized `HashMap<String, String>` of accumulated bindings (MessagePack).
+        /// Serialized accumulated bindings (MessagePack `HashMap<String, String>`).
         partial_row: Vec<u8>,
         /// The node name on THIS shard to resume expansion from.
         source_node: String,
@@ -286,26 +213,10 @@ pub enum GraphOp {
         source_binding: String,
     },
 
-    /// Cross-shard MATCH variable-length RESUME (continue a truncated
-    /// `[*min..max]` expansion on this shard).
-    ///
-    /// Dispatched after a shard's `MATCH (a)-[*min..max]->(b)-...` expansion hit
-    /// a hard cap and surfaced a `VarLenResume` cursor in its `MatchOutcome`. The
-    /// receiving shard rebuilds the variable-length `VarLenPattern` for the
-    /// capped triple from the (already-optimized) `query` and continues the BFS
-    /// from the carried frontier/depth, then runs the remaining pattern triples
-    /// over the resumed rows — yielding the SAME `{rows, frontier}` envelope as a
-    /// plain `Match`, and a FRESH truncation cursor if the resume itself caps
-    /// again (so paging continues across rounds).
-    ///
-    /// Unlike `MatchContinuation` (which resumes at a TRIPLE boundary), this
-    /// resumes MID-triple inside the variable-length edge. The query is carried
-    /// already-optimized and MUST NOT be re-optimized on resume —
-    /// `VarLenResume::triple_idx` indexes the originating shard's triple order.
-    ///
-    /// Both fields are MessagePack blobs (mirroring `MatchContinuation::query` /
-    /// `partial_row`) so `nodedb-physical` carries no dependency on the
-    /// executor's `VarLenResume` / `MatchQuery` types.
+    /// Cross-shard MATCH variable-length RESUME: continues a `[*min..max]`
+    /// expansion that hit a hard cap, resuming MID-triple (unlike
+    /// `MatchContinuation`, which resumes at a triple boundary). Query must
+    /// not be re-optimized; may emit a fresh truncation cursor if capped again.
     MatchVarLenResume {
         /// Serialized (already-optimized) `MatchQuery` (MessagePack).
         query: Vec<u8>,
@@ -316,31 +227,16 @@ pub enum GraphOp {
     },
 
     /// One distributed-PageRank BSP superstep on this shard's local CSR.
-    ///
-    /// Phase A primitive: the Control-Plane coordinator (Phase B) round-trips
-    /// this op once per superstep, threading the per-shard rank vector back in
-    /// via `rank_vec` and routing cross-shard contributions to the owning shard
-    /// via `incoming_contributions`. The handler is stateless across calls —
-    /// all per-superstep state lives in this variant and `BspSuperstepResult`.
-    ///
-    /// Boxed because the payload (params + three vectors) is large and
-    /// `PhysicalPlan` is cloned/moved across the SPSC bridge on every request;
-    /// keeping the common variants small avoids bloating the whole enum.
+    /// Round-tripped once per superstep by the Control-Plane coordinator,
+    /// threading the rank vector via `rank_vec` and cross-shard contributions
+    /// via `incoming_contributions`; the handler is stateless across calls.
+    /// Boxed: payload is large and `PhysicalPlan` clones across the SPSC bridge.
     BspSuperstep(Box<BspSuperstepPlan>),
 
-    /// One distributed-WCC contraction round on this shard's local CSR.
-    ///
-    /// Single-round primitive (NOT iterative): the Control-Plane coordinator
-    /// dispatches this op ONCE per owner node. Each shard computes connected
-    /// components over its OWNED nodes only — `union(u, v)` for owned→owned
-    /// out-edges, and a recorded boundary edge `(name(u), name(v))` for
-    /// owned→ghost out-edges. Each owned node's LOCAL label is the
-    /// lexicographically-minimum owned node NAME in its local component. The
-    /// coordinator stitches every shard's `node_labels` + `boundary_edges` into
-    /// one global union-find over node names and assigns dense component ids.
-    ///
-    /// Boxed to keep the common `GraphOp` variants small (the payload carries
-    /// `params` plus the owned-vShard set).
+    /// One distributed-WCC contraction round (single-round, not iterative):
+    /// each shard unions its owned→owned edges and records owned→ghost edges
+    /// as boundary edges; the coordinator stitches all shards' results into
+    /// one global union-find over node names. Boxed to keep the enum small.
     WccSuperstep(Box<WccSuperstepPlan>),
 
     /// Set node labels (bitset-based, up to 64 distinct labels).

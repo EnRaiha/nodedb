@@ -1,20 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WAL append dispatch for `PhysicalPlan::Graph(GraphOp)`, plus the helpers for
-//! batched graph edge writes (`GraphOp::EdgePutBatch` / `GraphOp::EdgeDeleteBatch`),
-//! produced by `CREATE GRAPH INDEX`.
+//! WAL append dispatch for `PhysicalPlan::Graph(GraphOp)`, plus batched graph
+//! edge writes (`EdgePutBatch`/`EdgeDeleteBatch`) from `CREATE GRAPH INDEX`.
 //!
-//! Each edge in a batch is appended as its own single-edge `Put` / `Delete`
-//! WAL record, byte-identical in shape to what the non-batch
-//! `GraphOp::EdgePut` / `EdgeDelete` arms append (collection,
-//! src_id, label, dst_id[, properties]) — so a batch needs no new
-//! `RecordType` and no new replay decoder: it is simply N individually
-//! durable edges, applied via the same `execute_edge_put` / `execute_edge_delete`
-//! replay path graph edges already rely on. `properties` is always encoded as
-//! empty for a batch edge: `BatchEdge` carries no properties field, and the
-//! Data Plane's `execute_edge_put_batch` applies every edge with a hardcoded
-//! `&[]`, so an empty payload here is a faithful pre-image of what is
-//! actually applied, not an assumed default.
+//! Each batch edge appends as its own single-edge `Put`/`Delete` record. Batch
+//! `properties` is always empty, matching what `execute_edge_put_batch` applies.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -24,13 +14,8 @@ use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 
 /// Append the WAL record for a single `GraphOp`, returning the allocated LSN
-/// for the edge / node-label write variants (`Some`) or `None` for every
-/// traversal / algorithm / read variant that carries no durable per-write
-/// effect.
-///
-/// The match over [`GraphOp`] is **exhaustive** (`wildcard_enum_match_arm` is
-/// denied), so a future write variant cannot silently become non-durable. The
-/// batched-edge variants delegate to the per-edge append helpers below.
+/// for edge/node-label writes or `None` for traversal/algorithm/read variants.
+/// Exhaustive match so a future write variant can't silently become non-durable.
 pub(super) fn wal_append_graph_op(
     wal: &WalManager,
     tenant_id: TenantId,
@@ -55,9 +40,7 @@ pub(super) fn wal_append_graph_op(
             })?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // The compiled write predicate is a planning-time artifact of the
-        // session that produced the plan, not part of the durable edge, so it
-        // is deliberately not part of the WAL entry.
+        // Compiled write predicate is a planning-time artifact, deliberately not in the WAL entry.
         GraphOp::EdgeDelete {
             collection,
             src_id,
@@ -84,19 +67,15 @@ pub(super) fn wal_append_graph_op(
             let entry = super::encode_graph_node_label_payload(node_id, labels)?;
             Some(wal.append_graph_node_label_remove(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // Batched edge writes (`CREATE GRAPH INDEX` build / rollback). Each
-        // edge is appended as its own single-edge `Put`/`Delete` record,
-        // byte-identical in shape to the non-batch `EdgePut`/`EdgeDelete`
-        // arms above — see the module docs for the encoding and the
-        // documented last-LSN-as-watermark / explicit-empty-batch contract.
+        // Batched edge writes (`CREATE GRAPH INDEX` build/rollback). See module
+        // doc for encoding and the last-LSN-as-watermark contract.
         GraphOp::EdgePutBatch { edges } => {
             wal_append_graph_edge_put_batch(wal, tenant_id, vshard_id, database_id, edges)?
         }
         GraphOp::EdgeDeleteBatch { edges } => {
             wal_append_graph_edge_delete_batch(wal, tenant_id, vshard_id, database_id, edges)?
         }
-        // NotAWrite — reads / query ops / DDL that produces no engine mutation
-        // here, plus the read-only resolve pass.
+        // Reads / query ops / read-only resolve pass — no engine mutation here.
         GraphOp::ResolveEdgeDelete(_)
         | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
@@ -117,20 +96,8 @@ pub(super) fn wal_append_graph_op(
     Ok(appended)
 }
 
-/// Append one `Put` WAL record per edge in a batched edge insert.
-///
-/// Returns the LSN of the LAST appended record. WAL LSNs are allocated
-/// monotonically increasing per append, so the last edge's LSN is the
-/// natural "this write is durable through here" watermark for a caller that
-/// threads a single LSN forward — every earlier edge in the batch is a real,
-/// independently persisted WAL record on disk; only the single number this
-/// function returns collapses to the last one, it does not erase the
-/// earlier appends.
-///
-/// An empty batch appends nothing and returns `Ok(None)` deliberately: a
-/// zero-edge `EdgePutBatch` has no logical write to make durable, so `None`
-/// here carries its usual meaning in this module (no durable record for this
-/// plan) rather than being an accidental fallthrough.
+/// Append one `Put` WAL record per edge in a batched edge insert. Returns the
+/// last record's LSN as a "durable through here" watermark. Empty batch → `Ok(None)`.
 pub(crate) fn wal_append_graph_edge_put_batch(
     wal: &WalManager,
     tenant_id: TenantId,
@@ -157,11 +124,8 @@ pub(crate) fn wal_append_graph_edge_put_batch(
     Ok(last_lsn)
 }
 
-/// Append one `Delete` WAL record per edge in a batched edge delete
-/// (`CREATE GRAPH INDEX` rollback).
-///
-/// Same last-LSN-as-watermark and explicit-empty-batch contract as
-/// [`wal_append_graph_edge_put_batch`] above.
+/// Append one `Delete` WAL record per edge in a batched edge delete (`CREATE
+/// GRAPH INDEX` rollback). Same last-LSN-as-watermark contract as [`wal_append_graph_edge_put_batch`].
 pub(crate) fn wal_append_graph_edge_delete_batch(
     wal: &WalManager,
     tenant_id: TenantId,

@@ -2,31 +2,17 @@
 
 //! RLS resolution for physical plans — both halves of it.
 //!
-//! The walk is exhaustive over [`PhysicalPlan`] and over every engine's own
-//! operation enum, split one module per engine. Each variant resolves to
-//! exactly one outcome:
+//! Exhaustive over [`PhysicalPlan`] and every engine's own op enum (one
+//! module per engine). Each variant resolves to one outcome: **Inject**
+//! (op reads rows, plan carries a filter slot), **Refuse** (protected read
+//! with no filter slot, or a write whose post-image isn't carried —
+//! `Error::PlanError`), **Admit** (write carries its image in full, policy
+//! evaluated, violation → `Error::RejectedAuthz`), or **No-op** (DDL/
+//! maintenance, no stored row touched). A write is never a silent no-op.
 //!
-//! - **Inject** — the op reads rows and its plan node carries a filter slot
-//!   (`filters` for storage pushdown, `rls_filters` for post-fetch evaluation).
-//! - **Refuse** — the op reads protected data through a result shape that
-//!   cannot carry a row filter, or writes a row whose post-image the plan does
-//!   not carry, so the plan is rejected with `Error::PlanError` while a policy
-//!   applies.
-//! - **Admit** — the op writes a row the plan carries in full, so the write
-//!   policy is evaluated against that image and a violating row fails the
-//!   statement with `Error::RejectedAuthz`.
-//! - **No-op** — the op is a DDL/maintenance action or a control operation
-//!   that neither returns nor writes a stored row.
-//!
-//! A write is never a silent no-op: a write policy that changes nothing is
-//! indistinguishable from no policy at all, which is the failure this pass
-//! exists to prevent.
-//!
-//! The redaction pass in `redaction_refusal` walks the same plan for the same
-//! identity and had to make the same per-variant calls; the two stay
-//! consistent, and where they legitimately diverge — RLS can inject a row
-//! filter into shapes redaction has no columns to mask, and RLS must refuse
-//! count-shaped results redaction can ignore — the arm says so.
+//! `redaction_refusal` walks the same plan for the same identity and
+//! legitimately diverges in places (RLS injects where redaction has no
+//! columns to mask; RLS refuses count shapes redaction can ignore).
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::auth_context::AuthContext;
@@ -35,28 +21,9 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::context::RlsCtx;
 
-/// Inject RLS predicates into physical tasks after plan conversion.
-///
-/// This is the RLS enforcement entry point for planner-produced work. For each
-/// read task:
-/// 1. Extracts the collection name from the physical plan.
-/// 2. Fetches RLS read policies for `(tenant_id, collection)`.
-/// 3. Substitutes `$auth.*` references using the `AuthContext`.
-/// 4. Injects the resulting concrete filters into the plan:
-///    - **Scans**: merged into the existing `filters` field (AND-combined).
-///    - **Point gets**: stored in `rls_filters` for post-fetch evaluation.
-///    - **Search ops**: stored in `rls_filters` for post-candidate filtering.
-///
-/// **Caller**: Session query execution, after DataFusion logical planning.
-/// **Superuser bypass**: Handled inside `combined_read_predicate_with_auth`.
-///
-/// For each write task, the collection's write policy either admits the row
-/// image the plan carries or refuses the statement when it carries none.
-///
-/// Returns `Err` if a required `$auth` field is missing (fail-closed), if the
-/// plan reads protected data through a shape no row filter can cover, if it
-/// writes a row a write policy rejects, or if it writes through a shape whose
-/// post-image the write policy cannot be evaluated against.
+/// Inject RLS predicates into physical tasks after plan conversion: reads
+/// get filters injected, a write's policy admits its image or refuses.
+/// `Err` on a missing `$auth` field or an uncoverable read/write shape.
 pub fn inject_rls(
     tasks: &mut [PhysicalTask],
     rls_store: &RlsPolicyStore,
@@ -90,18 +57,9 @@ pub fn inject_rls_for_single_plan(
     refuse_undecided_write_check(plan)
 }
 
-/// Refuse a plan whose write-check slot this pass left undecided.
-///
-/// The walk is exhaustive over every op, but an arm can still handle an op
-/// that carries a check slot and never touch it — that is invisible to the
-/// compiler, and it is how a plain columnar `INSERT` once reached dispatch
-/// stamped [`nodedb_types::RlsWriteCheck::PendingInjection`] and was refused
-/// as un-injected. Catching it at the pass boundary turns a silently
-/// unstamped arm into a loud planner error naming the collection, instead of
-/// an internal-invariant break several layers down.
-///
-/// Every arm that decides a write must record its verdict in the slot, whether
-/// it evaluated the rows here or shipped the predicate to the Data Plane.
+/// Refuse a plan whose write-check slot this pass left undecided — an arm
+/// can handle an op yet never touch its slot, invisible to the compiler.
+/// Turns a silently unstamped arm into a loud, collection-naming error.
 fn refuse_undecided_write_check(plan: &PhysicalPlan) -> crate::Result<()> {
     if !plan
         .rls_write_checks()
@@ -120,11 +78,8 @@ fn refuse_undecided_write_check(plan: &PhysicalPlan) -> crate::Result<()> {
     })
 }
 
-/// Core dispatch: resolve RLS for one physical plan.
-///
-/// Exhaustive over [`PhysicalPlan`] so a new engine forces a decision here,
-/// and each engine module is exhaustive over its own operations so a new
-/// operation forces one there.
+/// Core dispatch: resolve RLS for one physical plan. Exhaustive over
+/// [`PhysicalPlan`], and each engine module is exhaustive over its own ops.
 pub(super) fn walk(ctx: &RlsCtx<'_>, plan: &mut PhysicalPlan) -> crate::Result<()> {
     match plan {
         PhysicalPlan::Document(op) => super::document::inject_document(ctx, op),
@@ -153,14 +108,9 @@ pub(super) mod test_support {
 
     pub(in crate::control::planner::rls_injection) const TENANT: u64 = 1;
 
-    /// Stamp a plan's write check back to `PendingInjection`.
-    ///
-    /// Injection's only effect on a plan with no matching policy is to move
-    /// that slot from `PendingInjection` to `NoPolicyApplies`. Undoing just
-    /// that lets a test assert nothing ELSE about the plan changed, by
-    /// comparing against the pre-injection clone.
-    ///
-    /// Covers only the variants the tests in this module build.
+    /// Stamp a plan's write check back to `PendingInjection`, undoing
+    /// injection's only effect with no matching policy, so a test can
+    /// assert nothing else changed. Covers only variants tests build.
     pub(in crate::control::planner::rls_injection) fn reset_write_check(
         plan: &mut crate::bridge::envelope::PhysicalPlan,
     ) {

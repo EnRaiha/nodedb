@@ -23,19 +23,15 @@ pub enum DocumentOp {
     PointGet {
         collection: String,
         document_id: String,
-        /// Stable cross-engine identity bound to `(collection, document_id)`
-        /// in the catalog. The handler hex-encodes this to compute the
-        /// substrate row key; user-PK strings are not used for storage
-        /// addressing on the document path.
+        /// Catalog-bound identity for `(collection, document_id)`. Hex-encoded
+        /// by the handler for the substrate row key — user-PK strings are
+        /// never used for storage addressing here.
         surrogate: Surrogate,
-        /// Raw primary-key bytes, used by follower-side WAL decode to
-        /// re-derive the surrogate via the catalog rev table when the
-        /// physical plan is reconstructed from the WAL stream.
+        /// Raw primary-key bytes, for follower-side WAL decode to re-derive
+        /// the surrogate via the catalog rev table.
         pk_bytes: Vec<u8>,
-        /// RLS post-fetch filters (serialized `Vec<ScanFilter>`).
-        /// If non-empty, the Data Plane evaluates these after fetching
-        /// the document. Returns `NOT_FOUND` on denial (no info leak).
-        /// Injected by the Control Plane planner from RLS policies.
+        /// RLS post-fetch filters (serialized `Vec<ScanFilter>`). Denial
+        /// returns `NOT_FOUND`, never a distinguishable error (no info leak).
         rls_filters: Vec<u8>,
         /// System-time selection. `Current` = current state. Honored only by
         /// bitemporal collections; the planner rejects temporal point-gets on
@@ -60,39 +56,28 @@ pub enum DocumentOp {
         /// Raw primary-key bytes, used by follower-side WAL decode to
         /// re-derive the surrogate via the catalog rev table.
         pk_bytes: Vec<u8>,
-        /// When `Some`, return the STORED post-image of the written row
-        /// projected per spec — generated columns evaluated, `_rowid`
-        /// injected, strict tuple re-decoded. Never the submitted body: an
-        /// echo of the request would report what was asked for rather than
-        /// what landed.
+        /// When `Some`, return the STORED post-image, per spec (generated
+        /// columns evaluated, `_rowid` injected). Never the submitted body —
+        /// an echo would report the request, not what landed.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. The write policy
-        /// governs the write; this bounds what may be shown back, so a
-        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
-        /// See `PointDelete::rls_filters`.
+        /// Read filters bounding `returning` to what a `SELECT` by the same
+        /// principal would show. See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. Keyed on the PAIR because one source may drive
-        /// two bindings that share a join column and name different targets.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// `(target collection, join-key value)` → target row surrogate,
+        /// resolved by the Control Plane at plan time (Data Plane has no
+        /// PK→surrogate map). Keyed on the pair: one source can drive two
+        /// bindings on the same join column.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// Point insert: write one document, fail on duplicate primary key.
+    /// Point insert: write one document, fail on duplicate primary key
+    /// unless `if_absent` (silent skip on conflict).
     ///
-    /// When `if_absent` is true the handler silently skips conflicts
-    /// (`INSERT ... ON CONFLICT DO NOTHING`). When false, a duplicate
-    /// primary key raises a unique-violation error.
-    ///
-    /// Separate from [`DocumentOp::PointPut`] because the write path must
-    /// probe the existence of `document_id` inside the same write txn as
-    /// the insert — conflating the two routed `INSERT` to silent upsert.
+    /// Separate from [`DocumentOp::PointPut`]: the insert must probe
+    /// `document_id` existence inside the same write txn.
     PointInsert {
         collection: String,
         document_id: String,
@@ -112,26 +97,14 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. Keyed on the PAIR because one source may drive
-        /// two bindings that share a join column and name different targets.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
-        /// Materialized-sum TARGET collections whose delta this write must NOT
-        /// apply itself: the Control Plane settled each at plan time and
-        /// appended an
-        /// [`ApplyBalanceDelta`](DocumentOp::ApplyBalanceDelta) task of its
-        /// own, homed on the target's vShard.
-        ///
-        /// A target that homes elsewhere has no rows on the core this write
-        /// lands on, so applying its delta here would write the balance into a
-        /// store no reader of the target collection consults — and, once the
-        /// appended task runs, count it twice. Empty for every write whose
-        /// targets are co-resident, and for every collection with no binding.
+        /// Sum-binding TARGET collections this write must not apply its own
+        /// delta for — the Control Plane appended a separate
+        /// [`ApplyBalanceDelta`](DocumentOp::ApplyBalanceDelta) task homed on
+        /// each target's vShard instead. Empty when targets are co-resident
+        /// or the collection has no binding.
         #[serde(default)]
         deferred_sum_targets: Vec<String>,
     },
@@ -148,29 +121,16 @@ pub enum DocumentOp {
         /// When `Some`, return the pre-deletion document projected per spec.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. The write policy
-        /// governs the write; this bounds what may be shown back, so a
-        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        /// Read filters bounding `returning` to what a `SELECT` by the same
+        /// principal would show.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Compiled write policy gating the PERSIST, evaluated in the Data
-        /// Plane against the row image the statement actually writes — the
-        /// pre-image for a delete, the post-image for an update — or the
-        /// reason no predicate is attached. A row that fails it fails the
-        /// whole statement with `RejectedAuthz`; never a silent skip, which
-        /// would report a write that did happen as one that did not.
-        ///
-        /// A slot of its own, never an alias of `rls_filters`: that field is
-        /// the READ policy bounding what `RETURNING` may show. Conflating the
-        /// two would turn a write gate into row redaction, or the reverse.
+        /// Write policy gating the persist against the row's pre-image (this
+        /// op has no post-image), or the reason none applies. Fails the whole
+        /// statement with `RejectedAuthz` — never a silent skip. Separate slot
+        /// from `rls_filters`, which is the read-side redaction gate.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. Keyed on the PAIR because one source may drive
-        /// two bindings that share a join column and name different targets.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
@@ -192,17 +152,10 @@ pub enum DocumentOp {
         /// Read filters gating `returning` — see `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Write policy gating the persist, evaluated against the post-update
-        /// image, or the reason no predicate is attached — see
-        /// `PointDelete::rls_write_check`.
+        /// Write policy gating the persist against the post-update image, or
+        /// the reason none applies — see `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. Keyed on the PAIR because one source may drive
-        /// two bindings that share a join column and name different targets.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
@@ -221,11 +174,9 @@ pub enum DocumentOp {
         computed_columns: Vec<u8>,
         /// Serialized `Vec<WindowFuncSpec>`.
         window_functions: Vec<u8>,
-        /// System-time selection. `Current` = current state; `AsOf(ms)` =
-        /// point-in-time; `AllVersions` = every system-time version ordered
-        /// ascending (audit log). Honored only by collections registered with
-        /// bitemporal storage; the planner rejects temporal scans on
-        /// non-bitemporal collections at SQL plan time.
+        /// `Current` / `AsOf(ms)` / `AllVersions` (audit log, ascending).
+        /// Honored only on bitemporal collections; the planner rejects
+        /// temporal scans on non-bitemporal ones at SQL plan time.
         system_time: SystemTimeScope,
         /// `FOR VALID_TIME CONTAINS <ms>` filter. `None` = no filter.
         valid_at_ms: Option<i64>,
@@ -254,25 +205,11 @@ pub enum DocumentOp {
         /// `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. One entry per DISTINCT pair across `documents`.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// See `PointPut::resolved_sum_targets`. One entry per distinct pair
+        /// across `documents`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
-        /// Materialized-sum TARGET collections whose delta this write must NOT
-        /// apply itself: the Control Plane settled each at plan time and
-        /// appended an
-        /// [`ApplyBalanceDelta`](DocumentOp::ApplyBalanceDelta) task of its
-        /// own, homed on the target's vShard.
-        ///
-        /// A target that homes elsewhere has no rows on the core this write
-        /// lands on, so applying its delta here would write the balance into a
-        /// store no reader of the target collection consults — and, once the
-        /// appended task runs, count it twice. Empty for every write whose
-        /// targets are co-resident, and for every collection with no binding.
+        /// See `PointInsert::deferred_sum_targets`.
         #[serde(default)]
         deferred_sum_targets: Vec<String>,
     },
@@ -284,10 +221,8 @@ pub enum DocumentOp {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         limit: usize,
-        /// Row-level-security filters applied to fetched rows before they are
-        /// returned. This operation has no pushdown filter slot in storage, so
-        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
-        /// and `DocumentOp::PointGet` already use.
+        /// RLS filters applied post-fetch (no pushdown slot in storage) —
+        /// same shape `KvOp::Get` and `DocumentOp::PointGet` use.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -308,28 +243,18 @@ pub enum DocumentOp {
         /// `system_from_ms`; reads use the versioned table and Ceiling
         /// resolver.
         bitemporal: bool,
-        /// Durable CRDT conflict-resolution policy (JSON-serialized
-        /// `CollectionPolicy`), persisted on the collection's catalog record.
-        /// `Some` rehydrates the per-core `PolicyRegistry` on register/reboot
-        /// so `ALTER COLLECTION ... SET ON CONFLICT ...` survives a restart
-        /// instead of silently reverting to `CollectionPolicy::ephemeral()`.
-        /// `None` = no explicit policy persisted; the registry falls back to
-        /// the ephemeral default.
+        /// Durable CRDT conflict policy (JSON `CollectionPolicy`). `Some`
+        /// rehydrates the per-core `PolicyRegistry` on reboot so `ALTER
+        /// COLLECTION ... SET ON CONFLICT` survives a restart; `None` falls
+        /// back to `CollectionPolicy::ephemeral()`.
         conflict_policy: Option<String>,
-        /// Declared columns + designated `TIME_KEY` for a timeseries
-        /// collection. `Some` for every `engine='timeseries'` collection;
-        /// `None` for every other engine. The Data Plane builds the
-        /// collection's memtable schema from this instead of inferring one
-        /// from the first ingested batch.
+        /// Declared columns + `TIME_KEY` for a timeseries collection.
+        /// `Some` only for `engine='timeseries'`; the Data Plane builds the
+        /// memtable schema from this instead of inferring from ingest.
         timeseries: Option<Box<TimeseriesSchema>>,
-        /// Vector-primary access-path config. `Some` for every
-        /// `WITH (primary='vector')` collection, `None` for every other.
-        ///
-        /// The Data Plane read path needs it to know that this collection's
-        /// sparse rows are `zerompk` TAGGED metadata sidecars rather than
-        /// ordinary document bodies. Both encodings are legal MessagePack
-        /// maps, so no inspection of the stored bytes can tell them apart —
-        /// the collection's declared kind is the only sound discriminator.
+        /// Vector-primary access-path config, `Some` only for
+        /// `WITH (primary='vector')`. Both plain and vector-primary rows are
+        /// legal MessagePack maps — this is the only way to tell them apart.
         vector_primary: Option<Box<nodedb_types::VectorPrimaryConfig>>,
     },
 
@@ -340,20 +265,12 @@ pub enum DocumentOp {
         value: String,
     },
 
-    /// Fetch full document rows via a secondary index.
+    /// Fetch full document rows via a secondary index, for a SELECT with an
+    /// equality predicate on an indexed field.
     ///
-    /// Emitted from `SqlPlan::DocumentIndexLookup` for SELECT queries where
-    /// the WHERE clause has an equality predicate on an indexed field. The
-    /// handler resolves doc IDs via `sparse.index_lookup`, fetches each
-    /// document, and emits scan-compatible row output via `response_codec`.
-    /// `filters` (the compound-predicate residual left over after the
-    /// indexed equality) is applied to every fetched body — committed and a
-    /// transaction's staged overlay rows alike; `projection` is not yet
-    /// applied by the handler.
-    ///
-    /// Sort / distinct / window functions are handled by the planner
-    /// falling back to a full scan — the planner only emits this variant
-    /// when none of those are present.
+    /// `filters` is the residual predicate left after the indexed equality,
+    /// applied to every fetched body. Sort / distinct / window functions
+    /// fall back to a full scan upstream — never reach this variant.
     IndexedFetch {
         collection: String,
         /// Indexed field path (e.g. `$.email`).
@@ -372,15 +289,9 @@ pub enum DocumentOp {
     /// Drop all secondary index entries for a field.
     DropIndex { collection: String, field: String },
 
-    /// Backfill a secondary index from existing collection documents.
-    ///
-    /// Emitted by CREATE INDEX on a collection that already has rows.
-    /// The handler scans every document, extracts the indexed value, and
-    /// writes sparse-index entries — atomically detecting UNIQUE
-    /// violations along the way. Running this inside a single write
-    /// transaction is intentional: it mirrors Postgres's blocking CREATE
-    /// INDEX lock semantics and guarantees the index is consistent when
-    /// the Ready flip commits.
+    /// Backfill a secondary index from existing rows (CREATE INDEX on a
+    /// non-empty collection). Runs as one write transaction so the index is
+    /// consistent when the Ready flip commits.
     BackfillIndex {
         collection: String,
         /// JSON-path-like field (e.g. `$.email`).
@@ -401,15 +312,10 @@ pub enum DocumentOp {
     Truncate {
         collection: String,
         restart_identity: bool,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane from a recon scan of the rows this statement will remove.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in the
-        /// catalog redb, which is Control-Plane state. Because the set is
-        /// derived from a scan taken before execution, the Data-Plane leader
-        /// re-derives the actual join-key set and returns
-        /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
+        /// Sum-binding targets from a Control-Plane recon scan of the rows
+        /// this statement removes. The Data-Plane leader re-derives the
+        /// actual set and returns `ErrorCode::OllpRetryRequired` on
+        /// divergence, before writing.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
@@ -437,42 +343,25 @@ pub enum DocumentOp {
         /// Stable cross-engine identity assigned by the CP-side
         /// `SurrogateAssigner`. `Surrogate::ZERO` only in test fixtures.
         surrogate: Surrogate,
-        /// Write policy gating the persist, evaluated against the body actually
-        /// stored by whichever branch runs: the insert body when the row is
-        /// absent, the merge with the stored row (or the `on_conflict_updates`
-        /// result) when it is present, or the reason no predicate is attached.
-        /// See `PointDelete::rls_write_check`.
+        /// Write policy gating the persist against whichever body actually
+        /// lands: the insert body when absent, the merged/conflict-updated
+        /// row when present — see `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// When `Some`, return the STORED post-image projected per spec: the
-        /// merged row on the conflict branch, the inserted row otherwise.
-        /// Never the submitted body — on a conflict the caller's values are
-        /// only part of what the row ends up holding.
+        /// When `Some`, return the STORED post-image: merged row on conflict,
+        /// inserted row otherwise. Never the submitted body.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits — see
-        /// `PointDelete::rls_filters`.
+        /// See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane at plan time. Keyed on the PAIR because one source may drive
-        /// two bindings that share a join column and name different targets.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in
-        /// the catalog redb, which is Control-Plane state.
+        /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// Update target rows matched by a join with a source collection.
-    ///
-    /// Execution is two-phase within one Data Plane core:
-    /// 1. Scan `source_collection` (all rows).
-    /// 2. For each source row, find all target rows where
-    ///    `target[target_join_col] == source_row[source_join_col]`.
-    /// 3. Build a merged document with source fields qualified as
-    ///    `<source_alias>.<field>` and evaluate `updates` against it,
-    ///    then write back to the target row.
+    /// Update target rows matched by a join with a source collection: scan
+    /// source, build a merged doc per matching target row (source fields
+    /// qualified `<alias>.<field>`), evaluate `updates`, write back.
     UpdateFromJoin {
         target_collection: String,
         source_collection: String,
@@ -489,43 +378,20 @@ pub enum DocumentOp {
         #[serde(default)]
         returning: Option<ReturningSpec>,
         /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`.
-        /// When `Some`, the handler builds the source join-map from these
-        /// pre-scanned `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD
-        /// of reading the source collection from local storage. On a multi-core
-        /// node the source and target collections can map to different
-        /// Data-Plane cores; the source no longer lives in the target core's
-        /// local store, so the orchestrator scans the source on its OWN core
-        /// (via the source-scan primitive) and ships the rows in here. Each body
-        /// is the RAW stored source document (a Binary Tuple for a strict
-        /// source, MessagePack for a schemaless source), decoded by the handler
-        /// with the same schema-aware logic the local scan uses (the source's
-        /// strict schema is present on every core because `Register` is
-        /// broadcast), so the resulting join-map is byte-for-byte identical to
-        /// the local-read path. `None` = legacy local-read path (co-resident /
-        /// in-transaction buffered replay).
+        /// When `Some`, the join-map is built from these pre-scanned
+        /// `(source_doc_id, raw_stored_bytes)` rows instead of local storage —
+        /// needed because source and target can live on different
+        /// Data-Plane cores. `None` = legacy local-read path.
         #[serde(default)]
         source_rows: Option<Vec<(String, Vec<u8>)>>,
-        /// Read filters gating `returning`, keyed on `target_collection` —
-        /// every returned row is a target row. See `PointDelete::rls_filters`.
+        /// See `PointDelete::rls_filters`; every returned row is a target row.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Write policy of `target_collection` gating the persist, evaluated
-        /// against each matched target row's post-image — every row this op
-        /// writes is a target row — or the reason no predicate is attached.
-        /// See `PointDelete::rls_write_check`.
+        /// Write policy of `target_collection`, evaluated against each
+        /// matched target row's post-image — see `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// `target_collection`'s materialized-sum bindings, resolved on the
-        /// Control Plane from a recon scan of the target rows this statement
-        /// will rewrite. Both
-        /// sides of a join-key change are resolved, so a row moved from one
-        /// sum target to another can be debited and credited in one pass.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in the
-        /// catalog redb, which is Control-Plane state. Because the set is
-        /// derived from a scan taken before execution, the Data-Plane leader
-        /// re-derives the actual join-key set and returns
-        /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
+        /// See `PointPut::resolved_sum_targets`; resolved from a recon scan
+        /// covering both sides of a join-key change.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
@@ -538,41 +404,23 @@ pub enum DocumentOp {
         /// When `Some`, return updated documents projected per spec.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Optimistic pre-execution predicted matching surrogates (OLLP path).
-        ///
-        /// When `Some`, the executor verifies that the actual set of matching
-        /// surrogates equals this sorted set before applying any write. On
-        /// mismatch the executor returns `ErrorCode::OllpRetryRequired` without
-        /// writing. `None` on the non-OLLP (static-set) path — no verification.
+        /// OLLP path: when `Some`, the executor verifies the actual matching
+        /// surrogate set equals this sorted set before writing, else returns
+        /// `ErrorCode::OllpRetryRequired`. `None` = no verification.
         #[serde(default)]
         ollp_predicted_surrogates: Option<Vec<u32>>,
-        /// Optimistic pre-execution predicted implicit edges (OLLP path).
-        ///
-        /// Carried for symmetry/forward-use with `BulkDelete`. Edge-content
-        /// drift validation currently runs only on the `BulkDelete` path
-        /// (implicit-edge DELETE); the executor leaves this field unused for
-        /// `BulkUpdate`. `None` on the non-OLLP path.
+        /// OLLP path, carried for symmetry with `BulkDelete`; the executor
+        /// does not verify edge drift on this variant. `None` off OLLP.
         #[serde(default)]
         ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
-        /// Read filters gating `returning` — see `PointDelete::rls_filters`.
+        /// See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Write policy gating the persist, evaluated against each matched
-        /// row's post-update image, or the reason no predicate is attached —
-        /// see `PointDelete::rls_write_check`.
+        /// Write policy against each matched row's post-update image — see
+        /// `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane from a recon scan of the rows the predicate matches. Both
-        /// sides of a
-        /// join-key change are resolved, so a row moved from one sum target to
-        /// another can be debited and credited in one pass.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in the
-        /// catalog redb, which is Control-Plane state. Because the set is
-        /// derived from a scan taken before execution, the Data-Plane leader
-        /// re-derives the actual join-key set and returns
-        /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
+        /// See `PointPut::resolved_sum_targets`; resolved from a recon scan
+        /// covering both sides of a join-key change.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
@@ -584,55 +432,31 @@ pub enum DocumentOp {
         /// When `Some`, return pre-deletion documents projected per spec.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Optimistic pre-execution predicted matching surrogates (OLLP path).
-        ///
-        /// When `Some`, the executor verifies that the actual set of matching
-        /// surrogates equals this sorted set before applying any write. On
-        /// mismatch the executor returns `ErrorCode::OllpRetryRequired` without
-        /// writing. `None` on the non-OLLP (static-set) path — no verification.
+        /// See `BulkUpdate::ollp_predicted_surrogates`.
         #[serde(default)]
         ollp_predicted_surrogates: Option<Vec<u32>>,
-        /// Optimistic pre-execution predicted implicit edges (OLLP path).
-        ///
-        /// When `Some`, the executor recomputes the actual edge set
-        /// (`(surrogate, _from, _to, _type)` per matched edge doc) from the
-        /// stored docs and compares the sorted sets. On ANY divergence it
-        /// returns `OllpRetryRequired` BEFORE any write, closing the
-        /// recon→execute content TOCTOU on `_from`/`_to`/`_type`. `None` on the
-        /// non-OLLP path (no edge-content verification).
+        /// OLLP path: when `Some`, the executor recomputes the actual edge set
+        /// (`surrogate, _from, _to, _type` per matched edge doc) and returns
+        /// `OllpRetryRequired` before writing on any divergence, closing the
+        /// recon→execute TOCTOU. `None` off OLLP.
         #[serde(default)]
         ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
-        /// Read filters gating `returning` — see `PointDelete::rls_filters`.
+        /// See `PointDelete::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Write policy gating the persist, evaluated against each matched
-        /// row's pre-deletion image — the only image a delete has — or the
-        /// reason no predicate is attached. See `PointDelete::rls_write_check`.
+        /// Write policy against each matched row's pre-deletion image (the
+        /// only image a delete has) — see `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// this collection's materialized-sum bindings, resolved on the Control
-        /// Plane from a recon scan of the rows the predicate matches.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in the
-        /// catalog redb, which is Control-Plane state. Because the set is
-        /// derived from a scan taken before execution, the Data-Plane leader
-        /// re-derives the actual join-key set and returns
-        /// `ErrorCode::OllpRetryRequired` on divergence BEFORE writing.
+        /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// MERGE: join-based multi-action DML (INSERT / UPDATE / DELETE per WHEN arm).
-    ///
-    /// Execution:
-    /// 1. Build a join map from the source collection keyed by `source_join_col`.
-    /// 2. Walk all target rows; for each with a matching source row, find the
-    ///    first `Matched` arm whose extra_predicate is satisfied and apply its
-    ///    action.
-    /// 3. Walk source rows with no matching target row; find the first `NotMatched`
-    ///    arm whose extra_predicate is satisfied and apply its action (INSERT).
-    /// 4. Optionally, walk target rows with no matching source row; find the first
-    ///    `NotMatchedBySource` arm and apply it (UPDATE or DELETE).
+    /// MERGE: join-based multi-action DML (INSERT/UPDATE/DELETE per WHEN
+    /// arm). Builds a join map from the source, walks target rows applying
+    /// the first matching `Matched` arm, then source rows with no target
+    /// match applying `NotMatched` (INSERT), then optionally target rows
+    /// with no source match applying `NotMatchedBySource`.
     Merge {
         target_collection: String,
         source_collection: String,
@@ -643,173 +467,102 @@ pub enum DocumentOp {
         clauses: Vec<MergeClauseOp>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert
-        /// rows, keyed by source join value (orchestrator phase 3). When
-        /// `Some`, the handler runs the ATOMIC apply: it re-derives the insert
-        /// set, verifies its join-key set equals these keys — returning
-        /// `ErrorCode::OllpRetryRequired` WITHOUT writing on drift (closing the
-        /// resolve→apply TOCTOU) — and applies every arm's writes with these
-        /// surrogates in ONE redb transaction (matched UPDATE + NOT-MATCHED
-        /// INSERT share the txn; a UNIQUE violation rolls back the whole set).
-        /// `None` on a bare (unwrapped) `Merge` is the UNRESOLVED shape
-        /// every entry point intercepts on the Control Plane — autocommit via
-        /// the merge orchestrator, in-transaction via the statement-time
-        /// expander — so it never reaches the Data Plane, which rejects it.
+        /// Control-Plane-pre-assigned surrogates for NOT-MATCHED insert rows,
+        /// keyed by source join value. When `Some`, the handler re-verifies
+        /// the insert set against these keys (`OllpRetryRequired` on drift,
+        /// no write) and applies every arm in one redb transaction. `None`
+        /// is the unresolved shape every Control-Plane entry point
+        /// intercepts — never reaches the Data Plane.
         #[serde(default)]
         resolved_inserts: Option<Vec<(String, u32)>>,
-        /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`,
-        /// the handler builds the source join-map from these pre-scanned
-        /// `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD of reading
-        /// the source collection from local storage. On a multi-core node the
-        /// source and target collections can map to different Data-Plane cores;
-        /// the source no longer lives in the target core's local store, so the
-        /// orchestrator scans the source on its OWN core (via the source-scan
-        /// primitive) and ships the rows in here. Each body is the RAW stored
-        /// source document (a Binary Tuple for a strict source, MessagePack for
-        /// a schemaless source), exactly as the local scan would read it; the
-        /// handler decodes it with the same schema-aware logic (the source's
-        /// strict schema is present on every core because `Register` is
-        /// broadcast), so the resulting join-map is byte-for-byte identical to
-        /// the local-read path. `None` = legacy local-read path (co-resident /
-        /// in-transaction buffered replay).
+        /// See `UpdateFromJoin::source_rows`.
         #[serde(default)]
         source_rows: Option<Vec<(String, Vec<u8>)>>,
-        /// Read filters gating `returning`, keyed on `target_collection` —
-        /// every returned row is a target row. See `PointDelete::rls_filters`.
+        /// See `PointDelete::rls_filters`; every returned row is a target row.
         #[serde(default)]
         rls_filters: Vec<u8>,
-        /// Write policy of `target_collection` gating the persist: every arm
-        /// writes a target row, gated against the image it stores — post for an
-        /// UPDATE/INSERT arm, pre for a DELETE arm — or the reason no
-        /// predicate is attached. See `PointDelete::rls_write_check`.
+        /// Write policy of `target_collection`: post-image for an
+        /// UPDATE/INSERT arm, pre-image for a DELETE arm — see
+        /// `PointDelete::rls_write_check`.
         rls_write_check: RlsWriteCheck,
-        /// `(target collection, join-key value)` → target row surrogate for
-        /// `target_collection`'s materialized-sum bindings, resolved on the
-        /// Control Plane from the RESOLVE pass's classification. Every arm
-        /// moves the total: an INSERT
-        /// arm credits, a DELETE arm debits, an UPDATE arm applies the
-        /// difference and, when the arm rewrites the join key, both sides.
-        ///
-        /// The Data Plane cannot derive this: the PK→surrogate map lives in the
-        /// catalog redb, which is Control-Plane state. The APPLY pass already
-        /// re-derives its classification and returns
-        /// `ErrorCode::OllpRetryRequired` on drift BEFORE writing, which is the
-        /// same guard this set relies on.
+        /// See `PointPut::resolved_sum_targets`, resolved from the RESOLVE
+        /// pass's classification. INSERT credits, DELETE debits, UPDATE
+        /// applies the difference (both sides on a join-key rewrite).
         #[serde(default)]
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// Cursor-paginated scan for the clone materializer.
+    /// Cursor-paginated scan for the clone materializer. Returns
+    /// `(document_id, surrogate, value_bytes)` triples plus next-cursor as
+    /// `[next_cursor: bin, entries: [[id, surrogate, value_bytes], ...]]`;
+    /// `value_bytes` is always MessagePack, transcoded from the source
+    /// encoding. `next_cursor` empty = scan complete.
     ///
-    /// Returns `(document_id, surrogate, value_bytes)` triples plus next-cursor
-    /// in one payload so the materializer can drive the scan to completion in
-    /// O(N / count) round-trips.  `value_bytes` is standard MessagePack for
-    /// every source encoding — a strict Binary Tuple and a vector-primary
-    /// sidecar are transcoded by the handler, so a consumer writes the body to
-    /// any target without re-deciding the source format.  The response payload
-    /// is msgpack-encoded as a 2-element array:
-    ///   `[ next_cursor: bin,
-    ///      entries: [[document_id: str, surrogate: u32, value_bytes: bin], ...] ]`
-    /// `next_cursor` is empty when the scan is complete.
-    ///
-    /// Honors `system_as_of_ms` so the materializer reads the source collection
-    /// as-of the clone's `as_of_lsn`. For non-bitemporal collections the field
-    /// is ignored and current state is scanned.
+    /// Honors `system_as_of_ms` (the clone's `as_of_lsn`) on bitemporal
+    /// collections; ignored otherwise.
     MaterializeScan {
         collection: String,
         cursor: Vec<u8>,
         count: usize,
         system_as_of_ms: Option<i64>,
-        // NOTE: clone materialization is a point-in-time snapshot; `AllVersions`
-        // does not compose with snapshot clones and is rejected upstream.
+        // Point-in-time snapshot: `AllVersions` is rejected upstream.
     },
 
     /// Add a signed amount to a materialized-sum balance on a TARGET row.
     ///
-    /// A collection homes to one vShard, so a binding's source and target are
-    /// generally served by different cores. When they are, the balance write
-    /// cannot ride the source write's transaction — that transaction belongs to
-    /// the source's core and has no access to the target's rows. The Control
-    /// Plane appends this op as a task of its OWN, homed on the target
-    /// collection's vShard, exactly as an implicit graph edge is appended and
-    /// homed on its source endpoint. The pair then classifies as multi-shard and
-    /// commits atomically through Calvin.
-    ///
-    /// The Data Plane applies it as a read-modify-write through the full
-    /// document write path, so the target row gets the same index, statistics
-    /// and cache maintenance any other write of that row would get.
+    /// Source and target usually live on different cores, so this rides as
+    /// its own Control-Plane-appended task homed on the target's vShard
+    /// (like an implicit graph edge); the pair commits atomically through
+    /// Calvin. Applied as a normal read-modify-write on the Data Plane.
     ApplyBalanceDelta {
-        /// TARGET collection, db-qualified exactly as every other plan names the
-        /// collection it writes — this op's task homes on it.
+        /// TARGET collection this op's task homes on.
         collection: String,
-        /// Target row's storage key: the hex-encoded surrogate, the key every
-        /// reader of that collection uses.
+        /// Target row's storage key (hex-encoded surrogate).
         document_id: String,
-        /// Target row's stable cross-engine identity, resolved from the join
-        /// value on the Control Plane at plan time.
+        /// Target row's cross-engine identity, resolved from the join value.
         surrogate: Surrogate,
         /// The balance column this delta moves.
         column: String,
-        /// Signed amount to add, as an exact decimal STRING. Never `f64`: a
-        /// balance is precisely the column where 15 significant digits is not
-        /// enough, which is also why the stored total is a string.
+        /// Signed amount to add, as an exact decimal STRING — never `f64`,
+        /// which loses precision a balance cannot afford.
         delta: String,
-        /// Binding's join column, carried so a target that has gone missing
-        /// fails with the same typed error the co-resident path raises.
+        /// Binding's join column — a missing target fails with the same
+        /// typed error the co-resident path raises.
         join_column: String,
-        /// Join value that resolved to `surrogate`, carried for the same reason
-        /// as `join_column`.
+        /// Join value that resolved to `surrogate`.
         join_value: String,
     },
 
-    /// Read-only RESOLVE pass over the wrapped write op.
+    /// Read-only resolve pass over the wrapped write op: runs its full
+    /// classification and reports what it would write, without writing,
+    /// indexing, or emitting events. The Control-Plane expander turns the
+    /// answer into concrete point ops.
     ///
-    /// The handler runs the wrapped op's full classification — target scan,
-    /// join match, arm selection, assignment eval, post-image encode — and
-    /// returns what it WOULD write, without writing, re-indexing, accumulating
-    /// a write set, or emitting events. The Control-Plane expander turns that
-    /// answer into concrete, surrogate-carrying point ops.
-    ///
-    /// Only [`DocumentOp::Merge`], [`DocumentOp::UpdateFromJoin`],
+    /// Valid inner ops: [`DocumentOp::Merge`], [`DocumentOp::UpdateFromJoin`],
     /// [`DocumentOp::PointUpdate`], [`DocumentOp::PointDelete`],
-    /// [`DocumentOp::Upsert`], [`DocumentOp::BulkUpdate`] and
-    /// [`DocumentOp::BulkDelete`] are valid inner ops; the Data Plane rejects
-    /// any other.
+    /// [`DocumentOp::Upsert`], [`DocumentOp::BulkUpdate`],
+    /// [`DocumentOp::BulkDelete`] — any other is rejected.
     ///
-    /// The two join-driven ops report a classification the Control-Plane
-    /// expander turns into point ops. The five point/bulk ops report a
-    /// [`DocumentResolveOutcome`](super::resolved_mutation::DocumentResolveOutcome)
-    /// that becomes a [`DocumentOp::ResolvedWrite`] proposed through Raft.
-    ///
-    /// Carries NO check slot of its own: it persists nothing, so no write gate
-    /// applies. The wrapped op still holds the injected write predicate, and
-    /// the expander decides every resolved image against it before emitting a
-    /// point op. Classified as a READ everywhere — permission, write class,
-    /// lock keys, CDC, Calvin routing.
+    /// Carries no check slot: it persists nothing. The wrapped op's write
+    /// predicate still governs each resolved image. Classified as a read
+    /// everywhere — permission, write class, lock keys, CDC, Calvin routing.
     ResolveWrite(Box<DocumentOp>),
 
     /// Apply exactly the mutations a [`DocumentOp::ResolveWrite`] reported,
-    /// then return the reply it reported alongside them.
+    /// then return the reply it reported alongside them — the one shape
+    /// every governed point/bulk document write resolves to.
     ///
-    /// The one shape every governed point/bulk document write resolves to. A
-    /// `PointUpdate` / `Upsert` / each matched `BulkUpdate` row becomes a
-    /// [`DocumentResolvedMutation::Put`](super::resolved_mutation::DocumentResolvedMutation::Put);
-    /// a `PointDelete` / each matched `BulkDelete` row becomes a `Delete`. A
-    /// bulk op produces N mutations in one vector, which is what lets it share
-    /// this shape rather than needing a second wire form.
-    ///
-    /// Every mutation's `precondition` is checked BEFORE the first mutation
-    /// runs; any mismatch fails the whole write with
-    /// `ErrorCode::OllpRetryRequired` and mutates nothing.
+    /// Every mutation's `precondition` is checked before the first runs; a
+    /// mismatch fails the whole write with `ErrorCode::OllpRetryRequired`
+    /// and mutates nothing.
     ResolvedWrite {
         mutations: Vec<super::resolved_mutation::DocumentResolvedMutation>,
         /// The statement's reply, decided at resolve time. Every replica
-        /// returns it unchanged rather than recomputing it from state that has
-        /// moved on.
+        /// returns it unchanged rather than recomputing it.
         response_payload: Vec<u8>,
-        /// Always `RlsWriteCheck::DecidedEarlierInRequest`: this same request
-        /// already admitted these exact row images. The slot stays so the apply
-        /// path runs the same write gate every other write path runs.
+        /// Always `RlsWriteCheck::DecidedEarlierInRequest` — this request
+        /// already admitted these row images; the slot stays so apply runs
+        /// the same write gate every path runs.
         rls_write_check: RlsWriteCheck,
     },
 }

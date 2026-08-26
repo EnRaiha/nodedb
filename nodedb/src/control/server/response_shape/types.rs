@@ -36,10 +36,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
-        // A CRDT delete can legitimately remove nothing (the document was
-        // already tombstoned), so its affected count is only knowable from the
-        // write's own response — it must render as a DML count, not as a
-        // document-shaped read whose count no consumer ever reads.
+        // A CRDT delete can legitimately remove nothing, so its count must render
+        // as a DML count from the write's own response, not a document-shaped read.
         PhysicalPlan::Crdt(CrdtOp::DocDelete { .. }) => DmlResult("DELETE"),
 
         PhysicalPlan::Document(DocumentOp::PointGet { .. })
@@ -85,39 +83,29 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Text(TextOp::FtsIndexDoc { .. })
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { .. }) => PlanKind::MultiRow,
 
-        // Analyzer-binding DDL config write — opaque execution result, same
-        // as `VectorOp::SetParams`.
+        // Opaque execution results: config write, index teardown status.
         PhysicalPlan::Text(TextOp::SetTextConfig { .. })
-        // Index teardown reports only success or failure, like `SetParams`.
         | PhysicalPlan::Vector(VectorOp::DropIndex { .. })
-        // Preview results are an internal typed zerompk control-plane value,
-        // never a client document row. Preserve the bytes for the admission
-        // caller to decode as `CrdtPreviewResult`.
+        // Internal typed zerompk value, never a client row — decoded by the
+        // admission caller as `CrdtPreviewResult`.
         | PhysicalPlan::Crdt(CrdtOp::PreviewApply { .. }) => PlanKind::Execution,
 
         PhysicalPlan::Kv(KvOp::Get { .. }) | PhysicalPlan::Kv(KvOp::FieldGet { .. }) => {
             PlanKind::SingleDocument
         }
 
-        // Constant-result or catalog-scan expressions (SELECT 1, SELECT 'hello',
-        // catalog scans, etc.) are compiled to ProviderScan. Route through MultiRow
+        // Constant/catalog-scan expressions compile to ProviderScan; route MultiRow
         // so each array element streams as its own pgwire row.
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => PlanKind::MultiRow,
 
-        // Exchange nodes at this point mean the plan was not yet resolved.
-        // Recurse into the child to determine the plan kind.
+        // Exchange means the plan wasn't yet resolved — recurse into the child.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => describe_plan(&op.child),
 
-        // PostProcess reshapes a multi-row subquery result; its kind is the
-        // child's. (Unresolved at this point; resolved to a ProviderScan =
-        // MultiRow before dispatch.)
+        // PostProcess reshapes a multi-row subquery; its kind is the child's.
         PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => describe_plan(input),
 
-        // An insert carrying a projection returns real stored rows, so it must
-        // be decoded and redacted like every other RETURNING write. Without
-        // these arms it falls through to the count shape below, whose
-        // passthrough forwards the Data-Plane payload with no redaction applied
-        // at all — the same silent leak `Merge` had.
+        // An insert with a projection returns real stored rows and must be decoded
+        // and redacted, else it silently leaks unredacted rows like `Merge` did.
         PhysicalPlan::Kv(
             KvOp::Insert {
                 returning: Some(_), ..
@@ -154,12 +142,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
-        // DML operations that return affected row count.
-        //
-        // `PointInsert` and `KvOp::InsertIfAbsent` are here because
-        // `ON CONFLICT DO NOTHING` makes them no-op-capable: the count is 0 when
-        // the key was already present, so it has to be read from the write's
-        // response instead of assumed from the plan.
+        // `PointInsert`/`InsertIfAbsent`: `ON CONFLICT DO NOTHING` makes them
+        // no-op-capable, so the count must come from the write's response.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
         | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { .. })
@@ -189,28 +173,21 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         }) => PlanKind::ReturningRows,
         PhysicalPlan::Document(DocumentOp::UpdateFromJoin { .. }) => DmlResult("UPDATE"),
 
-        // A MERGE carrying a projection returns real target rows, so it must be
-        // decoded and redacted like every other RETURNING write. Without this
-        // arm it fell through to `Execution`, whose passthrough forwards the
-        // Data-Plane payload to the client with no redaction applied at all.
+        // A MERGE with a projection returns real target rows and must be decoded
+        // and redacted, else it falls through to unredacted `Execution` passthrough.
         PhysicalPlan::Document(DocumentOp::Merge {
             returning: Some(_), ..
         }) => PlanKind::ReturningRows,
-        // Postgres tags a plain MERGE `MERGE <total-rows-affected>`, matching
-        // the in-transaction staged path's tag.
+        // Postgres tags a plain MERGE `MERGE <rows-affected>`, matching the staged path.
         PhysicalPlan::Document(DocumentOp::Merge { .. }) => DmlResult("MERGE"),
 
         PhysicalPlan::Document(DocumentOp::Truncate { .. }) => DmlResult("TRUNCATE"),
 
-        // KV delete / truncate count the keys they removed. Classifying them as
-        // opaque `Execution` discarded that count, so a KV delete reported no
-        // rows however many keys it actually removed.
+        // KV delete/truncate count the keys removed — `Execution` would discard that.
         PhysicalPlan::Kv(KvOp::Delete { .. }) | PhysicalPlan::Kv(KvOp::PredicateDelete { .. }) => {
             DmlResult("DELETE")
         }
-        // Reports `{"affected": n}` — the rows the predicate matched and
-        // merged. Classifying it as opaque `Execution` would discard that
-        // count and report `UPDATE 0` however many rows changed.
+        // Reports `{"affected": n}` — `Execution` would discard that count.
         PhysicalPlan::Kv(KvOp::PredicateUpdate { .. }) => DmlResult("UPDATE"),
         PhysicalPlan::Kv(KvOp::Truncate { .. }) => DmlResult("TRUNCATE"),
 
@@ -221,12 +198,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         }) => PlanKind::ReturningRows,
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => DmlResult("UPSERT"),
 
-        // Array engine read & maintenance ops produce a JSON-array
-        // payload of rows; route to the multi-row decoder so each row
-        // streams as its own pgwire `result` field. Aggregate's payload
-        // is plain msgpack (decode_payload_to_json transcodes); Slice /
-        // Project payloads use the tagged Value codec which transcodes
-        // to a JSON array of arrays — clients receive JSON text per row.
+        // Array read/maintenance ops produce a JSON-array payload; route to the
+        // multi-row decoder so each row streams as its own pgwire field.
         PhysicalPlan::Array(nodedb_physical::physical_plan::ArrayOp::Slice { .. }) => {
             PlanKind::ArraySlice
         }
@@ -235,18 +208,14 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Array(nodedb_physical::physical_plan::ArrayOp::Elementwise { .. }) => {
             PlanKind::MultiRow
         }
-        // Flush / Compact return `{flushed: 1}` / `{compacted: N}` —
-        // route as SingleDocument so the row's `document` column
-        // carries the status JSON.
+        // Flush/Compact return status JSON — route SingleDocument.
         PhysicalPlan::Array(nodedb_physical::physical_plan::ArrayOp::Flush { .. })
         | PhysicalPlan::Array(nodedb_physical::physical_plan::ArrayOp::Compact { .. }) => {
             PlanKind::SingleDocument
         }
 
-        // Vector write / config ops carry no row payload to shape — they
-        // return an affected-count or status. Enumerated explicitly (not via
-        // a `Vector(_)` wildcard) so a future *read* op like `SparseSearch`
-        // cannot silently fall through to `Execution` and strand its hits.
+        // Vector write/config ops carry no row payload. Enumerated explicitly (not a
+        // `Vector(_)` wildcard) so a future read op can't silently strand its hits.
         PhysicalPlan::Vector(VectorOp::Insert { .. })
         | PhysicalPlan::Vector(VectorOp::BatchInsert { .. })
         | PhysicalPlan::Vector(VectorOp::Delete { .. })
@@ -262,39 +231,23 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Vector(VectorOp::MultiVectorDelete { .. })
         | PhysicalPlan::Vector(VectorOp::DirectUpsert { .. }) => PlanKind::Execution,
 
-        // Document ops with no row payload to shape: index DDL, collection
-        // registration, cardinality estimates, and the clone materializer's
-        // cursor scan (whose payload is an internal typed tuple the
-        // materializer decodes itself, never a client row). Enumerated
-        // explicitly, not via a `Document(_)` wildcard: a wildcard here made
-        // `Merge` default to unredacted passthrough for as long as it carried
-        // no rows, and the next row-bearing op added would inherit exactly the
-        // same silent leak.
+        // Document ops with no row payload. Enumerated explicitly, not a `Document(_)`
+        // wildcard — that let `Merge` default to unredacted passthrough.
         PhysicalPlan::Document(DocumentOp::Register { .. })
         | PhysicalPlan::Document(DocumentOp::IndexLookup { .. })
         | PhysicalPlan::Document(DocumentOp::DropIndex { .. })
         | PhysicalPlan::Document(DocumentOp::BackfillIndex { .. })
         | PhysicalPlan::Document(DocumentOp::EstimateCount { .. })
         | PhysicalPlan::Document(DocumentOp::MaterializeScan { .. })
-        // Read-only resolve: its payload is the internal classification tuple
-        // the Control-Plane orchestrator decodes, never a client row.
+        // Read-only resolve: payload is the internal classification tuple, never a client row.
         | PhysicalPlan::Document(DocumentOp::ResolveWrite(_))
-        // A derived balance write answers no client: it reports an affected
-        // count to the planner that appended it and shapes no row.
+        // A derived balance write answers no client — reports an affected count only.
         | PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. })
-        // A resolved governed write never reaches this classifier: the
-        // write-resolve orchestrator returns the response itself, and the
-        // caller shapes it from the INTERCEPTED plan — the `PointUpdate` /
-        // `Upsert` / bulk op whose `returning` slot says whether rows come
-        // back. Shaping from this plan would decide that from a shape that no
-        // longer carries the clause.
+        // Never reaches this classifier: write-resolve returns the response itself,
+        // shaped from the intercepted plan whose `returning` slot decides.
         | PhysicalPlan::Document(DocumentOp::ResolvedWrite { .. })
 
-        // Default: opaque execution result. The specific arms above take
-        // precedence; these inner wildcards catch every unmatched op of each
-        // engine (including the remaining `Crdt` ops not covered above) plus
-        // the engines with no arms at all here (Meta, ClusterArray).
-        // Exhaustive so a new PhysicalPlan variant forces a decision.
+        // Default: opaque execution result. Exhaustive so a new variant forces a decision.
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Columnar(_)
@@ -312,9 +265,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 // Bring the variant into scope for brevity in match arms above.
 use PlanKind::DmlResult;
 
-/// Protocol-neutral SQL column type. Each server entrypoint maps this to its
-/// own wire type (pgwire OID, native type tag, etc.). One variant per pgwire
-/// field-builder in `pgwire::types::field`, so the mapping is lossless.
+/// Protocol-neutral SQL column type, mapped to each entrypoint's own wire
+/// type. One variant per pgwire field-builder, so the mapping is lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DdlColType {
     #[default]
@@ -336,62 +288,29 @@ pub enum DdlColType {
 }
 
 /// Protocol-neutral shaped row set: columns + row objects + an optional
-/// client-facing notice. Not yet constructed anywhere — a later relocation
-/// unit wires this into a shared composed entry point.
+/// client-facing notice.
 #[derive(Debug, Clone)]
 pub struct ShapedRows {
     pub columns: Vec<String>,
-    /// Per-column SQL type, parallel to (same length/order as) `columns`.
-    /// Only the pgwire encoder consumes this to reproduce exact RowDescription
-    /// type OIDs; the native and http entrypoints ignore it. `Text` is used
-    /// wherever the source type is unknown.
+    /// Per-column SQL type, parallel to `columns`. Only pgwire consumes this
+    /// (RowDescription OIDs); `Text` when the source type is unknown.
     pub column_types: Vec<DdlColType>,
-    /// One map per row. Cells are keyed by [`ShapedRows::cell_keys`], NOT by
-    /// `columns` directly — SQL output names may repeat (`SELECT w.id, b.id`
-    /// displays both as `id`) and a map cannot hold two cells under one key.
-    /// Read cells through `cell_keys` so each column reads its own value.
+    /// One map per row, keyed by [`ShapedRows::cell_keys`] not `columns` —
+    /// SQL output names may repeat and a map can't hold two cells per key.
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub notice: Option<String>,
 }
 
 impl ShapedRows {
-    /// Build a `column_types` vec of `n` `Text` entries, for the non-DDL
-    /// construction sites whose consumers (native/http) ignore column types.
+    /// Build a `column_types` vec of `n` `Text` entries, for non-DDL sites
+    /// whose consumers ignore column types.
     pub fn text_types(n: usize) -> Vec<DdlColType> {
         vec![DdlColType::Text; n]
     }
 
-    /// Fold another shaped result into this one so the N tasks a single
-    /// statement plans to answer with ONE result set.
-    ///
-    /// A statement is one result set on the wire. A multi-row
-    /// `INSERT ... RETURNING` plans to one task per row, and emitting a
-    /// RowDescription/DataRow sequence per task hands an extended-query client
-    /// several results for one statement — which drivers that expect exactly
-    /// one either mis-read or reject. Rows accumulate in task order, which is
-    /// the order the statement listed them.
-    ///
-    /// The column set is the UNION of every contributor's columns, so a column
-    /// that appears in any row is present in the result. Rows are read by
-    /// column key rather than by position, so a row lacking one of those
-    /// columns encodes as NULL instead of shifting its remaining cells left.
-    /// Both halves are required: keeping only the first contributor's columns
-    /// would silently discard a later row's extra field, since the encoder
-    /// reads strictly through [`ShapedRows::cell_keys`] and never sees a key
-    /// absent from `columns`.
-    ///
-    /// **Ordering rule.** The first contributor that has any columns fixes the
-    /// leading positions and keeps them; a column that a later contributor
-    /// introduces is appended after them, in the order it is first seen. Column
-    /// order is therefore deterministic and append-only across the fold — a
-    /// client reading positionally never sees an earlier column move.
-    ///
-    /// Assumes each contributor's own column names are unique, which every
-    /// `RETURNING` shape satisfies: the names are either a stored row's object
-    /// keys or a projection list. That makes each cell key equal to its column
-    /// name, so rows merge by name with no re-keying. (Repeated output names
-    /// are a SELECT-list concern — `SELECT w.id, b.id` — and no SELECT is ever
-    /// folded here.)
+    /// Fold another shaped result into this one so N tasks answer with ONE result
+    /// set — some drivers reject multiple result sets. Columns are the union of
+    /// every contributor's; rows read by key so a missing column encodes NULL.
     pub fn append(&mut self, other: ShapedRows) {
         if self.notice.is_none() {
             self.notice = other.notice;
@@ -413,22 +332,9 @@ impl ShapedRows {
         self.rows.extend(other.rows);
     }
 
-    /// Per-column keys for reading cells out of [`ShapedRows::rows`], parallel
-    /// to `columns`.
-    ///
-    /// This is the single source of truth every consumer shares — the pgwire
-    /// encoders, the native converter, and the HTTP JSON serializers all key
-    /// rows through it, so the row-map layout can never drift from what a
-    /// consumer expects.
-    ///
-    /// Identical to `columns` unless two output columns share a name, in which
-    /// case later duplicates take a `_<n>` suffix (see
-    /// [`super::project::cell_keys`]). Because the HTTP transports serialize a
-    /// row map directly to JSON, that suffix is user-visible there: a
-    /// duplicate-name `SELECT w.id, b.id` emits `{"id": …, "id_1": …}`, since
-    /// a JSON object likewise cannot carry the same key twice. pgwire and
-    /// native are positional on the wire and still report both columns as
-    /// `id`, matching PostgreSQL.
+    /// Per-column keys for reading cells out of [`ShapedRows::rows`]. Identical
+    /// to `columns` unless names collide, then later duplicates take a `_<n>` suffix
+    /// — visible in HTTP JSON, but pgwire/native stay positional.
     pub fn cell_keys(&self) -> Vec<String> {
         super::project::cell_keys(&self.columns)
     }
@@ -459,12 +365,8 @@ mod tests {
         }
     }
 
-    /// A column only a LATER contributor carries must survive the fold.
-    ///
-    /// The encoder reads every cell through `cell_keys()`, derived from the
-    /// final `columns`, so a key absent from `columns` is never read — keeping
-    /// only the first contributor's columns dropped that value from the
-    /// response silently, for every row rather than just the row that had it.
+    /// A column only a later contributor carries must survive the fold — a key
+    /// absent from `columns` is never read by `cell_keys()`.
     #[test]
     fn append_unions_a_column_only_a_later_row_carries() {
         let mut merged = shaped(&["id", "name"], &[&[("id", "r1"), ("name", "a")]]);
@@ -553,9 +455,8 @@ mod tests {
         })
     }
 
-    /// A `MERGE ... RETURNING` payload is a `RowsPayload` of real target rows.
-    /// Classifying it as `Execution` would pass those rows straight to the
-    /// client with no decode and no redaction — the leak this arm closes.
+    /// A `MERGE ... RETURNING` payload is real target rows — `Execution` would
+    /// pass them unredacted.
     #[test]
     fn merge_with_returning_is_returning_rows() {
         use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
@@ -567,10 +468,8 @@ mod tests {
         assert!(matches!(describe_plan(&plan), PlanKind::ReturningRows));
     }
 
-    /// Every insert-family op that can carry a projection must classify as
-    /// row-returning. Falling through to the count arm forwards the Data-Plane
-    /// payload to the client with no decode and no redaction — the leak the
-    /// MERGE arm above closed, which any new row-bearing op would inherit.
+    /// Every insert-family op with a projection must classify row-returning,
+    /// else it leaks unredacted like the MERGE case above.
     #[test]
     fn inserts_with_returning_are_returning_rows() {
         use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};

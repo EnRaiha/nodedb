@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Query shapes a SHADOWED clone refuses instead of answering wrongly.
-//!
-//! A read over a shadowed clone either reads through to the source or refuses
-//! with a typed error naming the collection. It never returns target-only rows
-//! (silently incomplete) and never returns two partial answers concatenated
-//! (silently wrong — the clone read path appends the source payload to the
-//! target payload with no dedup and no aggregate reduction).
-//!
-//! Every shape below has no source-side rewrite in
-//! `control/clone/resolver/rewrite.rs`, so it refuses until the clone is
-//! materialized — at which point the clone owns every row and the query runs
-//! against the target alone.
+//! Query shapes a shadowed clone refuses instead of answering wrongly. A
+//! read over a shadowed clone either reads through to the source or refuses
+//! with a typed error — never target-only rows, never two partial answers
+//! silently concatenated. Every shape below has no source-side rewrite, so
+//! it refuses until materialized.
 
 use crate::harness::TestServer;
 
@@ -27,12 +20,9 @@ async fn exec_all(server: &TestServer, stmts: &[&str]) {
     }
 }
 
-/// Aggregating scan on the `timeseries` engine.
-///
-/// A timeseries aggregate lowers to `TimeseriesOp::Scan` carrying `aggregates`,
-/// not to `QueryOp::Aggregate` — the same unsound concatenation by a different
-/// plan shape, so it refuses the same way. A PLAIN timeseries scan still reads
-/// through (covered by `clone_materialize_timeseries`).
+/// Aggregating scan on the `timeseries` engine. Lowers to
+/// `TimeseriesOp::Scan` carrying `aggregates`, not `QueryOp::Aggregate` —
+/// the same unsound concatenation by a different plan shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeseries_aggregate_over_shadowed_clone_is_refused() {
     let server = TestServer::start().await;
@@ -315,10 +305,8 @@ async fn set_operation_over_shadowed_clone_is_refused() {
     );
 }
 
-/// `UNION ALL` across two collections carries NO `post_set_op`, so it is caught
-/// by the other half of the rule: only the first task's collection has its
-/// clone origin resolved, and the second branch would be answered from the
-/// target alone.
+/// `UNION ALL` across two collections carries no `post_set_op`: only the
+/// first task's collection has its clone origin resolved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_collection_read_over_shadowed_clone_is_refused() {
     let server = TestServer::start().await;

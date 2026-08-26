@@ -2,12 +2,8 @@
 
 //! Distributed WAL write path — propose writes through Raft, apply after commit.
 //!
-//! Split into:
-//! - [`types`]: `ReplicatedWrite`, `ReplicatedEntry`, `RaftProposer`, `RaftCompactor`,
-//!   `RaftAppliedIndexSink`, variant defaults.
-//! - [`replicable_write`]: `ReplicableWrite`, the decided-write type `encode` consumes.
-//! - [`encode`]: `to_replicated_entry` (ReplicableWrite → ReplicatedEntry).
-//! - [`decode`]: `from_replicated_entry` (bytes → PhysicalPlan) + internal conversions.
+//! [`types`] holds the wire types; [`replicable_write`] the decided-write type
+//! [`encode`] consumes; [`decode`] converts wire bytes back to `PhysicalPlan`.
 
 pub mod decode;
 mod decode_sync_engines;

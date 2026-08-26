@@ -7,29 +7,10 @@ use crate::data::executor::core_loop::write_index::KeyRepr;
 use crate::data::executor::wal_replay::kv_put::KvReplayRecord;
 
 impl CoreLoop {
-    /// Whether a KV WAL record must NOT be re-applied during boot replay.
-    ///
-    /// Two independent reasons to skip, each a correctness bug if missed:
-    ///
-    /// * **Tombstoned** — the collection was dropped at or after this LSN, so
-    ///   the record is shadowed by a delete that may itself have fallen out of
-    ///   the live WAL.
-    /// * **Below the checkpoint floor** — the record's effect is already inside
-    ///   the KV checkpoint restored before replay. Skipping is mandatory rather
-    ///   than merely wasteful: most KV records are DELTAS (`kv_incr`, `kv_cas`,
-    ///   `kv_field_set`, `kv_transfer`, `kv_insert_on_conflict_update`) whose
-    ///   replay re-executes against current state instead of overwriting it, so
-    ///   re-applying one already folded into the checkpoint double-counts it.
-    ///
-    /// Records ABOVE the floor are safe to replay on top of the restored table:
-    /// the checkpoint reproduces exactly the state that existed at its stamped
-    /// LSN, so applying the remaining records in LSN order reaches the same
-    /// state a full from-zero replay would.
-    ///
-    /// The floor is engine-wide rather than per-collection because a KV
-    /// checkpoint publishes every collection at ONE LSN atomically — see
-    /// `kv_checkpoint.rs` for why a per-collection floor is unsound for the
-    /// records that span two collections.
+    /// Whether a KV WAL record must not be re-applied: tombstoned, or below
+    /// the checkpoint floor (most records are deltas, so re-applying one
+    /// already folded in double-counts it). Floor is engine-wide, not
+    /// per-collection — a checkpoint publishes all collections at one LSN.
     pub(in crate::data::executor) fn skip_kv_replay_record(
         &self,
         tombstones: &nodedb_wal::DatabaseTombstones<'_>,
@@ -42,13 +23,9 @@ impl CoreLoop {
     }
 
     /// Replay WAL KV records to rebuild in-memory hash tables after crash.
-    ///
-    /// KV records use generic `RecordType::Put` and `RecordType::Delete` with
-    /// a discriminator prefix in the MessagePack payload: `("kv_put", ...)`
-    /// or `("kv_delete", ...)`.
-    ///
-    /// Called once during startup, after `open()` but before the event loop.
-    /// Each core only replays records routed to its vShard.
+    /// Records use generic `RecordType::Put`/`Delete` with a discriminator
+    /// prefix in the payload. Called once at startup; each core replays
+    /// only records routed to its vShard.
     pub fn replay_kv_wal(
         &mut self,
         records: &[nodedb_wal::WalRecord],
@@ -110,11 +87,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_transfer (delta record, not a post-image): re-executes
-                // `compute_transfer` against whatever source/dest values are
-                // present in this core's KV engine at this point in LSN
-                // order — see `wal_replay_kv_transfer.rs` for the full
-                // rationale and the missing-source / compute-error policy.
+                // kv_transfer (delta, not a post-image): re-executes
+                // `compute_transfer` against current state in LSN order.
                 if let Some(applied) = self.try_replay_kv_transfer(
                     &record.payload,
                     tenant_id,
@@ -127,9 +101,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_transfer_item (delta record): re-verifies source
-                // ownership and re-executes the delete+insert pair — see
-                // `wal_replay_kv_transfer.rs`.
+                // kv_transfer_item: re-verifies source ownership and
+                // re-executes the delete+insert pair.
                 if let Some((item_puts, item_deletes)) = self.try_replay_kv_transfer_item(
                     &record.payload,
                     tenant_id,
@@ -143,10 +116,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_cas / kv_incr_float / kv_getset (delta records, not
-                // post-images): re-run the same live computation against
-                // whatever value is present in this core's KV engine at this
-                // point in LSN order — see `wal_replay_kv_atomic.rs`.
+                // kv_cas / kv_incr_float / kv_getset (deltas): re-run the
+                // same live computation against current state.
                 if let Some(applied) = self.try_replay_kv_atomic(
                     &record.payload,
                     tenant_id,
@@ -159,10 +130,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_field_set (delta record, not a post-image): re-runs the
-                // same field merge against whatever value is present in this
-                // core's KV engine at this point in LSN order — see
-                // `wal_replay_kv_field.rs`.
+                // kv_field_set (delta): re-runs the same field merge against
+                // current state.
                 if let Some(applied) = self.try_replay_kv_field_set(
                     &record.payload,
                     tenant_id,
@@ -175,11 +144,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_insert_on_conflict_update (delta record, not a
-                // post-image): re-runs the same `apply_on_conflict_updates`
-                // RMW merge against whatever value is present in this core's
-                // KV engine at this point in LSN order — see
-                // `wal_replay_kv_insert_conflict.rs`.
+                // kv_insert_on_conflict_update (delta): re-runs the same
+                // `apply_on_conflict_updates` RMW merge against current state.
                 if let Some(applied) = self.try_replay_kv_insert_on_conflict_update(
                     &record.payload,
                     tenant_id,
@@ -241,10 +207,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_incr (delta record, not a post-image): re-runs the same
-                // integer increment against whatever value is present in
-                // this core's KV engine at this point in LSN order — see
-                // `wal_replay_kv_incr.rs`.
+                // kv_incr (delta): re-runs the same integer increment
+                // against current state.
                 if let Some(applied) = self.try_replay_kv_incr(
                     &record.payload,
                     tenant_id,
@@ -257,10 +221,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_predicate_update (delta record): re-resolves the row set
-                // against this core's KV engine at this point in LSN order and
-                // re-runs the same merge — see
-                // `wal_replay_kv_predicate.rs`.
+                // kv_predicate_update (delta): re-resolves the row set against
+                // current state and re-runs the same merge.
                 if let Some(applied) = self.try_replay_kv_predicate_update(
                     &record.payload,
                     tenant_id,
@@ -318,9 +280,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_predicate_delete (delta record): re-resolves the row set
-                // against this core's KV engine at this point in LSN order —
-                // see `wal_replay_kv_predicate.rs`.
+                // kv_predicate_delete (delta): re-resolves the row set
+                // against current state.
                 if let Some(removed) = self.try_replay_kv_predicate_delete(
                     &record.payload,
                     tenant_id,
@@ -333,10 +294,8 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_drop_sorted_index — see `wal_replay_kv_sorted_index.rs`.
-                // No tombstone gate here: the record carries only
-                // `index_name`, no collection to gate on. See that module's
-                // doc comment for why this is safe.
+                // No tombstone gate: the record carries only `index_name`,
+                // no collection to gate on.
                 if let Some(applied) =
                     self.try_replay_kv_drop_sorted_index(&record.payload, tenant_id, database_id)
                 {

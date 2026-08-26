@@ -1,33 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Resolve + emit the concrete point ops for one in-transaction
-//! `UPDATE ... FROM <source>`.
+//! Resolve + emit the concrete point ops for one in-transaction `UPDATE ... FROM <source>`.
 //!
-//! A transactional `BEGIN; UPDATE t SET ... FROM s WHERE t.col = s.col; COMMIT`
-//! must not replay the raw `UpdateFromJoin` plan through the legacy Data-Plane
-//! passthrough, whose `execute_update_from_join` writes each matched row via a
-//! raw `sparse.put` in its OWN redb transaction — OUTSIDE the COMMIT batch's undo
-//! log (not atomic with sibling ops / ROLLBACK) and minting no batch-tracked op
-//! (so a vector/FTS-indexed target is reindexed live but the write does not ride
-//! the replicated, undo-tracked point-write path).
-//!
-//! Instead the update is resolved at STATEMENT time (`session::expander_stage`):
-//! this module ships the source rows to the source's own core, dispatches the
-//! shared Data-Plane RESOLVE pass (the single classifier — never re-derived
-//! here), and reuses each EXISTING target row's registered surrogate. It returns
-//! the resulting per-row `PointPut` tasks; the expander then stages + buffers each
-//! through the normal statement-time staging path, so they land in the
-//! transaction's overlay immediately (read-your-own-writes for later statements)
-//! and commit as indexed, replicated, undo-tracked point writes.
-//!
-//! Because the RESOLVE pass reads the TARGET as base ∪ overlay (the staged
-//! transaction's id is threaded through), an `UPDATE ... FROM` affects — and
-//! reuses the surrogate of — a row a prior statement in the same transaction
-//! staged.
-//!
-//! Unlike the MERGE expander this is UPDATE-only: `UPDATE ... FROM` never inserts
-//! or deletes, so there is no fresh-surrogate assignment and only a `PointPut`
-//! arm. Mirrors [`crate::control::merge_orchestrator::expand_staged_merge`].
+//! Must not replay the raw plan through the legacy Data-Plane passthrough, which
+//! writes outside the COMMIT undo log. Resolves at statement time instead.
 
 use nodedb_types::TenantId;
 
@@ -41,24 +17,14 @@ use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-/// One resolved UPDATE row from the RESOLVE pass: `(target storage doc_id, its
-/// registered surrogate — `None` only for a legacy non-surrogate-keyed row, the
-/// post-image body, the PRE-image body)`.
-///
-/// The pre-image is what lets the Control Plane resolve BOTH sides of a
-/// materialized-sum join-key rewrite; see `encode_resolved_update_rows`.
+/// One resolved UPDATE row: `(doc_id, surrogate — None only for legacy rows,
+/// post-image body, pre-image body)`. Pre-image lets the Control Plane resolve
+/// both sides of a materialized-sum join-key rewrite.
 pub(crate) type ResolvedUpdateArm = (String, Option<u32>, Vec<u8>, Vec<u8>);
 
-/// Resolve one in-transaction `DocumentOp::UpdateFromJoin` task into the
-/// concrete, surrogate-carrying `PointPut` tasks its matched target rows expand
-/// to.
-///
-/// `task` must be an `UpdateFromJoin` plan with `task.txn_id` set to the active
-/// transaction, so the RESOLVE pass (and its source scan) fold rows staged by
-/// earlier statements in the same transaction. The emitted point ops carry the
-/// same `txn_id` and target the TARGET collection's vShard (recomputed here so
-/// dispatch classification stays honest, exactly as the MERGE / `INSERT ...
-/// SELECT` expanders do). The caller stages + buffers each returned op.
+/// Resolve one in-transaction `UpdateFromJoin` task into the concrete,
+/// surrogate-carrying `PointPut` tasks its matched target rows expand to.
+/// `task.txn_id` must be the active transaction. Caller stages + buffers each op.
 pub(crate) async fn resolve_and_emit_update_from_join_ops(
     state: &SharedState,
     tenant_id: TenantId,
@@ -80,12 +46,8 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
 
     let resolved = resolve_update_rows(state, tenant_id, task).await?;
 
-    // Gate every matched row's post-image on the target's write policy. This
-    // expansion rewrites the statement into concrete `PointPut` ops the RLS
-    // injection pass has already run past, so the predicate compiled into the
-    // `UpdateFromJoin` plan is the last thing that can decide these rows;
-    // without the check here, expanding a governed update would launder it into
-    // ungoverned point writes.
+    // Gate every matched row on the target's write policy — without this, expanding
+    // a governed update would launder it into ungoverned point writes.
     if let nodedb_types::WriteGateDecision::Evaluate(predicate) = rls_write_check.decision() {
         for (_, _, body, _) in &resolved {
             crate::control::security::rls::admit_compiled_write_image(
@@ -107,20 +69,12 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
         })?;
     let target_pk = resolve_target_pk(&target, "UPDATE ... FROM")?;
 
-    // Concrete writes land on the TARGET collection's vShard — that is where the
-    // updated rows live. Recomputing it (rather than reusing the staged task's
-    // vShard) keeps dispatch classification honest, exactly as the MERGE /
-    // `INSERT ... SELECT` expanders do.
+    // Recomputed rather than reusing the staged task's vShard, keeping dispatch
+    // classification honest, like the MERGE / INSERT SELECT expanders.
     let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
 
-    // Resolve this expansion's materialized-sum targets from the arms the
-    // RESOLVE pass classified. BOTH images of every matched row contribute a
-    // join key: an update that rewrites the join column debits the target the
-    // row leaves and credits the one it joins, so resolving the post-images
-    // alone would leave the abandoned target permanently overstated. Every
-    // emitted point op carries the whole resolution — a row is folded against
-    // the entry its own join value selects, and an entry no op needs costs one
-    // unused surrogate.
+    // A join-column rewrite debits the target left and credits the one joined —
+    // resolving post-images alone would leave the abandoned target overstated.
     let sum_bodies: Vec<&[u8]> = resolved
         .iter()
         .flat_map(|(_, _, body, old_body)| [body.as_slice(), old_body.as_slice()])
@@ -151,8 +105,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
                 value: body,
                 surrogate,
                 pk_bytes,
-                // The `UPDATE ... FROM` op owns the statement's projection; the
-                // puts it expands into answer no client.
+                // The op owns the statement's projection; expanded puts answer no client.
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: resolved_sum_targets.clone(),
@@ -164,10 +117,9 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
     Ok(out)
 }
 
-/// Ship the source rows and dispatch the shared Data-Plane RESOLVE pass for one
-/// staged update, decoding the matched target rows. Never re-derives the join /
-/// assignment locally — `collect_update_from_join_rows` on the Data Plane is the
-/// single shared classifier for both this path and the write path.
+/// Ship source rows and dispatch the shared RESOLVE pass, decoding matched
+/// target rows. Never re-derives the join locally — `collect_update_from_join_rows`
+/// is the single shared classifier.
 async fn resolve_update_rows(
     state: &SharedState,
     tenant_id: TenantId,
@@ -191,11 +143,8 @@ async fn resolve_update_rows(
         });
     };
 
-    // Phase 0: read the SOURCE where it lives (its vShard can map to a different
-    // Data-Plane core than the target's) and ship the raw rows into the plan.
-    // Threading the staged transaction's id folds the source's own staging
-    // overlay, so a source row inserted/updated earlier in this transaction is
-    // shipped too.
+    // Read the SOURCE where it lives (vShard can differ from target's) and ship raw
+    // rows into the plan. Threading `txn_id` folds the source's own staging overlay.
     let source_rows = read_all_source_rows(
         state,
         tenant_id,
@@ -217,24 +166,15 @@ async fn resolve_update_rows(
             target_filters: target_filters.clone(),
             returning: None,
             source_rows: Some(source_rows),
-            // Read-only resolve pass: it emits no rows to the client and writes
-            // nothing, so neither policy has anything to gate here. The caller
-            // decides the resolved post-images against the statement's write
-            // predicate before any of them becomes a point op.
+            // Read-only: emits no rows, writes nothing, so neither policy gates here.
             rls_filters: Vec::new(),
-            // The statement's injected write predicate, carried unchanged. The
-            // wrapper is read-only, so no gate reads it here.
+            // Statement's injected write predicate, carried unchanged.
             rls_write_check: rls_write_check.clone(),
-            // The RESOLVE pass writes nothing, so it folds no materialized-sum
-            // delta. The point ops this expansion emits carry their own
-            // resolution.
+            // Writes nothing, so folds no materialized-sum delta.
             resolved_sum_targets: Vec::new(),
         },
     )));
-    // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
-    // transaction's id lets the target scan fold rows this transaction staged
-    // earlier, so an `UPDATE ... FROM` affects a row a prior statement in the
-    // same transaction inserted.
+    // Passing `txn_id` lets the target scan fold rows this transaction staged earlier.
     let resolve_resp = dispatch_local(
         state,
         tenant_id,

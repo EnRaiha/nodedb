@@ -2,15 +2,10 @@
 
 //! KV implementation of [`EngineWriteResolver`].
 //!
-//! Resolves a governed state-dependent KV write — an atomic increment, a CAS,
-//! a field merge, a TTL mutation, a transfer, a predicate UPDATE/DELETE — to
-//! the concrete mutations it would apply, then rebuilds it as
-//! `KvOp::ResolvedWrite`.
-//!
-//! A KV write is not row-set shaped: one statement can put, delete, and move
-//! TTL across two collections, and a `CAS` that did not match owes the caller
-//! a reply while writing nothing. So the decided form is a mutation list plus
-//! the exact response payload, both reported by `KvOp::ResolveWrite`.
+//! Resolves a governed state-dependent KV write (increment, CAS, field
+//! merge, TTL, transfer, predicate UPDATE/DELETE) into `KvOp::ResolvedWrite`
+//! — a mutation list plus response payload, since e.g. a `CAS` miss owes a
+//! reply while writing nothing.
 
 use async_trait::async_trait;
 use nodedb_types::RlsWriteCheck;
@@ -26,19 +21,14 @@ use super::resolver::{EngineWriteResolver, WriteResolveContext};
 /// A governed state-dependent KV write, extracted at interception.
 pub struct KvWriteResolver {
     /// Routing collection — also the vshard key. `TransferItem` reports its
-    /// source collection, matching `KvOp::collection()`: both of its rows
-    /// co-locate on one vshard.
+    /// source collection; both its rows co-locate on one vshard.
     collection: String,
-    /// The intercepted write verbatim, live write predicate included. The
-    /// Data Plane decides the predicate against the images it computes, where
-    /// the writing identity is still available.
+    /// The intercepted write verbatim, live write predicate included.
     op: KvOp,
 }
 
 /// The resolver for `op`, or `None` when it carries no live write predicate.
-///
-/// Exhaustive over `KvOp`: a new KV op fails to compile here rather than
-/// silently skipping resolution.
+/// Exhaustive over `KvOp` — a new op fails to compile here.
 pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolver>> {
     let collection = match op {
         KvOp::InsertOnConflictUpdate {
@@ -91,8 +81,7 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
             rls_write_check,
             ..
         }
-        // A predicate write's row set is known only after committed state is
-        // scanned, so it resolves like a state-dependent point write.
+        // A predicate write resolves like a state-dependent point write.
         | KvOp::PredicateUpdate {
             collection,
             rls_write_check,
@@ -108,9 +97,8 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
             }
             collection
         }
-        // Both collections are checked: an identity may give a row up but not
-        // receive it. `sole_rls_write_check` reports `None` here by design
-        // and would wave the write through.
+        // Both collections checked: an identity may give a row up but not
+        // receive it — `sole_rls_write_check` would wave the write through.
         KvOp::TransferItem {
             source_collection,
             source_rls_write_check,
@@ -122,9 +110,7 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
             }
             source_collection
         }
-        // Already decided: `ResolveWrite` is the read-only resolve itself and
-        // `ResolvedWrite` carries the verdict. Every remaining op either
-        // writes an image the Control Plane already holds, or writes nothing.
+        // Already decided, or writes an image the Control Plane already holds.
         KvOp::Get { .. }
         | KvOp::Put { .. }
         | KvOp::Insert { .. }
@@ -164,10 +150,8 @@ impl EngineWriteResolver for KvWriteResolver {
         PhysicalPlan::Kv(KvOp::ResolveWrite(Box::new(self.op.clone())))
     }
 
-    /// A row the Data Plane's write-policy gate refuses surfaces here as
-    /// `crate::Error::DataPlane(ErrorCode::RejectedAuthz { .. })` — the exact
-    /// error the same op dispatched directly already returns, because the
-    /// resolve handler runs the same `admit_kv_row` gate.
+    /// A refused row surfaces as `DataPlane(RejectedAuthz)`, same as the op
+    /// dispatched directly — the resolve handler runs the same gate.
     async fn resolve(
         &self,
         state: &SharedState,

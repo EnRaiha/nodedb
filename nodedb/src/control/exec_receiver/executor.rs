@@ -2,15 +2,9 @@
 
 //! Local execution of incoming `ExecuteRequest` / `ExecuteStreamRequest` RPCs.
 //!
-//! When a remote node sends an `ExecuteRequest` to this node (because this
-//! node is the leader for the target vShard), the [`LocalPlanExecutor`]
-//! validates descriptor versions, decodes the `PhysicalPlan`, and fans it
-//! across ALL local Data-Plane cores via
-//! [`crate::control::server::exchange::execute_plan_all_local_cores`] before
-//! returning the merged result to the caller.
-//!
-//! At 1 core/node the fan is over a single core and behaviour is identical to
-//! the prior single-core dispatch.
+//! When this node leads the target vShard, [`LocalPlanExecutor`] validates
+//! descriptor versions, decodes the `PhysicalPlan`, and fans it across all
+//! local Data-Plane cores before returning the merged result.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -228,13 +222,10 @@ impl LocalPlanExecutor {
                         });
                     }
                 };
-            // The events are handed to an authenticated peer node, not to a
-            // subscriber: this is an internal buffer read, and the requesting
-            // node applies its caller's column redaction at the delivery
-            // surface that asked for them (the stream SELECT, the HTTP poll,
-            // and the SSE endpoint each redact what `consume_remote` returns).
-            // Redaction policies are catalog state replicated to every node, so
-            // the rules are the same on both sides of this hop.
+            // Events go to an authenticated peer node, not a subscriber; the
+            // requesting node applies its caller's redaction at the delivery
+            // surface (SELECT / HTTP poll / SSE), using the same replicated
+            // catalog policies on both sides.
             return match crate::event::cdc::consume::consume_local_with_offsets(
                 &self.state,
                 &params,
@@ -261,28 +252,15 @@ impl LocalPlanExecutor {
             };
         }
 
-        // ── Replicable write: drive through Raft, NOT local cores ─────────────
-        //
-        // The gateway forwarded this plan here because THIS node is the leader
-        // for the target data group. Fanning a replicable write across local
-        // cores only would commit to this node's Data Plane and NEVER propose
-        // it to the Raft group — coordinator + other voters never apply it, and
-        // SQL still returns Ok (silent write loss). So for any plan that
-        // `to_replicated_entry` recognizes as a replicable write, propose it
-        // through the SAME proposer the local pgwire write path uses: proposing
-        // via the local proposer targets the group this node leads → commit →
-        // all voters apply. The resolved surrogate is already carried on the
-        // forwarded entry (coordinator-side), and owner-side re-resolution at
-        // apply (wal_replication/decode.rs `bind_or_lookup`) covers the rest.
-        //
-        // Reads / non-replicable plans (`to_replicated_entry == None`) fall
+        // Replicable write: drive through Raft, not local cores. Fanning it
+        // across local cores only would commit here without proposing to the
+        // Raft group — silent write loss. Propose through the same proposer
+        // the local pgwire write path uses. Reads / non-replicable plans fall
         // through to `execute_plan_all_local_cores` unchanged.
         //
-        // The vshard the gateway routed this plan to is not carried on the wire;
-        // it is a pure function of the plan's primary collection (every data
-        // group is `CollectionHomed`), so we re-derive it exactly as the gateway
-        // router's `CollectionHomed` arm does (`vshard_for_collection`). This is
-        // the same group this node leads, so the local proposer targets it.
+        // The vshard is not carried on the wire; re-derive it as a pure
+        // function of the plan's primary collection, matching the gateway
+        // router's `CollectionHomed` arm (`vshard_for_collection`).
         let vshard_id = crate::types::VShardId::new(
             crate::control::gateway::version_set::touched_collections(&plan)
                 .into_iter()
@@ -327,10 +305,8 @@ impl LocalPlanExecutor {
                     )
                     .await
                     {
-                        // Replicated writes carry no read watermark → 0. The write's
-                        // per-collection version rides alongside the payload but is not
-                        // needed here: it floors a SESSION's later reads, and this RPC
-                        // seam serves a remote coordinator that holds no session.
+                        // Replicated writes carry no read watermark → 0: it floors a
+                        // session's later reads, and this RPC seam has no session.
                         Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
                         Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
                             code: PLAN_DECODE_FAILED,
@@ -371,13 +347,9 @@ impl LocalPlanExecutor {
     }
 
     /// Streaming execution: validate + decode, fan across all local cores via
-    /// `gather_all_cores_stream`, and push each result frame to `sink` as it
-    /// arrives.
-    ///
-    /// Returns `None` on a clean end, or `Some(err)` on a terminal failure
-    /// (validation rejection, stream error, or deadline). A `send_chunk` error
-    /// means the coordinator is gone: return `None` (there is no peer to
-    /// receive a terminal frame).
+    /// `gather_all_cores_stream`, push each frame to `sink` as it arrives.
+    /// Returns `None` on clean end or when `send_chunk` fails (coordinator
+    /// gone, no peer for a terminal frame), `Some(err)` on terminal failure.
     async fn execute_plan_streaming_inner(
         &self,
         req: ExecuteRequest,

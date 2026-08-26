@@ -3,15 +3,9 @@
 //! Document implementation of [`EngineWriteResolver`].
 //!
 //! Resolves a governed deferred document write — `PointUpdate`, `PointDelete`,
-//! `Upsert`, `BulkUpdate`, `BulkDelete` — to the concrete row mutations it
-//! would apply, then rebuilds it as `DocumentOp::ResolvedWrite`.
-//!
-//! `Merge` and `UpdateFromJoin` are NOT resolved here. Their Control-Plane
-//! orchestrators already expand them into concrete point ops inside an
-//! already-open, Calvin-locked transaction, which has no drift window between
-//! the decision and the write. This path is autocommit-then-Raft and has
-//! exactly that window, which is why every mutation it ships carries a
-//! body-level precondition.
+//! `Upsert`, `BulkUpdate`, `BulkDelete` — into `DocumentOp::ResolvedWrite`.
+//! `Merge` / `UpdateFromJoin` are excluded (already expanded inside an open
+//! Calvin-locked transaction); every mutation here carries its own precondition.
 
 use async_trait::async_trait;
 use nodedb_types::RlsWriteCheck;
@@ -35,9 +29,7 @@ pub struct DocumentWriteResolver {
 }
 
 /// The resolver for `op`, or `None` when it carries no live write predicate.
-///
-/// Exhaustive over `DocumentOp`: a new document op fails to compile here rather
-/// than silently skipping resolution.
+/// Exhaustive over `DocumentOp` — a new op fails to compile here.
 pub(super) fn resolver_for_document_op(op: &DocumentOp) -> Option<Box<dyn EngineWriteResolver>> {
     let collection = match op {
         DocumentOp::PointUpdate {
@@ -55,8 +47,7 @@ pub(super) fn resolver_for_document_op(op: &DocumentOp) -> Option<Box<dyn Engine
             rls_write_check,
             ..
         }
-        // A predicate write's row set is known only after committed state is
-        // scanned, so it resolves like a state-dependent point write.
+        // A predicate write resolves like a state-dependent point write.
         | DocumentOp::BulkUpdate {
             collection,
             rls_write_check,
@@ -72,14 +63,10 @@ pub(super) fn resolver_for_document_op(op: &DocumentOp) -> Option<Box<dyn Engine
             }
             collection
         }
-        // Already solved by `control::merge_orchestrator` /
-        // `control::update_from_join_orchestrator`, which expand them inside an
-        // open transaction. Routing them here would resolve them twice.
+        // Already expanded by the merge/update-from-join orchestrators.
         DocumentOp::Merge { .. }
         | DocumentOp::UpdateFromJoin { .. }
-        // Already decided: `ResolveWrite` is the read-only resolve itself and
-        // `ResolvedWrite` carries the verdict. Every remaining op either writes
-        // an image the Control Plane already holds, or writes nothing.
+        // Already decided, or writes an image the Control Plane already holds.
         | DocumentOp::ResolveWrite(_)
         | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::PointGet { .. }
@@ -115,10 +102,8 @@ impl EngineWriteResolver for DocumentWriteResolver {
         PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(self.op.clone())))
     }
 
-    /// A row the Data Plane's write-policy gate refuses surfaces here as
-    /// `crate::Error::DataPlane(ErrorCode::RejectedAuthz { .. })` — the exact
-    /// error the same op dispatched directly already returns, because the
-    /// resolve handler runs the same `rls_write_gate` gate.
+    /// A refused row surfaces as `DataPlane(RejectedAuthz)`, same as the op
+    /// dispatched directly — the resolve handler runs the same gate.
     async fn resolve(
         &self,
         state: &SharedState,

@@ -12,11 +12,8 @@ use super::resolver::EngineWriteResolver;
 use super::timeseries::resolver_for_timeseries_op;
 
 /// The resolver for `plan`, or `None` when it carries no live predicate to
-/// resolve before proposing.
-///
-/// Exhaustive over `PhysicalPlan` and over each engine's write class: a new
-/// state-dependent op with no resolver fails to compile here rather than
-/// silently reaching Raft as a bare predicate.
+/// resolve before proposing. Exhaustive over `PhysicalPlan` — a new
+/// state-dependent op with no resolver fails to compile here.
 pub fn resolver_for_plan(plan: &PhysicalPlan) -> Option<Box<dyn EngineWriteResolver>> {
     match plan {
         PhysicalPlan::Columnar(op) => resolver_for_columnar_op(op),

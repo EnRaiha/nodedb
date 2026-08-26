@@ -63,16 +63,8 @@ impl CoreLoop {
                 collection,
                 payload,
                 format,
-                // The write funnel mints the record's LSN and stamps it on the
-                // REQUEST ENVELOPE; only the sync path also fills the plan's
-                // copy, so the SQL and ILP planners both hand this arm a `None`
-                // there. That LSN is what `flush_ts_collection` stamps onto the
-                // partition it writes, and boot replay skips exactly the
-                // records at or below the highest stamp it finds — so reading
-                // the plan alone left every SQL/ILP ingest flushing partitions
-                // stamped 0, a gate that never fires and a WAL tail that
-                // replays on top of rows already on disk. The plan's copy stays
-                // the fallback for callers that carry no envelope LSN.
+                // The envelope LSN wins: SQL/ILP planners leave the plan's copy
+                // `None`, and a stamp of 0 there would defeat replay's dedup gate.
                 wal_lsn: task.wal_lsn().map(|lsn| lsn.as_u64()).or(*wal_lsn),
                 provenance: provenance.as_ref(),
                 mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
@@ -170,14 +162,8 @@ mod tests {
         })
     }
 
-    /// The invariant: the partition a flush writes must be stamped with the LSN
-    /// of the last record it fully contains, because boot replay skips every
-    /// record at or below the highest stamp it finds. A stamp of 0 makes that
-    /// gate a no-op, and the acknowledged records replay on top of the very
-    /// rows the partition already holds.
-    ///
-    /// The autocommit planners leave the plan's `wal_lsn` `None`, so this fails
-    /// the moment the handler stops consulting the request envelope.
+    /// A flushed partition must carry the last record's LSN, or boot replay's
+    /// dedup gate never fires and records replay on top of rows already on disk.
     #[test]
     fn autocommit_ingest_stamps_the_envelope_lsn_on_the_partition_it_flushes() {
         let mut h = make_core();

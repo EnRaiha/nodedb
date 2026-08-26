@@ -2,42 +2,21 @@
 
 //! A write plan proven safe to put on the Raft wire.
 //!
-//! A compiled RLS write predicate is decided against the writing identity. A
-//! follower has no such identity, so the predicate cannot cross the wire — and
-//! the leader applies through the same decode as every follower, so dropping it
-//! leaves the write ungoverned on every replica.
-//!
-//! [`ReplicableWrite`] makes that state unrepresentable instead of refusing it
-//! again at each encode site.
+//! A compiled RLS predicate is decided against the writing identity, which a
+//! follower lacks, so it can't cross the wire. [`ReplicableWrite`] makes that
+//! state unrepresentable instead of refusing it again at each encode site.
 
 use crate::bridge::envelope::PhysicalPlan;
 
-/// A write plan whose RLS write-check slots are all decided.
-///
-/// Guarantee: every slot is decided — one of `NoPolicyApplies`,
-/// `AlreadyDecidedElsewhere`, `DecidedEarlierInRequest`, or
-/// `SystemInternalCollection`. Never `Predicate`, never `PendingInjection`.
-///
-/// The field is private and only the two constructors below build the type, so
-/// the guarantee holds for every value that exists.
+/// A write plan whose RLS write-check slots are all decided (never `Predicate`
+/// or `PendingInjection`). Private field, only the two constructors below build
+/// it, so the guarantee holds for every value that exists.
 pub struct ReplicableWrite<'a>(&'a PhysicalPlan);
 
 impl<'a> ReplicableWrite<'a> {
-    /// Decide `plan` for replication, or refuse it. Control Plane only.
-    ///
-    /// An op whose policy decision is deferred to the handler must be resolved
-    /// to a concrete row set before it is proposed. Columnar `UPDATE`/`DELETE`
-    /// already are, by `control::write_resolve`. Every
-    /// other engine reaches here still carrying the predicate, and this refuses
-    /// it rather than replicating a write no replica will govern.
-    ///
-    /// Plain inserts are unaffected: the policy decides their rows at plan
-    /// time, so they arrive stamped `DecidedEarlierInRequest` (or
-    /// `NoPolicyApplies` where no policy restricts the identity).
-    ///
-    /// A slot still at `PendingInjection` is refused too, and separately: that
-    /// write was never policy-checked at all, so replicating it would run it
-    /// ungoverned on every replica.
+    /// Decide `plan` for replication, or refuse it. Control Plane only. An op
+    /// with a deferred policy decision must resolve to a concrete row set first;
+    /// a slot still at `PendingInjection` is refused as never policy-checked.
     pub fn decide_for_replication(plan: &'a PhysicalPlan) -> crate::Result<Self> {
         let checks = plan.rls_write_checks();
         if checks.iter().any(|c| c.is_pending_injection()) {
@@ -64,19 +43,9 @@ impl<'a> ReplicableWrite<'a> {
         Ok(Self(plan))
     }
 
-    /// Wrap a plan rebuilt from an entry that is already committed, without
-    /// deciding anything.
-    ///
-    /// Sound only on the replay/catchup side: the entry's policy decision was
-    /// made when it was first proposed, and a policy edited since then would
-    /// change replay if it were re-decided here. The caller owes the guarantee
-    /// that the plan's checks came from the committed entry, not from a live
-    /// identity.
-    ///
-    /// No caller re-encodes a committed entry today: follower apply decodes,
-    /// and WAL catchup dispatches straight to the Data Plane. This exists for
-    /// the moment `decide_for_replication` starts resolving predicates rather
-    /// than only refusing them — replay must keep taking this path instead.
+    /// Wrap a plan rebuilt from an already-committed entry, without deciding
+    /// anything. Sound only for replay/catchup: the caller owes the guarantee
+    /// that checks came from the committed entry, not a live identity.
     pub fn for_already_committed_entry(plan: &'a PhysicalPlan) -> Self {
         Self(plan)
     }

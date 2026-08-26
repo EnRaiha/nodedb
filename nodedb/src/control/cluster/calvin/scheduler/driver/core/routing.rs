@@ -2,12 +2,10 @@
 
 //! Exhaustive, compile-enforced routing oracle: `PhysicalPlan` → `PlanRouting`.
 //!
-//! This is the single chokepoint the Calvin scheduler uses to decide, for
-//! every plan carried in a `SequencedTxn`, whether it participates in THIS
-//! node's vshard. The match is exhaustive over every `PhysicalPlan` variant
-//! and every op variant nested inside it — a new variant is a compile error
-//! here, not a silently-empty routing result. Mirrors the technique used by
-//! the security tier's `required_permission` oracle.
+//! The chokepoint the Calvin scheduler uses to decide whether a plan carried
+//! in a `SequencedTxn` participates in this node's vshard. Exhaustive over
+//! every `PhysicalPlan` and nested op variant — a new one is a compile error,
+//! never a silent gap. Mirrors `required_permission`'s technique.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 

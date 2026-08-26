@@ -31,12 +31,8 @@ use super::{DatabaseQueryParam, resolve_database_id};
 
 /// POST /v1/query — execute a SQL/DDL statement.
 ///
-/// Request body: `{ "sql": "..." }`
-/// Response: `{ "status": "ok", "rows": [...] }` or `{ "error": "..." }`
-///
-/// Database context (optional):
-/// - `X-NodeDB-Database: <name>` header (highest priority)
-/// - `?database=<name>` query parameter (fallback)
+/// Body: `{ "sql": "..." }`. Database context via `X-NodeDB-Database` header
+/// or `?database=` param.
 pub async fn query(
     headers: HeaderMap,
     peer: PeerAddr,
@@ -54,12 +50,8 @@ pub async fn query(
 
     let sql = body.sql.as_str();
 
-    // The request-selected database is authoritative for RLS variables while
-    // retaining verified JWT/session enrichment from authentication: passing
-    // it as the session database makes `scope.database_id()` resolve to
-    // exactly `database_id`, and the verified JWT (when this request
-    // authenticated via JWT bearer) reproduces the same claim-derived
-    // enrichment `resolve_auth` would have given an `AuthContext`.
+    // Request-selected database is authoritative for RLS vars; passing it as the
+    // session database makes `scope.database_id()` resolve to `database_id`.
     let request = build_request_scope(
         &identity,
         verified_jwt.as_ref(),
@@ -69,14 +61,8 @@ pub async fn query(
         peer.as_str(),
     );
 
-    // Request-admission gate: internal-service exemption, blacklist, account
-    // status, then rate limit — run exactly once per request, here, before it
-    // can branch to `shared::ddl::dispatch` below or fall through to
-    // DataFusion planning, so both DDL/DSL text and ordinary DML/SELECT
-    // statements are covered by this one call. `Some(result)` carries the
-    // rate-limit outcome this handler surfaces as `X-RateLimit-*` response
-    // headers below. The accepted socket's address is what makes the
-    // IP-blacklist and risk halves of that gate live on this route.
+    // Admission gate runs once, before either DDL dispatch or DML planning, so both
+    // are covered. `Some(result)` carries the outcome as `X-RateLimit-*` headers below.
     let rate_limit_result = crate::control::server::session_auth::check_request_admission(
         &state.shared,
         &request,
@@ -86,18 +72,13 @@ pub async fn query(
     let rate_limit_headers =
         super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
 
-    // HTTP is stateless — there is no BEGIN/COMMIT session concept over this
-    // transport, so a session-less scope satisfies the DDL dispatch signature.
-    // A fresh store reports "not in a transaction block" for any address, so
-    // the staging gate inside `plan_and_dispatch` always takes the immediate
-    // autocommit branch here, unchanged from before the gate existed.
+    // HTTP is stateless — no BEGIN/COMMIT session concept — so a session-less scope
+    // satisfies the DDL dispatch signature and always takes the autocommit branch.
     let http_scope = crate::control::server::shared::session::DetachedTxnScope::new();
     let txn_ctx = http_scope.ctx();
 
-    // Try DDL commands first (same as pgwire handler). Now reached only after
-    // the single admission call above, so `shared::ddl::user_dispatch` (the
-    // DSL/DDL dispatch door some DDL/DSL statements fall through to) must not
-    // admit this request a second time.
+    // Try DDL commands first. Reached only after the admission call above, so
+    // `shared::ddl::user_dispatch` must not admit this request a second time.
     if let Some(result) = crate::control::server::shared::ddl::dispatch(
         &state.shared,
         &identity,
@@ -133,9 +114,8 @@ pub async fn query(
 
     let (clean_sql, scope) =
         crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
-    // Planning and lease admission run as one retried unit so a descriptor
-    // drain starting between them is absorbed rather than surfaced. The scope
-    // is retained through every dispatch and response-shaping operation below.
+    // Planning and lease admission run as one retried unit so a descriptor drain
+    // starting between them is absorbed rather than surfaced.
     let admission = plan_authorize_and_admit(PlanAdmissionRequest {
         state: &state.shared,
         query_ctx: &state.query_ctx,
@@ -162,31 +142,23 @@ pub async fn query(
 
     // Execute each task via the SPSC bridge.
     let mut result_rows = Vec::new();
-    // Checked once rather than per task — metering is disabled by default,
-    // so this keeps the per-task extraction below (which clones the
-    // collection name) a true no-op on the hot path for every deployment
-    // that hasn't turned it on.
+    // Checked once, not per task: keeps the per-task extraction below a true
+    // no-op when metering is disabled (the default).
     let metering_enabled = state.shared.metering_config.enabled;
 
     async {
         for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
-            // Extracted from `task.plan` before it's cloned/moved into any
-            // branch below — metering needs the collection/engine shape
-            // after this task's dispatch succeeds.
+            // Extracted before `task.plan` is cloned/moved into any branch below.
             let plan_metering_info =
                 metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
-            // A spent hard quota refuses the task before it runs; the
-            // charging calls below are all on the success path and so can
-            // never refuse anything themselves.
+            // A spent hard quota refuses the task before it runs; charging below is
+            // success-path only and never refuses.
             if let Some(info) = &plan_metering_info {
                 admit_quota_for_dispatch(&state.shared, &scope, info).map_err(gateway_error)?;
             }
             let rows_before = result_rows.len();
-            // `INSERT ... SELECT` is orchestrated on the Control Plane: the
-            // source is scanned, each target row gets its OWN fresh, registered
-            // surrogate, and the rows are written via an atomic `BatchInsert`.
-            // The orchestrator issues its own WAL-backed writes, so the outer
-            // per-task WAL append below is skipped for it.
+            // `INSERT ... SELECT` orchestrates on the Control Plane and issues its own
+            // WAL-backed writes, so the outer per-task WAL append is skipped for it.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
             ) = &task.plan
@@ -220,9 +192,7 @@ pub async fn query(
                 continue;
             }
 
-            // Autocommit `MERGE` is orchestrated on the Control Plane: each
-            // NOT-MATCHED insert row gets its OWN fresh, registered surrogate
-            // and all arms apply atomically. The orchestrator issues its own
+            // Autocommit `MERGE` orchestrates on the Control Plane and issues its own
             // writes, so the per-task WAL append below is skipped for it.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::Merge {
@@ -270,11 +240,8 @@ pub async fn query(
                 continue;
             }
 
-            // Autocommit `UPDATE ... FROM <source>` is orchestrated on the
-            // Control Plane: the source is scanned on its OWN core and shipped
-            // into the plan so the target-core handler joins against it instead
-            // of a local read. The orchestrator issues its own write, so the
-            // per-task WAL append below is skipped for it.
+            // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
+            // ships it into the plan; the orchestrator's own write skips the WAL append below.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
                     target_collection: _,
@@ -321,13 +288,8 @@ pub async fn query(
                 continue;
             }
 
-            // A governed columnar predicate `UPDATE`/`DELETE` (RLS write
-            // policy + live Raft proposer) is resolved to a concrete row set
-            // on the Control Plane before it is proposed. The orchestrator
-            // issues its own write, so the per-task WAL append below is
-            // skipped for it. On the local (non-Raft) path the predicate
-            // reaches the Data Plane gate intact and is enforced correctly
-            // there, so this intercept is skipped in that case.
+            // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
+            // before proposing, skipping the WAL append below; local (non-Raft) path skips this.
             if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
                 && state.shared.async_raft_proposer().is_some()
             {
@@ -361,20 +323,14 @@ pub async fn query(
                 continue;
             }
 
-            // Captured before dispatch moves `task.plan` — needed by the
-            // protocol-neutral shaping core below.
+            // Captured before dispatch moves `task.plan` — needed by shaping below.
             let plan_kind = describe_plan(&task.plan);
             let plan_for_shape = task.plan.clone();
-            // Resolved once for this task and reused for every payload it
-            // produced, rather than per payload.
+            // Resolved once per task, reused for every payload it produced.
             let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
 
-            // Dispatch: prefer gateway when available (cluster-aware routing —
-            // the gateway owns WAL durability on the target node), fall back to
-            // direct local SPSC dispatch on single-node boot. On the local path
-            // the WAL append is performed inside the dispatch core, under the
-            // write-admission guard and just before the enqueue, so LSN order
-            // matches apply order.
+            // Prefer gateway (cluster-aware, owns WAL durability), else fall back to
+            // local SPSC dispatch, where WAL append precedes enqueue so LSN order matches.
             let payloads = match state.shared.gateway.get() {
                 Some(gw) => {
                     let gw_ctx = QueryContext {
@@ -452,10 +408,8 @@ fn response_error(response: &crate::bridge::envelope::Response) -> ApiError {
     ApiError::Internal(detail)
 }
 
-/// Meter one task's dispatch, once its rows (if any) have already been
-/// appended to `result_rows` — the row count is the delta since
-/// `rows_before`, so this must run after every append point for the task,
-/// never before.
+/// Meter one task's dispatch after its rows are appended to `result_rows` —
+/// the row count is the delta since `rows_before`.
 fn meter_task_dispatch(
     state: &crate::control::state::SharedState,
     scope: &crate::control::security::request_scope::RequestAuthScope<'_>,

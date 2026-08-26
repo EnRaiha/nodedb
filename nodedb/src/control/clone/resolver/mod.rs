@@ -2,14 +2,10 @@
 
 //! Copy-on-write read resolution algorithm.
 //!
-//! For reads targeting a `Shadowed` or `Materializing` clone, this module
-//! produces an augmented task list: one task for the target database (post-clone
-//! writes) and one task for the source database (source rows at
-//! `effective_source_lsn`).  Both tasks are dispatched by the caller using the
-//! normal SPSC path; the results are then merged via `merge_clone_responses`.
-//!
-//! Non-cloned databases and `Materialized` clones return the original task list
-//! unchanged — zero overhead.
+//! For a `Shadowed` or `Materializing` clone, produces an augmented task
+//! list: one task for the target database (post-clone writes), one for the
+//! source (rows at `effective_source_lsn`), merged via
+//! `merge_clone_responses`. Other clones return the task list unchanged.
 
 pub mod filter;
 pub mod refusal;

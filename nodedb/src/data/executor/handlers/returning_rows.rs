@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Helper for projecting post-write documents into a `RowsPayload`.
-//!
-//! Called by every RETURNING-producing handler when the plan carries a
-//! `ReturningSpec`. Produces a `RowsPayload` msgpack blob that the Control
-//! Plane decodes into multi-column pgwire rows.
-//!
-//! This is the single choke point where the row-level-security READ policy is
-//! applied to DML output: every caller passes the full pre-projection
-//! documents, so the policy can be evaluated against columns the `RETURNING`
-//! list never mentions.
+//! Helper for projecting post-write documents into a `RowsPayload` msgpack
+//! blob the Control Plane decodes into multi-column pgwire rows. The single
+//! choke point where the RLS read policy applies to DML output — every
+//! caller passes full pre-projection documents so the policy sees columns
+//! `RETURNING` never mentions.
 
 use super::{returning_doc, rls_eval};
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -28,12 +23,8 @@ pub(in crate::data::executor) type StoredRow<'a> = (&'a str, &'a [u8]);
 
 impl CoreLoop {
     /// Build this task's `RETURNING` response from the rows it just stored.
-    ///
     /// The single exit every insert-family handler uses, so the read gate and
-    /// the storage-mode-aware decode can never be applied on one write path and
-    /// skipped on another. An empty `rows` slice is the correct answer for a
-    /// write that stored nothing (an `ON CONFLICT DO NOTHING` that hit a
-    /// conflict): the statement still returns a row set, it is just empty.
+    /// decode can never be applied on one path and skipped on another.
     pub(in crate::data::executor) fn stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -60,19 +51,10 @@ pub(in crate::data::executor) type KvStoredRow<'a> = (&'a [u8], &'a [u8]);
 
 impl CoreLoop {
     /// Build a KV write's `RETURNING` response from the rows it just stored.
-    ///
-    /// The row shape comes from [`kv_row_to_doc`], the same helper the KV scan
-    /// paths use, so a row a write hands back is byte-identical to the row a
-    /// `SELECT` on that key would produce — including the `key` field, and
-    /// including the `{key, value}` wrapper an opaque single-scalar value gets
-    /// (such a value has no field map to inject into, and inventing a second
-    /// shape here would make `RETURNING *` disagree with `SELECT *`).
-    ///
-    /// A body that fails to decode fails the statement. `kv_row_to_doc` wraps
-    /// every shape a KV value can take, so a wrapped row that will not decode
-    /// means the stored value is not what the KV engine says it is — and a bare
-    /// `{key}` substituted for it would report a row whose value the client
-    /// never wrote, in the very response it uses to learn what landed.
+    /// Row shape comes from [`kv_row_to_doc`], the same helper KV scans use,
+    /// so it's byte-identical to what `SELECT` on that key produces. A body
+    /// that fails to decode fails the statement rather than substitute a
+    /// bare `{key}` that hides an unreadable stored value.
     pub(in crate::data::executor) fn kv_stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -87,12 +69,9 @@ impl CoreLoop {
     }
 }
 
-/// The `RowsPayload` blob a KV write's `RETURNING` clause projects from the
-/// rows it stored.
-///
-/// Split out of [`CoreLoop::kv_stored_returning_response`] so the
-/// resolve-before-propose path can decide the same payload without holding a
-/// `Response` — the payload it ships is the one every replica hands back.
+/// The `RowsPayload` blob a KV write's `RETURNING` clause projects. Split
+/// from [`CoreLoop::kv_stored_returning_response`] so the resolve-before-
+/// propose path can decide the same payload without holding a `Response`.
 pub(in crate::data::executor) fn kv_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
@@ -112,16 +91,9 @@ pub(in crate::data::executor) fn kv_stored_rows_payload(
 
 impl CoreLoop {
     /// Build a columnar write's `RETURNING` response from the rows it stored.
-    ///
-    /// A columnar row is `Vec<Value>` in schema order, not a stored msgpack
-    /// body, so the row image is assembled by `row_values_to_object` — the same
-    /// builder the columnar WHERE evaluator and the row-level-security write
-    /// gate use. Assembling it a second way here is how `RETURNING` output would
-    /// drift from what a `SELECT` on the same key reports.
-    ///
-    /// `rows` must already exclude anything the engine skipped (an
-    /// `ON CONFLICT DO NOTHING` that hit a conflict), so an empty slice is the
-    /// correct answer for a write that stored nothing.
+    /// A columnar row is `Vec<Value>` in schema order, assembled by
+    /// `row_values_to_object` — the same builder the WHERE evaluator and RLS
+    /// write gate use, so output can't drift from what `SELECT` reports.
     pub(in crate::data::executor) fn columnar_stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -149,14 +121,10 @@ impl CoreLoop {
 }
 
 impl CoreLoop {
-    /// Build a timeseries ingest's `RETURNING` response from the points it stored.
-    ///
-    /// `rows` are already the output of the ordinary memtable scan projection —
-    /// see `raw_scan::emit_memtable_rows_at` — so a stored point renders here
-    /// exactly as `SELECT` renders it, `NaN`-as-NULL included. This function
-    /// only re-keys that row into the shape `build_rows_payload` reads; it makes
-    /// no per-cell decisions of its own, which is the entire reason the read-back
-    /// happens upstream rather than here.
+    /// Build a timeseries ingest's `RETURNING` response from the points it
+    /// stored. `rows` are already `raw_scan::emit_memtable_rows_at` output, so
+    /// a point renders exactly as `SELECT` would, `NaN`-as-NULL included; this
+    /// only re-keys the shape, no per-cell decisions of its own.
     pub(in crate::data::executor) fn timeseries_stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -178,25 +146,12 @@ impl CoreLoop {
 }
 
 impl CoreLoop {
-    /// Build a vector-primary upsert's `RETURNING` response from the sidecar it
-    /// just stored.
-    ///
-    /// The row image comes from [`sparse_row_to_doc`] against
-    /// [`SparseBodyFormatRef::VectorSidecar`] — the SAME converter the `SELECT`
-    /// scan resolves for this collection — so the returned row is byte-for-byte
-    /// what a later read renders. The sidecar is `zerompk` TAGGED bytes, which
-    /// an ordinary document decode ACCEPTS and misreads: a stored `"alice"`
-    /// comes back as the tag array `[4,"alice"]`. Deciding the encoding here a
-    /// second time is exactly how that defect would return.
-    ///
-    /// The format is passed as the literal `VectorSidecar` rather than resolved
-    /// via `sparse_body_format` because this op only ever runs against a
-    /// vector-primary collection — the same reasoning the vector-primary body
-    /// fetch already uses.
-    ///
-    /// `id` is injected only when the body carries none — a vector-primary
-    /// sidecar stores the user's declared primary key, and the sparse key is
-    /// the internal surrogate hex, which must not displace it.
+    /// Build a vector-primary upsert's `RETURNING` response from the sidecar
+    /// it stored, via [`sparse_row_to_doc`] against
+    /// [`SparseBodyFormatRef::VectorSidecar`] — the same converter `SELECT`
+    /// uses. The sidecar is `zerompk` TAGGED bytes an ordinary document
+    /// decode misreads (`"alice"` comes back as `[4,"alice"]`), so the
+    /// format must be this literal, not re-decided.
     pub(in crate::data::executor) fn vector_stored_returning_response(
         &self,
         task: &ExecutionTask,
@@ -224,10 +179,8 @@ impl CoreLoop {
     }
 }
 
-/// Re-key one scan-projected timeseries row into JSON for `build_rows_payload`.
-///
-/// A straight transcode: msgpack nil stays SQL NULL, and no value is
-/// reinterpreted. Anything cleverer here would be a second shaper.
+/// Re-key one scan-projected timeseries row into JSON for
+/// `build_rows_payload`. A straight transcode: msgpack nil stays SQL NULL.
 fn rmpv_row_to_json(row: &rmpv::Value) -> serde_json::Value {
     let rmpv::Value::Map(fields) = row else {
         return serde_json::Value::Null;
@@ -259,18 +212,11 @@ fn rmpv_row_to_json(row: &rmpv::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Project the STORED post-images of freshly written rows into a `RowsPayload`.
-///
-/// The write paths (point insert / put / batch insert / upsert) hold the exact
-/// bytes they handed to storage, so `RETURNING` reports what landed — generated
-/// columns evaluated, `_rowid` injected, an `ON CONFLICT` merge applied — rather
-/// than echoing the caller's submitted body, which would report the request
-/// instead of the row and would bypass the read gate entirely.
-///
-/// `strict_schema` must be `Some` exactly when the collection stores Binary
-/// Tuples; a body that fails to decode fails the statement rather than
-/// degrading to a bare `{id}` row, which would report a row the client never
-/// wrote and hide that the stored body is unreadable.
+/// Project the STORED post-images of freshly written rows into a
+/// `RowsPayload` — the write paths hold the exact bytes handed to storage,
+/// so `RETURNING` reports what landed rather than echoing the submitted
+/// body. `strict_schema` must be `Some` exactly when the collection stores
+/// Binary Tuples; a decode failure fails the statement, never a bare `{id}`.
 pub(in crate::data::executor) fn build_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
@@ -284,20 +230,12 @@ pub(in crate::data::executor) fn build_stored_rows_payload(
     build_rows_payload(spec, rls_filters, &docs)
 }
 
-/// Project a slice of documents per `spec` and encode as a `RowsPayload` msgpack blob.
-///
-/// For `ReturningColumns::Star`, all fields in each document are emitted in
-/// insertion order (JSON object key order). For `ReturningColumns::Named`,
-/// only the named fields are emitted in spec order. Missing fields and JSON
-/// nulls are encoded as `None` so the Control Plane can emit a real SQL NULL.
-///
-/// `rls_filters` carries the collection's compiled read policy. Rows failing it
-/// are dropped BEFORE projection — the predicate routinely references a column
-/// the `RETURNING` list omits, so a post-projection test would have nothing to
-/// evaluate against and would leak the row. The write itself already happened
-/// and the affected count already counted it; only the visible row set shrinks,
-/// matching how PostgreSQL applies the SELECT policy to `RETURNING` output.
-/// Empty `rls_filters` (no policy / superuser) admits every row.
+/// Project documents per `spec` (Star = insertion order, Named = spec order,
+/// missing/null → `None`) into a `RowsPayload` msgpack blob. `rls_filters`
+/// (the compiled read policy) is applied BEFORE projection — a predicate
+/// often references a column `RETURNING` omits, so a post-projection check
+/// would leak the row. Only the visible row set shrinks; the affected count
+/// already counted the write.
 pub(super) fn build_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
@@ -364,11 +302,8 @@ fn project_row(doc: &serde_json::Value, source_names: &[String]) -> Vec<Option<S
         .collect()
 }
 
-/// Convert a JSON value to its TEXT representation for pgwire.
-///
-/// Returns `None` for JSON null so the Control Plane emits a real SQL NULL
-/// rather than the string "null". Strings are returned as-is (no extra
-/// quotes); numbers, booleans, arrays, and objects use JSON text.
+/// Convert a JSON value to its TEXT representation for pgwire. `None` for
+/// JSON null (real SQL NULL); strings are as-is, other types use JSON text.
 fn value_to_text(val: &serde_json::Value) -> Option<String> {
     match val {
         serde_json::Value::Null => None,

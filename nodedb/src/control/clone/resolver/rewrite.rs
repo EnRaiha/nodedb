@@ -90,13 +90,10 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
     let source_qualified = db_qualified(source_db_id, source_coll);
 
     match plan {
-        // Structural wrappers, matched BEFORE the engine arms. The converter
-        // wraps every sharded read in `Exchange{Gather}` (and every
-        // materialized subquery body in `PostProcess`), so the engine op the
-        // arms below match on is never at the top level of such a plan.
-        // Recursing and re-wrapping with the IDENTICAL mode makes the
-        // source-side task fan and gather exactly like the target-side one,
-        // and covers every present and future sharded engine by construction.
+        // Structural wrappers, matched before the engine arms: the converter
+        // wraps every sharded read in `Exchange{Gather}` / `PostProcess`.
+        // Recursing and re-wrapping with the same mode makes the source-side
+        // task fan and gather exactly like the target-side one.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => {
             let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
                 plan: &op.child,
@@ -198,17 +195,11 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             system_time,
             valid_at_ms,
         }) if collection == &target_qualified => {
-            // The target surrogate is not valid in the source database — each
-            // database maintains its own (collection, pk_bytes) → surrogate
-            // mapping.  If the source has no binding for this pk, the row
-            // never existed there and there is nothing to fetch — skip the
-            // source task entirely rather than dispatching a task with a
-            // sentinel surrogate.
-            //
-            // Lookup errors are also treated as "skip": surfacing them here
-            // would force every read to wait on a degraded surrogate-store
-            // probe, but they are still observable in the surrogate
-            // assigner's own metrics/logs.
+            // The target surrogate is invalid in the source database — each
+            // maintains its own pk→surrogate mapping. No binding means the
+            // row never existed there; skip rather than use a sentinel.
+            // Lookup errors are also treated as "skip" (visible in the
+            // assigner's own metrics/logs instead).
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
             let Some(source_surrogate) = state
                 .surrogate_assigner
@@ -317,10 +308,10 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             )))
         }
 
-        // A timeseries scan that BUCKETS or AGGREGATES is the same unsound
-        // concatenation as `Query::Aggregate`: the target and source payloads
-        // are appended, so a bucket present on both sides comes back twice and
-        // every SUM / AVG over the union is wrong. Only a plain scan reads
+        // A bucketing or aggregating timeseries scan is the same unsound
+        // concatenation as `Query::Aggregate`: target and source payloads are
+        // appended, so a bucket present on both sides comes back twice and
+        // every sum/avg over the union is wrong. Only a plain scan reads
         // through; the aggregating form is refused.
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
             collection,
@@ -371,23 +362,10 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             )))
         }
 
-        // DEFAULT: refuse any READ that names the cloned collection, allow
-        // everything else through untouched.
-        //
-        // Everything above is a shape with a proven source-side rewrite. A read
-        // that reaches here names the clone but has no rewrite — aggregates,
-        // joins, vector / text / graph / spatial searches, and whatever the
-        // planner grows next. Answering it from the target's post-clone rows
-        // alone drops every source row silently, which is the defect class this
-        // resolver exists to prevent, so it is an error instead of an empty
-        // result. Writes and DDL execute against the target only and need no
-        // source task; plans over another collection are not this clone's
-        // business.
-        //
-        // The arm is a rule, not a list of shapes: every top-level variant is
-        // enumerated (so a new engine still forces a decision here) and they
-        // all route through the same read-vs-write test, so a new op inside an
-        // existing engine is refused rather than silently skipped.
+        // DEFAULT: refuse any READ naming the cloned collection (aggregates,
+        // joins, vector/text/graph/spatial searches — no proven rewrite);
+        // allow everything else through untouched. Every top-level variant
+        // is enumerated so a new engine forces a decision here.
         PhysicalPlan::Document(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Vector(_)
@@ -449,15 +427,10 @@ mod tests {
     }
 
     /// One representative plan per collection-carrying variant accepted by
-    /// `PhysicalPlan::is_sharded_source`.
-    ///
-    /// The graph traversal ops (`Hop`, `Neighbors`, `NeighborsMulti`, `Path`,
-    /// `Subgraph`, `Match`, `MatchContinuation`, `MatchVarLenResume`,
-    /// `TemporalNeighbors`, `TemporalAlgorithm`, `BspSuperstep`,
-    /// `WccSuperstep`, `Stats`) are sharded sources too but are keyed by graph
-    /// / edge label and carry no collection at all, so there is nothing for the
-    /// resolver to extract. `RagFusion` is the one graph op that names a
-    /// collection, and it is covered.
+    /// `PhysicalPlan::is_sharded_source`. Graph traversal ops are sharded
+    /// sources too but carry no collection (keyed by node/edge label
+    /// instead); `RagFusion` is the one graph op that names one, and it's
+    /// covered here.
     fn sharded_source_plans() -> Vec<(&'static str, PhysicalPlan)> {
         vec![
             (

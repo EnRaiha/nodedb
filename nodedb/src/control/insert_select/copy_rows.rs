@@ -1,28 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared row-copy machinery for `INSERT ... SELECT`, used by BOTH the
-//! autocommit orchestrator ([`crate::control::insert_select::run_insert_select`])
-//! and the statement-time staged expander
-//! ([`crate::control::insert_select::expand_staged`]).
+//! Shared row-copy machinery for `INSERT ... SELECT`, used by both the
+//! autocommit orchestrator and the statement-time staged expander: scan the
+//! source page-by-page, apply the residual `WHERE`, assign a fresh
+//! target-keyed surrogate, emit `(target_doc_id, value, surrogate)`.
 //!
-//! Both drive the same pipeline: scan the source page-by-page, apply the
-//! residual `WHERE` filter, assign a fresh catalog-registered surrogate keyed on
-//! the TARGET collection's primary key, and emit the concrete
-//! `(target_doc_id, value, surrogate)` to write.
-//!
-//! ## Where the bodies are normalized
-//!
-//! Every downstream step here operates on standard msgpack: the `WHERE` filter
-//! ([`ScanFilter::all_match_binary`]), primary-key extraction inside
-//! [`assign_target_surrogate`], and the target write handler (which decodes
-//! msgpack and re-encodes to the target's format). A Binary Tuple from a strict
-//! source would silently corrupt all three.
-//!
-//! `MaterializeScan` therefore normalizes each body on the Data Plane, where the
-//! source collection's encoding is already known, and every consumer of a scan
-//! page — this one included — receives standard msgpack. Do NOT re-add a
-//! Control-Plane decode here: a second copy of that decision is what left the
-//! trap armed for the next consumer.
+//! Every step here assumes standard msgpack bodies — `MaterializeScan`
+//! already normalized a strict source's Binary Tuple on the Data Plane.
+//! Never re-add a Control-Plane decode here; it would silently corrupt the
+//! filter, PK extraction, and target write.
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 

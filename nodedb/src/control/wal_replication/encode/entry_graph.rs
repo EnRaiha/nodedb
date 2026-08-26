@@ -32,9 +32,8 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
             src_surrogate.as_u32(),
             dst_surrogate.as_u32(),
         ),
-        // The compiled write predicate is a planning-time artifact of the
-        // originating session, already decided before replication, so it is not
-        // carried on the wire.
+        // The compiled write predicate is already decided before replication,
+        // so it is not carried on the wire.
         GraphOp::EdgeDelete {
             collection,
             src_id,
@@ -56,8 +55,7 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
         GraphOp::EdgePutBatch { edges } => graph::edge_put_batch(edges),
         GraphOp::EdgeDeleteBatch { edges } => graph::edge_delete_batch(edges),
 
-        // Not a write — traversals / pattern matching / algorithms / stats,
-        // plus the read-only resolve pass.
+        // Not a write — traversals, pattern matching, algorithms, and stats.
         GraphOp::ResolveEdgeDelete(_)
         | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }

@@ -3,47 +3,22 @@
 //! Control-Plane resolution of the materialized-sum targets a write addresses
 //! through its STORED row rather than through anything the plan carries.
 //!
-//! # The gap this closes
+//! `PointDelete` carries no body and `PointUpdate` carries only field
+//! assignments, so neither could say which target it contributes to — an
+//! empty resolution used to fail such statements outright. `PointPut` /
+//! `Upsert` onto an existing row have the reverse gap: a join-column
+//! rewrite moves value between TWO targets, but only the body-named one was
+//! ever resolved; the one the row is leaving is readable only from the
+//! stored image.
 //!
-//! A `PointDelete` names a row by key and carries no body. A `PointUpdate`
-//! carries field assignments, not a whole row. Neither can say which target the
-//! row it names contributes to, so both used to resolve nothing at all — and a
-//! plain `UPDATE ... WHERE id = '…'` or `DELETE FROM … WHERE id = '…'` on a
-//! collection driving a binding reached the Data-Plane fold with an empty
-//! resolution and failed the statement outright.
-//!
-//! `PointPut` and `Upsert` onto an EXISTING row have the same gap from the other
-//! side. They fold as an update of the stored row by the submitted body, so a
-//! write that rewrites the join column moves value between TWO targets — and
-//! only the target the body names was ever resolved. The one the row is leaving
-//! is readable from the stored image and nowhere else.
-//!
-//! # Where the row comes from
-//!
-//! [`recon_point_row`] — the same routed plan-time read the predicate-driven
-//! shapes use for their reconnaissance scan, narrowed to one row. There is
-//! deliberately no second way to read a source row at plan time: two readers are
-//! free to disagree about where a collection lives, and a disagreement here is a
-//! resolution that silently misses a target.
-//!
-//! The Data Plane resolves nothing, here or anywhere: the primary-key →
-//! surrogate map is catalog state, and a Data-Plane copy of it would be exactly
-//! the cross-plane shared state the plane rules forbid.
-//!
-//! # Both sides of a join-key change
-//!
-//! [`binding_join_keys`](crate::query::binding_join_keys) turns the write's
-//! IMAGES into join values, so the pre-image's value and the post-image's are
-//! BOTH resolved. Resolving one side only leaves the other target's total wrong
-//! by the row's whole value.
-//!
-//! The images are what it reads, not the assignments, because two of these four
-//! shapes form their post-image from the submitted BODY as well: a put replaces
-//! the stored row with it wholesale, and an upsert's conflict branch merges it
-//! in — either by overlaying it when the statement carries no conflict
-//! assignments, or by answering `EXCLUDED.col` from it when it does. Deriving
-//! the keys from the assignments alone would name a target the fold never
-//! addresses, and miss the one it does.
+//! [`recon_point_row`] is the only plan-time source read: two readers could
+//! disagree about where a collection lives, and the Data Plane never
+//! resolves this itself (the pk→surrogate map is catalog state, off-limits
+//! cross-plane). [`binding_join_keys`](crate::query::binding_join_keys)
+//! resolves BOTH the pre- and post-image's join value — one side alone
+//! leaves the other target's total wrong by the row's whole value. It reads
+//! images, not assignments, because `Put`/`Upsert` form their post-image
+//! from the submitted body too.
 
 use std::sync::Arc;
 
@@ -97,12 +72,9 @@ pub(super) struct StoredRowScope<'a> {
     pub post_image: PostImage<'a>,
 }
 
-/// What reading the stored row produced: the write's pre-/post-image pairs and
-/// the version they were read at.
-///
-/// The images come back from the SAME read that resolved the join values. A
-/// caller that re-read them would fold a different snapshot, and two snapshots
-/// is two totals.
+/// What reading the stored row produced: the write's pre-/post-image pairs
+/// and the version they were read at — from the SAME read that resolved
+/// the join values, so a re-read would fold a different snapshot.
 pub(super) struct StoredImages {
     /// One pair per row this write touches — at most one, for a point shape.
     pub images: Vec<(Option<serde_json::Value>, Option<serde_json::Value>)>,
@@ -111,19 +83,11 @@ pub(super) struct StoredImages {
 }
 
 /// The stored row an op rewrites or removes, or `None` for every op that
-/// rewrites none. The match is exhaustive so a new `DocumentOp` variant must
-/// state which side it is on.
-///
-/// The four point shapes are all here, including the two that DO carry a body.
-/// A `PointPut` or an `Upsert` onto an existing row folds as an update of the
-/// stored row by the submitted body, so a write that rewrites the join column
-/// debits the target the row is leaving — and that target is named only by the
-/// stored image.
-///
-/// `PointInsert` and `BatchInsert` are deliberately absent: their rows are new
-/// by construction (a duplicate primary key fails the statement, and an
-/// `if_absent` conflict writes nothing at all), so there is no pre-image to read
-/// and the routed read would cost one round trip per insert to learn that.
+/// rewrites none. Exhaustive so a new `DocumentOp` variant must state which
+/// side it is on. Covers all four point shapes, including `PointPut`/
+/// `Upsert` (a join-column rewrite debits the leaving target, named only by
+/// the stored image). `PointInsert`/`BatchInsert` are absent: rows are new
+/// by construction, so there's no pre-image to read.
 pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
     match op {
         DocumentOp::PointUpdate {

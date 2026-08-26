@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Clone correctness across engine types.
-//!
-//! A cloned database must read rows from the source across all supported
-//! non-array engine types: `kv`, `document_strict`, `document_schemaless`,
-//! `columnar`, and `spatial`. Each engine is exercised in its own test function
-//! so failures are isolated.
+//! Clone correctness across engine types: a cloned database must read rows
+//! from the source across `kv`, `document_strict`, `document_schemaless`,
+//! `columnar`, and `spatial`, each exercised in its own test function.
 
 use crate::harness::TestServer;
 
@@ -186,13 +183,9 @@ async fn clone_document_schemaless_engine_reads_source_row() {
     );
 }
 
-/// `columnar` engine: clone reads source rows.
-///
-/// The resolver rewrites `ColumnarOp::Scan` against a shadowed clone into a
-/// source scan the same way it rewrites `KvOp::Scan`
-/// (`control/clone/resolver/rewrite.rs`), so a clone that has not been
-/// materialized must answer from the source. Nothing in the resolver,
-/// dispatch, or merge path branches on engine type.
+/// `columnar` engine: clone reads source rows. The resolver rewrites
+/// `ColumnarOp::Scan` against a shadowed clone into a source scan the same
+/// way it rewrites `KvOp::Scan` — nothing branches on engine type.
 #[tokio::test]
 async fn clone_columnar_engine_reads_source_rows() {
     let server = TestServer::start().await;
@@ -248,11 +241,9 @@ async fn clone_columnar_engine_reads_source_rows() {
     );
 }
 
-/// `document_schemaless` engine, full scan: clone reads every source row.
-///
-/// A PK point-get lowers to `DocumentOp::PointGet`, which the converter leaves
-/// unwrapped. A bare `SELECT` lowers to `DocumentOp::Scan`, which the converter
-/// wraps in `Exchange{Gather}` — the shape the clone resolver must see through.
+/// `document_schemaless` engine, full scan: clone reads every source row. A
+/// bare `SELECT` lowers to `DocumentOp::Scan` wrapped in `Exchange{Gather}`,
+/// the shape the clone resolver must see through.
 #[tokio::test]
 async fn clone_document_scan_reads_all_source_rows() {
     let server = TestServer::start().await;
@@ -369,13 +360,9 @@ async fn clone_spatial_engine_reads_source_rows() {
     );
 }
 
-/// An aggregate over a shadowed clone is refused, and works once materialized.
-///
-/// The clone read path concatenates the target and source payloads, which is
-/// not the aggregate over their union — a silent `COUNT(*) = 0` (target rows
-/// only) or a two-row answer are both wrong. The resolver refuses instead
-/// (`control/clone/resolver/rewrite.rs`). After `MATERIALIZE` the clone owns
-/// every row and the aggregate runs normally.
+/// An aggregate over a shadowed clone is refused, and works once
+/// materialized. The read path concatenates target and source payloads,
+/// which is not the aggregate over their union, so the resolver refuses.
 #[tokio::test]
 async fn clone_aggregate_refused_until_materialized() {
     let server = TestServer::start().await;

@@ -1,26 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Data Plane handler for `DocumentOp::ResolvedWrite`.
+//! Data Plane handler for `DocumentOp::ResolvedWrite`. Runs on every replica;
+//! the plan carries the decided verdict and mutations, nothing recomputed.
 //!
-//! Runs on every replica, leader included. The Control Plane already read the
-//! rows this write depends on, computed every post-image, and decided the write
-//! policy against them while the writing identity was live — so the plan carries
-//! the verdict (`RlsWriteCheck::DecidedEarlierInRequest`) and the mutations, not
-//! an operation to re-derive. Nothing is recomputed here.
-//!
-//! ## Drift check
-//!
-//! Between the resolve and this apply, the committed log may have advanced (a
-//! concurrent write on another connection, replicated ahead of this one). Every
-//! replica must reach the SAME verdict on a resolution that no longer matches
-//! state, or replicas diverge. So every mutation's `precondition` — the exact
-//! stored bytes the resolve read — is compared with `==` BEFORE the first
-//! mutation runs; if any fails, nothing is mutated and the caller gets
-//! `ErrorCode::OllpRetryRequired`.
-//!
-//! A surrogate-existence check would not do: it proves only that the row was not
-//! deleted, and is blind to a concurrent write that changed the row's CONTENT
-//! between resolve and apply. That is the lost update.
+//! Drift check: every mutation's `precondition` (exact stored bytes resolve
+//! read) is compared `==` before the first mutation runs, all-or-nothing —
+//! a surrogate-existence check alone would miss a concurrent content change
+//! (a lost update).
 
 use nodedb_physical::physical_plan::DocumentResolvedMutation;
 use tracing::debug;
@@ -126,9 +112,8 @@ impl CoreLoop {
     }
 
     /// Confirm every mutation still describes the row it was resolved against.
-    ///
-    /// Runs to completion BEFORE the first mutation applies, so the write stays
-    /// all-or-nothing — the same contract `KvOp::ResolvedWrite` holds.
+    /// Runs to completion before the first mutation applies, all-or-nothing —
+    /// same contract `KvOp::ResolvedWrite` holds.
     fn check_resolved_document_preconditions(
         &self,
         task: &ExecutionTask,

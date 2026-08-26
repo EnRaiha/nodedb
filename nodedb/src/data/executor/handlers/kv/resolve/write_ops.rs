@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Resolvers for the KV writes whose image comes from a merge or from the
-//! stored row itself: `InsertOnConflictUpdate`, `Delete`, `Expire`,
-//! `Persist`, `FieldSet`.
-//!
-//! Each one reads what its live handler reads, computes the post-image by
-//! calling the same function the live handler calls, and decides the write
-//! policy with the same gate call. Re-deriving any of that here is exactly
-//! the drift this protocol exists to prevent.
+//! Resolvers for the KV writes whose image comes from a merge or the stored
+//! row itself: `InsertOnConflictUpdate`, `Delete`, `Expire`, `Persist`,
+//! `FieldSet`. Each reads what its live handler reads and computes the
+//! post-image via the same function — re-deriving it here is exactly the
+//! drift this protocol exists to prevent.
 
 use nodedb_physical::physical_plan::{KvResolveOutcome, KvResolvedMutation};
 
@@ -26,12 +23,9 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 
 impl CoreLoop {
-    /// Resolve `INSERT ... ON CONFLICT (key) DO UPDATE SET ...`.
-    ///
-    /// Mirrors `execute_kv_insert_on_conflict_update`: the merge runs through
-    /// `apply_on_conflict_updates`, and the gate decides whichever body would
-    /// actually be persisted — the incoming row when the key is absent, the
-    /// merge when it is present.
+    /// Resolve `INSERT ... ON CONFLICT (key) DO UPDATE SET ...`. Mirrors
+    /// `execute_kv_insert_on_conflict_update`: the gate decides whichever body
+    /// would actually persist — incoming row if absent, merge if present.
     pub(super) fn resolve_kv_insert_on_conflict_update(
         &self,
         params: KvInsertOnConflictUpdateParams<'_>,
@@ -108,11 +102,8 @@ impl CoreLoop {
         ))
     }
 
-    /// Resolve a KV `DELETE`.
-    ///
-    /// An absent key removes no row, so it contributes no mutation and is
-    /// counted as not-deleted — exactly what `execute_kv_delete` does. The
-    /// resolved count is therefore the number of keys that were present.
+    /// Resolve a KV `DELETE`. An absent key contributes no mutation and is
+    /// counted as not-deleted, same as `execute_kv_delete`.
     pub(super) fn resolve_kv_delete(
         &self,
         did: u64,
@@ -138,13 +129,9 @@ impl CoreLoop {
         })
     }
 
-    /// Resolve `EXPIRE`.
-    ///
-    /// The body does not change, so the stored row is both the pre- and the
-    /// post-image and the gate decides it here, exactly as
-    /// `execute_kv_expire` does. An absent key ships a mutation with
-    /// `precondition: None`; the apply reports `NotFound` when it is still
-    /// absent, matching today's reply.
+    /// Resolve `EXPIRE`. The body doesn't change, so the stored row is both
+    /// pre- and post-image; an absent key ships `precondition: None` and the
+    /// apply reports `NotFound` if still absent.
     pub(super) fn resolve_kv_expire(
         &self,
         target: KvTtlTarget<'_>,
@@ -180,10 +167,8 @@ impl CoreLoop {
     }
 
     /// Read a TTL mutation's target row and decide it against the policy.
-    ///
     /// Unlike `admit_kv_ttl_target`, the row is read even when the policy
-    /// admits everything: the read is what pins the drift precondition, not
-    /// only what feeds the gate.
+    /// admits everything — it pins the drift precondition, not just the gate.
     fn resolve_kv_ttl_precondition(
         &self,
         target: &KvTtlTarget<'_>,
@@ -203,11 +188,8 @@ impl CoreLoop {
         Ok(body)
     }
 
-    /// Resolve `FieldSet` (HSET-style field merge).
-    ///
-    /// The merge runs through `field_compute::merge_field_updates`, the same
-    /// function `execute_kv_field_set` calls, and the merged body is the image
-    /// the gate decides.
+    /// Resolve `FieldSet` (HSET-style field merge), via the same
+    /// `field_compute::merge_field_updates` `execute_kv_field_set` calls.
     pub(super) fn resolve_kv_field_set(
         &self,
         ctx: KvAtomicCtx<'_>,

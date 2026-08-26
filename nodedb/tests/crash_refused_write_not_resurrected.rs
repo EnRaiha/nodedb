@@ -1,52 +1,28 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! A write the server REFUSED must not come back after `kill -9`.
-//!
-//! The write funnel appends a write's redo record before the Data Plane has
-//! decided whether to accept it, so every refusal that is decided inside the
-//! engine leaves a record in the WAL describing a write that never happened.
-//! Replay is indifferent to why the record is there, so without an explicit
-//! cancellation it re-applies the refused write and recovery silently undoes
-//! the refusal.
-//!
-//! This file pins the acknowledged case against the REAL server binary: the
-//! client is told the write was rejected, the process is killed outright, and
-//! the same data directory is reopened. `kill -9` rather than a graceful
-//! shutdown is deliberate — a clean shutdown could flush state that hides a
-//! WAL-level defect; only a hard kill leaves recovery with nothing but the WAL,
-//! which is where the resurrection happens.
-//!
-//! The refusal used here is a unique-constraint violation, on the key-value
-//! engine. Constraint rather than row-level security because it needs no second
-//! identity, and key-value because its rows live only in an in-memory hash
-//! table: WAL replay is their sole recovery path, so a replayed record wins
-//! outright rather than being masked by a durable store. The row-level-security
-//! half of this invariant, on both the document and key-value engines, is
-//! covered in `restart_refused_write_not_resurrected.rs`.
+//! A write the server refused must not come back after `kill -9`. The write
+//! funnel appends a redo record before the Data Plane decides whether to
+//! accept it, so replay must not re-apply a refused write without explicit
+//! cancellation. Uses a unique-constraint violation on the key-value engine,
+//! whose rows live only in an in-memory hash table, so WAL replay is their
+//! sole recovery path. RLS coverage lives in
+//! `restart_refused_write_not_resurrected.rs`.
 
 mod crash_harness;
 
 use crash_harness::CrashHarness;
 
-/// Checkpoints run on a periodic timer, and one landing between the refused
-/// statement and the kill would flush engine state to disk independently of the
-/// WAL — recovery would then come up correct for a reason that has nothing to
-/// do with the abort record. Pushing the interval out to an hour makes that
-/// physically impossible inside a test that finishes in seconds, so a pass can
-/// only mean replay itself excluded the refused write.
+/// A checkpoint landing between the refused statement and the kill would
+/// flush engine state independent of the WAL, producing a false pass. An
+/// hour interval makes that impossible within test runtime.
 fn harness() -> CrashHarness {
     CrashHarness::new().with_env("NODEDB_CHECKPOINT_INTERVAL_SECS", "3600")
 }
 
-/// Run `sql` as the superuser and require the server to refuse it.
-///
-/// A statement that is ACCEPTED here fails the test immediately: the whole
-/// point is what happens to a refused write's WAL record, so a test that
-/// silently proceeded on an accepted write would assert nothing.
-///
-/// The message is read off the attached `DbError`; the `tokio_postgres::Error`
-/// wrapper's own `Display` is the fixed string "db error", which would make
-/// every refusal indistinguishable from every other failure.
+/// Run `sql` as the superuser and require the server to refuse it — an
+/// accepted statement fails the test immediately. Reads the message off the
+/// attached `DbError`, since `tokio_postgres::Error`'s own `Display` is
+/// always "db error".
 async fn refuse(h: &CrashHarness, sql: &str) -> String {
     let (client, connection) = tokio_postgres::connect(&h.pgwire_conn_str(), tokio_postgres::NoTls)
         .await

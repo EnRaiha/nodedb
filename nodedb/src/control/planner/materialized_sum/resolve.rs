@@ -24,43 +24,24 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// Resolve the materialized-sum target rows for every document write in
 /// `tasks`, storing the result in that op's `resolved_sum_targets`.
 ///
-/// Three sources of join values feed the resolution, and one op may draw on more
-/// than one of them:
+/// Three join-value sources feed resolution, and one op may draw on more
+/// than one: row BODIES read straight off each op; the PREDICATE
+/// `BulkUpdate`/`BulkDelete`/`TRUNCATE` name rows by (via a recon scan);
+/// and the STORED row a point write rewrites/removes (`PointDelete`/
+/// `PointUpdate` have no other source; `PointPut`/`Upsert` need it for a
+/// join-key rewrite's abandoned target). `UpdateFromJoin`/`InsertSelect`/
+/// `Merge` are resolved by their own orchestrators instead. A collection
+/// driving no binding costs one cached index probe and nothing else.
 ///
-/// - the row BODIES an op carries, read straight off each body;
-/// - the PREDICATE `BulkUpdate`, `BulkDelete` and `TRUNCATE` name their rows by,
-///   resolved by [`predicate::resolve_predicate_sum_targets`](super::predicate)
-///   from a reconnaissance scan of that same predicate;
-/// - the STORED row a point write rewrites or removes, resolved by
-///   [`stored::extend_with_stored_row`](super::stored) from a routed read of the
-///   one row. `PointDelete` and `PointUpdate` have no other source at all, and
-///   `PointPut` / `Upsert` need it for the target a join-key rewrite ABANDONS,
-///   which the submitted body cannot name.
+/// Also appends [`ApplyBalanceDelta`] tasks: a binding whose TARGET is
+/// cross-shard can't apply inside the source write's transaction, so this
+/// pass folds the read images and appends one task per settled balance,
+/// homed on the target (deferral recorded by removing the join value from
+/// the source op's resolution — see [`super::settle`]).
 ///
-/// `UpdateFromJoin`, `InsertSelect` and `Merge` are resolved by their own
-/// Control-Plane orchestrators, which hold the concrete rows the statement
-/// resolved to — a resolution derived from the plan alone would over-approximate
-/// their match sets.
-///
-/// A collection that drives no binding — nearly all of them — costs one cached
-/// index probe and nothing else: no catalog read, no surrogate lookup.
-///
-/// # What this pass also appends
-///
-/// A binding whose TARGET does not share the source's vShard cannot be applied
-/// inside the source write's transaction — that transaction belongs to the
-/// source's core, which owns none of the target's rows. For the shapes whose
-/// delta is a difference between two images, this pass folds the images it just
-/// read and appends an
-/// [`ApplyBalanceDelta`](nodedb_physical::physical_plan::DocumentOp::ApplyBalanceDelta)
-/// task per settled balance, homed on the target. See [`super::settle`] for why
-/// the deferral is recorded by REMOVING the join value from the source op's
-/// resolution rather than by a marker of its own.
-///
-/// The returned [`ReadSetEntry`]s cover the images those deltas were folded
-/// from. The caller must union them into the dispatch read-set: they are what
-/// makes the Calvin OCC check abort the statement, before any row moves, when
-/// the source rows have been written since the fold.
+/// The returned [`ReadSetEntry`]s cover the folded images; the caller must
+/// union them into the dispatch read-set so Calvin OCC aborts the
+/// statement on concurrent source writes, before any row moves.
 pub async fn resolve_materialized_sum_targets(
     state: &SharedState,
     tasks: &mut Vec<PhysicalTask>,

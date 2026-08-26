@@ -2,21 +2,11 @@
 
 //! A governed graph edge DELETE and a governed timeseries INSERT, in both
 //! directions: a conforming write lands, a violating write is refused with
-//! state unchanged.
-//!
-//! Both statements carry a compiled `RlsWriteCheck::Predicate` — graph because
-//! a delete's image is the edge's stored property object, timeseries because an
-//! ingest's rows exist only after the payload is rewritten into line protocol.
-//! Neither predicate can be replicated: a follower has no writing identity to
-//! evaluate `$auth.*` against, so `wal_replication::replicable_write` refuses
-//! any plan still carrying one. `control/write_resolve` resolves both to a
-//! decided form before proposing.
-//!
-//! That propose path is reachable only when `state.async_raft_proposer()` is
-//! `Some`. This harness spawns a single-node server, where the predicate
-//! instead reaches the Data Plane gate intact — so these tests pin the same
-//! observable behaviour the resolved path must preserve: the conforming write
-//! lands, the violating one does not, and the row count and value say which.
+//! state unchanged. Both carry a compiled `RlsWriteCheck::Predicate`, which
+//! can't be replicated since a follower has no writing identity to evaluate
+//! `$auth.*` against. This single-node harness reaches the Data Plane gate
+//! directly, but pins the same observable behavior the resolved path
+//! preserves.
 
 use nodedb::types::{DatabaseId, VShardId};
 
@@ -25,11 +15,8 @@ use crate::harness::TestServer;
 const PASSWORD: &str = "graph-ts-rls-probe-secret-9";
 const ROLE: &str = "readwrite";
 
-/// Edge endpoints. The names are chosen for their HASHES: `VShardId::from_key`
-/// maps both to the same vShard, which is what keeps every edge statement below
-/// SINGLE-SHARD. A cross-shard edge is dual-homed through Calvin instead, and
-/// on a single-node harness that submit is refused before the RLS gate is ever
-/// reached — the test would then assert nothing about the policy.
+/// Edge endpoints chosen so `VShardId::from_key` maps both to the same
+/// vShard — a cross-shard edge would be refused before the RLS gate.
 const EDGE_SRC: &str = "a";
 const EDGE_DST: &str = "xy";
 

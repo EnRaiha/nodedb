@@ -28,12 +28,9 @@ pub enum KvOp {
         /// RLS post-fetch filters. Evaluated after fetching the value.
         /// Returns nil on denial (no info leak).
         rls_filters: Vec<u8>,
-        /// Clone snapshot-isolation ceiling: when set, a fetched entry
-        /// whose surrogate exceeds this value is treated as not-found.
-        /// Populated by the clone resolver when rewriting a target-side
-        /// `Get` for delegation to the source database — bindings the
-        /// source allocated AFTER the clone's AS-OF must not leak
-        /// through.  `None` for normal (non-clone-delegated) gets.
+        /// Clone snapshot-isolation ceiling: an entry with surrogate above
+        /// this is treated as not-found, so post-AS-OF source bindings don't
+        /// leak through a delegated clone `Get`. `None` for normal gets.
         #[serde(default)]
         surrogate_ceiling: Option<u32>,
     },
@@ -54,23 +51,19 @@ pub enum KvOp {
         /// `SurrogateAssigner` from `(collection, key)`.
         /// `Surrogate::ZERO` only appears in test fixtures.
         surrogate: Surrogate,
-        /// When `Some`, return the STORED post-image of the written row
-        /// projected per spec — the row as `SELECT` would show it, `key`
-        /// included. Never the caller's submitted body: an echo of the
-        /// request would report what was asked for rather than what landed.
+        /// When `Some`, return the STORED post-image (row as `SELECT` would
+        /// show it, `key` included). Never the caller's submitted body.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. The write policy
-        /// governs the write; this bounds what may be shown back, so a
-        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        /// Read filters bounding `returning` to what a `SELECT` by the same
+        /// principal would show.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
 
     /// SQL `INSERT` semantics: write only if the key does not already exist.
-    /// Returns `unique_violation` (SQLSTATE 23505, via `NodeDbError`) on
-    /// duplicate key. Reserved for the `INSERT` SQL path — RESP `SET` and
-    /// `UPSERT` continue to use `Put`.
+    /// Returns `unique_violation` (SQLSTATE 23505) on duplicate key. RESP
+    /// `SET` and `UPSERT` continue to use `Put`.
     Insert {
         collection: String,
         key: Vec<u8>,
@@ -78,15 +71,10 @@ pub enum KvOp {
         ttl_ms: u64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
-        /// When `Some`, return the STORED post-image of the written row
-        /// projected per spec — the row as `SELECT` would show it, `key`
-        /// included. Never the caller's submitted body: an echo of the
-        /// request would report what was asked for rather than what landed.
+        /// See `Put::returning`.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. The write policy
-        /// governs the write; this bounds what may be shown back, so a
-        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        /// See `Put::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -100,15 +88,10 @@ pub enum KvOp {
         ttl_ms: u64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
-        /// When `Some`, return the STORED post-image of the written row
-        /// projected per spec — the row as `SELECT` would show it, `key`
-        /// included. Never the caller's submitted body: an echo of the
-        /// request would report what was asked for rather than what landed.
+        /// See `Put::returning`.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. The write policy
-        /// governs the write; this bounds what may be shown back, so a
-        /// `RETURNING` row set never exceeds a `SELECT` by the same principal.
+        /// See `Put::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -127,25 +110,15 @@ pub enum KvOp {
         updates: Vec<(String, crate::physical_plan::document::UpdateValue)>,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
         surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate, evaluated in the Data
-        /// Plane against the body actually persisted — the incoming row on the
-        /// insert branch, the merge of it with the stored row on the conflict
-        /// branch, neither of which exists at plan time — or the reason no
-        /// predicate is attached.
-        ///
-        /// Distinct from the read-side `rls_filters` slot beside it: that one
-        /// bounds what may be shown back, this one bounds what may be written
-        /// at all. Never conflate them — a write gate used as row redaction
-        /// admits rows it should hide, and the reverse silently drops writes.
+        /// Write policy against the body actually persisted — insert branch
+        /// or the conflict-merge, neither of which exists at plan time.
+        /// Distinct from `rls_filters`: never conflate write gate and redaction.
         rls_write_check: RlsWriteCheck,
-        /// When `Some`, return the STORED post-image projected per spec: the
-        /// merged row on the conflict branch, the inserted row otherwise.
-        /// Never the submitted body — on a conflict the caller's values are
-        /// only part of what the row ends up holding.
+        /// When `Some`, return the STORED post-image: merged row on conflict,
+        /// inserted row otherwise. Never the submitted body.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits — see
-        /// `Put::rls_filters`.
+        /// See `Put::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -176,12 +149,7 @@ pub enum KvOp {
         /// before encoding. Empty = unsorted (engine native order).
         #[serde(default)]
         sort_keys: Vec<crate::physical_plan::SortKeySpec>,
-        /// Clone snapshot-isolation ceiling: when set, scan results
-        /// drop entries whose surrogate exceeds this value.  Populated
-        /// by the clone resolver when rewriting a target-side scan for
-        /// delegation to the source database — bindings the source
-        /// allocated AFTER the clone's AS-OF must not leak through.
-        /// `None` for normal (non-clone-delegated) scans.
+        /// See `Get::surrogate_ceiling`; drops entries above the ceiling.
         #[serde(default)]
         surrogate_ceiling: Option<u32>,
     },
@@ -221,10 +189,8 @@ pub enum KvOp {
     BatchGet {
         collection: String,
         keys: Vec<Vec<u8>>,
-        /// Row-level-security filters applied to fetched rows before they are
-        /// returned. This operation has no pushdown filter slot in storage, so
-        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
-        /// and `DocumentOp::PointGet` already use.
+        /// RLS filters applied post-fetch (no pushdown slot in storage) —
+        /// same shape `KvOp::Get` and `DocumentOp::PointGet` use.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -278,63 +244,41 @@ pub enum KvOp {
         key: Vec<u8>,
         /// Field names to extract.
         fields: Vec<String>,
-        /// Row-level-security filters applied to fetched rows before they are
-        /// returned. This operation has no pushdown filter slot in storage, so
-        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
-        /// and `DocumentOp::PointGet` already use.
+        /// See `BatchGet::rls_filters`.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
 
-    /// Update specific fields in a key's value (HSET).
-    ///
-    /// Read-modify-write: reads the current value, merges field updates,
-    /// writes back. Maintains secondary indexes if any.
+    /// Update specific fields in a key's value (HSET): read-modify-write,
+    /// merges field updates, maintains secondary indexes.
     FieldSet {
         collection: String,
         key: Vec<u8>,
         /// Field name → new value (JSON-encoded bytes).
         updates: Vec<(String, Vec<u8>)>,
-        /// Stable cross-engine identity, content-addressed on `(collection,
-        /// key)` by the CP-side `SurrogateAssigner`. Threaded to the engine
-        /// write-back so a row touched by a field merge keeps the same
-        /// surrogate its original insert assigned. `Surrogate::ZERO` only in
-        /// test fixtures / when no assigner is wired.
+        /// Content-addressed identity on `(collection, key)`, threaded to the
+        /// write-back so a field merge keeps the row's original surrogate.
         surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate, evaluated against the
-        /// merged body — which exists only after the stored row has been read
-        /// and the field updates applied — or the reason no predicate is
-        /// attached.
+        /// Write policy evaluated against the merged body, which exists only
+        /// after the stored row is read and updates applied.
         rls_write_check: RlsWriteCheck,
     },
 
     /// Truncate: delete ALL entries in a KV collection.
     Truncate { collection: String },
 
-    /// Atomic increment on a numeric value. Returns new value.
-    ///
-    /// If key doesn't exist, initializes to 0 then adds delta.
-    /// If value is not i64, returns `TypeMismatch`.
-    /// On overflow (i64::MAX + 1), returns `OverflowError`.
-    /// TTL: if `ttl_ms > 0` and key is new, sets TTL; if key exists, resets TTL.
-    /// If `ttl_ms == 0`, preserves existing TTL (no change).
+    /// Atomic increment: init 0 if absent, `TypeMismatch` if not i64,
+    /// `OverflowError` on wrap. `ttl_ms > 0` sets/resets TTL; `0` preserves it.
     Incr {
         collection: String,
         key: Vec<u8>,
         delta: i64,
         /// TTL in milliseconds. 0 = preserve existing TTL.
         ttl_ms: u64,
-        /// Stable cross-engine identity, content-addressed on `(collection,
-        /// key)` by the CP-side `SurrogateAssigner`. Threaded to the engine
-        /// write-back so a row touched by an atomic op keeps the same
-        /// surrogate its original insert assigned. `Surrogate::ZERO` only in
-        /// test fixtures / when no assigner is wired.
+        /// See `FieldSet::surrogate`.
         surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate, or the reason no
-        /// predicate is attached. The incremented value is computed inside
-        /// the engine, so the engine consults this check with the computed
-        /// image before making it durable rather than the handler guessing
-        /// the result.
+        /// Write policy evaluated against the computed post-increment image
+        /// inside the engine, not guessed by the handler.
         rls_write_check: RlsWriteCheck,
     },
 
@@ -404,48 +348,35 @@ pub enum KvOp {
         field: String,
         /// Amount to transfer (encoded as f64 bytes).
         amount: f64,
-        /// Stable cross-engine identity of the debit (source) row, content-
-        /// addressed on `(collection, source_key)`. Threaded to the source
-        /// write-back so the debited row keeps its surrogate. `Surrogate::ZERO`
-        /// only in test fixtures / when no assigner is wired.
+        /// Debit (source) row's identity, content-addressed on `(collection,
+        /// source_key)`, threaded to the write-back.
         debit_surrogate: Surrogate,
-        /// Stable cross-engine identity of the credit (dest) row, content-
-        /// addressed on `(collection, dest_key)`. Threaded to the dest
-        /// write-back so the credited row keeps its surrogate. Distinct from
-        /// `debit_surrogate` so the two rows never collapse onto one identity.
+        /// Credit (dest) row's identity, content-addressed on `(collection,
+        /// dest_key)` — distinct from `debit_surrogate` so the rows never
+        /// collapse onto one identity.
         credit_surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate for the collection both
-        /// rows live in, or the reason no predicate is attached. Both
-        /// post-images — the debited source and the credited dest — are
-        /// decided against it before either is persisted, so a transfer
-        /// cannot half-apply.
+        /// Write policy for the (single) collection both rows live in. Both
+        /// post-images are decided against it before either persists, so a
+        /// transfer cannot half-apply.
         rls_write_check: RlsWriteCheck,
     },
 
-    /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
-    ///
-    /// Verifies source owns the item, then atomically deletes from source
-    /// and inserts at dest. Fails with NotFound if source doesn't own it.
+    /// Atomic non-fungible item transfer: verifies source owns the item,
+    /// then atomically deletes from source and inserts at dest. `NotFound`
+    /// if source doesn't own it.
     TransferItem {
         source_collection: String,
         dest_collection: String,
         item_key: Vec<u8>,
         dest_key: Vec<u8>,
-        /// Stable cross-engine identity of the moved row at its destination,
-        /// content-addressed on `(dest_collection, dest_key)`. Threaded to the
-        /// dest write-back so the inserted row carries its surrogate.
-        /// `Surrogate::ZERO` only in test fixtures / when no assigner is wired.
+        /// Moved row's identity at its destination, content-addressed on
+        /// `(dest_collection, dest_key)`.
         surrogate: Surrogate,
-        /// Compiled row-level-security WRITE predicate of the SOURCE
-        /// collection, decided against the row being removed from it, or the
-        /// reason no predicate is attached.
+        /// Write policy of the SOURCE collection, decided against the row
+        /// being removed.
         source_rls_write_check: RlsWriteCheck,
-        /// Compiled row-level-security WRITE predicate of the DESTINATION
-        /// collection, decided against the same bytes as the row being
-        /// inserted there, or the reason no predicate is attached. Kept
-        /// separate from the source check because the two collections carry
-        /// independent policies — one identity may be allowed to give a row
-        /// up but not to receive it.
+        /// Write policy of the DESTINATION collection. Kept separate from
+        /// the source check: an identity may give a row up but not receive it.
         dest_rls_write_check: RlsWriteCheck,
     },
 
@@ -526,7 +457,7 @@ pub enum KvOp {
     /// No predicate is evaluated and no image is recomputed: the Control
     /// Plane already decided both, and `rls_write_check` carries the verdict
     /// (`RlsWriteCheck::DecidedEarlierInRequest`). Every mutation's
-    /// `precondition` is checked against current state BEFORE the first one
+    /// `precondition` is checked against current state before the first one
     /// applies, so a resolution that drifted under a concurrent write applies
     /// nothing and asks for a retry.
     ResolvedWrite {

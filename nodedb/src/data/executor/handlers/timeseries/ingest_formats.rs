@@ -73,10 +73,7 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
-            // Carried through, never blanked: this function only rewrites the
-            // payload into line protocol and delegates. Dropping the slot here
-            // would leave the clause working on the ILP path and silently doing
-            // nothing on this one — a difference no caller could see.
+            // Carried through, never blanked, or RETURNING silently no-ops here.
             returning,
             rls_filters,
         } = params;
@@ -85,11 +82,8 @@ impl CoreLoop {
             .map(|(_, name)| name)
             .unwrap_or(collection);
 
-        // The measurement name carries an optional `<db_id>/` db-qualifier for
-        // non-default databases (`db_qualified()` in the planner emits this
-        // shape). The slash is part of the wire-level routing key, not part of
-        // the user-facing measurement, so allow it alongside the original
-        // `[a-zA-Z0-9_-]` set.
+        // Allows the optional `<db_id>/` db-qualifier slash alongside
+        // `[a-zA-Z0-9_-]` — it's a wire routing key, not the measurement.
         if !measurement
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/')
@@ -151,10 +145,8 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
-            // Forwarded so the projection is resolved in `execute_ilp_ingest`,
-            // on the far side of this conversion — the stored point exists only
-            // after the rewrite above, so projecting any earlier would report
-            // the submitted values instead.
+            // Forwarded to `execute_ilp_ingest` — the point exists only after
+            // the rewrite above, so projecting earlier reports submitted values.
             returning,
             rls_filters,
         })
@@ -172,10 +164,7 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
-            // Carried through, never blanked: this function only rewrites the
-            // payload into line protocol and delegates. Dropping the slot here
-            // would leave the clause working on the ILP path and silently doing
-            // nothing on this one — a difference no caller could see.
+            // Carried through, never blanked, or RETURNING silently no-ops here.
             returning,
             rls_filters,
         } = params;
@@ -205,11 +194,8 @@ impl CoreLoop {
             .map(|(_, name)| name)
             .unwrap_or(collection);
 
-        // The measurement name carries an optional `<db_id>/` db-qualifier for
-        // non-default databases (`db_qualified()` in the planner emits this
-        // shape). The slash is part of the wire-level routing key, not part of
-        // the user-facing measurement, so allow it alongside the original
-        // `[a-zA-Z0-9_-]` set.
+        // Allows the optional `<db_id>/` db-qualifier slash alongside
+        // `[a-zA-Z0-9_-]` — it's a wire routing key, not the measurement.
         if !measurement
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/')
@@ -250,10 +236,8 @@ impl CoreLoop {
             now_ms,
             mode,
             rls_write_check,
-            // Forwarded so the projection is resolved in `execute_ilp_ingest`,
-            // on the far side of this conversion — the stored point exists only
-            // after the rewrite above, so projecting any earlier would report
-            // the submitted values instead.
+            // Forwarded to `execute_ilp_ingest` — the point exists only after
+            // the rewrite above, so projecting earlier reports submitted values.
             returning,
             rls_filters,
         })

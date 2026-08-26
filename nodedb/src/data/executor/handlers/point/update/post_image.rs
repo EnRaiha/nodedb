@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Producing the post-update row image from the current one.
-//!
-//! Its own concern because this is pure value computation: it reads the stored
-//! body, applies the assignments, recomputes generated columns, and re-encodes
-//! in the collection's storage mode — touching no store, no index, and no
-//! transaction. That is what lets the two encodings of the same update live
-//! side by side and stay comparable: the binary field merge that never
-//! materializes a document, and the decode → mutate → re-encode path that
-//! every strict, generated-column, or expression assignment forces. Nothing
-//! here is allowed to have a side effect, so a failure means the statement
-//! aborts before anything has been written.
+//! Producing the post-update row image from the current one. Pure value
+//! computation — reads the stored body, applies assignments, recomputes
+//! generated columns, re-encodes — touching no store, index, or transaction.
+//! Nothing here has a side effect, so a failure aborts the statement before
+//! anything is written.
 
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
@@ -19,12 +13,10 @@ use crate::data::executor::strict_format;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::UpdateValue;
 
-/// The post-update row, before it is committed to a storage encoding.
-///
-/// Its own type because the two encodings the row can end up in — the stored
-/// body and the pre-encode MessagePack body a resolved write ships — must come
-/// from ONE computation. Recomputing the assignments per encoding is how a
-/// resolve and its apply start disagreeing about which row the policy admitted.
+/// The post-update row, before it is committed to a storage encoding. Its
+/// own type because the stored body and the resolved-write MessagePack body
+/// must come from ONE computation — recomputing per encoding is how resolve
+/// and apply disagree.
 pub(in crate::data::executor) enum PointUpdateBody {
     /// Schemaless fast path: fields merged at the binary level, already the
     /// MessagePack the collection stores.
@@ -170,10 +162,8 @@ impl CoreLoop {
             }
         };
 
-        // Apply field-level updates. Expressions are evaluated
-        // against the current-row snapshot, so a later assignment
-        // observing a column updated earlier in the same statement
-        // still sees the pre-update value — matches PostgreSQL.
+        // Expressions evaluate against the pre-update snapshot, so later
+        // assignments don't observe earlier ones — matches PostgreSQL.
         let eval_doc: nodedb_types::Value = doc.clone().into();
         if let Some(obj) = doc.as_object_mut() {
             for (field, update_val) in updates {
@@ -189,14 +179,9 @@ impl CoreLoop {
                     UpdateValue::Expr(expr) => {
                         let result: nodedb_types::Value = match expr.eval(&eval_doc) {
                             Ok(v) => v,
-                            // Division/modulo by zero fails the
-                            // statement, same as the
-                            // literal-decode-failure arm above.
+                            // Division/modulo by zero fails the statement.
                             Err(_e) => return Err(ErrorCode::DivisionByZero),
                         };
-                        // Convert nodedb_types::Value → serde_json::Value so the
-                        // downstream re-encode path (strict or msgpack) can proceed
-                        // through its existing json-based branches unchanged.
                         let json: serde_json::Value = result.into();
                         json
                     }
@@ -220,11 +205,9 @@ impl CoreLoop {
     }
 }
 
-/// The post-update row as pre-encode MessagePack.
-///
-/// The form the document write path takes for BOTH storage modes, so a resolved
-/// write ships one body shape and the apply encodes the strict Binary Tuple on
-/// the way to disk exactly as a direct write does.
+/// The post-update row as pre-encode MessagePack, for both storage modes — a
+/// resolved write ships this one shape and apply encodes the strict Binary
+/// Tuple exactly as a direct write does.
 pub(in crate::data::executor) fn point_update_body_to_msgpack(body: &PointUpdateBody) -> Vec<u8> {
     match body {
         PointUpdateBody::Msgpack(bytes) => bytes.clone(),

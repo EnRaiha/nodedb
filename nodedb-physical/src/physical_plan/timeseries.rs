@@ -6,13 +6,9 @@ use nodedb_types::{RlsWriteCheck, Surrogate, SystemTimeScope};
 
 use crate::physical_plan::document::ReturningSpec;
 
-/// An unconstrained `(min_ts_ms, max_ts_ms)` envelope.
-///
-/// The Control Plane always plans a timeseries scan unbounded: narrowing it
-/// requires knowing which column is the collection's declared `TIME_KEY`, and
-/// that is resolved in the Data Plane where the collection's registered schema
-/// lives. Internal callers that already know an exact window (retention,
-/// continuous-aggregate refresh) pass their own bounds instead.
+/// An unconstrained `(min_ts_ms, max_ts_ms)` envelope. The Control Plane
+/// always plans unbounded — narrowing needs the `TIME_KEY` column, resolved
+/// only in the Data Plane's registered schema.
 pub const UNBOUNDED_TIME_RANGE: (i64, i64) = (i64::MIN, i64::MAX);
 
 /// Timeseries engine physical operations.
@@ -40,37 +36,30 @@ pub enum TimeseriesOp {
         projection: Vec<String>,
         limit: usize,
         filters: Vec<u8>,
-        /// `ORDER BY` terms, each an expression, in significance order.
-        /// Empty = the engine's natural order. Applied to the materialized
-        /// result before `limit` is enforced, so an ordered query returns the
-        /// first `limit` rows of the ordering the client asked for.
+        /// `ORDER BY` terms, in significance order, applied before `limit`.
+        /// Empty = engine's natural order.
         sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// time_bucket interval in milliseconds. 0 = no bucketing.
         bucket_interval_ms: i64,
         /// GROUP BY column names (empty = no grouping or whole-table agg).
         group_by: Vec<String>,
-        /// Aggregate expressions: `(op, field)` e.g. `("count","*")`, `("avg","elapsed_ms")`.
-        /// Empty = raw scan (no aggregation).
+        /// Aggregate expressions: `(op, field)`, e.g. `("count","*")`. Empty
+        /// = raw scan.
         aggregates: Vec<(String, String)>,
-        /// Gap-fill strategy for time-bucket aggregation.
-        /// Empty = no gap-fill. Otherwise: "null", "prev", "linear", or literal value.
-        /// Only applied when `bucket_interval_ms > 0`.
+        /// Gap-fill strategy ("null"/"prev"/"linear"/literal), used only
+        /// when `bucket_interval_ms > 0`. Empty = none.
         gap_fill: String,
-        /// Serialized `Vec<ComputedColumn>` for scalar projection expressions
-        /// (e.g. `time_bucket('1h', timestamp)`). Applied per-row in raw scan mode.
+        /// Serialized `Vec<ComputedColumn>` for scalar projections (e.g.
+        /// `time_bucket('1h', timestamp)`), applied per-row in raw scan mode.
         computed_columns: Vec<u8>,
-        /// RLS post-scan filters (applied after time-range pruning).
+        /// RLS post-scan filters, applied after time-range pruning.
         rls_filters: Vec<u8>,
-        /// System-time selection. `Current` = current state; `AsOf(ms)` =
-        /// block-skip + post-filter to rows written ≤ ms; `AllVersions` =
-        /// every `_ts_system` row ordered ascending (audit log), system-time
-        /// column projected. Only meaningful for timeseries collections
-        /// created `WITH BITEMPORAL`.
+        /// `Current` / `AsOf(ms)` (block-skip + post-filter) / `AllVersions`
+        /// (audit log, ascending). Meaningful only `WITH BITEMPORAL`.
         #[serde(default)]
         system_time: SystemTimeScope,
-        /// Bitemporal valid-time point. When `Some`, only rows whose
-        /// `[_ts_valid_from, _ts_valid_until)` interval contains this
-        /// point are returned.
+        /// Bitemporal valid-time point: only rows whose
+        /// `[_ts_valid_from, _ts_valid_until)` contains it are returned.
         #[serde(default)]
         valid_at_ms: Option<i64>,
     },
@@ -86,56 +75,34 @@ pub enum TimeseriesOp {
         /// or flushed to disk. `None` for live ingest (always accepted).
         #[serde(default)]
         wal_lsn: Option<u64>,
-        /// Reserved for per-row cross-engine `Surrogate` identities. The
-        /// timeseries ingest handler does NOT consume this field: timeseries
-        /// rows are identified internally by `series_id` (a deterministic hash
-        /// of measurement + tags, computed identically on every replica), and
-        /// timeseries does not participate in cross-engine bitmap joins, so no
-        /// cross-engine surrogate binding is required. Almost always `vec![]`;
-        /// retained for plan-shape uniformity with the columnar `Insert` op.
+        /// Not consumed by the ingest handler: timeseries rows are identified
+        /// by `series_id` (deterministic hash of measurement + tags), not
+        /// cross-engine surrogates. Almost always `vec![]`; kept for
+        /// plan-shape uniformity with the columnar `Insert` op.
         #[serde(default)]
         surrogates: Vec<Surrogate>,
-        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        /// Sync provenance: originating peer and sequence, for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-        /// Compiled row-level-security WRITE predicate (`Vec<ScanFilter>` as
-        /// MessagePack), evaluated in the Data Plane against every parsed row
-        /// before it reaches the memtable, or the reason no predicate is
-        /// attached. Every ingest format normalizes into ILP inside the
-        /// handler, so one gate there covers all of them — including the raw
-        /// ILP listener, which builds its tasks outside the SQL planner.
+        /// Write policy evaluated against every parsed row before it reaches
+        /// the memtable. Every ingest format normalizes into ILP first, so
+        /// one gate covers all of them — including the raw ILP listener.
         rls_write_check: RlsWriteCheck,
-        /// When `Some`, return the STORED post-image of each ingested point —
-        /// the row as it exists after time-key normalization, tag/field
-        /// splitting and schema resolution, read back through the ordinary scan
-        /// projection so it matches what `SELECT` shows. Never the submitted
-        /// line: every format is rewritten into ILP before a point is built, so
-        /// echoing the request would report values the collection does not hold.
-        ///
-        /// A batch that rejects any row FAILS when this is set, rather than
-        /// answering with a short row set: the count response has a `rejected`
-        /// field to report the loss and a row set has nowhere to put it.
+        /// When `Some`, return the STORED post-image of each ingested point,
+        /// read back through the ordinary scan projection. Never the
+        /// submitted line. A batch that rejects any row FAILS when this is
+        /// set — the `rejected` count has nowhere to go in a row set.
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Read filters gating the rows `returning` emits. Distinct from
-        /// `rls_write_check` above, which decides whether the write happens at
-        /// all: this bounds what may be shown back, so a `RETURNING` row set
-        /// never exceeds a `SELECT` by the same principal.
+        /// Read filters bounding `returning` to what a `SELECT` by the same
+        /// principal would show — distinct from `rls_write_check`.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
 
-    /// Read-only resolve pass for a governed [`TimeseriesOp::Ingest`].
-    ///
-    /// A follower has no writing identity, so an ingest carrying a live
-    /// `RlsWriteCheck::Predicate` cannot be replicated. This wraps that exact
-    /// ingest, normalizes its payload into the canonical line protocol the
-    /// handler would have stored — every timestamp stamped, so no replica
-    /// consults a clock — decides the policy against those lines, and reports
-    /// them back. It writes nothing.
-    ///
-    /// Normalization has to happen here: the time column of a measurement with
-    /// no DDL behind it comes from the resident memtable's schema, which is
-    /// Data-Plane state the Control Plane cannot read.
+    /// Read-only resolve pass for a governed [`TimeseriesOp::Ingest`]: a
+    /// follower can't judge a live predicate, so this normalizes the payload
+    /// into stamped ILP lines (memtable schema is Data-Plane-only, so
+    /// normalization must happen here) and decides the policy without writing.
     ResolveIngest(Box<TimeseriesOp>),
 }

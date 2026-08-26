@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Graph operation handlers: EdgePut, EdgeDelete, GraphHop, GraphNeighbors,
-//! GraphPath, GraphSubgraph.
-//!
-//! ## Scoping at this layer
-//!
-//! The CSR index is partitioned structurally by tenant (see
-//! `ShardedCsrIndex`). Handlers resolve the caller's partition once
-//! via `self.csr_partition(_mut)(tid)` and then address node ids in
-//! their raw, user-visible form — no `<tid>:` prefix, no post-hoc
-//! stripping on the way out.
-//!
-//! `EdgeStore` now takes `(TenantId, name)` tuples and owns its
-//! tenant encoding internally. Handlers pass raw user-visible names
-//! throughout: to the CSR partition, to the edge store, and to the
-//! `deleted_nodes` dangling-edge tracker via `mark_node_deleted` /
-//! `is_node_deleted`. No `scoped_node()` wrapping at this layer.
+//! GraphPath, GraphSubgraph. The CSR index is partitioned structurally by
+//! tenant; handlers resolve the partition once via
+//! `self.csr_partition(_mut)(tid)` and address node ids in their raw,
+//! user-visible form throughout — no `<tid>:` prefix, no `scoped_node()`.
 
 use nodedb_types::diagnostic::DiagnosticLayer;
 use tracing::{debug, warn};
@@ -93,10 +82,8 @@ impl CoreLoop {
             .request
             .txn_id
             .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id));
-        // Read-your-own-writes. Multi-hop (depth > 1) pushes the staged delta
-        // into the traversal so staged-only intermediate nodes expand; the
-        // single-hop case (depth == 1) is handled by `merge_hop_single_hop`
-        // below, so the traversal stays durable-only there.
+        // Multi-hop pushes the staged delta into the traversal; single-hop
+        // (depth == 1) is handled by `merge_hop_single_hop` below instead.
         let delta = if depth > 1 {
             overlay.map(|ov| {
                 graph_txn_merge::build_graph_overlay_delta(
@@ -167,9 +154,8 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, tid, %node_id, ?edge_label, ?direction, "graph neighbors");
         let database_id = task.request.database_id.as_u64();
-        // A named collection restricts the walk to that collection's edges;
-        // the partition holds every collection's edges under one node space, so
-        // the unscoped `neighbors` would silently span all of them.
+        // A named collection restricts the walk; unscoped `neighbors` would
+        // silently span every collection's edges in the shared node space.
         let durable: Vec<(String, String)> = match self.csr_partition(database_id, tid) {
             Some(partition) => match collection {
                 Some(collection) => partition.neighbors_in_collection(
@@ -182,9 +168,8 @@ impl CoreLoop {
             },
             None => Vec::new(),
         };
-        // Read-your-own-writes: fold this transaction's staged edge writes
-        // into the durable result (see `graph_txn_merge`).
-        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        // Read-your-own-writes: fold staged edge writes into the durable
+        // result (see `graph_txn_merge`), and refresh the overlay lease.
         if let Some(txn_id) = task.request.txn_id {
             self.touch_overlay(txn_id);
         }

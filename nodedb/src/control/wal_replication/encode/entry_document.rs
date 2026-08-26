@@ -26,10 +26,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             pk_bytes: _,
             returning,
             rls_filters,
-            // Resolved against the proposing node's catalog at plan time, and
-            // copied onto the record: the applier re-executes this write and
-            // maintains the derived total itself, but cannot resolve the target
-            // row's identity — see `document`'s module doc.
+            // Resolved at plan time and copied onto the record: the applier can't
+            // resolve the target row's identity itself — see `document`'s module doc.
             resolved_sum_targets,
         } => document::point_put(
             collection,
@@ -74,8 +72,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             pk_bytes: _,
             returning,
             rls_filters,
-            // A follower has no writing identity; decode stamps
-            // `already_decided_elsewhere()`.
+            // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
             rls_write_check: _,
             // See `PointPut`.
             resolved_sum_targets,
@@ -96,8 +93,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             updates,
             returning,
             rls_filters,
-            // A follower has no writing identity; decode stamps
-            // `already_decided_elsewhere()`.
+            // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
             rls_write_check: _,
             // See `PointPut`.
             resolved_sum_targets,
@@ -118,8 +114,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             value,
             on_conflict_updates,
             surrogate,
-            // The leader already decided this row against the write policy; the
-            // replicated record carries the row, not the policy.
+            // Leader already decided this row; the record carries the row, not the policy.
             rls_write_check: _,
             returning,
             rls_filters,
@@ -144,11 +139,9 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
             rls_filters,
-            // The leader already decided every matched row against the write
-            // policy; the replicated record carries the predicate, not it.
+            // Leader already decided every matched row; the record carries the predicate.
             rls_write_check: _,
-            // See `PointPut`. The predicate's MATCHES are re-derived by every
-            // replica; the identity of the targets they credit is not.
+            // See `PointPut`. Matches are re-derived by every replica; target identity is not.
             resolved_sum_targets,
         } => document::bulk_delete(
             collection,
@@ -208,12 +201,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             rls_filters,
         ),
 
-        // Known replication gaps: genuine writes not yet wired to a
-        // `ReplicatedWrite`. The data still lands via the leader's own
-        // redb/WAL; only cross-node Raft replication of these ops is missing.
-        // `Merge` / `UpdateFromJoin` — cross-collection writes whose
-        // source/target co-location is not enforced (`Unroutable` in
-        // `plan_vshard`); no ReplicatedWrite shape yet.
+        // Known gap: cross-collection writes whose source/target co-location is
+        // not enforced (`Unroutable` in `plan_vshard`); no ReplicatedWrite shape yet.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => return None,
         DocumentOp::Truncate {
             collection,
@@ -221,20 +210,16 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `PointPut`.
             resolved_sum_targets,
         } => document::truncate(collection, *restart_identity, resolved_sum_targets),
-        // OLLP-prepared bulk plans carrying predicted surrogates/edges route
-        // via the cross-shard Calvin path, not single-shard Raft proposal, so
-        // they are intentionally not encoded here.
+        // OLLP-prepared bulk plans route via the cross-shard Calvin path, not
+        // single-shard Raft proposal.
         DocumentOp::BulkDelete { .. } | DocumentOp::BulkUpdate { .. } => return None,
 
-        // The verdict is already on the plan
-        // (`RlsWriteCheck::DecidedEarlierInRequest`), so unlike the predicate
-        // arms above there is nothing to re-decide here.
+        // Verdict is already on the plan (`RlsWriteCheck::DecidedEarlierInRequest`),
+        // so nothing to re-decide here.
         DocumentOp::ResolvedWrite {
             mutations,
             response_payload,
-            // Decode stamps `decided_earlier_in_request()`: the decision this
-            // slot carries was made before the entry was proposed, and the
-            // record is what proves it.
+            // Decode stamps `decided_earlier_in_request()`.
             rls_write_check: _,
         } => document::resolved_write(mutations, response_payload),
 

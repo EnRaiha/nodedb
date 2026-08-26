@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Rewriting every timeseries ingest payload shape into line protocol.
-//!
-//! This is where a structured ingest's values become the values that are
-//! STORED: the declared time column moves into the line's timestamp (and thence
-//! into the schema's millisecond time column), and a numeric-looking string
-//! becomes a number. Anything that needs to reason about the row an ingest will
-//! actually persist — the row-level-security gate, the resolve pass — has to go
-//! through here rather than reading the submitted values, or it is reasoning
-//! about an image the collection never holds.
+//! Rewriting every timeseries ingest payload shape into line protocol — where
+//! a structured ingest's values become the values that are STORED (time
+//! column moves to the line's timestamp, numeric strings become numbers).
+//! Anything reasoning about the persisted row (RLS gate, resolve pass) must
+//! go through here, not the submitted values.
 
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
@@ -19,16 +15,9 @@ use crate::engine::timeseries::ilp::{self, IlpError};
 /// stored time column is milliseconds.
 const NANOS_PER_MILLI: i64 = 1_000_000;
 
-/// Is `column` the time column of the row being ingested?
-///
-/// A collection created through DDL designates its time column explicitly, so
-/// the match is against that declared name and nothing else — a column called
-/// `timestamp` in a collection whose `TIME_KEY` is `captured_at` is an
-/// ordinary column and must keep its value.
-///
-/// `declared` is `None` only for a measurement with no DDL behind it (raw ILP
-/// protocol ingest). There the conventional names are the only signal
-/// available, so they remain the fallback.
+/// Is `column` the time column of the row being ingested? Matches only the
+/// declared `TIME_KEY` when DDL exists; falls back to conventional names
+/// (`ts`/`timestamp`/`time`) only for a measurement with no DDL behind it.
 pub(super) fn is_time_column(column: &str, declared: Option<&str>) -> bool {
     match declared {
         Some(time_key) => column.eq_ignore_ascii_case(time_key),
@@ -39,11 +28,8 @@ pub(super) fn is_time_column(column: &str, declared: Option<&str>) -> bool {
     }
 }
 
-/// Parse a datetime string to nanoseconds since Unix epoch.
-///
-/// Accepts RFC3339 / ISO8601 with timezone (e.g., "2024-01-01T00:00:00Z"),
-/// and common datetime formats without timezone (treated as UTC).
-/// Returns nanoseconds since Unix epoch, or `None` if the string cannot be parsed.
+/// Parse a datetime string to nanoseconds since Unix epoch. Accepts
+/// RFC3339/ISO8601 with timezone, and common formats without (treated as UTC).
 pub(super) fn parse_ts_string_to_nanos(s: &str) -> Option<i64> {
     use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
@@ -113,10 +99,8 @@ pub(in crate::data::executor) fn msgpack_rows_to_ilp(
                 MsgpackValue::Float(f) => fields.push(format!("{key}={f}")),
                 MsgpackValue::Int(n) => fields.push(format!("{key}={n}i")),
                 MsgpackValue::Str(s) => {
-                    // SQL parser routes numeric literals with `.`/`e`/`E` through
-                    // `SqlValue::Decimal`, which the standard msgpack writer encodes
-                    // as a string. Recover the numeric type here so timeseries
-                    // schema inference picks `Float64` / `Int64` instead of `Symbol`.
+                    // Recover the numeric type `SqlValue::Decimal` encoded as a
+                    // string, so schema inference picks Float64/Int64, not Symbol.
                     if let Ok(i) = s.parse::<i64>() {
                         fields.push(format!("{key}={i}i"));
                     } else if let Ok(f) = s.parse::<f64>()
@@ -137,10 +121,8 @@ pub(in crate::data::executor) fn msgpack_rows_to_ilp(
     ilp_buf
 }
 
-/// Normalize decoded JSON rows into line protocol.
-///
-/// The JSON value model carries no decimal-as-string case, so a numeric field
-/// arrives already typed and no string is re-parsed into a number here.
+/// Normalize decoded JSON rows into line protocol. The JSON value model
+/// carries no decimal-as-string case, so no string is re-parsed as a number.
 pub(in crate::data::executor) fn json_rows_to_ilp(
     rows: &sonic_rs::Array,
     measurement: &str,
@@ -183,12 +165,8 @@ pub(in crate::data::executor) fn json_rows_to_ilp(
     ilp_buf
 }
 
-/// Split `batch` into lines, giving every line that carries no timestamp the
-/// batch's `default_timestamp_ms`.
-///
-/// A replicated ingest must store the same row on every replica, and a line
-/// with no timestamp otherwise takes each applying node's own clock. Stamping
-/// it once, here, is what makes the resolved form replica-independent.
+/// Split `batch` into lines, giving every timestamp-less line the batch's
+/// `default_timestamp_ms` — otherwise each replica would stamp its own clock.
 pub(in crate::data::executor) fn stamp_timestamps(
     batch: &str,
     default_timestamp_ms: i64,

@@ -2,17 +2,9 @@
 
 //! Point-write lock-key extraction for the write-admission fast path.
 //!
-//! [`plan_lock_keys`] maps a physical plan to the exact deterministic lock keys
-//! the fast path must hold to serialize the write against a pending
-//! cross-shard commit. It returns `Some` ONLY for uncontended-eligible POINT
-//! writes that home to a single vShard and carry a single stable identity;
-//! every predicate / bulk / multi-home write (and every non-write) returns
-//! `None`, which the gate routes to the deterministic Calvin scheduler instead.
-//!
-//! The single-home requirement is enforced structurally: a plan is eligible
-//! only when [`plan_vshard`] resolves it to exactly one vShard. A cross-home
-//! graph edge resolves to two vShards and therefore falls through to the
-//! scheduler — it cannot be expressed as one `(vShard, keys)` pair.
+//! [`plan_lock_keys`] maps a plan to the deterministic lock keys the fast path
+//! must hold. Returns `Some` only for single-vShard, single-identity point
+//! writes; predicate/bulk/multi-home writes route to Calvin instead.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -24,16 +16,11 @@ use crate::types::VShardId;
 use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, VectorOp};
 
 /// The vShard and exact lock-key set a POINT write must hold on the fast path.
-///
-/// Returns `None` — routing the write to the deterministic Calvin scheduler —
-/// for any plan that is not a single-home, single-identity point write:
-/// predicate / bulk writes, multi-home graph edges, and non-writes.
+/// Returns `None` (routes to Calvin) for any plan that isn't a single-home,
+/// single-identity point write.
 pub(crate) fn plan_lock_keys(plan: &PhysicalPlan) -> Option<(VShardId, BTreeSet<LockKey>)> {
-    // Point writes home to exactly one vShard. `plan_vshard` returns two vShards
-    // for a cross-home graph edge; such an edge has no single `(vShard, keys)`
-    // representation, so it is ineligible for the fast path. Any non-`Vshards`
-    // routing (control-plane-only, non-write, or a known-unroutable gap) is
-    // likewise ineligible — the scheduler / gate above this handles those.
+    // `plan_vshard` returns two vShards for a cross-home graph edge, which has no
+    // single `(vShard, keys)` representation and is ineligible for the fast path.
     let vshard = match plan_vshard(plan) {
         PlanRouting::Vshards(v) => match v.as_slice() {
             [v] => *v,
@@ -49,20 +36,16 @@ pub(crate) fn plan_lock_keys(plan: &PhysicalPlan) -> Option<(VShardId, BTreeSet<
     Some((vshard, keys))
 }
 
-/// The single deterministic lock key identifying a point write, or `None` when
-/// the plan is not a single-identity point write.
+/// The single deterministic lock key identifying a point write, or `None`.
 ///
-/// The outer match is exhaustive over `PhysicalPlan` so a new engine variant
-/// forces a decision here rather than silently taking the fast path.
+/// Exhaustive over `PhysicalPlan` so a new engine variant forces a decision here.
 fn point_lock_key(plan: &PhysicalPlan) -> Option<LockKey> {
     match plan {
         PhysicalPlan::Document(op) => document_point_key(op),
         PhysicalPlan::Kv(op) => kv_point_key(op),
         PhysicalPlan::Vector(op) => vector_point_key(op),
         PhysicalPlan::Graph(op) => graph_point_key(op),
-        // Append-only, bulk, index-overlay, read and meta engines never carry a
-        // single-identity point write: they route to the deterministic
-        // scheduler, which owns their ordering.
+        // Never carry a single-identity point write; route to the scheduler.
         PhysicalPlan::Timeseries(_)
         | PhysicalPlan::Columnar(_)
         | PhysicalPlan::Crdt(_)
@@ -77,9 +60,8 @@ fn point_lock_key(plan: &PhysicalPlan) -> Option<LockKey> {
 }
 
 /// Document-engine point-write key: the row surrogate. `Upsert` carries a
-/// pre-assigned single-row surrogate just like the `Point*` ops, so it locks
-/// identically. Predicate / multi-row document writes have no single point
-/// identity and route to the scheduler.
+/// pre-assigned single-row surrogate like the `Point*` ops, so it locks
+/// identically. Predicate/multi-row writes route to the scheduler.
 fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
     match op {
         DocumentOp::PointPut {
@@ -110,13 +92,10 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
             collection: Arc::from(collection.as_str()),
             surrogate: surrogate.as_u32(),
         }),
-        // Multi-row and cross-collection writes have no single point identity;
-        // they route to the deterministic scheduler, which owns their ordering.
+        // Multi-row and cross-collection writes have no single point identity.
         DocumentOp::BatchInsert { .. }
-        // N rows, each with its own identity — and it is never admitted through
-        // this gate: the write-resolve orchestrator proposes it directly, and
-        // each mutation's content precondition is what orders it against a
-        // concurrent write.
+        // N rows, each with its own identity; never admitted through this gate — the
+        // write-resolve orchestrator proposes it directly with a content precondition.
         | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::BulkUpdate { .. }
@@ -124,11 +103,8 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
         | DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Truncate { .. }
         | DocumentOp::Merge { .. }
-        // A derived balance write DOES name one row, but it is never admitted
-        // through this gate: it only exists as the sibling of a source write
-        // that already classified multi-shard, so the scheduler is what locks
-        // it — on `(target collection, target surrogate)`, the same key a direct
-        // write of that row takes.
+        // Names one row but never admitted here: it's the sibling of an already
+        // multi-shard write, so the scheduler locks it on the same key instead.
         | DocumentOp::ApplyBalanceDelta { .. }
         // Reads and index DDL take no write lock at all.
         | DocumentOp::PointGet { .. }
@@ -145,12 +121,9 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
     }
 }
 
-/// KV-engine point-write key: the single raw byte key. Covers plain writes
-/// (`Put`/`Insert`/`InsertIfAbsent`/`InsertOnConflictUpdate`), single-key
-/// `Delete`, and single-key read-modify-write ops (`Incr`/`IncrFloat`/`Cas`/
-/// `GetSet`/`FieldSet`) — all of them mutate exactly one row identified by
-/// `(collection, key)`. Multi-key delete and batch put have no single
-/// identity.
+/// KV-engine point-write key: the single raw byte key. Covers plain writes,
+/// single-key `Delete`, and single-key read-modify-write ops — all mutate
+/// exactly one `(collection, key)` row. Multi-key/batch ops have no single identity.
 fn kv_point_key(op: &KvOp) -> Option<LockKey> {
     match op {
         KvOp::Put {

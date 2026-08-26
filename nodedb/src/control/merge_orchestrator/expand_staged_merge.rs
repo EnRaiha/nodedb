@@ -2,30 +2,19 @@
 
 //! Resolve + emit the concrete point ops for one in-transaction `MERGE`.
 //!
-//! A transactional `BEGIN; MERGE INTO t USING s ...; ...; COMMIT` must not
-//! replay the raw `Merge` plan through the legacy Data-Plane passthrough, which
-//! writes the NOT-MATCHED inserts under a raw `sparse.put` with NO surrogate
-//! (never indexed — invisible to vector/FTS search), whose `to_replicated_entry`
-//! returns `None` (the whole row is lost on a WAL-only restart), and outside the
-//! COMMIT batch's undo log (not atomic with sibling ops).
+//! A transactional MERGE must not replay the raw `Merge` plan through the
+//! legacy passthrough, which writes NOT-MATCHED inserts unsurrogated (never
+//! indexed, lost on WAL-only restart, outside the COMMIT undo log). Instead
+//! it's resolved at STATEMENT time: ship source rows, dispatch the shared
+//! Data-Plane RESOLVE pass, assign each inserted row a fresh registered
+//! surrogate (reusing the existing one for updates/deletes), then stage the
+//! resulting point ops through the normal path — indexed, replicated,
+//! undo-tracked, and visible to later statements immediately.
 //!
-//! Instead the MERGE is resolved at STATEMENT time (`session::expander_stage`):
-//! this module ships the source rows to the source's own core, dispatches the
-//! shared Data-Plane RESOLVE pass (the single classifier — never re-derived
-//! here), assigns each inserted row its OWN fresh, catalog-REGISTERED surrogate,
-//! and reuses the EXISTING target row's registered surrogate for updates/deletes.
-//! It returns the resulting per-row `PointInsert` / `PointPut` / `PointDelete`
-//! tasks; the expander then stages + buffers each through the normal
-//! statement-time staging path, so they land in the transaction's overlay
-//! immediately (read-your-own-writes for later statements) and commit as
-//! indexed, replicated, undo-tracked point writes.
-//!
-//! Because the RESOLVE pass reads the TARGET as base ∪ overlay (the staged
-//! transaction's id is threaded through), a MERGE matches — and reuses the
-//! surrogate of — a row a prior statement in the same transaction staged.
-//!
-//! Mirrors [`super::orchestrator::run_merge`]'s identity derivation for
-//! autocommit; the two drivers share [`crate::control::target_identity`].
+//! The RESOLVE pass reads TARGET as base ∪ overlay via the threaded `txn_id`,
+//! so a MERGE reuses the surrogate of a row a prior statement staged.
+//! Mirrors [`super::orchestrator::run_merge`]'s autocommit identity
+//! derivation via shared [`crate::control::target_identity`].
 
 use nodedb_types::TenantId;
 
@@ -46,12 +35,10 @@ use crate::control::target_identity::{
 /// surrogate-carrying `PointInsert` / `PointPut` / `PointDelete` tasks its three
 /// arms expand to.
 ///
-/// `task` must be a `Merge` plan with `task.txn_id` set to the active
-/// transaction, so the RESOLVE pass (and its source scan) fold rows staged by
-/// earlier statements in the same transaction. The emitted point ops carry the
-/// same `txn_id` and target the TARGET collection's vShard (recomputed here so
-/// dispatch classification stays honest, exactly as the `INSERT ... SELECT`
-/// expander does). The caller stages + buffers each returned op.
+/// `task.txn_id` must be the active transaction so the RESOLVE pass folds
+/// earlier-staged rows. Emitted ops carry the same `txn_id` and a recomputed
+/// target vShard (as the `INSERT ... SELECT` expander does). The caller
+/// stages + buffers each returned op.
 pub(crate) async fn resolve_and_emit_merge_ops(
     state: &SharedState,
     tenant_id: TenantId,
@@ -73,13 +60,10 @@ pub(crate) async fn resolve_and_emit_merge_ops(
 
     let arms = resolve_merge_arms(state, tenant_id, task).await?;
 
-    // Gate every resolved arm on the target's write policy, against the image
-    // that arm stores — the post-image for an UPDATE or INSERT arm, the
-    // pre-image for a DELETE arm. This expansion rewrites the statement into
-    // concrete point ops the RLS injection pass has already run past, so the
-    // predicate compiled into the MERGE plan is the last thing that can decide
-    // these rows; without the check here, expanding a governed MERGE would
-    // launder it into ungoverned point writes.
+    // Gate every resolved arm on the target's write policy (post-image for
+    // UPDATE/INSERT, pre-image for DELETE): this expansion rewrites the
+    // statement past RLS injection, so without this check a governed MERGE
+    // would launder into ungoverned point writes.
     if let nodedb_types::WriteGateDecision::Evaluate(predicate) = rls_write_check.decision() {
         let bodies = arms
             .updates
@@ -121,10 +105,10 @@ pub(crate) async fn resolve_and_emit_merge_ops(
     Ok(out)
 }
 
-/// Ship the source rows and dispatch the shared Data-Plane RESOLVE pass for one
-/// staged merge, decoding all three resolved arms. Never re-derives the
-/// classification locally — `collect_merge_plan` on the Data Plane is the single
-/// shared classifier for both this path and autocommit `run_merge`.
+/// Ship the source rows and dispatch the shared Data-Plane RESOLVE pass for
+/// one staged merge, decoding all three resolved arms. Never re-derives the
+/// classification locally — `collect_merge_plan` is the single shared
+/// classifier for both this path and autocommit `run_merge`.
 async fn resolve_merge_arms(
     state: &SharedState,
     tenant_id: TenantId,
@@ -147,11 +131,9 @@ async fn resolve_merge_arms(
         });
     };
 
-    // Phase 0: read the SOURCE where it lives (its vShard can map to a different
-    // Data-Plane core than the target's) and ship the raw rows into the plan.
-    // Threading the staged transaction's id folds the source's own staging
-    // overlay, so a source row inserted/updated earlier in this transaction is
-    // shipped too.
+    // Phase 0: read the SOURCE where it lives (a different core than the
+    // target's) and ship the rows into the plan; threading `txn_id` folds
+    // the source's own staging overlay too.
     let source_rows = read_all_source_rows(
         state,
         tenant_id,
@@ -173,24 +155,16 @@ async fn resolve_merge_arms(
             returning: None,
             resolved_inserts: None,
             source_rows: Some(source_rows),
-            // Read-only classification pass: it emits no rows to the client and
-            // writes nothing, so neither policy has anything to gate here. The
-            // caller decides the resolved arms against the statement's write
-            // predicate before any of them becomes a point op.
+            // Read-only classification pass: writes nothing, so no gate applies.
             rls_filters: Vec::new(),
-            // The statement's injected write predicate, carried unchanged. The
-            // wrapper is read-only, so no gate reads it here.
+            // The statement's injected write predicate, unread here.
             rls_write_check: rls_write_check.clone(),
-            // The RESOLVE pass writes nothing, so it folds no materialized-sum
-            // delta. The point ops this expansion emits carry their own
-            // resolution.
+            // Writes nothing, so folds no sum delta; the emitted point ops
+            // carry their own resolution.
             resolved_sum_targets: Vec::new(),
         })));
-    // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
-    // transaction's id lets `collect_target_docs` fold rows this transaction
-    // staged earlier, so a MERGE matches (and reuses the surrogate of) a row a
-    // prior statement inserted, instead of resolving against base and inserting
-    // a duplicate.
+    // Passing `txn_id` lets the RESOLVE pass fold TARGET's staging overlay,
+    // so a MERGE reuses a prior statement's row instead of duplicating it.
     let resolve_resp = dispatch_local(
         state,
         tenant_id,
@@ -211,10 +185,9 @@ async fn resolve_merge_arms(
     decode_resolve(&resolve_resp.payload)
 }
 
-/// Rewrite the three resolved arms into concrete point-write tasks appended to
-/// `out`. An UPDATE/DELETE arm with no registered surrogate is a hard error: a
-/// non-surrogate-keyed target row is unreachable for any surrogate-keyed
-/// collection, and emitting a degraded raw op would reproduce the indexing /
+/// Rewrite the three resolved arms into concrete point-write tasks appended
+/// to `out`. An UPDATE/DELETE arm with no registered surrogate is a hard
+/// error — emitting a degraded raw op would reproduce the indexing /
 /// durability defect this expansion fixes.
 fn emit_arms(
     state: &SharedState,
@@ -289,13 +262,9 @@ fn emit_arms(
                 pk_bytes,
                 returning: None,
                 rls_filters: Vec::new(),
-                // The arm's pre-image was already decided against the merge's
-                // write predicate before this op was emitted, by the
-                // `admit_compiled_write_image` pass above. This op removes
-                // that same row, so re-checking it would re-run the same test
-                // against the same image. The identity that decided it is live
-                // and known here, which is what separates this from a
-                // follower or replay path.
+                // Already decided against the merge's write predicate by
+                // `admit_compiled_write_image` above; this op removes that
+                // same row, so re-checking would re-run the same test.
                 rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
                 resolved_sum_targets: Vec::new(),
             }),

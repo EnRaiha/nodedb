@@ -2,28 +2,11 @@
 
 //! Durable re-issue of restored CRDT tenant state.
 //!
-//! The snapshot-install path lands CRDT state via a per-node DIRECT dispatch:
-//! `RestoreTenantSnapshot` → `restore_crdt_state` → `import_snapshot_bytes`.
-//! That dispatch is race-prone — on a freshly spawned cluster, if a data
-//! group has not yet elected a leader at restore time, that group's nodes are
-//! skipped and a later read returns `NotFound` — and it is not durable across
-//! restart (no WAL record, no Raft entry).
-//!
-//! RESTORE instead re-issues each collection's Loro snapshot durably through
-//! Raft, branching on cluster vs single-node exactly like the columnar /
-//! timeseries reissue:
-//!
-//! - Cluster (`async_raft_proposer` present): build a `ReplicatedEntry` via
-//!   `to_replicated_entry` (which maps `CrdtOp::ImportSnapshot` →
-//!   `ReplicatedWrite::CrdtImportCollection`) and propose it through Raft. Every
-//!   replica of the data group applies `import_snapshot_bytes`, a monotonic,
-//!   idempotent, commutative Loro merge that converges deterministically.
-//! - Single-node: WAL-append the plan (durable for restart replay), then
-//!   dispatch it into the Data Plane so it is installed live.
-//!
-//! Each collection owns its own Loro doc, so routing is exact: a snapshot for
-//! `(tenant, collection)` is issued to the single data group that owns that
-//! collection's vshard — no multi-group fan-out or representative selection.
+//! Direct-dispatch snapshot install (`RestoreTenantSnapshot` →
+//! `import_snapshot_bytes`) is race-prone on a freshly spawned cluster (a
+//! leaderless group is skipped) and not durable across restart. RESTORE
+//! instead re-issues each collection's Loro snapshot through Raft (cluster)
+//! or WAL + live dispatch (single-node), routed to the vshard that owns it.
 
 use std::time::Duration;
 

@@ -2,15 +2,8 @@
 
 //! Entry point: decode a committed `ReplicatedEntry` into a `PhysicalPlan`.
 //!
-//! `to_physical_plan` is a thin top-level dispatcher: it groups the
-//! `ReplicatedWrite` variants by the `PhysicalPlan` family they produce and
-//! delegates each group to a per-engine `decode_arm` (mirroring how `encode/`
-//! splits its per-engine classification into `entry_*` siblings). The
-//! top-level match is exhaustive over every `ReplicatedWrite` variant — a new
-//! variant is a compile error here, never a silent omission.
-//!
-//! The shared `DecodeCtx` + surrogate-binding helpers used across the
-//! per-engine decode submodules live in [`super::ctx`].
+//! `to_physical_plan` groups variants by `PhysicalPlan` family and delegates to
+//! a per-engine `decode_arm`, exhaustively. Shared helpers live in [`super::ctx`].
 
 use super::super::types::{ReplicatedEntry, ReplicatedWrite};
 use super::ctx::DecodeCtx;
@@ -22,29 +15,13 @@ use crate::control::surrogate::SurrogateAssigner;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 /// Decoded `(tenant, vshard, plan, resolved_now_ms)` for a committed entry.
-///
-/// `resolved_now_ms` is the wall-clock instant the proposing node resolved
-/// for a TTL-bearing KV write (see `ReplicatedWrite::KvPut::resolved_now_ms`),
-/// `None` for every non-TTL write and for writes with no TTL. The caller
-/// stamps it onto the dispatched `Request::resolved_now_ms` so every replica
-/// installs the identical `expire_at_ms` instead of reading its own wall
-/// clock at apply time.
+/// `resolved_now_ms` is `None` except for a TTL-bearing KV write, where it's
+/// stamped onto the request so every replica installs the same `expire_at_ms`.
 pub type DecodedEntry = (TenantId, VShardId, PhysicalPlan, Option<u64>);
 
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
-///
-/// `assigner`, when `Some`, drives follower-local surrogate binding. Every
-/// write family (documents, KV, vector, graph edges, CRDT apply / list ops)
-/// carries the leader-assigned surrogate verbatim on the wire and calls
-/// `assigner.bind(...)` / `bind_or_lookup(...)` to install that exact
-/// identity in the local catalog (+ `SurrogateBind` WAL record) — they never
-/// re-allocate, so the same key resolves to the same surrogate on every
-/// node. The lone exception is a CRDT apply entry written before it carried
-/// a surrogate (pre-migration wire format, `surrogate == 0`): that legacy
-/// case falls back to per-node `assign` with a loud warning — see
-/// `decode/crdt.rs::resolve_apply_surrogate`. When `None`, surrogate fields
-/// fall back to the carried value / `Surrogate::ZERO` without catalog writes
-/// (used by tests that exercise the decoder without `SharedState`).
+/// `assigner`, when `Some`, installs the leader-assigned surrogate, never
+/// re-allocating — except a pre-migration CRDT entry, see `decode/crdt.rs`.
 pub fn from_replicated_entry(
     data: &[u8],
     assigner: Option<&SurrogateAssigner>,
@@ -53,9 +30,7 @@ pub fn from_replicated_entry(
         Some(e) => e,
         None => return Ok(None),
     };
-    // Array CRDT variants are handled by the distributed applier before this
-    // function is called. Return None so the applier skips the generic dispatch
-    // path for them.
+    // Array CRDT variants are handled by the distributed applier before this call.
     match &entry.write {
         ReplicatedWrite::ArrayOp { .. } | ReplicatedWrite::ArraySchema { .. } => {
             return Ok(None);
@@ -63,8 +38,7 @@ pub fn from_replicated_entry(
         _ => {}
     }
     let tenant_id = TenantId::new(entry.tenant_id);
-    // `0` decodes to `DatabaseId::DEFAULT` — the same convention used for
-    // entries that pre-date the field (see `LegacyReplicatedEntry`).
+    // `0` decodes to `DatabaseId::DEFAULT` (see `LegacyReplicatedEntry`).
     let database_id = DatabaseId::new(entry.database_id);
     let ctx = DecodeCtx {
         assigner,
@@ -80,10 +54,8 @@ pub fn from_replicated_entry(
     )))
 }
 
-/// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane
-/// execution, alongside the TTL-bearing KV writes' `resolved_now_ms` (see
-/// [`DecodedEntry`]). `resolved_now_ms` stays `None` for every group except
-/// the KV group, whose TTL-bearing arms stamp it from the wire field.
+/// Convert a ReplicatedWrite back into a PhysicalPlan, alongside `resolved_now_ms`
+/// (see [`DecodedEntry`]) — `None` except for the KV group's TTL-bearing arms.
 fn to_physical_plan(
     write: &ReplicatedWrite,
     ctx: &DecodeCtx,
@@ -103,9 +75,7 @@ fn to_physical_plan(
         | ReplicatedWrite::DocumentResolvedWrite { .. } => {
             Ok((entry_document::decode_arm(ctx, write)?, None))
         }
-        // The full `Vector*` variant family (original four write shapes plus
-        // the sparse / multi-vector / direct-upsert / delete-by-surrogate
-        // additions) is dispatched to a single helper — see
+        // The full `Vector*` variant family dispatches to one helper — see
         // `vector::decode_arm`'s doc.
         ReplicatedWrite::VectorInsert { .. }
         | ReplicatedWrite::VectorBatchInsert { .. }
@@ -140,8 +110,7 @@ fn to_physical_plan(
         | ReplicatedWrite::EdgeDeleteBatch { .. } => {
             Ok((entry_graph::decode_arm(ctx, write)?, None))
         }
-        // KV family (`PhysicalPlan::Kv`) — the only group that carries
-        // `resolved_now_ms` (TTL-bearing arms stamp it from the wire field).
+        // KV family — the only group carrying `resolved_now_ms`.
         ReplicatedWrite::KvTruncate { .. }
         | ReplicatedWrite::KvPut { .. }
         | ReplicatedWrite::KvDelete { .. }
@@ -165,8 +134,7 @@ fn to_physical_plan(
         | ReplicatedWrite::KvResolvedWrite { .. }
         | ReplicatedWrite::KvPredicateUpdate { .. }
         | ReplicatedWrite::KvPredicateDelete { .. } => entry_kv::decode_arm(ctx, write),
-        // Columnar-storage family + overlay sync engines
-        // (`PhysicalPlan::Columnar` / `Timeseries` / `Text` / `Spatial`).
+        // Columnar-storage family + overlay sync engines.
         ReplicatedWrite::ColumnarIngest { .. }
         | ReplicatedWrite::TimeseriesIngest { .. }
         | ReplicatedWrite::FtsIndex { .. }
@@ -177,18 +145,12 @@ fn to_physical_plan(
         | ReplicatedWrite::ColumnarBulkDmlResolved { .. } => {
             Ok((entry_columnar_family::decode_arm(write)?, None))
         }
-        // Raft-native array cell writes (`PhysicalPlan::Array`) — the cluster
-        // SQL DML array path. Distinct from the Lite-sync `ArrayOp` CRDT variant
-        // below, which is intercepted by the distributed applier and never
-        // reaches this dispatcher. The applier routes the plan these produce
-        // through the array-open bootstrap rather than the plain dispatch path.
+        // Raft-native array cell writes — the cluster SQL DML array path.
+        // Distinct from the Lite-sync `ArrayOp` CRDT variant, intercepted below.
         ReplicatedWrite::ArrayCellPut { .. } | ReplicatedWrite::ArrayCellDelete { .. } => {
             Ok((entry_array::decode_arm(ctx, write)?, None))
         }
-        // The following variants are intercepted upstream (Array CRDT ops by
-        // `from_replicated_entry`, CalvinReadResult by the apply loop) and never
-        // dispatched through the generic Data Plane path. These arms exist only
-        // to keep the match exhaustive.
+        // Intercepted upstream, never dispatched here; these arms exist only for exhaustiveness.
         ReplicatedWrite::ArrayOp { .. } => Err(crate::Error::Internal {
             detail: "ArrayOp reached to_physical_plan (should have been intercepted)".into(),
         }),

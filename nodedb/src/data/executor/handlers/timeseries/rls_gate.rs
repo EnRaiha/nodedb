@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Row-level-security WRITE enforcement for timeseries ingest.
-//!
-//! A timeseries row only exists once the line-protocol parser has produced it,
-//! so the Control Plane ships the compiled predicate on the plan and the rows
-//! are decided here. Every ingest format — line protocol from the raw listener,
-//! its canonical MessagePack form, JSON rows — normalizes into parsed ILP lines
-//! before anything is appended, so deciding them here covers all of them.
-//!
-//! The whole batch is decided before the first row is appended: a rejection
-//! fails the statement with nothing written, rather than leaving the lines
-//! ahead of the offending one durable.
+//! Row-level-security WRITE enforcement for timeseries ingest. A row only
+//! exists once the line-protocol parser produces it, so the Control Plane
+//! ships the compiled predicate and rows are decided here — every ingest
+//! format normalizes into parsed ILP lines first, so this covers all of
+//! them. The whole batch is decided before the first row is appended.
 
 use std::collections::HashMap;
 
@@ -24,13 +18,9 @@ use crate::engine::timeseries::ilp::{self, FieldValue, IlpLine};
 /// stored time column is milliseconds.
 const NANOS_PER_MILLI: i64 = 1_000_000;
 
-/// Decide every parsed line against the compiled write policy.
-///
-/// `time_key` is the collection's declared `TIME_KEY`, absent only for a
-/// measurement with no DDL behind it (raw protocol ingest into a collection
-/// that was never created), where no column name can be bound to the line's
-/// timestamp. Empty `rls_write_check` admits everything, the same convention
-/// every other write gate uses.
+/// Decide every parsed line against the compiled write policy. `time_key` is
+/// `None` only for a measurement with no DDL, where no column can be bound
+/// to the timestamp. Empty `rls_write_check` admits everything.
 pub(in crate::data::executor) fn admit_ilp_lines(
     rls_write_check: &RlsWriteCheck,
     lines: &[IlpLine<'_>],
@@ -49,19 +39,10 @@ pub(in crate::data::executor) fn admit_ilp_lines(
     Ok(())
 }
 
-/// Decide a structured MessagePack row batch against the compiled write policy.
-///
-/// The rows are normalized into line protocol first, exactly as the ingest
-/// handler normalizes them, so the policy sees the values that will be STORED
-/// rather than the values that were submitted: a numeric-looking string is
-/// stored as a number, and the time column is stored in milliseconds under the
-/// collection's declared `TIME_KEY`. Deciding the submitted values instead
-/// would refuse a conforming row whenever a predicate names a column whose
-/// type normalization rewrites.
-///
-/// A payload that does not decode, or that produces no line protocol at all, is
-/// refused rather than admitted — an image the policy could not be evaluated
-/// against is not an image the policy admitted.
+/// Decide a structured MessagePack row batch against the compiled write
+/// policy, normalized into line protocol first — same as the ingest handler
+/// — so the policy sees STORED values, not submitted ones. A payload that
+/// fails to decode or normalize is refused rather than admitted.
 pub(in crate::data::executor) fn admit_msgpack_rows(
     rls_write_check: &RlsWriteCheck,
     payload: &[u8],
@@ -94,13 +75,9 @@ pub(in crate::data::executor) fn admit_msgpack_rows(
     )
 }
 
-/// Build the row image a line will be stored as: its tags, its fields, and its
-/// timestamp bound to the declared time column.
-///
-/// The timestamp is written last and unconditionally, because the ingest path
-/// gives the designated time column the line's own timestamp regardless of any
-/// field that happens to share its name — the image the policy decides has to
-/// be the row that will exist, not the row as submitted.
+/// Build the row image a line will be stored as: tags, fields, and timestamp
+/// bound to the declared time column. The timestamp overwrites any field of
+/// the same name unconditionally, matching what the ingest path stores.
 fn line_image(line: &IlpLine<'_>, time_key: Option<&str>, default_timestamp_ms: i64) -> Value {
     let mut map: HashMap<String, Value> =
         HashMap::with_capacity(line.tags.len() + line.fields.len() + 1);
@@ -120,10 +97,8 @@ fn line_image(line: &IlpLine<'_>, time_key: Option<&str>, default_timestamp_ms: 
     Value::Object(map)
 }
 
-/// An unsigned field beyond `i64::MAX` has no integer representation the value
-/// model can hold, so it widens to a float rather than wrapping negative — a
-/// wrapped value would be compared against a policy bound as a different number
-/// entirely.
+/// An unsigned field beyond `i64::MAX` widens to a float rather than
+/// wrapping negative, which would compare against the policy bound wrong.
 fn field_value(value: &FieldValue<'_>) -> Value {
     match value {
         FieldValue::Float(f) => Value::Float(*f),
@@ -260,12 +235,9 @@ mod tests {
         ));
     }
 
-    /// A structured MessagePack batch is decided against the values the ingest
-    /// will STORE, not the values submitted. The SQL parser hands a decimal
-    /// literal over as a string, and normalization turns it back into a number
-    /// before storage — so a policy predicating on that column must be
-    /// evaluated after the conversion. Decided on the submitted string, this
-    /// conforming row is refused.
+    /// Decided against STORED values, not submitted ones — the SQL parser
+    /// hands a decimal literal over as a string, normalized to a number
+    /// before storage, so the policy must evaluate after conversion.
     #[test]
     fn a_msgpack_row_is_decided_on_its_normalized_values() {
         let filter = ScanFilter {

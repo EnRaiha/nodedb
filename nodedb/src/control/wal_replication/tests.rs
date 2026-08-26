@@ -221,9 +221,8 @@ fn propose_tracker_register_and_complete() {
     let tracker = ProposeTracker::new();
     let mut rx = tracker.register(1, 5, 0xdead_beef);
 
-    // The apply side stamps the written collection's post-write `coll_write_lsn`
-    // alongside the payload; the waiter must receive BOTH — it is the proposer's
-    // only channel for a version minted on the apply path.
+    // Waiter must receive both payload and coll_write_lsn — its only channel
+    // for a version minted on the apply path.
     assert!(tracker.complete(
         1,
         5,
@@ -250,10 +249,8 @@ fn propose_tracker_key_mismatch_surfaces_retryable_leader_change() {
     let tracker = ProposeTracker::new();
     let mut rx = tracker.register(1, 5, 0xaaaa);
 
-    // A different proposer's entry (different idempotency_key)
-    // committed at the same (group_id, log_index). The waiter must
-    // see RetryableLeaderChange, not the success result that belongs
-    // to a different proposal.
+    // A different proposer's entry committed at the same (group_id,
+    // log_index); waiter must see RetryableLeaderChange, not its result.
     assert!(tracker.complete(
         1,
         5,
@@ -278,12 +275,8 @@ fn propose_tracker_key_mismatch_surfaces_retryable_leader_change() {
 
 #[test]
 fn propose_tracker_zero_applied_key_passes_through_explicit_error() {
-    // Empty raft entries (leader-change no-ops) carry no idempotency
-    // key. The applier passes `applied_key = 0` together with an
-    // explicit `RetryableLeaderChange` result; the tracker must
-    // forward that result rather than treating the zero key as a
-    // mismatch (which would produce the same error but mask the
-    // distinction in logs).
+    // applied_key = 0 (leader-change no-op) must forward the explicit
+    // RetryableLeaderChange, not be treated as a key mismatch.
     let tracker = ProposeTracker::new();
     let mut rx = tracker.register(1, 5, 0xaaaa);
     assert!(tracker.complete(
@@ -339,14 +332,9 @@ fn to_replicated_entry_writes_only() {
     );
 }
 
-/// The materialized-sum resolution survives the wire, on the insert shape and
-/// on the predicate shape.
-///
-/// A replica re-executes the write and folds its own delta, so the join-key →
-/// target-surrogate table and the deferral list have to arrive with it. Losing
-/// either is invisible until a balance is read: an empty resolution makes the
-/// fold fail on a write the leader accepted, and a lost deferral makes the
-/// replica fold a delta its sibling `ApplyBalanceDelta` entry also applies.
+/// The materialized-sum resolution survives the wire on the insert and
+/// predicate shapes. A lost resolution fails the fold silently; a lost
+/// deferral double-counts against the sibling `ApplyBalanceDelta` entry.
 #[test]
 fn materialized_sum_resolution_roundtrips() {
     let tenant = TenantId::new(1);
@@ -363,9 +351,7 @@ fn materialized_sum_resolution_roundtrips() {
         resolved_sum_targets: vec![
             ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
             ResolvedSumTarget::new("accounts", "acc-2", Surrogate::new(4243)),
-            // A SECOND binding of the same source, reading the same join column
-            // into a different target. Keyed on the join value alone this entry
-            // could not travel at all — its value is already spoken for.
+            // A second binding on the same join column, different target.
             ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
         ],
         deferred_sum_targets: vec!["accounts_elsewhere".to_string()],
@@ -441,13 +427,9 @@ fn materialized_sum_resolution_roundtrips() {
     }
 }
 
-/// A record committed BEFORE the target collection travelled on the wire still
-/// decodes, and its entries still resolve.
-///
-/// Every node replays its own committed Raft log across an upgrade, so refusing
-/// such a record would refuse to start. The superseded slot names no target, so
-/// its entries are lifted UNTARGETED and match any binding by join value alone —
-/// which is exactly what that record meant when the proposing node wrote it.
+/// A record committed before the target collection travelled on the wire
+/// still decodes: the superseded slot's entries are lifted untargeted and
+/// match any binding by join value alone.
 #[test]
 fn a_record_without_target_collections_decodes_as_untargeted() {
     let entry = ReplicatedEntry::new(
@@ -486,13 +468,9 @@ fn a_record_without_target_collections_decodes_as_untargeted() {
     }
 }
 
-/// A record a current node writes carries the resolution in BOTH slots, and the
-/// newer one is what a current node reads.
-///
-/// The older slot stays populated so a peer running an older binary parses the
-/// record and behaves exactly as it does today, rather than seeing an empty
-/// resolution and dropping every balance. It is derived from the newer slot, so
-/// the two cannot disagree.
+/// A current-node record carries the resolution in both slots; the newer one
+/// is authoritative. The older slot stays populated so an older-binary peer
+/// keeps working instead of seeing an empty resolution.
 #[test]
 fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
@@ -685,8 +663,7 @@ fn crdt_apply_legacy_and_fenced_wire_compatibility() {
         other => panic!("expected CrdtApply, got {other:?}"),
     }
 
-    // Construct the legacy enum shape directly. Its positional bytes must
-    // still decode through the full replicated-entry path with no fence.
+    // Legacy positional bytes must still decode with no fence.
     let legacy = ReplicatedEntry::new(
         tenant.as_u64(),
         DatabaseId::DEFAULT.as_u64(),
@@ -698,8 +675,7 @@ fn crdt_apply_legacy_and_fenced_wire_compatibility() {
             peer_id: 8,
             provenance: None,
             constraint_version_required: 0,
-            // Pre-migration wire shape: no surrogate was ever assigned on
-            // this record.
+            // Pre-migration shape: no surrogate ever assigned.
             surrogate: 0,
         },
     );
@@ -787,9 +763,7 @@ fn doc_batch_insert_roundtrip() {
         .expect("encode must not error")
         .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    // Decode with no assigner: carried surrogates fall through verbatim, so we
-    // can assert every (doc_id, body) pair and every surrogate round-trips
-    // exactly — none dropped or reordered.
+    // No assigner: carried surrogates fall through verbatim.
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
@@ -868,13 +842,8 @@ fn kv_truncate_roundtrip() {
     }
 }
 
-/// `KvOp::RegisterIndex` (KV secondary-index DDL) must produce a
-/// `ReplicatedEntry` and round-trip verbatim. Regression guard: this op was
-/// previously classified as a non-replicated write (`kv_write` returned
-/// `None`), so `CREATE INDEX` on a KV collection committed only on the leader
-/// and never reached followers — replica divergence. Every field, especially
-/// `backfill` and `field_position` (neither inferable at apply time), must
-/// survive the wire.
+/// `KvOp::RegisterIndex` must produce a `ReplicatedEntry` and round-trip
+/// verbatim — `backfill` and `field_position` aren't inferable at apply time.
 #[test]
 fn kv_register_index_roundtrip() {
     let tenant = TenantId::new(1);
@@ -913,7 +882,7 @@ fn kv_register_index_roundtrip() {
         other => panic!("expected Kv(RegisterIndex), got {other:?}"),
     }
 
-    // The `backfill = false` shape must survive distinctly, not default to true.
+    // backfill = false must survive distinctly, not default to true.
     let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
         collection: "players".into(),
         field: "name".into(),
@@ -999,10 +968,8 @@ fn crdt_list_delete_roundtrip() {
     }
 }
 
-/// Also proves the fix motivating `CrdtListOpWalRecord`'s design: `from_index`
-/// and `to_index` are two distinct required wire fields, not one `Option<u64>`
-/// slot each — they round-trip distinctly and never collapse to the same
-/// value or to zero.
+/// `from_index` and `to_index` are two distinct required wire fields, not
+/// one `Option<u64>` slot each — they must never collapse to the same value.
 #[test]
 fn crdt_list_move_roundtrip_distinct_indices() {
     let tenant = TenantId::new(1);
@@ -1157,9 +1124,8 @@ fn timeseries_ingest_provenance_roundtrip() {
     }
 }
 
-/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
-/// hardcode `on_conflict_updates: Vec::new()` on decode: an `ON CONFLICT DO
-/// UPDATE` replicated to followers as a plain overwrite, a lost update.
+/// Decode must not hardcode `on_conflict_updates: Vec::new()` — that turns
+/// `ON CONFLICT DO UPDATE` into a plain overwrite on followers.
 #[test]
 fn columnar_ingest_on_conflict_updates_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
@@ -1203,9 +1169,8 @@ fn columnar_ingest_on_conflict_updates_roundtrip() {
     }
 }
 
-/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
-/// hardcode `intent: ColumnarInsertIntent::Insert`: an `ON CONFLICT DO
-/// NOTHING` insert silently became a plain insert on replication.
+/// Decode must not hardcode `intent: ColumnarInsertIntent::Insert` — that
+/// silently drops `ON CONFLICT DO NOTHING` on replication.
 #[test]
 fn columnar_ingest_intent_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
@@ -1246,9 +1211,8 @@ fn columnar_ingest_intent_roundtrip() {
     }
 }
 
-/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
-/// hardcode `format: "msgpack".to_owned()`: a native-protocol JSON payload
-/// was mis-tagged and misparsed on replication.
+/// Decode must not hardcode `format: "msgpack"` — that mis-tags a
+/// native-protocol JSON payload on replication.
 #[test]
 fn columnar_ingest_json_format_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
@@ -1288,9 +1252,8 @@ fn columnar_ingest_json_format_roundtrip() {
     }
 }
 
-/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
-/// hardcode `returning: None`: a `RETURNING` insert silently yielded no rows
-/// once the write was replicated.
+/// Decode must not hardcode `returning: None` — that silently drops
+/// `RETURNING` rows once the write is replicated.
 #[test]
 fn columnar_ingest_returning_roundtrip() {
     let spec = ReturningSpec {
@@ -1337,10 +1300,8 @@ fn columnar_ingest_returning_roundtrip() {
     }
 }
 
-/// Pins the bug at `decode_sync_engines::columnar_ingest`, which used to
-/// hardcode `rls_filters: Vec::new()`: once `returning` is fixed, an
-/// unreplicated read policy would let a `RETURNING` row set exceed what a
-/// `SELECT` by the same principal may see.
+/// Decode must not hardcode `rls_filters: Vec::new()` — an unreplicated read
+/// policy lets a `RETURNING` row set exceed what a `SELECT` may see.
 #[test]
 fn columnar_ingest_rls_filters_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
@@ -1432,12 +1393,9 @@ fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
     }
 }
 
-/// Pins the class of bug fixed for the document engine in
-/// `entry_document.rs` / `decode/document.rs`: encode bound `returning` /
-/// `rls_filters` to `_` on every document write, and decode hardcoded
-/// `returning: None`, `rls_filters: Vec::new()`. Because the LEADER re-derives
-/// its own executed plan from the committed Raft entry, this silently dropped
-/// `RETURNING` for the ORIGINATING request, not just for followers.
+/// Encode must not drop `returning` / `rls_filters` on a document write —
+/// the leader re-derives its own plan from the committed entry, so this
+/// would drop `RETURNING` for the originating request too.
 #[test]
 fn document_point_put_returning_and_rls_filters_roundtrip() {
     let spec = ReturningSpec {
@@ -2068,14 +2026,9 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
     }
 }
 
-// ---- Regression coverage for the six `VectorOp` writes that used to hit
-// `to_replicated_entry`'s `_ => return None` catch-all and were therefore
-// NEVER proposed to Raft in a cluster (autocommit, not just in-transaction —
-// see `encode/vector.rs::encode` and `decode/vector.rs::decode_arm`). Each
-// test drives the real production `to_replicated_entry` /
-// `from_replicated_entry` functions end to end (never a hand-rolled
-// encoding) and asserts the reconstructed plan equals the original,
-// including the exact surrogate value carried verbatim.
+// ---- Regression coverage: six `VectorOp` writes must not fall through
+// `to_replicated_entry`'s `_ => return None` catch-all, or they never
+// reach Raft. Each test runs the real encode/decode path end to end.
 
 #[test]
 fn vector_extended_variants_all_encode_to_some() {
@@ -2126,8 +2079,7 @@ fn vector_extended_variants_all_encode_to_some() {
         }),
     ];
     for plan in &plans {
-        // On the pre-fix code this is `None` for all six — that regression
-        // is exactly what this assertion catches.
+        // Must not be `None` for any of the six.
         assert!(
             to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan)
                 .expect("encode must not error")
@@ -2360,11 +2312,8 @@ fn direct_upsert_roundtrip() {
 
 #[test]
 fn pre_database_id_entry_decodes_to_default_database() {
-    // Simulates a Raft log entry proposed by a not-yet-upgraded leader: the
-    // pre-`database_id` 4-field shape. `ReplicatedEntry::from_bytes` must
-    // recognize the resulting `ArrayLengthMismatch` and fall back to
-    // `LegacyReplicatedEntry`, defaulting `database_id` to `0`
-    // (`DatabaseId::DEFAULT`), rather than failing to decode.
+    // Pre-database_id 4-field shape must fall back to `LegacyReplicatedEntry`
+    // (database_id defaults to 0), not fail to decode.
     let legacy = super::legacy_entry::LegacyReplicatedEntry {
         tenant_id: 1,
         vshard_id: 0,
@@ -2402,14 +2351,9 @@ fn pre_database_id_entry_decodes_to_default_database() {
     }
 }
 
-// ---- Pinned replication gaps: writes that `to_replicated_entry` classifies
-// as `None` today because they have no `ReplicatedWrite` shape yet. The data
-// still lands via the leader's own redb/WAL; only cross-node Raft replication
-// of these ops is missing. Each assertion is a tripwire: it fails loudly if
-// someone wires one of these, forcing them to update the tracking (and move
-// the variant out of this list). The exhaustive `#![deny(wildcard...)]` match
-// in `encode/entry*.rs` guarantees a NEW write variant cannot slip through as
-// a silent `None` — these tests pin the KNOWN gaps that are `None` on purpose.
+// ---- Pinned replication gaps: writes with no `ReplicatedWrite` shape yet,
+// so `to_replicated_entry` returns `None` on purpose. Each assertion is a
+// tripwire — wiring one of these must fail loudly and update this list.
 
 #[test]
 fn known_write_gaps_are_not_replicated() {
@@ -2539,8 +2483,7 @@ fn representative_handled_writes_still_replicate() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
 
-    // A live document write and a live KV write must still return `Some` — a
-    // guard that the exhaustive-match refactor did not drop a handled arm.
+    // Guard: a live document/KV write must still return `Some`.
     let point_put = PhysicalPlan::Document(DocumentOp::PointPut {
         collection: "docs".into(),
         document_id: "d1".into(),
@@ -2575,11 +2518,9 @@ fn representative_handled_writes_still_replicate() {
     );
 }
 
-/// Pins the bug: `entry_kv::kv_write` used to drop `KvOp::Put::returning` /
-/// `rls_filters` via a bare `..`, and decode hardcoded `None` /
-/// `Vec::new()` — a `RETURNING` write replicated via Raft silently produced
-/// no rows, for the originating request too, since the leader re-derives
-/// its own executed plan from the committed entry.
+/// `entry_kv::kv_write` must not drop `KvOp::Put::returning` / `rls_filters`
+/// — the leader re-derives its plan from the committed entry, so a drop here
+/// loses `RETURNING` for the originating request too, not just followers.
 #[test]
 fn kv_put_returning_and_rls_filters_roundtrip() {
     use nodedb_physical::physical_plan::KvOp;
@@ -2679,11 +2620,8 @@ fn kv_insert_on_conflict_update_returning_and_rls_filters_roundtrip() {
     }
 }
 
-/// Pins the bug: `entry_vector::encode` used to drop
-/// `VectorOp::DirectUpsert::returning` / `rls_filters` via named
-/// `returning: _` / `rls_filters: _`, and decode hardcoded `None` /
-/// `Vec::new()` — a `RETURNING` vector-primary upsert replicated via Raft
-/// silently produced no rows.
+/// `entry_vector::encode` must not drop `VectorOp::DirectUpsert::returning` /
+/// `rls_filters` — a dropped field silently yields no rows on replication.
 #[test]
 fn vector_direct_upsert_returning_and_rls_filters_roundtrip() {
     let tenant = TenantId::new(1);
@@ -2731,11 +2669,8 @@ fn vector_direct_upsert_returning_and_rls_filters_roundtrip() {
     }
 }
 
-/// Pins the bug: `entry_crdt::encode` used to drop
-/// `CrdtOp::DocUpsert::returning` / `rls_filters` via named `returning: _`
-/// / `rls_filters: _`, and decode hardcoded `None` / `Vec::new()` — a
-/// `RETURNING` CRDT document upsert replicated via Raft silently produced
-/// no rows.
+/// `entry_crdt::encode` must not drop `CrdtOp::DocUpsert::returning` /
+/// `rls_filters` — a dropped field silently yields no rows on replication.
 #[test]
 fn crdt_doc_upsert_returning_and_rls_filters_roundtrip() {
     let tenant = TenantId::new(1);
@@ -2780,10 +2715,8 @@ fn crdt_doc_upsert_returning_and_rls_filters_roundtrip() {
     }
 }
 
-/// Build a real (non-`Noop`) `SurrogateAssigner` over a temp `redb` catalog,
-/// mirroring `surrogate::assign::core::assign_ops::tests::open_test`. Needed
-/// here (rather than `assigner: None`) to prove decode BINDS the carried
-/// surrogate into the catalog instead of allocating a fresh one.
+/// Real (non-`Noop`) `SurrogateAssigner` over a temp `redb` catalog — needed
+/// to prove decode binds the carried surrogate instead of allocating fresh.
 fn open_test_assigner() -> (
     tempfile::TempDir,
     crate::control::surrogate::SurrogateAssigner,
@@ -2804,21 +2737,17 @@ fn open_test_assigner() -> (
     (dir, assigner)
 }
 
-/// `CrdtOp::Apply` carries the leader-assigned surrogate on the wire and
-/// decode BINDS it (first-wins) rather than re-deriving via this node's own
-/// allocator. Advance the local allocator past the carried value first, so
-/// a divergent-by-construction fresh `assign()` (which would return the
-/// NEXT local value) is distinguishable from a correct bind (which installs
-/// the carried value verbatim).
+/// `CrdtOp::Apply` decode binds the carried surrogate (first-wins), never
+/// re-derives via the local allocator. Advances the local allocator past
+/// the carried value first, so a divergent fresh `assign()` is distinguishable.
 #[test]
 fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let (_dir, assigner) = open_test_assigner();
 
-    // Burn this node's next few local allocations on unrelated keys so a
-    // fresh `assign()` for "doc-1" would return something other than the
-    // leader-carried value below.
+    // Burn local allocations on unrelated keys so a fresh assign() for
+    // "doc-1" would diverge from the leader-carried value below.
     for i in 0..5 {
         assigner
             .assign(
@@ -2860,9 +2789,8 @@ fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
         other => panic!("expected Crdt(Apply), got {other:?}"),
     }
 
-    // The bind must be durably installed: a second decode of the SAME
-    // entry (replay / retry) must return the identical value via the
-    // first-wins pre-check, never re-allocate or overwrite.
+    // A second decode of the same entry (replay/retry) must return the
+    // identical value, never re-allocate or overwrite.
     let (_, _, decoded_again, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
@@ -2885,11 +2813,9 @@ fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
     );
 }
 
-/// A `CrdtApply` entry written before the surrogate field existed
-/// (`surrogate: 0` on the wire, the `#[serde(default)]`) has no leader
-/// value to bind. Decode must still resolve a surrogate via this node's own
-/// allocator (the documented, loud, pre-migration-only fallback) rather
-/// than propagating `Surrogate::ZERO` into a fresh document row.
+/// A pre-migration `CrdtApply` entry (`surrogate: 0`) has no leader value to
+/// bind. Decode must resolve via the local allocator, never propagate
+/// `Surrogate::ZERO` into a fresh document row.
 #[test]
 fn crdt_apply_legacy_no_surrogate_falls_back_to_local_assign() {
     let tenant = TenantId::new(1);
@@ -2927,9 +2853,8 @@ fn crdt_apply_legacy_no_surrogate_falls_back_to_local_assign() {
 }
 
 /// `CrdtOp::ListInsert` / `ListDelete` / `ListMove` carry the parent
-/// document's surrogate on the wire and decode binds it via
-/// `bind_or_lookup` — same identity, no fresh allocation — even though the
-/// live dispatch handler does not yet consume the field.
+/// document's surrogate; decode binds it via `bind_or_lookup` — same
+/// identity, no fresh allocation.
 #[test]
 fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
     let tenant = TenantId::new(1);
@@ -2937,8 +2862,7 @@ fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
     let (_dir, assigner) = open_test_assigner();
 
     let parent_surrogate = Surrogate::new(4_242);
-    // Establish the parent document's binding first, exactly as `DocUpsert`
-    // would have when the document was created.
+    // Establish the parent document's binding first, as `DocUpsert` would.
     assigner
         .bind(
             DatabaseId::DEFAULT,

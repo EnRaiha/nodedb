@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Data Plane handler for `KvOp::ResolvedWrite`.
+//! Data Plane handler for `KvOp::ResolvedWrite`. Runs on every replica; the
+//! plan carries the decided verdict and mutations, nothing recomputed.
 //!
-//! Runs on every replica, leader included. The Control Plane already read the
-//! rows this write depends on, computed every post-image, and decided the
-//! write policy against them while the writing identity was live — so the plan
-//! carries the verdict (`RlsWriteCheck::DecidedEarlierInRequest`) and the
-//! mutations, not an operation to re-derive. Nothing is recomputed here.
-//!
-//! ## Drift check
-//!
-//! Between the resolve and this apply, the committed log may have advanced (a
-//! concurrent write on another connection, replicated ahead of this one).
-//! Every replica must reach the SAME verdict on a resolution that no longer
-//! matches state, or replicas diverge. So every mutation's `precondition` is
-//! checked BEFORE the first mutation runs; if any fails, nothing is mutated
-//! and the caller gets `ErrorCode::OllpRetryRequired` — the same retry
-//! contract the columnar resolved-row apply uses. The check runs
-//! unconditionally on every replica, each against its own committed log
-//! prefix, so leader and followers agree.
+//! Drift check: every mutation's `precondition` is checked before the first
+//! mutation runs, all-or-nothing; a failure returns `OllpRetryRequired` —
+//! same contract the columnar resolved-row apply uses.
 
 use nodedb_physical::physical_plan::KvResolvedMutation;
 use tracing::debug;
@@ -54,11 +41,8 @@ impl CoreLoop {
             if current.as_deref() != mutation.precondition() {
                 return self.response_error(task, ErrorCode::OllpRetryRequired);
             }
-            // A TTL mutation on a key that was absent at resolve time and is
-            // still absent has nothing to expire or persist — the same
-            // `NotFound` `execute_kv_expire` / `execute_kv_persist` return.
-            // Raised here, before any mutation, so the statement stays
-            // all-or-nothing.
+            // A still-absent key has nothing to expire/persist — same
+            // `NotFound` the live handlers return, raised before any mutation.
             if current.is_none()
                 && matches!(
                     mutation,
@@ -67,9 +51,7 @@ impl CoreLoop {
             {
                 return self.response_error(task, ErrorCode::NotFound);
             }
-            // The gate stays on every write path even though
-            // `DecidedEarlierInRequest` makes this a no-op — a single path
-            // that skips it entirely is a hole future callers can fall into.
+            // Gate stays on every write path even as a no-op here.
             if let KvResolvedMutation::Put {
                 collection,
                 key,
@@ -89,10 +71,8 @@ impl CoreLoop {
         self.response_with_payload(task, response_payload.to_vec())
     }
 
-    /// Apply one already-checked mutation and emit its change event.
-    ///
-    /// `old` on the event is the mutation's precondition — the exact image the
-    /// resolve read and the drift check just confirmed is still stored.
+    /// Apply one already-checked mutation and emit its change event. `old` on
+    /// the event is the precondition the drift check just confirmed.
     fn apply_kv_resolved_mutation(
         &mut self,
         task: &ExecutionTask,
@@ -163,9 +143,7 @@ impl CoreLoop {
                 );
                 self.note_kv_write_lsn(task, did, tid, collection, key);
             }
-            // A TTL mutation leaves the body untouched, so there is no new
-            // image to publish — the live `EXPIRE` / `PERSIST` handlers emit
-            // no change event either.
+            // No body change, so no event — matches the live handlers.
             KvResolvedMutation::Expire {
                 collection,
                 key,

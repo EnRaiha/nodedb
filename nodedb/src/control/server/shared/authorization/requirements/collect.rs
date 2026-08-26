@@ -6,12 +6,8 @@ use super::AuthorizationRequirement;
 use super::order::requirement_order;
 use super::query::collect_query_requirements;
 
-/// Return every authorization requirement for `plan`.
-///
-/// The general plan permission applies to ordinary single-resource plans. The
-/// multi-resource cases below intentionally override it so sources require
-/// `Read` while targets require `Write`. Nested query inputs are traversed
-/// iteratively in addition to their named collection fields.
+/// Return every authorization requirement for `plan`. General plan permission
+/// applies to single-resource plans; multi-resource sources require `Read`, targets `Write`.
 pub fn plan_requirements(plan: &PhysicalPlan) -> Vec<AuthorizationRequirement> {
     let mut requirements = Vec::new();
     collect_requirements(plan, &mut requirements);
@@ -151,8 +147,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                     add_collection_requirement(target_collection, Permission::Read, out);
                     add_collection_requirement(source_collection, Permission::Read, out);
                 }
-                // The five point/bulk writes read exactly one collection: the
-                // one they would write.
+                // Point/bulk writes read exactly the collection they'd write.
                 DocumentOp::PointUpdate { collection, .. }
                 | DocumentOp::PointDelete { collection, .. }
                 | DocumentOp::Upsert { collection, .. }
@@ -160,10 +155,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | DocumentOp::BulkDelete { collection, .. } => {
                     add_collection_requirement(collection, Permission::Read, out);
                 }
-                // No other op is ever wrapped. Adding nothing leaves the
-                // requirement set empty, which the tenant fallback below turns
-                // into a tenant-wide check — fail-closed, not a bypass.
-                // Enumerated so a newly wrapped op is a compile error here.
+                // No other op is ever wrapped; an empty set falls back to a tenant-wide
+                // check below — fail-closed, not a bypass. Enumerated so a new op is a compile error.
                 DocumentOp::PointGet { .. }
                 | DocumentOp::PointPut { .. }
                 | DocumentOp::PointInsert { .. }
@@ -183,8 +176,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | DocumentOp::ResolveWrite(_)
                 | DocumentOp::ResolvedWrite { .. } => {}
             },
-            // Per-mutation: the mutation list names every row this write
-            // touches, and `PhysicalPlan::collection` reports none of them.
+            // Per-mutation: `PhysicalPlan::collection` reports none of the rows touched.
             PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) => {
                 for mutation in mutations {
                     add_collection_requirement(mutation.collection(), Permission::Write, out);
@@ -196,9 +188,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                     add_collection_requirement(collection, Permission::Read, out);
                 }
             }
-            // Per-mutation: a resolved `TransferItem` writes into a different
-            // collection than it deletes from, and `KvOp::collection` reports
-            // neither.
+            // Per-mutation: a resolved `TransferItem` spans two collections,
+            // neither reported by `KvOp::collection`.
             PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => {
                 for mutation in mutations {
                     add_collection_requirement(mutation.collection(), Permission::Write, out);
@@ -234,8 +225,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | KvOp::SortedIndexCount { .. }
                 | KvOp::SortedIndexScore { .. }
                 | KvOp::MaterializeScan { .. }
-                // One collection each, named on the plan — the general
-                // extractor reads it off `KvOp::collection`.
+                // One collection each — the general extractor reads `KvOp::collection`.
                 | KvOp::PredicateUpdate { .. }
                 | KvOp::PredicateDelete { .. },
             ) => add_general_requirements(plan, out),
@@ -252,10 +242,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             | PhysicalPlan::ClusterEvent(_) => add_general_requirements(plan, out),
         }
 
-        // A wrapper delegates its resource boundary to its nested plans. Its
-        // own missing collection must not add a tenant-wide requirement when a
-        // descendant names the protected resource; a genuinely resource-less
-        // descendant still receives this fail-closed fallback when visited.
+        // A wrapper delegates its resource boundary to nested plans — its own missing
+        // collection must not add a tenant-wide requirement when a descendant names one.
         if out.len() == initial_len && requires_tenant_fallback(plan) {
             out.push(AuthorizationRequirement::tenant(required_permission(plan)));
         }
@@ -292,13 +280,8 @@ fn requires_tenant_fallback(plan: &PhysicalPlan) -> bool {
     }
 }
 
-/// Every collection a KV op names.
-///
-/// `TransferItem` names two and `ResolvedWrite` one per mutation; the rest
-/// defer to `KvOp::collection`, which is itself an exhaustive match and stays
-/// the single source of truth for that answer rather than being restated here.
-/// The remainder is enumerated rather than wildcarded so a new op cannot reach
-/// authorization without a decision being made here.
+/// Every collection a KV op names. `TransferItem` names two, `ResolvedWrite`
+/// one per mutation; enumerated, not wildcarded, so a new op forces a decision here.
 fn kv_op_collections(op: &nodedb_physical::physical_plan::KvOp) -> Vec<&str> {
     use nodedb_physical::physical_plan::KvOp;
     match op {

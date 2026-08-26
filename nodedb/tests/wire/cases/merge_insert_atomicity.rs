@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! All-or-nothing atomicity of a `MERGE` whose UPDATE and INSERT arms both fire.
-//!
-//! Autocommit `MERGE` is Control-Plane-orchestrated: the matched UPDATE and the
-//! NOT-MATCHED INSERT arms are applied under ONE redb write transaction, so a
-//! constraint violation on the insert must roll back the update too — nothing
-//! lands.
-//!
-//! The MERGE below UPDATEs an existing row (`a`.n → 100) AND INSERTs a new row
-//! (`c`) whose `code` collides with a pre-existing UNIQUE value (`b`.code =
-//! 'Y'). The insert's UNIQUE violation must abort the whole statement, leaving
-//! BOTH the update and the insert un-applied.
-//!
-//! Fails pre-fix (and against any naive split): the raw per-row insert path
-//! applied the matched UPDATE in its own commit before the insert ran, so
-//! `a`.n would already be 100 when the insert failed — the update would survive
-//! the abort.
+//! All-or-nothing atomicity of a `MERGE` whose UPDATE and INSERT arms both
+//! fire. Autocommit `MERGE` applies both arms under one redb write
+//! transaction, so a constraint violation on the insert must roll back the
+//! update too. The MERGE below updates `a`.n and inserts a row whose `code`
+//! collides with `b`.code — the UNIQUE violation must abort the whole
+//! statement.
 
 use crate::harness::TestServer;
 

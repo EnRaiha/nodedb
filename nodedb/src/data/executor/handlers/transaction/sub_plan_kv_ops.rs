@@ -10,13 +10,9 @@ use nodedb_physical::physical_plan::KvOp;
 use super::undo::UndoEntry;
 
 impl CoreLoop {
-    /// Execute a KV operation in a transaction context.
-    ///
-    /// Write operations (including TTL `Expire`/`Persist` and sorted-index
-    /// `RegisterSortedIndex`/`DropSortedIndex` DDL) capture prior state before
-    /// executing and push an `UndoEntry`. Read-only operations execute
-    /// without undo tracking. Secondary-index DDL and `Truncate` are
-    /// rejected — see the reject arm below for why.
+    /// Execute a KV operation in a transaction context. Write ops (including
+    /// TTL and sorted-index DDL) capture prior state and push an
+    /// `UndoEntry`; reads execute without undo tracking.
     pub(super) fn execute_tx_kv(
         &mut self,
         task: &ExecutionTask,
@@ -47,15 +43,10 @@ impl CoreLoop {
                 Ok(resp)
             }
 
-            // ── DDL — reject inside TransactionBatch ─────────────────────────
-            //
-            // `plan_requires_txn_buffering`
-            // (`control/server/shared/write_admission/predicate/txn_buffering.rs`)
-            // classifies these three `false` (write-but-unbuffered): a
-            // client statement never buffers them, so they never replay
-            // through this arm at COMMIT via the `BEGIN ... COMMIT` path.
-            // This arm is a defensive guard for a hypothetical direct-dispatch
-            // route into `execute_tx_kv`, not dead code reachable today.
+            // ── DDL — reject inside TransactionBatch ──
+            // `plan_requires_txn_buffering` classifies these unbuffered, so a
+            // client statement never replays through this arm at commit; it
+            // guards a hypothetical direct-dispatch route.
             KvOp::RegisterIndex { .. } | KvOp::DropIndex { .. } | KvOp::Truncate { .. } => {
                 Err(ErrorCode::Internal {
                     detail: "KV secondary-index / truncate DDL is not permitted inside a \
@@ -130,9 +121,7 @@ impl CoreLoop {
                 self.execute_tx_kv_drop_sorted_index(task, did, tid, index_name, undo_log)
             }
 
-            // ── Write ops — delegated (capture prior value, execute, push
-            // undo) to `sub_plan_kv_writes::execute_tx_kv_write`, moved out
-            // once this file crossed the per-file line budget.
+            // ── Write ops — delegated to `sub_plan_kv_writes::execute_tx_kv_write`.
             KvOp::Put { .. }
             | KvOp::Insert { .. }
             | KvOp::InsertIfAbsent { .. }
@@ -147,11 +136,9 @@ impl CoreLoop {
             | KvOp::Transfer { .. }
             | KvOp::TransferItem { .. } => self.execute_tx_kv_write(task, did, tid, op, undo_log),
 
-            // ── Resolve-before-propose — reject inside TransactionBatch ─────
-            //
-            // Both are autocommit-only: the resolution is decided against
-            // committed state and proposed straight through Raft, so neither
-            // has an undo shape and neither is ever buffered into an overlay.
+            // ── Resolve-before-propose — reject inside TransactionBatch ──
+            // Both are autocommit-only: resolution is decided against
+            // committed state and proposed straight through Raft.
             KvOp::ResolveWrite(_) | KvOp::ResolvedWrite { .. } => Err(ErrorCode::Internal {
                 detail: "KV resolve-before-propose is not permitted inside a TransactionBatch"
                     .into(),

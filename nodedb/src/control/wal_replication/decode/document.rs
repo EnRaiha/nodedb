@@ -2,48 +2,24 @@
 
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Document`.
 //!
-//! # The materialized-sum resolution is read off the record, never re-derived
-//!
-//! An applying node re-EXECUTES the write — the record carries the source row,
-//! not a post-image of the derived total — so its own enforcement funnel folds
-//! the delta and maintains the target's balance. That fold needs two things the
-//! node cannot work out for itself: which target row each join-key value names,
-//! and which targets were split onto a sibling `ApplyBalanceDelta` entry. Both
-//! were decided once, by the node that accepted the statement, and both travel
-//! on the record (see `ReplicatedWrite::PointPut::resolved_sum_targets`).
-//!
-//! Re-resolving here was the alternative, and it is not open to us. The
-//! pk → surrogate binding for a target row lives in the catalog of the vShard
-//! that owns that row's primary key — `lookup_surrogate_routed` routes the probe
-//! to that vShard's LEADER — so a node replicating only the source's vShard has
-//! no local answer, and the remote answer is an async round-trip through another
-//! node's committed state taken from inside a synchronous apply loop. Two
-//! replicas asking at different instants could get different answers, which is
-//! precisely the divergence replication exists to prevent. This is the same
-//! contract every other non-derivable value on this wire follows: the leader's
-//! surrogate travels beside `pk_bytes` and is `bind`-installed rather than
-//! re-allocated, and `KvPut::resolved_now_ms` carries the leader's clock rather
-//! than letting each replica read its own.
+//! Materialized-sum resolution is read off the record, never re-derived: the
+//! pk → surrogate binding needs an async round-trip to another node's leader,
+//! and asking twice could get different answers.
 
 use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::wal_replication::types::ReplicatedSumTarget;
 use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, ReturningSpec, UpdateValue};
 
-/// A decoded RETURNING projection spec plus the read filters gating it — see
-/// `ReplicatedWrite::PointPut::returning`. Bundled into a struct — plain
-/// positional arguments here exceed clippy's arity lint once every point op
-/// carries it.
+/// A decoded RETURNING projection spec plus the read filters gating it.
+/// Bundled to stay under clippy's arity lint once every point op carries it.
 pub(super) struct ReturningFields<'a> {
     pub returning: Option<ReturningSpec>,
     pub rls_filters: &'a [u8],
 }
 
-/// The two slots a record carries its materialized-sum resolution in.
-///
-/// They travel together because they are one answer in two shapes, and a caller
-/// that passed only the older one would silently strip every entry's target
-/// collection — which is the ambiguity the newer slot exists to remove.
+/// The two slots a record carries its materialized-sum resolution in. Travel
+/// together — passing only the older one silently strips every entry's target.
 pub(super) struct WireSumResolution<'a> {
     /// The AUTHORITATIVE slot: `(target collection, join value)` → surrogate.
     pub bindings: &'a [ReplicatedSumTarget],
@@ -52,22 +28,8 @@ pub(super) struct WireSumResolution<'a> {
     pub legacy: &'a [(String, u32)],
 }
 
-/// Lift the wire resolution back into plan shape.
-///
-/// `bindings` wins whenever it carries anything: a node that wrote it knew each
-/// entry's target collection, and that is the key both planes look the
-/// resolution up by.
-///
-/// The older slot is the fallback for one case only — a record committed before
-/// that slot existed, which every node replays out of its own log across the
-/// upgrade. Its entries name no target collection, so they are lifted
-/// UNTARGETED and match any binding by join value alone. That is exactly what
-/// the record meant when it was written; inventing a target collection for it
-/// would be a resolution nobody made.
-///
-/// A record that carries both — every record a current node writes — is read
-/// from `bindings`, so the fallback never widens a resolution that already knows
-/// its targets.
+/// Lift the wire resolution back into plan shape. `bindings` wins whenever
+/// non-empty; `legacy` entries name no target, so lift untargeted.
 fn plan_targets(wire: &WireSumResolution<'_>) -> Vec<ResolvedSumTarget> {
     if !wire.bindings.is_empty() {
         return wire
@@ -117,8 +79,7 @@ pub(super) fn point_put(
         value: value.to_vec(),
         surrogate,
         pk_bytes,
-        // Carried on the record — a replay re-executes this write for the
-        // originating request, not just for the follower's own state.
+        // Carried on the record — a replay re-executes for the originating request.
         returning: returning.returning,
         rls_filters: returning.rls_filters.to_vec(),
         // Read off the record — see this module's doc.
@@ -127,11 +88,8 @@ pub(super) fn point_put(
 }
 
 /// The materialized-sum decisions the proposer made, carried on the record.
-///
-/// The two travel together because they are one decision per binding: the
-/// proposer either resolved the target and folds inline, or deferred it onto a
-/// sibling task. Splitting them across parameters lets a caller pass one and
-/// forget the other, which is a double-counted or a dropped balance.
+/// Travel together: the proposer resolved-and-folds or deferred to a sibling
+/// task per binding; splitting these risks a double-counted or dropped balance.
 pub(super) struct SumDecisions<'a> {
     /// `(target collection, join value)` → target surrogate, resolved by the
     /// node that accepted the statement. Never re-resolved here — see this
@@ -209,9 +167,8 @@ pub(super) fn point_delete(
         // Carried on the record — see `point_put`.
         returning: returning.returning,
         rls_filters: returning.rls_filters.to_vec(),
-        // No predicate here: this node is a follower applying an
-        // already-committed write. The writing identity is not available on
-        // this node. The leader enforces RLS before proposing the write.
+        // No predicate: writing identity isn't available on a follower; the
+        // leader enforces RLS before proposing.
         rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
@@ -287,11 +244,8 @@ pub(super) fn doc_upsert(
 }
 
 /// Reconstruct a `BatchInsert` plan, binding each row's carried surrogate to
-/// its `document_id` on this replica (mirrors `kv::batch_put`). On apply the
-/// existing `execute_document_batch_insert` handler lands each row via
-/// `apply_point_put` keyed by the bound surrogate, so a replayed entry
-/// overwrites the identical rows — idempotent under exactly-once, LSN-ordered
-/// Raft apply.
+/// its `document_id` on this replica (mirrors `kv::batch_put`). Idempotent
+/// under exactly-once, LSN-ordered Raft apply.
 pub(super) fn batch_insert(
     ctx: &DecodeCtx,
     collection: &str,
@@ -301,11 +255,8 @@ pub(super) fn batch_insert(
     deferred_sum_targets: &[String],
     returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
-    // `zip` below stops at the shorter side, so a record that lost surrogates
-    // would decode into a plan whose rows have no cross-engine identity — the
-    // apply then refuses the whole batch, but only after the truncation has
-    // already been silently baked into the plan. Refuse it here, where the
-    // discrepancy is still visible as what it is: a malformed record.
+    // `zip` stops at the shorter side, silently truncating rows with no identity.
+    // Refuse here, where the discrepancy is still visibly a malformed record.
     if documents.len() != surrogates.len() {
         return Err(crate::Error::Serialization {
             format: "replicated_write".into(),
@@ -347,14 +298,9 @@ pub(super) fn batch_insert(
     }))
 }
 
-/// Reconstruct the bulk plan in its plain (non-OLLP) form. The apply
-/// re-scans local state at this committed log position and mutates the
-/// predicate matches; `ollp_predicted_surrogates = None` selects the
-/// local-scan path in the executor (no leader-only verification, no
-/// predicted set). Deterministic across replicas: Raft log order ⇒
-/// identical prior state ⇒ identical matching set; cascade cleanup keys off
-/// each matched row's existing surrogate. No surrogate binding is needed
-/// here — the matches already carry their identity.
+/// Reconstruct the bulk plan in its plain (non-OLLP) form. `ollp_predicted_surrogates
+/// = None` selects the local-scan path — deterministic since Raft log order gives
+/// identical prior state across replicas. No surrogate binding needed.
 pub(super) fn bulk_dml(
     collection: &str,
     filters: &[u8],
@@ -363,9 +309,7 @@ pub(super) fn bulk_dml(
     resolved_sum_targets: &WireSumResolution<'_>,
     returning: ReturningFields<'_>,
 ) -> PhysicalPlan {
-    // The MATCHES are re-derived locally (same log position ⇒ same rows); the
-    // identity of the targets those matches credit is read off the record — see
-    // this module's doc.
+    // Matches are re-derived locally; target identity is read off the record.
     let resolved_sum_targets = plan_targets(resolved_sum_targets);
     if is_update {
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
@@ -397,10 +341,8 @@ pub(super) fn bulk_dml(
     }
 }
 
-/// Reconstruct a `Truncate` plan. `DocumentOp::Truncate` is autocommit-only
-/// and clearing a collection is idempotent + deterministic, so every replica
-/// safely re-executes the same clear on apply. No surrogate binding: there is
-/// no per-row identity, just a whole-collection clear.
+/// Reconstruct a `Truncate` plan. Autocommit-only, idempotent, deterministic —
+/// no surrogate binding since there's no per-row identity.
 pub(super) fn truncate(
     collection: &str,
     restart_identity: bool,
@@ -428,22 +370,8 @@ pub(super) fn insert_select(
     })
 }
 
-/// Reconstruct an `ApplyBalanceDelta` plan.
-///
-/// No surrogate BINDING happens here, unlike the point ops: this record
-/// addresses a row of the TARGET collection that already exists — the leader
-/// resolved it from a join value against a row it had to find — and the
-/// surrogate space is Raft-replicated, so the carried identity names the same
-/// row on this replica. Binding it to `document_id` would install a
-/// primary-key mapping for a key that is not the target row's primary key at
-/// all; the document id here IS the hex surrogate.
-///
-/// Idempotent under exactly-once, LSN-ordered Raft apply for the same reason
-/// `KvIncr` is: the entry is applied once per replica, in log order, and the
-/// read-modify-write it drives reads the balance this replica has already
-/// committed. Re-applying it would double the delta — which is what
-/// exactly-once apply exists to prevent, and why the record carries a delta
-/// rather than being made idempotent by carrying an absolute total.
+/// Reconstruct an `ApplyBalanceDelta` plan. No surrogate binding: the document
+/// id here IS the hex surrogate, not a primary key. Idempotent like `KvIncr`.
 pub(super) fn apply_balance_delta(
     collection: &str,
     document_id: &str,
@@ -465,12 +393,8 @@ pub(super) fn apply_balance_delta(
 }
 
 /// Reconstruct a resolved document write plan (`DocumentOp::ResolvedWrite`).
-///
-/// Every mutation's surrogate is bound through the assigner against its own
-/// `(collection, primary key)`, so a follower addresses the rows the leader
-/// did. Nothing else is re-derived: the bodies, the preconditions, the reply
-/// and the materialized-sum resolution all travel on the record — see this
-/// module's doc for why re-resolving is not open to an applying node.
+/// Every mutation's surrogate binds via the assigner against its own
+/// `(collection, primary key)`; everything else travels on the record.
 pub(super) fn resolved_write(
     ctx: &DecodeCtx,
     mutations: &[super::super::types::DocumentResolvedMutationWire],
@@ -534,8 +458,7 @@ pub(super) fn resolved_write(
     Ok(PhysicalPlan::Document(DocumentOp::ResolvedWrite {
         mutations: decoded,
         response_payload: response_payload.to_vec(),
-        // The decision was made before this entry was proposed; the record is
-        // what proves it.
+        // Decided before this entry was proposed; the record proves it.
         rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
     }))
 }

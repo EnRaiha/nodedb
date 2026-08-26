@@ -2,18 +2,10 @@
 
 //! Timeseries implementation of [`EngineWriteResolver`].
 //!
-//! Resolves a governed `TimeseriesOp::Ingest` to the canonical line protocol it
-//! would store, then rebuilds it as an `"ilp-msgpack"` ingest carrying those
-//! exact lines.
-//!
-//! The rows an ingest persists do not exist until the Data Plane has rewritten
-//! the payload into line protocol: a numeric-looking string becomes a number,
-//! the declared `TIME_KEY` becomes the line's timestamp, and a measurement with
-//! no DDL behind it takes its time column from the resident memtable's schema.
-//! So the Control Plane cannot decide the policy against the submitted bytes —
-//! it would be deciding an image the collection never holds. The resolve pass
-//! normalizes and decides where that state lives, and stamps every timestamp on
-//! the way out so the proposed lines store the same row on every replica.
+//! Resolves a governed `TimeseriesOp::Ingest` to the canonical line protocol
+//! it would store, then rebuilds it as an `"ilp-msgpack"` ingest. Rows don't
+//! exist until rewritten to line protocol, so the resolve pass normalizes,
+//! decides, and stamps timestamps before the policy check.
 
 use async_trait::async_trait;
 use nodedb_types::RlsWriteCheck;
@@ -35,9 +27,7 @@ pub struct TimeseriesWriteResolver {
 }
 
 /// The resolver for `op`, or `None` when it carries no live write predicate.
-///
-/// Exhaustive over `TimeseriesOp`: a new timeseries op fails to compile here
-/// rather than silently skipping resolution.
+/// Exhaustive over `TimeseriesOp` — a new op fails to compile here.
 pub(super) fn resolver_for_timeseries_op(
     op: &TimeseriesOp,
 ) -> Option<Box<dyn EngineWriteResolver>> {
@@ -72,10 +62,8 @@ impl EngineWriteResolver for TimeseriesWriteResolver {
         PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(Box::new(self.op.clone())))
     }
 
-    /// A line the Data Plane's write-policy gate refuses surfaces here as
-    /// `crate::Error::DataPlane(ErrorCode::RejectedAuthz { .. })` — the exact
-    /// error a directly dispatched ingest already returns, because the resolve
-    /// handler runs the same `admit_ilp_lines` gate.
+    /// A refused line surfaces as `DataPlane(RejectedAuthz)`, same as a
+    /// directly dispatched ingest — the resolve handler runs the same gate.
     async fn resolve(
         &self,
         state: &SharedState,
@@ -124,9 +112,7 @@ impl EngineWriteResolver for TimeseriesWriteResolver {
                 self.collection
             ),
         })?;
-        // Every field but the payload, its format, and the decided check is
-        // carried over verbatim: the statement's `RETURNING` projection, its
-        // read filters, and its provenance all still apply to the same write.
+        // Every other field carries over verbatim, unchanged.
         let TimeseriesOp::Ingest {
             collection,
             payload: _,

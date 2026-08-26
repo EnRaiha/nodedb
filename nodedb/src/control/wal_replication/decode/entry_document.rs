@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Grouped decode arm for `ReplicatedWrite` variants that produce
-//! `PhysicalPlan::Document`.
-//!
-//! Delegated from `decode/entry.rs`'s single grouped match arm (every
-//! document-family pattern dispatches here) so that dispatcher stays under the
-//! file size limit. `write` is guaranteed by that caller to already be one of
-//! these variants — every other `ReplicatedWrite` variant is handled by its
-//! own grouped arm in `decode/entry.rs`'s exhaustive match and never reaches
-//! here; the trailing arm below exists only because `write`'s static type is
-//! the full enum, mirroring how `vector::decode_arm` guards the same
-//! dispatch contract.
+//! `PhysicalPlan::Document`, delegated from `decode/entry.rs`'s grouped match
+//! arm to stay under the file size limit. `write` is guaranteed to be one of
+//! these variants.
 
 use super::super::decode_sync_engines::decode_returning;
 use super::super::types::{ReplicatedSumTarget, ReplicatedWrite};
@@ -19,12 +12,8 @@ use super::document;
 use super::document::{PointInsertOptions, ReturningFields, UpsertExtras, WireSumResolution};
 use crate::bridge::envelope::PhysicalPlan;
 
-/// Pair a record's two materialized-sum resolution slots.
-///
-/// Both are handed to the decoder together so it — and not each call site —
-/// decides which one answers. Passing the superseded slot alone would strip
-/// every entry's target collection, which is the ambiguity the newer slot
-/// exists to remove; see [`WireSumResolution`].
+/// Pair a record's two materialized-sum resolution slots so the decoder, not
+/// each call site, decides which answers — see [`WireSumResolution`].
 fn sums<'a>(
     bindings: &'a [ReplicatedSumTarget],
     legacy: &'a [(String, u32)],

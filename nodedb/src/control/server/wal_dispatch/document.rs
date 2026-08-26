@@ -9,17 +9,8 @@ use nodedb_physical::physical_plan::DocumentOp;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 
-/// Encode a document PUT redo record.
-///
-/// Shape: `(collection, document_id, value, Option<SyncProvenance>, surrogate)`.
-/// The trailing `surrogate` carries the row's global identity so startup replay
-/// can rebuild any secondary vector index bound to this document with its real
-/// cross-engine identity. This is an arity-cascade extension of the legacy
-/// `(collection, document_id, value, provenance)` shape that older decoders
-/// still parse, and it is **byte-identical** to what the redo replay decoder
-/// expects (`data::executor::wal_replay_redo_document`). Producer (`PointPut` /
-/// `PointInsert` autocommit) and the post-apply write-set redo helper share this
-/// one encoder so the shape lives in exactly one place.
+/// Encode a document PUT redo record: `(collection, document_id, value,
+/// Option<SyncProvenance>, surrogate)`. Must match `wal_replay_redo_document`'s decode.
 pub(crate) fn encode_document_put_record(
     collection: &str,
     document_id: &str,
@@ -35,12 +26,8 @@ pub(crate) fn encode_document_put_record(
     })
 }
 
-/// Encode a document DELETE redo record.
-///
-/// Shape: `(collection, document_id, Option<SyncProvenance>, surrogate)` — the
-/// four-element redo shape the replay decoder expects (the autocommit
-/// `PointDelete` three-element shape omits the surrogate, which replay needs to
-/// key the redb storage row). Used by the post-apply write-set redo helper.
+/// Encode a document DELETE redo record: `(collection, document_id,
+/// Option<SyncProvenance>, surrogate)` — surrogate keys the redb storage row.
 pub(crate) fn encode_document_delete_record(
     collection: &str,
     document_id: &str,
@@ -55,13 +42,8 @@ pub(crate) fn encode_document_delete_record(
     })
 }
 
-/// Append the WAL record for a single `DocumentOp`, returning the allocated
-/// LSN for the point-write variants (`Some`) or `None` for every read / bulk /
-/// DDL variant that carries no durable per-write effect on THIS path.
-///
-/// The match over [`DocumentOp`] is **exhaustive** (`wildcard_enum_match_arm`
-/// is denied), so a future write variant cannot silently become non-durable:
-/// every variant's durability is decided here by name.
+/// Append the WAL record for a `DocumentOp`: the allocated LSN for point-write
+/// variants, `None` otherwise. Exhaustive so a new variant can't silently skip durability.
 pub(super) fn wal_append_document_op(
     wal: &WalManager,
     tenant_id: TenantId,
@@ -76,12 +58,10 @@ pub(super) fn wal_append_document_op(
             value,
             surrogate,
             pk_bytes: _,
-            // The WAL record carries the row; the projection is answered
-            // from the Data Plane's response, not from the journal.
+            // Projection is answered from the Data Plane's response, not the journal.
             returning: _,
             rls_filters: _,
-            // The journal carries the row; the plan-time materialized-sum
-            // resolution is not part of the applied record.
+            // Plan-time materialized-sum resolution is not part of the applied record.
             resolved_sum_targets: _,
         } => {
             let entry =
@@ -110,9 +90,8 @@ pub(super) fn wal_append_document_op(
             surrogate,
             ..
         } => {
-            // Surrogate-carrying 4-tuple so the redo-document replay can key the
-            // secondary vector-index removal by surrogate on restart (a 3-tuple
-            // omits it, leaving the deleted embedding to resurrect).
+            // 4-tuple keys secondary vector-index removal by surrogate on restart —
+            // a 3-tuple would leave the deleted embedding to resurrect.
             let entry = encode_document_delete_record(collection, document_id, surrogate.as_u32())?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -125,16 +104,12 @@ pub(super) fn wal_append_document_op(
         | DocumentOp::IndexedFetch { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
-        // Durability comes from the post-apply write-set redo, which names the
-        // TARGET collection and re-derives its vShard per entry — the same
-        // route the co-resident derived write already takes.
+        // Durability comes from the post-apply write-set redo, which re-derives its vShard.
         | DocumentOp::ApplyBalanceDelta { .. }
-        // Durable as the committed Raft entry that carries it; the per-row redo
-        // shapes here cannot express a mutation list.
+        // Durable as the committed Raft entry; per-row redo shapes can't express a mutation list.
         | DocumentOp::ResolvedWrite { .. } => None,
-        // DurableElsewhere — row is redb-synchronous-durable; secondary-vector-index
-        // restart fidelity would need an apply-time per-row Put/Delete record —
-        // tracked, not built here
+        // Row is redb-synchronous-durable; secondary-vector-index restart fidelity
+        // would need an apply-time per-row Put/Delete record — tracked, not built here.
         DocumentOp::PointUpdate { .. }
         | DocumentOp::Upsert { .. }
         | DocumentOp::BatchInsert { .. }
@@ -143,11 +118,8 @@ pub(super) fn wal_append_document_op(
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::UpdateFromJoin { .. } => None,
-        // DurableElsewhere — row deletion is redb-durable; a vector-indexed
-        // collection's per-row HNSW cleanup is carried back in
-        // `Response::write_set` and minted as a post-apply `Delete` redo by
-        // `plan_post_apply_redo` / `append_write_set_redo` (mirrors
-        // `BulkDelete`), so restart does not resurrect truncated vectors.
+        // Row deletion is redb-durable; per-row HNSW cleanup is carried in
+        // `Response::write_set` and minted as a post-apply `Delete` redo.
         DocumentOp::Truncate { .. } => None,
         // DurableElsewhere — index state is catalog + redb durable
         DocumentOp::Register { .. }

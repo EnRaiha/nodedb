@@ -331,15 +331,9 @@ impl CoreLoop {
             }
 
             DocumentOp::InsertSelect { .. } => {
-                // `INSERT ... SELECT` is resolved entirely on the Control Plane and
-                // never dispatched to the Data Plane as an `InsertSelect`: the
-                // autocommit path runs the `control::insert_select` orchestrator
-                // (scan → fresh registered surrogate per row → atomic `BatchInsert`),
-                // and the in-transaction statement is resolved + staged at STATEMENT
-                // time (`session::expander_stage` → `resolve_and_emit_insert_select_ops`)
-                // into concrete fresh-surrogate `PointInsert` tasks. Reaching this
-                // arm means an `InsertSelect` plan bypassed both — a routing bug,
-                // surfaced loudly rather than silently mis-copied.
+                // `INSERT ... SELECT` is resolved entirely on the Control Plane
+                // (autocommit orchestrator or statement-time expander). Reaching
+                // this arm is a routing bug, surfaced loudly, not silently mis-copied.
                 self.response_error(
                     task,
                     crate::bridge::envelope::ErrorCode::Internal {

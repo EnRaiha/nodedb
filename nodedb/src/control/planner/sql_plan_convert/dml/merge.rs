@@ -80,19 +80,14 @@ pub(in super::super) fn convert_merge(
             target_join_col: target_join_col.into(),
             source_join_col: source_join_col.into(),
             clauses: clause_ops,
-            // The projected column list lives only in the raw SQL: it is parsed
-            // and stripped by the RETURNING pre-processor, which attaches the
-            // resulting `ReturningSpec` to this op after conversion. The logical
-            // plan carries a bare bool with no column names, so it cannot build
-            // a spec here without inventing a projection. Same shape as the
-            // sibling UPDATE / DELETE / UPDATE-FROM conversions.
+            // Projected columns live only in raw SQL, attached as a
+            // `ReturningSpec` by the RETURNING pre-processor after
+            // conversion; same shape as sibling UPDATE/DELETE conversions.
             returning: None,
-            // Autocommit MERGE is intercepted at the dispatch entry points and
-            // driven by the Control-Plane orchestrator (`control::merge_orchestrator`),
-            // which re-issues this op wrapped in `ResolveWrite`, then with
-            // `resolved_inserts` set. The plan produced here is the neutral
-            // form: in-transaction MERGE is expanded into concrete point ops at
-            // statement time, so this shape never reaches the Data Plane.
+            // Autocommit MERGE is intercepted and driven by
+            // `control::merge_orchestrator`, which re-issues this wrapped
+            // in `ResolveWrite`. This neutral form never reaches the Data
+            // Plane directly.
             resolved_inserts: None,
             // The source rows are shipped in by the Control-Plane orchestrator
             // (cross-core source-ship); the neutral plan carries none.

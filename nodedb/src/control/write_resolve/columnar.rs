@@ -29,9 +29,7 @@ pub struct ColumnarWriteResolver {
 }
 
 /// The resolver for `op`, or `None` when it carries no live write predicate.
-///
-/// Exhaustive over `ColumnarOp`: a new columnar op fails to compile here
-/// rather than silently skipping resolution.
+/// Exhaustive over `ColumnarOp` — a new op fails to compile here.
 pub(super) fn resolver_for_columnar_op(op: &ColumnarOp) -> Option<Box<dyn EngineWriteResolver>> {
     let (collection, filters, updates, is_update, rls_write_check) = match op {
         ColumnarOp::Update {
@@ -80,11 +78,8 @@ impl EngineWriteResolver for ColumnarWriteResolver {
         })
     }
 
-    /// A row the Data Plane's write-policy gate refuses surfaces here as
-    /// `crate::Error::DataPlane(ErrorCode::RejectedAuthz { .. })` — the exact
-    /// error a direct predicate `UPDATE`/`DELETE` against this collection
-    /// already returns, unchanged, because it goes through the same
-    /// `rls_write_gate::admit_columnar_row` call.
+    /// A refused row surfaces as `DataPlane(RejectedAuthz)`, same as a direct
+    /// predicate `UPDATE`/`DELETE` — both go through `admit_columnar_row`.
     async fn resolve(
         &self,
         state: &SharedState,

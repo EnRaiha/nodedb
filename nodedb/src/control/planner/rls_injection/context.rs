@@ -2,14 +2,11 @@
 
 //! The policy-store and identity inputs every injection arm keys on.
 //!
-//! Each engine module receives an [`RlsCtx`] and resolves one outcome per plan
-//! variant. A read either injects the policy into a filter slot, refuses
-//! because its result cannot carry a row filter, or no-ops because the op reads
-//! no user rows. A write either admits its post-image against the write policy
-//! when the plan carries that image, ships the compiled predicate along for the
-//! Data Plane to evaluate against the row bytes it is about to persist, or
-//! refuses because neither is possible — never a silent no-op, which is
-//! indistinguishable from having no policy at all.
+//! Each engine module receives an [`RlsCtx`] and resolves one outcome per
+//! plan variant: a read injects into a filter slot, refuses (no filter
+//! slot), or no-ops (no user rows). A write admits its post-image, ships
+//! the predicate for the Data Plane to evaluate, or refuses — never a
+//! silent no-op, indistinguishable from no policy at all.
 
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::rls::{PolicyType, RlsPolicyStore};
@@ -17,11 +14,8 @@ use crate::control::security::rls::{PolicyType, RlsPolicyStore};
 use super::filters::{get_rls, get_rls_write, merge_filters};
 
 /// Policy registry plus the requester's tenant and authenticated identity.
-///
-/// Superuser bypass and fail-closed handling of unresolved `$auth.*`
-/// references both live inside `combined_read_predicate_with_auth`, which
-/// every method here reaches through [`get_rls`] — so no arm has to restate
-/// either rule.
+/// Superuser bypass and fail-closed `$auth.*` handling live inside
+/// `combined_read_predicate_with_auth`, reached via [`get_rls`].
 pub(super) struct RlsCtx<'a> {
     pub(super) store: &'a RlsPolicyStore,
     pub(super) tenant_id: u64,
@@ -57,12 +51,8 @@ impl RlsCtx<'_> {
         Ok(())
     }
 
-    /// Refuse the plan while a read policy restricts this identity on
-    /// `collection`.
-    ///
-    /// `why` completes the sentence "…is not supported with this operation:
-    /// {why}", so it must state what the result carries instead of rows and
-    /// why the filter cannot be evaluated against it.
+    /// Refuse while a read policy restricts this identity on `collection`.
+    /// `why` completes "…is not supported with this operation: {why}".
     pub(super) fn refuse_if_policy(&self, collection: &str, why: &str) -> crate::Result<()> {
         if collection.is_empty() || self.read_filters(collection)?.is_empty() {
             return Ok(());
@@ -74,12 +64,9 @@ impl RlsCtx<'_> {
         })
     }
 
-    /// Refuse when this identity holds any read policy anywhere in the tenant.
-    ///
-    /// Used only where the plan does not name the collection it reads, so the
-    /// narrow per-collection question cannot be asked and the plan cannot be
-    /// shown to avoid a protected collection. Mirrors the redaction pass's
-    /// tenant-wide fallback for an unscoped MATCH.
+    /// Refuse when this identity holds any read policy in the tenant. Used
+    /// only where the plan names no collection, so the narrow question
+    /// can't be asked. Mirrors the redaction pass's unscoped-MATCH fallback.
     pub(super) fn refuse_if_any_policy(&self, why: &str) -> crate::Result<()> {
         if self.auth.is_superuser() || !self.identity_has_any_read_policy() {
             return Ok(());
@@ -92,16 +79,9 @@ impl RlsCtx<'_> {
         })
     }
 
-    /// Admit a write whose post-image the plan already carries.
-    ///
-    /// `image` is the MessagePack row body the statement is about to persist,
-    /// so the predicate decides the row that will exist after the write —
-    /// matching the CRDT admission path, which evaluates the same policies
-    /// against the merged post-image.
-    ///
-    /// A row the policy rejects fails the whole statement rather than being
-    /// skipped: a silently dropped row would report a write that never
-    /// happened.
+    /// Admit a write whose post-image the plan already carries as
+    /// MessagePack. A rejected row fails the whole statement — a silently
+    /// dropped row would report a write that never happened.
     pub(super) fn admit_write_image(&self, collection: &str, image: &[u8]) -> crate::Result<()> {
         let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
         crate::control::security::rls::admit_compiled_write_image(
@@ -112,20 +92,9 @@ impl RlsCtx<'_> {
         )
     }
 
-    /// Admit a write whose post-image the plan carries as a JSON object.
-    ///
-    /// A graph edge stores the `PROPERTIES` clause as JSON text rather than
-    /// MessagePack, so the image is transcoded here and then decided by the
-    /// same [`admit_compiled_write_image`] every other engine goes through —
-    /// one compiled predicate cannot mean one thing for a document row and
-    /// another for an edge's property object.
-    ///
-    /// Bytes that are not a JSON object — including the empty clause an edge
-    /// written without `PROPERTIES` carries — hold no field the predicate can
-    /// test, so they are denied rather than admitted by omission. That is the
-    /// same fail-closed direction as a row missing the governed column.
-    ///
-    /// [`admit_compiled_write_image`]: crate::control::security::rls::admit_compiled_write_image
+    /// Admit a write whose post-image is a JSON object (a graph edge's
+    /// `PROPERTIES`). Non-object bytes, including an empty `PROPERTIES`,
+    /// deny rather than admit by omission.
     pub(super) fn admit_write_json_image(
         &self,
         collection: &str,
@@ -153,24 +122,9 @@ impl RlsCtx<'_> {
         )
     }
 
-    /// Admit a write whose post-image the plan carries as a zerompk-encoded
-    /// `HashMap<String, Value>`.
-    ///
-    /// [`nodedb_types::Value`]'s zerompk representation is TAGGED: a string
-    /// field is written as the two-element array `[4, "…"]`, not as a bare
-    /// MessagePack string. Handing those bytes to the row evaluator directly
-    /// would compare every predicate against a tag array and reject rows the
-    /// policy permits — a gate that denies everything, which is as wrong as one
-    /// that admits everything. So the map is decoded and rewritten as the
-    /// standard MessagePack body every other engine's image already is, and one
-    /// compiled predicate decides them all identically.
-    ///
-    /// Field names are lower-cased because that is what the collection will
-    /// store: a policy on `owner` must not depend on whether the statement
-    /// spelled the column `owner` or `Owner`.
-    ///
-    /// Bytes that do not decode as that map carry no field the predicate can
-    /// test, so they deny rather than being admitted by omission.
+    /// Admit a write whose post-image is a zerompk `HashMap<String, Value>`,
+    /// TAGGED (`[4, "…"]`, not a bare string) — rewritten as plain
+    /// MessagePack first, or comparing tags directly would deny every row.
     pub(super) fn admit_write_value_map_image(
         &self,
         collection: &str,
@@ -210,24 +164,9 @@ impl RlsCtx<'_> {
         )
     }
 
-    /// Admit every row of a MessagePack row batch the plan carries in full.
-    ///
-    /// The columnar family ships a statement's rows as one MessagePack array of
-    /// per-row objects rather than as separate op fields, so the batch is split
-    /// here and each row decided on its own. The first violation fails the whole
-    /// statement before any dispatch, which is what keeps a partially applied
-    /// batch impossible: nothing has been written yet when the refusal happens.
-    ///
-    /// A payload that is neither an array of rows nor a single row object is
-    /// refused rather than admitted — an image the policy could not be
-    /// evaluated against is not an image the policy admitted.
-    ///
-    /// Takes the plan's check slot and records the verdict in it. The decision
-    /// happened here, against the exact rows the plan carries, so the slot must
-    /// say so — a slot left at
-    /// [`nodedb_types::RlsWriteCheck::PendingInjection`] reads as "injection
-    /// never ran" everywhere downstream, and the write is refused even though
-    /// the policy admitted it.
+    /// Admit every row of a MessagePack batch; the first violation fails
+    /// the whole statement before dispatch. Records the verdict in the
+    /// check slot — left at `PendingInjection` it reads as "never ran".
     pub(super) fn admit_write_batch(
         &self,
         collection: &str,
@@ -264,27 +203,14 @@ impl RlsCtx<'_> {
                 collection,
             )?;
         }
-        // Every row was decided here, in this request, with a live identity,
-        // against the exact images the plan carries.
+        // Decided here, with a live identity, against the exact images carried.
         *rls_write_check = nodedb_types::RlsWriteCheck::decided_earlier_in_request();
         Ok(())
     }
 
-    /// Compile the collection's write policy into a plan's write-gate slot.
-    ///
-    /// For a write whose row image is produced where it is persisted: an
-    /// update's post-image exists only after the stored row is read and the
-    /// statement's changes are applied, and a delete's image only after the row
-    /// being removed is read. The predicate therefore travels with the plan and
-    /// the Data Plane evaluates it against the actual row bytes before
-    /// persisting, rather than the plan being refused outright.
-    ///
-    /// Resolved through the same [`get_rls_write`] as [`Self::admit_write_image`],
-    /// so superuser bypass and the fail-closed deny on an unresolvable
-    /// `$auth.*` reference behave identically on both paths. An empty
-    /// predicate becomes [`nodedb_types::RlsWriteCheck::NoPolicyApplies`], so
-    /// "no policy restricts this identity" and "the predicate was lost" can
-    /// never be confused.
+    /// Compile the write policy into a plan's write-gate slot, for a write
+    /// whose image exists only where it's persisted (update's post-image,
+    /// delete's removed row) — evaluated there instead of refusing outright.
     pub(super) fn set_write_check(
         &self,
         collection: &str,
@@ -300,11 +226,8 @@ impl RlsCtx<'_> {
     }
 
     /// Refuse the write while a write policy restricts this identity on
-    /// `collection`.
-    ///
-    /// `why` completes the sentence "…cannot be enforced for this operation:
-    /// {why}", so it must state why the row image the policy decides is not
-    /// available where the write happens.
+    /// `collection`. `why` completes "…cannot be enforced for this operation:
+    /// {why}".
     pub(super) fn refuse_if_write_policy(&self, collection: &str, why: &str) -> crate::Result<()> {
         if collection.is_empty()
             || get_rls_write(self.store, self.tenant_id, collection, self.auth)?.is_empty()
@@ -318,11 +241,9 @@ impl RlsCtx<'_> {
         })
     }
 
-    /// Refuse while this identity holds any write policy anywhere in the tenant.
-    ///
-    /// Used only where the write does not name the collection it mutates, so
-    /// the narrow per-collection question cannot be asked and the write cannot
-    /// be shown to avoid a protected collection.
+    /// Refuse while this identity holds any write policy in the tenant.
+    /// Used only where the write names no collection, so the narrow
+    /// question can't be asked.
     pub(super) fn refuse_if_any_write_policy(&self, why: &str) -> crate::Result<()> {
         if self.auth.is_superuser() || !self.store.tenant_has_write_policy(self.tenant_id) {
             return Ok(());
@@ -335,10 +256,8 @@ impl RlsCtx<'_> {
         })
     }
 
-    /// Whether any enabled, non-vacuous read policy exists in this tenant.
-    ///
-    /// A policy with no compiled predicate filters nothing, so it is ignored
-    /// here exactly as `combined_read_predicate_with_auth` ignores it.
+    /// Whether any enabled, non-vacuous read policy exists in this tenant
+    /// (a policy with no compiled predicate is ignored, like elsewhere).
     fn identity_has_any_read_policy(&self) -> bool {
         self.store
             .all_policies_for_tenant(self.tenant_id)

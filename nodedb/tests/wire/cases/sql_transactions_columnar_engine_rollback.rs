@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! End-to-end companions to the direct handler-level rollback regression.
-//!
-//! The core regression — that a ROLLED-BACK columnar transaction must not
-//! leave a phantom empty engine registered — is asserted directly on
-//! `CoreLoop::columnar_engines` membership in the unit test
-//! `txn_created_columnar_engine_tests` in
-//! `data/executor/dispatch/meta.rs` (a leaked empty engine is invisible to
-//! ordinary SELECTs, so SQL cannot observe it; and RESTORE-based probes are
-//! confounded by RESTORE's HLC-watermark guard, which fires before the
-//! columnar-engine collision guard).
-//!
-//! These two SQL-level tests cover the observable end-state the fix must NOT
-//! regress: COMMIT keeps the engine + row (no over-drop), and a plain
-//! autocommit INSERT into a brand-new collection still creates and keeps its
+//! End-to-end companions to the direct handler-level rollback regression:
+//! a rolled-back columnar transaction must not leave a phantom empty
+//! engine registered (asserted directly in `data/executor/dispatch/meta.rs`,
+//! since a leaked empty engine is invisible to ordinary SELECTs). These two
+//! SQL-level tests cover the observable end-state the fix must not regress:
+//! COMMIT keeps the engine + row, and a plain autocommit INSERT still keeps its
 //! engine (the untouched non-transactional path).
 
 use crate::harness::TestServer;
@@ -27,10 +19,9 @@ fn command_count(msgs: &[SimpleQueryMessage]) -> Option<u64> {
     })
 }
 
-/// COMMIT of the first insert into a new collection must KEEP the engine and
-/// its row -- guards against an over-eager fix that unconditionally drops
-/// every txn-created engine on `DropTxnOverlay` regardless of commit vs
-/// rollback.
+/// COMMIT of the first insert into a new collection must keep the engine
+/// and its row, guarding against a fix that drops every txn-created engine
+/// on `DropTxnOverlay` regardless of commit vs rollback.
 #[tokio::test]
 async fn commit_of_new_collection_insert_keeps_columnar_engine_populated() {
     let target = TestServer::start().await;

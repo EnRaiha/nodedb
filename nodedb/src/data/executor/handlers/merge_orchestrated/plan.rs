@@ -29,12 +29,9 @@ pub(super) struct MergeUpdate {
     pub(super) surrogate: Option<Surrogate>,
     /// Post-update document as MessagePack (pre-strict-encoding).
     pub(super) body: Vec<u8>,
-    /// The target row as it stood BEFORE the arm, as MessagePack.
-    ///
-    /// An UPDATE arm's materialized-sum delta is the DIFFERENCE between the two
-    /// images, and a `RowImages::Update` cannot be constructed without both —
-    /// which is what stops the arm's whole new value being credited on top of
-    /// the contribution the row already holds.
+    /// The target row as it stood BEFORE the arm, as MessagePack. An UPDATE
+    /// arm's materialized-sum delta is the difference between the two images —
+    /// without both, the arm's whole new value gets credited on top.
     pub(super) old_body: Vec<u8>,
 }
 
@@ -63,11 +60,9 @@ pub(super) struct MergePlanActions {
     pub(super) inserts: Vec<MergeInsert>,
 }
 
-/// Decode a stored target row into JSON, using the strict schema when present.
-///
-/// Fails rather than skipping the row: a target row the classifier cannot read
-/// is not "absent", and treating it as absent makes the MERGE fall through to
-/// its NOT MATCHED arm and insert a duplicate of a row that already exists.
+/// Decode a stored target row into JSON. Fails rather than skipping — a row
+/// the classifier can't read is not "absent", and treating it as absent
+/// inserts a duplicate of a row that already exists.
 fn decode_target(
     bytes: &[u8],
     strict_schema: &Option<nodedb_types::columnar::StrictSchema>,
@@ -76,18 +71,10 @@ fn decode_target(
 }
 
 impl CoreLoop {
-    /// Classify a MERGE against a point-in-time snapshot WITHOUT writing.
-    ///
-    /// Walks the target rows (matched → UPDATE/DELETE, unmatched-by-source →
-    /// UPDATE/DELETE) and the unmatched source rows (→ INSERT), collecting the
-    /// resolved bodies. Shared by [`Self::execute_merge_resolve`] and
+    /// Classify a MERGE against a point-in-time snapshot without writing.
+    /// Shared by [`Self::execute_merge_resolve`] and
     /// [`Self::execute_merge_apply`] so both derive an identical action set.
-    ///
-    /// `txn_id` threads the staged transaction's identity into the target scan
-    /// (`collect_target_docs`) so both the RESOLVE and APPLY passes classify
-    /// against the transaction's CURRENT view = base ∪ overlay, seeing rows
-    /// staged by earlier statements in the same transaction. `None` (autocommit)
-    /// classifies against committed base storage only.
+    /// `txn_id` classifies against base ∪ overlay; `None` is base only.
     pub(super) fn collect_merge_plan(
         &self,
         database_id: u64,
@@ -129,9 +116,8 @@ impl CoreLoop {
                     (MergeClauseKindOp::NotMatchedBySource, &null_source)
                 };
 
-            // MATCHED arms select against the merged (target + qualified source)
-            // document; NOT-MATCHED-BY-SOURCE arms select against the target
-            // alone (there is no source row). Mirrors the legacy walk.
+            // MATCHED selects against the merged doc; NOT-MATCHED-BY-SOURCE
+            // selects against the target alone (no source row).
             let context = if arm_kind == MergeClauseKindOp::Matched {
                 build_merged(&target_doc, source_doc, params.source_alias)
             } else {

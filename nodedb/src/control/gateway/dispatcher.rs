@@ -2,18 +2,10 @@
 
 //! Per-route dispatch: local SPSC or remote `ExecuteRequest` RPC.
 //!
-//! The dispatcher takes a single [`TaskRoute`] and executes it:
-//!
-//! - `RouteDecision::Local` → dispatch through the SPSC bridge via
-//!   [`dispatch_to_data_plane`].
-//! - `RouteDecision::Remote { node_id, .. }` → encode the plan as
-//!   [`ExecuteRequest`] bytes and send via [`NexarTransport::send_rpc`].
-//! - `RouteDecision::Broadcast { .. }` → each individual route in the
-//!   broadcast list is already split into Local/Remote routes by the router,
-//!   so by the time dispatch runs, each element is a concrete Local or Remote.
-//!
-//! Returns `Vec<u8>` payloads — raw Data Plane response bytes that the fuser
-//! can merge.
+//! Executes a single [`TaskRoute`]: `Local` via the SPSC bridge, `Remote` via
+//! an `ExecuteRequest` RPC, `Broadcast` never reached here (the router
+//! splits it into concrete Local/Remote routes first). Returns raw Data
+//! Plane response bytes for the fuser to merge.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,33 +27,23 @@ use super::version_set::GatewayVersionSet;
 /// Result of dispatching a single route: the raw payload bytes plus the
 /// per-shard read watermarks observed while producing them.
 ///
-/// `shard_watermarks` carries one `(vshard, watermark_lsn)` entry per shard that
-/// contributed to `payloads` — the local SPSC response's own watermark, or the
-/// remote `ExecuteResponse.watermark_lsn` keyed to the collection's owning
-/// vShard. The gateway accumulates these across routes so an in-transaction read
-/// records one read-set entry per participating shard at its true committed LSN
-/// (rather than the former hardcoded `Lsn::ZERO`).
+/// `shard_watermarks` is one `(vshard, watermark_lsn)` per contributing shard
+/// — local SPSC watermark, or remote `ExecuteResponse.watermark_lsn` keyed to
+/// the owning vShard — accumulated so an in-transaction read gets one
+/// read-set entry per shard at its true committed LSN.
 pub struct DispatchOutcome {
     pub payloads: Vec<Vec<u8>>,
     pub shard_watermarks: Vec<(VShardId, Lsn)>,
-    /// Per-collection read-version LSN for this route's scanned collection (its
-    /// `coll_write_lsn` at read time, a WAL LSN); `Lsn::ZERO`
-    /// for writes / non-read routes. The gateway max-folds these across routes —
-    /// a read targets one collection, so one non-zero value survives — giving the
-    /// sound comparand for cross-shard OCC read validation (distinct from the
-    /// per-shard `shard_watermarks`, which report the core-global watermark).
+    /// This route's scanned collection's read-version LSN (`coll_write_lsn`
+    /// at read time), `Lsn::ZERO` for writes. Max-folded across routes — a
+    /// read targets one collection, so one non-zero value survives — for
+    /// cross-shard OCC read validation.
     pub read_version_lsn: Lsn,
 }
 
-/// Parameters for [`dispatch_route`].
-///
-/// `tenant_id` — the authenticated tenant for this query.
-/// `trace_id` — distributed trace ID propagated from the client request.
-/// `deadline_ms` — remaining deadline in milliseconds.
-/// `version_set` — descriptor versions for the collections touched by the plan.
-/// `txn_id` — session-transaction context for local overlay resolution and
-///   remote `ExecuteRequest` forwarding, or `None` for non-transactional
-///   dispatch (the common case).
+/// Parameters for [`dispatch_route`]. `txn_id` is session-transaction
+/// context for local overlay resolution and remote forwarding, `None` for
+/// non-transactional dispatch (the common case).
 pub struct DispatchRouteParams<'a> {
     pub route: TaskRoute,
     pub shared: &'a Arc<SharedState>,
@@ -117,18 +99,16 @@ pub(crate) async fn dispatch_route(
             .await
         }
         RouteDecision::Broadcast { .. } => {
-            // Broadcast routes are split into individual Local/Remote routes
-            // by the router before dispatch. This arm should not be reached.
+            // Split into individual Local/Remote routes by the router before
+            // dispatch; this arm should not be reached.
             Err(Error::Internal {
                 detail: "dispatcher: Broadcast route reached dispatch — should have been split"
                     .into(),
             })
         }
         RouteDecision::LeaderUnknown { vshard_id } => {
-            // Cluster mode with no leader currently known for this vShard.
-            // Surface as NotLeader so the gateway retry loop sleeps and
-            // re-resolves the routing table on the next attempt — never
-            // silently serve from a possibly-stale local replica.
+            // No known leader for this vShard: surface as NotLeader so the
+            // retry loop re-resolves rather than serving stale local data.
             Err(Error::NotLeader {
                 vshard_id: VShardId::new(vshard_id as u32),
                 leader_node: 0,
@@ -149,15 +129,9 @@ pub struct DispatchRouteStreamParams<'a> {
     pub version_set: &'a GatewayVersionSet,
 }
 
-/// Streaming sibling of [`dispatch_route`]: dispatch a single route and return
-/// a [`ResultStream`] of row batches.
-///
-/// - `Local` → [`gather_all_cores_stream`] over the route's plan (the route is
-///   a single-vShard-homed scan answered on this node; fanning to all local
-///   cores mirrors the local degenerate of `gather_all_vshards`).
-/// - `Remote` → [`dispatch_remote_stream`] (eager first frame + retry split).
-/// - `Broadcast` → unreachable (router splits broadcasts before dispatch).
-/// - `LeaderUnknown` → `NotLeader` so the gateway retry loop re-resolves.
+/// Streaming sibling of [`dispatch_route`]: `Local` fans to all local cores,
+/// `Remote` uses eager-first-frame dispatch, `Broadcast` is unreachable
+/// (pre-split by the router), `LeaderUnknown` returns `NotLeader`.
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
     if matches!(
         plan,
@@ -328,10 +302,8 @@ async fn dispatch_local(
                 .await?;
         return Ok(DispatchOutcome {
             payloads: vec![payload],
-            // A write carries no read watermark (Lsn::ZERO). Its per-collection
-            // version — the applying replica's post-write `coll_write_lsn` — is
-            // surfaced via `read_version_lsn` to floor this session's later reads,
-            // matching the leader-local write path's `resp.read_version_lsn`.
+            // A write carries no read watermark (Lsn::ZERO); its post-write
+            // `coll_write_lsn` is surfaced via `read_version_lsn` instead.
             shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
             read_version_lsn: write_version,
         });
@@ -375,11 +347,8 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
             expected_version,
             actual_version,
         } => {
-            // The versions are the whole diagnosis for this error: a mismatch
-            // that keeps repeating means the planner and the leaseholder
-            // disagree persistently, which is a bug rather than the transient
-            // race the retry assumes. Dropping them leaves "retryable schema
-            // change" with nothing to act on.
+            // A repeating mismatch means the planner and leaseholder disagree
+            // persistently — a bug, not the transient race the retry assumes.
             tracing::debug!(
                 %collection,
                 expected_version,

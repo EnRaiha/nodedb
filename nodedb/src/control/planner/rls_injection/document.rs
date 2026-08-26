@@ -18,19 +18,16 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             ..
         } => ctx.merge_into(collection, filters),
 
-        // Inject: the indexed equality resolves doc ids, then every fetched
-        // body is tested against `filters` — the residual post-filter slot the
-        // policy ANDs into.
+        // Inject: fetched bodies are tested against `filters`, the residual
+        // post-filter slot the policy ANDs into.
         DocumentOp::IndexedFetch {
             collection,
             filters,
             ..
         } => ctx.merge_into(collection, filters),
 
-        // Inject: no storage pushdown slot, so the handler evaluates the
-        // policy on the rows it fetched. An excluded row reads back as absent
-        // — indistinguishable from a missing key, so a caller cannot probe for
-        // rows it may not read.
+        // Inject: no pushdown slot, so the handler evaluates post-fetch. An
+        // excluded row reads back as absent, not distinguishably denied.
         DocumentOp::PointGet {
             collection,
             rls_filters,
@@ -42,23 +39,8 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // Inject both policies: the read filter for what may be shown back, and
-        // the compiled write predicate for what may be persisted.
-        //
-        // These writes surface rows through a `RETURNING` clause, and that
-        // output is a read — a row the policy hides must not become visible
-        // just because the statement wrote it. The handler evaluates the filter
-        // against each full pre-projection document, so a predicate on a column
-        // the `RETURNING` list omits still decides the row.
-        //
-        // The write is gated in the Data Plane rather than here, because the
-        // image a write policy decides is not in the plan: for an update it
-        // exists only after the handler has read the stored row and applied the
-        // assignments, for a delete only after it has read the row being
-        // removed. Shipping the compiled predicate lets the handler test the
-        // actual row bytes just before it persists them, and reject the whole
-        // statement when one fails — the two slots stay separate because one
-        // decides visibility and the other decides the write.
+        // Inject both: read filter for `RETURNING`, write predicate ships
+        // to the Data Plane since the image exists only after the read.
         DocumentOp::PointDelete {
             collection,
             rls_filters,
@@ -83,9 +65,8 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             rls_write_check,
             ..
         }
-        // The joined source is read, but every row these two return — and every
-        // row they write — belongs to the TARGET, so the target's policy is the
-        // one that gates both halves.
+        // Source is read, but every row returned/written belongs to TARGET,
+        // so the target's policy gates both halves.
         | DocumentOp::UpdateFromJoin {
             target_collection: collection,
             rls_filters,
@@ -110,38 +91,23 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
              evaluate against",
         ),
 
-        // Refuse: an HLL cardinality estimate counts rows the policy hides,
-        // and a scalar count carries no row for the filter to test. Redaction
-        // ignores this shape (a count exposes no column value); RLS cannot,
-        // because the row set itself is what the policy restricts.
+        // Refuse: a scalar count carries no row for the filter to test, and
+        // the row set itself (not a column value) is what RLS restricts.
         DocumentOp::EstimateCount { collection, .. } => ctx.refuse_if_policy(
             collection,
             "the estimate is a row count, which the row filter cannot be evaluated against",
         ),
 
-        // Refuse: the clone materializer streams raw `(id, surrogate, value)`
-        // triples with no filter slot, so every stored body would be copied
-        // regardless of the policy.
+        // Refuse: streams raw triples with no filter slot — every stored
+        // body would be copied regardless of policy.
         DocumentOp::MaterializeScan { collection, .. } => ctx.refuse_if_policy(
             collection,
             "the materializing scan streams raw stored bodies through a cursor payload that \
              carries no row filter",
         ),
 
-        // Admit the write image, then inject the read filter: the plan carries
-        // the whole post-image, so the write policy is evaluated against the
-        // exact row that will exist afterwards. The planner emits these bodies
-        // as MessagePack for every storage mode — the Data Plane re-encodes a
-        // strict collection's tuple on the way to disk — so the predicate reads
-        // the same field names a `SELECT` would.
-        //
-        // The read filter is not redundant with that admission. It gates a
-        // different thing: a `RETURNING` clause on these writes ships rows back,
-        // and that output is a read, so a row a read-only policy hides must not
-        // become visible just because the statement wrote it. The two policies
-        // are independent — a collection can carry a `FOR SELECT` policy and no
-        // write policy at all, in which case the write is unrestricted and the
-        // returned row set still shrinks.
+        // Admit the write image now (plan carries the full post-image),
+        // then inject the read filter for independent `RETURNING` visibility.
         DocumentOp::PointPut {
             collection,
             value,
@@ -170,14 +136,8 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Ship the write predicate: the insert body is in the plan, but the
-        // conflict branch persists a merge of that body with the stored row (or
-        // the assignments in `on_conflict_updates` applied to it), and neither
-        // of those images exists until the handler has read the stored row.
-        // Admitting on the insert body alone would clear a write whose actual
-        // post-image the policy never saw, so the handler tests whichever body
-        // it is about to store. The read filter rides along for the same reason
-        // it does on the plain inserts above: `RETURNING` output is a read.
+        // Ship the predicate: the conflict-merged body doesn't exist until
+        // the handler reads the stored row.
         DocumentOp::Upsert {
             collection,
             rls_write_check,
@@ -198,39 +158,28 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
              no row image",
         ),
 
-        // Refuse: a truncate removes every row without reading one, so there is
-        // no image the policy could be evaluated against — and a policy that
-        // restricts which rows this identity may write is precisely a statement
-        // that it may not remove all of them.
+        // Refuse: removes every row without reading one, so no image the
+        // policy could be evaluated against exists.
         DocumentOp::Truncate { collection, .. } => ctx.refuse_if_write_policy(
             collection,
             "a truncate removes every row without reading one, so no row image is available",
         ),
 
-        // No-op: index and collection DDL. These write no user row, so neither
-        // the read nor the write policy has anything to restrict in them; the
-        // DDL itself is authorized by the permission check that precedes this
-        // pass.
+        // No-op: DDL writes no user row; authorized by the permission check
+        // that precedes this pass.
         DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => Ok(()),
 
-        // No-op: a derived balance write carries no user intent and no user
-        // identity. Its admission was decided when the SOURCE row it was
-        // derived from was admitted; deciding it again against the TARGET's own
-        // policy would refuse every governed write on the strength of a row
-        // whose only changed column is one the engine maintains — the same
-        // reason the co-resident derived write runs with `enforce: false`.
+        // No-op: carries no user identity — its admission was already
+        // decided when the SOURCE row it derives from was admitted.
         DocumentOp::ApplyBalanceDelta { .. } => Ok(()),
 
-        // No-op: the write policy was already decided against these exact row
-        // images, by the resolve pass this write came from. Injecting again
-        // would replace a verdict with a predicate no applying node can decide.
+        // No-op: already decided by the resolve pass; re-injecting would
+        // replace a verdict with a predicate no applying node can decide.
         DocumentOp::ResolvedWrite { .. } => Ok(()),
 
-        // Inject into the wrapped op: it is the intercepted write verbatim, and
-        // the expander decides the resolved images against the check injected
-        // there.
+        // Recurse: the wrapped op is the intercepted write verbatim.
         DocumentOp::ResolveWrite(inner) => inject_document(ctx, inner),
     }
 }
@@ -541,9 +490,7 @@ mod tests {
     /// With no policy at all every write shape runs untouched.
     #[test]
     fn writes_without_a_policy_record_that_injection_ran() {
-        // `point_insert` is decided at plan time and carries no write-check
-        // slot to stamp, so only the update is checked for the stamp. Both are
-        // checked for leaving everything else alone.
+        // `point_insert` has no write-check slot to stamp; only update is.
         let mut insert = point_insert("orders", "99");
         let insert_before = insert.clone();
         assert!(inject_without_policy(&mut insert).is_ok());
