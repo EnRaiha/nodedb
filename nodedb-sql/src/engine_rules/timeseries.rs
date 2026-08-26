@@ -81,14 +81,15 @@ impl EngineRules for TimeseriesRules {
         })
     }
 
-    fn plan_delete(&self, p: DeleteParams) -> Result<Vec<SqlPlan>> {
-        // Timeseries supports range-based deletion (e.g. retention).
-        Ok(vec![SqlPlan::Delete {
-            collection: p.collection,
-            engine: EngineType::Timeseries,
-            filters: p.filters,
-            target_keys: p.target_keys,
-        }])
+    fn plan_delete(&self, _p: DeleteParams) -> Result<Vec<SqlPlan>> {
+        // Timeseries has no row-level delete; only whole-partition drop via
+        // retention policy. Routing to columnar deletes nothing.
+        Err(SqlError::Unsupported {
+            detail: "DELETE is not supported on timeseries collections; \
+                     expire rows with CREATE RETENTION POLICY, which drops \
+                     whole partitions older than the configured age"
+                .into(),
+        })
     }
 
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
