@@ -26,6 +26,9 @@
 mod crash_harness;
 
 use std::path::PathBuf;
+// Only the failpoints-gated boot-failure test needs an explicit duration;
+// the ready path uses the harness constant.
+#[cfg(feature = "failpoints")]
 use std::time::Duration;
 
 use crash_harness::{CrashHarness, direct_io_supported};
@@ -52,7 +55,7 @@ async fn production_direct_io_default_boots_and_survives_restart() {
 
     let mut h = CrashHarness::new_in(&parent).with_direct_io_wal();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION direct_io_default (id TEXT PRIMARY KEY, v INT) \

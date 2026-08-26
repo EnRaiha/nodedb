@@ -12,7 +12,6 @@
 mod crash_harness;
 
 use crash_harness::CrashHarness;
-use std::time::Duration;
 
 /// `SELECT COUNT(*) AS n FROM <collection>`, as a number.
 ///
@@ -35,7 +34,7 @@ async fn count_rows(h: &CrashHarness, collection: &str) -> u64 {
 async fn columnar_write_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION crash_columnar \
@@ -80,7 +79,7 @@ async fn columnar_write_survives_kill_9() {
 async fn timeseries_write_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION crash_timeseries \
@@ -135,7 +134,7 @@ async fn timeseries_write_survives_kill_9() {
 async fn array_cell_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE ARRAY crash_arr \
@@ -232,7 +231,7 @@ fn cardinality_harness() -> CrashHarness {
 async fn timeseries_partial_record_flush_does_not_duplicate_on_replay() {
     let mut h = cardinality_harness();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     // `id` is BIGINT, not TEXT, deliberately: only `host` may be a symbol
     // column, so `host` alone drives the dictionary and the cardinality ceiling

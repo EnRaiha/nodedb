@@ -20,13 +20,12 @@
 mod crash_harness;
 
 use crash_harness::CrashHarness;
-use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_edges_survive_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION crash_graph_edges").await;
     h.exec("GRAPH INSERT EDGE IN 'crash_graph_edges' FROM 'a' TO 'b' TYPE 'knows'")
@@ -66,7 +65,7 @@ async fn graph_edges_survive_kill_9() {
 async fn graph_node_labels_survive_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION crash_graph_labels").await;
     h.exec("INSERT INTO crash_graph_labels { id: 'alice', name: 'Alice' }")
@@ -106,7 +105,7 @@ async fn graph_node_labels_survive_kill_9() {
 async fn fts_index_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION crash_fts WITH (engine='document_schemaless')")
         .await;
@@ -147,7 +146,7 @@ async fn fts_index_survives_kill_9() {
 async fn spatial_document_geometry_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     // A DOCUMENT collection (NOT `engine='spatial'`, which is columnar-family):
     // the geometry lives as a field of the stored document — no declared

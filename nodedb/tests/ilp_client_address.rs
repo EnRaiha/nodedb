@@ -74,7 +74,7 @@ const INGEST_SOURCE: &str = "127.0.0.2:0";
 async fn start_ingest_server(collection: &str) -> CrashHarness {
     let mut harness = CrashHarness::new();
     harness.spawn();
-    harness.wait_ready(Duration::from_secs(20));
+    harness.wait_ready();
     harness.wait_for_calvin_ready(Duration::from_secs(20)).await;
 
     harness

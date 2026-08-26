@@ -26,8 +26,6 @@
 
 mod crash_harness;
 
-use std::time::Duration;
-
 use crash_harness::CrashHarness;
 
 /// Checkpoints run on a periodic timer, and one landing between the refused
@@ -100,7 +98,7 @@ async fn stored(h: &CrashHarness, collection: &str) -> Vec<String> {
 async fn constraint_refused_insert_is_not_resurrected_by_replay() {
     let mut h = harness();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION refused_pk (id TEXT PRIMARY KEY, owner TEXT, note TEXT) \

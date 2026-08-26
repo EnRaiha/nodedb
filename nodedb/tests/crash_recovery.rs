@@ -12,13 +12,12 @@
 mod crash_harness;
 
 use crash_harness::CrashHarness;
-use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_write_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION crash_kv (id TEXT PRIMARY KEY, v INT) WITH (engine='document_strict')",
@@ -51,7 +50,7 @@ async fn committed_write_survives_kill_9() {
 async fn pk_index_and_scan_agree_after_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION ghost_check (id TEXT PRIMARY KEY, title TEXT) \
@@ -105,7 +104,7 @@ async fn pk_index_and_scan_agree_after_kill_9() {
 async fn kv_write_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION crash_kv_engine (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;
@@ -129,7 +128,7 @@ async fn kv_write_survives_kill_9() {
 async fn vector_index_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION crash_vec TYPE document").await;
     h.exec("CREATE VECTOR INDEX idx_crash_vec ON crash_vec (embedding) METRIC cosine DIM 4")
@@ -199,7 +198,7 @@ async fn vector_index_survives_kill_9() {
 async fn spatial_index_survives_kill_9() {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION geo_places (id TEXT, location GEOMETRY SPATIAL_INDEX, name TEXT) \

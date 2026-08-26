@@ -40,8 +40,6 @@
 
 mod crash_harness;
 
-use std::time::Duration;
-
 use crash_harness::CrashHarness;
 
 const COLLECTION: &str = "crash_wedge_ts";
@@ -65,7 +63,7 @@ fn no_incidental_checkpoint() -> CrashHarness {
 async fn ddl_burst_after_boot_does_not_wedge_metadata_applier_on_replay() {
     let mut h = no_incidental_checkpoint();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     // Three catalog-affecting DDL statements, back to back, before any DML —
     // the structural feature every passing crash test lacks. Only the first

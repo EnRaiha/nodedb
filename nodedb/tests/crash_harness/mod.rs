@@ -45,6 +45,13 @@ mod support;
 #[allow(unused_imports)]
 pub use support::direct_io::direct_io_supported;
 
+/// Boot budget for a harness-spawned server.
+///
+/// Generous because a full-workspace run has many test binaries starting
+/// servers at once. The poll returns as soon as `/healthz` is ready, so this
+/// only bounds how long a genuinely stuck boot takes to report.
+pub const BOOT_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     l.local_addr().expect("local_addr").port()
@@ -329,10 +336,10 @@ impl CrashHarness {
     }
 
     /// Block until `/healthz` reports ready, panicking on timeout.
-    pub fn wait_ready(&self, timeout: Duration) {
+    pub fn wait_ready(&self) {
         assert!(
-            wait_for_healthz(self.http_port, timeout),
-            "nodedb did not become ready within {timeout:?}"
+            wait_for_healthz(self.http_port, BOOT_READY_TIMEOUT),
+            "nodedb did not become ready within {BOOT_READY_TIMEOUT:?}"
         );
     }
 
@@ -457,7 +464,7 @@ impl CrashHarness {
     /// boot) and wait for it to become ready.
     pub fn reopen(&mut self) {
         self.spawn();
-        self.wait_ready(Duration::from_secs(20));
+        self.wait_ready();
     }
 }
 

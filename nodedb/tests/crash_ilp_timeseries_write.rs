@@ -134,7 +134,7 @@ async fn ilp_write_visible_to_readers_survives_kill_9() {
     let mut h = no_incidental_checkpoint();
     let spawned_at = Instant::now();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
     // `/healthz` (just polled above) reports ready before the Calvin
     // sequencer has necessarily elected a leader, and the ILP write below
     // has no retry for that race — see the file-level doc comment. Wait for
@@ -275,7 +275,7 @@ async fn many_calvin_writes_survive_immediate_kill_9() {
     let mut h = no_incidental_checkpoint();
     let spawned_at = Instant::now();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
     // Same rationale as the single-write test above: `/healthz` does not
     // imply Calvin has a leader yet, and ILP has no retry for that race.
     h.wait_for_calvin_ready(Duration::from_secs(20)).await;

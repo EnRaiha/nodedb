@@ -123,7 +123,7 @@ fn await_segment_deleted(h: &CrashHarness, segment: &str) {
 async fn kv_row_survives_wal_segment_truncation() {
     let mut h = tuned_harness();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION trunc_kv (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;
@@ -189,7 +189,7 @@ async fn kv_row_survives_wal_segment_truncation() {
 async fn columnar_row_survives_wal_segment_truncation() {
     let mut h = tuned_harness();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION trunc_columnar \

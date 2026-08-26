@@ -142,7 +142,7 @@ async fn dropped_vector_collection_does_not_resurrect_after_restart() {
 
     let mut h = checkpoint_every_second();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(&format!("CREATE COLLECTION {COLLECTION} TYPE document"))
         .await;
@@ -200,7 +200,7 @@ async fn dropped_spatial_collection_does_not_resurrect_after_restart() {
 
     let mut h = checkpoint_every_second();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(&format!(
         "CREATE COLLECTION {COLLECTION} (id TEXT, location GEOMETRY SPATIAL_INDEX, name TEXT) \

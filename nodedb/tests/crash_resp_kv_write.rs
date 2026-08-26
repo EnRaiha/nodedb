@@ -59,7 +59,7 @@ async fn resp_kv_set_survives_kill_9() {
     let mut h = no_incidental_checkpoint();
     let spawned_at = Instant::now();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION resp_kv_survive (id TEXT PRIMARY KEY, val TEXT) \
@@ -129,7 +129,7 @@ async fn http_query_kv_write_survives_kill_9() {
     let mut h = no_incidental_checkpoint();
     let spawned_at = Instant::now();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec(
         "CREATE COLLECTION http_kv_survive (id TEXT PRIMARY KEY, val TEXT) \

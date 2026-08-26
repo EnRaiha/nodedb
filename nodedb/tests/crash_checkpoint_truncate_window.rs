@@ -50,7 +50,7 @@ async fn acknowledged_rows_survive_a_crash_between_checkpoint_marker_and_truncat
             "checkpoint::after_marker_before_truncate=abort",
         );
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION ckpt_window (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;

@@ -154,7 +154,7 @@ fn assert_no_new_integrity_reports(
 async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
     let mut h = CrashHarness::new();
     h.spawn();
-    h.wait_ready(Duration::from_secs(20));
+    h.wait_ready();
 
     h.exec("CREATE COLLECTION replay_kv (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;
