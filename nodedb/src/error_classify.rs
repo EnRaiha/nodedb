@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The one internal [`Error`] to public [`NodeDbError`] mapping table.
-//!
-//! Taken by reference rather than by value because both callers need it and
-//! only one of them owns the error: `From<Error> for NodeDbError` consumes
-//! (the idiomatic shape for a conversion, and the one the whole workspace
-//! already calls), while the native protocol's error frames render a borrowed
-//! `&Error` and need its numeric code to put on the wire. Duplicating the
-//! match for the borrowed case would create a second table that drifts from
-//! this one the first time a variant is added to only one of them — and a
-//! variant missing from the wire-side copy reaches the client as NDB-9000,
-//! indistinguishable from a crashed database. So there is exactly one match,
-//! it borrows, and the consuming `From` impl delegates to it.
+//! The one internal [`Error`] to public [`NodeDbError`] mapping table. Takes
+//! `&Error` since both `From<Error>` (consuming) and the native protocol's
+//! error frames (borrowed) need it — a second table would drift, and a
+//! variant missing from it reaches the client as an indistinguishable NDB-9000.
 
 use nodedb_types::error::NodeDbError;
 
@@ -29,9 +21,7 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::TxnOverlayMemoryExceeded { .. } => NodeDbError::bad_request(e.to_string()),
         Error::OffsetRegression { .. } => NodeDbError::bad_request(e.to_string()),
         Error::DeadlineExceeded { .. } => NodeDbError::deadline_exceeded(),
-        // Nothing applied, and the identical write is expected to succeed
-        // once the transient precondition clears — the same contract as a
-        // write conflict, which callers already retry.
+        // Same contract as a write conflict, which callers already retry.
         Error::RetryableRefusal { reason } => NodeDbError::write_conflict("crdt", reason.clone()),
         Error::ConflictRetry {
             collection,
@@ -54,9 +44,8 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::BalanceViolation {
             collection, detail, ..
         } => NodeDbError::balance_violation(collection.clone(), detail),
-        // A missing target row breaks the balance invariant this collection
-        // maintains, so it surfaces as the same class of violation and
-        // carries the target as the offending collection.
+        // Breaks the balance invariant, so it carries the target as the
+        // offending collection.
         Error::MaterializedSumTargetNotFound {
             target_collection,
             join_column,
@@ -68,10 +57,8 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
                  '{join_column}'"
             ),
         ),
-        // NOT a balance violation: nothing about the user's data is wrong.
-        // The plan and the fold disagreed about which rows participate, so
-        // it surfaces as the internal defect it is rather than accusing the
-        // statement of naming a row that does not exist.
+        // Not a balance violation: the plan and fold disagreed about which
+        // rows participate — a system defect, not a missing row.
         Error::MaterializedSumResolutionMissing { .. } => NodeDbError::internal(e.to_string()),
         Error::PeriodLocked {
             collection, detail, ..
@@ -193,6 +180,7 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::RemoteTyped { code, message } => NodeDbError::remote_typed(*code, message.clone()),
         Error::DescriptorVersionAnomaly { .. } => NodeDbError::internal(e.to_string()),
         Error::CatalogIntegrityViolation { .. } => NodeDbError::internal(e.to_string()),
+        Error::CollectionPurgeRowMissing { .. } => NodeDbError::internal(e.to_string()),
         Error::Promql(promql_err) => NodeDbError::bad_request(promql_err.to_string()),
         Error::DependentObjectsExist {
             tenant_id: _,
@@ -273,11 +261,8 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::OidcNoDefaultDatabase { sub } => NodeDbError::bad_request(format!(
             "OIDC: no default database resolved for sub '{sub}'"
         )),
-        // Preserve typed Data-Plane failures. Exhaustive by construction:
-        // a code that falls through to `internal` reaches the client as
-        // NDB-9000, which is indistinguishable from a crashed database, so
-        // the compiler is made to name every new variant here rather than
-        // letting a catch-all silently degrade it.
+        // Exhaustive by construction: a code falling through to `internal`
+        // reaches the client as an indistinguishable NDB-9000.
         Error::DataPlane(code) => {
             crate::error_from_data_plane::data_plane_code_to_public(code.clone())
         }

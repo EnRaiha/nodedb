@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Forensic payloads for capture sites outside the WAL, grouped by the
+//! subsystem that detects them.
+//!
+//! A grouping key excludes per-occurrence values, so a retry loop files one
+//! report with a rising count instead of one per attempt.
+
+mod catalog;
+mod data_plane;
+mod ingest;
+mod recovery;
+mod write_path;
+
+pub(in crate::diag) use catalog::{
+    CatalogApplyOrphanRow, CollectionPurgeRowMissing, MetadataApplyWedged,
+};
+pub use data_plane::LostResponseWrite;
+pub(in crate::diag) use data_plane::{CalvinCompletionTimeout, DataPlaneResponseLost};
+pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;
+pub use ingest::IlpFlushOutcome;
+pub(in crate::diag) use recovery::ReplayRecordUnapplied;
+pub(in crate::diag) use write_path::{
+    BatchInsertWithoutSurrogates, FtsIndexUpdateFailed, WriteAckedWithoutDurability,
+};

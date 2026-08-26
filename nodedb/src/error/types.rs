@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The `Error` enum: internal actionable errors, grouped by subsystem —
-//! write path, read path, routing, client input, and infrastructure — plus
-//! the crate's `Result<T>` alias built on it.
-//!
-//! This is the crate's single central error type; it is deliberately one
-//! `thiserror` sum type rather than nested per-subsystem enums so that every
-//! existing `match crate::Error::Variant { .. }` across the workspace keeps
-//! resolving unchanged. `From` impls that build an `Error` from
-//! external-crate error types live in [`super::conversions`]; conversions
-//! *out* of `Error` (into the public `NodeDbError`, cluster wire errors,
-//! etc.) live in `crate::error_from`.
+//! write path, read path, routing, client input, infrastructure — plus the
+//! crate's `Result<T>` alias. One `thiserror` sum type, not nested
+//! per-subsystem enums, so `match crate::Error::Variant` keeps resolving.
+//! `From` impls live in [`super::conversions`]; the reverse in `crate::error_from`.
 
 use crate::types::{DatabaseId, RequestId, TenantId, VShardId};
 
@@ -66,14 +60,10 @@ pub enum Error {
     #[error("CRDT delta pre-validation rejected: {constraint} — {reason}")]
     RejectedPrevalidation { constraint: String, reason: String },
 
-    /// Nothing was applied, and the identical frame is expected to succeed once
-    /// a transient precondition resolves.
-    ///
-    /// Distinct from [`Self::RejectedPrevalidation`] and
-    /// [`Self::RejectedConstraint`], which are permanent: a caller that owns a
-    /// retry channel (the sync listener) must surface this as a retryable ack
-    /// rather than a terminal rejection, or the sender abandons a write the
-    /// server is still holding its stream position open for.
+    /// Nothing was applied; the identical frame is expected to succeed once
+    /// a transient precondition resolves. Distinct from
+    /// [`Self::RejectedPrevalidation`]/[`Self::RejectedConstraint`], which
+    /// are permanent — a retry-owning caller must surface this as retryable.
     #[error("write refused without applying, retry the same frame: {reason}")]
     RetryableRefusal { reason: String },
 
@@ -84,15 +74,9 @@ pub enum Error {
     BalanceViolation { collection: String, detail: String },
 
     /// A materialized-sum binding's join key names no row in the target
-    /// collection, so there is no balance to add the delta to.
-    ///
-    /// This fails the statement rather than skipping the row. The stored
-    /// balance is a derived total whose invariant is independently checkable by
-    /// `VERIFY_BALANCE`, which recomputes `SUM(...)` over EVERY source row — a
-    /// silently-skipped row would count toward the recomputed sum but never
-    /// toward the stored balance, so the feature would report itself broken.
-    /// Auto-inserting the target is worse still: it fabricates a target row
-    /// carrying a balance and none of its other columns.
+    /// collection. Fails the statement rather than skipping the row — a
+    /// skipped row would count toward `VERIFY_BALANCE`'s recomputed sum but
+    /// never the stored balance, making the feature report itself broken.
     #[error(
         "materialized sum target not found: no row in '{target_collection}' has primary key \
          '{join_value}', referenced by join column '{join_column}'"
@@ -103,27 +87,9 @@ pub enum Error {
         join_value: String,
     },
 
-    /// A plan reached the write path carrying no target surrogate for a join
-    /// value its own rows require.
-    ///
-    /// Distinct from [`Self::MaterializedSumTargetNotFound`], and never
-    /// interchangeable with it. That error is a verdict about the USER's
-    /// statement: the join key names no row in the target collection, and it is
-    /// reached on the Control Plane, while the statement is still in scope and
-    /// the client is still there to be told. By the time a plan reaches the
-    /// write path, that question has already been answered — a resolution is
-    /// either present or the statement never got here. So a value the fold
-    /// requires and the plan does not carry means the resolution pass and the
-    /// fold disagree about which rows participate, which is a defect in this
-    /// system, not in the statement.
-    ///
-    /// The distinction is load-bearing on a replica. A replica re-executing a
-    /// write the leader accepted has no user to report a user error to, and
-    /// "the target row does not exist" would be a false statement about a row
-    /// the leader resolved successfully. Reporting the internal shortfall as
-    /// what it is keeps a replication defect from being read — by an operator or
-    /// by an error-code consumer — as the application referencing a missing
-    /// account.
+    /// A plan reached the write path carrying no target surrogate a fold
+    /// requires. Distinct from [`Self::MaterializedSumTargetNotFound`] (a
+    /// user-statement verdict): this is a system defect, not a missing row.
     #[error(
         "materialized sum resolution missing: the plan carries no target row in \
          '{target_collection}' for join value '{join_value}' of join column '{join_column}', \
@@ -277,10 +243,8 @@ pub enum Error {
     #[error("function {name}(...) does not exist")]
     UndefinedFunction { name: String },
 
-    /// Expression evaluation divided or took a modulus by zero. Propagated
-    /// from the row-expression evaluator (`nodedb_query::EvalError::DivisionByZero`)
-    /// and the procedural executor's constant folder; the pgwire layer
-    /// renders this as SQLSTATE `22012` (division_by_zero).
+    /// Expression evaluation divided or took a modulus by zero. Rendered as
+    /// SQLSTATE `22012` (division_by_zero) at the pgwire layer.
     #[error("division by zero")]
     DivisionByZero,
 
@@ -294,10 +258,8 @@ pub enum Error {
     )]
     RetryableLeaderChange { group_id: u64, log_index: u64 },
 
-    /// No leader is elected on the metadata group yet, so a proposal cannot be
-    /// routed. Transient by construction — an election is in progress, most
-    /// often right after a restart — and distinct from a durable failure so
-    /// callers can wait it out instead of failing the statement.
+    /// No leader elected on the metadata group yet. Transient — an election
+    /// is in progress — so callers can wait it out instead of failing.
     #[error("metadata raft group has no elected leader yet; retry needed")]
     MetadataLeaderUnavailable,
 
@@ -378,11 +340,22 @@ pub enum Error {
         prior: u64,
     },
 
+    /// A collection purge found no catalog row to deactivate, so the
+    /// fail-closed CREATE/UNDROP barrier was never written — the lookup key
+    /// and stored key disagree, or another writer removed it concurrently.
+    #[error(
+        "purge of collection '{name}' (database {database_id}, tenant {tenant_id}) \
+         found no catalog row to deactivate"
+    )]
+    CollectionPurgeRowMissing {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
+
     /// A `catalog_entry::apply_to` call left redb with a `Put*` primary row
-    /// that has no matching `StoredOwner` row, or vice versa — the
-    /// `verify_redb_integrity` `OrphanRow` class. Fails the metadata apply
-    /// closed rather than persisting the orphan and leaving it for the next
-    /// restart's boot-time verifier to find.
+    /// with no matching `StoredOwner`, or vice versa. Fails closed rather
+    /// than persisting the orphan for the next boot verifier to find.
     #[error("catalog_entry::apply_to({entry_kind}) left an orphaned catalog row: {detail}")]
     CatalogIntegrityViolation { entry_kind: String, detail: String },
 
@@ -477,9 +450,7 @@ pub enum Error {
     TenantGraphDepthExceeded { depth: u32, limit: u32 },
 
     /// A GRANT ROLE would create a cycle in the role inheritance graph.
-    ///
-    /// NodeDB enforces a DAG at write time so `resolve_inheritance` never
-    /// needs runtime cycle detection.
+    /// Enforced at write time so `resolve_inheritance` needs no runtime check.
     #[error(
         "role inheritance cycle: granting '{parent}' as parent of '{child}' would create a cycle"
     )]
@@ -490,10 +461,8 @@ pub enum Error {
     #[error("role inheritance depth {depth} exceeds the maximum allowed depth of {limit}")]
     RoleInheritanceDepthExceeded { depth: usize, limit: usize },
 
-    /// The OLLP dependent-read retry loop exhausted its retry budget.
-    ///
-    /// The predicate's matching set kept changing across retries. Consider
-    /// rephrasing as a static-key UPDATE if possible.
+    /// The OLLP dependent-read retry loop exhausted its budget — the
+    /// predicate's matching set kept changing across retries.
     #[error(
         "OLLP dependent-read exhausted {retries} retries; the predicate's matching set kept \
          changing across retries. Consider rephrasing as a static-key UPDATE if possible."
@@ -504,10 +473,8 @@ pub enum Error {
     #[error("database '{database}' is a read-only mirror; promote it before writing")]
     MirrorReadOnly { database: String },
 
-    /// A strong-consistency read was attempted on a mirror database.
-    ///
-    /// Mirrors cannot serve strong reads because they are not the Raft leader
-    /// for the source's commit log. The client should redirect to the source cluster.
+    /// A strong-consistency read was attempted on a mirror database. Mirrors
+    /// aren't the Raft leader for the source's commit log.
     #[error(
         "database '{database}' is a mirror; redirect strong reads to source cluster '{source_cluster}'"
     )]

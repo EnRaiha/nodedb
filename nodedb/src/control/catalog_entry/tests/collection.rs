@@ -70,10 +70,8 @@ fn apply_deactivate_collection_preserves_record() {
     let (credentials, _tmp) = open_catalog();
     let catalog = credentials.catalog();
 
-    // Set up through `apply_to` so the owner row is written
-    // alongside the primary row — deactivate would otherwise
-    // trip the debug-build integrity check on an orphan
-    // collection left over from the direct `put_collection`.
+    // Set up through `apply_to` so the owner row is written alongside the
+    // primary row, avoiding an orphan-row integrity trip on deactivate.
     let stored = StoredCollection::new(1, "archived", "carol");
     apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
         .expect("apply put_collection");
@@ -106,10 +104,8 @@ fn purge_collection_is_scoped_to_database() {
         .expect("apply put_collection");
     apply_to(&CatalogEntry::PutCollection(Box::new(other)), catalog).expect("apply put_collection");
 
-    // A `PurgeCollection` apply only deactivates the catalog row (the
-    // crash-durable same-name barrier); the row/owner/surrogate deletion is the
-    // `finalize_purge` half that runs once storage reclaim succeeds. Drive both
-    // to assert the delete is scoped to the target database.
+    // `PurgeCollection` only deactivates the row; `finalize_purge` deletes it.
+    // Drive both to assert the delete is scoped to the target database.
     apply_to(
         &CatalogEntry::PurgeCollection {
             database_id: 9,
@@ -157,5 +153,89 @@ fn apply_deactivate_missing_is_noop() {
             .get_collection(DatabaseId::DEFAULT, 1, "ghost")
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn prepare_purge_reports_the_row_it_deactivated() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let stored = StoredCollection::new(1, "orders", "tester");
+    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
+
+    let found =
+        crate::control::catalog_entry::apply::collection::prepare_purge(0, 1, "orders", catalog)
+            .expect("prepare purge");
+    assert!(found);
+    assert!(
+        !catalog
+            .get_collection(DatabaseId::DEFAULT, 1, "orders")
+            .unwrap()
+            .expect("row preserved")
+            .is_active
+    );
+}
+
+/// The replicated applier runs on nodes that may never have held the row, so
+/// `prepare_purge` reports the miss instead of raising.
+#[test]
+fn prepare_purge_reports_a_missing_row_without_raising() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let found =
+        crate::control::catalog_entry::apply::collection::prepare_purge(0, 1, "ghost", catalog)
+            .expect("missing row is not a read failure");
+    assert!(!found);
+}
+
+/// A collection stored under the default database is invisible to a purge
+/// looking under another one. The checked variant must not report success.
+#[test]
+fn prepare_purge_checked_rejects_a_database_id_that_holds_no_row() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let stored = StoredCollection::new(1, "orders", "tester");
+    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
+
+    let err = crate::control::catalog_entry::apply::collection::prepare_purge_checked(
+        1024, 1, "orders", catalog,
+    )
+    .expect_err("a purge that deactivates nothing must not report success");
+    assert!(matches!(
+        err,
+        crate::Error::CollectionPurgeRowMissing {
+            database_id: 1024,
+            tenant_id: 1,
+            ..
+        }
+    ));
+    // The row under the database that actually holds it is untouched.
+    assert!(
+        catalog
+            .get_collection(DatabaseId::DEFAULT, 1, "orders")
+            .unwrap()
+            .expect("row preserved")
+            .is_active
+    );
+}
+
+#[test]
+fn prepare_purge_checked_accepts_the_database_that_holds_the_row() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let mut stored = StoredCollection::new(1, "orders", "tester");
+    stored.database_id = DatabaseId::new(1024);
+    apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
+
+    crate::control::catalog_entry::apply::collection::prepare_purge_checked(
+        1024, 1, "orders", catalog,
+    )
+    .expect("prepare purge under the owning database");
+    assert!(
+        !catalog
+            .get_collection(DatabaseId::new(1024), 1, "orders")
+            .unwrap()
+            .expect("row preserved")
+            .is_active
     );
 }

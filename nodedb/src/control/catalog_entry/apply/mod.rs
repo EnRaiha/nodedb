@@ -3,11 +3,8 @@
 //! Synchronous host-side application of a [`CatalogEntry`] to
 //! `SystemCatalog` redb — dispatched by DDL family.
 //!
-//! The top-level [`apply_to`] is an exhaustive match that routes
-//! each variant to a typed function in a per-family sibling file.
-//! Adding a new variant forces this file to grow by one line (the
-//! match arm) and the corresponding family file by one function —
-//! never grows unboundedly.
+//! [`apply_to`] is an exhaustive match routing each variant to a typed
+//! function in a per-family sibling file, one match arm per variant.
 
 pub mod api_key;
 pub mod auth_user;
@@ -37,29 +34,18 @@ pub mod trigger;
 pub mod user;
 pub mod wal_tombstone;
 
+use tracing::debug;
+
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
-/// Apply `entry` to `catalog`. Most per-variant errors are logged and
-/// swallowed so startup replay can retry them. Compound lifecycle mutations
-/// whose partial application would expose stale object state (currently
-/// materialized-view definition + target deletion) fail closed by panicking
-/// the applying node.
+/// Apply `entry` to `catalog`.
 ///
-/// Debug builds run the full referential-integrity verifier after every
-/// apply and fail closed with [`crate::Error::CatalogIntegrityViolation`] on
-/// any violation. This catches the "forgot-to-write-the-owner-row" class of
-/// bug on the first DDL a developer runs instead of deferring to the next
-/// restart, so reviewers don't need to rely on a user report to surface
-/// half-finished sync work.
-///
-/// Release builds skip the check. `verify_redb_integrity` re-scans the
-/// WHOLE catalog on every call (`load_all_collections_across_databases` and
-/// siblings), not just the entry just applied, so turning it on
-/// unconditionally would let a pre-existing orphan from before this build's
-/// fix — not anything the current apply did — wedge `raft_tick_loop` on a
-/// node that starts from old state. Keep it debug-only until the check is
-/// scoped to the entry's own object.
+/// Per-variant errors are logged and swallowed so startup replay can retry.
+/// A compound mutation whose partial application would expose stale state
+/// panics the applying node instead. Debug builds verify referential
+/// integrity after every apply — release-gated because a full rescan would
+/// wedge `raft_tick_loop` on a node with a pre-existing orphan.
 pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<bool, crate::Error> {
     let applied = match entry {
         CatalogEntry::PutTenantWithAdmin { tenant, admin } => {
@@ -75,12 +61,9 @@ pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<bool, c
     }
     #[cfg(debug_assertions)]
     {
-        // Narrow to OrphanRow — the "half-finished sync" class this
-        // check exists to catch (a primary row written without its
-        // owner row, or vice versa). DanglingReference is test-fixture
-        // hygiene (e.g. a test owner with no StoredUser backing) and
-        // legitimate startup state — leave those to the full
-        // startup-time verifier.
+        // Narrow to OrphanRow (primary row without owner row, or vice versa).
+        // DanglingReference is test-fixture hygiene / legitimate startup
+        // state — leave those to the full startup-time verifier.
         use crate::control::cluster::recovery_check::divergence::DivergenceKind;
         let orphans: Vec<_> =
             crate::control::cluster::recovery_check::integrity::verify_redb_integrity(catalog)
@@ -118,11 +101,18 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             tenant_id,
             name,
         } => {
-            // Preserve an inactive catalog row until synchronous post-apply
-            // storage reclaim succeeds. This row is the restart-durable
-            // same-name lifecycle barrier.
-            if let Err(error) = collection::prepare_purge(*database_id, *tenant_id, name, catalog) {
-                panic!("collection catalog purge preparation failed: {error}");
+            // Preserve an inactive row until post-apply storage reclaim
+            // succeeds — the restart-durable same-name lifecycle barrier.
+            match collection::prepare_purge(*database_id, *tenant_id, name, catalog) {
+                // A node that never held the row has nothing to fence.
+                // Interactive purge paths use `prepare_purge_checked` instead.
+                Ok(found) => debug!(
+                    collection = %name,
+                    tenant = *tenant_id,
+                    found,
+                    "catalog_entry: purge preparation"
+                ),
+                Err(error) => panic!("collection catalog purge preparation failed: {error}"),
             }
         }
         CatalogEntry::PutSequence(stored) => sequence::put(stored, catalog),

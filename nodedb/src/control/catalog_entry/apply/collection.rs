@@ -64,14 +64,10 @@ fn set_index_visibility(
     }
 }
 
-/// Create-only variant of [`put`]: writes the collection (and its
-/// owner row) exactly as `put` does, but ONLY when no collection with
-/// the same `(database_id, tenant_id, name)` already exists. If one is
-/// present, this is a no-op — the existing schema is never clobbered.
-///
-/// The existence check is the ONLY behavioral difference from `put`;
-/// the create path mirrors `put`'s body precisely so replay/snapshot
-/// re-application stays idempotent.
+/// Create-only variant of [`put`]: writes the collection (and its owner row)
+/// exactly as `put` does, but only when no collection with the same
+/// `(database_id, tenant_id, name)` already exists — a no-op otherwise, so
+/// replay/snapshot re-application stays idempotent.
 pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
     match catalog.put_collection_if_absent(stored.database_id, stored) {
         Ok(true) => super::owner::put_parent_owner_in_database(
@@ -97,23 +93,49 @@ pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
 }
 
 /// Persist the fail-closed catalog half of a purge before touching storage.
-/// The inactive row survives crashes and prevents same-name CREATE/UNDROP from
-/// crossing an incomplete reclaim.
+/// The inactive row survives crashes and blocks a same-name CREATE/UNDROP
+/// from crossing an incomplete reclaim.
+///
+/// Returns whether a row was found and deactivated. `false` is legitimate
+/// only for the replicated applier (may never have held the row) — a caller
+/// that already read the row must use [`prepare_purge_checked`] instead.
 pub fn prepare_purge(
     database_id: u64,
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let database_id = DatabaseId::new(database_id);
-    if let Some(mut stored) = catalog.get_collection(database_id, tenant_id, name)? {
-        stored.is_active = false;
-        catalog.put_collection(database_id, &stored)?;
-        // Hide the indexes for the window between the fail-closed row write and
-        // `finalize_purge`, which removes their records outright.
-        set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
+    let Some(mut stored) = catalog.get_collection(database_id, tenant_id, name)? else {
+        return Ok(false);
+    };
+    stored.is_active = false;
+    catalog.put_collection(database_id, &stored)?;
+    // Hide the indexes for the window between the fail-closed row write and
+    // `finalize_purge`, which removes their records outright.
+    set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
+    Ok(true)
+}
+
+/// Fail-closed [`prepare_purge`] for callers that resolved the collection
+/// before asking for the purge. A miss is never benign: the reclaim would run
+/// while the row is active and a same-name CREATE could register over keys
+/// the old incarnation still owns. Raises rather than reporting success.
+pub fn prepare_purge_checked(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    if prepare_purge(database_id, tenant_id, name, catalog)? {
+        return Ok(());
     }
-    Ok(())
+    crate::diag::collection_purge_row_missing(database_id, tenant_id, name);
+    Err(crate::Error::CollectionPurgeRowMissing {
+        database_id,
+        tenant_id,
+        name: name.to_string(),
+    })
 }
 
 /// Remove catalog metadata only after every persistent engine surface has been
@@ -215,14 +237,7 @@ pub fn deactivate(database_id: u64, tenant_id: u64, name: &str, catalog: &System
             "catalog_entry: deactivate_collection get failed"
         ),
     }
-    // Intentionally preserve the `StoredOwner` row on soft-delete.
-    // The primary `StoredCollection` record is kept for audit and
-    // undrop (see `CatalogEntry::DeactivateCollection` doc and
-    // `ddl/collection/drop.rs`). Stripping the owner row would
-    // split truth from the preserved primary row whose
-    // `stored.owner` is still populated, and would break any
-    // future `UNDROP COLLECTION` by requiring admin to restore
-    // ownership that was still knowable from the primary. Hard
-    // deletion of the collection (not wired today) would remove
-    // both halves via `delete_parent_owner`.
+    // Intentionally preserve the `StoredOwner` row on soft-delete: the
+    // primary record's `owner` field stays populated, and stripping the
+    // owner row would break `UNDROP COLLECTION`'s ownership restore.
 }

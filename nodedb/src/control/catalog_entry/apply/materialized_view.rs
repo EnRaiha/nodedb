@@ -2,7 +2,7 @@
 
 //! Apply MaterializedView catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::{StoredMaterializedView, SystemCatalog};
@@ -34,8 +34,14 @@ pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Res
         catalog,
     )?;
 
-    // Preserve the target as inactive until synchronous post-apply reclaim
-    // succeeds. Its row is the restart-durable ownership/lifecycle barrier.
-    super::collection::prepare_purge(0, tenant_id, name, catalog)?;
+    // Preserve the target as inactive until post-apply reclaim succeeds.
+    // Materialized views carry no database, so lookup uses the default one.
+    let found = super::collection::prepare_purge(0, tenant_id, name, catalog)?;
+    debug!(
+        view = %name,
+        tenant = tenant_id,
+        found,
+        "catalog_entry: materialized view target purge preparation"
+    );
     Ok(())
 }
