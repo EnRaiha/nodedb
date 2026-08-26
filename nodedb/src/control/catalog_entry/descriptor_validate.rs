@@ -19,7 +19,9 @@ pub enum ValidationOutcome {
 /// Validate every descriptor-bearing `Put*` entry against the locally
 /// persisted version before applying it. Historical replay is idempotent for
 /// all descriptor families, while equal-version conflicts and forward gaps
-/// remain loud anomalies.
+/// remain loud anomalies. A create (carried version 1) carrying a strictly
+/// newer clock is the one exception: it is a recreate of the same name and
+/// applies over the incarnation this node still holds.
 pub fn validate(
     entry: &CatalogEntry,
     catalog: &SystemCatalog,
@@ -179,19 +181,18 @@ fn validate_one<T: zerompk::ToMessagePack>(
     if carried == 0 {
         return Ok(ValidationOutcome::Apply);
     }
-    // A recreated descriptor restarts its numeric version namespace. Once a
-    // newer lifecycle is persisted, every older-HLC record is historical even
-    // if its old numeric version is greater than the recreated version.
+    // An older clock is a prior incarnation, whatever its version number.
     if current.is_some() && incoming_hlc < current_hlc {
         return Ok(ValidationOutcome::AlreadyApplied);
     }
-    // A lower carried version is a stale historical replay only when its clock
-    // is not ahead of the persisted record (older or equal — legacy records
-    // predating HLC stamping share the ZERO clock). A regressed version paired
-    // with a strictly newer HLC is a genuine anomaly (a corrupted or misordered
-    // proposal, a stamping race) and must fall through to be rejected loudly.
+    // A regressed version is a stale replay only if its clock is not ahead.
+    // Legacy records predating HLC stamping share the ZERO clock.
     if carried < prior && incoming_hlc <= current_hlc {
         return Ok(ValidationOutcome::AlreadyApplied);
+    }
+    // The stamp emits 1 only when no prior row existed — a later incarnation.
+    if carried == 1 && incoming_hlc > current_hlc {
+        return Ok(ValidationOutcome::Apply);
     }
     if carried == prior {
         let same_payload = current
@@ -418,15 +419,103 @@ mod tests {
             .put_collection(DatabaseId::DEFAULT, &persisted)
             .expect("seed persisted collection");
 
-        // The replicated entry at version 1 carried only `host`. A local write
-        // that appended `cpu` without advancing the version makes the two
-        // disagree about what version 1 means, which is a genuine divergence
-        // and must stay an error — any schema projection an ingest path infers
-        // has to travel as its own descriptor version instead.
+        // A local write that appended `cpu` without advancing the version
+        // makes the two disagree about what version 1 means — a genuine
+        // divergence that must stay an error.
         let mut replicated = persisted.clone();
         replicated.fields = vec![("host".to_owned(), "VARCHAR".to_owned())];
         let err = validate(&CatalogEntry::PutCollection(Box::new(replicated)), catalog)
             .expect_err("locally mutated payload at the same version must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::DescriptorVersionAnomaly {
+                carried: 1,
+                prior: 1,
+                ..
+            }
+        ));
+    }
+
+    /// CREATE → DROP → re-CREATE of the same name. The re-create's stamp saw
+    /// no prior row, so it carries version 1 with a strictly newer clock while
+    /// this node still holds the first incarnation at version 1.
+    #[test]
+    fn validate_applies_recreate_at_version_one_with_newer_clock() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "tester");
+        current.descriptor_version = 1;
+        current.modification_hlc = nodedb_types::Hlc::new(1_787_734_007_496_107_753, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed first incarnation");
+
+        let mut recreated = current.clone();
+        recreated.modification_hlc = nodedb_types::Hlc::new(1_787_734_009_023_967_051, 0);
+        assert!(matches!(
+            validate(&CatalogEntry::PutCollection(Box::new(recreated)), catalog),
+            Ok(ValidationOutcome::Apply)
+        ));
+    }
+
+    /// Same re-create, but the DROP did deactivate the persisted row first.
+    #[test]
+    fn validate_applies_recreate_over_deactivated_row() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "tester");
+        current.descriptor_version = 1;
+        current.is_active = false;
+        current.modification_hlc = nodedb_types::Hlc::new(10, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed soft-dropped incarnation");
+
+        let mut recreated = current.clone();
+        recreated.is_active = true;
+        recreated.modification_hlc = nodedb_types::Hlc::new(20, 0);
+        assert!(matches!(
+            validate(&CatalogEntry::PutCollection(Box::new(recreated)), catalog),
+            Ok(ValidationOutcome::Apply)
+        ));
+    }
+
+    /// Re-delivery of the identical stamped entry: equal clock, byte-identical
+    /// payload. Idempotent, and never reaches the recreate branch.
+    #[test]
+    fn validate_acknowledges_stamped_redelivery_at_equal_clock() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "tester");
+        current.descriptor_version = 1;
+        current.modification_hlc = nodedb_types::Hlc::new(1_787_734_007_496_107_753, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed stamped record");
+
+        assert!(matches!(
+            validate(&CatalogEntry::PutCollection(Box::new(current)), catalog),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
+    }
+
+    /// A version-1 divergence with no clock advance stays a loud anomaly: the
+    /// recreate carve-out needs a strictly newer clock, not just version 1.
+    #[test]
+    fn validate_rejects_version_one_divergence_at_equal_clock() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "first");
+        current.descriptor_version = 1;
+        current.modification_hlc = nodedb_types::Hlc::new(10, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed current collection");
+
+        let mut divergent = current;
+        divergent.owner = "second".into();
+        let err = validate(&CatalogEntry::PutCollection(Box::new(divergent)), catalog)
+            .expect_err("equal-clock version-1 divergence must be rejected");
         assert!(matches!(
             err,
             crate::Error::DescriptorVersionAnomaly {
