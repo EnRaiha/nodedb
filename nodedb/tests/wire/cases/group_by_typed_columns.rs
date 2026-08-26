@@ -11,9 +11,7 @@
 //! and the non-null count (the value must still resolve under the raw grouped
 //! column key).
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// `SELECT k AS label, COUNT(*) AS n FROM t GROUP BY k` must:
 /// - return the aliases `label` and `n` as the column NAMES (not `k`/`count`),

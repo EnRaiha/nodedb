@@ -5,9 +5,7 @@
 //! fresh scan/AS-OF read and via the PK point-lookup path (which must not
 //! be served a stale post-op value from any point-lookup cache).
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 async fn create_bitemporal(srv: &TestServer, name: &str) {
     srv.exec(&format!(

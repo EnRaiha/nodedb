@@ -2,9 +2,7 @@
 
 //! PostgreSQL-compatible RESET behavior for mutable session parameters.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn reset_unknown_parameter_is_rejected() {

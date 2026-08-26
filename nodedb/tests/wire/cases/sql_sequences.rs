@@ -2,9 +2,7 @@
 
 //! Integration tests for sequences: CREATE/DROP/ALTER/SHOW SEQUENCE, SERIAL.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_drop_sequence() {

@@ -9,8 +9,7 @@
 //! columns (and, being prepended, shifted the user columns). This test asserts
 //! the user-facing projection contains exactly the declared user columns.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_bitemporal_select_star_hides_reserved_columns() {

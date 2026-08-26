@@ -2,9 +2,7 @@
 
 //! Integration tests for temporary tables.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_temp_table_and_drop() {

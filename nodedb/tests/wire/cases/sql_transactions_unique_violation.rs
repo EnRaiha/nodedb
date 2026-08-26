@@ -4,9 +4,7 @@
 //! rejected with SQLSTATE 23505, exactly as it is outside a transaction —
 //! a transaction context must not silently accept a duplicate PK insert.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tx_duplicate_pk_insert_raises_unique_violation() {

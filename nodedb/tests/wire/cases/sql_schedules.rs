@@ -2,9 +2,7 @@
 
 //! Integration tests for scheduled jobs.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_alter_drop_schedule() {

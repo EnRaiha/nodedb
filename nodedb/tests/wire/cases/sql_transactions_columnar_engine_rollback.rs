@@ -16,8 +16,7 @@
 //! autocommit INSERT into a brand-new collection still creates and keeps its
 //! engine (the untouched non-transactional path).
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 use tokio_postgres::SimpleQueryMessage;
 

@@ -8,8 +8,7 @@
 //! routes to `VectorOp::SparseSearch`, returning the `k` documents with the
 //! highest dot-product score against the query vector.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn order_by_sparse_score_ranks_by_dot_product() {

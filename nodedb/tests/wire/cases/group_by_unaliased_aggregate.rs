@@ -6,9 +6,7 @@
 //! when an aggregate is the leading select item, and (3) an unaliased
 //! aggregate must serialize its computed value, not an empty cell.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 async fn setup() -> TestServer {

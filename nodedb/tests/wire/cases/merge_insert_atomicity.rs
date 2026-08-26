@@ -17,9 +17,7 @@
 //! `a`.n would already be 100 when the insert failed — the update would survive
 //! the abort.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_update_plus_failing_insert_is_all_or_nothing() {

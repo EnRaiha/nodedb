@@ -7,9 +7,7 @@
 //! from the CP planner through the SPSC bridge to the DP handler and that
 //! the correct row is returned.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spatial_sql_query_returns_correct_row() {

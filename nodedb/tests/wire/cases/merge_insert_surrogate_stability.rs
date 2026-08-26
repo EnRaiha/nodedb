@@ -19,9 +19,7 @@
 //! stored but neither is in the HNSW index, so the vector searches return
 //! nothing. Either way an assertion below fails.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_insert_two_rows_get_distinct_stable_identity() {

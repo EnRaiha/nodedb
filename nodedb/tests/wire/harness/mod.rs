@@ -19,7 +19,7 @@ pub mod insert_returning_engines;
 
 // The harness deliberately mirrors the whole `TestServer` API surface that
 // `nodedb-test-support::pgwire_harness` exposes, so porting a test file is an
-// import swap and nothing else. Only 10 of the 247 files have moved so far, so
+// import swap and nothing else. Only part of `tests/*.rs` has moved so far, so
 // parts of that surface have no caller yet. Same reason the in-process harness
 // carries this attribute.
 #[allow(unused_imports)]

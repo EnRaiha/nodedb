@@ -3,9 +3,7 @@
 //! End-to-end tests for function security: CREATE/DROP lifecycle,
 //! DML rejection in function bodies, procedural UDF compilation.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// CREATE FUNCTION succeeds and DROP FUNCTION removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

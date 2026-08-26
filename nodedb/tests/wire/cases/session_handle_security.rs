@@ -17,9 +17,7 @@
 //! 100 attempts), and passes once the rate-limit + audit plumbing lands,
 //! regardless of how the fix is shaped internally.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn set_local_auth_session_flood_closes_connection() {

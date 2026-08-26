@@ -1,39 +1,39 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression twin of `strict_bitemporal_audit_query`: the `AS OF SYSTEM TIME
-//! NULL` (all-versions / audit-log) query on a `document_schemaless` collection
-//! created `WITH (bitemporal=true)` must surface the identical uniform triple of
-//! synthetic user-facing temporal columns (`_ts_system`, `_ts_valid_from`,
-//! `_ts_valid_until`) that the strict engine and columnar/timeseries emit, read
-//! from the row's real stored temporal data. User columns must survive and the
-//! raw reserved bitemporal columns must not leak into the audit output.
+//! Regression: `AS OF SYSTEM TIME NULL` (the all-versions / audit-log query)
+//! on a `document_strict` collection created `WITH (bitemporal=true)` used to
+//! silently drop every user column. The audit-log scan handler treated the
+//! stored row body as MessagePack, but strict bitemporal rows store a Binary
+//! Tuple — decoding it as msgpack yields a non-object `Value`, which the old
+//! code silently swallowed into an empty object carrying only the synthetic
+//! `_ts_system` column. This test asserts the user columns survive and the
+//! raw reserved bitemporal columns do not leak into the audit output.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn schemaless_bitemporal_audit_query_surfaces_uniform_temporal_columns() {
+async fn strict_bitemporal_audit_query_preserves_user_columns() {
     let srv = TestServer::start().await;
 
     srv.exec(
-        "CREATE COLLECTION bt_audit_sl (id STRING PRIMARY KEY, value STRING) \
-         WITH (engine='document_schemaless', bitemporal=true)",
+        "CREATE COLLECTION bt_audit (id STRING PRIMARY KEY, value STRING) \
+         WITH (engine='document_strict', bitemporal=true)",
     )
     .await
-    .expect("create schemaless bitemporal collection");
+    .expect("create strict bitemporal collection");
 
-    srv.exec("INSERT INTO bt_audit_sl (id, value) VALUES ('r1', 'hello')")
+    srv.exec("INSERT INTO bt_audit (id, value) VALUES ('r1', 'hello')")
         .await
         .expect("insert row");
 
-    srv.exec("UPDATE bt_audit_sl SET value = 'world' WHERE id = 'r1'")
+    srv.exec("UPDATE bt_audit SET value = 'world' WHERE id = 'r1'")
         .await
         .expect("update row to create a second system-time version");
 
     let rows = srv
-        .query_named_rows("SELECT * FROM bt_audit_sl AS OF SYSTEM TIME NULL")
+        .query_named_rows("SELECT * FROM bt_audit AS OF SYSTEM TIME NULL")
         .await
-        .expect("select audit-log (all versions) from schemaless bitemporal collection");
+        .expect("select audit-log (all versions) from strict bitemporal collection");
 
     assert_eq!(
         rows.len(),

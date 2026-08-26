@@ -13,8 +13,7 @@
 //! This is a regression guard: a prior bug truncated multi-chunk scans to
 //! `stream_chunk_size` rows because only the first frame was consumed.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 use std::collections::HashSet;
 

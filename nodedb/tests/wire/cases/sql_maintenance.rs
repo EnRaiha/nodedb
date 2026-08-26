@@ -2,9 +2,7 @@
 
 //! Integration tests for maintenance commands: ANALYZE, COMPACT, REINDEX, SHOW STORAGE.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn analyze_collection() {

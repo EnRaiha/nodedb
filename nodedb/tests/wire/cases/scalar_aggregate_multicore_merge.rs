@@ -12,9 +12,7 @@
 //! one. The fix routes single-vShard-homed plans to their one owning core.
 //! A single-core harness masks the bug, so these tests drive an 8-core server.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scalar_count_star_merges_to_one_row_multicore() {

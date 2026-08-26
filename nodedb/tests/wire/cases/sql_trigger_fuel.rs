@@ -6,11 +6,9 @@
 //! Control Plane worker for the full 3600-second deadline. The execution
 //! budget must cap iterations and wall-clock time to a reasonable bound.
 
-mod common;
-
 use std::time::{Duration, Instant};
 
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// An infinite-loop trigger body must be terminated by the execution budget
 /// within a reasonable time (< 30 seconds), not the 1-hour wall clock.

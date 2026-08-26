@@ -124,11 +124,12 @@ pub(super) fn spawn(
     data_dir: &Path,
     auth_mode: AuthMode,
     columnar_flush_threshold: Option<usize>,
+    cores: usize,
 ) -> SpawnedServer {
     let config_path = config_toml::write_config(data_dir, auth_mode, columnar_flush_threshold);
     let mut last_failure = String::new();
     for _ in 0..START_ATTEMPTS {
-        match try_spawn(data_dir, &config_path) {
+        match try_spawn(data_dir, &config_path, cores) {
             Ok(server) => return server,
             Err((reason, log)) => last_failure = format!("{reason}\n--- server log ---\n{log}"),
         }
@@ -140,7 +141,11 @@ pub(super) fn spawn(
 const START_ATTEMPTS: u32 = 3;
 
 /// One spawn attempt. `Err` carries the reason and the server's own log.
-fn try_spawn(data_dir: &Path, config_path: &Path) -> Result<SpawnedServer, (String, String)> {
+fn try_spawn(
+    data_dir: &Path,
+    config_path: &Path,
+    cores: usize,
+) -> Result<SpawnedServer, (String, String)> {
     let ports = ServerPorts::allocate();
 
     let log_path = data_dir.join("server.log");
@@ -153,7 +158,7 @@ fn try_spawn(data_dir: &Path, config_path: &Path) -> Result<SpawnedServer, (Stri
 
     let child = Command::new(env!("CARGO_BIN_EXE_nodedb"))
         .env("NODEDB_DATA_DIR", data_dir)
-        .env("NODEDB_DATA_PLANE_CORES", "1")
+        .env("NODEDB_DATA_PLANE_CORES", cores.to_string())
         .env("NODEDB_CONFIG", config_path)
         .env("NODEDB_PORT_HTTP", ports.http.to_string())
         .env("NODEDB_PORT_PGWIRE", ports.pgwire.to_string())

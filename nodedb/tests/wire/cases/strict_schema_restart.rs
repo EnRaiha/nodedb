@@ -13,8 +13,7 @@
 //! asserts that the original typed column values — not just the row count —
 //! survive a graceful shutdown + reopen of the same data directory.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn strict_collection_columns_survive_restart() {

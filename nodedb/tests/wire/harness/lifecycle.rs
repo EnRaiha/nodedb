@@ -16,7 +16,16 @@ impl TestServer {
     /// Spawn a single-core NodeDB server and connect via pgwire (trust mode).
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, None);
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);
+        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
+    }
+
+    /// Spawn a NodeDB server with `cores` Data Plane cores and connect via
+    /// pgwire (trust mode). Exercises fan-out/gather across cores, which a
+    /// single-core server cannot.
+    pub async fn start_multicores(cores: usize) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, cores);
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -27,7 +36,7 @@ impl TestServer {
     /// client authenticates with it.
     pub async fn start_password() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Password, None);
+        let spawned = process::spawn(dir.path(), AuthMode::Password, None, 1);
         Self::connect_and_build(spawned, dir, AuthMode::Password).await
     }
 
@@ -36,7 +45,7 @@ impl TestServer {
     /// behaviour on small datasets without inserting 65k rows.
     pub async fn start_with_columnar_flush_threshold(flush_threshold: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold));
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold), 1);
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -48,7 +57,7 @@ impl TestServer {
     /// caller, who gets it back unchanged, exactly as
     /// `nodedb-test-support::pgwire_harness::TestServer::open_on_path` does.
     pub async fn open_on_path(dir: TestDataDir) -> (Self, TestDataDir) {
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, None);
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
         (server, dir)
@@ -61,7 +70,7 @@ impl TestServer {
         dir: TestDataDir,
         flush_threshold: usize,
     ) -> (Self, TestDataDir) {
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold));
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold), 1);
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
         (server, dir)
