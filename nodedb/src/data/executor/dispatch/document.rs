@@ -238,39 +238,9 @@ impl CoreLoop {
                 },
             ),
 
-            DocumentOp::UpdateFromJoin {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                updates,
-                target_filters,
-                returning,
-                resolve_only,
-                source_rows,
-                rls_filters,
-                rls_write_check,
-                resolved_sum_targets,
-            } => self.execute_update_from_join(
-                task,
-                tid,
-                super::super::handlers::update_from_join::UpdateFromJoinParams {
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    updates,
-                    target_filter_bytes: target_filters,
-                    returning: returning.as_ref(),
-                    resolve_only: *resolve_only,
-                    source_rows: source_rows.as_deref(),
-                    rls_filters,
-                    rls_write_check,
-                    resolved_sum_targets,
-                },
-            ),
+            DocumentOp::UpdateFromJoin { .. } => {
+                self.dispatch_update_from_join(task, tid, op, false)
+            }
 
             DocumentOp::BulkUpdate {
                 collection,
@@ -439,39 +409,11 @@ impl CoreLoop {
                 self.execute_drop_document_index(task, tid, collection, field)
             }
 
-            DocumentOp::Merge {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                clauses,
-                returning,
-                resolve_only,
-                resolved_inserts,
-                source_rows,
-                rls_filters,
-                rls_write_check,
-                resolved_sum_targets,
-            } => self.execute_merge(
-                task,
-                tid,
-                super::super::handlers::merge::MergeParams {
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    clauses,
-                    resolve_only: *resolve_only,
-                    resolved_inserts: resolved_inserts.as_deref(),
-                    source_rows: source_rows.as_deref(),
-                    returning: returning.as_ref(),
-                    rls_filters,
-                    rls_write_check,
-                    resolved_sum_targets,
-                },
-            ),
+            DocumentOp::Merge { .. } => self.dispatch_merge(task, tid, op, false),
+
+            DocumentOp::ResolveWrite(inner) => {
+                self.dispatch_document_resolve_write(task, tid, inner)
+            }
 
             DocumentOp::BackfillIndex {
                 collection,

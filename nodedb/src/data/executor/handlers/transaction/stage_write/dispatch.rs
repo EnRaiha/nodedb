@@ -337,6 +337,7 @@ impl CoreLoop {
             // `resolve_and_emit_insert_select_ops`); a raw `InsertSelect`
             // plan never reaches `StageWrite`, so it is not a point write here.
             DocumentOp::InsertSelect { .. }
+            | DocumentOp::ResolveWrite(_)
             | DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }

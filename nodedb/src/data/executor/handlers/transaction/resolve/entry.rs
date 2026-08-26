@@ -330,6 +330,16 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
             detail: "kv resolved write is not supported in transaction resolve".to_string(),
         }),
 
+        // Predicate DML resolves its row set from committed state at apply
+        // time; the per-row KV redo shapes cannot express that. Autocommit
+        // is the supported path.
+        KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. } => {
+            Err(crate::Error::PlanError {
+                detail: "kv predicate UPDATE/DELETE is not supported in transaction resolve"
+                    .to_string(),
+            })
+        }
+
         // TTL-only writes: `Expire` / `Persist` stage a TTL delta with NO value
         // post-image (`stage_kv_ttl.rs`). The KV redo shapes carry a TTL only as
         // the sixth element of a value put, so a standalone TTL change on a base
@@ -387,7 +397,8 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
 
         // Read-only families: scans, lookups, point-gets, and estimates carry
         // no persisted post-image.
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }
@@ -1034,7 +1045,6 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
-                resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -1048,7 +1058,6 @@ mod tests {
                 source_join_col: "id".to_string(),
                 clauses: Vec::new(),
                 returning: None,
-                resolve_only: false,
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),

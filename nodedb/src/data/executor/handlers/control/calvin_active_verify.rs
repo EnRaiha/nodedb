@@ -117,6 +117,7 @@ impl CoreLoop {
                     | DocumentOp::InsertSelect { .. }
                     | DocumentOp::UpdateFromJoin { .. }
                     | DocumentOp::Merge { .. }
+                    | DocumentOp::ResolveWrite(_)
                     | DocumentOp::MaterializeScan { .. }
                     | DocumentOp::ApplyBalanceDelta { .. } => continue,
                 };

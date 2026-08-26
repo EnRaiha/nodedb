@@ -67,15 +67,16 @@ pub fn to_replicated_entry(
     let plan = write.plan();
     let encoded = match plan {
         PhysicalPlan::Document(op) => entry_document::document_write(op),
-        PhysicalPlan::Kv(op) => entry_kv::kv_write(op),
+        // Fallible: a governed predicate DML refuses rather than encode a
+        // bare predicate for a collection with a write policy.
+        PhysicalPlan::Kv(op) => entry_kv::kv_write(op)?,
         // `vector::encode` / `crdt::encode` are exhaustive over their op enums
         // (each returns `None` for reads and still-unencoded variants) — see
         // their module docs.
         PhysicalPlan::Vector(op) => vector::encode(op),
         PhysicalPlan::Crdt(op) => crdt::encode(op),
         PhysicalPlan::Graph(op) => entry_graph::graph_write(op),
-        // The only fallible arm: a governed predicate DML refuses rather than
-        // encode a bare predicate for a collection with a write policy.
+        // Fallible for the same reason as the Kv arm above.
         PhysicalPlan::Columnar(op) => entry_columnar_family::columnar_write(op)?,
         PhysicalPlan::Timeseries(op) => entry_columnar_family::timeseries_write(op),
         PhysicalPlan::Text(op) => entry_columnar_family::text_write(op),

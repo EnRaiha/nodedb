@@ -137,6 +137,7 @@ async fn resolve_merge_arms(
         target_join_col,
         source_join_col,
         clauses,
+        rls_write_check,
         ..
     }) = &task.plan
     else {
@@ -161,29 +162,30 @@ async fn resolve_merge_arms(
     .await?;
 
     // Phase 1: dispatch the read-only RESOLVE pass against the target's core.
-    let resolve_plan = PhysicalPlan::Document(DocumentOp::Merge {
-        target_collection: target_collection.clone(),
-        source_collection: source_collection.clone(),
-        source_alias: source_alias.clone(),
-        target_join_col: target_join_col.clone(),
-        source_join_col: source_join_col.clone(),
-        clauses: clauses.clone(),
-        returning: None,
-        resolve_only: true,
-        resolved_inserts: None,
-        source_rows: Some(source_rows),
-        // Read-only classification pass: it emits no rows to the client and
-        // writes nothing, so neither policy has anything to gate here. The
-        // caller decides the resolved arms against the statement's write
-        // predicate before any of them becomes a point op.
-        rls_filters: Vec::new(),
-        // Never evaluated: the resolve pass writes nothing, so no gate ever
-        // reads this.
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
-        // The RESOLVE pass writes nothing, so it folds no materialized-sum
-        // delta. The point ops this expansion emits carry their own resolution.
-        resolved_sum_targets: Vec::new(),
-    });
+    let resolve_plan =
+        PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(DocumentOp::Merge {
+            target_collection: target_collection.clone(),
+            source_collection: source_collection.clone(),
+            source_alias: source_alias.clone(),
+            target_join_col: target_join_col.clone(),
+            source_join_col: source_join_col.clone(),
+            clauses: clauses.clone(),
+            returning: None,
+            resolved_inserts: None,
+            source_rows: Some(source_rows),
+            // Read-only classification pass: it emits no rows to the client and
+            // writes nothing, so neither policy has anything to gate here. The
+            // caller decides the resolved arms against the statement's write
+            // predicate before any of them becomes a point op.
+            rls_filters: Vec::new(),
+            // The statement's injected write predicate, carried unchanged. The
+            // wrapper is read-only, so no gate reads it here.
+            rls_write_check: rls_write_check.clone(),
+            // The RESOLVE pass writes nothing, so it folds no materialized-sum
+            // delta. The point ops this expansion emits carry their own
+            // resolution.
+            resolved_sum_targets: Vec::new(),
+        })));
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets `collect_target_docs` fold rows this transaction
     // staged earlier, so a MERGE matches (and reuses the surrogate of) a row a

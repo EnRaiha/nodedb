@@ -213,6 +213,7 @@ fn settleable_insert(op: &DocumentOp) -> crate::Result<Option<SettleableInsert<'
         | DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
         // Reads, index DDL, and the balance task this pass itself appends.
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
@@ -252,6 +253,7 @@ fn defer_binding(plan: &mut PhysicalPlan, target_collection: String) {
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }

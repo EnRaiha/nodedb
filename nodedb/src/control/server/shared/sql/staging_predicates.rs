@@ -329,7 +329,11 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         // Autocommit-only: transaction resolve rejects both, so neither is
         // ever staged into the overlay.
         | KvOp::ResolveWrite(_)
-        | KvOp::ResolvedWrite { .. } => unreachable!(
+        | KvOp::ResolvedWrite { .. }
+        // Autocommit-only for the same reason: a predicate resolves its row
+        // set at apply time, so there is no post-image to stage.
+        | KvOp::PredicateUpdate { .. }
+        | KvOp::PredicateDelete { .. } => unreachable!(
             "staged_kv_tag_kind called on a non-stageable KvOp; \
              is_stageable_write invariant broken: {op:?}"
         ),

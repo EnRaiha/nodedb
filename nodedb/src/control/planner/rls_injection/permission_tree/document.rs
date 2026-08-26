@@ -167,6 +167,11 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             Ok(())
         }
 
+        // Resolve against the wrapped op: it is the intercepted write verbatim,
+        // and the rows it classifies are the rows that write persists, so it
+        // narrows at exactly that write's level.
+        DocumentOp::ResolveWrite(inner) => apply_document(ctx, inner),
+
         // No-op: index DDL and collection registration. These describe the
         // collection rather than acting on its rows, and are authorized as
         // DDL rather than against a permission level.

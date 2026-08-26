@@ -48,6 +48,8 @@ mod enforcement_balanced;
 mod engine_surface_array;
 mod engine_surface_columnar;
 mod engine_surface_crdt_document;
+mod kv_predicate_dml;
+mod kv_write_row_level_security;
 mod quota_bitemporal_composition;
 mod rls_policy_database_scope;
 mod sql_backup_restore_columnar;

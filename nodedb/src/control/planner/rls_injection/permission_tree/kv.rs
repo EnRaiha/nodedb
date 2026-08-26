@@ -71,12 +71,18 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
         | KvOp::IncrFloat { collection, .. }
         | KvOp::Cas { collection, .. }
         | KvOp::GetSet { collection, .. }
-        | KvOp::Transfer { collection, .. } => ctx.authorize(collection, PermTreeLevel::Write),
-
-        // Filter (delete level, blanket): both remove rows they name directly.
-        KvOp::Delete { collection, .. } | KvOp::Truncate { collection } => {
-            ctx.authorize(collection, PermTreeLevel::Delete)
+        | KvOp::Transfer { collection, .. }
+        // A predicate update writes rows a scan selects, so no subtree filter
+        // can narrow it: the identity must hold write access somewhere.
+        | KvOp::PredicateUpdate { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Write)
         }
+
+        // Filter (delete level, blanket): all three remove rows the identity
+        // does not enumerate — by key, by predicate, or wholesale.
+        KvOp::Delete { collection, .. }
+        | KvOp::PredicateDelete { collection, .. }
+        | KvOp::Truncate { collection } => ctx.authorize(collection, PermTreeLevel::Delete),
 
         // Filter (both levels, blanket): the item leaves the source collection
         // and lands in the destination, so it is a delete on one and a write

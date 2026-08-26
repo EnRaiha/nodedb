@@ -6,6 +6,7 @@
 //! [`run::run_write_resolve`] for the one loop that drives it.
 
 mod columnar;
+mod kv;
 mod propose;
 mod resolved_rows;
 mod resolver;
@@ -13,6 +14,7 @@ mod run;
 mod select;
 
 pub use columnar::ColumnarWriteResolver;
+pub use kv::KvWriteResolver;
 pub use resolved_rows::ResolvedRows;
 pub use resolver::{EngineWriteResolver, WriteResolveContext};
 pub use run::{MAX_WRITE_RESOLVE_RETRIES, run_authorized_write_resolve, run_write_resolve};

@@ -117,7 +117,8 @@ pub(super) fn wal_append_document_op(
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // NotAWrite — reads / query ops / DDL that produces no engine mutation here
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }

@@ -181,6 +181,7 @@ async fn resolve_update_rows(
         source_join_col,
         updates,
         target_filters,
+        rls_write_check,
         ..
     }) = &task.plan
     else {
@@ -205,29 +206,31 @@ async fn resolve_update_rows(
     .await?;
 
     // Phase 1: dispatch the read-only RESOLVE pass against the target's core.
-    let resolve_plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-        target_collection: target_collection.clone(),
-        source_collection: source_collection.clone(),
-        source_alias: source_alias.clone(),
-        target_join_col: target_join_col.clone(),
-        source_join_col: source_join_col.clone(),
-        updates: updates.clone(),
-        target_filters: target_filters.clone(),
-        returning: None,
-        resolve_only: true,
-        source_rows: Some(source_rows),
-        // Read-only resolve pass: it emits no rows to the client and writes
-        // nothing, so neither policy has anything to gate here. The caller
-        // decides the resolved post-images against the statement's write
-        // predicate before any of them becomes a point op.
-        rls_filters: Vec::new(),
-        // Never evaluated: the resolve pass writes nothing, so no gate ever
-        // reads this.
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
-        // The RESOLVE pass writes nothing, so it folds no materialized-sum
-        // delta. The point ops this expansion emits carry their own resolution.
-        resolved_sum_targets: Vec::new(),
-    });
+    let resolve_plan = PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(
+        DocumentOp::UpdateFromJoin {
+            target_collection: target_collection.clone(),
+            source_collection: source_collection.clone(),
+            source_alias: source_alias.clone(),
+            target_join_col: target_join_col.clone(),
+            source_join_col: source_join_col.clone(),
+            updates: updates.clone(),
+            target_filters: target_filters.clone(),
+            returning: None,
+            source_rows: Some(source_rows),
+            // Read-only resolve pass: it emits no rows to the client and writes
+            // nothing, so neither policy has anything to gate here. The caller
+            // decides the resolved post-images against the statement's write
+            // predicate before any of them becomes a point op.
+            rls_filters: Vec::new(),
+            // The statement's injected write predicate, carried unchanged. The
+            // wrapper is read-only, so no gate reads it here.
+            rls_write_check: rls_write_check.clone(),
+            // The RESOLVE pass writes nothing, so it folds no materialized-sum
+            // delta. The point ops this expansion emits carry their own
+            // resolution.
+            resolved_sum_targets: Vec::new(),
+        },
+    )));
     // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
     // transaction's id lets the target scan fold rows this transaction staged
     // earlier, so an `UPDATE ... FROM` affects a row a prior statement in the

@@ -128,6 +128,8 @@ fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut V
         | GetSet { collection, .. }
         | Transfer { collection, .. }
         | RegisterSortedIndex { collection, .. }
+        | PredicateUpdate { collection, .. }
+        | PredicateDelete { collection, .. }
         | MaterializeScan { collection, .. } => out.push(collection.clone()),
 
         // TransferItem touches two collections.
@@ -160,6 +162,65 @@ fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut V
     }
 }
 
+/// Append every collection a document op names into `out`.
+///
+/// Split out for the same reason [`kv_touched_collections`] is: `ResolveWrite`
+/// recurses into the write it wraps.
+fn document_touched_collections(
+    op: &nodedb_physical::physical_plan::DocumentOp,
+    out: &mut Vec<String>,
+) {
+    use nodedb_physical::physical_plan::DocumentOp::*;
+    match op {
+        PointGet { collection, .. }
+        | PointPut { collection, .. }
+        | PointInsert { collection, .. }
+        | PointDelete { collection, .. }
+        | PointUpdate { collection, .. }
+        | Scan { collection, .. }
+        | BatchInsert { collection, .. }
+        | RangeScan { collection, .. }
+        | Register { collection, .. }
+        | IndexLookup { collection, .. }
+        | IndexedFetch { collection, .. }
+        | DropIndex { collection, .. }
+        | BackfillIndex { collection, .. }
+        | Truncate { collection, .. }
+        | EstimateCount { collection, .. }
+        | Upsert { collection, .. }
+        | BulkUpdate { collection, .. }
+        | BulkDelete { collection, .. }
+        | MaterializeScan { collection, .. }
+        // The TARGET collection whose balance this derived write moves.
+        // It is the only collection the op touches — the source row that
+        // caused it rides a separate task on its own vShard.
+        | ApplyBalanceDelta { collection, .. } => out.push(collection.clone()),
+
+        InsertSelect {
+            target_collection,
+            source_collection,
+            ..
+        }
+        | UpdateFromJoin {
+            target_collection,
+            source_collection,
+            ..
+        }
+        | Merge {
+            target_collection,
+            source_collection,
+            ..
+        } => {
+            out.push(target_collection.clone());
+            out.push(source_collection.clone());
+        }
+
+        // The wrapped op is the intercepted write verbatim, so it reads
+        // exactly the collections that write touches.
+        ResolveWrite(inner) => document_touched_collections(inner, out),
+    }
+}
+
 /// Extract every collection name touched by a `PhysicalPlan`.
 ///
 /// Returns a `Vec<String>` that may contain duplicates; callers are
@@ -174,61 +235,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Kv(op) => kv_touched_collections(op, &mut out),
 
         // ── Document ────────────────────────────────────────────────────
-        PhysicalPlan::Document(op) => {
-            use DocumentOp::*;
-            match op {
-                PointGet { collection, .. }
-                | PointPut { collection, .. }
-                | PointInsert { collection, .. }
-                | PointDelete { collection, .. }
-                | PointUpdate { collection, .. }
-                | Scan { collection, .. }
-                | BatchInsert { collection, .. }
-                | RangeScan { collection, .. }
-                | Register { collection, .. }
-                | IndexLookup { collection, .. }
-                | IndexedFetch { collection, .. }
-                | DropIndex { collection, .. }
-                | BackfillIndex { collection, .. }
-                | Truncate { collection, .. }
-                | EstimateCount { collection, .. }
-                | Upsert { collection, .. }
-                | BulkUpdate { collection, .. }
-                | BulkDelete { collection, .. }
-                | MaterializeScan { collection, .. }
-                // The TARGET collection whose balance this derived write moves.
-                // It is the only collection the op touches — the source row that
-                // caused it rides a separate task on its own vShard.
-                | ApplyBalanceDelta { collection, .. } => out.push(collection.clone()),
-
-                InsertSelect {
-                    target_collection,
-                    source_collection,
-                    ..
-                } => {
-                    out.push(target_collection.clone());
-                    out.push(source_collection.clone());
-                }
-
-                UpdateFromJoin {
-                    target_collection,
-                    source_collection,
-                    ..
-                } => {
-                    out.push(target_collection.clone());
-                    out.push(source_collection.clone());
-                }
-
-                Merge {
-                    target_collection,
-                    source_collection,
-                    ..
-                } => {
-                    out.push(target_collection.clone());
-                    out.push(source_collection.clone());
-                }
-            }
-        }
+        PhysicalPlan::Document(op) => document_touched_collections(op, &mut out),
 
         // ── Vector ──────────────────────────────────────────────────────
         PhysicalPlan::Vector(op) => {

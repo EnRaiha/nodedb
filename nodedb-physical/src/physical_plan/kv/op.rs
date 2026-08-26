@@ -536,4 +536,35 @@ pub enum KvOp {
         response_payload: Vec<u8>,
         rls_write_check: RlsWriteCheck,
     },
+
+    // ── Predicate DML (SQL UPDATE / DELETE with no resolvable primary key) ──
+    /// Merge `updates` into every row matching `filters`.
+    ///
+    /// The predicate form of [`KvOp::FieldSet`]: the plan carries the
+    /// predicate, not a key list, since `WHERE` selects rows only once the
+    /// Data Plane scans current state. Uses the same merge as `FieldSet`.
+    PredicateUpdate {
+        collection: String,
+        /// Serialized `Vec<ScanFilter>` (MessagePack). Empty matches every row.
+        filters: Vec<u8>,
+        /// Field assignments: `(field_name, msgpack_value_bytes)`.
+        updates: Vec<(String, Vec<u8>)>,
+        /// Compiled row-level-security WRITE predicate, evaluated against each
+        /// matched row's post-image once the assignments have been applied, or
+        /// the reason no predicate is attached.
+        rls_write_check: RlsWriteCheck,
+    },
+
+    /// Delete every row matching `filters`.
+    ///
+    /// The predicate form of [`KvOp::Delete`], which it delegates to once the
+    /// scan has resolved the matching keys.
+    PredicateDelete {
+        collection: String,
+        /// Serialized `Vec<ScanFilter>` (MessagePack). Empty matches every row.
+        filters: Vec<u8>,
+        /// Compiled row-level-security WRITE predicate, evaluated against the
+        /// pre-image of every row this removes.
+        rls_write_check: RlsWriteCheck,
+    },
 }

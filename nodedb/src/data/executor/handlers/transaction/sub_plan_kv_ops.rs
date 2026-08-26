@@ -156,6 +156,17 @@ impl CoreLoop {
                 detail: "KV resolve-before-propose is not permitted inside a TransactionBatch"
                     .into(),
             }),
+
+            // A predicate write resolves its row set from committed state at
+            // apply time; the transaction redo record has no per-row shape
+            // for that. Autocommit is the supported path.
+            KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. } => {
+                Err(ErrorCode::Internal {
+                    detail: "KV predicate UPDATE/DELETE is not permitted inside a \
+                             TransactionBatch; run it outside an explicit transaction"
+                        .into(),
+                })
+            }
         }
     }
 }

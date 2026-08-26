@@ -32,6 +32,8 @@ impl CoreLoop {
                 | KvOp::GetSet { .. }
                 | KvOp::Transfer { .. }
                 | KvOp::TransferItem { .. }
+                | KvOp::PredicateUpdate { .. }
+                | KvOp::PredicateDelete { .. }
         );
         if is_kv_write && let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Kv) {
             return r;

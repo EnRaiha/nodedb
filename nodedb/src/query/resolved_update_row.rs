@@ -15,4 +15,9 @@
 /// Both images travel, not just the post-image. A materialized sum folds a
 /// signed delta from the pair, and a rewritten join key moves value between TWO
 /// target rows — neither is derivable from the post-image alone.
+///
+/// Both images are the standard schemaless document wire body
+/// (`nodedb_types::Value` msgpack), NEVER a stored Binary Tuple: the Control
+/// Plane rewrites these arms into point ops whose bodies the write path encodes
+/// to stored form, so a stored body here is encoded twice and fails to decode.
 pub type ResolvedUpdateRowWire = (String, Option<u32>, Vec<u8>, Vec<u8>);

@@ -245,7 +245,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         ),
 
         // Not a write — reads / scans / index DDL-metadata / system ops.
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }

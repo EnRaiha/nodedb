@@ -87,7 +87,6 @@ pub async fn run_authorized_update_from_join(
         updates,
         target_filters,
         returning,
-        resolve_only: false,
         source_rows: _,
         rls_filters,
         rls_write_check,
@@ -183,7 +182,6 @@ pub(crate) async fn run_update_from_join(
             updates: args.updates.to_vec(),
             target_filters: args.target_filters.to_vec(),
             returning: args.returning.cloned(),
-            resolve_only: false,
             source_rows: Some(source_rows),
             rls_filters: args.rls_filters.to_vec(),
             rls_write_check: args.rls_write_check.clone(),
@@ -258,29 +256,29 @@ async fn resolve_matched_sum_targets(
     args: &UpdateFromJoinArgs<'_>,
     source_rows: Vec<(String, Vec<u8>)>,
 ) -> crate::Result<Option<Vec<ResolvedSumTarget>>> {
-    let resolve_plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-        target_collection: args.target_collection.to_string(),
-        source_collection: args.source_collection.to_string(),
-        source_alias: args.source_alias.to_string(),
-        target_join_col: args.target_join_col.to_string(),
-        source_join_col: args.source_join_col.to_string(),
-        updates: args.updates.to_vec(),
-        target_filters: args.target_filters.to_vec(),
-        returning: None,
-        resolve_only: true,
-        source_rows: Some(source_rows),
-        // The RESOLVE pass emits no rows to the client and writes nothing, so
-        // neither policy has anything to gate; the write pass below runs both
-        // against the rows it actually rewrites.
-        rls_filters: Vec::new(),
-        // Never evaluated: the resolve pass writes nothing, so no gate ever
-        // reads this. Pending rather than a bypass so a future write path built
-        // from this same plan shape fails closed instead of inheriting a
-        // silent admit-all.
-        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
-        // A read-only pass folds no delta, so it needs no resolution of its own.
-        resolved_sum_targets: Vec::new(),
-    });
+    let resolve_plan = PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(
+        DocumentOp::UpdateFromJoin {
+            target_collection: args.target_collection.to_string(),
+            source_collection: args.source_collection.to_string(),
+            source_alias: args.source_alias.to_string(),
+            target_join_col: args.target_join_col.to_string(),
+            source_join_col: args.source_join_col.to_string(),
+            updates: args.updates.to_vec(),
+            target_filters: args.target_filters.to_vec(),
+            returning: None,
+            source_rows: Some(source_rows),
+            // The RESOLVE pass emits no rows to the client and writes nothing,
+            // so neither policy has anything to gate; the write pass below runs
+            // both against the rows it actually rewrites.
+            rls_filters: Vec::new(),
+            // The statement's injected write predicate, carried unchanged. The
+            // wrapper is read-only, so no gate reads it here.
+            rls_write_check: args.rls_write_check.clone(),
+            // A read-only pass folds no delta, so it needs no resolution of its
+            // own.
+            resolved_sum_targets: Vec::new(),
+        },
+    )));
     let resp = dispatch_local(
         state,
         args.tenant_id,

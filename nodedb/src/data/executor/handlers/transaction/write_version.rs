@@ -380,8 +380,12 @@ impl CoreLoop {
                     );
                 }
             }
-            KvOp::Truncate { collection } => {
-                // Whole-collection mutation: record the collection floor only.
+            // Whole-collection mutations: the key set is either every row
+            // (`Truncate`) or one a predicate resolved at apply time, so the
+            // collection floor is the only version this can record.
+            KvOp::Truncate { collection }
+            | KvOp::PredicateUpdate { collection, .. }
+            | KvOp::PredicateDelete { collection, .. } => {
                 self.note_write_lsn(db, tenant, collection, None, lsn);
             }
             _ => {}

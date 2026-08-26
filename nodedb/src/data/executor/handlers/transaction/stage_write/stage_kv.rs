@@ -209,7 +209,11 @@ impl CoreLoop {
             // Resolve-before-propose is autocommit-only: it decides against
             // committed state and proposes directly, never through staging.
             | KvOp::ResolveWrite(_)
-            | KvOp::ResolvedWrite { .. } => self.stage_not_point_write(task),
+            | KvOp::ResolvedWrite { .. }
+            // Predicate DML resolves its row set from committed state at
+            // apply time, so there is no point write to stage.
+            | KvOp::PredicateUpdate { .. }
+            | KvOp::PredicateDelete { .. } => self.stage_not_point_write(task),
         }
     }
 

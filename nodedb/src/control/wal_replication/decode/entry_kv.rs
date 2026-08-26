@@ -246,6 +246,15 @@ pub(super) fn decode_arm(
             mutations,
             response_payload,
         } => kv::resolved_write(ctx, mutations, response_payload)?,
+        ReplicatedWrite::KvPredicateUpdate {
+            collection,
+            filters,
+            updates,
+        } => kv::predicate_update(collection, filters, updates),
+        ReplicatedWrite::KvPredicateDelete {
+            collection,
+            filters,
+        } => kv::predicate_delete(collection, filters),
         ReplicatedWrite::KvTransferItem {
             source_collection,
             dest_collection,

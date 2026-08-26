@@ -137,6 +137,23 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 ));
             }
             // Read-only probe over exactly the rows the wrapped write reads.
+            PhysicalPlan::Document(DocumentOp::ResolveWrite(inner)) => {
+                if let DocumentOp::UpdateFromJoin {
+                    target_collection,
+                    source_collection,
+                    ..
+                }
+                | DocumentOp::Merge {
+                    target_collection,
+                    source_collection,
+                    ..
+                } = inner.as_ref()
+                {
+                    add_collection_requirement(target_collection, Permission::Read, out);
+                    add_collection_requirement(source_collection, Permission::Read, out);
+                }
+            }
+            // Read-only probe over exactly the rows the wrapped write reads.
             PhysicalPlan::Kv(KvOp::ResolveWrite(inner)) => {
                 for collection in kv_op_collections(inner) {
                     add_collection_requirement(collection, Permission::Read, out);
@@ -179,7 +196,11 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | KvOp::SortedIndexRange { .. }
                 | KvOp::SortedIndexCount { .. }
                 | KvOp::SortedIndexScore { .. }
-                | KvOp::MaterializeScan { .. },
+                | KvOp::MaterializeScan { .. }
+                // One collection each, named on the plan — the general
+                // extractor reads it off `KvOp::collection`.
+                | KvOp::PredicateUpdate { .. }
+                | KvOp::PredicateDelete { .. },
             ) => add_general_requirements(plan, out),
             PhysicalPlan::Document(_)
             | PhysicalPlan::Graph(_)
@@ -280,6 +301,8 @@ fn kv_op_collections(op: &nodedb_physical::physical_plan::KvOp) -> Vec<&str> {
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
+        | KvOp::PredicateUpdate { .. }
+        | KvOp::PredicateDelete { .. }
         | KvOp::MaterializeScan { .. }) => other.collection().into_iter().collect(),
     }
 }

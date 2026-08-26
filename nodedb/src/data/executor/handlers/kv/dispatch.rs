@@ -448,6 +448,36 @@ impl CoreLoop {
                 cursor,
                 count,
             } => self.execute_kv_materialize_scan(task, did, tid, collection, cursor, *count),
+            KvOp::PredicateUpdate {
+                collection,
+                filters,
+                updates,
+                rls_write_check,
+            } => self.execute_kv_predicate_update(
+                task,
+                super::predicate::KvPredicateCtx {
+                    did,
+                    tid,
+                    collection,
+                    filters,
+                    rls_write_check,
+                },
+                updates,
+            ),
+            KvOp::PredicateDelete {
+                collection,
+                filters,
+                rls_write_check,
+            } => self.execute_kv_predicate_delete(
+                task,
+                super::predicate::KvPredicateCtx {
+                    did,
+                    tid,
+                    collection,
+                    filters,
+                    rls_write_check,
+                },
+            ),
             KvOp::ResolveWrite(inner) => self.execute_kv_resolve_write(task, did, tid, inner),
             KvOp::ResolvedWrite {
                 mutations,

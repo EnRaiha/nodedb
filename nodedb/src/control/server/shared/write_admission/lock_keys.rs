@@ -133,6 +133,7 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
         | DocumentOp::IndexedFetch { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => None,

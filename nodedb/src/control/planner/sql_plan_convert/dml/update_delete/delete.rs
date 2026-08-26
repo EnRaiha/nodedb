@@ -32,7 +32,24 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
 
-    if matches!(engine, EngineType::KeyValue) && !target_keys.is_empty() {
+    if matches!(engine, EngineType::KeyValue) {
+        // A KV collection has no document store; a WHERE with no primary key
+        // must still route to the KV engine, not `DocumentOp::BulkDelete`.
+        if target_keys.is_empty() {
+            let filter_bytes = serialize_filters(filters)?;
+            return Ok(vec![PhysicalTask {
+                tenant_id,
+                vshard_id: vshard,
+                database_id: ctx.database_id,
+                plan: PhysicalPlan::Kv(KvOp::PredicateDelete {
+                    collection: collection.into(),
+                    filters: filter_bytes,
+                    rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                }),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            }]);
+        }
         let keys: Vec<Vec<u8>> = target_keys.iter().map(sql_value_to_bytes).collect();
         return Ok(vec![PhysicalTask {
             tenant_id,
@@ -48,6 +65,18 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             post_set_op: PostSetOp::None,
             txn_id: None,
         }]);
+    }
+
+    // `TimeseriesRules::plan_delete` already rejects this; this guard keeps
+    // the rejection true for any other caller, not a fall-through to
+    // `DocumentOp::BulkDelete` over the empty document store.
+    if matches!(engine, EngineType::Timeseries) {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "DELETE is not supported on timeseries collection '{collection}'; \
+                 expire rows with CREATE RETENTION POLICY"
+            ),
+        });
     }
 
     // Columnar and spatial engines have no document store; route to

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::doc_format::encode_resolved_wire_body as encode_doc_body;
 use crate::engine::document::store::doc_id_to_surrogate;
 use nodedb_physical::physical_plan::document::merge_types::{
     MergeActionOp, MergeClauseKind as MergeClauseKindOp,
@@ -60,20 +61,6 @@ pub(super) struct MergePlanActions {
     pub(super) updates: Vec<MergeUpdate>,
     pub(super) deletes: Vec<MergeDelete>,
     pub(super) inserts: Vec<MergeInsert>,
-}
-
-/// Encode a merge row body to the standard schemaless document wire format.
-///
-/// The document store, the scan decoder, AND the vector-search result flattener
-/// (`from_msgpack::<HashMap<String, nodedb_types::Value>>`) all expect the
-/// `nodedb_types::Value` msgpack encoding that plain `INSERT` produces. Encoding
-/// via `json_to_msgpack` instead yields a JSON-flavoured map that the scan can
-/// still read but the vector flattener cannot decode — so a merge-inserted row's
-/// non-key fields come back empty from a vector search. Route through
-/// `value_to_msgpack` so a merge body is byte-compatible with a plain insert.
-fn encode_doc_body(doc: &serde_json::Value) -> Vec<u8> {
-    let value: nodedb_types::Value = doc.clone().into();
-    nodedb_types::value_to_msgpack(&value).unwrap_or_else(|_| doc_format::encode_to_msgpack(doc))
 }
 
 /// Decode a stored target row into JSON, using the strict schema when present.

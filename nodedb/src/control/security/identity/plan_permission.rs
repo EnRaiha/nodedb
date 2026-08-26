@@ -26,7 +26,10 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::IndexLookup { .. }
             | DocumentOp::IndexedFetch { .. }
             | DocumentOp::EstimateCount { .. }
-            | DocumentOp::MaterializeScan { .. },
+            | DocumentOp::MaterializeScan { .. }
+            // Read-only: it reports what the wrapped write would apply and
+            // mutates nothing. The write it feeds is authorized on its own.
+            | DocumentOp::ResolveWrite(_),
         ) => Permission::Read,
 
         PhysicalPlan::Vector(
@@ -294,7 +297,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::DropSortedIndex { .. }
             | KvOp::Transfer { .. }
             | KvOp::TransferItem { .. }
-            | KvOp::ResolvedWrite { .. },
+            | KvOp::ResolvedWrite { .. }
+            | KvOp::PredicateUpdate { .. }
+            | KvOp::PredicateDelete { .. },
         ) => Permission::Write,
 
         // Tenant purge requires superuser (checked at DDL level); map to Write.

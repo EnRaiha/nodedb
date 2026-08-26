@@ -238,6 +238,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
         }),
         DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::PointInsert { .. }
         | DocumentOp::PointPut { .. }
@@ -279,6 +280,7 @@ fn set_predicate_resolution(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget
         } => *resolved_sum_targets = resolved,
         DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::PointInsert { .. }
         | DocumentOp::PointPut { .. }

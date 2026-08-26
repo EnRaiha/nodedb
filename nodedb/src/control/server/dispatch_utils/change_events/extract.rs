@@ -98,47 +98,27 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Document(DocumentOp::Truncate { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
         }
-        // `resolve_only = true` is the Control-Plane read-only classification
-        // pass (see the field's own doc comment: "WITHOUT writing ... or
-        // emitting events") — no row has actually changed yet, so no event.
         PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection,
-            resolve_only,
-            ..
-        }) => {
-            if *resolve_only {
-                Vec::new()
-            } else {
-                vec![(
-                    target_collection.clone(),
-                    "*".into(),
-                    ChangeOperation::Update,
-                )]
-            }
-        }
+            target_collection, ..
+        }) => vec![(
+            target_collection.clone(),
+            "*".into(),
+            ChangeOperation::Update,
+        )],
         // MERGE mixes INSERT/UPDATE/DELETE per matched arm; not individually
         // addressable with today's single-tuple-per-plan shape, so — like
-        // `BulkUpdate` — it's reported as one `Update` covering the
-        // collection. Same `resolve_only` read-only-pass guard as
-        // `UpdateFromJoin`.
+        // `BulkUpdate` — it's reported as one `Update` covering the collection.
         PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection,
-            resolve_only,
-            ..
-        }) => {
-            if *resolve_only {
-                Vec::new()
-            } else {
-                vec![(
-                    target_collection.clone(),
-                    "*".into(),
-                    ChangeOperation::Update,
-                )]
-            }
-        }
+            target_collection, ..
+        }) => vec![(
+            target_collection.clone(),
+            "*".into(),
+            ChangeOperation::Update,
+        )],
         // Remaining DocumentOp variants (PointGet, Scan, RangeScan, Register,
         // IndexLookup, IndexedFetch, DropIndex, BackfillIndex, EstimateCount,
-        // MaterializeScan) are reads or catalog/schema DDL — no row changed.
+        // MaterializeScan, ResolveWrite) are reads or catalog/schema DDL — no
+        // row changed.
         PhysicalPlan::Document(_) => Vec::new(),
 
         // Timeseries ingest: batch write. CDC is opt-in for timeseries
@@ -168,8 +148,15 @@ pub(super) fn extract_write_metadata(
             String::from_utf8_lossy(key).into_owned(),
             ChangeOperation::Insert,
         )],
-        PhysicalPlan::Kv(KvOp::Delete { collection, .. }) => {
+        PhysicalPlan::Kv(KvOp::Delete { collection, .. })
+        // Which keys a predicate selects is decided in the Data Plane, so —
+        // like every other multi-row write in this match — it reports one
+        // event with `document_id = "*"`.
+        | PhysicalPlan::Kv(KvOp::PredicateDelete { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Delete)]
+        }
+        PhysicalPlan::Kv(KvOp::PredicateUpdate { collection, .. }) => {
+            vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
         }
         PhysicalPlan::Kv(KvOp::FieldSet {
             collection, key, ..

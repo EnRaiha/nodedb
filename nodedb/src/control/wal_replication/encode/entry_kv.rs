@@ -12,10 +12,14 @@ use super::kv;
 use super::kv::WireReturning;
 use nodedb_physical::physical_plan::KvOp;
 
-/// Encode a `KvOp` write variant into its `ReplicatedWrite` wire shape, or
-/// `None` when the op is not a single-shard replicated write.
-pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
-    Some(match op {
+/// Encode a `KvOp` write variant into its `ReplicatedWrite` wire shape,
+/// `Ok(None)` when the op is not a single-shard replicated write, or an error
+/// when the op cannot be replicated safely.
+///
+/// `KvOp::PredicateUpdate` / `KvOp::PredicateDelete` refuse when
+/// `rls_write_check.has_predicate()` — see [`refuse_governed_predicate_dml`].
+pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
+    Ok(Some(match op {
         KvOp::Put {
             collection,
             key,
@@ -267,6 +271,27 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             rls_write_check: _,
         } => kv::resolved_write(mutations, response_payload),
 
+        // With no write policy, each replica re-scans the predicate against
+        // its own committed state — deterministic replay. A restricting
+        // policy must refuse here; see `refuse_governed_predicate_dml`.
+        KvOp::PredicateUpdate {
+            collection,
+            filters,
+            updates,
+            rls_write_check,
+        } => {
+            refuse_governed_predicate_dml(collection, rls_write_check)?;
+            kv::predicate_update(collection, filters, updates)
+        }
+        KvOp::PredicateDelete {
+            collection,
+            filters,
+            rls_write_check,
+        } => {
+            refuse_governed_predicate_dml(collection, rls_write_check)?;
+            kv::predicate_delete(collection, filters)
+        }
+
         // Not a write — reads / scans / sorted-index queries.
         // `ResolveWrite` reads the rows a governed write depends on and
         // reports what it would do; it mutates nothing, so nothing replicates.
@@ -281,6 +306,31 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
-        | KvOp::SortedIndexScore { .. } => return None,
-    })
+        | KvOp::SortedIndexScore { .. } => return Ok(None),
+    }))
+}
+
+/// Refuse a KV predicate `UPDATE` / `DELETE` on a collection that carries an
+/// RLS write policy.
+///
+/// A follower has no writing identity to evaluate the predicate against, so
+/// replicating the bare predicate would either admit every row on every
+/// replica (silent bypass) or have the leader re-decide after commit and
+/// reject what followers already applied (divergence). The statement must be
+/// resolved to `KvOp::ResolvedWrite` before it is proposed.
+fn refuse_governed_predicate_dml(
+    collection: &str,
+    rls_write_check: &nodedb_types::RlsWriteCheck,
+) -> crate::Result<()> {
+    if rls_write_check.has_predicate() {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "kv predicate UPDATE/DELETE on '{collection}' cannot be replicated as a \
+                 predicate because it carries an RLS write policy: a follower has no writing \
+                 identity to evaluate the predicate against. It must be resolved to a concrete \
+                 mutation list before it is proposed."
+            ),
+        });
+    }
+    Ok(())
 }

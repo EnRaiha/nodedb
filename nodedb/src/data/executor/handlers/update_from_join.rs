@@ -21,6 +21,7 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::response_codec::encode_json_as_msgpack;
@@ -103,7 +104,7 @@ impl CoreLoop {
             // No source rows — nothing matches. The RESOLVE pass returns an
             // empty match set; the write path reports zero affected.
             if resolve_only {
-                return self.encode_resolved_update_rows(task, Vec::new());
+                return self.encode_resolved_update_rows(task, Vec::new(), strict_schema.as_ref());
             }
             let result = serde_json::json!({ "affected": 0u64 });
             return match encode_json_as_msgpack(&result) {
@@ -166,7 +167,7 @@ impl CoreLoop {
         // RESOLVE pass: hand the matched rows back for COMMIT-time expansion.
         // No `sparse.put`, no vector re-index, no write-set, no events.
         if resolve_only {
-            return self.encode_resolved_update_rows(task, rows);
+            return self.encode_resolved_update_rows(task, rows, strict_schema.as_ref());
         }
 
         // Materialized-sum coverage verification (LEADER-ONLY, mirroring the
@@ -311,22 +312,38 @@ impl CoreLoop {
     /// the DIFFERENCE between the two images, and an assignment that rewrites
     /// the join column moves value between TWO targets, neither of which the
     /// post-image alone identifies.
+    ///
+    /// Both images travel in the standard schemaless wire body form, the same
+    /// shape the MERGE RESOLVE pass emits. `ResolvedUpdateRow` carries STORED
+    /// bodies (a Binary Tuple for a strict target) because the write pass
+    /// persists them verbatim; the point ops the expander emits are re-encoded
+    /// to stored form by the write path, so shipping stored bodies here
+    /// double-encodes them.
     fn encode_resolved_update_rows(
         &self,
         task: &ExecutionTask,
         rows: Vec<ResolvedUpdateRow>,
+        strict_schema: Option<&nodedb_types::columnar::StrictSchema>,
     ) -> Response {
-        let wire: Vec<crate::query::ResolvedUpdateRowWire> = rows
-            .into_iter()
-            .map(|r| {
-                (
-                    r.doc_id,
-                    r.surrogate.map(|s| s.as_u32()),
-                    r.body,
-                    r.old_body,
-                )
-            })
-            .collect();
+        let mut wire: Vec<crate::query::ResolvedUpdateRowWire> = Vec::with_capacity(rows.len());
+        for r in rows {
+            // The pre-image is stored bytes read straight off the scan; the
+            // post-image is already decoded on the row.
+            let old_doc = match doc_format::decode_document_or_binary_tuple(
+                &r.old_body,
+                strict_schema,
+                "UPDATE ... FROM pre-image",
+            ) {
+                Ok(d) => d,
+                Err(e) => return self.response_error(task, e),
+            };
+            wire.push((
+                r.doc_id,
+                r.surrogate.map(|s| s.as_u32()),
+                doc_format::encode_resolved_wire_body(&r.doc),
+                doc_format::encode_resolved_wire_body(&old_doc),
+            ));
+        }
         match zerompk::to_msgpack_vec(&wire) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

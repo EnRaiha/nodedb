@@ -9,7 +9,7 @@
 //! computed from the stored row cannot be re-derived after commit without
 //! risking a different answer on every replica.
 //!
-//! Read-only, so this takes `&self`. The eleven arms below are exactly the KV
+//! Read-only, so this takes `&self`. The arms below are exactly the KV
 //! ops whose stored image depends on state the Control Plane cannot see; every
 //! other op either has no such dependence or is not a write.
 
@@ -233,10 +233,28 @@ impl CoreLoop {
                 source_rls_write_check,
                 dest_rls_write_check,
             }),
+            KvOp::PredicateUpdate {
+                collection,
+                filters,
+                updates,
+                rls_write_check,
+            } => self.resolve_kv_predicate_update(
+                did,
+                tid,
+                collection,
+                filters,
+                updates,
+                rls_write_check,
+            ),
+            KvOp::PredicateDelete {
+                collection,
+                filters,
+                rls_write_check,
+            } => self.resolve_kv_predicate_delete(did, tid, collection, filters, rls_write_check),
             // Every other KV op either writes an image the Control Plane
             // already holds (a plain `Put`), writes nothing, or is itself a
             // resolve/resolved op. None of them is resolvable, and none is
-            // ever wrapped: `resolver_for_plan` selects the eleven above.
+            // ever wrapped: `resolver_for_plan` selects the ops above.
             other => Err(ErrorCode::Internal {
                 detail: format!(
                     "kv resolve-write wraps an op with no state-dependent image: {}",
@@ -292,5 +310,7 @@ fn kv_op_name(op: &KvOp) -> &'static str {
         KvOp::MaterializeScan { .. } => "MaterializeScan",
         KvOp::ResolveWrite(_) => "ResolveWrite",
         KvOp::ResolvedWrite { .. } => "ResolvedWrite",
+        KvOp::PredicateUpdate { .. } => "PredicateUpdate",
+        KvOp::PredicateDelete { .. } => "PredicateDelete",
     }
 }

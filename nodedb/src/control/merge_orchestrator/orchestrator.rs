@@ -17,7 +17,7 @@
 //!    `MaterializeScan` primitive and ships those rows into the plan's
 //!    `source_rows`; the Data Plane builds the join-map from these instead of a
 //!    local read. This is what makes cross-core MERGE correct.
-//! 1. **Resolve** (`DocumentOp::Merge { resolve_only: true }`): the Data Plane
+//! 1. **Resolve** (`DocumentOp::ResolveWrite(Merge)`): the Data Plane
 //!    classifies the merge against a point-in-time snapshot and returns the
 //!    NOT-MATCHED insert rows as `Vec<(join_key, body)>` WITHOUT writing.
 //! 2. **Assign**: for each insert row, allocate a fresh, registered surrogate
@@ -98,7 +98,6 @@ pub async fn run_authorized_merge(
         target_join_col,
         source_join_col,
         clauses,
-        resolve_only: false,
         resolved_inserts: None,
         source_rows: _,
         returning,
@@ -290,7 +289,7 @@ fn merge_plan(
     source_rows: Option<Vec<(String, Vec<u8>)>>,
     resolved_sum_targets: Vec<nodedb_physical::physical_plan::ResolvedSumTarget>,
 ) -> PhysicalPlan {
-    PhysicalPlan::Document(DocumentOp::Merge {
+    let merge = DocumentOp::Merge {
         target_collection: args.target_collection.to_string(),
         source_collection: args.source_collection.to_string(),
         source_alias: args.source_alias.to_string(),
@@ -306,7 +305,6 @@ fn merge_plan(
         } else {
             args.returning.cloned()
         },
-        resolve_only,
         resolved_inserts,
         source_rows,
         rls_filters: args.rls_filters.to_vec(),
@@ -318,5 +316,10 @@ fn merge_plan(
         // Empty on the RESOLVE pass — it writes nothing, so it folds no delta.
         // The APPLY pass carries the resolution derived from that pass's arms.
         resolved_sum_targets,
-    })
+    };
+    if resolve_only {
+        PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(merge)))
+    } else {
+        PhysicalPlan::Document(merge)
+    }
 }

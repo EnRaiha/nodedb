@@ -9,6 +9,7 @@ pub mod columnar;
 pub mod crdt;
 pub mod document;
 mod document_admit;
+mod document_dml;
 pub mod graph;
 pub mod kv;
 pub mod meta;

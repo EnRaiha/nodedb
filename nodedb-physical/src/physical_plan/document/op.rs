@@ -488,17 +488,6 @@ pub enum DocumentOp {
         target_filters: Vec<u8>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// RESOLVE-ONLY read pass (Control-Plane COMMIT expander). When `true`
-        /// the handler runs the same target-scan, join-match, assignment-eval,
-        /// and strict-encode logic that produces each matched row's post-image,
-        /// but WITHOUT writing, re-indexing, accumulating a write-set, or
-        /// emitting events. It returns the matched rows as msgpack
-        /// `Vec<(doc_id, Option<surrogate_u32>, post_image_body)>` so the
-        /// in-transaction expander can rewrite them into concrete `PointPut`
-        /// ops carrying each target row's existing surrogate. `false` is the
-        /// normal write path (autocommit / co-resident replay).
-        #[serde(default)]
-        resolve_only: bool,
         /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`.
         /// When `Some`, the handler builds the source join-map from these
         /// pre-scanned `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD
@@ -654,14 +643,6 @@ pub enum DocumentOp {
         clauses: Vec<MergeClauseOp>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// RESOLVE-ONLY read pass (Control-Plane orchestrator, phase 1). When
-        /// `true` the handler classifies the merge WITHOUT writing and returns
-        /// the NOT-MATCHED insert rows as msgpack `Vec<(join_key, body)>` so the
-        /// orchestrator can allocate a fresh, registered surrogate per inserted
-        /// row (surrogate registration is Control-Plane-only). No storage
-        /// mutation happens on this pass.
-        #[serde(default)]
-        resolve_only: bool,
         /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert
         /// rows, keyed by source join value (orchestrator phase 3). When
         /// `Some`, the handler runs the ATOMIC apply: it re-derives the insert
@@ -670,7 +651,7 @@ pub enum DocumentOp {
         /// resolve→apply TOCTOU) — and applies every arm's writes with these
         /// surrogates in ONE redb transaction (matched UPDATE + NOT-MATCHED
         /// INSERT share the txn; a UNIQUE violation rolls back the whole set).
-        /// `None` together with `resolve_only == false` is the UNRESOLVED shape
+        /// `None` on a bare (unwrapped) `Merge` is the UNRESOLVED shape
         /// every entry point intercepts on the Control Plane — autocommit via
         /// the merge orchestrator, in-transaction via the statement-time
         /// expander — so it never reaches the Data Plane, which rejects it.
@@ -780,4 +761,22 @@ pub enum DocumentOp {
         /// as `join_column`.
         join_value: String,
     },
+
+    /// Read-only RESOLVE pass over the wrapped write op.
+    ///
+    /// The handler runs the wrapped op's full classification — target scan,
+    /// join match, arm selection, assignment eval, post-image encode — and
+    /// returns what it WOULD write, without writing, re-indexing, accumulating
+    /// a write set, or emitting events. The Control-Plane expander turns that
+    /// answer into concrete, surrogate-carrying point ops.
+    ///
+    /// Only [`DocumentOp::Merge`] and [`DocumentOp::UpdateFromJoin`] are valid
+    /// inner ops; the Data Plane rejects any other.
+    ///
+    /// Carries NO check slot of its own: it persists nothing, so no write gate
+    /// applies. The wrapped op still holds the injected write predicate, and
+    /// the expander decides every resolved image against it before emitting a
+    /// point op. Classified as a READ everywhere — permission, write class,
+    /// lock keys, CDC, Calvin routing.
+    ResolveWrite(Box<DocumentOp>),
 }

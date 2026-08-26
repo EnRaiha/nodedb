@@ -222,6 +222,11 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         // whose only changed column is one the engine maintains — the same
         // reason the co-resident derived write runs with `enforce: false`.
         DocumentOp::ApplyBalanceDelta { .. } => Ok(()),
+
+        // Inject into the wrapped op: it is the intercepted write verbatim, and
+        // the expander decides the resolved images against the check injected
+        // there.
+        DocumentOp::ResolveWrite(inner) => inject_document(ctx, inner),
     }
 }
 
@@ -394,7 +399,6 @@ mod tests {
             source_join_col: "id".into(),
             clauses: Vec::new(),
             returning: None,
-            resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
@@ -638,7 +642,6 @@ mod tests {
             source_join_col: "id".into(),
             clauses: Vec::new(),
             returning: None,
-            resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),

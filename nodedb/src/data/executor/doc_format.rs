@@ -113,6 +113,25 @@ pub(super) fn encode_to_msgpack(value: &serde_json::Value) -> Vec<u8> {
     })
 }
 
+/// Encode a resolved document to the standard schemaless document wire body.
+///
+/// This is the ONE body encoding a RESOLVE pass hands the Control Plane, for
+/// MERGE and `UPDATE ... FROM` alike: the Control Plane rewrites those arms into
+/// point ops whose bodies are re-encoded to stored form (Binary Tuple for a
+/// strict target) by the normal write path, so a stored-form body there is
+/// double-encoded and fails to decode.
+///
+/// The document store, the scan decoder, AND the vector-search result flattener
+/// (`from_msgpack::<HashMap<String, nodedb_types::Value>>`) all expect the
+/// `nodedb_types::Value` msgpack encoding that plain `INSERT` produces. Encoding
+/// via `json_to_msgpack` instead yields a JSON-flavoured map that the scan can
+/// still read but the vector flattener cannot decode — so a resolved row's
+/// non-key fields come back empty from a vector search.
+pub(super) fn encode_resolved_wire_body(doc: &serde_json::Value) -> Vec<u8> {
+    let value: nodedb_types::Value = doc.clone().into();
+    nodedb_types::value_to_msgpack(&value).unwrap_or_else(|_| encode_to_msgpack(doc))
+}
+
 /// Convert JSON bytes to MessagePack bytes, borrowing when nothing changes.
 ///
 /// Handles three input formats:

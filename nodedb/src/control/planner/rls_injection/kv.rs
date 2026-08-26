@@ -164,6 +164,20 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             collection,
             rls_write_check,
             ..
+        }
+        // The row set is resolved by the Data Plane scan, so the images the
+        // policy decides — each merged post-image, each removed pre-image —
+        // exist only where they are persisted, exactly as for the keyed
+        // shapes above. Mirrors `ColumnarOp::{Update, Delete}`.
+        | KvOp::PredicateUpdate {
+            collection,
+            rls_write_check,
+            ..
+        }
+        | KvOp::PredicateDelete {
+            collection,
+            rls_write_check,
+            ..
         } => ctx.set_write_check(collection, rls_write_check),
 
         // Ship the write predicate, and refuse under a read policy: each of

@@ -64,6 +64,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::MaterializeScan { .. }
+            // Read-only classification pass issued by the Control-Plane
+            // expander itself; it writes nothing and buffers nothing.
+            | DocumentOp::ResolveWrite(_)
             // Appended by the planner AFTER statement admission and dispatched
             // as its own task; it never reaches the transaction write buffer.
             | DocumentOp::ApplyBalanceDelta { .. },
@@ -271,6 +274,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // state-dependent KV write replicates as), but transaction resolve
         // rejects it, so it is never stageable and never needs buffering.
         PhysicalPlan::Kv(KvOp::ResolvedWrite { .. }) => false,
+
+        // ---- Kv: predicate DML — encoded (buffered) ----
+        //
+        // `to_replicated_entry` encodes both, so the oracle says buffer.
+        // COMMIT-time resolve refuses them (`transaction/resolve/entry.rs`):
+        // autocommit is the supported path.
+        PhysicalPlan::Kv(KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. }) => true,
 
         // ---- Columnar: encoded (buffered) ----
         PhysicalPlan::Columnar(
@@ -1250,6 +1260,17 @@ mod tests {
                 keys: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
+            PhysicalPlan::Kv(KvOp::PredicateUpdate {
+                collection: "c".into(),
+                filters: Vec::new(),
+                updates: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            }),
+            PhysicalPlan::Kv(KvOp::PredicateDelete {
+                collection: "c".into(),
+                filters: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            }),
             PhysicalPlan::Kv(KvOp::Scan {
                 collection: "c".into(),
                 cursor: Vec::new(),
@@ -2070,7 +2091,6 @@ mod tests {
                 source_join_col: "id".into(),
                 clauses: Vec::new(),
                 returning: None,
-                resolve_only: false,
                 resolved_inserts: None,
                 source_rows: None,
                 rls_filters: Vec::new(),
@@ -2086,7 +2106,6 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
-                resolve_only: false,
                 source_rows: None,
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,

@@ -842,4 +842,27 @@ pub enum ReplicatedWrite {
         /// has moved on.
         response_payload: Vec<u8>,
     },
+
+    /// KV predicate `UPDATE` on a collection with NO write policy. Appended
+    /// last to preserve the positional ABI.
+    ///
+    /// The predicate travels, not a row set: every replica re-scans it
+    /// against its own committed state (same contract as `ColumnarBulkDml`).
+    /// A collection WITH a write policy never reaches this shape —
+    /// `entry_kv` resolves it to `KvResolvedWrite` first.
+    KvPredicateUpdate {
+        collection: String,
+        /// Serialized `Vec<ScanFilter>`. Empty matches every row.
+        filters: Vec<u8>,
+        updates: Vec<(String, Vec<u8>)>,
+    },
+
+    /// KV predicate `DELETE` on a collection with NO write policy — see
+    /// [`ReplicatedWrite::KvPredicateUpdate`]. Appended last to preserve the
+    /// positional ABI.
+    KvPredicateDelete {
+        collection: String,
+        /// Serialized `Vec<ScanFilter>`. Empty matches every row.
+        filters: Vec<u8>,
+    },
 }

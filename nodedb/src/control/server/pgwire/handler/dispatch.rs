@@ -221,7 +221,6 @@ impl NodeDbPgHandler {
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::Merge {
-                    resolve_only: false,
                     resolved_inserts: None,
                     ..
                 }
@@ -246,7 +245,6 @@ impl NodeDbPgHandler {
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                    resolve_only: false,
                     source_rows: None,
                     ..
                 }

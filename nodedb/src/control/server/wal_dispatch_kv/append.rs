@@ -10,9 +10,10 @@ use super::encode::{
     KvRegisterSortedIndexFields, KvTransferFields, encode_kv_batch_put, encode_kv_cas,
     encode_kv_delete, encode_kv_drop_index, encode_kv_drop_sorted_index, encode_kv_expire,
     encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
-    encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_put,
-    encode_kv_register_index, encode_kv_register_sorted_index, encode_kv_transfer,
-    encode_kv_transfer_item, encode_kv_truncate,
+    encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_predicate_delete,
+    encode_kv_predicate_update, encode_kv_put, encode_kv_register_index,
+    encode_kv_register_sorted_index, encode_kv_transfer, encode_kv_transfer_item,
+    encode_kv_truncate,
 };
 
 /// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN (if a durable
@@ -286,6 +287,27 @@ pub fn wal_append_kv_op(
         }
         KvOp::Truncate { collection } => {
             let entry = encode_kv_truncate(collection)?;
+            Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
+        }
+        // The predicate is the durable record; replay re-executes it through
+        // the same computation the live handler runs.
+        KvOp::PredicateUpdate {
+            collection,
+            filters,
+            updates,
+            // A per-request authorization input, not part of the image being
+            // made durable — the same reason every other KV arm drops it.
+            rls_write_check: _,
+        } => {
+            let entry = encode_kv_predicate_update(collection, filters, updates)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
+        }
+        KvOp::PredicateDelete {
+            collection,
+            filters,
+            rls_write_check: _,
+        } => {
+            let entry = encode_kv_predicate_delete(collection, filters)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Transfer {

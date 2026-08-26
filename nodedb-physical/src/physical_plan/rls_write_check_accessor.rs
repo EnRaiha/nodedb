@@ -103,6 +103,12 @@ impl PhysicalPlan {
             | PhysicalPlan::Kv(KvOp::Transfer {
                 rls_write_check, ..
             })
+            | PhysicalPlan::Kv(KvOp::PredicateUpdate {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Kv(KvOp::PredicateDelete {
+                rls_write_check, ..
+            })
             | PhysicalPlan::Kv(KvOp::ResolvedWrite {
                 rls_write_check, ..
             }) => Some(rls_write_check),
@@ -114,6 +120,11 @@ impl PhysicalPlan {
             // holds the live predicate, and the resolve handler decides it
             // there against the images it computes.
             PhysicalPlan::Kv(KvOp::ResolveWrite(_)) => None,
+
+            // Same shape on the document side: the wrapped `Merge` /
+            // `UpdateFromJoin` holds the live predicate, and the Control-Plane
+            // expander decides the resolved images against it.
+            PhysicalPlan::Document(DocumentOp::ResolveWrite(_)) => None,
 
             // Every other op is not write-class: it carries no
             // `rls_write_check` field at all.

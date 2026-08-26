@@ -256,6 +256,22 @@ impl CoreLoop {
                     puts += applied;
                     continue;
                 }
+
+                // kv_predicate_update (delta record): re-resolves the row set
+                // against this core's KV engine at this point in LSN order and
+                // re-runs the same merge — see
+                // `wal_replay_kv_predicate.rs`.
+                if let Some(applied) = self.try_replay_kv_predicate_update(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
             }
 
             if is_delete {
@@ -299,6 +315,21 @@ impl CoreLoop {
                         record_lsn,
                     );
                     deletes += 1;
+                    continue;
+                }
+
+                // kv_predicate_delete (delta record): re-resolves the row set
+                // against this core's KV engine at this point in LSN order —
+                // see `wal_replay_kv_predicate.rs`.
+                if let Some(removed) = self.try_replay_kv_predicate_delete(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    deletes += removed;
                     continue;
                 }
 

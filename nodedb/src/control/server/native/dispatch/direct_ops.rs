@@ -167,7 +167,6 @@ pub(crate) async fn handle_direct_op(
         if matches!(
             &plan,
             PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
-                resolve_only: false,
                 resolved_inserts: None,
                 ..
             })
@@ -200,7 +199,6 @@ pub(crate) async fn handle_direct_op(
         if matches!(
             &plan,
             PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                resolve_only: false,
                 source_rows: None,
                 ..
             })

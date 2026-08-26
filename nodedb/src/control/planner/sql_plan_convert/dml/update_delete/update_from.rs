@@ -98,7 +98,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
             updates,
             target_filters: target_filter_bytes,
             returning: None,
-            resolve_only: false,
             // The source rows are shipped in by the Control-Plane orchestrator
             // (cross-core source-ship); the neutral plan carries none.
             source_rows: None,

@@ -189,7 +189,8 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             needs_existence_probe: false,
         }),
         // Not a write operation.
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::Register { .. }

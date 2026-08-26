@@ -422,6 +422,37 @@ pub(crate) fn encode_kv_drop_sorted_index(index_name: &str) -> crate::Result<Vec
     encode("drop sorted index", &("kv_drop_sorted_index", index_name))
 }
 
+/// Encode a `kv_predicate_update` WAL payload:
+/// `("kv_predicate_update", collection, filters, updates)`.
+///
+/// A DELTA record, not a post-image: which rows a predicate selects is only
+/// known once current state is scanned, so replay re-runs the predicate and
+/// the same `merge_field_updates` the live handler uses — the rationale
+/// [`encode_kv_field_set`] gives, applied to a row set instead of one key.
+pub(crate) fn encode_kv_predicate_update(
+    collection: &str,
+    filters: &[u8],
+    updates: &[(String, Vec<u8>)],
+) -> crate::Result<Vec<u8>> {
+    encode(
+        "predicate update",
+        &("kv_predicate_update", collection, filters, updates),
+    )
+}
+
+/// Encode a `kv_predicate_delete` WAL payload:
+/// `("kv_predicate_delete", collection, filters)`. See
+/// [`encode_kv_predicate_update`] for why the predicate travels.
+pub(crate) fn encode_kv_predicate_delete(
+    collection: &str,
+    filters: &[u8],
+) -> crate::Result<Vec<u8>> {
+    encode(
+        "predicate delete",
+        &("kv_predicate_delete", collection, filters),
+    )
+}
+
 /// Encode a `kv_truncate` WAL payload: `("kv_truncate", collection)`.
 pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
     encode("truncate", &("kv_truncate", collection))

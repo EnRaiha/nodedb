@@ -381,7 +381,9 @@ impl CoreLoop {
             | KvOp::RegisterSortedIndex { .. }
             | KvOp::DropSortedIndex { .. }
             | KvOp::ResolveWrite(_)
-            | KvOp::ResolvedWrite { .. } => Err(ErrorCode::Internal {
+            | KvOp::ResolvedWrite { .. }
+            | KvOp::PredicateUpdate { .. }
+            | KvOp::PredicateDelete { .. } => Err(ErrorCode::Internal {
                 detail: "execute_tx_kv_write called with a non-write-RMW KvOp variant".into(),
             }),
         }

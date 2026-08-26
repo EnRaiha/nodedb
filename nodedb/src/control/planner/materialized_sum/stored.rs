@@ -189,6 +189,7 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
         }),
         DocumentOp::PointInsert { .. }
         | DocumentOp::BatchInsert { .. }
+        | DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }

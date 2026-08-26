@@ -215,7 +215,8 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
         // [`stored_row_scope`].
         DocumentOp::PointDelete { .. } | DocumentOp::PointUpdate { .. } => None,
         // Predicate-driven and read-only ops.
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::Register { .. }
@@ -267,7 +268,8 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
             resolved_sum_targets,
             ..
         } => *resolved_sum_targets = resolved,
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::Register { .. }

@@ -53,7 +53,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
     let filter_bytes = serialize_filters(filters)?;
     let updates = assignments_to_update_values(assignments)?;
 
-    if matches!(engine, EngineType::KeyValue) && !target_keys.is_empty() {
+    if matches!(engine, EngineType::KeyValue) {
         if let Some((field, _)) = assignments
             .iter()
             .find(|(_, expr)| !matches!(expr, SqlExpr::Literal(_)))
@@ -64,6 +64,30 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                      is not yet supported; use a literal value"
                 ),
             });
+        }
+        // A KV collection has no document store; a WHERE with no primary key
+        // must still route to the KV engine, not `DocumentOp::BulkUpdate`.
+        if target_keys.is_empty() {
+            let literal_updates: Vec<(String, Vec<u8>)> = assignments
+                .iter()
+                .filter_map(|(field, expr)| match expr {
+                    SqlExpr::Literal(val) => Some((field.clone(), sql_value_to_msgpack(val))),
+                    _ => None,
+                })
+                .collect();
+            return Ok(vec![PhysicalTask {
+                tenant_id,
+                vshard_id: vshard,
+                database_id: ctx.database_id,
+                plan: PhysicalPlan::Kv(KvOp::PredicateUpdate {
+                    collection: collection.into(),
+                    filters: filter_bytes,
+                    updates: literal_updates,
+                    rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                }),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            }]);
         }
         let mut tasks = Vec::new();
         for key in target_keys {
@@ -100,6 +124,18 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             });
         }
         return Ok(tasks);
+    }
+
+    // `TimeseriesRules::plan_update` already rejects this; this guard keeps
+    // the rejection true for any other caller, not a fall-through to
+    // `DocumentOp::BulkUpdate` over the empty document store.
+    if matches!(engine, EngineType::Timeseries) {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "UPDATE is not supported on timeseries collection '{collection}'; \
+                 timeseries data is append-only"
+            ),
+        });
     }
 
     // Columnar and spatial engines have no document store; route to

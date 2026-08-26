@@ -205,7 +205,13 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         // KV delete / truncate count the keys they removed. Classifying them as
         // opaque `Execution` discarded that count, so a KV delete reported no
         // rows however many keys it actually removed.
-        PhysicalPlan::Kv(KvOp::Delete { .. }) => DmlResult("DELETE"),
+        PhysicalPlan::Kv(KvOp::Delete { .. }) | PhysicalPlan::Kv(KvOp::PredicateDelete { .. }) => {
+            DmlResult("DELETE")
+        }
+        // Reports `{"affected": n}` — the rows the predicate matched and
+        // merged. Classifying it as opaque `Execution` would discard that
+        // count and report `UPDATE 0` however many rows changed.
+        PhysicalPlan::Kv(KvOp::PredicateUpdate { .. }) => DmlResult("UPDATE"),
         PhysicalPlan::Kv(KvOp::Truncate { .. }) => DmlResult("TRUNCATE"),
 
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => DmlResult("INSERT"),
@@ -270,6 +276,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Document(DocumentOp::BackfillIndex { .. })
         | PhysicalPlan::Document(DocumentOp::EstimateCount { .. })
         | PhysicalPlan::Document(DocumentOp::MaterializeScan { .. })
+        // Read-only resolve: its payload is the internal classification tuple
+        // the Control-Plane orchestrator decodes, never a client row.
+        | PhysicalPlan::Document(DocumentOp::ResolveWrite(_))
         // A derived balance write answers no client: it reports an affected
         // count to the planner that appended it and shapes no row.
         | PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. })
@@ -529,7 +538,6 @@ mod tests {
             source_join_col: "id".to_string(),
             clauses: Vec::new(),
             returning,
-            resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),

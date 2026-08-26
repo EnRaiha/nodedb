@@ -94,7 +94,6 @@ where
     }
     let (ops, kind) = match &task.plan {
         PhysicalPlan::Document(DocumentOp::Merge {
-            resolve_only: false,
             resolved_inserts: None,
             ..
         }) => {
@@ -112,10 +111,7 @@ where
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Merge)
         }
-        PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            resolve_only: false,
-            ..
-        }) => {
+        PhysicalPlan::Document(DocumentOp::UpdateFromJoin { .. }) => {
             // Stamp the active transaction id so the RESOLVE pass (and its
             // source scan) fold this transaction's staging overlay: an
             // `UPDATE ... FROM` matches — and reuses the surrogate of — a row

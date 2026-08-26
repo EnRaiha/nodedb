@@ -118,7 +118,10 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => PlanRouting::Unroutable(
             "cross-collection write: source/target co-location is not enforced",
         ),
-        DocumentOp::PointGet { .. }
+        // Read-only: it reports what the wrapped write would do and mutates
+        // nothing.
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }
@@ -149,7 +152,11 @@ fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
         | KvOp::GetSet { collection, .. }
         // Transfer moves value between two KEYS in the SAME collection field,
         // so it stays single-home unlike `TransferItem` below.
-        | KvOp::Transfer { collection, .. } => {
+        | KvOp::Transfer { collection, .. }
+        // Predicate DML touches only the collection it names, so it homes on
+        // that collection's vshard like every other single-collection write.
+        | KvOp::PredicateUpdate { collection, .. }
+        | KvOp::PredicateDelete { collection, .. } => {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         // Source and dest are DIFFERENT collections; no co-location guarantee.
@@ -635,7 +642,6 @@ mod tests {
             source_join_col: "id".to_owned(),
             clauses: Vec::new(),
             returning: None,
-            resolve_only: false,
             resolved_inserts: None,
             source_rows: None,
             rls_filters: Vec::new(),
@@ -667,7 +673,6 @@ mod tests {
             updates: Vec::new(),
             target_filters: Vec::new(),
             returning: None,
-            resolve_only: false,
             source_rows: None,
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),

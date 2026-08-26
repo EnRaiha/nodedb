@@ -42,6 +42,8 @@ impl KvOp {
             | KvOp::GetSet { collection, .. }
             | KvOp::Transfer { collection, .. }
             | KvOp::RegisterSortedIndex { collection, .. }
+            | KvOp::PredicateUpdate { collection, .. }
+            | KvOp::PredicateDelete { collection, .. }
             | KvOp::MaterializeScan { collection, .. } => Some(collection.as_str()),
             KvOp::TransferItem {
                 source_collection, ..

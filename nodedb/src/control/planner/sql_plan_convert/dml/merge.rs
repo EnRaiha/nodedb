@@ -89,11 +89,10 @@ pub(in super::super) fn convert_merge(
             returning: None,
             // Autocommit MERGE is intercepted at the dispatch entry points and
             // driven by the Control-Plane orchestrator (`control::merge_orchestrator`),
-            // which re-issues this op with `resolve_only` / `resolved_inserts`
-            // set. The plan produced here is the neutral form: in-transaction
-            // MERGE is expanded into concrete point ops at statement time, so
-            // this shape never reaches the Data Plane.
-            resolve_only: false,
+            // which re-issues this op wrapped in `ResolveWrite`, then with
+            // `resolved_inserts` set. The plan produced here is the neutral
+            // form: in-transaction MERGE is expanded into concrete point ops at
+            // statement time, so this shape never reaches the Data Plane.
             resolved_inserts: None,
             // The source rows are shipped in by the Control-Plane orchestrator
             // (cross-core source-ship); the neutral plan carries none.

@@ -224,7 +224,12 @@ pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
             | KvOp::IncrFloat { collection, .. }
             | KvOp::Cas { collection, .. }
             | KvOp::GetSet { collection, .. }
-            | KvOp::FieldSet { collection, .. },
+            | KvOp::FieldSet { collection, .. }
+            // Predicate DML homes on the collection it names — matching
+            // `plan_vshard`'s KV routing, which the participant set must
+            // agree with.
+            | KvOp::PredicateUpdate { collection, .. }
+            | KvOp::PredicateDelete { collection, .. },
         ) => collection.clone(),
         PhysicalPlan::Vector(
             VectorOp::Insert { collection, .. }
@@ -268,7 +273,8 @@ fn document_write_collection(op: &DocumentOp) -> String {
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => String::new(),
         // Reads and index DDL: the caller skips every plan `is_write_plan`
         // rejects before it gets here.
-        DocumentOp::PointGet { .. }
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }

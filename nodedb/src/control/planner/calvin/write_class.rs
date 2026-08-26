@@ -73,7 +73,10 @@ fn document_is_write(op: &DocumentOp) -> bool {
         // the pair it belongs to classifies as single-shard and the source
         // write commits without the balance.
         | DocumentOp::ApplyBalanceDelta { .. } => true,
-        DocumentOp::PointGet { .. }
+        // Read-only: it reports what the wrapped write would apply and mutates
+        // nothing.
+        DocumentOp::ResolveWrite(_)
+        | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
         | DocumentOp::RangeScan { .. }
         | DocumentOp::IndexLookup { .. }
@@ -149,7 +152,11 @@ fn kv_is_write(op: &KvOp) -> bool {
         | KvOp::IncrFloat { .. }
         | KvOp::Cas { .. }
         | KvOp::GetSet { .. }
-        | KvOp::Transfer { .. } => true,
+        | KvOp::Transfer { .. }
+        // Predicate DML mutates the rows a scan selects, homed on the one
+        // collection it names — a single-vshard write like `Truncate`.
+        | KvOp::PredicateUpdate { .. }
+        | KvOp::PredicateDelete { .. } => true,
         KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::GetTtl { .. }

@@ -6,6 +6,7 @@ mod apply;
 mod atomic_ops;
 mod context;
 mod dispatch;
+mod predicate_ops;
 mod transfer_ops;
 mod write_ops;
 
