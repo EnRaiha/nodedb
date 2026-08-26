@@ -10,7 +10,7 @@
 pub(super) fn extract_system_as_of_ms(
     plan: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
 ) -> Option<i64> {
-    use nodedb_physical::physical_plan::PhysicalPlan;
+    use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
     // Exhaustive match — adding a new top-level engine MUST require an
     // explicit decision here about how `FOR SYSTEM_TIME AS OF` is plumbed
     // (or that it is intentionally unsupported on that engine). A
@@ -20,10 +20,19 @@ pub(super) fn extract_system_as_of_ms(
         PhysicalPlan::Document(op) => extract_doc_as_of(op),
         PhysicalPlan::Columnar(op) => extract_columnar_as_of(op),
         PhysicalPlan::Timeseries(op) => extract_timeseries_as_of(op),
+        // Structural wrappers: the converter wraps every sharded read in
+        // `Exchange{Gather}` (and every materialized subquery body in
+        // `PostProcess`), so the temporal qualifier sits on the child. Without
+        // these arms `FOR SYSTEM_TIME AS OF` never reached the clone predation
+        // check and `query_lsn` fell back to the WAL frontier.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_system_as_of_ms(Some(&*op.child)),
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => {
+            extract_system_as_of_ms(Some(&**input))
+        }
         // Index-only / overlay engines (Vector, Text, Spatial, Graph) and
         // engines that do not currently carry a `system_as_of_ms` qualifier
-        // on their plan variants (Kv, Crdt, Query, Meta, Array,
-        // ClusterArray) are explicitly None. Bitemporal queries against
+        // on their plan variants (Kv, Crdt, the non-wrapper Query ops, Meta,
+        // Array, ClusterArray) are explicitly None. Bitemporal queries against
         // these go through composition with a data-bearing collection;
         // when that changes, add a branch here rather than relaxing this
         // match.

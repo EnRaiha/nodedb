@@ -59,6 +59,12 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { collection, .. })
         | PhysicalPlan::Text(TextOp::SetTextConfig { collection, .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { collection, .. })
+        // The shuffle map-side producer scans the named collection exactly like
+        // `PartialAggregate`; `collection` stays populated even when `input` is
+        // set. Reporting `None` hid it from every caller that keys on the read
+        // collection — including the clone resolver, which then treated a
+        // shadowed-clone aggregate as a non-clone read.
+        | PhysicalPlan::Query(QueryOp::PartialAggregateState { collection, .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. })

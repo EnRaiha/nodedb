@@ -99,7 +99,6 @@ pub(crate) async fn run_insert_select(
         tenant_id,
         database_id,
         target_collection,
-        source_collection,
         source_filters,
     )?;
 

@@ -11,18 +11,20 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use redb::{ReadableDatabase, ReadableTable};
 
+pub(super) use super::merge_helpers::json_to_str as json_value_to_string;
+
 impl CoreLoop {
     /// Build the source join map `join_val → source document`.
     ///
     /// Two sources of source rows, selected by `source_rows`:
     /// - `Some(rows)` (cross-core): the Control Plane scanned the source on its
-    ///   OWN Data-Plane core and shipped the RAW stored bytes here. This core
-    ///   need not hold the source's storage, but `Register` is broadcast so it
-    ///   DOES hold the source's strict schema — the shipped bytes are decoded
-    ///   with the exact same schema-aware logic the local scan uses, so the
-    ///   resulting map is byte-for-byte identical to a co-resident local read.
+    ///   OWN Data-Plane core and shipped the bodies here, already normalized to
+    ///   standard msgpack by the source handler — so they decode without the
+    ///   source's strict schema and yield the same map a co-resident local read
+    ///   produces.
     /// - `None` (legacy co-resident / in-txn buffered replay): read the source
-    ///   from this core's local storage.
+    ///   from this core's local storage, whose rows are still in stored form
+    ///   (a Binary Tuple for a strict source) and need the schema.
     pub(in crate::data::executor) fn build_source_join_map(
         &self,
         database_id: u64,
@@ -47,31 +49,32 @@ impl CoreLoop {
             }
         });
 
-        // Decode one raw stored source document and extract its non-empty join
-        // key. Shared by the shipped-rows path and the local-scan path so both
-        // derive an identical `join_val → document` mapping from identical bytes.
+        // Decode one source document and extract its non-empty join key.
+        // `schema` states the encoding of the bytes handed in: `Some` for a
+        // stored Binary Tuple, `None` for an already-normalized body.
         //
         // `Ok(None)` is the domain answer "this source row has no usable join
         // key"; a body that will not decode is not that answer. Dropping it
         // silently would leave the row unmatched, so the UPDATE would skip
         // every target row that should have joined to it and report a smaller
         // affected count as the truth.
-        let decode_and_key =
-            |value_bytes: &[u8]| -> crate::Result<Option<(String, serde_json::Value)>> {
-                let doc = doc_format::decode_document_or_binary_tuple(
-                    value_bytes,
-                    strict_schema.as_ref(),
-                    "UPDATE ... FROM source row",
-                )?;
-                let key = doc
-                    .get(join_col)
-                    .map(json_value_to_string)
-                    .unwrap_or_default();
-                if key.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some((key, doc)))
-            };
+        let decode_and_key = |value_bytes: &[u8],
+                              schema: Option<&nodedb_types::columnar::StrictSchema>|
+         -> crate::Result<Option<(String, serde_json::Value)>> {
+            let doc = doc_format::decode_document_or_binary_tuple(
+                value_bytes,
+                schema,
+                "UPDATE ... FROM source row",
+            )?;
+            let key = doc
+                .get(join_col)
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            if key.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some((key, doc)))
+        };
 
         let mut map = std::collections::HashMap::new();
 
@@ -80,7 +83,7 @@ impl CoreLoop {
         // empty; the shipped bytes are the source's on-disk rows verbatim.
         if let Some(rows) = source_rows {
             for (_source_doc_id, value_bytes) in rows {
-                if let Some((key, doc)) = decode_and_key(value_bytes)? {
+                if let Some((key, doc)) = decode_and_key(value_bytes, None)? {
                     map.insert(key, doc);
                 }
             }
@@ -109,23 +112,12 @@ impl CoreLoop {
 
         if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
             for entry in range.flatten() {
-                if let Some((key, doc)) = decode_and_key(entry.1.value())? {
+                if let Some((key, doc)) = decode_and_key(entry.1.value(), strict_schema.as_ref())? {
                     map.insert(key, doc);
                 }
             }
         }
         Ok(map)
-    }
-}
-
-/// Convert a `serde_json::Value` to a string for join-key comparison.
-pub(super) fn json_value_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
     }
 }
 

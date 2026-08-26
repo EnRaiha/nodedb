@@ -9,8 +9,12 @@ use nodedb_types::DatabaseId;
 use nodedb_types::TenantId;
 
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp, PhysicalPlan, TimeseriesOp};
+use nodedb_physical::physical_plan::{
+    ColumnarOp, DocumentOp, ExchangeOp, KvOp, PhysicalPlan, QueryOp, TimeseriesOp,
+};
 use nodedb_types::SystemTimeScope;
+
+use super::refusal::{SourceRewrite, plan_reads_cloned_collection, refuse_clone_read_shape};
 
 /// Compute the source-side system-time selection for a clone scan rewrite.
 ///
@@ -36,16 +40,6 @@ fn rewrite_system_time(
     }
 }
 
-/// Rewrite a `PhysicalPlan` to target the source database and collection at
-/// the effective source LSN.  Returns `None` for plan types that are not
-/// read-type operations (writes, DDL), and also returns `None` for
-/// `DocumentOp::PointGet` when the source database has no surrogate binding
-/// for `pk_bytes` — i.e. the row never existed in the source, so there is
-/// nothing to fetch and no source task should be created.
-///
-/// `state` is used to resolve the source surrogate for `DocumentOp::PointGet`
-/// rewrites — the target surrogate is not valid in the source database, so we
-/// perform a read-only catalog lookup against the source-qualified collection.
 /// Per-call inputs for [`rewrite_plan_for_source`].
 ///
 /// Bundled into a struct so the function stays under the clippy
@@ -69,9 +63,16 @@ pub struct RewriteForSourceParams<'a> {
     pub state: &'a Arc<SharedState>,
 }
 
-pub fn rewrite_plan_for_source(
-    params: RewriteForSourceParams<'_>,
-) -> crate::Result<Option<PhysicalPlan>> {
+/// Rewrite a `PhysicalPlan` to target the source database and collection at
+/// the effective source LSN.
+///
+/// `state` resolves the source surrogate for `DocumentOp::PointGet` rewrites —
+/// the target surrogate is not valid in the source database, so the lookup runs
+/// read-only against the source-qualified collection.
+///
+/// A read that names the cloned collection but has no rewrite is refused with a
+/// typed error; see [`SourceRewrite`].
+pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Result<SourceRewrite> {
     use crate::control::planner::sql_plan_convert::convert::db_qualified;
 
     let RewriteForSourceParams {
@@ -89,6 +90,72 @@ pub fn rewrite_plan_for_source(
     let source_qualified = db_qualified(source_db_id, source_coll);
 
     match plan {
+        // Structural wrappers, matched BEFORE the engine arms. The converter
+        // wraps every sharded read in `Exchange{Gather}` (and every
+        // materialized subquery body in `PostProcess`), so the engine op the
+        // arms below match on is never at the top level of such a plan.
+        // Recursing and re-wrapping with the IDENTICAL mode makes the
+        // source-side task fan and gather exactly like the target-side one,
+        // and covers every present and future sharded engine by construction.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => {
+            let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
+                plan: &op.child,
+                target_db_id,
+                source_db_id,
+                tenant_id,
+                target_coll,
+                source_coll,
+                effective_source_ms,
+                kv_surrogate_ceiling,
+                state,
+            })?;
+            Ok(match rewritten {
+                SourceRewrite::Task(child) => {
+                    SourceRewrite::task(PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                        child,
+                        mode: op.mode.clone(),
+                    })))
+                }
+                SourceRewrite::NoSourceTask => SourceRewrite::NoSourceTask,
+            })
+        }
+
+        PhysicalPlan::Query(QueryOp::PostProcess {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            limit,
+            offset,
+            distinct,
+        }) => {
+            let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
+                plan: input,
+                target_db_id,
+                source_db_id,
+                tenant_id,
+                target_coll,
+                source_coll,
+                effective_source_ms,
+                kv_surrogate_ceiling,
+                state,
+            })?;
+            Ok(match rewritten {
+                SourceRewrite::Task(child) => {
+                    SourceRewrite::task(PhysicalPlan::Query(QueryOp::PostProcess {
+                        input: child,
+                        filters: filters.clone(),
+                        projection: projection.clone(),
+                        sort_keys: sort_keys.clone(),
+                        limit: *limit,
+                        offset: *offset,
+                        distinct: *distinct,
+                    }))
+                }
+                SourceRewrite::NoSourceTask => SourceRewrite::NoSourceTask,
+            })
+        }
+
         PhysicalPlan::Document(DocumentOp::Scan {
             collection,
             limit,
@@ -104,20 +171,22 @@ pub fn rewrite_plan_for_source(
             prefilter,
         }) if collection == &target_qualified => {
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(Some(PhysicalPlan::Document(DocumentOp::Scan {
-                collection: source_qualified,
-                limit: *limit,
-                offset: *offset,
-                sort_keys: sort_keys.clone(),
-                filters: filters.clone(),
-                distinct: *distinct,
-                projection: projection.clone(),
-                computed_columns: computed_columns.clone(),
-                window_functions: window_functions.clone(),
-                system_time,
-                valid_at_ms: *valid_at_ms,
-                prefilter: prefilter.clone(),
-            })))
+            Ok(SourceRewrite::task(PhysicalPlan::Document(
+                DocumentOp::Scan {
+                    collection: source_qualified,
+                    limit: *limit,
+                    offset: *offset,
+                    sort_keys: sort_keys.clone(),
+                    filters: filters.clone(),
+                    distinct: *distinct,
+                    projection: projection.clone(),
+                    computed_columns: computed_columns.clone(),
+                    window_functions: window_functions.clone(),
+                    system_time,
+                    valid_at_ms: *valid_at_ms,
+                    prefilter: prefilter.clone(),
+                },
+            )))
         }
 
         PhysicalPlan::Document(DocumentOp::PointGet {
@@ -133,8 +202,8 @@ pub fn rewrite_plan_for_source(
             // database maintains its own (collection, pk_bytes) → surrogate
             // mapping.  If the source has no binding for this pk, the row
             // never existed there and there is nothing to fetch — skip the
-            // source task entirely (return None) rather than dispatching a
-            // task with a sentinel surrogate.
+            // source task entirely rather than dispatching a task with a
+            // sentinel surrogate.
             //
             // Lookup errors are also treated as "skip": surfacing them here
             // would force every read to wait on a degraded surrogate-store
@@ -147,17 +216,19 @@ pub fn rewrite_plan_for_source(
                 .ok()
                 .flatten()
             else {
-                return Ok(None);
+                return Ok(SourceRewrite::NoSourceTask);
             };
-            Ok(Some(PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: source_qualified,
-                document_id: document_id.clone(),
-                surrogate: source_surrogate,
-                pk_bytes: pk_bytes.clone(),
-                rls_filters: rls_filters.clone(),
-                system_time,
-                valid_at_ms: *valid_at_ms,
-            })))
+            Ok(SourceRewrite::task(PhysicalPlan::Document(
+                DocumentOp::PointGet {
+                    collection: source_qualified,
+                    document_id: document_id.clone(),
+                    surrogate: source_surrogate,
+                    pk_bytes: pk_bytes.clone(),
+                    rls_filters: rls_filters.clone(),
+                    system_time,
+                    valid_at_ms: *valid_at_ms,
+                },
+            )))
         }
 
         PhysicalPlan::Document(DocumentOp::IndexedFetch {
@@ -168,8 +239,8 @@ pub fn rewrite_plan_for_source(
             projection,
             limit,
             offset,
-        }) if collection == &target_qualified => {
-            Ok(Some(PhysicalPlan::Document(DocumentOp::IndexedFetch {
+        }) if collection == &target_qualified => Ok(SourceRewrite::task(PhysicalPlan::Document(
+            DocumentOp::IndexedFetch {
                 collection: source_qualified,
                 path: path.clone(),
                 value: value.clone(),
@@ -177,8 +248,8 @@ pub fn rewrite_plan_for_source(
                 projection: projection.clone(),
                 limit: *limit,
                 offset: *offset,
-            })))
-        }
+            },
+        ))),
 
         PhysicalPlan::Kv(KvOp::Scan {
             collection,
@@ -191,27 +262,31 @@ pub fn rewrite_plan_for_source(
             // (clones-of-clones still funnel through here per-level);
             // the resolver overrides it for source delegation below.
             surrogate_ceiling: _,
-        }) if collection == &target_qualified => Ok(Some(PhysicalPlan::Kv(KvOp::Scan {
-            collection: source_qualified,
-            cursor: cursor.clone(),
-            count: *count,
-            filters: filters.clone(),
-            match_pattern: match_pattern.clone(),
-            sort_keys: sort_keys.clone(),
-            surrogate_ceiling: kv_surrogate_ceiling,
-        }))),
+        }) if collection == &target_qualified => {
+            Ok(SourceRewrite::task(PhysicalPlan::Kv(KvOp::Scan {
+                collection: source_qualified,
+                cursor: cursor.clone(),
+                count: *count,
+                filters: filters.clone(),
+                match_pattern: match_pattern.clone(),
+                sort_keys: sort_keys.clone(),
+                surrogate_ceiling: kv_surrogate_ceiling,
+            })))
+        }
 
         PhysicalPlan::Kv(KvOp::Get {
             collection,
             key,
             rls_filters,
             surrogate_ceiling: _,
-        }) if collection == &target_qualified => Ok(Some(PhysicalPlan::Kv(KvOp::Get {
-            collection: source_qualified,
-            key: key.clone(),
-            rls_filters: rls_filters.clone(),
-            surrogate_ceiling: kv_surrogate_ceiling,
-        }))),
+        }) if collection == &target_qualified => {
+            Ok(SourceRewrite::task(PhysicalPlan::Kv(KvOp::Get {
+                collection: source_qualified,
+                key: key.clone(),
+                rls_filters: rls_filters.clone(),
+                surrogate_ceiling: kv_surrogate_ceiling,
+            })))
+        }
 
         PhysicalPlan::Columnar(ColumnarOp::Scan {
             collection,
@@ -226,18 +301,37 @@ pub fn rewrite_plan_for_source(
             computed_columns,
         }) if collection == &target_qualified => {
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(Some(PhysicalPlan::Columnar(ColumnarOp::Scan {
-                collection: source_qualified,
-                projection: projection.clone(),
-                limit: *limit,
-                filters: filters.clone(),
-                rls_filters: rls_filters.clone(),
-                sort_keys: sort_keys.clone(),
-                system_time,
-                valid_at_ms: *valid_at_ms,
-                prefilter: prefilter.clone(),
-                computed_columns: computed_columns.clone(),
-            })))
+            Ok(SourceRewrite::task(PhysicalPlan::Columnar(
+                ColumnarOp::Scan {
+                    collection: source_qualified,
+                    projection: projection.clone(),
+                    limit: *limit,
+                    filters: filters.clone(),
+                    rls_filters: rls_filters.clone(),
+                    sort_keys: sort_keys.clone(),
+                    system_time,
+                    valid_at_ms: *valid_at_ms,
+                    prefilter: prefilter.clone(),
+                    computed_columns: computed_columns.clone(),
+                },
+            )))
+        }
+
+        // A timeseries scan that BUCKETS or AGGREGATES is the same unsound
+        // concatenation as `Query::Aggregate`: the target and source payloads
+        // are appended, so a bucket present on both sides comes back twice and
+        // every SUM / AVG over the union is wrong. Only a plain scan reads
+        // through; the aggregating form is refused.
+        PhysicalPlan::Timeseries(TimeseriesOp::Scan {
+            collection,
+            bucket_interval_ms,
+            group_by,
+            aggregates,
+            ..
+        }) if collection == &target_qualified
+            && (!group_by.is_empty() || !aggregates.is_empty() || *bucket_interval_ms != 0) =>
+        {
+            Err(refuse_clone_read_shape(plan, target_coll))
         }
 
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
@@ -257,28 +351,43 @@ pub fn rewrite_plan_for_source(
             valid_at_ms,
         }) if collection == &target_qualified => {
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(Some(PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: source_qualified,
-                time_range: *time_range,
-                projection: projection.clone(),
-                limit: *limit,
-                filters: filters.clone(),
-                sort_keys: sort_keys.clone(),
-                bucket_interval_ms: *bucket_interval_ms,
-                group_by: group_by.clone(),
-                aggregates: aggregates.clone(),
-                gap_fill: gap_fill.clone(),
-                computed_columns: computed_columns.clone(),
-                rls_filters: rls_filters.clone(),
-                system_time,
-                valid_at_ms: *valid_at_ms,
-            })))
+            Ok(SourceRewrite::task(PhysicalPlan::Timeseries(
+                TimeseriesOp::Scan {
+                    collection: source_qualified,
+                    time_range: *time_range,
+                    projection: projection.clone(),
+                    limit: *limit,
+                    filters: filters.clone(),
+                    sort_keys: sort_keys.clone(),
+                    bucket_interval_ms: *bucket_interval_ms,
+                    group_by: group_by.clone(),
+                    aggregates: aggregates.clone(),
+                    gap_fill: gap_fill.clone(),
+                    computed_columns: computed_columns.clone(),
+                    rls_filters: rls_filters.clone(),
+                    system_time,
+                    valid_at_ms: *valid_at_ms,
+                },
+            )))
         }
 
-        // Write operations, DDL, and all other engine plans are not replicated
-        // to the source — they execute against the target only.  Exhaustively
-        // listing every PhysicalPlan top-level variant ensures the compiler
-        // catches any newly added variants.
+        // DEFAULT: refuse any READ that names the cloned collection, allow
+        // everything else through untouched.
+        //
+        // Everything above is a shape with a proven source-side rewrite. A read
+        // that reaches here names the clone but has no rewrite — aggregates,
+        // joins, vector / text / graph / spatial searches, and whatever the
+        // planner grows next. Answering it from the target's post-clone rows
+        // alone drops every source row silently, which is the defect class this
+        // resolver exists to prevent, so it is an error instead of an empty
+        // result. Writes and DDL execute against the target only and need no
+        // source task; plans over another collection are not this clone's
+        // business.
+        //
+        // The arm is a rule, not a list of shapes: every top-level variant is
+        // enumerated (so a new engine still forces a decision here) and they
+        // all route through the same read-vs-write test, so a new op inside an
+        // existing engine is refused rather than silently skipped.
         PhysicalPlan::Document(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Vector(_)
@@ -292,41 +401,12 @@ pub fn rewrite_plan_for_source(
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => Ok(None),
-    }
-}
-
-/// Extract the raw (db_qualified) collection name from a plan.
-pub(super) fn extract_collection_from_plan(plan: &PhysicalPlan) -> Option<&str> {
-    match plan {
-        PhysicalPlan::Document(DocumentOp::Scan { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::PointGet { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::IndexedFetch { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::PointDelete { collection, .. }) => Some(collection),
-        PhysicalPlan::Document(DocumentOp::PointInsert { collection, .. }) => Some(collection),
-        PhysicalPlan::Kv(KvOp::Scan { collection, .. }) => Some(collection),
-        PhysicalPlan::Kv(KvOp::Get { collection, .. }) => Some(collection),
-        PhysicalPlan::Columnar(ColumnarOp::Scan { collection, .. }) => Some(collection),
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. }) => Some(collection),
-        // All other plan types do not carry a collection in a form the clone
-        // resolver needs to inspect.  Exhaustively listing every top-level
-        // PhysicalPlan variant here ensures the compiler reports new variants.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => None,
+        | PhysicalPlan::ClusterEvent(_) => {
+            if plan_reads_cloned_collection(plan, &target_qualified) {
+                return Err(refuse_clone_read_shape(plan, target_coll));
+            }
+            Ok(SourceRewrite::NoSourceTask)
+        }
     }
 }
 
@@ -342,5 +422,250 @@ pub(super) fn strip_db_prefix(db_id: DatabaseId, qualified: &str) -> &str {
         stripped
     } else {
         qualified
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::control::server::shared::plan_util::extract_collection;
+    use nodedb_graph::{Direction, GraphTraversalOptions};
+    use nodedb_physical::physical_plan::{
+        ColumnarOp, DocumentOp, ExchangeMode, ExchangeOp, GraphOp, PhysicalPlan, QueryOp, TextOp,
+        VectorOp,
+    };
+    use nodedb_types::SystemTimeScope;
+    use nodedb_types::vector_distance::DistanceMetric;
+
+    const COLL: &str = "7/users";
+
+    /// Wrap a plan the way the converter wraps every sharded source.
+    fn gather(plan: PhysicalPlan) -> PhysicalPlan {
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child: Box::new(plan),
+            mode: ExchangeMode::Gather {
+                as_aggregate: false,
+            },
+        }))
+    }
+
+    /// One representative plan per collection-carrying variant accepted by
+    /// `PhysicalPlan::is_sharded_source`.
+    ///
+    /// The graph traversal ops (`Hop`, `Neighbors`, `NeighborsMulti`, `Path`,
+    /// `Subgraph`, `Match`, `MatchContinuation`, `MatchVarLenResume`,
+    /// `TemporalNeighbors`, `TemporalAlgorithm`, `BspSuperstep`,
+    /// `WccSuperstep`, `Stats`) are sharded sources too but are keyed by graph
+    /// / edge label and carry no collection at all, so there is nothing for the
+    /// resolver to extract. `RagFusion` is the one graph op that names a
+    /// collection, and it is covered.
+    fn sharded_source_plans() -> Vec<(&'static str, PhysicalPlan)> {
+        vec![
+            (
+                "document_scan",
+                PhysicalPlan::Document(DocumentOp::Scan {
+                    collection: COLL.to_string(),
+                    limit: 10,
+                    offset: 0,
+                    sort_keys: Vec::new(),
+                    filters: Vec::new(),
+                    distinct: false,
+                    projection: Vec::new(),
+                    computed_columns: Vec::new(),
+                    window_functions: Vec::new(),
+                    system_time: SystemTimeScope::default(),
+                    valid_at_ms: None,
+                    prefilter: None,
+                }),
+            ),
+            (
+                "columnar_scan",
+                PhysicalPlan::Columnar(ColumnarOp::Scan {
+                    collection: COLL.to_string(),
+                    projection: Vec::new(),
+                    limit: 10,
+                    filters: Vec::new(),
+                    rls_filters: Vec::new(),
+                    sort_keys: Vec::new(),
+                    system_time: SystemTimeScope::default(),
+                    valid_at_ms: None,
+                    prefilter: None,
+                    computed_columns: Vec::new(),
+                }),
+            ),
+            (
+                "partial_aggregate",
+                PhysicalPlan::Query(QueryOp::PartialAggregate {
+                    collection: COLL.to_string(),
+                    group_by: Vec::new(),
+                    aggregates: Vec::new(),
+                    filters: Vec::new(),
+                }),
+            ),
+            (
+                "partial_aggregate_state",
+                PhysicalPlan::Query(QueryOp::PartialAggregateState {
+                    collection: COLL.to_string(),
+                    input: None,
+                    group_by: Vec::new(),
+                    aggregates: Vec::new(),
+                    filters: Vec::new(),
+                }),
+            ),
+            (
+                "vector_search",
+                PhysicalPlan::Vector(VectorOp::Search {
+                    collection: COLL.to_string(),
+                    query_vector: vec![0.0, 1.0],
+                    top_k: 4,
+                    ef_search: 16,
+                    metric: DistanceMetric::L2,
+                    filter_bitmap: None,
+                    field_name: "emb".to_string(),
+                    rls_filters: Vec::new(),
+                    inline_prefilter_plan: None,
+                    ann_options: nodedb_types::VectorAnnOptions::default(),
+                    skip_payload_fetch: false,
+                    payload_filters: Vec::new(),
+                }),
+            ),
+            (
+                "text_search",
+                PhysicalPlan::Text(TextOp::Search {
+                    collection: COLL.to_string(),
+                    query: "hello".to_string(),
+                    top_k: 4,
+                    fuzzy: false,
+                    prefilter: None,
+                    rls_filters: Vec::new(),
+                }),
+            ),
+            (
+                "text_bm25_score_scan",
+                PhysicalPlan::Text(TextOp::BM25ScoreScan {
+                    collection: COLL.to_string(),
+                    query: "hello".to_string(),
+                    score_alias: "score".to_string(),
+                    fuzzy: false,
+                }),
+            ),
+            (
+                "text_hybrid_search",
+                PhysicalPlan::Text(TextOp::HybridSearch {
+                    collection: COLL.to_string(),
+                    query_vector: vec![0.0, 1.0],
+                    query_text: "hello".to_string(),
+                    top_k: 4,
+                    ef_search: 16,
+                    fuzzy: false,
+                    vector_weight: 0.5,
+                    filter_bitmap: None,
+                    rls_filters: Vec::new(),
+                    score_alias: None,
+                }),
+            ),
+            (
+                "text_hybrid_search_triple",
+                PhysicalPlan::Text(TextOp::HybridSearchTriple {
+                    collection: COLL.to_string(),
+                    query_vector: vec![0.0, 1.0],
+                    query_text: "hello".to_string(),
+                    graph_seed_id: "n1".to_string(),
+                    graph_depth: 1,
+                    graph_edge_label: None,
+                    top_k: 4,
+                    ef_search: 16,
+                    fuzzy: false,
+                    rrf_k: (60.0, 60.0, 60.0),
+                    filter_bitmap: None,
+                    rls_filters: Vec::new(),
+                    score_alias: None,
+                }),
+            ),
+            (
+                "graph_rag_fusion",
+                PhysicalPlan::Graph(GraphOp::RagFusion {
+                    collection: COLL.to_string(),
+                    query_vector: vec![0.0, 1.0],
+                    vector_top_k: 4,
+                    edge_label: None,
+                    direction: Direction::Out,
+                    expansion_depth: 1,
+                    final_top_k: 4,
+                    rrf_k: (60.0, 60.0),
+                    rrf_k_triple: None,
+                    vector_field: "emb".to_string(),
+                    options: GraphTraversalOptions::default(),
+                    bm25_query: None,
+                    bm25_field: None,
+                }),
+            ),
+        ]
+    }
+
+    /// Every sharded source the converter wraps in `Exchange{Gather}` must
+    /// still be reachable by the collection extractor the clone resolver runs
+    /// on the first task. When it is not, the resolver reads a cloned
+    /// collection as "not a clone" and the query silently returns zero source
+    /// rows.
+    #[test]
+    fn clone_resolver_sees_through_the_converter_wrapper() {
+        for (name, plan) in sharded_source_plans() {
+            assert!(
+                plan.is_sharded_source(),
+                "{name}: plan is no longer a sharded source — update this list"
+            );
+            assert_eq!(
+                extract_collection(&plan),
+                Some(COLL),
+                "{name}: bare plan must expose its collection"
+            );
+            assert_eq!(
+                extract_collection(&gather(plan)),
+                Some(COLL),
+                "{name}: wrapped plan must expose its collection"
+            );
+        }
+    }
+
+    /// The default arm refuses a plan when it is classified `Read` AND its
+    /// collection is extractable. Both inputs must hold for every sharded
+    /// source, or an unrewritable read would fall through to `NoSourceTask` and
+    /// answer from the target alone.
+    #[test]
+    fn every_sharded_source_is_a_classified_read() {
+        for (name, plan) in sharded_source_plans() {
+            assert_eq!(
+                crate::control::security::identity::required_permission(&plan),
+                crate::control::security::identity::Permission::Read,
+                "{name}: a sharded source must classify as a read"
+            );
+            assert_eq!(
+                extract_collection(&gather(plan)),
+                Some(COLL),
+                "{name}: the refusal check must see the collection"
+            );
+        }
+    }
+
+    /// `PostProcess` is the other wrapper the converter puts over a
+    /// materialized subquery body.
+    #[test]
+    fn clone_resolver_sees_through_post_process() {
+        for (name, plan) in sharded_source_plans() {
+            let wrapped = PhysicalPlan::Query(QueryOp::PostProcess {
+                input: Box::new(gather(plan)),
+                filters: Vec::new(),
+                projection: Vec::new(),
+                sort_keys: Vec::new(),
+                limit: None,
+                offset: 0,
+                distinct: false,
+            });
+            assert_eq!(
+                extract_collection(&wrapped),
+                Some(COLL),
+                "{name}: post-processed plan must expose its collection"
+            );
+        }
     }
 }

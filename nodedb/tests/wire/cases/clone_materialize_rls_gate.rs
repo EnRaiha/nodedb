@@ -109,10 +109,15 @@ async fn target_write_policy_blocks_columnar_materialize() {
         .query_rows("SELECT id FROM rows")
         .await
         .expect("select from clone target");
+    // The clone is still shadowed, so this SELECT reads through to the source:
+    // 0 target-local rows + 5 source rows. The merge concatenates without
+    // dedup, so a materialization that leaked its 5 rows into the target shows
+    // up here as 10, and 0 would mean read-through itself is broken.
     assert_eq!(
         rows.len(),
-        0,
-        "a refused materialization must copy no rows: {rows:?}"
+        5,
+        "a refused materialization must copy no rows — 5 is source read-through, \
+         10 would be leaked target rows: {rows:?}"
     );
 }
 
@@ -151,10 +156,15 @@ async fn source_read_policy_blocks_columnar_materialize() {
         .query_rows("SELECT id FROM rows")
         .await
         .expect("select from clone target");
+    // The clone is still shadowed, so this SELECT reads through to the source:
+    // 0 target-local rows + 5 source rows. The merge concatenates without
+    // dedup, so a materialization that leaked its 5 rows into the target shows
+    // up here as 10, and 0 would mean read-through itself is broken.
     assert_eq!(
         rows.len(),
-        0,
-        "a refused materialization must copy no rows: {rows:?}"
+        5,
+        "a refused materialization must copy no rows — 5 is source read-through, \
+         10 would be leaked target rows: {rows:?}"
     );
 }
 
@@ -204,10 +214,15 @@ async fn target_write_policy_blocks_kv_materialize() {
         .query_rows("SELECT key FROM rows")
         .await
         .expect("select from clone target");
+    // The clone is still shadowed, so this SELECT reads through to the source:
+    // 0 target-local rows + 5 source rows. The merge concatenates without
+    // dedup, so a materialization that leaked its 5 rows into the target shows
+    // up here as 10, and 0 would mean read-through itself is broken.
     assert_eq!(
         rows.len(),
-        0,
-        "a refused materialization must copy no rows: {rows:?}"
+        5,
+        "a refused materialization must copy no rows — 5 is source read-through, \
+         10 would be leaked target rows: {rows:?}"
     );
 }
 

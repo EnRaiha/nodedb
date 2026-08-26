@@ -160,8 +160,8 @@ struct MaterializeCopy<'a> {
 /// Scan the source page-by-page and produce the concrete target rows:
 /// `(target_document_id, msgpack_value, fresh_surrogate)`, one per surviving
 /// source row. Reuses the shared [`resolve_copy_spec`] / [`assign_page_rows`]
-/// pipeline (scan → normalize → filter → assign) so the strict-source
-/// normalization and identity derivation stay identical to the autocommit path.
+/// pipeline (scan → filter → assign) so filtering and identity derivation stay
+/// identical to the autocommit path.
 async fn materialize_copy(
     state: &SharedState,
     args: MaterializeCopy<'_>,
@@ -180,7 +180,6 @@ async fn materialize_copy(
         tenant_id,
         database_id,
         target_collection,
-        source_collection,
         source_filters,
     )?;
 

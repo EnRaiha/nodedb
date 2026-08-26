@@ -27,9 +27,12 @@ use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
+use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::super::types::{error_to_sqlstate, sqlstate_error};
+use super::super::super::super::types::{
+    error_to_sqlstate, response_status_to_sqlstate, sqlstate_error,
+};
 use super::super::super::core::NodeDbPgHandler;
 use super::merge::{filter_kv_tombstoned_rows, merge_msgpack_arrays, wrap_single_map_as_array};
 use super::temporal::extract_system_as_of_ms;
@@ -62,6 +65,35 @@ fn meter_clone_task(
         .with_session_database(Some(task.database_id))
         .build();
     meter_dispatch(state, &scope, &info, None);
+}
+
+/// Raise a Data-Plane error status as a pgwire error.
+///
+/// A clone read dispatches both halves itself, so `dispatch_task_loop`'s status
+/// check never sees them. Without this an errored half is shaped into an
+/// ordinary empty result set and the client reads it as success.
+fn raise_clone_task_error(resp: &crate::bridge::envelope::Response) -> PgWireResult<()> {
+    match response_status_to_sqlstate(resp.status, resp.error_code.as_deref()) {
+        None => Ok(()),
+        Some((severity, code, message)) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            severity.to_owned(),
+            code.to_owned(),
+            message,
+        )))),
+    }
+}
+
+/// The source surrogate a rewritten document point-read fetches.
+///
+/// A point-get answers with the row body alone — no surrogate travels with it —
+/// so the row-level filter cannot tell which row the payload holds. Deciding
+/// suppression from the plan keeps point reads agreeing with scans, whose rows
+/// carry the hex surrogate as their `"id"`.
+fn point_read_surrogate(plan: &PhysicalPlan) -> Option<u32> {
+    match plan {
+        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => Some(surrogate.as_u32()),
+        _ => None,
+    }
 }
 
 impl NodeDbPgHandler {
@@ -199,12 +231,16 @@ impl NodeDbPgHandler {
                                 message,
                             )))
                         })?;
+                    raise_clone_task_error(&resp)?;
                     meter_clone_task(&self.state, identity, task);
                     responses.push(resp);
                 }
 
-                // Load tombstones for source row filtering.
-                let tombstoned = self
+                // Load the suppressed source surrogates: rows deleted from the
+                // clone (tombstones) plus rows copied up into it. A copy-up
+                // leaves the superseded source row in place, so merging it back
+                // in would return the row twice — once stale, once updated.
+                let mut tombstoned = self
                     .state
                     .credentials
                     .catalog()
@@ -217,6 +253,20 @@ impl NodeDbPgHandler {
                             message,
                         )))
                     })?;
+                let copied_up = self
+                    .state
+                    .credentials
+                    .catalog()
+                    .list_clone_copyups(&target_collection_key)
+                    .map_err(|e| {
+                        let (severity, code, message) = error_to_sqlstate(&e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        )))
+                    })?;
+                tombstoned.extend(copied_up);
 
                 // Load KV tombstones for KV-engine key-based filtering.
                 let kv_tombstoned = self
@@ -243,6 +293,11 @@ impl NodeDbPgHandler {
                 // must be merged into the same target response slot.
                 let target_count = target_tasks.len().max(1);
                 for (source_idx, source_task) in source_tasks.iter().enumerate() {
+                    if point_read_surrogate(&source_task.plan)
+                        .is_some_and(|s| tombstoned.contains(&s))
+                    {
+                        continue;
+                    }
                     let response_idx = source_idx % target_count;
                     let source_resp = self
                         .dispatch_authorized_task(source_task.clone(), None, identity)
@@ -255,6 +310,7 @@ impl NodeDbPgHandler {
                                 message,
                             )))
                         })?;
+                    raise_clone_task_error(&source_resp)?;
                     meter_clone_task(&self.state, identity, source_task);
 
                     // For KvOp::Get: inject the primary key field into the raw map response

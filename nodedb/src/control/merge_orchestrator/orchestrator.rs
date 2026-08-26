@@ -14,7 +14,7 @@
 //!    Data-Plane core than the target's, so the resolve/apply dispatches (which
 //!    target the target core) cannot read the source from local storage. The
 //!    Control Plane scans the source on its OWN core via the shared
-//!    `MaterializeScan` primitive and ships the RAW stored rows into the plan's
+//!    `MaterializeScan` primitive and ships those rows into the plan's
 //!    `source_rows`; the Data Plane builds the join-map from these instead of a
 //!    local read. This is what makes cross-core MERGE correct.
 //! 1. **Resolve** (`DocumentOp::Merge { resolve_only: true }`): the Data Plane

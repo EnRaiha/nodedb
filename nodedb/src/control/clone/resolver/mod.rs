@@ -12,8 +12,10 @@
 //! unchanged — zero overhead.
 
 pub mod filter;
+pub mod refusal;
 pub mod resolve;
 pub mod rewrite;
 
 pub use filter::filter_tombstoned_rows;
+pub use refusal::SourceRewrite;
 pub use resolve::{CloneReadParams, ResolveOutcome, resolve_read};

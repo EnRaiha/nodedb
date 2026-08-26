@@ -8,6 +8,10 @@
 //! surrogate.  Calls the reaper at the end to flip the collection status to
 //! `Materialized` and clear `cloned_from`.
 //!
+//! Scan bodies arrive as standard msgpack for every source encoding — the
+//! source handler normalizes them — so the insert carries them through
+//! unchanged and the target write handler re-encodes to its own format.
+//!
 //! ## Idempotency / restart-safety
 //!
 //! Resume after a crash works because every step is observable:
@@ -290,15 +294,14 @@ pub(crate) async fn scan_source_page(
 }
 
 /// Scan a source collection to completion on its OWN Data-Plane core and
-/// collect every row as `(source_doc_id, raw_stored_bytes)`.
+/// collect every row as `(source_doc_id, msgpack_body)`.
 ///
 /// Drives the cursor-paginated [`scan_source_page`] primitive (which routes by
 /// the source collection's vShard, so the read lands on whichever core owns the
 /// source — the whole point of source-shipping) to the end. Shared by the
-/// `MERGE` and `UPDATE ... FROM` Control-Plane orchestrators: both ship the RAW
-/// stored source rows (a Binary Tuple for a strict source, MessagePack for a
-/// schemaless source) into their plan so the Data Plane builds the join-map from
-/// the shipped bytes instead of a local read of a possibly-non-resident source.
+/// `MERGE` and `UPDATE ... FROM` Control-Plane orchestrators: both ship the
+/// source rows into their plan so the Data Plane builds the join-map from the
+/// shipped bytes instead of a local read of a possibly-non-resident source.
 ///
 /// `txn_id` selects the read view: `None` (autocommit `run_merge` /
 /// `run_update_from_join`) scans committed base storage only; `Some(txn)` (the

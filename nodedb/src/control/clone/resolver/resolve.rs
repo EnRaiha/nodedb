@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use nodedb_types::{CloneOrigin, CloneStatus, Lsn, TenantId};
 
+use crate::control::security::identity::{Permission, required_permission};
+use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
-use nodedb_physical::physical_task::PhysicalTask;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::metadata::ClonePredicatesNote;
+use super::refusal::SourceRewrite;
 use super::rewrite::rewrite_plan_for_source;
 
 /// Parameters for the clone read resolver.
@@ -62,13 +65,35 @@ pub fn resolve_read(
     let Some(first_task) = tasks.first() else {
         return Ok(None);
     };
+
+    // Clone resolution is a READ protocol: it augments the task set with
+    // source-database reads and merges the two halves. A write must instead
+    // reach `dispatch_task_loop`, whose pre-dispatch hook owns the
+    // copy-on-write protocol (copy-up / tombstone). A write answered here
+    // writes only the target and records no suppression, so the superseded
+    // source row survives the next read.
+    //
+    // The gate runs before any collection name is extracted so the invariant
+    // holds whatever plan shapes `extract_collection` learns to recognize.
+    if tasks
+        .iter()
+        .any(|t| required_permission(&t.plan) != Permission::Read)
+    {
+        return Ok(None);
+    }
+
     let db_id = first_task.database_id;
 
     // Retrieve catalog for lookup.
     let catalog = state.credentials.catalog();
 
     // Extract the collection name from the first read-type task.
-    let Some(raw_coll) = super::rewrite::extract_collection_from_plan(&first_task.plan) else {
+    //
+    // The shared extractor is the only one that sees through the
+    // `Exchange` / `PostProcess` wrappers the converter puts over every
+    // sharded read; a clone-local copy drifted out of sync with it and read
+    // those plans as "not a clone".
+    let Some(raw_coll) = extract_collection(&first_task.plan) else {
         return Ok(None);
     };
     // Strip the database prefix that db_qualified() prepends, e.g. "1/users" → "users".
@@ -92,6 +117,40 @@ pub fn resolve_read(
     match desc.clone_status {
         CloneStatus::Materialized => return Ok(None),
         CloneStatus::Shadowed | CloneStatus::Materializing { .. } => {}
+    }
+
+    // A set operation (UNION DISTINCT / INTERSECT / EXCEPT) is applied by the
+    // normal dispatch loop, which the clone read path bypasses — the branches
+    // are concatenated instead. EXCEPT would then return the very rows it must
+    // subtract, and UNION DISTINCT would return duplicates. Refuse.
+    if tasks
+        .iter()
+        .any(|t| !matches!(t.post_set_op, PostSetOp::None))
+    {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "a set operation over '{coll_name}' cannot be read through an unmaterialized \
+                 clone; run ALTER DATABASE <clone> MATERIALIZE first"
+            ),
+        });
+    }
+
+    // Only `coll_name`'s clone origin is resolved, and every task is rewritten
+    // against it. A statement whose other branch reads a DIFFERENT collection
+    // (e.g. `UNION ALL`, which carries no `post_set_op`) would answer that
+    // branch from the target alone, silently dropping its source rows.
+    if let Some(other) = tasks
+        .iter()
+        .filter_map(|t| extract_collection(&t.plan))
+        .find(|c| *c != raw_coll)
+    {
+        let other = super::rewrite::strip_db_prefix(db_id, other).to_string();
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "a statement reading both '{coll_name}' and '{other}' cannot be read through an \
+                 unmaterialized clone; run ALTER DATABASE <clone> MATERIALIZE first"
+            ),
+        });
     }
 
     // Bitemporal correctness: check if T_lsn < clone_created_at.
@@ -150,41 +209,41 @@ pub fn resolve_read(
         let mut this_level_tasks: Vec<PhysicalTask> = Vec::new();
 
         for task in &prev_level_tasks {
-            if let Some(source_plan) =
-                rewrite_plan_for_source(super::rewrite::RewriteForSourceParams {
-                    plan: &task.plan,
-                    target_db_id: cur_db_id,
-                    source_db_id: src_db_id,
-                    tenant_id,
-                    target_coll: cur_coll_str,
-                    source_coll: src_coll_name,
-                    effective_source_ms: cur_effective_ms,
-                    kv_surrogate_ceiling: cur_origin.kv_surrogate_ceiling,
-                    state,
-                })?
-            {
-                let source_vshard = VShardId::from_collection_in_database(
+            // An unsupported read shape over the cloned collection returns an
+            // error here, not `NoSourceTask` — it propagates to the client
+            // instead of quietly producing a target-only answer.
+            let rewritten = rewrite_plan_for_source(super::rewrite::RewriteForSourceParams {
+                plan: &task.plan,
+                target_db_id: cur_db_id,
+                source_db_id: src_db_id,
+                tenant_id,
+                target_coll: cur_coll_str,
+                source_coll: src_coll_name,
+                effective_source_ms: cur_effective_ms,
+                kv_surrogate_ceiling: cur_origin.kv_surrogate_ceiling,
+                state,
+            })?;
+            let SourceRewrite::Task(source_plan) = rewritten else {
+                continue;
+            };
+            let source_vshard = VShardId::from_collection_in_database(
+                src_db_id,
+                &crate::control::planner::sql_plan_convert::convert::db_qualified(
                     src_db_id,
-                    &crate::control::planner::sql_plan_convert::convert::db_qualified(
-                        src_db_id,
-                        src_coll_name,
-                    ),
-                );
-                let task = PhysicalTask {
-                    tenant_id,
-                    vshard_id: source_vshard,
-                    database_id: src_db_id,
-                    plan: source_plan,
-                    post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-                    txn_id: None,
-                };
-                this_level_tasks.push(task);
-            }
+                    src_coll_name,
+                ),
+            );
+            this_level_tasks.push(PhysicalTask {
+                tenant_id,
+                vshard_id: source_vshard,
+                database_id: src_db_id,
+                plan: *source_plan,
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            });
         }
 
-        for task in this_level_tasks.iter().cloned() {
-            augmented_tasks.push(task);
-        }
+        augmented_tasks.extend(this_level_tasks.iter().cloned());
         prev_level_tasks = this_level_tasks;
 
         // Check whether `src_db_id / src_coll_name` is itself a clone so we

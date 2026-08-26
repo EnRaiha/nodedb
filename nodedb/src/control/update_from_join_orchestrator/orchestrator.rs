@@ -16,7 +16,7 @@
 //!
 //! 1. **Source-ship**: scan `source_collection` to completion on its OWN core
 //!    via the shared `read_all_source_rows` source-scan primitive (which routes
-//!    by the source collection's vShard) and collect the RAW stored rows.
+//!    by the source collection's vShard) and collect those rows.
 //! 2. **Dispatch**: build the `DocumentOp::UpdateFromJoin` plan with the shipped
 //!    rows threaded into `source_rows` and dispatch it to the TARGET's core via
 //!    `dispatch_local`. The Data Plane builds the join-map from the shipped rows

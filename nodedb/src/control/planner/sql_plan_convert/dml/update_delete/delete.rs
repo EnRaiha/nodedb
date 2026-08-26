@@ -3,7 +3,6 @@
 //! `SqlPlan::Delete` → `PhysicalTask` lowering.
 
 use nodedb_sql::types::{EngineType, Filter, SqlValue};
-use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
@@ -127,13 +126,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         for key in target_keys {
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
-            let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => match a.lookup(ctx.database_id, ctx.tenant_id, collection, &pk_bytes)? {
-                    Some(s) => s,
-                    None => continue,
-                },
-                None => Surrogate::ZERO,
-            };
+            // Idempotent on `(db, tenant, collection, pk)`, so a task always
+            // exists: the write hook still runs, and an unbound row_key simply
+            // affects 0 rows in the Data Plane.
+            let surrogate = ctx.surrogate_for_pk(collection, &pk_bytes)?;
             let plan = if is_crdt {
                 PhysicalPlan::Crdt(CrdtOp::DocDelete {
                     collection: collection.into(),

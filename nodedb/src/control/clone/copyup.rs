@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb_types::{CloneOrigin, DatabaseId, Surrogate, TenantId};
+use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Status};
 use crate::control::state::SharedState;
@@ -134,7 +134,6 @@ pub struct CopyUpParams<'a> {
     pub target_db_id: DatabaseId,
     /// Plain (non-db_qualified) collection name.
     pub target_collection: &'a str,
-    pub origin: &'a CloneOrigin,
     /// The source surrogate to copy up.
     pub source_surrogate: Surrogate,
     /// Serialized source row body (msgpack).  Must be obtained by the caller
@@ -154,7 +153,6 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         tenant_id,
         target_db_id,
         target_collection,
-        origin,
         source_surrogate,
         source_doc_id,
         source_row_bytes,
@@ -185,13 +183,13 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
     // which would later cause duplicate surrogates on retry.
     let catalog = state.credentials.catalog();
 
-    let source_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
-        origin.source_database,
-        &origin.source_collection,
-    );
+    // Keyed by the TARGET collection: every reader — the materializer's
+    // already-copied skip, the read path's source-row suppression, and the
+    // post-materialization reaper — looks the mapping up under the clone it
+    // belongs to.
     catalog
         .put_clone_copyup(
-            &source_coll_qualified,
+            &target_coll_qualified,
             source_surrogate.as_u32(),
             target_surrogate.as_u32(),
         )
@@ -207,7 +205,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
     // semantics as having no mapping at all.
     let rollback_mapping = |reason: &str| {
         if let Err(e) =
-            catalog.delete_clone_copyup(&source_coll_qualified, source_surrogate.as_u32())
+            catalog.delete_clone_copyup(&target_coll_qualified, source_surrogate.as_u32())
         {
             tracing::error!(
                 target_collection = %target_coll_qualified,

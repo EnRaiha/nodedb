@@ -25,8 +25,10 @@ pub(in crate::control::server::pgwire::handler::routing) enum CloneWriteOutcome 
 impl NodeDbPgHandler {
     /// Intercept a single write task for a cloned collection.
     ///
-    /// Must be called for every `PointUpdate` and `PointDelete` task before
-    /// normal dispatch. Returns `Passthrough` when the collection is not a
+    /// Must be called for every write task before normal dispatch — an insert
+    /// as much as an update or a delete: an insert of a key the source already
+    /// holds needs the source row suppressed or the clone returns that key
+    /// twice. Returns `Passthrough` when the collection is not a
     /// Shadowed/Materializing clone (zero overhead for non-clone paths).
     pub(in crate::control::server::pgwire::handler::routing) async fn maybe_intercept_clone_write(
         &self,
@@ -35,15 +37,28 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
     ) -> PgWireResult<CloneWriteOutcome> {
         match &task.plan {
-            PhysicalPlan::Document(DocumentOp::PointUpdate { .. })
-            | PhysicalPlan::Document(DocumentOp::PointDelete { .. }) => {
+            PhysicalPlan::Document(
+                DocumentOp::PointUpdate { .. }
+                | DocumentOp::PointDelete { .. }
+                | DocumentOp::PointInsert { .. }
+                | DocumentOp::PointPut { .. }
+                | DocumentOp::Upsert { .. }
+                | DocumentOp::BatchInsert { .. },
+            ) => {
                 self.intercept_doc_clone_write(task, identity, tenant_id)
                     .await
             }
-            PhysicalPlan::Kv(KvOp::FieldSet { .. }) | PhysicalPlan::Kv(KvOp::Delete { .. }) => {
+            PhysicalPlan::Kv(KvOp::FieldSet { .. } | KvOp::Delete { .. }) => {
                 self.intercept_kv_clone_write(task, identity, tenant_id)
                     .await
             }
+            PhysicalPlan::Kv(
+                KvOp::Put { .. }
+                | KvOp::Insert { .. }
+                | KvOp::InsertIfAbsent { .. }
+                | KvOp::InsertOnConflictUpdate { .. }
+                | KvOp::BatchPut { .. },
+            ) => self.intercept_kv_clone_insert(task, tenant_id).await,
             _ => Ok(CloneWriteOutcome::Passthrough),
         }
     }

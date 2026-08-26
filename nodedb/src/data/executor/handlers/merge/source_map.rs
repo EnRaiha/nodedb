@@ -45,13 +45,13 @@ impl CoreLoop {
     ///
     /// Two sources of source rows, selected by `source_rows`:
     /// - `Some(rows)` (cross-core): the Control Plane scanned the source on its
-    ///   OWN Data-Plane core and shipped the RAW stored bytes here. This core
-    ///   does not hold the source's storage, but `Register` is broadcast so it
-    ///   DOES hold the source's strict schema — the shipped bytes are decoded
-    ///   with the exact same schema-aware logic the local scan uses, so the
-    ///   resulting map is byte-for-byte identical to a co-resident local read.
+    ///   OWN Data-Plane core and shipped the bodies here, already normalized to
+    ///   standard msgpack by the source handler — so they decode without the
+    ///   source's strict schema and yield the same map a co-resident local read
+    ///   produces.
     /// - `None` (legacy co-resident / in-txn buffered replay): read the source
-    ///   from this core's local storage.
+    ///   from this core's local storage, whose rows are still in stored form
+    ///   (a Binary Tuple for a strict source) and need the schema.
     pub(in crate::data::executor) fn build_merge_source_map(
         &self,
         database_id: u64,
@@ -75,33 +75,34 @@ impl CoreLoop {
             }
         });
 
-        // Decode one raw stored source document and extract its non-empty join
-        // key. Shared by the shipped-rows path and the local-scan path so both
-        // derive an identical `join_val → document` mapping from identical bytes.
+        // Decode one source document and extract its non-empty join key.
+        // `schema` states the encoding of the bytes handed in: `Some` for a
+        // stored Binary Tuple, `None` for an already-normalized body.
         //
         // `Ok(None)` is the domain answer "this source row has no usable join
         // key"; a body that will not decode is not that answer. Dropping it
         // silently would leave its key unmatched, so the MERGE would classify
         // matched target rows as NOT MATCHED and insert duplicates.
-        let decode_and_key =
-            |value_bytes: &[u8]| -> crate::Result<Option<(String, serde_json::Value)>> {
-                let doc = doc_format::decode_document_or_binary_tuple(
-                    value_bytes,
-                    strict_schema.as_ref(),
-                    "MERGE source row",
-                )?;
-                let key = doc.get(join_col).map(json_to_str).unwrap_or_default();
-                if key.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some((key, doc)))
-            };
+        let decode_and_key = |value_bytes: &[u8],
+                              schema: Option<&nodedb_types::columnar::StrictSchema>|
+         -> crate::Result<Option<(String, serde_json::Value)>> {
+            let doc = doc_format::decode_document_or_binary_tuple(
+                value_bytes,
+                schema,
+                "MERGE source row",
+            )?;
+            let key = doc.get(join_col).map(json_to_str).unwrap_or_default();
+            if key.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some((key, doc)))
+        };
 
         let mut map = std::collections::HashMap::new();
 
         if let Some(rows) = source_rows {
             for (_source_doc_id, value_bytes) in rows {
-                if let Some((key, doc)) = decode_and_key(value_bytes)? {
+                if let Some((key, doc)) = decode_and_key(value_bytes, None)? {
                     map.insert(key, doc);
                 }
             }
@@ -128,7 +129,7 @@ impl CoreLoop {
 
         if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
             for entry in range.flatten() {
-                if let Some((key, doc)) = decode_and_key(entry.1.value())? {
+                if let Some((key, doc)) = decode_and_key(entry.1.value(), strict_schema.as_ref())? {
                     map.insert(key, doc);
                 }
             }

@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Query shapes a SHADOWED clone refuses instead of answering wrongly.
+//!
+//! A read over a shadowed clone either reads through to the source or refuses
+//! with a typed error naming the collection. It never returns target-only rows
+//! (silently incomplete) and never returns two partial answers concatenated
+//! (silently wrong — the clone read path appends the source payload to the
+//! target payload with no dedup and no aggregate reduction).
+//!
+//! Every shape below has no source-side rewrite in
+//! `control/clone/resolver/rewrite.rs`, so it refuses until the clone is
+//! materialized — at which point the clone owns every row and the query runs
+//! against the target alone.
+
+use crate::harness::TestServer;
+
+/// Substring shared by every clone-read refusal.
+const REFUSAL: &str = "cannot be read through an unmaterialized clone";
+
+async fn exec_all(server: &TestServer, stmts: &[&str]) {
+    for sql in stmts {
+        server
+            .exec(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Aggregating scan on the `timeseries` engine.
+///
+/// A timeseries aggregate lowers to `TimeseriesOp::Scan` carrying `aggregates`,
+/// not to `QueryOp::Aggregate` — the same unsound concatenation by a different
+/// plan shape, so it refuses the same way. A PLAIN timeseries scan still reads
+/// through (covered by `clone_materialize_timeseries`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeseries_aggregate_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_ts_src",
+            "USE DATABASE crs_ts_src",
+            "CREATE COLLECTION metrics \
+             COLUMNS (id TEXT, ts BIGINT TIME_KEY, sensor TEXT, value FLOAT) \
+             WITH (engine='timeseries')",
+        ],
+    )
+    .await;
+    for i in 0..5u32 {
+        let ts = u64::from(i) * 1000 + 1000;
+        server
+            .exec(&format!(
+                "INSERT INTO metrics (id, ts, sensor, value) \
+                 VALUES ('m{i}', {ts}, 's1', {i}.0)"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("insert m{i}: {e}"));
+    }
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "CLONE DATABASE crs_ts_clone FROM crs_ts_src",
+            "USE DATABASE crs_ts_clone",
+        ],
+    )
+    .await;
+
+    server
+        .expect_error("SELECT COUNT(*) FROM metrics", REFUSAL)
+        .await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_ts_clone MATERIALIZE",
+            "USE DATABASE crs_ts_clone",
+        ],
+    )
+    .await;
+    let rows = server
+        .query_rows("SELECT COUNT(*) FROM metrics")
+        .await
+        .expect("COUNT(*) on a materialized timeseries clone");
+    assert_eq!(
+        rows.first().and_then(|r| r.first()).map(String::as_str),
+        Some("5"),
+        "materialized clone must count every source row: {rows:?}"
+    );
+}
+
+/// Join. `extract_collection` reports a join's LEFT collection, and the
+/// resolver also checks the right side, so a clone on either side refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_join_src",
+            "USE DATABASE crs_join_src",
+            "CREATE COLLECTION cj_left (id TEXT PRIMARY KEY, v TEXT) \
+             WITH (engine='document_strict')",
+            "CREATE COLLECTION cj_right (id TEXT PRIMARY KEY, w TEXT) \
+             WITH (engine='document_strict')",
+            "INSERT INTO cj_left (id, v) VALUES ('k1', 'left1')",
+            "INSERT INTO cj_right (id, w) VALUES ('k1', 'right1')",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_join_clone FROM crs_join_src",
+            "USE DATABASE crs_join_clone",
+        ],
+    )
+    .await;
+
+    server
+        .expect_error(
+            "SELECT a.id FROM cj_left a JOIN cj_right b ON a.id = b.id",
+            REFUSAL,
+        )
+        .await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_join_clone MATERIALIZE",
+            "USE DATABASE crs_join_clone",
+        ],
+    )
+    .await;
+    let rows = server
+        .query_rows("SELECT a.id FROM cj_left a JOIN cj_right b ON a.id = b.id")
+        .await
+        .expect("join on a materialized clone");
+    assert_eq!(rows.len(), 1, "join must return the matching row: {rows:?}");
+}
+
+/// Vector ANN search (`VectorOp::Search`). Graph `RagFusion` — the only graph
+/// op that names a collection — refuses through the identical default arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vector_search_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_vec_src",
+            "USE DATABASE crs_vec_src",
+            "CREATE COLLECTION vecs WITH (engine='vector')",
+            "CREATE INDEX ON vecs (embedding)",
+            "INSERT INTO vecs { id: 'v1', embedding: [1.0,0.0,0.0,0.0] }",
+            "INSERT INTO vecs { id: 'v2', embedding: [0.0,1.0,0.0,0.0] }",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_vec_clone FROM crs_vec_src",
+            "USE DATABASE crs_vec_clone",
+        ],
+    )
+    .await;
+
+    let query = "SELECT id FROM vecs \
+                 ORDER BY vector_distance(embedding, ARRAY[1.0,0.0,0.0,0.0]) LIMIT 2";
+    server.expect_error(query, REFUSAL).await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_vec_clone MATERIALIZE",
+            "USE DATABASE crs_vec_clone",
+        ],
+    )
+    .await;
+    // Row identity depends on the target's index rebuild, which this refusal
+    // does not govern; what must hold is that the refusal lifts.
+    server
+        .query_rows(query)
+        .await
+        .expect("vector search on a materialized clone must not refuse");
+}
+
+/// Full-text search (`TextOp::Search`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_search_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_fts_src",
+            "USE DATABASE crs_fts_src",
+            "CREATE COLLECTION docs (id TEXT PRIMARY KEY, content TEXT) \
+             WITH (engine='document_strict')",
+            "CREATE SEARCH INDEX idx_crs_fts ON docs FIELDS content",
+            "INSERT INTO docs (id, content) VALUES \
+             ('d1', 'consensus algorithm distributed'), \
+             ('d2', 'vector search memory')",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_fts_clone FROM crs_fts_src",
+            "USE DATABASE crs_fts_clone",
+        ],
+    )
+    .await;
+
+    let query = "SELECT id FROM docs WHERE text_match(content, 'consensus')";
+    server.expect_error(query, REFUSAL).await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_fts_clone MATERIALIZE",
+            "USE DATABASE crs_fts_clone",
+        ],
+    )
+    .await;
+    // As with vector: the assertion is that the refusal lifts, not that the
+    // target's search index was rebuilt with identical scoring.
+    server
+        .query_rows(query)
+        .await
+        .expect("text search on a materialized clone must not refuse");
+}
+
+/// Spatial predicate scan (`SpatialOp::Scan`). A PLAIN scan over a spatial
+/// collection lowers to `ColumnarOp::Scan` and still reads through — only the
+/// `ST_*` predicate form takes the spatial plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spatial_predicate_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_sp_src",
+            "USE DATABASE crs_sp_src",
+            "CREATE COLLECTION places \
+             COLUMNS (id TEXT, location GEOMETRY, name TEXT) \
+             WITH (engine='spatial')",
+            "INSERT INTO places (id, location, name) \
+             VALUES ('p1', ST_Point(-73.9857, 40.7580), 'Times Square')",
+            "INSERT INTO places (id, location, name) \
+             VALUES ('p2', ST_Point(2.3522, 48.8566), 'Paris')",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_sp_clone FROM crs_sp_src",
+            "USE DATABASE crs_sp_clone",
+        ],
+    )
+    .await;
+
+    let query = "SELECT name FROM places WHERE \
+                 ST_DWithin(location, '{\"type\":\"Point\",\"coordinates\":[-73.9857,40.7580]}', 5000)";
+    server.expect_error(query, REFUSAL).await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_sp_clone MATERIALIZE",
+            "USE DATABASE crs_sp_clone",
+        ],
+    )
+    .await;
+    let rows = server
+        .query_rows(query)
+        .await
+        .expect("spatial predicate on a materialized clone");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one place is within 5 km of Times Square: {rows:?}"
+    );
+}
+
+/// `UNION DISTINCT` / `INTERSECT` / `EXCEPT`. The clone read path bypasses the
+/// dispatch loop that applies `post_set_op`, so the branches would come back
+/// concatenated — `EXCEPT` would return the rows it must subtract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_operation_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_set_src",
+            "USE DATABASE crs_set_src",
+            "CREATE COLLECTION so_items (id TEXT PRIMARY KEY, v TEXT) \
+             WITH (engine='document_strict')",
+            "INSERT INTO so_items (id, v) VALUES ('s1', 'a')",
+            "INSERT INTO so_items (id, v) VALUES ('s2', 'b')",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_set_clone FROM crs_set_src",
+            "USE DATABASE crs_set_clone",
+        ],
+    )
+    .await;
+
+    let query = "SELECT id FROM so_items UNION SELECT id FROM so_items";
+    server.expect_error(query, REFUSAL).await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_set_clone MATERIALIZE",
+            "USE DATABASE crs_set_clone",
+        ],
+    )
+    .await;
+    let rows = server
+        .query_rows(query)
+        .await
+        .expect("UNION on a materialized clone");
+    assert_eq!(
+        rows.len(),
+        2,
+        "UNION of a collection with itself is its distinct rows: {rows:?}"
+    );
+}
+
+/// `UNION ALL` across two collections carries NO `post_set_op`, so it is caught
+/// by the other half of the rule: only the first task's collection has its
+/// clone origin resolved, and the second branch would be answered from the
+/// target alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_collection_read_over_shadowed_clone_is_refused() {
+    let server = TestServer::start().await;
+    exec_all(
+        &server,
+        &[
+            "CREATE DATABASE crs_multi_src",
+            "USE DATABASE crs_multi_src",
+            "CREATE COLLECTION ua_one (id TEXT PRIMARY KEY) WITH (engine='document_strict')",
+            "CREATE COLLECTION ua_two (id TEXT PRIMARY KEY) WITH (engine='document_strict')",
+            "INSERT INTO ua_one (id) VALUES ('o1')",
+            "INSERT INTO ua_two (id) VALUES ('t1')",
+            "USE DATABASE default",
+            "CLONE DATABASE crs_multi_clone FROM crs_multi_src",
+            "USE DATABASE crs_multi_clone",
+        ],
+    )
+    .await;
+
+    let query = "SELECT id FROM ua_one UNION ALL SELECT id FROM ua_two";
+    server.expect_error(query, REFUSAL).await;
+
+    exec_all(
+        &server,
+        &[
+            "USE DATABASE default",
+            "ALTER DATABASE crs_multi_clone MATERIALIZE",
+            "USE DATABASE crs_multi_clone",
+        ],
+    )
+    .await;
+    let rows = server
+        .query_rows(query)
+        .await
+        .expect("UNION ALL on a materialized clone");
+    assert_eq!(rows.len(), 2, "one row from each collection: {rows:?}");
+}

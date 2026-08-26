@@ -718,12 +718,15 @@ pub enum DocumentOp {
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// Cursor-paginated raw scan for the clone materializer.
+    /// Cursor-paginated scan for the clone materializer.
     ///
-    /// Returns raw `(document_id, surrogate, value_bytes)` triples plus
-    /// next-cursor in one payload so the materializer can drive the scan to
-    /// completion in O(N / count) round-trips.  The response payload is
-    /// msgpack-encoded as a 2-element array:
+    /// Returns `(document_id, surrogate, value_bytes)` triples plus next-cursor
+    /// in one payload so the materializer can drive the scan to completion in
+    /// O(N / count) round-trips.  `value_bytes` is standard MessagePack for
+    /// every source encoding — a strict Binary Tuple and a vector-primary
+    /// sidecar are transcoded by the handler, so a consumer writes the body to
+    /// any target without re-deciding the source format.  The response payload
+    /// is msgpack-encoded as a 2-element array:
     ///   `[ next_cursor: bin,
     ///      entries: [[document_id: str, surrogate: u32, value_bytes: bin], ...] ]`
     /// `next_cursor` is empty when the scan is complete.

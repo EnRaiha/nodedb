@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cursor-paginated raw document scan for the clone materializer.
+//! Cursor-paginated document scan for the clone materializer.
 //!
-//! Returns raw `(doc_id_hex, surrogate_u32, value_bytes)` triples plus the
+//! Returns `(doc_id_hex, surrogate_u32, value_bytes)` triples plus the
 //! next-cursor in a single response so the Control Plane materializer can
 //! drive the scan to completion in O(N / count) round-trips.
+//!
+//! `value_bytes` is standard MessagePack for every source encoding: a strict
+//! Binary Tuple and a vector-primary sidecar are transcoded here, so a consumer
+//! can write the body into any target without re-deciding the source format.
 //!
 //! The `doc_id` returned here is the **hex-encoded surrogate** (the redb storage
 //! key, e.g. `"0000002a"`).  The Control Plane materializer recovers the
@@ -19,6 +23,7 @@
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::doc_id_to_surrogate;
 use crate::engine::sparse::btree::DOCUMENTS;
@@ -144,10 +149,9 @@ impl CoreLoop {
         // Fold the transaction's staging overlay into the full base set: a
         // staged tombstone hides its base row, a staged put replaces the base
         // body, and a staged put absent from base is appended. Staged bodies are
-        // the same canonical stored form as base bodies (Binary Tuple for a
-        // strict source, MessagePack for a schemaless one), so the caller decodes
-        // both identically. The source ships ALL rows unfiltered, so the merge
-        // predicate is collect-all.
+        // the same stored form as base bodies, so the normalization below covers
+        // both. The source ships ALL rows unfiltered, so the merge predicate is
+        // collect-all.
         let next_cursor: Vec<u8> = if let Some(txn_id) = txn_id {
             let coll_key: (DatabaseId, TenantId, String) = (
                 task.request.database_id,
@@ -173,6 +177,25 @@ impl CoreLoop {
         } else {
             last_doc_id.into_bytes()
         };
+
+        // Normalize every body — base and staged alike — to standard msgpack.
+        // The stored form is a Binary Tuple for a strict source and a tagged
+        // sidecar for a vector-primary one; a consumer that re-inserts either
+        // into a strict target would hand `bytes_to_binary_tuple` a body it
+        // cannot decode. Normalizing here is the one place that owns the source
+        // collection's format, so no consumer repeats the decision.
+        let body_format =
+            self.sparse_body_format(task.request.database_id, TenantId::new(tid), collection);
+        let format_ref = body_format.as_format_ref();
+        for entry in &mut entries {
+            let normalized = match sparse_body_to_msgpack(&entry.2, format_ref) {
+                std::borrow::Cow::Owned(v) => Some(v),
+                std::borrow::Cow::Borrowed(_) => None,
+            };
+            if let Some(v) = normalized {
+                entry.2 = v;
+            }
+        }
 
         // Encode response: [next_cursor: bin, entries: [[str, u32, bin], ...]]
         let mut payload = Vec::with_capacity(

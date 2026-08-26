@@ -67,6 +67,37 @@ impl SystemCatalog {
         Ok(val)
     }
 
+    /// Return the set of source surrogates that have been copied up into
+    /// `target_collection_key`.
+    ///
+    /// A copied-up row is present in the target under a fresh surrogate, so the
+    /// clone read path must suppress the source row it superseded — the same
+    /// role `list_clone_tombstones` plays for deletes. Returns an empty set
+    /// when nothing has been copied up (common case).
+    pub fn list_clone_copyups(
+        &self,
+        target_collection_key: &str,
+    ) -> crate::Result<std::collections::HashSet<u32>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("clone_copyups list begin_read", e))?;
+        let table = txn
+            .open_table(CLONE_COPYUPS)
+            .map_err(|e| catalog_err("open clone_copyups list", e))?;
+        let mut set = std::collections::HashSet::new();
+        for row in table
+            .iter()
+            .map_err(|e| catalog_err("iter clone_copyups list", e))?
+        {
+            let (k, _) = row.map_err(|e| catalog_err("iter clone_copyups list row", e))?;
+            if k.value().0 == target_collection_key {
+                set.insert(k.value().1);
+            }
+        }
+        Ok(set)
+    }
+
     /// Remove a copy-up record (called when the collection is fully
     /// materialised and the CoW tables are reaped).
     pub fn delete_clone_copyup(
@@ -437,6 +468,20 @@ mod tests {
         assert_eq!(removed, 2);
         assert_eq!(cat.get_clone_copyup("db1:0:users", 1).unwrap(), None);
         assert_eq!(cat.get_clone_copyup("db1:0:posts", 5).unwrap(), Some(50));
+    }
+
+    #[test]
+    fn copyup_list_is_scoped_to_one_collection() {
+        let (_dir, cat) = open_catalog();
+        cat.put_clone_copyup("db1:0:users", 1, 10).unwrap();
+        cat.put_clone_copyup("db1:0:users", 2, 11).unwrap();
+        cat.put_clone_copyup("db1:0:posts", 5, 50).unwrap();
+        let set = cat.list_clone_copyups("db1:0:users").unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&1));
+        assert!(set.contains(&2));
+        assert!(!set.contains(&5));
+        assert!(cat.list_clone_copyups("db1:0:absent").unwrap().is_empty());
     }
 
     #[test]
