@@ -1,36 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Real process-kill regressions for WAL truncation against memory-only
-//! engines.
-//!
-//! `crash_recovery.rs` proves a committed write survives `kill -9` while its
-//! WAL record still exists. These tests prove the harder half: that the write
-//! survives after the periodic checkpoint has DELETED the WAL segment holding
-//! its record. For an engine whose state lives only in memory, the WAL was the
-//! only durable copy, and the checkpoint reported the core's write watermark as
-//! though every engine had flushed to it — so `truncate_before` unlinked sealed
-//! segments whose rows nothing else held. Default config, single node, every
-//! five minutes.
-//!
-//! Reproducing that needs three things the existing crash tests do not do, and
-//! all three are load-bearing:
-//!
-//!   1. A checkpoint cycle inside the test's lifetime. The default 300s
-//!      interval dwarfs a crash test's runtime, so the truncation window never
-//!      opened and the bug sat under a green suite until these tests forced a
-//!      short interval.
-//!   2. WAL segment ROTATION. `truncate_segments` skips the active segment
-//!      unconditionally, so with a single segment nothing is ever deleted and
-//!      this test would pass against the buggy code having proven nothing.
-//!      Hence the filler writes: they push the canary's segment out of the
-//!      active slot and into the sealed, deletable set.
-//!   3. An assertion that a sealed segment was actually unlinked. Without it a
-//!      pass cannot be told apart from "truncation never ran", which is the
-//!      failure mode that hid the bug in the first place.
-//!
-//! The row read after the restart therefore cannot have come from the WAL. It
-//! can only have come from the engine's own checkpoint, which is exactly the
-//! claim under test.
+//! engines: a write must survive after the checkpoint deletes the WAL
+//! segment holding its record, the only durable copy. Requires a short
+//! checkpoint interval, forced WAL segment rotation (`truncate_segments`
+//! skips the active segment), and confirming the sealed segment was unlinked.
 
 mod crash_harness;
 
@@ -45,12 +19,9 @@ const CHECKPOINT_INTERVAL_SECS: &str = "2";
 /// rotation.
 const WAL_SEGMENT_TARGET_MB: &str = "1";
 
-/// Filler payload per row — deliberately large so the whole segment-sealing
-/// filler is a handful of writes, not dozens. Each filler INSERT is its own
-/// WAL fsync round-trip against a spawned (unoptimized) server, so a few big
-/// rows are dramatically faster than many small ones on a slow CI disk while
-/// sealing the same number of segments. Stays under the 1 MiB segment target
-/// (so one record fits in a segment) and far under the 64 MiB WAL record cap.
+/// Filler payload per row — large so a handful of writes seal the segment,
+/// not dozens (each is its own WAL fsync round-trip). Stays under the 1 MiB
+/// segment target and far under the 64 MiB WAL record cap.
 const FILLER_VALUE_BYTES: usize = 512 * 1024;
 
 /// ~2.5 MiB of filler over a 1 MiB segment target: enough to seal at least two
@@ -73,18 +44,10 @@ fn filler_value() -> String {
     "x".repeat(FILLER_VALUE_BYTES)
 }
 
-/// The segment the write that just returned landed in.
-///
-/// The highest-numbered segment is the active one, and the WAL appends to the
-/// active segment, so the record of the last acknowledged write is in it. Names
-/// are `wal-<20-digit first LSN>.seg`, zero-padded, so lexicographic order is
-/// LSN order and `last()` is the active segment.
-///
-/// Taking this snapshot BEFORE writing the filler is what makes the later
-/// assertion exact rather than approximate. At this instant the segment cannot
-/// have been truncated — it is active, and `truncate_segments` skips the active
-/// segment — so it is unambiguously the canary's, and its later disappearance
-/// is unambiguously the truncation of the canary's own WAL record.
+/// The segment the write that just returned landed in. Names are
+/// zero-padded `wal-<20-digit first LSN>.seg`, so `last()` is the active
+/// segment. Snapshotting before the filler write means the segment cannot
+/// yet be truncated, so its later disappearance is unambiguous.
 fn active_segment(h: &CrashHarness) -> String {
     let segments = h.wal_segments();
     segments
@@ -93,11 +56,9 @@ fn active_segment(h: &CrashHarness) -> String {
         .clone()
 }
 
-/// Block until `segment` has been unlinked, panicking if it never is.
-///
-/// This is the assertion the whole test exists for: it is the only thing that
-/// distinguishes "the engine's checkpoint restored the row" from "the WAL
-/// record was still there all along".
+/// Block until `segment` has been unlinked, panicking if it never is. The
+/// only thing distinguishing "checkpoint restored the row" from "WAL record
+/// was still there all along".
 fn await_segment_deleted(h: &CrashHarness, segment: &str) {
     let deadline = Instant::now() + TRUNCATION_TIMEOUT;
     loop {
@@ -115,15 +76,14 @@ fn await_segment_deleted(h: &CrashHarness, segment: &str) {
     }
 }
 
-/// KV is the flagship case: `KvEngine` is a plain in-memory `HashMap` with no
-/// redb store behind it, so before it had a checkpoint the WAL held the only
-/// copy of every KV row — and KV writes advanced the very watermark that
-/// authorised deleting it.
+/// KV is the flagship case: `KvEngine` is a plain in-memory `HashMap`, so
+/// before it had a checkpoint the WAL held the only copy of every row —
+/// and KV writes advanced the watermark that authorized deleting it.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_row_survives_wal_segment_truncation() {
     let mut h = tuned_harness();
     h.spawn();
-    h.wait_ready();
+    h.wait_ready_extended();
 
     h.exec("CREATE COLLECTION trunc_kv (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;
@@ -145,9 +105,8 @@ async fn kv_row_survives_wal_segment_truncation() {
         "KV row must read back BEFORE the crash (test-setup sanity): {live:?}"
     );
 
-    // Force rotation: seal the canary's segment by pushing past the 1 MiB
-    // target several times over. Until this happens the canary's segment is the
-    // active one and truncation skips it unconditionally.
+    // Force rotation: seal the canary's segment, or truncation skips it
+    // unconditionally while it's still active.
     let filler = filler_value();
     for i in 0..FILLER_ROWS {
         h.exec(&format!(
@@ -181,15 +140,13 @@ async fn kv_row_survives_wal_segment_truncation() {
     );
 }
 
-/// Columnar is memory-only on both halves — the live memtable in
-/// `columnar_engines` and the encoded bytes of already-flushed segments in
-/// `columnar_flushed_segments`, neither of which had a store behind it — so it
-/// faces the same truncation the KV engine does.
+/// Columnar is memory-only on both halves — the live memtable and the
+/// encoded bytes of flushed segments — so it faces the same truncation.
 #[tokio::test(flavor = "multi_thread")]
 async fn columnar_row_survives_wal_segment_truncation() {
     let mut h = tuned_harness();
     h.spawn();
-    h.wait_ready();
+    h.wait_ready_extended();
 
     h.exec(
         "CREATE COLLECTION trunc_columnar \

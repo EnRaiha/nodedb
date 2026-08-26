@@ -2,18 +2,11 @@
 
 //! Real process-kill crash-recovery harness.
 //!
-//! This spawns the actual `nodedb` binary as a child process, lets tests
-//! drive it over pgwire, then simulates a hard crash with `kill -9`
-//! (`SIGKILL`, no graceful shutdown, no extra flush) followed by reaping the
-//! zombie and spawning a fresh process on the SAME data directory. Reopening
-//! triggers WAL replay through the normal binary boot path.
-//!
-//! This is deliberately distinct from the in-process `nodedb-test-support`
-//! harnesses, which link the library directly and execute in the same OS
-//! process as the test — they cannot simulate a real process crash because
-//! there is no separate process to kill. Only an actual `kill -9` against a
-//! separate child process exercises the boot-time WAL replay path the way a
-//! real deployment would encounter it after a hard crash.
+//! Spawns the actual `nodedb` binary as a child process, drives it over
+//! pgwire, then `kill -9`s it and reopens the same data directory to
+//! exercise WAL replay through the normal binary boot path. Distinct from
+//! the in-process `nodedb-test-support` harnesses, which cannot simulate a
+//! real process crash since there is no separate process to kill.
 
 #![allow(dead_code)] // Not every crash-test binary uses every helper.
 
@@ -21,20 +14,15 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-// `pub` so a crash test can read faultbox reports directly (see
-// `crash_metadata_applier_wedge.rs`), not just via the panic-path
-// diagnostics this module already wires into `pgwire.rs`.
+// `pub` so a crash test can read faultbox reports directly, not just via
+// the panic-path diagnostics wired into `pgwire.rs`.
 pub mod diagnostics;
-// The ILP client helper lives in `nodedb-test-support`, because tests outside
-// this harness drive the same handshake. A test that needs it imports it from
-// there directly rather than through a re-export here, which every crash-test
-// binary that does NOT use it would have to suppress as unused.
+// The ILP client helper lives in `nodedb-test-support` and is imported
+// directly by tests that need it, not re-exported here.
 mod pgwire;
 pub mod resp_client;
 
-// Only `crash_ilp_timeseries_write.rs` names `Session` and
-// `RetryableSchemaChange` directly; every other crash-test binary pulls in this
-// module too, so the re-exports are unused there.
+// Only `crash_ilp_timeseries_write.rs` uses these directly.
 #[allow(unused_imports)]
 pub use pgwire::{RetryableSchemaChange, Session};
 #[path = "../support/mod.rs"]
@@ -45,12 +33,14 @@ mod support;
 #[allow(unused_imports)]
 pub use support::direct_io::direct_io_supported;
 
-/// Boot budget for a harness-spawned server.
-///
-/// Generous because a full-workspace run has many test binaries starting
-/// servers at once. The poll returns as soon as `/healthz` is ready, so this
-/// only bounds how long a genuinely stuck boot takes to report.
-pub const BOOT_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Boot budget for a server in a default-budget test. Stays well under
+/// nextest's kill (`slow-timeout` 30s x 4 = 120s), since a test may boot twice
+/// and still do work inside it.
+pub const BOOT_READY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Boot budget for tests whose nextest override raises the kill to 240s
+/// (`terminate-after = 8`). They run serially and boot under a loaded machine.
+pub const BOOT_READY_TIMEOUT_EXTENDED: Duration = Duration::from_secs(150);
 
 pub fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -111,32 +101,21 @@ pub struct CrashHarness {
     pub http_port: u16,
     pub pgwire_port: u16,
     pub native_port: u16,
-    /// The sync WebSocket port. Unused by the tests themselves, but it must
-    /// be unique per harness: every protocol bind is boot-fatal, so two
-    /// concurrent harnesses left on the default sync port would collide and
-    /// one server would refuse to boot.
+    /// Unique per harness — every protocol bind is boot-fatal, so two
+    /// concurrent harnesses on the default sync port would collide.
     pub sync_port: u16,
-    /// The RESP port. Always allocated, like the other ports, to avoid a bind collision.
+    /// Always allocated, like the other ports, to avoid a bind collision.
     pub resp_port: u16,
-    /// The ILP (InfluxDB Line Protocol) port. Always allocated, like the
-    /// other ports, to avoid a bind collision, and always exported to the
-    /// spawned process so `reopen` reuses the same port a pre-crash ILP
-    /// connection was made against.
+    /// Always exported to the spawned process so `reopen` reuses the same
+    /// port a pre-crash ILP connection was made against.
     pub ilp_port: u16,
     child: Option<std::process::Child>,
-    /// Extra server env applied on EVERY spawn, including `reopen`. A test that
-    /// tunes the server (short checkpoint interval, small WAL segments) needs
-    /// the restarted process to boot under the same tuning as the one it
-    /// killed, or the recovery half runs against a differently configured
-    /// server than the crash half did.
+    /// Applied on every spawn, including `reopen`, so the restarted process
+    /// boots under the same tuning as the one it killed.
     extra_env: Vec<(String, String)>,
-    /// `NODEDB_WAL_DIRECT_IO` value forced on every spawn, or `None` to boot
-    /// the server on its shipped default.
-    ///
-    /// Decided once at construction by probing the real data directory, and
-    /// reused for `reopen` so a restarted process runs the same WAL mode as the
-    /// one it replaces — a recovery half booting differently from the crash
-    /// half would be testing a configuration no deployment ever runs.
+    /// `NODEDB_WAL_DIRECT_IO` forced on every spawn, or `None` for the
+    /// shipped default. Reused on `reopen` so recovery runs the same WAL
+    /// mode as the crash half.
     wal_direct_io: Option<&'static str>,
 }
 
@@ -176,21 +155,14 @@ impl CrashHarness {
     }
 
     /// Demand direct I/O even if the probe says the filesystem cannot provide
-    /// it.
-    ///
-    /// Direct I/O is already the default wherever the data directory supports
-    /// it, so this is for the two tests whose subject *is* the direct-I/O path:
-    /// they must never be quietly downgraded into proving nothing.
+    /// it — for the two tests whose subject is the direct-I/O path itself.
     pub fn with_direct_io_wal(mut self) -> CrashHarness {
         self.wal_direct_io = Some("true");
         self
     }
 
-    /// Force the WAL open buffered instead of using direct I/O.
-    ///
-    /// Only for a test whose subject is buffered I/O itself — everything else
-    /// runs the production configuration so the suite covers the write path a
-    /// deployment actually takes.
+    /// Force the WAL open buffered instead of using direct I/O — only for a
+    /// test whose subject is buffered I/O itself.
     pub fn with_buffered_wal(mut self) -> CrashHarness {
         self.wal_direct_io = Some("false");
         self
@@ -203,14 +175,9 @@ impl CrashHarness {
     }
 
     /// Set (or replace) a server env override in place, between spawns.
-    ///
-    /// [`CrashHarness::with_env`] is builder-style and pins the value for the
-    /// whole life of the harness — right for tuning knobs the recovery half
-    /// must inherit from the crash half. A crash-during-recovery test needs the
-    /// opposite: `NODEDB_FAILPOINTS` armed for exactly ONE boot. Left armed,
-    /// every later `reopen` aborts at the same point and recovery never gets to
-    /// run to completion, so the test could never observe the state it exists
-    /// to check.
+    /// Unlike [`CrashHarness::with_env`], this lets a crash-during-recovery
+    /// test arm `NODEDB_FAILPOINTS` for exactly one boot — left armed, every
+    /// later `reopen` would abort at the same point.
     pub fn set_env(&mut self, key: &str, value: &str) {
         match self.extra_env.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value.to_string(),
@@ -218,11 +185,9 @@ impl CrashHarness {
         }
     }
 
-    /// Drop a previously-set env override so subsequent spawns boot without it.
-    ///
-    /// The test process itself never exports the vars this harness sets, so
-    /// removing the override here really does leave the child with the variable
-    /// unset rather than falling back to an inherited value.
+    /// Drop a previously-set env override so subsequent spawns boot without
+    /// it, leaving the variable unset rather than falling back to an
+    /// inherited value.
     pub fn clear_env(&mut self, key: &str) {
         self.extra_env.retain(|(k, _)| k != key);
     }
@@ -239,11 +204,9 @@ impl CrashHarness {
         diagnostics::keep_data_dir_note(&self.data_dir_path)
     }
 
-    /// File names of the WAL segments currently on disk, sorted.
-    ///
-    /// Reading the directory rather than asking the server keeps this honest:
-    /// the question a truncation test must answer is whether the file was
-    /// actually unlinked, which only the filesystem can answer.
+    /// File names of the WAL segments currently on disk, sorted. Reads the
+    /// directory directly so a truncation test can confirm a file was
+    /// actually unlinked, not just what the server reports.
     pub fn wal_segments(&self) -> Vec<String> {
         let dir = self.data_dir().join("wal");
         let entries = match std::fs::read_dir(&dir) {
@@ -261,8 +224,6 @@ impl CrashHarness {
         names
     }
 
-    /// Spawn (or respawn) the `nodedb` binary against this harness's data
-    /// directory and ports.
     /// Path the server's stdout/stderr is appended to across every spawn.
     pub fn server_log_path(&self) -> std::path::PathBuf {
         self.data_dir_path.join("server.log")
@@ -278,9 +239,7 @@ impl CrashHarness {
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
-        // Capture the server's output instead of discarding it. When a crash
-        // test fails, the reason is almost always in the server's own log —
-        // discarding it leaves nothing to debug but the timeout itself.
+        // Capture server output so a crash-test failure has something to debug.
         // Appended, not truncated, so a `reopen` keeps the pre-crash half.
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -306,10 +265,8 @@ impl CrashHarness {
             // leaves the ILP listener disabled — a test that drives ILP must
             // set this to enable it, same as a real deployment opting in.
             .env("NODEDB_PORT_ILP", self.ilp_port.to_string())
-            // Pin the superuser password so the test can authenticate. Without
-            // this the binary auto-generates a random password into
-            // `<data_dir>/.superuser_password` (default auth mode is Password),
-            // which the client would not know. The same value is used on reopen.
+            // Pin the superuser password; otherwise the binary auto-generates
+            // one into `<data_dir>/.superuser_password` and the test can't auth.
             .env("NODEDB_SUPERUSER_PASSWORD", "nodedb")
             // A test that needs server diagnostics overrides this via
             // `with_env`, so it is set only when the test did not ask for
@@ -327,30 +284,32 @@ impl CrashHarness {
             .spawn()
             .expect("failed to spawn nodedb binary");
         self.boot_count += 1;
-        // Mark which boot these log lines belong to before the child has had
-        // a chance to write its own first line — the log accumulates across
-        // `spawn()`/`reopen()` in one file, so a tail dump is otherwise
-        // ambiguous about which boot each line came from.
+        // Mark which boot these log lines belong to — the log accumulates
+        // across spawns in one file, so a tail dump is otherwise ambiguous.
         diagnostics::mark_boot(&self.server_log_path(), self.boot_count, child.id());
         self.child = Some(child);
     }
 
     /// Block until `/healthz` reports ready, panicking on timeout.
     pub fn wait_ready(&self) {
+        self.wait_ready_within(BOOT_READY_TIMEOUT);
+    }
+
+    /// [`wait_ready`] for a test whose nextest kill budget is raised.
+    pub fn wait_ready_extended(&self) {
+        self.wait_ready_within(BOOT_READY_TIMEOUT_EXTENDED);
+    }
+
+    fn wait_ready_within(&self, budget: Duration) {
         assert!(
-            wait_for_healthz(self.http_port, BOOT_READY_TIMEOUT),
-            "nodedb did not become ready within {BOOT_READY_TIMEOUT:?}"
+            wait_for_healthz(self.http_port, budget),
+            "nodedb did not become ready within {budget:?}"
         );
     }
 
-    /// Spawn the server and assert that boot FAILS-STOP rather than coming up.
-    ///
-    /// Used by tests that make boot impossible before spawning — an unreadable
-    /// checkpoint on disk, a WAL open the filesystem must refuse. The server
-    /// must NEVER report `/healthz`-ready, and must exit non-zero
-    /// within `timeout` (the fail-stop path aborts boot, `main` returns `Err`,
-    /// and the process exits with a failure code). Panics if the server becomes
-    /// ready, exits cleanly, or neither exits nor becomes ready in time.
+    /// Spawn the server and assert that boot fails-stop rather than coming up.
+    /// The server must never report `/healthz`-ready and must exit non-zero
+    /// within `timeout`. Panics otherwise.
     pub fn spawn_expect_boot_failure(&mut self, timeout: Duration) {
         self.spawn();
         let deadline = Instant::now() + timeout;
@@ -408,12 +367,8 @@ impl CrashHarness {
         let _ = child.wait();
     }
 
-    /// Wait for the server to die on its own and reap it.
-    ///
-    /// Used with an armed `NODEDB_FAILPOINTS` abort: the crash happens inside
-    /// the server, at an exact point the test could never hit from outside
-    /// with `kill -9`. A timeout here means the injection never fired, so the
-    /// test must fail rather than go on to prove nothing.
+    /// Wait for the server to die on its own and reap it, used with an armed
+    /// `NODEDB_FAILPOINTS` abort. A timeout means the injection never fired.
     pub fn await_self_crash(&mut self, timeout: Duration) {
         let mut child = match self.child.take() {
             Some(c) => c,
@@ -431,10 +386,8 @@ impl CrashHarness {
                     let _ = child.wait();
                     let log = self.server_log();
                     let lines: Vec<&str> = log.lines().collect();
-                    // Both ends matter: boot decides whether the subsystem
-                    // under test even came up, the tail shows what it was
-                    // doing when the wait expired. Budget (and so the head/tail
-                    // split) comes from `NODEDB_TEST_LOG_TAIL_LINES`.
+                    // Head shows whether the subsystem under test came up; tail
+                    // shows what it was doing when the wait expired.
                     let budget = diagnostics::tail_line_count();
                     let half = budget / 2;
                     let excerpt = if lines.len() <= budget {
@@ -476,9 +429,8 @@ impl Default for CrashHarness {
 
 impl Drop for CrashHarness {
     fn drop(&mut self) {
-        // Kill and reap any surviving process before the tempdir field
-        // drops and removes the data directory, so we never leave an
-        // orphan server process running against a deleted path.
+        // Kill and reap before tempdir drops, so no orphan process runs
+        // against a deleted data directory.
         if self.child.is_some() {
             self.kill_9();
         }
