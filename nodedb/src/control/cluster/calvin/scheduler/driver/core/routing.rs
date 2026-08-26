@@ -156,7 +156,15 @@ fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
         KvOp::TransferItem { .. } => PlanRouting::Unroutable(
             "cross-collection write: source/target co-location is not enforced",
         ),
-        KvOp::Get { .. }
+        // A resolved write carries per-mutation collections and may span two
+        // (a resolved `TransferItem`), so the plan alone does not name one
+        // home — same gap as `TransferItem` above.
+        KvOp::ResolvedWrite { .. } => PlanRouting::Unroutable(
+            "resolved KV write: mutations may span collections with no co-location guarantee",
+        ),
+        // Read-only: it reports what a write would do and mutates nothing.
+        KvOp::ResolveWrite(_)
+        | KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::GetTtl { .. }
         | KvOp::BatchGet { .. }

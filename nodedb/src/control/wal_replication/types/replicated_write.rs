@@ -6,7 +6,8 @@ use super::aliases::{
     default_ivf_nprobe, default_pq_m,
 };
 use super::wire_shapes::{
-    ColumnarResolvedRow, ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget,
+    ColumnarResolvedRow, ConstraintChangeOp, KvResolvedMutationWire, ReplicatedBatchEdge,
+    ReplicatedSumTarget,
 };
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, UpdateValue};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
@@ -824,5 +825,21 @@ pub enum ReplicatedWrite {
         collection: String,
         is_update: bool,
         rows: Vec<ColumnarResolvedRow>,
+    },
+
+    /// Resolved form of a state-dependent KV write on a collection carrying a
+    /// write policy. Appended last to preserve the positional ABI.
+    ///
+    /// The Control Plane already read the rows the write depends on, computed
+    /// every post-image, and decided the policy against them while the writing
+    /// identity was live — so this carries the mutations and the reply, not an
+    /// operation to re-derive. `mutations` may span two collections: a
+    /// resolved `TransferItem` moves a row from one to another.
+    KvResolvedWrite {
+        mutations: Vec<KvResolvedMutationWire>,
+        /// The statement's reply, decided at resolve time. Every replica
+        /// returns it unchanged rather than recomputing it from state that
+        /// has moved on.
+        response_payload: Vec<u8>,
     },
 }

@@ -31,9 +31,9 @@
 //! - `KvOp::{RegisterIndex, DropIndex, RegisterSortedIndex,
 //!   DropSortedIndex}` are `Permission::Write` but `NotAWrite` in
 //!   `plan_vshard` (index metadata, not key-value state).
-//! - `DocumentOp::Merge` and `KvOp::TransferItem` are `Permission::Write` but
-//!   `Unroutable` in `plan_vshard` (cross-collection writes with no
-//!   enforced co-location).
+//! - `DocumentOp::Merge`, `KvOp::TransferItem` and `KvOp::ResolvedWrite` are
+//!   `Permission::Write` but `Unroutable` in `plan_vshard` (cross-collection
+//!   writes with no enforced co-location).
 //! - `TextOp::{FtsIndexDoc, FtsDeleteDoc}` and `SpatialOp::{Insert, Delete}`
 //!   are `Permission::Write` but their whole families are blanket
 //!   `NotAWrite` in `plan_vshard`.
@@ -163,6 +163,9 @@ fn kv_is_write(op: &KvOp) -> bool {
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
+        // Read-only: reports what a governed write would apply, mutates
+        // nothing, and is `NotAWrite` in `plan_vshard`.
+        | KvOp::ResolveWrite(_)
         // `Permission::Write` but `NotAWrite` in `plan_vshard` — index
         // metadata registration, not key-value state; no vshard to lock on.
         | KvOp::RegisterIndex { .. }
@@ -171,7 +174,10 @@ fn kv_is_write(op: &KvOp) -> bool {
         | KvOp::DropSortedIndex { .. }
         // `Permission::Write` but `Unroutable` in `plan_vshard`
         // (cross-collection write, no enforced co-location).
-        | KvOp::TransferItem { .. } => false,
+        | KvOp::TransferItem { .. }
+        // `Permission::Write` but `Unroutable` in `plan_vshard` — its
+        // mutations may span two collections, so no single vshard to lock on.
+        | KvOp::ResolvedWrite { .. } => false,
     }
 }
 

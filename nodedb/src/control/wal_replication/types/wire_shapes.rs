@@ -89,6 +89,60 @@ pub struct ColumnarResolvedRow {
     pub new_row_msgpack: Vec<u8>,
 }
 
+/// One mutation of a `KvResolvedWrite` in the cross-node wire shape.
+///
+/// Mirrors `nodedb_physical::physical_plan::KvResolvedMutation`, with the
+/// surrogate as a bare `u32` rather than the `Surrogate` newtype — the same
+/// convention every other identity on this wire uses. Decode binds it through
+/// the surrogate assigner, so a follower addresses the row the leader did.
+///
+/// `precondition` is the drift check, not a CAS condition: `None` means the
+/// key must be ABSENT at apply time, `Some(bytes)` that it must hold exactly
+/// those raw stored bytes.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum KvResolvedMutationWire {
+    Put {
+        collection: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        /// Absolute expiry instant resolved by the proposing node, `0` for
+        /// none. Carried for the same reason `KvPut::resolved_now_ms` is: no
+        /// applying node may re-derive it from its own clock.
+        expire_at_ms: u64,
+        surrogate: u32,
+        precondition: Option<Vec<u8>>,
+    },
+    Delete {
+        collection: String,
+        key: Vec<u8>,
+        precondition: Option<Vec<u8>>,
+    },
+    Expire {
+        collection: String,
+        key: Vec<u8>,
+        ttl_ms: u64,
+        /// See `ReplicatedWrite::KvExpire::resolved_now_ms`. Per-mutation here
+        /// because one resolved write can carry several.
+        resolved_now_ms: u64,
+        precondition: Option<Vec<u8>>,
+    },
+    Persist {
+        collection: String,
+        key: Vec<u8>,
+        precondition: Option<Vec<u8>>,
+    },
+}
+
 /// Whether a `ConstraintChange` installs (`Set`) or removes (`Drop`) a
 /// collection's constraint set on every replica.
 #[derive(

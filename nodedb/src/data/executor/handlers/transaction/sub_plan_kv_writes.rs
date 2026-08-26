@@ -379,7 +379,9 @@ impl CoreLoop {
             | KvOp::Expire { .. }
             | KvOp::Persist { .. }
             | KvOp::RegisterSortedIndex { .. }
-            | KvOp::DropSortedIndex { .. } => Err(ErrorCode::Internal {
+            | KvOp::DropSortedIndex { .. }
+            | KvOp::ResolveWrite(_)
+            | KvOp::ResolvedWrite { .. } => Err(ErrorCode::Internal {
                 detail: "execute_tx_kv_write called with a non-write-RMW KvOp variant".into(),
             }),
         }

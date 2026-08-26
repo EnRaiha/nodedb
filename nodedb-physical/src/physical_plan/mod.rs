@@ -42,7 +42,7 @@ pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{
     BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp, WccSuperstepPlan, WccSuperstepResult,
 };
-pub use kv::KvOp;
+pub use kv::{KvOp, KvResolveOutcome, KvResolvedMutation};
 pub use meta::MetaOp;
 pub use query::{AggregateSpec, GroupKeySpec, JoinProjection, QueryOp};
 pub use routing::plan_contains_cluster_partitioned_leaf;

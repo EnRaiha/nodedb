@@ -127,20 +127,39 @@ impl CoreLoop {
     /// records its LSN into the index before building its response, so the value
     /// read back here already includes the write. That is what lets the apply
     /// path hand a committed write's own version back to its proposer.
+    /// A resolved KV write names no single collection — its mutations may span
+    /// two — so its version is the highest of the ones it wrote. Falling back
+    /// on `PhysicalPlan::collection`'s `None` would report `Lsn::ZERO` and
+    /// leave the proposing session with no own-write floor for a write that
+    /// definitely happened.
     pub(in crate::data::executor) fn read_version_lsn(
         &self,
         task: &ExecutionTask,
     ) -> crate::types::Lsn {
+        if let crate::bridge::envelope::PhysicalPlan::Kv(
+            nodedb_physical::physical_plan::KvOp::ResolvedWrite { mutations, .. },
+        ) = task.plan()
+        {
+            return mutations
+                .iter()
+                .map(|m| self.collection_read_version(task, m.collection()))
+                .max()
+                .unwrap_or(crate::types::Lsn::ZERO);
+        }
         task.plan()
             .collection()
-            .map(|c| {
-                self.write_index
-                    .collection_write_lsn(&super::write_index::CollKey {
-                        db: task.request.database_id,
-                        tenant: task.request.tenant_id,
-                        collection: Box::from(c),
-                    })
-                    .unwrap_or(crate::types::Lsn::ZERO)
+            .map(|c| self.collection_read_version(task, c))
+            .unwrap_or(crate::types::Lsn::ZERO)
+    }
+
+    /// One collection's recorded write LSN on this core, or `Lsn::ZERO` when
+    /// it has none.
+    fn collection_read_version(&self, task: &ExecutionTask, collection: &str) -> crate::types::Lsn {
+        self.write_index
+            .collection_write_lsn(&super::write_index::CollKey {
+                db: task.request.database_id,
+                tenant: task.request.tenant_id,
+                collection: Box::from(collection),
             })
             .unwrap_or(crate::types::Lsn::ZERO)
     }

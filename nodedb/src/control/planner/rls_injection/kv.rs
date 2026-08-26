@@ -238,6 +238,15 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             "a truncate removes every row without reading one, so no row image is available",
         ),
 
+        // Inject into the wrapped op: it is the intercepted write verbatim,
+        // and resolution decides exactly the check injected there.
+        KvOp::ResolveWrite(inner) => inject_kv(ctx, inner),
+
+        // No-op: the write policy was already decided against every image
+        // this write persists, before it was proposed. Re-injecting would
+        // replace a verdict with a predicate no applying node can evaluate.
+        KvOp::ResolvedWrite { .. } => Ok(()),
+
         // No-op: index DDL writes no user row, so no row policy restricts it.
         KvOp::RegisterIndex { .. }
         | KvOp::DropIndex { .. }

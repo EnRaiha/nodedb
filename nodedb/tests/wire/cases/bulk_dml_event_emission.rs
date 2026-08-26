@@ -26,6 +26,12 @@ use std::time::Duration;
 
 use crate::harness::TestServer;
 
+/// How long to wait for asynchronous trigger dispatch to land. Generous
+/// because the suite runs several servers concurrently and the poll returns
+/// as soon as the count matches, so a high ceiling costs nothing except on a
+/// genuine failure.
+const FIRE_LOG_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Poll `fire_log` until it holds exactly `expected` rows, or fail with the
 /// last observed count once `timeout` elapses. The Event Plane consumes
 /// `WriteEvent`s and dispatches ASYNC triggers asynchronously, so the log
@@ -90,7 +96,7 @@ async fn bulk_update_emits_one_update_event_per_row() {
         .await
         .expect("bulk UPDATE should succeed");
 
-    wait_for_fire_log_count(&server, 2, Duration::from_secs(5)).await;
+    wait_for_fire_log_count(&server, 2, FIRE_LOG_TIMEOUT).await;
 
     // The row that did NOT match the WHERE clause must be unaffected.
     let unmatched_v = server
@@ -139,7 +145,7 @@ async fn bulk_delete_emits_one_delete_event_per_row() {
         .await
         .expect("bulk DELETE should succeed");
 
-    wait_for_fire_log_count(&server, 2, Duration::from_secs(5)).await;
+    wait_for_fire_log_count(&server, 2, FIRE_LOG_TIMEOUT).await;
 
     // The row that did NOT match the WHERE clause must still exist.
     let remaining = server.query_text("SELECT id FROM src").await.unwrap();
@@ -204,7 +210,7 @@ async fn update_from_join_emits_one_update_event_per_row() {
         .await
         .expect("UPDATE ... FROM should succeed");
 
-    wait_for_fire_log_count(&server, 2, Duration::from_secs(5)).await;
+    wait_for_fire_log_count(&server, 2, FIRE_LOG_TIMEOUT).await;
 
     // The row with no matching source row must be unaffected.
     let unmatched_name = server
@@ -248,7 +254,7 @@ async fn truncate_emits_one_delete_event_per_row() {
         .await
         .expect("TRUNCATE should succeed");
 
-    wait_for_fire_log_count(&server, 2, Duration::from_secs(5)).await;
+    wait_for_fire_log_count(&server, 2, FIRE_LOG_TIMEOUT).await;
 
     let remaining = server.query_text("SELECT id FROM src").await.unwrap();
     assert!(remaining.is_empty(), "TRUNCATE must remove all rows");

@@ -242,6 +242,10 @@ pub(super) fn decode_arm(
                 credit_surrogate: *credit_surrogate,
             },
         )?,
+        ReplicatedWrite::KvResolvedWrite {
+            mutations,
+            response_payload,
+        } => kv::resolved_write(ctx, mutations, response_payload)?,
         ReplicatedWrite::KvTransferItem {
             source_collection,
             dest_collection,

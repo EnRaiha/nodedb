@@ -102,10 +102,18 @@ impl PhysicalPlan {
             })
             | PhysicalPlan::Kv(KvOp::Transfer {
                 rls_write_check, ..
+            })
+            | PhysicalPlan::Kv(KvOp::ResolvedWrite {
+                rls_write_check, ..
             }) => Some(rls_write_check),
 
             // Carries two checks, not one — see `rls_write_checks`.
             PhysicalPlan::Kv(KvOp::TransferItem { .. }) => None,
+
+            // Read-only, and carries no check slot of its own: the wrapped op
+            // holds the live predicate, and the resolve handler decides it
+            // there against the images it computes.
+            PhysicalPlan::Kv(KvOp::ResolveWrite(_)) => None,
 
             // Every other op is not write-class: it carries no
             // `rls_write_check` field at all.

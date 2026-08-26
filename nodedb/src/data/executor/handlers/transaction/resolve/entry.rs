@@ -318,7 +318,17 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
-        | KvOp::SortedIndexScore { .. } => Ok(()),
+        | KvOp::SortedIndexScore { .. }
+        // Read-only: reports what a governed write would apply, stages
+        // nothing.
+        | KvOp::ResolveWrite(_) => Ok(()),
+
+        // Resolve-before-propose is an autocommit path: the resolution is
+        // decided against committed state and proposed directly, never staged
+        // into a transaction overlay, so no row-level redo shape carries it.
+        KvOp::ResolvedWrite { .. } => Err(crate::Error::PlanError {
+            detail: "kv resolved write is not supported in transaction resolve".to_string(),
+        }),
 
         // TTL-only writes: `Expire` / `Persist` stage a TTL delta with NO value
         // post-image (`stage_kv_ttl.rs`). The KV redo shapes carry a TTL only as

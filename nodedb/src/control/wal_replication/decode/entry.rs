@@ -160,7 +160,8 @@ fn to_physical_plan(
         | ReplicatedWrite::KvDropIndex { .. }
         | ReplicatedWrite::KvFieldSet { .. }
         | ReplicatedWrite::KvTransfer { .. }
-        | ReplicatedWrite::KvTransferItem { .. } => entry_kv::decode_arm(ctx, write),
+        | ReplicatedWrite::KvTransferItem { .. }
+        | ReplicatedWrite::KvResolvedWrite { .. } => entry_kv::decode_arm(ctx, write),
         // Columnar-storage family + overlay sync engines
         // (`PhysicalPlan::Columnar` / `Timeseries` / `Text` / `Spatial`).
         ReplicatedWrite::ColumnarIngest { .. }

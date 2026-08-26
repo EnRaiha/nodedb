@@ -80,27 +80,34 @@ impl CoreLoop {
         rls_filters: &[u8],
         rows: &[KvStoredRow<'_>],
     ) -> Response {
-        let docs: Vec<serde_json::Value> = match rows
-            .iter()
-            .map(|(key, value)| {
-                let (_key_str, body) = kv_row_to_doc(key, value);
-                doc_format::decode_document(&body)
-            })
-            .collect::<crate::Result<Vec<_>>>()
-        {
-            Ok(docs) => docs,
-            Err(e) => return self.response_error(task, e),
-        };
-        match build_rows_payload(spec, rls_filters, &docs) {
+        match kv_stored_rows_payload(spec, rls_filters, rows) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("RETURNING encode: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, e),
         }
     }
+}
+
+/// The `RowsPayload` blob a KV write's `RETURNING` clause projects from the
+/// rows it stored.
+///
+/// Split out of [`CoreLoop::kv_stored_returning_response`] so the
+/// resolve-before-propose path can decide the same payload without holding a
+/// `Response` — the payload it ships is the one every replica hands back.
+pub(in crate::data::executor) fn kv_stored_rows_payload(
+    spec: &ReturningSpec,
+    rls_filters: &[u8],
+    rows: &[KvStoredRow<'_>],
+) -> crate::Result<Vec<u8>> {
+    let docs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(key, value)| {
+            let (_key_str, body) = kv_row_to_doc(key, value);
+            doc_format::decode_document(&body)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    build_rows_payload(spec, rls_filters, &docs).map_err(|e| crate::Error::Internal {
+        detail: format!("RETURNING encode: {e}"),
+    })
 }
 
 impl CoreLoop {

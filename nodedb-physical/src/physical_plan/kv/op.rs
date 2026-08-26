@@ -4,6 +4,7 @@
 
 use nodedb_types::{RlsWriteCheck, Surrogate};
 
+use super::resolved_mutation::KvResolvedMutation;
 use crate::physical_plan::document::ReturningSpec;
 
 /// KV engine physical operations.
@@ -507,5 +508,32 @@ pub enum KvOp {
         collection: String,
         cursor: Vec<u8>,
         count: usize,
+    },
+
+    // ── Resolve-before-propose (governed state-dependent writes) ────────
+    /// Read-only: report every mutation the wrapped write would apply, and
+    /// the response payload it would return, without applying anything.
+    ///
+    /// The wrapped op is the intercepted write verbatim, live write predicate
+    /// included — the handler decides the policy against the exact images it
+    /// computes here, where the writing identity is still available. A
+    /// follower has none, so the predicate can never cross the Raft wire.
+    ResolveWrite(Box<KvOp>),
+
+    /// Apply exactly the mutations a [`KvOp::ResolveWrite`] reported, then
+    /// return `response_payload` verbatim.
+    ///
+    /// No predicate is evaluated and no image is recomputed: the Control
+    /// Plane already decided both, and `rls_write_check` carries the verdict
+    /// (`RlsWriteCheck::DecidedEarlierInRequest`). Every mutation's
+    /// `precondition` is checked against current state BEFORE the first one
+    /// applies, so a resolution that drifted under a concurrent write applies
+    /// nothing and asks for a retry.
+    ResolvedWrite {
+        mutations: Vec<KvResolvedMutation>,
+        /// The statement's reply, decided while resolving. Applying nodes
+        /// return it unchanged, so leader and follower report the same thing.
+        response_payload: Vec<u8>,
+        rls_write_check: RlsWriteCheck,
     },
 }

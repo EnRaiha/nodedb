@@ -205,7 +205,11 @@ impl CoreLoop {
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
-            | KvOp::MaterializeScan { .. } => self.stage_not_point_write(task),
+            | KvOp::MaterializeScan { .. }
+            // Resolve-before-propose is autocommit-only: it decides against
+            // committed state and proposes directly, never through staging.
+            | KvOp::ResolveWrite(_)
+            | KvOp::ResolvedWrite { .. } => self.stage_not_point_write(task),
         }
     }
 

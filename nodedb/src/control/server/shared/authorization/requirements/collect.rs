@@ -136,6 +136,20 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                     Permission::Write,
                 ));
             }
+            // Read-only probe over exactly the rows the wrapped write reads.
+            PhysicalPlan::Kv(KvOp::ResolveWrite(inner)) => {
+                for collection in kv_op_collections(inner) {
+                    add_collection_requirement(collection, Permission::Read, out);
+                }
+            }
+            // Per-mutation: a resolved `TransferItem` writes into a different
+            // collection than it deletes from, and `KvOp::collection` reports
+            // neither.
+            PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => {
+                for mutation in mutations {
+                    add_collection_requirement(mutation.collection(), Permission::Write, out);
+                }
+            }
             PhysicalPlan::Kv(
                 KvOp::Get { .. }
                 | KvOp::Put { .. }
@@ -217,6 +231,56 @@ fn requires_tenant_fallback(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_)
         | PhysicalPlan::ClusterEvent(_) => true,
+    }
+}
+
+/// Every collection a KV op names.
+///
+/// `TransferItem` names two and `ResolvedWrite` one per mutation; the rest
+/// defer to `KvOp::collection`, which is itself an exhaustive match and stays
+/// the single source of truth for that answer rather than being restated here.
+/// The remainder is enumerated rather than wildcarded so a new op cannot reach
+/// authorization without a decision being made here.
+fn kv_op_collections(op: &nodedb_physical::physical_plan::KvOp) -> Vec<&str> {
+    use nodedb_physical::physical_plan::KvOp;
+    match op {
+        KvOp::TransferItem {
+            source_collection,
+            dest_collection,
+            ..
+        } => vec![source_collection.as_str(), dest_collection.as_str()],
+        KvOp::ResolvedWrite { mutations, .. } => mutations.iter().map(|m| m.collection()).collect(),
+        KvOp::ResolveWrite(inner) => kv_op_collections(inner),
+        other @ (KvOp::Get { .. }
+        | KvOp::Put { .. }
+        | KvOp::Insert { .. }
+        | KvOp::InsertIfAbsent { .. }
+        | KvOp::InsertOnConflictUpdate { .. }
+        | KvOp::Delete { .. }
+        | KvOp::Scan { .. }
+        | KvOp::Expire { .. }
+        | KvOp::Persist { .. }
+        | KvOp::GetTtl { .. }
+        | KvOp::BatchGet { .. }
+        | KvOp::BatchPut { .. }
+        | KvOp::RegisterIndex { .. }
+        | KvOp::DropIndex { .. }
+        | KvOp::FieldGet { .. }
+        | KvOp::FieldSet { .. }
+        | KvOp::Truncate { .. }
+        | KvOp::Incr { .. }
+        | KvOp::IncrFloat { .. }
+        | KvOp::Cas { .. }
+        | KvOp::GetSet { .. }
+        | KvOp::Transfer { .. }
+        | KvOp::RegisterSortedIndex { .. }
+        | KvOp::DropSortedIndex { .. }
+        | KvOp::SortedIndexRank { .. }
+        | KvOp::SortedIndexTopK { .. }
+        | KvOp::SortedIndexRange { .. }
+        | KvOp::SortedIndexCount { .. }
+        | KvOp::SortedIndexScore { .. }
+        | KvOp::MaterializeScan { .. }) => other.collection().into_iter().collect(),
     }
 }
 

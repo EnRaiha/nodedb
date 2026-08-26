@@ -316,6 +316,78 @@ pub(super) fn truncate(collection: &str) -> ReplicatedWrite {
     }
 }
 
+/// Encode a resolved KV write: every mutation the Control Plane decided, plus
+/// the reply it decided alongside them.
+///
+/// Nothing is re-derived here — no clock read, no expiry arithmetic. Each
+/// mutation already carries the absolute instant the resolving node resolved
+/// (`Put::expire_at_ms`, `Expire::resolved_now_ms`), so every replica installs
+/// the identical expiry.
+pub(super) fn resolved_write(
+    mutations: &[nodedb_physical::physical_plan::KvResolvedMutation],
+    response_payload: &[u8],
+) -> ReplicatedWrite {
+    use super::super::types::KvResolvedMutationWire as W;
+    use nodedb_physical::physical_plan::KvResolvedMutation as M;
+
+    ReplicatedWrite::KvResolvedWrite {
+        mutations: mutations
+            .iter()
+            .map(|m| match m {
+                M::Put {
+                    collection,
+                    key,
+                    value,
+                    ttl_ms,
+                    expire_at_ms,
+                    surrogate,
+                    precondition,
+                } => W::Put {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    ttl_ms: *ttl_ms,
+                    expire_at_ms: *expire_at_ms,
+                    surrogate: surrogate.as_u32(),
+                    precondition: precondition.clone(),
+                },
+                M::Delete {
+                    collection,
+                    key,
+                    precondition,
+                } => W::Delete {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    precondition: precondition.clone(),
+                },
+                M::Expire {
+                    collection,
+                    key,
+                    ttl_ms,
+                    resolved_now_ms,
+                    precondition,
+                } => W::Expire {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    ttl_ms: *ttl_ms,
+                    resolved_now_ms: *resolved_now_ms,
+                    precondition: precondition.clone(),
+                },
+                M::Persist {
+                    collection,
+                    key,
+                    precondition,
+                } => W::Persist {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    precondition: precondition.clone(),
+                },
+            })
+            .collect(),
+        response_payload: response_payload.to_vec(),
+    }
+}
+
 pub(super) fn transfer_item(
     source_collection: &str,
     dest_collection: &str,

@@ -107,6 +107,26 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
              and the plan names only the index",
         ),
 
+        // Resolve against the wrapped op: it is the intercepted write
+        // verbatim, so it authorizes at exactly the level that write does.
+        KvOp::ResolveWrite(inner) => apply_kv(ctx, inner),
+
+        // Authorize every collection the resolved mutations touch. A resolved
+        // `TransferItem` spans two, so one blanket call on a hoisted
+        // collection would leave the other side unauthorized.
+        KvOp::ResolvedWrite { mutations, .. } => {
+            for mutation in mutations.iter() {
+                let level = match mutation {
+                    nodedb_physical::physical_plan::KvResolvedMutation::Delete { .. } => {
+                        PermTreeLevel::Delete
+                    }
+                    _ => PermTreeLevel::Write,
+                };
+                ctx.authorize(mutation.collection(), level)?;
+            }
+            Ok(())
+        }
+
         // No-op: index DDL. It describes the collection rather than acting on
         // its rows, and is authorized as DDL rather than against a level.
         KvOp::RegisterIndex { .. }

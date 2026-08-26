@@ -448,6 +448,19 @@ impl CoreLoop {
                 cursor,
                 count,
             } => self.execute_kv_materialize_scan(task, did, tid, collection, cursor, *count),
+            KvOp::ResolveWrite(inner) => self.execute_kv_resolve_write(task, did, tid, inner),
+            KvOp::ResolvedWrite {
+                mutations,
+                response_payload,
+                rls_write_check,
+            } => self.execute_kv_resolved_write(
+                task,
+                did,
+                tid,
+                mutations,
+                response_payload,
+                rls_write_check,
+            ),
         }
     }
 }

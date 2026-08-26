@@ -26,5 +26,6 @@ pub use aliases::{AsyncRaftProposer, RaftAppliedIndexSink, RaftCompactor, RaftPr
 pub use replicated_entry::ReplicatedEntry;
 pub use replicated_write::ReplicatedWrite;
 pub use wire_shapes::{
-    ColumnarResolvedRow, ConstraintChangeOp, ReplicatedBatchEdge, ReplicatedSumTarget,
+    ColumnarResolvedRow, ConstraintChangeOp, KvResolvedMutationWire, ReplicatedBatchEdge,
+    ReplicatedSumTarget,
 };

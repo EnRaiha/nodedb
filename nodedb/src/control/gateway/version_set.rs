@@ -98,6 +98,68 @@ impl GatewayVersionSet {
     }
 }
 
+/// Append every collection a KV op names into `out`.
+///
+/// Split out of [`touched_collections`] so `ResolveWrite` can recurse into the
+/// write it wraps rather than restating that write's own shape.
+fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut Vec<String>) {
+    use nodedb_physical::physical_plan::KvOp::*;
+    match op {
+        Get { collection, .. }
+        | Put { collection, .. }
+        | Insert { collection, .. }
+        | InsertIfAbsent { collection, .. }
+        | InsertOnConflictUpdate { collection, .. }
+        | Delete { collection, .. }
+        | Scan { collection, .. }
+        | Expire { collection, .. }
+        | Persist { collection, .. }
+        | GetTtl { collection, .. }
+        | BatchGet { collection, .. }
+        | BatchPut { collection, .. }
+        | RegisterIndex { collection, .. }
+        | DropIndex { collection, .. }
+        | FieldGet { collection, .. }
+        | FieldSet { collection, .. }
+        | Truncate { collection }
+        | Incr { collection, .. }
+        | IncrFloat { collection, .. }
+        | Cas { collection, .. }
+        | GetSet { collection, .. }
+        | Transfer { collection, .. }
+        | RegisterSortedIndex { collection, .. }
+        | MaterializeScan { collection, .. } => out.push(collection.clone()),
+
+        // TransferItem touches two collections.
+        TransferItem {
+            source_collection,
+            dest_collection,
+            ..
+        } => {
+            out.push(source_collection.clone());
+            out.push(dest_collection.clone());
+        }
+
+        // The wrapped op is the intercepted write verbatim, so it reads
+        // exactly the collections that write touches.
+        ResolveWrite(inner) => kv_touched_collections(inner, out),
+
+        // Per-mutation: a resolved `TransferItem` writes into a different
+        // collection than it deletes from.
+        ResolvedWrite { mutations, .. } => {
+            out.extend(mutations.iter().map(|m| m.collection().to_owned()));
+        }
+
+        // Sorted index ops — not per-collection.
+        DropSortedIndex { .. }
+        | SortedIndexRank { .. }
+        | SortedIndexTopK { .. }
+        | SortedIndexRange { .. }
+        | SortedIndexCount { .. }
+        | SortedIndexScore { .. } => {}
+    }
+}
+
 /// Extract every collection name touched by a `PhysicalPlan`.
 ///
 /// Returns a `Vec<String>` that may contain duplicates; callers are
@@ -109,53 +171,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 
     match plan {
         // ── KV ──────────────────────────────────────────────────────────
-        PhysicalPlan::Kv(op) => {
-            use KvOp::*;
-            match op {
-                Get { collection, .. }
-                | Put { collection, .. }
-                | Insert { collection, .. }
-                | InsertIfAbsent { collection, .. }
-                | InsertOnConflictUpdate { collection, .. }
-                | Delete { collection, .. }
-                | Scan { collection, .. }
-                | Expire { collection, .. }
-                | Persist { collection, .. }
-                | GetTtl { collection, .. }
-                | BatchGet { collection, .. }
-                | BatchPut { collection, .. }
-                | RegisterIndex { collection, .. }
-                | DropIndex { collection, .. }
-                | FieldGet { collection, .. }
-                | FieldSet { collection, .. }
-                | Truncate { collection }
-                | Incr { collection, .. }
-                | IncrFloat { collection, .. }
-                | Cas { collection, .. }
-                | GetSet { collection, .. }
-                | Transfer { collection, .. }
-                | RegisterSortedIndex { collection, .. }
-                | MaterializeScan { collection, .. } => out.push(collection.clone()),
-
-                // TransferItem touches two collections.
-                TransferItem {
-                    source_collection,
-                    dest_collection,
-                    ..
-                } => {
-                    out.push(source_collection.clone());
-                    out.push(dest_collection.clone());
-                }
-
-                // Sorted index ops — not per-collection.
-                DropSortedIndex { .. }
-                | SortedIndexRank { .. }
-                | SortedIndexTopK { .. }
-                | SortedIndexRange { .. }
-                | SortedIndexCount { .. }
-                | SortedIndexScore { .. } => {}
-            }
-        }
+        PhysicalPlan::Kv(op) => kv_touched_collections(op, &mut out),
 
         // ── Document ────────────────────────────────────────────────────
         PhysicalPlan::Document(op) => {

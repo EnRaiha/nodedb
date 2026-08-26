@@ -146,6 +146,16 @@ impl CoreLoop {
             | KvOp::GetSet { .. }
             | KvOp::Transfer { .. }
             | KvOp::TransferItem { .. } => self.execute_tx_kv_write(task, did, tid, op, undo_log),
+
+            // ── Resolve-before-propose — reject inside TransactionBatch ─────
+            //
+            // Both are autocommit-only: the resolution is decided against
+            // committed state and proposed straight through Raft, so neither
+            // has an undo shape and neither is ever buffered into an overlay.
+            KvOp::ResolveWrite(_) | KvOp::ResolvedWrite { .. } => Err(ErrorCode::Internal {
+                detail: "KV resolve-before-propose is not permitted inside a TransactionBatch"
+                    .into(),
+            }),
         }
     }
 }

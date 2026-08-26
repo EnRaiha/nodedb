@@ -325,7 +325,11 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
-        | KvOp::MaterializeScan { .. } => unreachable!(
+        | KvOp::MaterializeScan { .. }
+        // Autocommit-only: transaction resolve rejects both, so neither is
+        // ever staged into the overlay.
+        | KvOp::ResolveWrite(_)
+        | KvOp::ResolvedWrite { .. } => unreachable!(
             "staged_kv_tag_kind called on a non-stageable KvOp; \
              is_stageable_write invariant broken: {op:?}"
         ),

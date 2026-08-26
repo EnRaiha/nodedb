@@ -7,7 +7,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, MetaOp, TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, KvResolvedMutation, MetaOp,
+    TimeseriesOp, VectorOp,
 };
 
 /// Extract write metadata from a physical plan for change event publishing.
@@ -16,7 +17,8 @@ use nodedb_physical::physical_plan::{
 /// in the plan (empty for reads, DDL/config ops, and index/overlay
 /// maintenance ops whose underlying data row already published its own
 /// event). Almost all write plans produce exactly one tuple; only
-/// `KvOp::TransferItem` spans two distinct collections and so produces two.
+/// `KvOp::TransferItem` and `KvOp::ResolvedWrite` span two distinct
+/// collections and so produce more than one.
 ///
 /// The match is exhaustive over the top-level [`PhysicalPlan`] enum (no
 /// catch-all `_ =>`) so a new engine variant is a compile error here, not a
@@ -229,9 +231,37 @@ pub(super) fn extract_write_metadata(
                 ChangeOperation::Insert,
             ),
         ],
+        // A resolved governed write reports one event per mutation: it names
+        // every collection and key it touches, and those may span two
+        // collections (a resolved `TransferItem`), so nothing here has to be
+        // collapsed to `document_id="*"`.
+        PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => mutations
+            .iter()
+            .map(|mutation| {
+                let operation = match mutation {
+                    KvResolvedMutation::Delete { .. } => ChangeOperation::Delete,
+                    // The precondition is what the resolve found stored: a row
+                    // that was absent is an insert, one that was present is an
+                    // update.
+                    KvResolvedMutation::Put { precondition, .. } => match precondition {
+                        Some(_) => ChangeOperation::Update,
+                        None => ChangeOperation::Insert,
+                    },
+                    KvResolvedMutation::Expire { .. } | KvResolvedMutation::Persist { .. } => {
+                        ChangeOperation::Update
+                    }
+                };
+                (
+                    mutation.collection().to_owned(),
+                    String::from_utf8_lossy(mutation.key()).into_owned(),
+                    operation,
+                )
+            })
+            .collect(),
+
         // Remaining KvOp variants (Get, Scan, GetTtl, BatchGet, secondary /
-        // sorted-index DDL and reads, MaterializeScan) are reads or
-        // catalog-only — no row changed.
+        // sorted-index DDL and reads, MaterializeScan, ResolveWrite) are reads
+        // or catalog-only — no row changed.
         PhysicalPlan::Kv(_) => Vec::new(),
 
         // Columnar storage core: base `columnar` collections AND `spatial`

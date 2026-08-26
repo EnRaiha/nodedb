@@ -393,6 +393,90 @@ pub(super) fn truncate(collection: &str) -> PhysicalPlan {
     })
 }
 
+/// Reconstruct a resolved KV write plan (`KvOp::ResolvedWrite`).
+///
+/// Every `Put` mutation's surrogate is bound through the assigner against its
+/// own `(collection, key)`, so a follower addresses the same rows the leader
+/// did even though one write spans two collections. Nothing else is
+/// re-derived: expiry instants and the reply travel on the record.
+pub(super) fn resolved_write(
+    ctx: &DecodeCtx,
+    mutations: &[super::super::types::KvResolvedMutationWire],
+    response_payload: &[u8],
+) -> crate::Result<PhysicalPlan> {
+    use super::super::types::KvResolvedMutationWire as W;
+    use nodedb_physical::physical_plan::KvResolvedMutation as M;
+
+    let decoded = mutations
+        .iter()
+        .map(|m| -> crate::Result<M> {
+            Ok(match m {
+                W::Put {
+                    collection,
+                    key,
+                    value,
+                    ttl_ms,
+                    expire_at_ms,
+                    surrogate,
+                    precondition,
+                } => {
+                    let carried = nodedb_types::Surrogate::new(*surrogate);
+                    M::Put {
+                        collection: collection.clone(),
+                        key: key.clone(),
+                        value: value.clone(),
+                        ttl_ms: *ttl_ms,
+                        expire_at_ms: *expire_at_ms,
+                        surrogate: bind_or_lookup(ctx, collection, key, carried)?,
+                        precondition: precondition.clone(),
+                    }
+                }
+                W::Delete {
+                    collection,
+                    key,
+                    precondition,
+                } => M::Delete {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    precondition: precondition.clone(),
+                },
+                W::Expire {
+                    collection,
+                    key,
+                    ttl_ms,
+                    resolved_now_ms,
+                    precondition,
+                } => M::Expire {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    ttl_ms: *ttl_ms,
+                    // Stamped from the wire, never from this node's clock —
+                    // mirrors the `KvExpire` arm, per mutation.
+                    resolved_now_ms: *resolved_now_ms,
+                    precondition: precondition.clone(),
+                },
+                W::Persist {
+                    collection,
+                    key,
+                    precondition,
+                } => M::Persist {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    precondition: precondition.clone(),
+                },
+            })
+        })
+        .collect::<crate::Result<Vec<M>>>()?;
+
+    Ok(PhysicalPlan::Kv(KvOp::ResolvedWrite {
+        mutations: decoded,
+        response_payload: response_payload.to_vec(),
+        // The decision was made before this entry was proposed; the record is
+        // what proves it — see `delete` for why nothing is re-decided here.
+        rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
+    }))
+}
+
 pub(super) fn transfer_item(
     ctx: &DecodeCtx,
     source_collection: &str,

@@ -266,7 +266,10 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::SortedIndexTopK { .. }
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
-            | KvOp::SortedIndexScore { .. },
+            | KvOp::SortedIndexScore { .. }
+            // Read-only: it reports what a governed write would apply and
+            // mutates nothing. The wrapped write is authorized on its own.
+            | KvOp::ResolveWrite(_),
         ) => Permission::Read,
 
         // KV engine: write operations.
@@ -290,7 +293,8 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::RegisterSortedIndex { .. }
             | KvOp::DropSortedIndex { .. }
             | KvOp::Transfer { .. }
-            | KvOp::TransferItem { .. },
+            | KvOp::TransferItem { .. }
+            | KvOp::ResolvedWrite { .. },
         ) => Permission::Write,
 
         // Tenant purge requires superuser (checked at DDL level); map to Write.

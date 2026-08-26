@@ -51,7 +51,7 @@ pub async fn run_write_resolve(
     loop {
         let resolve_op = resolver.build_resolve_op();
         let resolved = resolver.resolve(state, ctx, resolve_op).await?;
-        let resolved_plan = resolver.apply(resolved);
+        let resolved_plan = resolver.apply(resolved)?;
 
         match propose_resolved(state, ctx, resolver.collection(), resolved_plan).await? {
             ProposeOutcome::Applied(response) => return Ok(response),

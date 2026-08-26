@@ -59,7 +59,12 @@ pub trait EngineWriteResolver: Send + Sync {
         op: PhysicalPlan,
     ) -> crate::Result<ResolvedRows>;
 
-    /// Control Plane. Pure and infallible: the write carrying `resolved` and a
+    /// Control Plane. Pure, no I/O: the write carrying `resolved` and a
     /// decided `RlsWriteCheck`.
-    fn apply(&self, resolved: ResolvedRows) -> PhysicalPlan;
+    ///
+    /// Fallible only because [`ResolvedRows`] spans every engine's decided
+    /// shape while an implementor handles one: a shape from another engine is
+    /// an internal dispatch break, reported rather than silently rewritten
+    /// into a write it does not describe.
+    fn apply(&self, resolved: ResolvedRows) -> crate::Result<PhysicalPlan>;
 }

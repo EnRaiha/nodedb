@@ -247,7 +247,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
-            | KvOp::MaterializeScan { .. },
+            | KvOp::MaterializeScan { .. }
+            // Read-only: reports what a governed write would apply and
+            // mutates nothing, so `to_replicated_entry` encodes nothing.
+            | KvOp::ResolveWrite(_),
         ) => false,
 
         // ---- Kv: index / DDL / truncate — encoded, but autocommit-only ----
@@ -261,6 +264,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Kv(
             KvOp::Truncate { .. } | KvOp::RegisterIndex { .. } | KvOp::DropIndex { .. },
         ) => false,
+
+        // ---- Kv: resolved write — encoded, but autocommit-only ----
+        // Same inverse divergence as the three above: `to_replicated_entry`
+        // encodes it (that is the whole point — it is what a governed
+        // state-dependent KV write replicates as), but transaction resolve
+        // rejects it, so it is never stageable and never needs buffering.
+        PhysicalPlan::Kv(KvOp::ResolvedWrite { .. }) => false,
 
         // ---- Columnar: encoded (buffered) ----
         PhysicalPlan::Columnar(

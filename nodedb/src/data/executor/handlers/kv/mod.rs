@@ -9,6 +9,7 @@ mod dispatch;
 mod field;
 mod index;
 mod materialize_scan;
+pub(in crate::data::executor) mod resolve;
 pub(in crate::data::executor) mod rls;
 mod scan;
 pub(in crate::data::executor) mod sorted;

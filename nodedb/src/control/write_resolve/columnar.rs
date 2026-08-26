@@ -128,8 +128,8 @@ impl EngineWriteResolver for ColumnarWriteResolver {
         }
     }
 
-    fn apply(&self, resolved: ResolvedRows) -> PhysicalPlan {
-        PhysicalPlan::Columnar(match resolved {
+    fn apply(&self, resolved: ResolvedRows) -> crate::Result<PhysicalPlan> {
+        Ok(PhysicalPlan::Columnar(match resolved {
             ResolvedRows::Update(rows) => ColumnarOp::ResolvedUpdate {
                 collection: self.collection.clone(),
                 rows,
@@ -140,6 +140,15 @@ impl EngineWriteResolver for ColumnarWriteResolver {
                 pks,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             },
-        })
+            ResolvedRows::Kv { .. } => {
+                return Err(crate::Error::Internal {
+                    detail: format!(
+                        "columnar write resolver for '{}' was handed a KV resolution; \
+                         resolver_for_plan dispatched the wrong engine",
+                        self.collection
+                    ),
+                });
+            }
+        }))
     }
 }

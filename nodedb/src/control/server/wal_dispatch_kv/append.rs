@@ -326,8 +326,41 @@ pub fn wal_append_kv_op(
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        // Read-only or non-WAL KV ops.
-        KvOp::Get { .. }
+        // Every mutation gets its own durable record, in apply order, through
+        // the same encoders the equivalent live op uses — so redo replay
+        // reconstructs exactly what the apply installed. The returned LSN is
+        // the LAST one appended: it is the point the whole resolved write is
+        // durable at.
+        //
+        // `resolved_now_ms` stays `None`: every instant this write installs
+        // already travels inside the mutation, so there is nothing for the
+        // caller to hand back to the Data Plane.
+        KvOp::ResolvedWrite {
+            mutations,
+            // The reply is decided per request, not per durable record: replay
+            // re-applies state, it does not answer a client.
+            response_payload: _,
+            // Already decided when the entry was proposed; a redo re-applies
+            // an admitted write rather than re-deciding it.
+            rls_write_check: _,
+        } => {
+            let mut last: Option<crate::types::Lsn> = None;
+            for mutation in mutations {
+                last = Some(append_kv_resolved_mutation(
+                    wal,
+                    tenant_id,
+                    vshard_id,
+                    database_id,
+                    mutation,
+                )?);
+            }
+            last
+        }
+
+        // Read-only or non-WAL KV ops. `ResolveWrite` reads the rows a
+        // governed write depends on and mutates nothing.
+        KvOp::ResolveWrite(_)
+        | KvOp::Get { .. }
         | KvOp::BatchGet { .. }
         | KvOp::Scan { .. }
         | KvOp::FieldGet { .. }
@@ -343,4 +376,73 @@ pub fn wal_append_kv_op(
         lsn,
         resolved_now_ms,
     })
+}
+
+/// Append one mutation of a resolved KV write and return its LSN.
+///
+/// Each mutation maps onto the record class its live counterpart writes, with
+/// the absolute expiry instant the Control Plane already resolved — never a
+/// clock read here, so a redo installs the same expiry the apply did.
+fn append_kv_resolved_mutation(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    mutation: &nodedb_physical::physical_plan::KvResolvedMutation,
+) -> crate::Result<crate::types::Lsn> {
+    use nodedb_physical::physical_plan::KvResolvedMutation as M;
+    match mutation {
+        M::Put {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            expire_at_ms,
+            surrogate,
+            precondition: _,
+        } => {
+            let entry = encode_kv_put(
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                // Always explicit, `0` included: `0` is this write's decided
+                // "no expiry", not an absent field to re-derive `ttl_ms` from.
+                Some(*expire_at_ms),
+                surrogate.as_u32(),
+            )?;
+            wal.append_put(tenant_id, vshard_id, database_id, &entry)
+        }
+        M::Delete {
+            collection,
+            key,
+            precondition: _,
+        } => {
+            let entry = encode_kv_delete(collection, std::slice::from_ref(key))?;
+            wal.append_delete(tenant_id, vshard_id, database_id, &entry)
+        }
+        M::Expire {
+            collection,
+            key,
+            ttl_ms,
+            resolved_now_ms,
+            precondition: _,
+        } => {
+            let entry = encode_kv_expire(
+                collection,
+                key,
+                *ttl_ms,
+                resolved_now_ms.saturating_add(*ttl_ms),
+            )?;
+            wal.append_put(tenant_id, vshard_id, database_id, &entry)
+        }
+        M::Persist {
+            collection,
+            key,
+            precondition: _,
+        } => {
+            let entry = encode_kv_persist(collection, key)?;
+            wal.append_put(tenant_id, vshard_id, database_id, &entry)
+        }
+    }
 }

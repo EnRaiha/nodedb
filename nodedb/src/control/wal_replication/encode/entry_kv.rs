@@ -255,8 +255,23 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
 
         KvOp::Truncate { collection } => kv::truncate(collection),
 
+        // The verdict is already on the plan
+        // (`RlsWriteCheck::DecidedEarlierInRequest`), so unlike every arm
+        // above there is no predicate to drop here.
+        KvOp::ResolvedWrite {
+            mutations,
+            response_payload,
+            // Decode stamps `decided_earlier_in_request()`: the decision this
+            // slot carries was made before the entry was proposed, and the
+            // record is what proves it.
+            rls_write_check: _,
+        } => kv::resolved_write(mutations, response_payload),
+
         // Not a write — reads / scans / sorted-index queries.
-        KvOp::Get { .. }
+        // `ResolveWrite` reads the rows a governed write depends on and
+        // reports what it would do; it mutates nothing, so nothing replicates.
+        KvOp::ResolveWrite(_)
+        | KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::GetTtl { .. }
         | KvOp::BatchGet { .. }
