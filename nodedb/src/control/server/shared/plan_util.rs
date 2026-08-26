@@ -150,6 +150,47 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
     }
 }
 
+/// Every collection a plan's work must be metered against, first-seen order,
+/// no duplicates.
+///
+/// [`extract_collection`] answers "which ONE collection identifies this
+/// plan" and reports `None` for a KV `ResolvedWrite`, whose mutations may
+/// span two collections. Metering needs all of them: `TransferItem` and the
+/// `ResolvedWrite` it resolves to move rows between two collections in one
+/// plan. Every other plan yields exactly what [`extract_collection`] reports.
+pub(crate) fn metered_collections(plan: &PhysicalPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    if let PhysicalPlan::Kv(KvOp::TransferItem {
+        source_collection,
+        dest_collection,
+        ..
+    }) = plan
+    {
+        push_distinct(&mut out, source_collection);
+        push_distinct(&mut out, dest_collection);
+        return out;
+    }
+    if let PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) = plan {
+        for mutation in mutations {
+            push_distinct(&mut out, mutation.collection());
+        }
+        return out;
+    }
+    // Every other plan identifies one collection at most, and
+    // `extract_collection` is itself exhaustive over `PhysicalPlan`, so this
+    // stays exhaustive without restating that match.
+    out.extend(extract_collection(plan).map(str::to_string));
+    out
+}
+
+/// Append `collection` unless it is already present. The list holds at most a
+/// handful of names, so a linear scan beats building a set.
+fn push_distinct(out: &mut Vec<String>, collection: &str) {
+    if !out.iter().any(|held| held == collection) {
+        out.push(collection.to_string());
+    }
+}
+
 /// Classify which peer engine a plan targets. Total over the top-level
 /// [`PhysicalPlan`] variants (one-to-one with [`EngineTag`]) so a new engine
 /// forces an explicit decision rather than a silent default.

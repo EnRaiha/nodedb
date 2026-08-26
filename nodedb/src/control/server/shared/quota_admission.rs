@@ -50,26 +50,31 @@ pub(crate) fn admit_quota_for_dispatch(
     if scope.identity().is_internal_service() {
         return Ok(());
     }
-    let Some(collection) = info.collection() else {
+    let collections = info.collections();
+    if collections.is_empty() {
         return Ok(());
-    };
+    }
 
     let auth = scope.auth();
     let now_secs = crate::control::security::time::now_secs();
     let effective = state.scope_grants.effective_scopes(&auth.id, &auth.org_ids);
 
-    for scope_name in &effective {
-        if !scope_covers_request(state, scope_name, info.permission(), collection) {
-            continue;
-        }
-        // A scope with no definition returns `Ok` — `check_quota`'s own
-        // "no quota defined → allow" path — so this loop costs nothing for
-        // the overwhelmingly common uncapped scope.
-        if let Err(status) = state
-            .quota_manager
-            .check_quota(scope_name, &auth.id, 0, now_secs)
-        {
-            return Err(quota_exceeded(&status));
+    // Every collection the plan writes into, not just the one that
+    // identifies it: an exhausted cap on any of them refuses the write.
+    for collection in collections {
+        for scope_name in &effective {
+            if !scope_covers_request(state, scope_name, info.permission(), collection) {
+                continue;
+            }
+            // A scope with no definition returns `Ok` — `check_quota`'s own
+            // "no quota defined → allow" path — so this loop costs nothing
+            // for the overwhelmingly common uncapped scope.
+            if let Err(status) = state
+                .quota_manager
+                .check_quota(scope_name, &auth.id, 0, now_secs)
+            {
+                return Err(quota_exceeded(&status));
+            }
         }
     }
 

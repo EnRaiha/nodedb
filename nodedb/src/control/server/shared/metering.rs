@@ -14,7 +14,7 @@ use crate::control::security::identity::{Permission, required_permission};
 use crate::control::security::metering::counter::UsageEvent;
 use crate::control::security::permission::parse_permission;
 use crate::control::security::request_scope::RequestAuthScope;
-use crate::control::server::shared::plan_util::{extract_collection, plan_engine};
+use crate::control::server::shared::plan_util::{metered_collections, plan_engine};
 use crate::control::state::SharedState;
 use nodedb_types::calvin::EngineTag;
 
@@ -80,7 +80,12 @@ pub(crate) fn operation_for_plan(plan: &PhysicalPlan) -> &'static str {
 /// payloads (vector floats, row upserts, filter trees), while metering only
 /// ever reads the collection name, engine, and operation classification.
 pub(crate) struct PlanMeteringInfo {
-    collection: Option<String>,
+    /// Every collection this dispatch attributes to, first-seen order, no
+    /// duplicates. Empty for cluster/algo/meta plans with no user-facing
+    /// collection. A KV `TransferItem` (and its resolved write) writes two
+    /// collections in one plan; attributing only the first would leave the
+    /// second unbilled and outside its cap.
+    collections: Vec<String>,
     engine: EngineTag,
     operation: &'static str,
     /// The [`Permission`] this dispatch required, per
@@ -95,12 +100,10 @@ pub(crate) struct PlanMeteringInfo {
 }
 
 impl PlanMeteringInfo {
-    /// The collection this dispatch attributes to, if any.
-    ///
-    /// `None` for cluster/algo/meta plans with no user-facing collection —
-    /// there is nothing to bill or cap such a plan against.
-    pub(crate) fn collection(&self) -> Option<&str> {
-        self.collection.as_deref()
+    /// Every collection this dispatch attributes to. Empty for
+    /// cluster/algo/meta plans with no user-facing collection.
+    pub(crate) fn collections(&self) -> &[String] {
+        &self.collections
     }
 
     /// The [`Permission`] this dispatch required.
@@ -115,7 +118,7 @@ impl PlanMeteringInfo {
     /// disabled by default).
     pub(crate) fn extract(plan: &PhysicalPlan) -> Self {
         Self {
-            collection: extract_collection(plan).map(str::to_string),
+            collections: metered_collections(plan),
             engine: plan_engine(plan),
             operation: operation_for_plan(plan),
             permission: required_permission(plan),
@@ -132,7 +135,7 @@ impl PlanMeteringInfo {
         permission: Permission,
     ) -> Self {
         Self {
-            collection: Some(collection),
+            collections: vec![collection],
             engine,
             operation,
             permission,
@@ -243,9 +246,9 @@ pub(crate) fn meter_dispatch(
     if scope.identity().is_internal_service() {
         return;
     }
-    let Some(collection) = info.collection.as_deref() else {
+    if info.collections.is_empty() {
         return;
-    };
+    }
     let engine = engine_tag_str(info.engine);
     let operation = info.operation;
     let operation_cost = state
@@ -258,18 +261,21 @@ pub(crate) fn meter_dispatch(
     let tokens = operation_cost.saturating_mul(rows.unwrap_or(1).max(1));
 
     let now_secs = crate::control::security::time::now_secs();
-    charge_quota_for_held_scopes(state, scope.auth(), info, collection, tokens, now_secs);
-    state.usage_counter.record(&UsageEvent {
-        auth_user_id: scope.auth().id.clone(),
-        org_id: scope.auth().org_id.clone().unwrap_or_default(),
-        tenant_id: scope.tenant_id().as_u64(),
-        collection: collection.to_string(),
-        engine: engine.to_string(),
-        operation: operation.to_string(),
-        tokens,
-        // Filled in by `UsageCounter::drain`, not the caller.
-        timestamp_secs: 0,
-    });
+    // One charge per collection the plan writes into.
+    for collection in &info.collections {
+        charge_quota_for_held_scopes(state, scope.auth(), info, collection, tokens, now_secs);
+        state.usage_counter.record(&UsageEvent {
+            auth_user_id: scope.auth().id.clone(),
+            org_id: scope.auth().org_id.clone().unwrap_or_default(),
+            tenant_id: scope.tenant_id().as_u64(),
+            collection: collection.clone(),
+            engine: engine.to_string(),
+            operation: operation.to_string(),
+            tokens,
+            // Filled in by `UsageCounter::drain`, not the caller.
+            timestamp_secs: 0,
+        });
+    }
 }
 
 /// Meter an in-transaction `Staged` write's dispatch, called from inside the
@@ -376,7 +382,9 @@ impl DetachedMeterGuard {
         if !state.metering_config.enabled || scope.identity().is_internal_service() {
             return None;
         }
-        let collection = info.collection.clone()?;
+        // A streamed response is a read scan, which reads exactly one
+        // collection; the multi-collection shapes are all KV writes.
+        let collection = info.collections.first().cloned()?;
         let held = state
             .scope_grants
             .effective_scopes(&scope.auth().id, &scope.auth().org_ids);
@@ -1197,7 +1205,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let info = PlanMeteringInfo::extract(&plan);
-        assert_eq!(info.collection.as_deref(), Some("cpu"));
+        assert_eq!(info.collections, vec!["cpu".to_string()]);
         assert_eq!(engine_tag_str(info.engine), "timeseries");
     }
 }
