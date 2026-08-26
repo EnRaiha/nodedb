@@ -259,7 +259,9 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
         GraphOp::SetNodeLabels { node_id, .. } | GraphOp::RemoveNodeLabels { node_id, .. } => {
             PlanRouting::Vshards(vec![VShardId::from_key(node_id.as_bytes())])
         }
-        GraphOp::Hop { .. }
+        // Read-only: it decides the wrapped delete's policy and mutates nothing.
+        GraphOp::ResolveEdgeDelete(_)
+        | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
         | GraphOp::NeighborsMulti { .. }
         | GraphOp::Path { .. }
@@ -282,7 +284,9 @@ fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting
         TimeseriesOp::Ingest { collection, .. } => {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
-        TimeseriesOp::Scan { .. } => PlanRouting::NotAWrite,
+        // Read-only: it reports the lines the wrapped ingest would store and
+        // mutates nothing.
+        TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => PlanRouting::NotAWrite,
     }
 }
 

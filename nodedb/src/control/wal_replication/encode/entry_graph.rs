@@ -56,8 +56,10 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
         GraphOp::EdgePutBatch { edges } => graph::edge_put_batch(edges),
         GraphOp::EdgeDeleteBatch { edges } => graph::edge_delete_batch(edges),
 
-        // Not a write — traversals / pattern matching / algorithms / stats.
-        GraphOp::Hop { .. }
+        // Not a write — traversals / pattern matching / algorithms / stats,
+        // plus the read-only resolve pass.
+        GraphOp::ResolveEdgeDelete(_)
+        | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
         | GraphOp::NeighborsMulti { .. }
         | GraphOp::Path { .. }

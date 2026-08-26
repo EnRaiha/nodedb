@@ -80,6 +80,10 @@ impl CoreLoop {
                 returning: returning.as_ref(),
                 rls_filters,
             }),
+
+            TimeseriesOp::ResolveIngest(inner) => {
+                self.execute_timeseries_resolve_ingest(task, inner)
+            }
         }
     }
 }

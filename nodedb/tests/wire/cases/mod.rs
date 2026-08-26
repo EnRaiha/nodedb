@@ -49,6 +49,7 @@ mod enforcement_balanced;
 mod engine_surface_array;
 mod engine_surface_columnar;
 mod engine_surface_crdt_document;
+mod graph_timeseries_rls_probe;
 mod kv_predicate_dml;
 mod kv_write_row_level_security;
 mod quota_bitemporal_composition;

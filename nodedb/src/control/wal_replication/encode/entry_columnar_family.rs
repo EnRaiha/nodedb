@@ -191,8 +191,8 @@ pub(super) fn timeseries_write(op: &TimeseriesOp) -> Option<ReplicatedWrite> {
             rls_filters,
         ),
 
-        // Not a write — reads / scans.
-        TimeseriesOp::Scan { .. } => return None,
+        // Not a write — reads / scans, and the read-only resolve pass.
+        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => return None,
     })
 }
 

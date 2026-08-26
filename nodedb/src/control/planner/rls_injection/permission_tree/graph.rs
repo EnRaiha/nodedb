@@ -117,6 +117,8 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
         // Filter (delete level, blanket): removing an edge removes stored
         // topology of the collection.
         GraphOp::EdgeDelete { collection, .. } => ctx.authorize(collection, PermTreeLevel::Delete),
+        // Recurse: the resolve pass stands in for the delete it wraps.
+        GraphOp::ResolveEdgeDelete(inner) => apply_graph(ctx, inner),
         GraphOp::EdgeDeleteBatch { edges } => {
             for edge in edges {
                 ctx.authorize(&edge.collection, PermTreeLevel::Delete)?;

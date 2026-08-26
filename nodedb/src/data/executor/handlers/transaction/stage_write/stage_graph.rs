@@ -116,7 +116,8 @@ impl CoreLoop {
                 self.stage_count_response(task, labels.len())
             }
 
-            GraphOp::Hop { .. }
+            GraphOp::ResolveEdgeDelete(_)
+            | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
             | GraphOp::NeighborsMulti { .. }
             | GraphOp::Path { .. }

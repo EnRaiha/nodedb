@@ -316,7 +316,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     collection: None, ..
                 }
                 | SetNodeLabels { .. }
-                | RemoveNodeLabels { .. } => {}
+                | RemoveNodeLabels { .. }
+                // The wrapped delete is structural too — node IDs, no collection.
+                | ResolveEdgeDelete(_) => {}
             }
         }
 
@@ -340,6 +342,13 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             use TimeseriesOp::*;
             match op {
                 Scan { collection, .. } | Ingest { collection, .. } => out.push(collection.clone()),
+
+                // The wrapped ingest is the intercepted write verbatim.
+                ResolveIngest(inner) => {
+                    if let Ingest { collection, .. } = inner.as_ref() {
+                        out.push(collection.clone());
+                    }
+                }
             }
         }
 

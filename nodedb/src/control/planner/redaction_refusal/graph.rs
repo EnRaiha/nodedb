@@ -49,6 +49,7 @@ pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Resu
         | GraphOp::EdgePutBatch { .. }
         | GraphOp::EdgeDelete { .. }
         | GraphOp::EdgeDeleteBatch { .. }
+        | GraphOp::ResolveEdgeDelete(_)
         | GraphOp::RagFusion { .. }
         | GraphOp::Algo { .. }
         | GraphOp::TemporalAlgorithm { .. }

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use nodedb_types::{RlsWriteCheck, Value, WriteGateDecision};
 
-use super::{ingest_formats, msgpack_decode};
+use super::{msgpack_decode, normalize};
 use crate::data::executor::handlers::rls_write_gate::admit_value_row;
 use crate::engine::timeseries::ilp::{self, FieldValue, IlpLine};
 
@@ -82,7 +82,7 @@ pub(in crate::data::executor) fn admit_msgpack_rows(
         ),
     };
     let rows = msgpack_decode::decode_msgpack_rows(payload).map_err(|_| undecodable())?;
-    let batch = ingest_formats::msgpack_rows_to_ilp(&rows, measurement, time_key);
+    let batch = normalize::msgpack_rows_to_ilp(&rows, measurement, time_key);
     let parsed = ilp::parse_batch(&batch).map_err(|_| undecodable())?;
     admit_ilp_lines(
         rls_write_check,

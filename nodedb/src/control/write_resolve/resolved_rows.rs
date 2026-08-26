@@ -40,4 +40,17 @@ pub enum ResolvedRows {
         mutations: Vec<DocumentResolvedMutation>,
         response_payload: Vec<u8>,
     },
+    /// Timeseries: the canonical line-protocol lines the governed ingest
+    /// resolved to, every timestamp stamped.
+    ///
+    /// An ingest is not row-set shaped either: its rows exist only after the
+    /// payload is rewritten into line protocol, and that rewrite is what the
+    /// policy was decided against. The lines travel back so the proposed write
+    /// carries the exact images the decision covered.
+    Timeseries { lines: Vec<String> },
+    /// Graph: the governed edge delete's pre-image satisfied the policy.
+    ///
+    /// A delete names its edge in full on the plan, so nothing has to travel
+    /// back — the verdict is the whole resolution.
+    GraphEdgeDeleteAdmitted,
 }

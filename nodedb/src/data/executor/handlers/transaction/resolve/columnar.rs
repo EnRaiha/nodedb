@@ -196,7 +196,8 @@ pub(super) fn serialize_timeseries_op(
             Ok(())
         }
 
-        // Read family: no persisted post-image.
-        TimeseriesOp::Scan { .. } => Ok(()),
+        // Read family: no persisted post-image. The resolve pass is read-only
+        // too — the ingest it reports is proposed as its own plan.
+        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => Ok(()),
     }
 }

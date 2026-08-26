@@ -2,10 +2,9 @@
 
 //! MessagePack + JSON ingest formats for timeseries.
 
-use sonic_rs::{JsonContainerTrait, JsonValueTrait};
-
 use super::ingest_dispatch::TimeseriesIngestParams;
-use super::msgpack_decode::{self, MsgpackValue};
+use super::msgpack_decode;
+use super::normalize;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 
@@ -36,101 +35,6 @@ fn decode_canonical_ilp_lines(payload: &[u8]) -> Result<Vec<String>, ErrorCode> 
         });
     }
     Ok(lines)
-}
-
-/// Is `column` the time column of the row being ingested?
-///
-/// A collection created through DDL designates its time column explicitly, so
-/// the match is against that declared name and nothing else — a column called
-/// `timestamp` in a collection whose `TIME_KEY` is `captured_at` is an
-/// ordinary column and must keep its value.
-///
-/// `declared` is `None` only for a measurement with no DDL behind it (raw ILP
-/// protocol ingest). There the conventional names are the only signal
-/// available, so they remain the fallback.
-fn is_time_column(column: &str, declared: Option<&str>) -> bool {
-    match declared {
-        Some(time_key) => column.eq_ignore_ascii_case(time_key),
-        None => {
-            let lower = column.to_lowercase();
-            lower == "ts" || lower == "timestamp" || lower == "time"
-        }
-    }
-}
-
-/// Normalize decoded MessagePack rows into line protocol.
-///
-/// This is where a structured ingest's values become the values that are
-/// STORED: the declared time column moves into the line's timestamp (and thence
-/// into the schema's millisecond time column), and a numeric-looking string
-/// becomes a number. Anything that needs to reason about the row a MessagePack
-/// ingest will actually persist — the row-level-security gate in particular —
-/// has to go through here rather than reading the submitted values, or it is
-/// reasoning about an image the collection never holds.
-pub(super) fn msgpack_rows_to_ilp(
-    rows: &[Vec<(String, MsgpackValue)>],
-    measurement: &str,
-    time_key: Option<&str>,
-) -> String {
-    let mut ilp_buf = String::new();
-    for row in rows {
-        let mut fields = Vec::new();
-        let mut timestamp_ns: Option<i64> = None;
-
-        for (key, val) in row {
-            if is_time_column(key, time_key) {
-                match val {
-                    MsgpackValue::Str(s) => {
-                        timestamp_ns = parse_ts_string_to_nanos(s);
-                    }
-                    MsgpackValue::Int(n) => {
-                        timestamp_ns = Some(*n * 1_000_000);
-                    }
-                    MsgpackValue::Float(f) => {
-                        timestamp_ns = Some(*f as i64 * 1_000_000);
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            match val {
-                MsgpackValue::Float(f) => fields.push(format!("{key}={f}")),
-                MsgpackValue::Int(n) => fields.push(format!("{key}={n}i")),
-                MsgpackValue::Str(s) => {
-                    // SQL parser routes numeric literals with `.`/`e`/`E` through
-                    // `SqlValue::Decimal`, which the standard msgpack writer encodes
-                    // as a string. Recover the numeric type here so timeseries
-                    // schema inference picks `Float64` / `Int64` instead of `Symbol`.
-                    if let Ok(i) = s.parse::<i64>() {
-                        fields.push(format!("{key}={i}i"));
-                    } else if let Ok(f) = s.parse::<f64>()
-                        && f.is_finite()
-                    {
-                        fields.push(format!("{key}={f}"));
-                    } else {
-                        fields.push(format!("{key}=\"{}\"", s.replace('\"', "\\\"")));
-                    }
-                }
-                MsgpackValue::Bool(b) => fields.push(format!("{key}={b}")),
-                _ => {}
-            }
-        }
-
-        if fields.is_empty() {
-            continue;
-        }
-
-        ilp_buf.push_str(measurement);
-        ilp_buf.push(' ');
-        ilp_buf.push_str(&fields.join(","));
-        if let Some(ts) = timestamp_ns {
-            ilp_buf.push(' ');
-            ilp_buf.push_str(&ts.to_string());
-        }
-        ilp_buf.push('\n');
-    }
-    ilp_buf
 }
 
 impl CoreLoop {
@@ -227,7 +131,7 @@ impl CoreLoop {
             .declared_ts_time_key(task.request.database_id, tid, collection)
             .map(str::to_string);
 
-        let ilp_buf = msgpack_rows_to_ilp(&rows, measurement, time_key.as_deref());
+        let ilp_buf = normalize::msgpack_rows_to_ilp(&rows, measurement, time_key.as_deref());
 
         if ilp_buf.is_empty() {
             return self.response_error(
@@ -326,52 +230,7 @@ impl CoreLoop {
             .declared_ts_time_key(task.request.database_id, tid, collection)
             .map(str::to_string);
 
-        let mut ilp_buf = String::new();
-        for row_val in rows.iter() {
-            let obj = match row_val.as_object() {
-                Some(o) => o,
-                None => continue,
-            };
-
-            let mut fields = Vec::new();
-            let mut timestamp_ns: Option<i64> = None;
-
-            for (key, val) in obj.iter() {
-                if is_time_column(key, time_key.as_deref()) {
-                    if let Some(s) = val.as_str() {
-                        timestamp_ns = parse_ts_string_to_nanos(s);
-                    } else if let Some(n) = val.as_i64() {
-                        timestamp_ns = Some(n * 1_000_000);
-                    } else if let Some(f) = val.as_f64() {
-                        timestamp_ns = Some(f as i64 * 1_000_000);
-                    }
-                    continue;
-                }
-
-                if let Some(f) = val.as_f64() {
-                    fields.push(format!("{key}={f}"));
-                } else if let Some(n) = val.as_i64() {
-                    fields.push(format!("{key}={n}i"));
-                } else if let Some(s) = val.as_str() {
-                    fields.push(format!("{key}=\"{}\"", s.replace('\"', "\\\"")));
-                } else if let Some(b) = val.as_bool() {
-                    fields.push(format!("{key}={b}"));
-                }
-            }
-
-            if fields.is_empty() {
-                continue;
-            }
-
-            ilp_buf.push_str(measurement);
-            ilp_buf.push(' ');
-            ilp_buf.push_str(&fields.join(","));
-            if let Some(ts) = timestamp_ns {
-                ilp_buf.push(' ');
-                ilp_buf.push_str(&ts.to_string());
-            }
-            ilp_buf.push('\n');
-        }
+        let ilp_buf = normalize::json_rows_to_ilp(&rows, measurement, time_key.as_deref());
 
         if ilp_buf.is_empty() {
             return self.response_error(
@@ -399,33 +258,6 @@ impl CoreLoop {
             rls_filters,
         })
     }
-}
-
-/// Parse a datetime string to nanoseconds since Unix epoch.
-///
-/// Accepts RFC3339 / ISO8601 with timezone (e.g., "2024-01-01T00:00:00Z"),
-/// and common datetime formats without timezone (treated as UTC).
-/// Returns nanoseconds since Unix epoch, or `None` if the string cannot be parsed.
-fn parse_ts_string_to_nanos(s: &str) -> Option<i64> {
-    use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return dt.timestamp_nanos_opt();
-    }
-
-    let formats = [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-    ];
-    for fmt in &formats {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Utc.from_utc_datetime(&ndt).timestamp_nanos_opt();
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]

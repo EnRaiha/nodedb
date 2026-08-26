@@ -124,4 +124,18 @@ pub enum TimeseriesOp {
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
+
+    /// Read-only resolve pass for a governed [`TimeseriesOp::Ingest`].
+    ///
+    /// A follower has no writing identity, so an ingest carrying a live
+    /// `RlsWriteCheck::Predicate` cannot be replicated. This wraps that exact
+    /// ingest, normalizes its payload into the canonical line protocol the
+    /// handler would have stored — every timestamp stamped, so no replica
+    /// consults a clock — decides the policy against those lines, and reports
+    /// them back. It writes nothing.
+    ///
+    /// Normalization has to happen here: the time column of a measurement with
+    /// no DDL behind it comes from the resident memtable's schema, which is
+    /// Data-Plane state the Control Plane cannot read.
+    ResolveIngest(Box<TimeseriesOp>),
 }

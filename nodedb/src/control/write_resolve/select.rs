@@ -6,8 +6,10 @@ use crate::bridge::envelope::PhysicalPlan;
 
 use super::columnar::resolver_for_columnar_op;
 use super::document::resolver_for_document_op;
+use super::graph::resolver_for_graph_op;
 use super::kv::resolver_for_kv_op;
 use super::resolver::EngineWriteResolver;
+use super::timeseries::resolver_for_timeseries_op;
 
 /// The resolver for `plan`, or `None` when it carries no live predicate to
 /// resolve before proposing.
@@ -20,10 +22,10 @@ pub fn resolver_for_plan(plan: &PhysicalPlan) -> Option<Box<dyn EngineWriteResol
         PhysicalPlan::Columnar(op) => resolver_for_columnar_op(op),
         PhysicalPlan::Kv(op) => resolver_for_kv_op(op),
         PhysicalPlan::Document(op) => resolver_for_document_op(op),
+        PhysicalPlan::Timeseries(op) => resolver_for_timeseries_op(op),
+        PhysicalPlan::Graph(op) => resolver_for_graph_op(op),
         PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
         | PhysicalPlan::Text(_)
-        | PhysicalPlan::Timeseries(_)
         | PhysicalPlan::Spatial(_)
         | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Query(_)

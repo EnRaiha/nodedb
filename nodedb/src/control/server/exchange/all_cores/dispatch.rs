@@ -116,6 +116,7 @@ pub(crate) async fn execute_plan_all_local_cores(
             | GraphOp::EdgePutBatch { .. }
             | GraphOp::EdgeDelete { .. }
             | GraphOp::EdgeDeleteBatch { .. }
+            | GraphOp::ResolveEdgeDelete(_)
             | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
             | GraphOp::NeighborsMulti { .. }

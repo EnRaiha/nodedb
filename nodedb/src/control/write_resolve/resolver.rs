@@ -18,6 +18,7 @@
 //! 3. **Propose** it through the same Raft proposer an ordinary replicated
 //!    write uses, retrying on drift.
 
+use crate::types::VShardId;
 use async_trait::async_trait;
 use nodedb_types::{DatabaseId, TenantId};
 
@@ -40,8 +41,18 @@ pub struct WriteResolveContext {
 /// every method below is total without re-matching the plan.
 #[async_trait]
 pub trait EngineWriteResolver: Send + Sync {
-    /// Control Plane. Collection the write targets — also its vshard key.
+    /// Control Plane. Collection the write targets.
     fn collection(&self) -> &str;
+
+    /// Control Plane. Home vShard the resolved write is proposed to.
+    ///
+    /// Collection-homed for every engine that keys its rows by collection. A
+    /// graph edge is key-homed on its source endpoint instead, so the graph
+    /// resolver overrides this — routing that write by collection would
+    /// propose it to a shard that never held the edge.
+    fn vshard(&self, database_id: DatabaseId) -> VShardId {
+        VShardId::from_collection_in_database(database_id, self.collection())
+    }
 
     /// Control Plane. Pure, no I/O: the read-only op that resolves this write.
     fn build_resolve_op(&self) -> PhysicalPlan;

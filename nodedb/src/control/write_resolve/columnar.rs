@@ -140,7 +140,10 @@ impl EngineWriteResolver for ColumnarWriteResolver {
                 pks,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             },
-            ResolvedRows::Kv { .. } | ResolvedRows::Document { .. } => {
+            ResolvedRows::Kv { .. }
+            | ResolvedRows::Document { .. }
+            | ResolvedRows::Timeseries { .. }
+            | ResolvedRows::GraphEdgeDeleteAdmitted => {
                 return Err(crate::Error::Internal {
                     detail: format!(
                         "columnar write resolver for '{}' was handed another engine's \

@@ -316,6 +316,16 @@ impl PhysicalPlan {
             | PhysicalPlan::Document(DocumentOp::DropIndex { collection, .. }) => {
                 Some(collection.as_str())
             }
+            // Read-only resolve wrapper: it reports the wrapped ingest's
+            // collection, which is what the propose step routes on.
+            PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
+                TimeseriesOp::Scan { collection, .. }
+                | TimeseriesOp::Ingest { collection, .. } => Some(collection.as_str()),
+                TimeseriesOp::ResolveIngest(_) => None,
+            },
+            // Same shape on the graph side, and `EdgeDelete` itself reports
+            // `None` here: an edge plan is key-homed on its endpoints.
+            PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(_)) => None,
             PhysicalPlan::Graph(GraphOp::EdgePut { .. })
             | PhysicalPlan::Graph(GraphOp::EdgeDelete { .. })
             | PhysicalPlan::Graph(GraphOp::Hop { .. })

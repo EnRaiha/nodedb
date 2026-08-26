@@ -87,6 +87,7 @@ pub(super) async fn gather_graph_op_all_cores(
                     | GraphOp::EdgePutBatch { .. }
                     | GraphOp::EdgeDelete { .. }
                     | GraphOp::EdgeDeleteBatch { .. }
+                    | GraphOp::ResolveEdgeDelete(_)
                     | GraphOp::Hop { .. }
                     | GraphOp::Neighbors { .. }
                     | GraphOp::NeighborsMulti { .. }

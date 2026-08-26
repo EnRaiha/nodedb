@@ -50,7 +50,10 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         ) => Permission::Read,
 
         PhysicalPlan::Graph(
-            GraphOp::Hop { .. }
+            // Read-only: it decides what a governed delete would do and
+            // mutates nothing. The wrapped delete is authorized on its own.
+            GraphOp::ResolveEdgeDelete(_)
+            | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
             | GraphOp::NeighborsMulti { .. }
             | GraphOp::Path { .. }
@@ -116,7 +119,11 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. }) => Permission::Read,
+        // Read-only: it reports the lines a governed ingest would store and
+        // mutates nothing. The wrapped ingest is authorized on its own.
+        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
+            Permission::Read
+        }
 
         // Write operations.
         PhysicalPlan::Crdt(

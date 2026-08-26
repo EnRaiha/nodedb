@@ -53,7 +53,8 @@ pub async fn run_write_resolve(
         let resolved = resolver.resolve(state, ctx, resolve_op).await?;
         let resolved_plan = resolver.apply(resolved)?;
 
-        match propose_resolved(state, ctx, resolver.collection(), resolved_plan).await? {
+        let vshard_id = resolver.vshard(ctx.database_id);
+        match propose_resolved(state, ctx, resolver.collection(), vshard_id, resolved_plan).await? {
             ProposeOutcome::Applied(response) => return Ok(response),
             ProposeOutcome::RetryRequired => {
                 attempt += 1;

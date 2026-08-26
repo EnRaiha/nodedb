@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Read-only resolve pass for a governed `GraphOp::EdgeDelete`.
+//!
+//! A follower has no writing identity, so a delete carrying a live write
+//! predicate cannot be replicated. This reads the edge's stored property
+//! object — the image the policy governs — decides the policy against it, and
+//! writes nothing. Success means the Control Plane may propose the same delete
+//! with a decided check; a refusal is the same authorization error the direct
+//! delete returns, and the edge stays in place either way.
+
+use nodedb_physical::physical_plan::GraphOp;
+
+use crate::bridge::envelope::{ErrorCode, Response};
+use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::task::ExecutionTask;
+use crate::types::TenantId;
+
+impl CoreLoop {
+    /// Decide the wrapped delete's policy against the edge's stored image.
+    pub(in crate::data::executor) fn execute_edge_delete_resolve(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        inner: &GraphOp,
+    ) -> Response {
+        let GraphOp::EdgeDelete {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            rls_write_check,
+            ..
+        } = inner
+        else {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: "graph resolve pass wraps a plan that is not an edge delete".into(),
+                },
+            );
+        };
+
+        let stored = self
+            .edge_store
+            .get_edge(
+                task.request.database_id.as_u64(),
+                TenantId::new(tid),
+                collection,
+                src_id,
+                label,
+                dst_id,
+            )
+            .ok()
+            .flatten();
+
+        match crate::data::executor::handlers::rls_write_gate::admit_edge_properties(
+            rls_write_check,
+            stored.as_deref(),
+            tid,
+            collection,
+        ) {
+            Ok(()) => self.response_ok(task),
+            Err(error) => self.response_error(task, error),
+        }
+    }
+}

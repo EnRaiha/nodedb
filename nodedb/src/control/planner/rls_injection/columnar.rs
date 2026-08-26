@@ -139,6 +139,10 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
             ctx.set_write_check(collection, rls_write_check)?;
             ctx.set_post_filters(collection, rls_filters)
         }
+
+        // Recurse: the resolve pass carries the ingest it is about to decide,
+        // and that ingest's own slots are the ones the policy fills.
+        TimeseriesOp::ResolveIngest(inner) => inject_timeseries(ctx, inner),
     }
 }
 

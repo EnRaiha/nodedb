@@ -106,6 +106,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         }
         PhysicalPlan::Graph(GraphOp::EdgePut { .. })
         | PhysicalPlan::Graph(GraphOp::EdgeDelete { .. })
+        | PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(_))
         | PhysicalPlan::Graph(GraphOp::Hop { .. })
         | PhysicalPlan::Graph(GraphOp::Neighbors { .. })
         | PhysicalPlan::Graph(GraphOp::Path { .. })
@@ -131,6 +132,13 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
         // KV ops carry their own collection (sorted-index-only ops return None).
         PhysicalPlan::Kv(op) => op.collection(),
+        // Read-only resolve wrapper: it reports the wrapped ingest's collection.
+        PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
+            TimeseriesOp::Scan { collection, .. } | TimeseriesOp::Ingest { collection, .. } => {
+                Some(collection.as_str())
+            }
+            TimeseriesOp::ResolveIngest(_) => None,
+        },
         // All remaining ops carry no extractable user collection here: the
         // specific arms above take precedence; these inner wildcards catch the
         // unmatched ops of each engine plus the engines with no arms at all

@@ -86,6 +86,8 @@ impl CoreLoop {
                 },
             ),
 
+            GraphOp::ResolveEdgeDelete(inner) => self.execute_edge_delete_resolve(task, tid, inner),
+
             GraphOp::EdgeDeleteBatch { edges } => self.execute_edge_delete_batch(task, tid, edges),
 
             GraphOp::Hop {

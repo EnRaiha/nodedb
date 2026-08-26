@@ -67,6 +67,16 @@ pub enum GraphOp {
         rls_write_check: RlsWriteCheck,
     },
 
+    /// Read-only resolve pass for a governed [`GraphOp::EdgeDelete`].
+    ///
+    /// A follower has no writing identity, so a delete carrying a live
+    /// `RlsWriteCheck::Predicate` cannot be replicated. This wraps that exact
+    /// delete, reads the edge's stored property object, and decides the policy
+    /// against it. It writes nothing: a refusal comes back as the same
+    /// authorization error the direct delete returns, and success means the
+    /// wrapped delete may be proposed with a decided check.
+    ResolveEdgeDelete(Box<GraphOp>),
+
     /// Batched edge delete: used to revert a partial `EdgePutBatch` on
     /// failure so the DDL leaves no stranded edges.
     EdgeDeleteBatch { edges: Vec<BatchEdge> },

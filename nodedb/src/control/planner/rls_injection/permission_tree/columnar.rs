@@ -87,6 +87,10 @@ pub(super) fn apply_timeseries(ctx: &PermCtx<'_>, op: &mut TimeseriesOp) -> crat
         // Filter (write level, blanket): ingest carries an encoded batch of
         // samples rather than a predicate.
         TimeseriesOp::Ingest { collection, .. } => ctx.authorize(collection, PermTreeLevel::Write),
+
+        // Recurse: the resolve pass stands in for the ingest it wraps, so it
+        // needs the same write level on the same collection.
+        TimeseriesOp::ResolveIngest(inner) => apply_timeseries(ctx, inner),
     }
 }
 

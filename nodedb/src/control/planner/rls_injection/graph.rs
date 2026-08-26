@@ -141,6 +141,10 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
             ..
         } => ctx.set_write_check(collection, rls_write_check),
 
+        // Recurse: the resolve pass carries the delete it is about to decide,
+        // and that delete's own slot is the one the policy fills.
+        GraphOp::ResolveEdgeDelete(inner) => inject_graph(ctx, inner),
+
         // Refuse: the batch forms carry no property image at all — every edge
         // in a batch is applied with empty properties — so there is nothing for
         // the policy to be evaluated against. Each `BatchEdge` does name its

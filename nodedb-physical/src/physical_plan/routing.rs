@@ -113,6 +113,7 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Graph(GraphOp::EdgePutBatch { .. })
         | PhysicalPlan::Graph(GraphOp::EdgeDelete { .. })
         | PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { .. })
+        | PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(_))
         | PhysicalPlan::Graph(GraphOp::SetNodeLabels { .. })
         | PhysicalPlan::Graph(GraphOp::RemoveNodeLabels { .. })
         | PhysicalPlan::Vector(_)

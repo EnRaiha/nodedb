@@ -184,7 +184,9 @@ impl CoreLoop {
                 | GraphOp::WccSuperstep(_)
                 | GraphOp::TemporalNeighbors { .. }
                 | GraphOp::TemporalAlgorithm { .. }
-                | GraphOp::Stats { .. },
+                | GraphOp::Stats { .. }
+                // Autocommit-then-Raft, never staged in a transaction.
+                | GraphOp::ResolveEdgeDelete(_),
             ) => return self.stage_not_point_write(task),
             PhysicalPlan::Vector(_) => return self.stage_not_point_write(task),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
@@ -206,7 +208,9 @@ impl CoreLoop {
                     rls_write_check,
                 });
             }
-            PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. }) => {
+            PhysicalPlan::Timeseries(
+                TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_),
+            ) => {
                 return self.stage_not_point_write(task);
             }
             PhysicalPlan::Text(_)

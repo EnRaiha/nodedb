@@ -283,8 +283,9 @@ pub(super) fn classify_graph_op(
         }
 
         // Read-only families: traversal, pattern matching, algorithms, and
-        // stats carry no persisted post-image.
-        GraphOp::Hop { .. }
+        // stats carry no persisted post-image. Nor does the resolve pass.
+        GraphOp::ResolveEdgeDelete(_)
+        | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
         | GraphOp::NeighborsMulti { .. }
         | GraphOp::Path { .. }

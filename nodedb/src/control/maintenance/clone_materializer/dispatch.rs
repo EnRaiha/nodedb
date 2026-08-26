@@ -45,10 +45,27 @@ pub(crate) async fn dispatch_local(
     plan: PhysicalPlan,
     txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
+    let vshard_id = VShardId::from_collection_in_database(database_id, collection_qualified);
+    dispatch_local_on_vshard(state, tenant_id, database_id, vshard_id, plan, txn_id).await
+}
+
+/// [`dispatch_local`] for a plan whose home vShard is not derived from a
+/// collection name.
+///
+/// A graph edge plan is key-homed on its endpoints, so the vShard that holds
+/// the edge is `VShardId::from_key(src_id)` and not the collection's hash.
+/// Routing such a plan by collection reads a shard that never held it.
+pub(crate) async fn dispatch_local_on_vshard(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+    txn_id: Option<TxnId>,
+) -> crate::Result<Response> {
     let req_id = RequestId::new(state.request_id_counter.fetch_add(1, Ordering::Relaxed));
     let deadline_secs = state.tuning.network.default_deadline_secs;
     let deadline_dur = Duration::from_secs(deadline_secs);
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection_qualified);
     let req = Request {
         request_id: req_id,
         tenant_id,

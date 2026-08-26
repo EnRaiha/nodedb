@@ -344,6 +344,29 @@ pub async fn delete_edge(
         }]);
     }
 
+    // A governed delete cannot be proposed carrying its predicate: a follower
+    // has no writing identity to decide it. Resolve it against the edge's
+    // stored properties here, while the identity is live, and propose the
+    // decided delete. Only when a Raft proposer is actually live — on the
+    // single-node path the predicate reaches the Data Plane gate intact and is
+    // enforced correctly there, so resolving would only add cost.
+    if let Some(resolver) =
+        crate::control::write_resolve::resolver_for_plan(&PhysicalPlan::Graph(edge_delete.clone()))
+        && state.async_raft_proposer().is_some()
+    {
+        let ctx = crate::control::write_resolve::WriteResolveContext {
+            tenant_id,
+            database_id,
+        };
+        crate::control::write_resolve::run_write_resolve(state, ctx, &*resolver)
+            .await
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
+        return Ok(vec![DdlResult::Status {
+            command: "DELETE EDGE".to_string(),
+            rows_affected: None,
+        }]);
+    }
+
     if single_home {
         // F1a fast path (unchanged): both endpoints share one home vShard (or we
         // are single-node), so a single-home write to `vsrc` tombstones both the

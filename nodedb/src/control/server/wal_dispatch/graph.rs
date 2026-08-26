@@ -95,8 +95,10 @@ pub(super) fn wal_append_graph_op(
         GraphOp::EdgeDeleteBatch { edges } => {
             wal_append_graph_edge_delete_batch(wal, tenant_id, vshard_id, database_id, edges)?
         }
-        // NotAWrite — reads / query ops / DDL that produces no engine mutation here
-        GraphOp::Hop { .. }
+        // NotAWrite — reads / query ops / DDL that produces no engine mutation
+        // here, plus the read-only resolve pass.
+        GraphOp::ResolveEdgeDelete(_)
+        | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
         | GraphOp::NeighborsMulti { .. }
         | GraphOp::Path { .. }

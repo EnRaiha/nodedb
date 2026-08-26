@@ -164,15 +164,17 @@ impl EngineWriteResolver for DocumentWriteResolver {
                 response_payload,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             })),
-            ResolvedRows::Update(_) | ResolvedRows::Delete(_) | ResolvedRows::Kv { .. } => {
-                Err(crate::Error::Internal {
-                    detail: format!(
-                        "document write resolver for '{}' was handed another engine's \
+            ResolvedRows::Update(_)
+            | ResolvedRows::Delete(_)
+            | ResolvedRows::Kv { .. }
+            | ResolvedRows::Timeseries { .. }
+            | ResolvedRows::GraphEdgeDeleteAdmitted => Err(crate::Error::Internal {
+                detail: format!(
+                    "document write resolver for '{}' was handed another engine's \
                          resolution; resolver_for_plan dispatched the wrong engine",
-                        self.collection
-                    ),
-                })
-            }
+                    self.collection
+                ),
+            }),
         }
     }
 }

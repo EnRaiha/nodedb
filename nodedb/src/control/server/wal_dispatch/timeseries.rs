@@ -60,8 +60,9 @@ pub(super) fn wal_append_timeseries_op(
                 )?)
             }
         }
-        // NotAWrite — reads / query ops / DDL that produces no engine mutation here
-        TimeseriesOp::Scan { .. } => None,
+        // NotAWrite — reads / query ops / DDL that produces no engine mutation
+        // here, plus the read-only resolve pass.
+        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => None,
     };
     Ok(appended)
 }

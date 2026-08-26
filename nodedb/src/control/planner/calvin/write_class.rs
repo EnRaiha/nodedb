@@ -225,7 +225,10 @@ fn graph_is_write(op: &GraphOp) -> bool {
         | GraphOp::EdgeDeleteBatch { .. }
         | GraphOp::SetNodeLabels { .. }
         | GraphOp::RemoveNodeLabels { .. } => true,
-        GraphOp::Hop { .. }
+        // The resolve pass writes nothing; the delete it decides is proposed
+        // separately by the write-resolve orchestrator.
+        GraphOp::ResolveEdgeDelete(_)
+        | GraphOp::Hop { .. }
         | GraphOp::Neighbors { .. }
         | GraphOp::NeighborsMulti { .. }
         | GraphOp::Path { .. }
@@ -246,7 +249,9 @@ fn graph_is_write(op: &GraphOp) -> bool {
 fn timeseries_is_write(op: &TimeseriesOp) -> bool {
     match op {
         TimeseriesOp::Ingest { .. } => true,
-        TimeseriesOp::Scan { .. } => false,
+        // The resolve pass writes nothing; the ingest it reports is proposed
+        // separately by the write-resolve orchestrator.
+        TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => false,
     }
 }
 

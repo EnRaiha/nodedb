@@ -36,6 +36,7 @@ pub(super) async fn propose_resolved(
     state: &SharedState,
     ctx: WriteResolveContext,
     collection: &str,
+    vshard_id: VShardId,
     plan: PhysicalPlan,
 ) -> crate::Result<ProposeOutcome> {
     let proposer = state
@@ -46,7 +47,6 @@ pub(super) async fn propose_resolved(
                  proposer; this path is only reachable when async_raft_proposer().is_some()"
             ),
         })?;
-    let vshard_id = VShardId::from_collection_in_database(ctx.database_id, collection);
     // The resolved op stamps `DecidedEarlierInRequest`, so this never refuses.
     let replicable = ReplicableWrite::decide_for_replication(&plan)?;
     let entry = to_replicated_entry(ctx.tenant_id, ctx.database_id, vshard_id, &replicable)?

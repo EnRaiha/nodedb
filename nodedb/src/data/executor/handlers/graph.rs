@@ -26,6 +26,8 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
+#[path = "graph_edge_resolve.rs"]
+pub(in crate::data::executor) mod graph_edge_resolve;
 #[path = "graph_edge_write.rs"]
 pub(in crate::data::executor) mod graph_edge_write;
 #[path = "graph_traversal.rs"]

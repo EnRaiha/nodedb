@@ -198,7 +198,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
         // ---- Graph: reads, not encoded ----
         PhysicalPlan::Graph(
-            GraphOp::Hop { .. }
+            // The resolve pass is read-only, so `to_replicated_entry` reports
+            // `None` for it — a read here as well.
+            GraphOp::ResolveEdgeDelete(_)
+            | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
             | GraphOp::NeighborsMulti { .. }
             | GraphOp::Path { .. }
@@ -305,7 +308,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
         // ---- Timeseries ----
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => true,
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. }) => false,
+        // The resolve pass is read-only, so `to_replicated_entry` reports
+        // `None` for it — a read here as well.
+        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
+            false
+        }
 
         // ---- Text: encoded (buffered) ----
         PhysicalPlan::Text(TextOp::FtsIndexDoc { .. } | TextOp::FtsDeleteDoc { .. }) => true,
