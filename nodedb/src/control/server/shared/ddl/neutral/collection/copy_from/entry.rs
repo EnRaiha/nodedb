@@ -110,6 +110,12 @@ pub async fn copy_from_file(
         }
     };
 
+    // The count is baked into `command` (not `rows_affected`) because the
+    // native and HTTP encoders (`ddl_result_to_native`, `ddl_results_to_json`)
+    // read only `command` for a `Status` result and drop `rows_affected` —
+    // this is the only shape that surfaces the row count on every protocol.
+    // pgwire's `ddl_result_to_response` renders it bare via the `None` arm,
+    // which already produces the spec-correct `COPY <rows>` tag text.
     Ok(vec![DdlResult::Status {
         command: format!("COPY {row_count}"),
         rows_affected: None,

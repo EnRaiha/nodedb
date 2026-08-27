@@ -241,9 +241,11 @@ pub async fn upsert_document(
         return Some(Ok(returned_rows));
     }
 
+    // A single-document `{ ... }` upsert without RETURNING always applies
+    // exactly one row — carry a real count rather than a bare tag.
     Some(Ok(vec![DdlResult::Status {
         command: "UPSERT".to_string(),
-        rows_affected: None,
+        rows_affected: Some(1),
     }]))
 }
 

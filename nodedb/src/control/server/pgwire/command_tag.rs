@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Build a pgwire `CommandComplete` [`Tag`] that matches the Postgres wire
+//! protocol's documented tag shapes, so `psql` and other strict clients can
+//! parse it (`tokio_postgres` tolerates the malformed shapes this replaces,
+//! which is why regressions here go unnoticed by the driver-based test
+//! suite).
+//!
+//! Per the protocol's `CommandComplete` spec: `INSERT` alone carries an OID
+//! ahead of the row count (`INSERT <oid> <rows>`); `UPDATE` / `DELETE` /
+//! `SELECT` / `MERGE` / `MOVE` / `FETCH` / `COPY` carry `<cmd> <rows>`; a
+//! literal SQL `TRUNCATE` carries no count at all. Every other command name
+//! here is a NodeDB SQL-DSL extension with no Postgres equivalent (`UPSERT`,
+//! `RESTORE TENANT`, `CREATE COLLECTION`, ...) — those keep whatever shape
+//! their caller already used; the protocol has no rule to conform to.
+
+use pgwire::api::results::Tag;
+
+/// OID reported in the `INSERT <oid> <rows>` tag. Real Postgres has emitted
+/// `0` here since 8.x (the OID-based tag only mattered for `oid`-typed
+/// tables, long removed); NodeDB never had per-row OIDs, so `0` is the only
+/// value a client should ever see.
+const INSERT_TAG_OID: u32 = 0;
+
+/// Build the `CommandComplete` tag for `command`, given the number of rows
+/// it affected. `command` must already be the exact tag text (e.g.
+/// `"INSERT"`, `"UPDATE"`, or a NodeDB-specific name like `"UPSERT"`).
+pub(in crate::control::server::pgwire) fn dml_tag(command: &str, rows: usize) -> Tag {
+    match command {
+        "INSERT" => Tag::new(command).with_oid(INSERT_TAG_OID).with_rows(rows),
+        // Real SQL TRUNCATE: Postgres's tag (`TRUNCATE TABLE`) never carries
+        // a count — drop it here too rather than inventing one.
+        "TRUNCATE" => Tag::new(command),
+        _ => Tag::new(command).with_rows(rows),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_gets_oid_then_rows() {
+        let tag: pgwire::messages::response::CommandComplete = dml_tag("INSERT", 3).into();
+        assert_eq!(tag.tag, "INSERT 0 3");
+    }
+
+    #[test]
+    fn update_gets_rows_only() {
+        let tag: pgwire::messages::response::CommandComplete = dml_tag("UPDATE", 2).into();
+        assert_eq!(tag.tag, "UPDATE 2");
+    }
+
+    #[test]
+    fn truncate_drops_the_count() {
+        let tag: pgwire::messages::response::CommandComplete = dml_tag("TRUNCATE", 9).into();
+        assert_eq!(tag.tag, "TRUNCATE");
+    }
+
+    #[test]
+    fn nodedb_specific_command_keeps_its_count() {
+        let tag: pgwire::messages::response::CommandComplete = dml_tag("UPSERT", 1).into();
+        assert_eq!(tag.tag, "UPSERT 1");
+    }
+}

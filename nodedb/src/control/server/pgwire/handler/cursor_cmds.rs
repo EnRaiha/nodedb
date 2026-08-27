@@ -50,10 +50,11 @@ impl NodeDbPgHandler {
             let _ = encoder.encode_field(row_json);
             encoded_rows.push(Ok(encoder.take_row()));
         }
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            futures::stream::iter(encoded_rows),
-        ))])
+        let mut response = QueryResponse::new(schema, futures::stream::iter(encoded_rows));
+        // `QueryResponse::new` defaults to the `SELECT` command tag; a cursor
+        // FETCH gets the Postgres `FETCH <rows>` tag instead.
+        response.set_command_tag("FETCH");
+        Ok(vec![Response::Query(response)])
     }
 
     /// Handle MOVE [FORWARD | BACKWARD] n IN cursor_name.

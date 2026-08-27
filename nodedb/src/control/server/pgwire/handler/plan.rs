@@ -17,6 +17,7 @@ use crate::control::server::shared::sql::staging_predicates::{
     StagedTagKind, require_affected_count,
 };
 
+use super::super::command_tag::dml_tag;
 use super::super::types::text_field;
 
 pub(super) use crate::control::server::response_shape::types::{PlanKind, describe_plan};
@@ -91,22 +92,22 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
 /// resolved to an update or `INSERT 0 n` when it resolved to an insert.
 pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
     match kind {
-        StagedTagKind::Insert => Tag::new("INSERT").with_rows(affected),
-        StagedTagKind::Update => Tag::new("UPDATE").with_rows(affected),
-        StagedTagKind::Delete => Tag::new("DELETE").with_rows(affected),
-        StagedTagKind::KvUpsert { updated: true } => Tag::new("UPDATE").with_rows(affected),
-        StagedTagKind::KvUpsert { updated: false } => Tag::new("INSERT").with_rows(affected),
+        StagedTagKind::Insert => dml_tag("INSERT", affected),
+        StagedTagKind::Update => dml_tag("UPDATE", affected),
+        StagedTagKind::Delete => dml_tag("DELETE", affected),
+        StagedTagKind::KvUpsert { updated: true } => dml_tag("UPDATE", affected),
+        StagedTagKind::KvUpsert { updated: false } => dml_tag("INSERT", affected),
         // Matches the autocommit `DocumentOp::Upsert` tag exactly: always the
         // literal `UPSERT` command, regardless of insert-vs-update outcome
         // (see `response_shape::types::describe_plan`'s `DmlResult("UPSERT")`
         // arm and `payload_to_response`'s `PlanKind::DmlResult` rendering).
-        StagedTagKind::DocUpsert => Tag::new("UPSERT").with_rows(affected),
+        StagedTagKind::DocUpsert => dml_tag("UPSERT", affected),
         // Statement-time in-transaction MERGE: the Postgres command tag for a
         // MERGE is `MERGE <total-rows-affected>` across all arms.
-        StagedTagKind::Merge => Tag::new("MERGE").with_rows(affected),
+        StagedTagKind::Merge => dml_tag("MERGE", affected),
         // Statement-time in-transaction `UPDATE ... FROM`: an UPDATE reports the
         // Postgres `UPDATE <n>` command tag over the matched target rows.
-        StagedTagKind::UpdateFromJoin => Tag::new("UPDATE").with_rows(affected),
+        StagedTagKind::UpdateFromJoin => dml_tag("UPDATE", affected),
         // KV `Incr` / `IncrFloat` / `Cas` / `GetSet` never reach pgwire's
         // generic tag-rendering path today: their sole SQL surface (`SELECT
         // KV_INCR(..)` and friends, in `ddl/neutral/kv_atomic/`) reads
@@ -114,7 +115,7 @@ pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
         // `tag_from_staged`. This arm exists only so the match stays
         // exhaustive against a new `PhysicalPlan::Kv` caller; it renders the
         // same tag pgwire uses for a function-call `SELECT`.
-        StagedTagKind::RawPayload => Tag::new("SELECT").with_rows(affected),
+        StagedTagKind::RawPayload => dml_tag("SELECT", affected),
     }
 }
 
@@ -128,7 +129,7 @@ pub(super) fn calvin_tag_for_plan(plan: &PhysicalPlan) -> PgWireResult<Tag> {
 
     match plan {
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
-        | PhysicalPlan::Kv(KvOp::Put { .. }) => Ok(Tag::new("INSERT").with_rows(1)),
+        | PhysicalPlan::Kv(KvOp::Put { .. }) => Ok(dml_tag("INSERT", 1)),
 
         other => Err(invalid_plan_shape(format!(
             "calvin_tag_for_plan called on non-foldable plan: {other:?}"
@@ -167,7 +168,7 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> PgWireResul
             let count = require_affected_count(payload).map_err(|e| {
                 invalid_plan_shape(format!("{tag} response is missing its affected count: {e}"))
             })? as usize;
-            Ok(Response::Execution(Tag::new(tag).with_rows(count)).into())
+            Ok(Response::Execution(dml_tag(tag, count)).into())
         }
         PlanKind::ArraySlice | PlanKind::ReturningRows | PlanKind::SingleDocument => {
             Err(invalid_plan_shape(format!(

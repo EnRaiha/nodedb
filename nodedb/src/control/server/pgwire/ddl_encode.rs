@@ -21,6 +21,7 @@ use serde_json::Value as JsonValue;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 
+use super::command_tag::dml_tag;
 use super::numeric_narrow::checked_narrow_f32;
 use super::types::{
     bool_field, bytea_field, float4_array_field, float4_field, float8_array_field, float8_field,
@@ -55,7 +56,7 @@ fn ddl_result_to_response(ddl: DdlResult) -> PgWireResult<Response> {
             rows_affected,
         } => {
             let tag = match rows_affected {
-                Some(n) => Tag::new(&command).with_rows(n as usize),
+                Some(n) => dml_tag(&command, n as usize),
                 None => Tag::new(&command),
             };
             Ok(Response::Execution(tag))

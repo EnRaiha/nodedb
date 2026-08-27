@@ -310,9 +310,12 @@ pub async fn insert_document(
         return Some(Ok(returned_rows));
     }
 
+    // A single-document `{ ... }` insert without RETURNING always applies
+    // exactly one row — the Postgres `INSERT <oid> <rows>` tag needs a real
+    // count, not a bare `INSERT` (which real `psql` cannot parse).
     Some(Ok(vec![DdlResult::Status {
         command: "INSERT".to_string(),
-        rows_affected: None,
+        rows_affected: Some(1),
     }]))
 }
 

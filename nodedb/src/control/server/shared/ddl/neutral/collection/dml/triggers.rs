@@ -111,9 +111,12 @@ pub(super) async fn fire_instead_triggers(
     .await
     {
         Ok(crate::control::trigger::fire_instead::InsteadOfResult::Handled) => {
+            // The INSTEAD OF trigger replaced a single-document statement, so
+            // it always stands in for exactly one logical row — never a bare
+            // tag (real `psql` cannot parse a bare `INSERT`).
             Some(Ok(vec![DdlResult::Status {
                 command: tag.to_string(),
-                rows_affected: None,
+                rows_affected: Some(1),
             }]))
         }
         Ok(crate::control::trigger::fire_instead::InsteadOfResult::NoTrigger) => None,
