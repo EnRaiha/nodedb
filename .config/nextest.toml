@@ -114,9 +114,18 @@ threads-required = 'num-test-threads'
 # suite (different group), so this is NOT the old whole-suite eviction.
 # Settings are resolved per-key by first match, so this test-group wins over the
 # general server-process override below for this binary.
+#
+# They also claim every test slot. Grouping the rest of the suite into a few
+# large binaries raised peak parallelism enough to starve this one's server of
+# cores during boot: it fails the harness's 150s readiness wait under the full
+# suite while passing in 16.5s on its own, a 9x margin that rules out slowness.
+# `max-threads = 1` alone does not help, because the competition is the
+# unit-test fan-out rather than the other server tests. The cost is bounded —
+# two tests, one of which the default filter already excludes.
 [[profile.default.overrides]]
 filter = 'binary(crash_wal_truncation) | binary(crash_ilp_timeseries_write)'
 test-group = 'server-process-serial'
+threads-required = 'num-test-threads'
 slow-timeout = { period = "30s", terminate-after = 8 }
 
 # Tests that spawn REAL `nodedb` server OS processes (crash-recovery,
@@ -129,16 +138,18 @@ slow-timeout = { period = "30s", terminate-after = 8 }
 # that cap: the harness picks ephemeral (OS-assigned) ports and a private
 # tempdir per instance, so any two can run side by side without colliding.
 #
-# We deliberately do NOT set `threads-required = 'num-test-threads'` here
-# (unlike the cluster group). That flag would make a running server test EVICT
-# the entire rest of the suite (every other test idles every other core for the
-# full duration of each server test), a large serial tail in stage 1. These are
-# single-node, ephemeral-port servers: the cheap in-process unit tests run
-# alongside them without stealing ports, and single-node boot is fast enough
-# that readiness does not need every core free.
+# These DO claim every test slot, which this group historically avoided to keep
+# stage 1 from growing a serial tail. Grouping the suite into a few large
+# binaries raised peak parallelism past what a booting server tolerates:
+# `timeseries_write_survives_kill_9` fails the harness's 45s readiness wait
+# under the full suite and passes in 9.8s on its own. A 4.5x margin means the
+# server is starved of cores, not slow, so widening the readiness budget would
+# hide the cause rather than fix it. The tail this costs is bounded — roughly a
+# dozen crash/shutdown tests at about ten seconds each.
 [[profile.default.overrides]]
 filter = 'binary(wal_direct_io) | binary(ilp_client_address) | binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(crash_resp_kv_write) | binary(crash_metadata_applier_wedge) | binary(crash_dropped_collection_reclaim) | binary(crash_mid_replay) | test(/^cases::startup_failure::/) | test(/^cases::shutdown_in_flight::/) | test(/^cases::shutdown_budget::/) | test(/^cases::shutdown_abort_offender::/) | test(/^cases::shutdown_idempotent::/)'
 test-group = 'server-process'
+threads-required = 'num-test-threads'
 
 # Every test in the `wire` target spawns its own real `nodedb` server process.
 # At full fan-out the box runs one server per core, and each server carries a
