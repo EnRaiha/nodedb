@@ -12,9 +12,7 @@
 //! CREATE -> INSERT -> SELECT entirely over one native connection, for every
 //! non-array engine family, to guard against that regression.
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, send_sql};
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_sql};
 
 use nodedb_types::protocol::HelloFrame;
 use nodedb_types::protocol::opcodes::ResponseStatus;

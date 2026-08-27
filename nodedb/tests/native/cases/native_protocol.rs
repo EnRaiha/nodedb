@@ -9,9 +9,9 @@
 //! - JSON-vs-MsgPack auto-detect: first frame selects encoding for the session
 //! - Mid-session encoding switch: rejected with a decode error response
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, read_frame, write_frame};
+use nodedb_test_support::native_harness::{
+    NativeTestServer, do_handshake, read_frame, write_frame,
+};
 
 use std::time::Duration;
 

@@ -12,9 +12,7 @@
 //!
 //! Mirrors `pgwire_show_dispatch.rs` for the native protocol entry point.
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, send_sql};
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_sql};
 
 use nodedb_types::protocol::HelloFrame;
 use nodedb_types::protocol::opcodes::ResponseStatus;

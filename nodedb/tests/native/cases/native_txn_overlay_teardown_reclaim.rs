@@ -14,14 +14,12 @@
 //! transaction's first staged write materializes the overlay, and must
 //! fall back to baseline once the abandoned connection is torn down.
 
-mod common;
-
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use common::native_harness::{NativeTestServer, do_handshake, send_sql};
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_sql};
 #[cfg(feature = "failpoints")]
-use common::native_harness::{read_frame, write_frame};
+use nodedb_test_support::native_harness::{read_frame, write_frame};
 
 #[cfg(feature = "failpoints")]
 use nodedb::fail_point::{FailAction, FailGuard};

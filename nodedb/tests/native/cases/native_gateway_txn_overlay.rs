@@ -9,10 +9,8 @@
 //!    SPSC with `txn_id`), matching the direct-op path already covered by
 //!    `native_direct_op_txn_overlay.rs`.
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, send_request, send_sql};
-use common::pgwire_harness::TestServer;
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_request, send_sql};
+use nodedb_test_support::pgwire_harness::TestServer;
 
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;
@@ -111,7 +109,10 @@ async fn native_first_frame_begin_buffers_following_write() {
         "ROLLBACK must succeed: {rollback:?}"
     );
 
-    // After ROLLBACK the staged row must not be durable.
+    // ROLLBACK discards the whole block, the CREATE included, so the
+    // collection itself is gone. Had the first-frame BEGIN no-oped, the CREATE
+    // would have autocommitted and this SELECT would find an empty collection
+    // instead of no collection.
     let after = send_sql(
         &mut stream,
         6,
@@ -121,16 +122,13 @@ async fn native_first_frame_begin_buffers_following_write() {
     server.shutdown().await;
     assert_eq!(
         after.status,
-        ResponseStatus::Ok,
-        "post-rollback SELECT: {after:?}"
+        ResponseStatus::Error,
+        "post-rollback SELECT must not find the rolled-back collection: {after:?}"
     );
-    let after_rows = after.rows.unwrap_or_default();
-    assert!(
-        after_rows.is_empty()
-            || after_rows
-                .iter()
-                .all(|r| r.iter().all(|v| matches!(v, Value::Null))),
-        "ROLLBACK must discard the staged write, got: {after_rows:?}"
+    let code = after.error.map(|e| e.code).unwrap_or_default();
+    assert_eq!(
+        code, "42P01",
+        "post-rollback SELECT must report the collection as absent"
     );
 }
 

@@ -20,10 +20,8 @@
 //!   - Vector search must serialize the computed `distance`, not collapse it
 //!     to NULL.
 
-mod common;
-
-use common::native_harness::{do_handshake, send_sql};
-use common::pgwire_harness::TestServer;
+use nodedb_test_support::native_harness::{do_handshake, send_sql};
+use nodedb_test_support::pgwire_harness::TestServer;
 
 use nodedb_types::protocol::HelloFrame;
 use nodedb_types::protocol::opcodes::ResponseStatus;

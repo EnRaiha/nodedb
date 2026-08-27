@@ -9,9 +9,7 @@
 //! so it carries the same contract — a delete against an absent row reports 0,
 //! including a row deleted by an earlier statement.
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, send_sql};
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_sql};
 
 use nodedb_types::protocol::HelloFrame;
 use nodedb_types::protocol::opcodes::ResponseStatus;

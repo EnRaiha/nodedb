@@ -26,12 +26,10 @@
 //! planning — so they travel a different rendering path and were the last
 //! place a typed classification was still being flattened to NDB-9000.
 
-mod common;
-
-use common::native_harness::{
+use nodedb_test_support::native_harness::{
     NativeTestServer, do_handshake, send_api_key_auth, send_request, send_sql,
 };
-use common::pgwire_harness::TestServer;
+use nodedb_test_support::pgwire_harness::TestServer;
 
 use nodedb::control::security::apikey::CreateKeyParams;
 use nodedb::control::security::identity::Role;

@@ -16,9 +16,7 @@
 //! same-connection, same-transaction staged `INSERT` (read-your-own-writes),
 //! then asserts `ROLLBACK` removes it from view again.
 
-mod common;
-
-use common::native_harness::{NativeTestServer, do_handshake, send_request, send_sql};
+use nodedb_test_support::native_harness::{NativeTestServer, do_handshake, send_request, send_sql};
 
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;

@@ -5,15 +5,13 @@
 //! Native materialized and lazy SQL paths must apply the same collection-
 //! permission gates as pgwire before dispatch.
 
-mod common;
-
-use common::native_harness::{
-    NativeTestServer, do_handshake, send_api_key_auth, send_request, send_sql,
-};
 use nodedb::control::security::apikey::CreateKeyParams;
 use nodedb::control::security::identity::Role;
 use nodedb::control::state::SharedState;
 use nodedb::types::{DatabaseId, TenantId};
+use nodedb_test_support::native_harness::{
+    NativeTestServer, do_handshake, send_api_key_auth, send_request, send_sql,
+};
 use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{AuthMethod, HelloFrame, OpCode};

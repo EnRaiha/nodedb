@@ -12,12 +12,10 @@
 //! as production boot does, and (b) more than one Data Plane core, so that
 //! vShard 0 and the collection's owning vShard live on different cores.
 
-mod common;
-
 use std::time::Duration;
 
-use common::native_harness::{do_handshake, read_frame, write_frame};
-use common::pgwire_harness::TestServer;
+use nodedb_test_support::native_harness::{do_handshake, read_frame, write_frame};
+use nodedb_test_support::pgwire_harness::TestServer;
 
 use nodedb_types::id::VShardId;
 use nodedb_types::protocol::opcodes::ResponseStatus;
