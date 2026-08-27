@@ -69,6 +69,13 @@ pub fn try_buffer(entry: CatalogEntry) -> bool {
     })
 }
 
+/// Run `f` over the entries this connection's open transaction has buffered,
+/// in statement order. Returns `None` when no buffer is active — outside a
+/// transaction, and outside any connection scope, there is nothing to overlay.
+pub fn with_buffered<T>(f: impl FnOnce(&[BufferedDdl]) -> T) -> Option<T> {
+    with_slot(None, |b| b.borrow().as_ref().map(|buf| f(buf)))
+}
+
 /// Take the accumulated buffer contents and deactivate. Returns
 /// `None` if the buffer was never activated.
 pub fn take() -> Option<DdlBuffer> {

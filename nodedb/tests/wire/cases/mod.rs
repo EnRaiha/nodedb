@@ -242,6 +242,7 @@ mod strict_schema_restart;
 mod timeseries_declared_time_key;
 mod timeseries_write_row_level_security;
 mod transactional_ddl_atomicity;
+mod transactional_ddl_visibility;
 mod trigger_e2e;
 mod txn_ddl_commit_registry_sync;
 mod vector_index_bulk_delete_reindex;

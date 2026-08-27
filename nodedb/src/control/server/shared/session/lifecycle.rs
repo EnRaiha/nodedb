@@ -43,11 +43,12 @@ pub fn run_begin(
 
 /// Run the neutral ROLLBACK sequence.
 ///
-/// Discards the DDL buffer, rolls back GAP_FREE reservations (with sequence-log
-/// audit), clears the write buffer + read-set, closes non-hold cursors,
-/// discards buffered NOTIFY messages, and releases the staging overlay on its
-/// home vShard. Infallible — every cleanup step is best-effort, mirroring the
-/// original swallow-on-error behavior.
+/// Drains the DDL buffer and restores the Data Plane to the committed shape,
+/// rolls back GAP_FREE reservations (with sequence-log audit), clears the write
+/// buffer + read-set, closes non-hold cursors, discards buffered NOTIFY
+/// messages, and releases the staging overlay on its home vShard. Infallible —
+/// every cleanup step is best-effort, mirroring the original swallow-on-error
+/// behavior.
 pub async fn run_rollback(
     sessions: &SessionStore,
     session_id: SessionId,
@@ -55,7 +56,9 @@ pub async fn run_rollback(
     state: &SharedState,
     dp: &impl TxnDataPlane,
 ) {
-    ddl_buffer::discard();
+    // Taken, not discarded: the entries name every collection whose Data-Plane
+    // registration this transaction moved, and the restoration below needs them.
+    let discarded_ddl = ddl_buffer::take();
     // Snapshot the overlay identity BEFORE `rollback()` clears session state,
     // so the staging overlay can be released on EVERY vShard the transaction
     // staged writes to (a transaction may span multiple cores).
@@ -116,4 +119,9 @@ pub async fn run_rollback(
     sessions.close_non_hold_cursors(session_id);
     // Discard NOTIFY messages buffered during this transaction.
     sessions.discard_pending_notifies(session_id);
+    // Last, once the staging overlay is gone: put the Data Plane back to the
+    // committed shape, so the rolled-back DDL survives nowhere.
+    if let Some(discarded) = discarded_ddl {
+        super::ddl_rollback::restore_data_plane(state, &discarded).await;
+    }
 }

@@ -25,7 +25,10 @@ use super::result::DdlError;
 ///
 /// Callers gate their own single-node-only side effects (in-memory registry
 /// refresh) on `needs_local_apply`. A `Buffered` outcome belongs to an open
-/// transaction: nothing is applied and no side effect may run.
+/// transaction: nothing durable is applied. The Data-Plane registration a
+/// collection CREATE/ALTER dispatches next is deliberately NOT gated on the
+/// outcome — the transaction encodes its own writes against the shape it sees,
+/// and ROLLBACK puts the Data Plane back (`session::ddl_rollback`).
 pub fn propose_and_apply(
     state: &SharedState,
     entry: &CatalogEntry,

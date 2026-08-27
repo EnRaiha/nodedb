@@ -150,7 +150,8 @@ impl SystemCatalog {
         Ok(inserted)
     }
 
-    /// Load all collections for a tenant within a database.
+    /// Load all collections for a tenant within a database, with the calling
+    /// connection's buffered transactional DDL merged in.
     pub fn load_collections_for_tenant(
         &self,
         database_id: DatabaseId,
@@ -160,7 +161,12 @@ impl SystemCatalog {
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        load_collections_for_tenant_in(&read_txn, database_id, tenant_id)
+        let committed = load_collections_for_tenant_in(&read_txn, database_id, tenant_id)?;
+        Ok(crate::control::catalog_overlay::resolve_tenant_collections(
+            database_id,
+            tenant_id,
+            committed,
+        ))
     }
 
     /// Load every soft-deleted collection across all tenants within a database.
@@ -242,7 +248,30 @@ impl SystemCatalog {
     }
 
     /// Get a single collection by database_id + tenant_id + name.
+    ///
+    /// DDL the calling connection has buffered in an open transaction shadows
+    /// the committed row, so a transaction resolves names against its own
+    /// uncommitted `CREATE` / `ALTER` / `DROP`. Every other session, and every
+    /// caller outside a connection scope, reads committed state only.
     pub fn get_collection(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredCollection>> {
+        let committed = self.get_committed_collection(database_id, tenant_id, name)?;
+        Ok(crate::control::catalog_overlay::resolve_collection(
+            database_id,
+            tenant_id,
+            name,
+            committed,
+        ))
+    }
+
+    /// Committed-only read, bypassing the transaction DDL overlay. The
+    /// descriptor stamper reads through this: a version derived from an
+    /// uncommitted overlay row would stamp two entries at the same version.
+    pub fn get_committed_collection(
         &self,
         database_id: DatabaseId,
         tenant_id: u64,

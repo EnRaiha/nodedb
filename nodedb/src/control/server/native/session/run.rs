@@ -30,6 +30,11 @@ pub(crate) struct NativeTxnCleanup {
     session_id: crate::control::server::shared::session::SessionId,
     state: Arc<crate::control::state::SharedState>,
     identity: OnceLock<crate::control::security::identity::AuthenticatedIdentity>,
+    /// DDL this connection buffered in an open transaction, taken at teardown
+    /// start. Teardown is detached and runs outside the connection scope, so
+    /// the buffer has to be carried across rather than read there.
+    discarded_ddl:
+        std::sync::Mutex<Option<crate::control::server::shared::session::ddl_buffer::DdlBuffer>>,
     started: AtomicBool,
     completed: AtomicBool,
     completion: Notify,
@@ -46,6 +51,7 @@ impl NativeTxnCleanup {
             session_id,
             state,
             identity: OnceLock::new(),
+            discarded_ddl: std::sync::Mutex::new(None),
             started: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             completion: Notify::new(),
@@ -79,7 +85,7 @@ impl NativeTxnCleanup {
             self.publish_completion();
             return;
         };
-        crate::control::server::shared::session::ddl_buffer::discard();
+        self.take_discarded_ddl_into_slot();
         let cleanup = Arc::clone(self);
         handle.spawn(async move {
             let _ = crate::control::server::shared::isolate_connection_future(
@@ -112,27 +118,49 @@ impl NativeTxnCleanup {
         }
     }
 
+    /// Move this connection's DDL buffer into the cleanup slot. Runs inside the
+    /// connection scope, synchronously, before teardown detaches.
+    fn take_discarded_ddl_into_slot(&self) {
+        let taken = crate::control::server::shared::session::ddl_buffer::take();
+        let mut slot = self
+            .discarded_ddl
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = taken;
+    }
+
     async fn rollback(self: Arc<Self>) {
         use crate::control::server::native::dispatch::NativeTxnDp;
-        use crate::control::server::shared::session::{TransactionState, lifecycle};
+        use crate::control::server::shared::session::{TransactionState, ddl_rollback, lifecycle};
 
-        let Some(identity) = self.identity.get().cloned() else {
-            return;
+        let discarded = {
+            let mut slot = self
+                .discarded_ddl
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.take()
         };
-        if self.sessions.transaction_state(self.session_id) == TransactionState::Idle {
-            return;
+        if let Some(identity) = self.identity.get().cloned()
+            && self.sessions.transaction_state(self.session_id) != TransactionState::Idle
+        {
+            let dp = NativeTxnDp {
+                state: self.state.as_ref(),
+            };
+            lifecycle::run_rollback(
+                self.sessions.as_ref(),
+                self.session_id,
+                &identity,
+                self.state.as_ref(),
+                &dp,
+            )
+            .await;
         }
-        let dp = NativeTxnDp {
-            state: self.state.as_ref(),
-        };
-        lifecycle::run_rollback(
-            self.sessions.as_ref(),
-            self.session_id,
-            &identity,
-            self.state.as_ref(),
-            &dp,
-        )
-        .await;
+        // Runs on every teardown path, including the ones that have no session
+        // to roll back: a connection that dropped after a buffered CREATE still
+        // moved this node's Data Plane.
+        if let Some(discarded) = discarded {
+            ddl_rollback::restore_data_plane(self.state.as_ref(), &discarded).await;
+        }
     }
 }
 
@@ -163,7 +191,7 @@ impl NativeSession {
     /// panic unwinding, or task cancellation; normal completion waits for it.
     pub async fn run(self) -> crate::Result<()> {
         // The connection-scoped slots wrap the cleanup guard too, so its
-        // synchronous discard still targets this connection's DDL buffer.
+        // synchronous take still reaches this connection's DDL buffer.
         crate::control::server::shared::session::conn_scope::scoped(self.run_guarded()).await
     }
 

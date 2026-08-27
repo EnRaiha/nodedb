@@ -11,6 +11,7 @@ mod cursor;
 pub mod cursor_spill;
 pub mod ddl_buffer;
 mod ddl_flush;
+pub mod ddl_rollback;
 pub mod expander_stage;
 mod hot_key;
 mod leader_forward;

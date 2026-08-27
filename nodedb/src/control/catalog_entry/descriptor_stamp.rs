@@ -52,8 +52,11 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
     let mut hlc = clock.now();
     match entry {
         CatalogEntry::PutCollection(mut stored) => {
+            // Committed-only: a version must be derived from what the catalog
+            // actually holds, never from the transaction's own uncommitted DDL
+            // overlay, or the same descriptor stamps twice at one version.
             let prior = catalog
-                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
             if let Some(prior_hlc) = prior.as_ref().map(|c| c.modification_hlc)
@@ -84,8 +87,11 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutCollection(stored)
         }
         CatalogEntry::PutCollectionIfAbsent(mut stored) => {
+            // Committed-only: a version must be derived from what the catalog
+            // actually holds, never from the transaction's own uncommitted DDL
+            // overlay, or the same descriptor stamps twice at one version.
             let prior = catalog
-                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
             // Existing is a semantic no-op. Freeze the exact persisted record
