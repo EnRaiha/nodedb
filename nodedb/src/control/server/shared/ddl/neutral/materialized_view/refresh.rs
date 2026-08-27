@@ -8,7 +8,7 @@
 //!
 //!   1. Plan the stored `SELECT` through `nodedb-sql`.
 //!   2. Dispatch each produced `PhysicalTask` to the Data Plane and collect rows.
-//!   3. Clear the target (`DELETE FROM <view>`).
+//!   3. Clear the target (`TRUNCATE <view>`).
 //!   4. Write each collected row back with `INSERT INTO <view> (cols)
 //!      VALUES (...)` through the same SQL pipeline.
 //!
@@ -69,11 +69,15 @@ pub async fn refresh_materialized_view(
     // 2) Clear the target so rows no longer selected by the SELECT
     //    (narrowed WHERE, dropped JOIN match, deleted source row,
     //    regrouped aggregate) disappear from the view.
+    //
+    //    `TRUNCATE`, not `DELETE FROM`: the target's post-image is decided at
+    //    plan time (empty), so the write carries no predicate whose matching
+    //    set has to be resolved against stored state first.
     dispatch_sql(
         state,
         identity,
         database_id,
-        &format!("DELETE FROM {}", ::nodedb_types::quote_ident(&view.name)),
+        &format!("TRUNCATE {}", ::nodedb_types::quote_ident(&view.name)),
     )
     .await?;
 
