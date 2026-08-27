@@ -16,7 +16,7 @@ pub(super) fn try_parse(
 ) -> Option<Result<NodedbStatement, SqlError>> {
     (|| -> Result<Option<NodedbStatement>, SqlError> {
         if upper.starts_with("CREATE MATERIALIZED VIEW ") {
-            return Ok(Some(parse_create_mv(upper, trimmed)));
+            return parse_create_mv(upper, trimmed).map(Some);
         }
         if upper.starts_with("DROP MATERIALIZED VIEW ") {
             let if_exists = upper.contains("IF EXISTS");
@@ -59,8 +59,10 @@ pub(super) fn try_parse(
 /// Structural extraction for `CREATE MATERIALIZED VIEW`.
 ///
 /// Extracts name, source, query_sql, and refresh_mode string.
-/// The handler converts refresh_mode to the internal enum.
-fn parse_create_mv(upper: &str, trimmed: &str) -> NodedbStatement {
+/// The handler converts refresh_mode to the internal enum. A periodic view
+/// requires both `ON <source>` and `AS <select>`; a missing clause is a syntax
+/// error here rather than a catalog lookup on an empty name downstream.
+fn parse_create_mv(upper: &str, trimmed: &str) -> Result<NodedbStatement, SqlError> {
     const KW_MV: &str = "MATERIALIZED VIEW ";
     const KW_ON: &str = " ON ";
     const KW_AS: &str = " AS ";
@@ -101,12 +103,41 @@ fn parse_create_mv(upper: &str, trimmed: &str) -> NodedbStatement {
 
     let refresh_mode = extract_refresh_mode(upper, trimmed);
 
-    NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
-        name,
-        source,
-        query_sql,
-        refresh_mode,
-    })
+    if name.is_empty() {
+        return Err(SqlError::Parse {
+            detail: "CREATE MATERIALIZED VIEW is missing the view name; write \
+                     CREATE MATERIALIZED VIEW <name> ON <source_collection> AS <select>"
+                .to_owned(),
+        });
+    }
+    // A STREAMING view sources from a change stream named in its own FROM
+    // clause, so it takes no `ON` collection.
+    let streaming = refresh_mode.eq_ignore_ascii_case("STREAMING");
+    if !streaming && source.is_empty() {
+        return Err(SqlError::Parse {
+            detail: format!(
+                "CREATE MATERIALIZED VIEW {name} is missing the required ON <source_collection> \
+                 clause; write CREATE MATERIALIZED VIEW {name} ON <source_collection> AS <select>"
+            ),
+        });
+    }
+    if query_sql.is_empty() {
+        return Err(SqlError::Parse {
+            detail: format!(
+                "CREATE MATERIALIZED VIEW {name} is missing the required AS <select> clause; \
+                 write CREATE MATERIALIZED VIEW {name} ON <source_collection> AS <select>"
+            ),
+        });
+    }
+
+    Ok(NodedbStatement::StreamView(
+        StreamViewStmt::CreateMaterializedView {
+            name,
+            source,
+            query_sql,
+            refresh_mode,
+        },
+    ))
 }
 
 /// Find trailing `WITH (` options clause (not a CTE WITH).
@@ -252,7 +283,7 @@ mod tests {
             source,
             query_sql,
             ..
-        }) = parse_create_mv(&upper, sql)
+        }) = parse_create_mv(&upper, sql).expect("valid CREATE MATERIALIZED VIEW")
         {
             assert_eq!(name, "summaryﬀﬀ");
             assert_eq!(source, "orders");
@@ -271,7 +302,7 @@ mod tests {
             source,
             query_sql,
             refresh_mode,
-        }) = parse_create_mv(&upper, sql)
+        }) = parse_create_mv(&upper, sql).expect("valid CREATE MATERIALIZED VIEW")
         {
             assert_eq!(name, "summary");
             assert_eq!(source, "orders");
@@ -322,5 +353,36 @@ mod tests {
         } else {
             panic!("expected CreateContinuousAggregate");
         }
+    }
+
+    #[test]
+    fn parse_mv_without_on_clause_is_a_syntax_error() {
+        let sql = "CREATE MATERIALIZED VIEW summary AS SELECT count(*) FROM orders";
+        let upper = sql.to_uppercase();
+        let err = parse_create_mv(&upper, sql).expect_err("ON is required for a periodic view");
+        let SqlError::Parse { detail } = err else {
+            panic!("expected a parse error");
+        };
+        assert!(detail.contains("ON <source_collection>"), "{detail}");
+        assert!(detail.contains("summary"), "{detail}");
+    }
+
+    #[test]
+    fn parse_streaming_mv_needs_no_on_clause() {
+        let sql = "CREATE MATERIALIZED VIEW live AS SELECT count(*) FROM orders WITH (refresh='STREAMING')";
+        let upper = sql.to_uppercase();
+        let stmt = parse_create_mv(&upper, sql).expect("streaming view takes no ON clause");
+        let NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
+            name,
+            source,
+            refresh_mode,
+            ..
+        }) = stmt
+        else {
+            panic!("expected CreateMaterializedView");
+        };
+        assert_eq!(name, "live");
+        assert!(source.is_empty());
+        assert_eq!(refresh_mode, "STREAMING");
     }
 }
