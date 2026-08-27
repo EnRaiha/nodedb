@@ -99,6 +99,12 @@ impl ErrorCode {
     /// Tenant is already at the target database; `MOVE TENANT` was a no-op.
     pub const MOVE_TENANT_ALREADY_AT_TARGET: Self = Self(1604);
 
+    // Backup / Restore (1800–1899)
+    /// RESTORE targeted a tenant different from the one the envelope belongs to.
+    pub const BACKUP_TENANT_MISMATCH: Self = Self(1800);
+    /// Backup envelope did not decrypt under this server's configured backup KEK.
+    pub const BACKUP_KEY_MISMATCH: Self = Self(1801);
+
     // Auth / Security (2000–2099)
     pub const AUTHORIZATION_DENIED: Self = Self(2000);
     pub const AUTH_EXPIRED: Self = Self(2001);

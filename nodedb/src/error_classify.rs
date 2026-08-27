@@ -19,6 +19,10 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             NodeDbError::authorization_denied(resource.clone())
         }
         Error::TxnOverlayMemoryExceeded { .. } => NodeDbError::bad_request(e.to_string()),
+        Error::BackupTenantMismatch { expected, actual } => {
+            NodeDbError::backup_tenant_mismatch(*expected, *actual)
+        }
+        Error::BackupKeyMismatch => NodeDbError::backup_key_mismatch(),
         Error::OffsetRegression { .. } => NodeDbError::bad_request(e.to_string()),
         Error::DeadlineExceeded { .. } => NodeDbError::deadline_exceeded(),
         // Same contract as a write conflict, which callers already retry.

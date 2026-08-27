@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, RaftRpc, TypedClusterError};
-use nodedb_types::backup_envelope::EnvelopeError;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
@@ -83,20 +82,4 @@ pub(super) fn map_typed_error(err: TypedClusterError, node_id: u64) -> Error {
         // must not read as a generic internal restore fault.
         TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
     }
-}
-
-/// Map envelope-level errors to a generic `Error::Internal` — never echoes deserializer context.
-pub(super) fn envelope_to_err(e: EnvelopeError) -> Error {
-    let msg = match e {
-        EnvelopeError::TenantMismatch { expected, actual } => {
-            format!("backup tenant mismatch: expected {expected}, got {actual}")
-        }
-        EnvelopeError::OverSizeTotal { cap } => format!("backup exceeds size cap of {cap} bytes"),
-        EnvelopeError::OverSizeSection { cap } => {
-            format!("backup section exceeds size cap of {cap} bytes")
-        }
-        EnvelopeError::UnsupportedVersion(v) => format!("unsupported backup version: {v}"),
-        _ => "invalid backup format".to_string(),
-    };
-    Error::Internal { detail: msg }
 }

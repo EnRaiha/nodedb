@@ -10,7 +10,9 @@
 //!   6000 cluster, 7000 memory, 8000 encryption, 9000 internal/bridge/dispatch.
 //! - [`from_wire`] — rebuilds a typed error from a numeric code decoded off
 //!   the wire, for the receiving side that no longer holds the context.
+//! - [`backup`] — 1800-range backup/restore envelope errors.
 
+pub mod backup;
 pub mod from_wire;
 pub mod mirror;
 pub mod move_tenant;

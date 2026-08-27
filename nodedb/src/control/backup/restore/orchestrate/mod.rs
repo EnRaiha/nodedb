@@ -17,7 +17,7 @@ mod reissue;
 use std::sync::Arc;
 
 use nodedb_types::backup_envelope::{
-    DEFAULT_MAX_TOTAL_BYTES, parse_encrypted as parse_envelope_encrypted,
+    DEFAULT_MAX_TOTAL_BYTES, EnvelopeError, parse_encrypted as parse_envelope_encrypted,
 };
 use serde::Serialize;
 
@@ -28,7 +28,7 @@ use crate::control::state::SharedState;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::MetaOp;
 
-use super::remote::{NODE_RESTORE_TIMEOUT, dispatch_remote, envelope_to_err};
+use super::remote::{NODE_RESTORE_TIMEOUT, dispatch_remote};
 use super::sections::{apply_metadata_sections, merge_sections};
 use super::topology::{SplitOutput, is_self, split_by_current_topology};
 
@@ -76,8 +76,7 @@ pub async fn restore_tenant(
     force: bool,
 ) -> Result<RestoreStats, Error> {
     let env = match &state.backup_kek {
-        Some(kek) => parse_envelope_encrypted(envelope_bytes, DEFAULT_MAX_TOTAL_BYTES, kek)
-            .map_err(envelope_to_err)?,
+        Some(kek) => parse_envelope_encrypted(envelope_bytes, DEFAULT_MAX_TOTAL_BYTES, kek)?,
         None => {
             return Err(Error::Internal {
                 detail: "restore: envelope is encrypted but no backup KEK is configured; \
@@ -87,12 +86,11 @@ pub async fn restore_tenant(
         }
     };
     if env.meta.tenant_id != tenant_id {
-        return Err(Error::Internal {
-            detail: format!(
-                "backup tenant mismatch: envelope has {}, request is for {}",
-                env.meta.tenant_id, tenant_id
-            ),
-        });
+        return Err(EnvelopeError::TenantMismatch {
+            expected: tenant_id,
+            actual: env.meta.tenant_id,
+        }
+        .into());
     }
 
     if !dry_run && env.meta.snapshot_watermark != 0 {

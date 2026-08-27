@@ -196,6 +196,14 @@ pub enum ErrorDetails {
     #[serde(rename = "clone_predates_query_time")]
     ClonePredatesQueryTime { as_of_lsn: u64, created_at_lsn: u64 },
 
+    // Backup / Restore
+    /// RESTORE targeted `expected` but the envelope belongs to `actual`.
+    #[serde(rename = "backup_tenant_mismatch")]
+    BackupTenantMismatch { expected: u64, actual: u64 },
+    /// The envelope did not decrypt under this server's configured backup KEK.
+    #[serde(rename = "backup_key_mismatch")]
+    BackupKeyMismatch,
+
     // Mirror DDL
     /// Write attempted on a mirror database that has not been promoted.
     #[serde(rename = "mirror_read_only")]

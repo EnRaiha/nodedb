@@ -100,6 +100,8 @@ impl NodeDbError {
                 | ErrorDetails::SqlNotEnabled
                 | ErrorDetails::UndefinedFunction { .. }
                 | ErrorDetails::DivisionByZero
+                | ErrorDetails::BackupTenantMismatch { .. }
+                | ErrorDetails::BackupKeyMismatch
         )
     }
 }

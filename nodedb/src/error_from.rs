@@ -116,6 +116,49 @@ impl From<nodedb_spatial::RTreeCheckpointError> for Error {
     }
 }
 
+/// `WrongBackupKek` and `TenantMismatch` are caller-actionable and get their
+/// own `Error` variant + SQLSTATE; every other envelope failure means the
+/// presented bytes are not a recoverable backup, so it stays generic —
+/// distinguishing corruption from truncation from a bad magic byte gives an
+/// attacker probing the format free feedback without helping a real operator.
+impl From<nodedb_types::backup_envelope::EnvelopeError> for Error {
+    fn from(e: nodedb_types::backup_envelope::EnvelopeError) -> Self {
+        use nodedb_types::backup_envelope::EnvelopeError as Ee;
+        match e {
+            Ee::TenantMismatch { expected, actual } => {
+                Self::BackupTenantMismatch { expected, actual }
+            }
+            Ee::WrongBackupKek => Self::BackupKeyMismatch,
+            Ee::UnsupportedVersion(v) => Self::Internal {
+                detail: format!("unsupported backup version: {v}"),
+            },
+            Ee::OverSizeTotal { cap } => Self::Internal {
+                detail: format!("backup exceeds size cap of {cap} bytes"),
+            },
+            Ee::OverSizeSection { cap } => Self::Internal {
+                detail: format!("backup section exceeds size cap of {cap} bytes"),
+            },
+            Ee::BadMagic
+            | Ee::HeaderCrcMismatch
+            | Ee::BodyCrcMismatch
+            | Ee::TrailerCrcMismatch
+            | Ee::Truncated
+            | Ee::TooManySections(_)
+            | Ee::DecryptionFailed
+            | Ee::EncryptionFailed
+            | Ee::RandomFailure(_) => Self::Internal {
+                detail: "invalid backup format".to_string(),
+            },
+            // `EnvelopeError` is `#[non_exhaustive]`. An envelope this build
+            // cannot name is still an envelope it cannot verify, so refuse it
+            // the same way rather than letting a future variant fall through.
+            _ => Self::Internal {
+                detail: "invalid backup format".to_string(),
+            },
+        }
+    }
+}
+
 /// The mapping table itself lives in [`crate::error_classify`] and borrows,
 /// so the native protocol's error frames — which only ever hold a `&Error` —
 /// classify through the same table instead of a second one that would drift.

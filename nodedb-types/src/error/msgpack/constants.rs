@@ -143,3 +143,5 @@ pub(super) const TAG_STALE_READ_NOT_LEADER: u16 = 65;
 pub(super) const TAG_MIRROR_NOT_PROMOTED: u16 = 66;
 pub(super) const TAG_UNDEFINED_FUNCTION: u16 = 67;
 pub(super) const TAG_DIVISION_BY_ZERO: u16 = 68;
+pub(super) const TAG_BACKUP_TENANT_MISMATCH: u16 = 69;
+pub(super) const TAG_BACKUP_KEY_MISMATCH: u16 = 70;

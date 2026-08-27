@@ -285,6 +285,14 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let dependents = read_string_vec(reader, field_count)?;
                 Ok(ErrorDetails::CloneDependency { dependents })
             }
+            TAG_BACKUP_TENANT_MISMATCH => {
+                let (expected, actual) = read2_u64(reader, field_count)?;
+                Ok(ErrorDetails::BackupTenantMismatch { expected, actual })
+            }
+            TAG_BACKUP_KEY_MISMATCH => {
+                skip_fields(reader, field_count)?;
+                Ok(ErrorDetails::BackupKeyMismatch)
+            }
             TAG_CLONE_PREDATES_QUERY_TIME => {
                 let (as_of_lsn, created_at_lsn) = read2_u64(reader, field_count)?;
                 Ok(ErrorDetails::ClonePredatesQueryTime {

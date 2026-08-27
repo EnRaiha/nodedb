@@ -216,6 +216,19 @@ pub const CLONE_PREDATES_QUERY_TIME: &str = "22023";
 /// in both cases.
 pub const STALE_READ_NOT_LEADER: &str = "55P03";
 
+// ── Backup / Restore (Class 22 / 28) ────────────────────────────────────────
+
+/// `22023` — NodeDB extension: RESTORE's target tenant does not match the
+/// tenant the envelope belongs to. Uses Class 22 "Data Exception" because the
+/// envelope is well-formed, just not for the requested tenant.
+pub const BACKUP_TENANT_MISMATCH: &str = "22023";
+
+/// `28000` — NodeDB extension: the backup envelope did not decrypt under this
+/// server's configured `backup_encryption` key. Aliased to
+/// `invalid_authorization_specification`, the same class used for any other
+/// presented-key mismatch.
+pub const BACKUP_KEY_MISMATCH: &str = "28000";
+
 // ── Move Tenant DDL (Class 55 / 57) ─────────────────────────────────────────
 
 /// `57014` — `query_canceled`: drain phase timed out; client should re-try after

@@ -231,6 +231,23 @@ pub enum Error {
     #[error("bad request: {detail}")]
     BadRequest { detail: String },
 
+    /// RESTORE targeted `expected` but the envelope belongs to `actual`.
+    #[error(
+        "backup tenant mismatch: RESTORE targeted tenant {expected} but this envelope \
+         belongs to tenant {actual}; restore tenant {expected}'s own backup, or target \
+         tenant {actual} instead"
+    )]
+    BackupTenantMismatch { expected: u64, actual: u64 },
+
+    /// The envelope did not decrypt under this server's configured backup KEK.
+    /// Never carries key material or a fingerprint/hash.
+    #[error(
+        "wrong backup KEK: this envelope was not encrypted with the key at this \
+         server's configured backup_encryption.key_path; verify the key file matches \
+         the one used when this backup was created"
+    )]
+    BackupKeyMismatch,
+
     #[error("quota overcommit on field '{field}': {detail}")]
     QuotaOvercommit { field: String, detail: String },
 

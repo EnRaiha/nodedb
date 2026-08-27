@@ -21,6 +21,12 @@ pub fn sqlstate_error(code: &str, message: &str) -> PgWireError {
 pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, String) {
     match err {
         crate::Error::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
+        crate::Error::BackupTenantMismatch { .. } => {
+            ("ERROR", sqlstate::BACKUP_TENANT_MISMATCH, err.to_string())
+        }
+        crate::Error::BackupKeyMismatch => {
+            ("ERROR", sqlstate::BACKUP_KEY_MISMATCH, err.to_string())
+        }
         crate::Error::PlanError { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         crate::Error::CollectionNotFound { collection, .. } => (
             "ERROR",
