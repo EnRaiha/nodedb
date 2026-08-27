@@ -196,7 +196,14 @@ impl NodeDbPgHandler {
 
         // Cache key isn't session-knob-scoped, so bypass entirely under a strategy
         // override — else a plan built for one join strategy serves a differently-tuned query.
-        let bypass_cache = override_flags.bypass_plan_cache();
+        //
+        // A cached plan carries the RLS predicates injected when it was built,
+        // and policy writes bump no descriptor version, so a plan compiled
+        // before a policy existed would keep serving rows the policy now hides.
+        // While the tenant holds any policy, every statement is replanned and
+        // re-injected against the live store.
+        let bypass_cache = override_flags.bypass_plan_cache()
+            || self.state.rls.tenant_has_any_policy(tenant_id.as_u64());
         let cached_tasks = if bypass_cache {
             None
         } else {

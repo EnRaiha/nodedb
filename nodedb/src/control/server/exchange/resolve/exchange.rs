@@ -32,7 +32,7 @@ use crate::control::server::response_translate::vector::resolve_surrogate_pk;
 use super::capture::DistributedReadCapture;
 use super::join_input::{gather_join_build_side, resolve_join_input};
 use super::materialize::materialize_providers;
-use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
+use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 
 /// Result of `resolve_and_materialize`.
 pub enum Resolved {
@@ -262,8 +262,12 @@ async fn resolve_exchange(
             // alone via `extract_collection` and miss the build side (captured
             // separately in `join_input`).
             if let Some(coll) = probe_collection
-                && let Some(scan_plan) =
-                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+                && let Some(scan_plan) = full_scan_plan_for_collection(
+                    state,
+                    database_id,
+                    tenant_id,
+                    ScanSide::read_set_only(&coll),
+                )?
             {
                 captures.push(DistributedReadCapture {
                     scan_plan,
@@ -385,7 +389,7 @@ async fn resolve_exchange(
             )
             .await?;
 
-            // Cross-node build-side gather (cluster only).
+            // Cross-node build-side gather.
             //
             // The HashJoin task routes to the LEFT (probe) collection's owning
             // vShard, where the LEFT side is scanned locally. The RIGHT (build)
@@ -393,11 +397,12 @@ async fn resolve_exchange(
             // a single-vShard-homed build collection may live on a DIFFERENT
             // node, so the by-name scan returns nothing and the join drops rows.
             //
-            // When running in cluster mode (`gateway.is_some()`), and the build
-            // side has not already been materialized by `resolve_join_input`
-            // (i.e. `right_input` is still `None`), and `right_collection` names
-            // a real user collection (catalog sides carry an empty name and are
-            // already embedded as a ProviderScan), gather the build collection
+            // When a gateway is installed (it always is, single node included),
+            // and the build side has not already been materialized by
+            // `resolve_join_input` (`right_input` still `None`), and
+            // `right_collection` names a real user collection (catalog sides
+            // carry an empty name and are already embedded as a
+            // ProviderScan), gather the build collection
             // across all vShards on the coordinator and inline it as a
             // `ProviderScan`. The HashJoin shipped to the probe node is then
             // self-contained. Only the RIGHT/build side is gathered; the
@@ -410,7 +415,10 @@ async fn resolve_exchange(
                     state,
                     database_id,
                     tenant_id,
-                    &right_collection,
+                    // The side's own collection and its own injected policy,
+                    // taken as one value: a planner that swaps build and probe
+                    // swaps both together, never one without the other.
+                    ScanSide::join_side(&right_collection, &right_rls_filters),
                     trace_id,
                     txn_id,
                     captures,
@@ -522,8 +530,12 @@ async fn resolve_exchange(
                 gather_all_vshards(state, tenant_id, database_id, child, trace_id, txn_id).await?;
 
             if let Some(coll) = probe_collection
-                && let Some(scan_plan) =
-                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+                && let Some(scan_plan) = full_scan_plan_for_collection(
+                    state,
+                    database_id,
+                    tenant_id,
+                    ScanSide::read_set_only(&coll),
+                )?
             {
                 captures.push(DistributedReadCapture {
                     scan_plan,

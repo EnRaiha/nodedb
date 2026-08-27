@@ -9,7 +9,7 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::flatten_to_relational_rows;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 
-use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
+use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 use crate::control::server::exchange::gather::{
     finalize_aggregate, gather_all_cores, gather_all_vshards,
 };
@@ -112,8 +112,12 @@ pub(super) async fn resolve_join_input(
             let outcome =
                 gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
             if let Some(coll) = child_collection
-                && let Some(scan_plan) =
-                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+                && let Some(scan_plan) = full_scan_plan_for_collection(
+                    state,
+                    database_id,
+                    tenant_id,
+                    ScanSide::read_set_only(&coll),
+                )?
             {
                 captures.push(DistributedReadCapture {
                     scan_plan,
@@ -145,28 +149,32 @@ pub(super) async fn resolve_join_input(
 }
 
 /// Gather a HashJoin build collection across all vShards and inline it as a
-/// `ProviderScan` (cluster mode only).
+/// `ProviderScan`.
 ///
-/// Looks up `collection`'s engine in the catalog, builds a minimal unfiltered
-/// full-collection scan for that engine, gathers it across all vShards via the
+/// Looks up the side's engine in the catalog, builds a full-collection scan
+/// under that side's read policy, gathers it across all vShards via the
 /// gateway, and embeds the merged rows as a `ProviderScan{provider: None, rows}`
 /// — mirroring the embedding shape used by `resolve_join_input`.
 ///
+/// `side` carries the collection together with the RLS filters injected for
+/// it, so the gathered rows are filtered per side *before* the join, exactly
+/// as the local name-scan this gather replaces would have filtered them.
+///
 /// Returns `Ok(None)` (the name-scan fallback) when the catalog has no record
-/// for `collection`. This is a graceful degradation, never an error: a missing
+/// for the collection. This is graceful degradation, never an error: a missing
 /// catalog entry on the coordinator falls back to the existing by-name scan on
 /// the executing node.
 pub(super) async fn gather_join_build_side(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
-    collection: &str,
+    side: ScanSide<'_>,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
     captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
-    // Build a minimal, unfiltered, unprojected full-collection scan for the
-    // engine via the shared builder. `Ok(None)` (no catalog / unknown
+    // Build an unprojected full-collection scan for the engine via the shared
+    // builder, carrying this side's read policy. `Ok(None)` (no catalog / unknown
     // collection) keeps the existing graceful name-scan fallback — never an
     // error. The build side of a hash join must be COMPLETE (every build row is
     // needed for correct match output); the shared builder uses an unbounded
@@ -182,7 +190,7 @@ pub(super) async fn gather_join_build_side(
             state,
             database_id,
             tenant_id,
-            collection,
+            side,
         )?
     else {
         // No catalog on this node, or unknown collection: fall back to name-scan.

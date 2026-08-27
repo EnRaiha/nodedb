@@ -10,33 +10,36 @@
 //! policy excludes must neither match a partner nor survive as a null-extended
 //! outer row, and a post-join predicate cannot express either.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "probe-secret-99";
+
+/// Create `collection` and fill it with three rows, all owned by `alice`.
+async fn seed_collection(server: &TestServer, collection: &str) {
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {collection} (\
+                 id TEXT PRIMARY KEY, owner TEXT, note TEXT) \
+             WITH (engine='document_strict')"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("create {collection}: {e}"));
+    for i in 1..=3 {
+        server
+            .exec(&format!(
+                "INSERT INTO {collection} (id, owner, note) \
+                 VALUES ('k{i}', 'alice', 'secret-{i}')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed {collection} row {i}: {e}"));
+    }
+}
 
 /// Two collections joined on `owner_id`, seeded so that every row belongs to
 /// `alice` — nothing the probing principal may read.
 async fn seed(server: &TestServer, left: &str, right: &str, user: &str) {
     for collection in [left, right] {
-        server
-            .exec(&format!(
-                "CREATE COLLECTION {collection} (\
-                     id TEXT PRIMARY KEY, owner TEXT, note TEXT) \
-                 WITH (engine='document_strict')"
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("create {collection}: {e}"));
-        for i in 1..=3 {
-            server
-                .exec(&format!(
-                    "INSERT INTO {collection} (id, owner, note) \
-                     VALUES ('k{i}', 'alice', 'secret-{i}')"
-                ))
-                .await
-                .unwrap_or_else(|e| panic!("seed {collection} row {i}: {e}"));
-        }
+        seed_collection(server, collection).await;
     }
     server
         .exec(&format!("CREATE USER {user} PASSWORD '{PASSWORD}'"))
@@ -211,5 +214,111 @@ async fn join_returns_rows_the_policy_admits() {
         rows,
         vec!["visible".to_string()],
         "the policy should admit the principal's own row and exclude the rest"
+    );
+}
+
+/// A RIGHT JOIN is rewritten to a LEFT JOIN with the sides swapped, so the
+/// policed collection written first ends up as the side the planner does not
+/// drive from. The policy travels with its collection, never with a position:
+/// the unpoliced side may null-extend, but no policed value may appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn right_join_swap_still_applies_the_policy() {
+    let server = TestServer::start().await;
+    seed(
+        &server,
+        "join_rls_swap_l",
+        "join_rls_swap_r",
+        "join_swap_user",
+    )
+    .await;
+    server
+        .exec(
+            "CREATE RLS POLICY swap_owner ON join_rls_swap_l FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create swap policy");
+
+    let rows = rows_as(
+        &server,
+        "join_swap_user",
+        "SELECT l.note FROM join_rls_swap_l l \
+         RIGHT JOIN join_rls_swap_r r ON l.id = r.id",
+    )
+    .await;
+
+    assert!(
+        rows.iter().all(|row| !row.contains("secret")),
+        "the side-swapping RIGHT JOIN surfaced rows the read policy excludes: {rows:?}"
+    );
+}
+
+/// An `IN` subquery lowers to a semi-join. A row of the policed collection the
+/// policy excludes must not qualify an outer row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn semi_join_from_in_subquery_applies_the_policy() {
+    let server = TestServer::start().await;
+    seed(
+        &server,
+        "join_rls_semi_l",
+        "join_rls_semi_r",
+        "join_semi_user",
+    )
+    .await;
+    server
+        .exec(
+            "CREATE RLS POLICY semi_owner ON join_rls_semi_r FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create semi policy");
+
+    let rows = rows_as(
+        &server,
+        "join_semi_user",
+        "SELECT id FROM join_rls_semi_l \
+         WHERE id IN (SELECT id FROM join_rls_semi_r)",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "the semi-join qualified outer rows from partners the policy excludes: {rows:?}"
+    );
+}
+
+/// Every input of a three-way join carries its own policy, including the side
+/// joined last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_way_join_applies_the_policy_on_the_last_side() {
+    let server = TestServer::start().await;
+    seed(
+        &server,
+        "join_rls_three_a",
+        "join_rls_three_b",
+        "join_three_user",
+    )
+    .await;
+    seed_collection(&server, "join_rls_three_c").await;
+    server
+        .exec(
+            "CREATE RLS POLICY three_owner ON join_rls_three_c FOR READ \
+             USING (owner = $auth.username)",
+        )
+        .await
+        .expect("create three-way policy");
+
+    let rows = rows_as(
+        &server,
+        "join_three_user",
+        "SELECT c.note FROM join_rls_three_a a \
+         JOIN join_rls_three_b b ON a.id = b.id \
+         JOIN join_rls_three_c c ON c.id = b.id",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "the last-joined side surfaced rows the read policy excludes: {rows:?}"
     );
 }

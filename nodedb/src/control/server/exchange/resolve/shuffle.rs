@@ -38,7 +38,7 @@ use nodedb_cluster::{
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
-use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
+use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 use crate::control::server::exchange::gather::outcome_to_response;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
@@ -78,6 +78,8 @@ pub async fn resolve_shuffle_join(
         limit,
         left_input,
         right_input,
+        left_rls_filters,
+        right_rls_filters,
         ..
     }) = child
     else {
@@ -189,11 +191,24 @@ pub async fn resolve_shuffle_join(
         register_peers_from_topology(state, transport, &targets);
     }
 
-    // 6. Encode each side's bare full-collection scan. The producer cannot scan
+    // 6. Encode each side's full-collection scan. The producer cannot scan
     //    by name across nodes, so a missing catalog entry is a hard error here
     //    (unlike the broadcast-gather path's graceful name-scan fallback).
-    let build_scan = require_scan_plan(state, database_id, tenant_id, &right_collection)?;
-    let probe_scan = require_scan_plan(state, database_id, tenant_id, &left_collection)?;
+    // Each producer scans its side under that side's own injected read policy:
+    // the shuffle stages rows per side before any match, so an excluded row
+    // never reaches a partner on any part.
+    let build_scan = require_scan_plan(
+        state,
+        database_id,
+        tenant_id,
+        ScanSide::join_side(&right_collection, &right_rls_filters),
+    )?;
+    let probe_scan = require_scan_plan(
+        state,
+        database_id,
+        tenant_id,
+        ScanSide::join_side(&left_collection, &left_rls_filters),
+    )?;
     let build_plan_bytes = plan_wire::encode(&build_scan).map_err(|e| crate::Error::Internal {
         detail: format!("shuffle join: encode build scan: {e}"),
     })?;
@@ -385,16 +400,18 @@ async fn send_consume(
     }
 }
 
-/// Build a full-collection scan plan for `collection`, erroring if the catalog
-/// has no record for it (the shuffle producer cannot scan by name across nodes,
-/// so a missing entry is fatal — unlike the broadcast path's name-scan fallback).
+/// Build a full-collection scan plan for one join side under its own read
+/// policy, erroring if the catalog has no record for it (the shuffle producer
+/// cannot scan by name across nodes, so a missing entry is fatal — unlike the
+/// broadcast path's name-scan fallback).
 fn require_scan_plan(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
-    collection: &str,
+    side: ScanSide<'_>,
 ) -> crate::Result<PhysicalPlan> {
-    full_scan_plan_for_collection(state, database_id, tenant_id, collection)?.ok_or_else(|| {
+    let collection = side.collection().to_string();
+    full_scan_plan_for_collection(state, database_id, tenant_id, side)?.ok_or_else(|| {
         crate::Error::Internal {
             detail: format!(
                 "shuffle join: no catalog entry for collection '{collection}' on coordinator"

@@ -125,6 +125,20 @@ impl RlsPolicyStore {
             })
     }
 
+    /// Whether any enabled, non-vacuous policy of any type exists in this
+    /// tenant. Callers that reuse a compiled plan across statements ask this to
+    /// stop serving a plan whose injected predicates may no longer match the
+    /// live policy set. A vacuous policy restricts nothing and is ignored.
+    pub fn tenant_has_any_policy(&self, tenant_id: u64) -> bool {
+        let prefix = format!("{tenant_id}:");
+        self.lock_read().iter().any(|(key, list)| {
+            key.starts_with(&prefix)
+                && list
+                    .iter()
+                    .any(|policy| policy.enabled && policy.compiled_predicate.is_some())
+        })
+    }
+
     /// Write-path RLS check with `$auth.*` support. Evaluates compiled
     /// write policies; fail-closed on unresolved auth references.
     ///
