@@ -23,29 +23,22 @@ use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
 use crate::control::planner::calvin::tx_class::collection_name_from_plan;
 use crate::control::planner::calvin::{
-    DependentRetryArgs, build_dependent_tx_class, build_single_vshard_dependent_tx_class,
-    is_dependent_predicate, predicate_class_for_filters, run_dependent_with_retry,
-    submit_calvin_routed_assign,
+    DependentOutcome, DependentRetryArgs, build_dependent_tx_class,
+    build_single_vshard_dependent_tx_class, is_dependent_predicate, predicate_class_for_filters,
+    run_dependent_with_retry, submit_calvin_routed_assign,
 };
 use crate::control::planner::implicit_edges::{
-    EdgeFieldOverrides, EdgeUpdateCtx, append_implicit_edge_delete_tasks,
-    append_implicit_edge_update_tasks, parse_edge_field_overrides,
+    EdgeUpdateCtx, append_implicit_edge_delete_tasks, append_implicit_edge_update_tasks,
 };
 use crate::control::state::{CalvinApplyResult, SharedState};
 use crate::types::{DatabaseId, TenantId, TraceId};
-use nodedb_cluster::calvin::sequencer::error::SequencerError;
-use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan};
+use nodedb_physical::physical_plan::OllpPredictedEdge;
 
 use super::dependent_recon_plan::{inject_ollp_predicted_edges, inject_ollp_surrogates};
+use super::dependent_recon_predicate::{
+    EdgeLifecycle, classify_edge_lifecycle, extract_bulk_predicate_info,
+};
 use nodedb_physical::physical_task::PhysicalTask;
-
-/// The implicit-edge lifecycle a dependent (OLLP) Calvin task drives, derived
-/// once from the dependent task's plan variant. `Update` carries the SET-clause
-/// overrides (parsed once — they are constant across retries).
-enum EdgeLifecycle {
-    Delete,
-    Update(EdgeFieldOverrides),
-}
 
 /// Protocol-neutral result of [`dispatch_dependent_edge_recon`].
 ///
@@ -61,42 +54,6 @@ pub struct DependentReconOutcome {
     /// Applied Data-Plane response for the RETURNING doc write, if any. `None`
     /// for a plain (non-RETURNING) dependent write.
     pub apply_result: Option<crate::bridge::envelope::Response>,
-}
-
-/// Extract the collection name and serialized filter bytes from a
-/// `BulkUpdate` or `BulkDelete` plan.
-///
-/// Returns `("", vec![])` for plan variants that are not bulk predicates.
-fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u8>) {
-    match plan {
-        PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection,
-            filters,
-            ..
-        })
-        | PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection,
-            filters,
-            ..
-        }) => (collection.clone(), filters.clone()),
-        // Not a bulk predicate. The two bulk arms above take precedence; these
-        // inner wildcards catch every other op (including non-bulk document
-        // ops). Exhaustive so a new PhysicalPlan variant forces a decision.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => (String::new(), vec![]),
-    }
 }
 
 /// Detect whether `tasks` carry a dependent predicate on an implicit-edge-
@@ -245,42 +202,7 @@ async fn dispatch_dependent_edge_recon_inner(
     let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
     let pred_class = predicate_class_for_filters(&dep_filter_bytes, &dep_collection);
 
-    // Classify the implicit-edge lifecycle the dependent task drives. A
-    // `BulkDelete` retracts the matched edge documents' mirrored edges; a
-    // `BulkUpdate` reconciles them against the SET clause. The SET clause is
-    // immutable across retries, so the override parse happens ONCE here
-    // (propagating any `Expr`-on-edge-field error — defensive: the planner
-    // gate rejects it earlier). Other variants never reach the dependent
-    // path (`is_dependent_predicate` only matches the two bulk ops).
-    let edge_mode = match &dep_task.plan {
-        PhysicalPlan::Document(DocumentOp::BulkDelete { .. }) => EdgeLifecycle::Delete,
-        PhysicalPlan::Document(DocumentOp::BulkUpdate { updates, .. }) => {
-            let overrides = parse_edge_field_overrides(updates)?;
-            EdgeLifecycle::Update(overrides)
-        }
-        // Unreachable: `is_dependent_predicate` only selects BulkUpdate /
-        // BulkDelete. Surface a typed error rather than panicking. The two
-        // bulk arms above take precedence; these inner wildcards catch every
-        // other op. Exhaustive so a new PhysicalPlan variant forces a decision.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => {
-            return Err(Error::Internal {
-                detail: "dependent Calvin task is neither BulkUpdate nor BulkDelete".to_owned(),
-            });
-        }
-    };
+    let edge_mode = classify_edge_lifecycle(&dep_task.plan)?;
 
     // Initial reconnaissance — the first prediction the loop submits.
     let initial_predicted = run_preexec_scan(
@@ -352,7 +274,7 @@ async fn dispatch_dependent_edge_recon_inner(
                         &edges,
                     )
                     .await
-                    .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))?;
+                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
                 }
                 EdgeLifecycle::Update(overrides) => {
                     append_implicit_edge_update_tasks(
@@ -369,7 +291,7 @@ async fn dispatch_dependent_edge_recon_inner(
                         overrides,
                     )
                     .await
-                    .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))?;
+                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
                 }
             }
 
@@ -387,7 +309,7 @@ async fn dispatch_dependent_edge_recon_inner(
                         &state.roles,
                         &emitter,
                     )
-                    .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))?
+                    .map_err(|e| OllpError::Terminal(Box::new(e.into())))?
                     .into_tasks()
                     .into_iter()
                     .map(|task| task.into_physical_task())
@@ -430,14 +352,14 @@ async fn dispatch_dependent_edge_recon_inner(
                             &[],
                         )
                     };
-                    built.map_err(|_| {
-                        nodedb_cluster::error::CalvinError::Sequencer(SequencerError::Unavailable)
-                    })
+                    built.map_err(|e| OllpError::Terminal(Box::new(e)))
                 },
+                // Retryable: a routed submit races a leader change. The cause
+                // travels so exhaustion names it instead of claiming drift.
                 |tx_class| async move {
                     submit_calvin_routed_assign(state, tx_class)
                         .await
-                        .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))
+                        .map_err(|e| OllpError::Retryable(Box::new(e)))
                 },
             )
             .await
@@ -455,7 +377,7 @@ async fn dispatch_dependent_edge_recon_inner(
         )
     };
 
-    let completed_txn = run_dependent_with_retry(DependentRetryArgs {
+    let completed_txn = match run_dependent_with_retry(DependentRetryArgs {
         registry,
         orchestrator: orc,
         predicate_class_hash: pred_class,
@@ -465,7 +387,18 @@ async fn dispatch_dependent_edge_recon_inner(
         submit,
         rescan,
     })
-    .await?;
+    .await?
+    {
+        DependentOutcome::Committed(txn_id) => txn_id,
+        // The predicate matched no rows and nothing else in the batch writes,
+        // so no entry was sequenced. The statement reports zero rows affected.
+        DependentOutcome::NoOp => {
+            return Ok(DependentReconOutcome {
+                tasks_dispatched: 0,
+                apply_result: None,
+            });
+        }
+    };
 
     // Completion fired: the scheduler deposited the applied Response (with any
     // RETURNING rows) into the sidecar before proposing the ack that woke the

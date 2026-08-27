@@ -102,7 +102,9 @@ async fn ollp_circuit_opens_after_retry_storm() {
 
     // Now a submission should be rejected with CircuitOpen.
     let result = orchestrator
-        .submit_with_retry(&inbox, predicate_class, tenant, || Ok(make_tx_class(1, 2)))
+        .submit_with_retry(&inbox, predicate_class, tenant, || {
+            Ok(Some(make_tx_class(1, 2)))
+        })
         .await;
 
     assert!(
@@ -145,7 +147,7 @@ async fn ollp_circuit_recovers_after_open_window() {
     }
     let r = orchestrator
         .submit_with_retry(&inbox, predicate_class, tenant, || {
-            Ok(make_tx_class(10, 11))
+            Ok(Some(make_tx_class(10, 11)))
         })
         .await;
     assert!(
@@ -164,7 +166,7 @@ async fn ollp_circuit_recovers_after_open_window() {
     for _ in 0..4u32 {
         let res = orchestrator
             .submit_with_retry(&inbox2, predicate_class, tenant, || {
-                Ok(make_tx_class(20, 21))
+                Ok(Some(make_tx_class(20, 21)))
             })
             .await;
         // In HalfOpen the submission goes through (not CircuitOpen).
@@ -215,7 +217,7 @@ async fn ollp_100_retry_attempts_circuit_opens_and_stays_open() {
     for i in 0..100u32 {
         let result = orchestrator
             .submit_with_retry(&inbox, predicate_class, tenant, || {
-                Ok(make_tx_class(i * 2, i * 2 + 1))
+                Ok(Some(make_tx_class(i * 2, i * 2 + 1)))
             })
             .await;
 
@@ -278,7 +280,7 @@ async fn ollp_tenant_budget_eventually_enforced() {
         orchestrator.on_retry_required(predicate_class, i).await;
         let result = orchestrator
             .submit_with_retry(&inbox, predicate_class, tenant, || {
-                Ok(make_tx_class(i * 2 + 50, i * 2 + 51))
+                Ok(Some(make_tx_class(i * 2 + 50, i * 2 + 51)))
             })
             .await;
         match result {

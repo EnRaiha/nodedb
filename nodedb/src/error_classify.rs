@@ -214,9 +214,8 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
              this node is running in embedded/local mode"
                 .to_owned(),
         ),
-        Error::OllpExhausted { retries } => NodeDbError::bad_request(format!(
-            "OLLP dependent-read exhausted {retries} retries; the predicate's matching set \
-             kept changing across retries. Consider rephrasing as a static-key UPDATE if possible."
+        Error::OllpExhausted { retries, cause } => NodeDbError::bad_request(format!(
+            "optimistic retry gave up after {retries} attempts: {cause}"
         )),
         Error::SessionCapExceeded { cap } => NodeDbError::bad_request(format!(
             "session cap ({cap}) exceeded — rejecting new login"

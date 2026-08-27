@@ -39,7 +39,6 @@ use super::metrics::{
 };
 use super::rate_bucket::RateBucket;
 use crate::control::planner::calvin::submit::RoutedAssignment;
-use nodedb_cluster::error::CalvinError;
 
 // ── OllpRetryRequired ─────────────────────────────────────────────────────────
 
@@ -85,13 +84,14 @@ impl OllpOrchestrator {
     /// Checks the per-predicate circuit state (recording the state metric),
     /// returns `Err(OllpError::CircuitOpen)` if the circuit is open, builds
     /// `TxClass` via `tx_builder`, and ensures the per-tenant rate bucket
-    /// exists.  On success returns the built `TxClass` ready to submit.
+    /// exists.  `Ok(None)` from `tx_builder` means the transaction has nothing
+    /// to write and must not be submitted; it is passed through unchanged.
     fn check_and_build(
         &self,
         predicate_class: u64,
         tenant_id: TenantId,
-        tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
-    ) -> Result<TxClass, OllpError> {
+        tx_builder: impl Fn() -> Result<Option<TxClass>, OllpError>,
+    ) -> Result<Option<TxClass>, OllpError> {
         // Check circuit state first — denies submission entirely when open.
         let circuit_state = {
             let mut breakers = self
@@ -125,12 +125,7 @@ impl OllpOrchestrator {
         }
 
         // Build the txn class from the caller's closure.
-        let tx_class = tx_builder().map_err(|e| match e {
-            CalvinError::Sequencer(s) => OllpError::Sequencer(s),
-            _other => OllpError::Sequencer(
-                nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
-            ),
-        })?;
+        let tx_class = tx_builder()?;
 
         // Ensure tenant budget bucket exists. Budget consumption happens in
         // `on_retry_required` since first-attempt admissions don't count.
@@ -171,27 +166,30 @@ impl OllpOrchestrator {
     /// `tx_builder` is called once per attempt to build a fresh `TxClass`
     /// from the latest optimistic pre-execution result.
     ///
-    /// Returns the `inbox_seq` of the successfully submitted txn, or an
+    /// Returns the `inbox_seq` of the successfully submitted txn, `None` when
+    /// `tx_builder` decided the transaction has nothing to write, or an
     /// `OllpError`.
     pub async fn submit_with_retry(
         &self,
         inbox: &Inbox,
         predicate_class: u64,
         tenant_id: TenantId,
-        tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
-    ) -> Result<u64, OllpError> {
+        tx_builder: impl Fn() -> Result<Option<TxClass>, OllpError>,
+    ) -> Result<Option<u64>, OllpError> {
         // Single-attempt admission gate. Retries are driven externally by the
         // SPSC response handler calling `on_retry_required` followed by another
         // `submit_with_retry` call from the SQL layer with a fresh `tx_builder`
         // closure; the budget + circuit checks below run on every attempt
         // because they are stored on `self` and persist across calls.
-        let tx_class = self.check_and_build(predicate_class, tenant_id, tx_builder)?;
+        let Some(tx_class) = self.check_and_build(predicate_class, tenant_id, tx_builder)? else {
+            return Ok(None);
+        };
 
         // Submit to the inbox.
         match inbox.submit(tx_class) {
             Ok(inbox_seq) => {
                 self.record_submit_success(predicate_class);
-                Ok(inbox_seq)
+                Ok(Some(inbox_seq))
             }
             Err(e) => Err(OllpError::Sequencer(e)),
         }
@@ -208,27 +206,31 @@ impl OllpOrchestrator {
     /// [`RoutedAssignment`]) while still passing through this node's
     /// circuit-breaker / budget gate.
     ///
-    /// On `Ok(assignment)` the per-predicate circuit success is recorded (same as
-    /// [`Self::submit_with_retry`]) and the assignment is returned. On `Err` the
-    /// underlying `OllpError` is returned verbatim (not re-mapped).
+    /// On `Ok(Some(assignment))` the per-predicate circuit success is recorded
+    /// (same as [`Self::submit_with_retry`]) and the assignment is returned.
+    /// `Ok(None)` means `tx_builder` decided the transaction has nothing to
+    /// write, so nothing was submitted. On `Err` the underlying `OllpError` is
+    /// returned verbatim (not re-mapped).
     pub async fn submit_with_retry_via<F, Fut>(
         &self,
         predicate_class: u64,
         tenant_id: TenantId,
-        tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
+        tx_builder: impl Fn() -> Result<Option<TxClass>, OllpError>,
         submit_fn: F,
-    ) -> Result<RoutedAssignment, OllpError>
+    ) -> Result<Option<RoutedAssignment>, OllpError>
     where
         F: Fn(TxClass) -> Fut,
         Fut: std::future::Future<Output = Result<RoutedAssignment, OllpError>>,
     {
-        let tx_class = self.check_and_build(predicate_class, tenant_id, tx_builder)?;
+        let Some(tx_class) = self.check_and_build(predicate_class, tenant_id, tx_builder)? else {
+            return Ok(None);
+        };
 
         // Submit via the injected routed-submit closure.
         match submit_fn(tx_class).await {
             Ok(assignment) => {
                 self.record_submit_success(predicate_class);
-                Ok(assignment)
+                Ok(Some(assignment))
             }
             Err(ollp_err) => Err(ollp_err),
         }

@@ -11,12 +11,38 @@
 
 use nodedb_cluster::calvin::{AttemptOutcome, CalvinCompletionRegistry, TxnId};
 
-use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
 use crate::control::planner::calvin::submit::RoutedAssignment;
+use crate::{Error, OllpExhaustedCause};
 
 // ── run_dependent_with_retry ──────────────────────────────────────────────────
+
+/// Classify a pre-admission `OllpError` for the exhaustion error. A carried
+/// `crate::Error` travels verbatim; the orchestrator's own admission verdicts
+/// have no inner error and are reported as a refused gate.
+fn pre_admission_cause(err: OllpError) -> OllpExhaustedCause {
+    match err {
+        OllpError::Terminal(cause) | OllpError::Retryable(cause) => {
+            OllpExhaustedCause::PreAdmission(cause)
+        }
+        refused => OllpExhaustedCause::AdmissionRefused {
+            detail: refused.to_string(),
+        },
+    }
+}
+
+/// Terminal outcome of the dependent-read retry loop.
+#[derive(Debug)]
+pub enum DependentOutcome {
+    /// The dependent transaction committed; carries its `TxnId` so the caller
+    /// can drain the applied response the scheduler deposited.
+    Committed(TxnId),
+    /// The batch decided an empty write set — the predicate matched no rows and
+    /// no other task in it writes — so no Calvin entry was proposed. The
+    /// statement's result is zero rows affected.
+    NoOp,
+}
 
 /// Coordinator-owned OLLP dependent-read retry loop with FRESH reconnaissance
 /// per attempt.
@@ -46,10 +72,10 @@ pub struct DependentRetryArgs<'a, P, SF, RF> {
 
 pub async fn run_dependent_with_retry<P, SF, SFut, RF, RFut>(
     args: DependentRetryArgs<'_, P, SF, RF>,
-) -> crate::Result<TxnId>
+) -> crate::Result<DependentOutcome>
 where
     SF: FnMut(&P) -> SFut,
-    SFut: std::future::Future<Output = Result<RoutedAssignment, OllpError>>,
+    SFut: std::future::Future<Output = Result<Option<RoutedAssignment>, OllpError>>,
     RF: FnMut() -> RFut,
     RFut: std::future::Future<Output = crate::Result<P>>,
 {
@@ -67,14 +93,23 @@ where
     let mut retry: u32 = 0;
     loop {
         let assignment = match submit(&predicted).await {
-            Ok(assignment) => assignment,
-            Err(_ollp_err) => {
-                // PRE-ADMISSION failure (circuit/sequencer/budget). Nothing
-                // executed, so there is no aborted attempt to re-scan around —
-                // resubmit the SAME prediction after backoff bookkeeping.
+            Ok(Some(assignment)) => assignment,
+            // Nothing to write: the prediction decided an empty write set, so
+            // no transaction was submitted and there is nothing to await.
+            Ok(None) => return Ok(DependentOutcome::NoOp),
+            // Deterministic pre-admission failure (TxClass construction,
+            // authorization, edge-task synthesis). The same inputs reproduce
+            // it, so surface the real error instead of retrying and reporting
+            // predicate drift that never happened.
+            Err(OllpError::Terminal(error)) => return Err(*error),
+            Err(ollp_err) => {
+                // PRE-ADMISSION failure (routed submit / circuit / budget).
+                // Nothing executed, so there is no aborted attempt to re-scan
+                // around — resubmit the SAME prediction after backoff.
                 if retry >= ollp_max_retries {
                     return Err(Error::OllpExhausted {
                         retries: ollp_max_retries.min(u8::MAX as u32) as u8,
+                        cause: pre_admission_cause(ollp_err),
                     });
                 }
                 orchestrator
@@ -105,7 +140,7 @@ where
         match outcome {
             // Return the completed txn's id so the caller can drain the applied
             // Response (RETURNING rows) the scheduler deposited before the ack.
-            AttemptOutcome::Completed => return Ok(txn_id),
+            AttemptOutcome::Completed => return Ok(DependentOutcome::Committed(txn_id)),
             // Terminal, NON-retryable: the global cross-shard OCC verdict was
             // ABORT (read-set validation failed). A serialization failure is a
             // terminal verdict, not OLLP predicate drift — a fresh reconnaissance
@@ -131,6 +166,7 @@ where
                 if retry >= ollp_max_retries {
                     return Err(Error::OllpExhausted {
                         retries: ollp_max_retries.min(u8::MAX as u32) as u8,
+                        cause: OllpExhaustedCause::PredicateDrift,
                     });
                 }
                 orchestrator

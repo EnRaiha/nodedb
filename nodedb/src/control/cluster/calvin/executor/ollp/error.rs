@@ -26,4 +26,17 @@ pub enum OllpError {
     /// An underlying sequencer error prevented submission.
     #[error("OLLP sequencer error: {0}")]
     Sequencer(#[from] SequencerError),
+
+    /// A pre-admission step failed deterministically (`TxClass` construction,
+    /// authorization, derived edge-task synthesis). The same inputs produce the
+    /// same failure, so the retry loop surfaces it instead of burning its
+    /// budget and reporting predicate drift that never happened.
+    #[error("OLLP pre-admission failure: {0}")]
+    Terminal(Box<crate::Error>),
+
+    /// A pre-admission step failed for a reason a retry can clear (a routed
+    /// submit that raced a leader change). Retried, but the cause travels so
+    /// exhaustion reports it rather than a drift claim.
+    #[error("OLLP routed submit failed: {0}")]
+    Retryable(Box<crate::Error>),
 }

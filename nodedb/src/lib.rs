@@ -39,6 +39,6 @@ pub mod version;
 pub mod wal;
 
 pub use config::{EngineConfig, ServerConfig};
-pub use error::{Error, Result};
+pub use error::{Error, OllpExhaustedCause, Result};
 pub use nodedb_types::error::{ErrorCode, NodeDbError, NodeDbResult};
 pub use types::{DocumentId, Lsn, ReadConsistency, RequestId, TenantId, VShardId};

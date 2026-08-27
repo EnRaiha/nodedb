@@ -212,6 +212,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
             if attempt > MAX_MERGE_RETRIES {
                 return Err(crate::Error::OllpExhausted {
                     retries: MAX_MERGE_RETRIES.min(u8::MAX as u32) as u8,
+                    cause: crate::OllpExhaustedCause::PredicateDrift,
                 });
             }
             // Concurrent drift: re-resolve (fresh phase 1) and retry. The

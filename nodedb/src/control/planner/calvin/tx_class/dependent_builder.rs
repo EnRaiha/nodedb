@@ -43,6 +43,8 @@ use super::shared::{
 /// set) for commit-time optimistic-concurrency validation. Autocommit paths
 /// pass an empty slice.
 ///
+/// Returns `Ok(None)` when the batch turns out to write nothing at all — the
+/// predicate matched no rows and no other task in the batch carries a write.
 /// Returns `Err` if encoding fails or the resulting TxClass is invalid.
 pub fn build_dependent_tx_class(
     tasks: &[PhysicalTask],
@@ -50,7 +52,7 @@ pub fn build_dependent_tx_class(
     collection: &str,
     predicted_surrogates: &[u32],
     reads: &[ReadSetEntry],
-) -> crate::Result<TxClass> {
+) -> crate::Result<Option<TxClass>> {
     build_dependent_tx_class_impl(
         tasks,
         tenant_id,
@@ -80,7 +82,7 @@ pub fn build_single_vshard_dependent_tx_class(
     collection: &str,
     predicted_surrogates: &[u32],
     reads: &[ReadSetEntry],
-) -> crate::Result<TxClass> {
+) -> crate::Result<Option<TxClass>> {
     build_dependent_tx_class_impl(
         tasks,
         tenant_id,
@@ -103,7 +105,7 @@ fn build_dependent_tx_class_impl(
     predicted_surrogates: &[u32],
     reads: &[ReadSetEntry],
     allow_single_vshard: bool,
-) -> crate::Result<TxClass> {
+) -> crate::Result<Option<TxClass>> {
     use std::collections::BTreeMap;
 
     let database_id = tasks
@@ -202,6 +204,14 @@ fn build_dependent_tx_class_impl(
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
     let write_set = ReadWriteSet::new(write_sets);
+    // A predicate that matched no rows, in a batch whose other tasks write
+    // nothing either, decides an empty write set: there is no state change to
+    // sequence, so no Calvin entry is proposed. `TxClass` rejects an empty
+    // write set, and that rejection is not a retryable condition — the caller
+    // returns the statement's zero-row result instead of retrying.
+    if write_set.is_empty() {
+        return Ok(None);
+    }
     // Populate the routing/identity read_set from the session read-set (a txn
     // that writes shard A but reads shard B enumerates B as a participant). An
     // empty `reads` slice yields an empty read_set.
@@ -239,7 +249,7 @@ fn build_dependent_tx_class_impl(
             versioned_reads,
         )
     };
-    result.map_err(|e| Error::BadRequest {
+    result.map(Some).map_err(|e| Error::BadRequest {
         detail: format!("invalid dependent TxClass: {e}"),
     })
 }
@@ -289,8 +299,21 @@ mod tests {
         // Single-vshard builder accepts it, with exactly one participating vshard.
         let tx =
             build_single_vshard_dependent_tx_class(&tasks, TenantId::new(1), "users", &[7, 8], &[])
-                .expect("single-vshard dependent TxClass accepted");
+                .expect("single-vshard dependent TxClass accepted")
+                .expect("non-empty write set builds a TxClass");
         assert_eq!(tx.participating_vshards().len(), 1);
         assert_eq!(tx.participating_vshards()[0].as_u32(), want_vshard);
+    }
+
+    #[test]
+    fn zero_match_predicate_builds_no_tx_class() {
+        // A predicate matching no rows decides an empty write set: nothing to
+        // sequence, so the builder reports "no transaction" rather than an
+        // error the retry loop would mistake for predicate drift.
+        let tasks = vec![bulk_delete_task("users")];
+        let built =
+            build_single_vshard_dependent_tx_class(&tasks, TenantId::new(1), "users", &[], &[])
+                .expect("zero-match predicate is not an error");
+        assert!(built.is_none(), "zero-match predicate builds no TxClass");
     }
 }

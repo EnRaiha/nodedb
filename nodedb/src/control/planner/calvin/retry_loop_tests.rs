@@ -117,7 +117,7 @@ fn converges_after_two_mismatches() {
                         let assignment = fake_assignment(inbox_seq);
                         let txn = TxnId::new(assignment.epoch, assignment.position);
                         tx.send(txn).await.expect("fake recv alive");
-                        Ok::<RoutedAssignment, OllpError>(assignment)
+                        Ok::<Option<RoutedAssignment>, OllpError>(Some(assignment))
                     }
                 },
                 rescan: move || {
@@ -131,7 +131,10 @@ fn converges_after_two_mismatches() {
             .await
         };
 
-        assert!(result.is_ok(), "expected Ok(txn_id), got {result:?}");
+        assert!(
+            matches!(result, Ok(DependentOutcome::Committed(_))),
+            "expected Committed, got {result:?}"
+        );
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
             3,
@@ -185,7 +188,7 @@ fn exhausts_on_persistent_mismatch() {
                         let assignment = fake_assignment(inbox_seq);
                         let txn = TxnId::new(assignment.epoch, assignment.position);
                         tx.send(txn).await.expect("fake recv alive");
-                        Ok::<RoutedAssignment, OllpError>(assignment)
+                        Ok::<Option<RoutedAssignment>, OllpError>(Some(assignment))
                     }
                 },
                 rescan: move || async move { Ok(vec![1]) },
@@ -194,8 +197,14 @@ fn exhausts_on_persistent_mismatch() {
         };
 
         assert!(
-            matches!(result, Err(Error::OllpExhausted { retries: 3 })),
-            "expected OllpExhausted {{ retries: 3 }}, got {result:?}"
+            matches!(
+                result,
+                Err(Error::OllpExhausted {
+                    retries: 3,
+                    cause: OllpExhaustedCause::PredicateDrift
+                })
+            ),
+            "expected drift exhaustion after 3 retries, got {result:?}"
         );
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
@@ -252,7 +261,7 @@ fn pre_admission_retry_does_not_rescan() {
                         let assignment = fake_assignment(inbox_seq);
                         let txn = TxnId::new(assignment.epoch, assignment.position);
                         tx.send(txn).await.expect("fake recv alive");
-                        Ok::<RoutedAssignment, OllpError>(assignment)
+                        Ok::<Option<RoutedAssignment>, OllpError>(Some(assignment))
                     }
                 },
                 rescan: move || {
@@ -266,7 +275,10 @@ fn pre_admission_retry_does_not_rescan() {
             .await
         };
 
-        assert!(result.is_ok(), "expected Ok(txn_id), got {result:?}");
+        assert!(
+            matches!(result, Ok(DependentOutcome::Committed(_))),
+            "expected Committed, got {result:?}"
+        );
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
             3,
@@ -279,5 +291,146 @@ fn pre_admission_retry_does_not_rescan() {
         );
         drop(tx);
         let _ = fake.await;
+    });
+}
+
+#[test]
+fn empty_write_set_short_circuits_without_submitting() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    rt.block_on(async {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let orchestrator = zero_backoff_orchestrator();
+        let rescan_calls = Arc::new(AtomicU32::new(0));
+
+        let result = {
+            let rescan_calls = Arc::clone(&rescan_calls);
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                timeout: std::time::Duration::from_secs(5),
+                ollp_max_retries: 5,
+                initial_predicted: Vec::<u32>::new(),
+                // A zero-match prediction builds no TxClass, so nothing is
+                // submitted and nothing is awaited.
+                submit: move |_predicted: &Vec<u32>| async move {
+                    Ok::<Option<RoutedAssignment>, OllpError>(None)
+                },
+                rescan: move || {
+                    let rescan_calls = Arc::clone(&rescan_calls);
+                    async move {
+                        rescan_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![1])
+                    }
+                },
+            })
+            .await
+        };
+
+        assert!(
+            matches!(result, Ok(DependentOutcome::NoOp)),
+            "expected NoOp, got {result:?}"
+        );
+        assert_eq!(
+            rescan_calls.load(Ordering::SeqCst),
+            0,
+            "an empty write set is decided, not drifting — no re-scan"
+        );
+    });
+}
+
+#[test]
+fn terminal_pre_admission_error_is_surfaced_not_retried() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    rt.block_on(async {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let orchestrator = zero_backoff_orchestrator();
+        let submit_calls = Arc::new(AtomicU64::new(0));
+
+        let result = {
+            let submit_calls = Arc::clone(&submit_calls);
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                timeout: std::time::Duration::from_secs(5),
+                ollp_max_retries: 5,
+                initial_predicted: vec![1],
+                submit: move |_predicted: &Vec<u32>| {
+                    let submit_calls = Arc::clone(&submit_calls);
+                    async move {
+                        submit_calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<Option<RoutedAssignment>, OllpError>(OllpError::Terminal(Box::new(
+                            Error::BadRequest {
+                                detail: "Calvin transaction spans multiple databases".to_owned(),
+                            },
+                        )))
+                    }
+                },
+                rescan: move || async move { Ok(vec![1]) },
+            })
+            .await
+        };
+
+        assert!(
+            matches!(result, Err(Error::BadRequest { .. })),
+            "expected the underlying error, got {result:?}"
+        );
+        assert_eq!(
+            submit_calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic pre-admission failure is not retried"
+        );
+    });
+}
+
+#[test]
+fn exhausted_pre_admission_reports_its_cause_not_drift() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    rt.block_on(async {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let orchestrator = zero_backoff_orchestrator();
+
+        let result = run_dependent_with_retry(DependentRetryArgs {
+            registry: &registry,
+            orchestrator: &orchestrator,
+            predicate_class_hash: 0xABCD,
+            timeout: std::time::Duration::from_secs(5),
+            ollp_max_retries: 2,
+            initial_predicted: vec![1],
+            // Retryable every time: the loop exhausts, and the carried cause
+            // must reach the exhaustion error instead of a drift claim.
+            submit: move |_predicted: &Vec<u32>| async move {
+                Err::<Option<RoutedAssignment>, OllpError>(OllpError::Retryable(Box::new(
+                    Error::NoLeader {
+                        vshard_id: crate::types::VShardId::new(0),
+                    },
+                )))
+            },
+            rescan: move || async move { Ok(vec![1]) },
+        })
+        .await;
+
+        let Err(Error::OllpExhausted { retries, cause }) = result else {
+            panic!("expected OllpExhausted, got {result:?}");
+        };
+        assert_eq!(retries, 2);
+        assert!(
+            matches!(cause, OllpExhaustedCause::PreAdmission(_)),
+            "pre-admission exhaustion must not be reported as drift"
+        );
+        assert!(
+            !cause.to_string().contains("matching set"),
+            "message must name the real cause: {cause}"
+        );
     });
 }

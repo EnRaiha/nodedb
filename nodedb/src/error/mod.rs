@@ -16,6 +16,8 @@
 //! `&Error` classify through the same table.
 
 mod conversions;
+mod ollp;
 mod types;
 
+pub use ollp::OllpExhaustedCause;
 pub use types::{Error, Result};

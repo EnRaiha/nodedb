@@ -461,13 +461,13 @@ pub enum Error {
     #[error("role inheritance depth {depth} exceeds the maximum allowed depth of {limit}")]
     RoleInheritanceDepthExceeded { depth: usize, limit: usize },
 
-    /// The OLLP dependent-read retry loop exhausted its budget — the
-    /// predicate's matching set kept changing across retries.
-    #[error(
-        "OLLP dependent-read exhausted {retries} retries; the predicate's matching set kept \
-         changing across retries. Consider rephrasing as a static-key UPDATE if possible."
-    )]
-    OllpExhausted { retries: u8 },
+    /// An optimistic (OLLP) retry loop exhausted its budget. `cause` names why,
+    /// so a loop that never got admitted is not reported as predicate drift.
+    #[error("optimistic retry gave up after {retries} attempts: {cause}")]
+    OllpExhausted {
+        retries: u8,
+        cause: super::ollp::OllpExhaustedCause,
+    },
 
     /// Unpromoted mirrors are read-only.
     #[error("database '{database}' is a read-only mirror; promote it before writing")]

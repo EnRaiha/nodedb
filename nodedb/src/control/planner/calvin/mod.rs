@@ -3,6 +3,7 @@
 pub mod cross_shard_mode;
 pub mod dependent_recon;
 pub mod dependent_recon_plan;
+mod dependent_recon_predicate;
 pub mod dispatch;
 pub mod dispatch_multi;
 pub mod explain;
@@ -29,7 +30,7 @@ pub use dispatch_multi::{
 };
 pub use explain::calvin_explain_preamble;
 pub use predicate::predicate_class_for_filters;
-pub use retry_loop::{DependentRetryArgs, run_dependent_with_retry};
+pub use retry_loop::{DependentOutcome, DependentRetryArgs, run_dependent_with_retry};
 pub use submit::{
     RoutedAssignment, submit_and_await_calvin, submit_and_await_calvin_with_timeout,
     submit_calvin_routed, submit_calvin_routed_assign,

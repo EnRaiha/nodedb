@@ -54,6 +54,7 @@ pub async fn run_write_resolve(
                 if attempt > MAX_WRITE_RESOLVE_RETRIES {
                     return Err(crate::Error::OllpExhausted {
                         retries: MAX_WRITE_RESOLVE_RETRIES.min(u8::MAX as u32) as u8,
+                        cause: crate::OllpExhaustedCause::PredicateDrift,
                     });
                 }
             }

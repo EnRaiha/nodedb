@@ -164,6 +164,7 @@ pub(crate) async fn run_update_from_join(
             if attempt > MAX_UPDATE_FROM_JOIN_RETRIES {
                 return Err(crate::Error::OllpExhausted {
                     retries: MAX_UPDATE_FROM_JOIN_RETRIES.min(u8::MAX as u32) as u8,
+                    cause: crate::OllpExhaustedCause::PredicateDrift,
                 });
             }
             continue;

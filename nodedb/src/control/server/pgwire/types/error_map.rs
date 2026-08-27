@@ -5,6 +5,7 @@
 use nodedb_types::error::sqlstate;
 use pgwire::error::{ErrorInfo, PgWireError};
 
+use crate::OllpExhaustedCause;
 use crate::bridge::envelope::{ErrorCode, Status};
 
 /// Create a pgwire ErrorResponse with a SQLSTATE code.
@@ -104,12 +105,22 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::DATABASE_DROPPED,
             format!("cluster in leader election; leader hint: {leader_addr}"),
         ),
-        // OLLP dependent-read retry exhaustion is client-retryable: the predicate's
-        // matching set kept drifting across fresh re-scans. Surface as a
-        // serialization failure (40001) so clients retry, not as an opaque XX000.
-        crate::Error::OllpExhausted { .. } => {
-            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
-        }
+        // OLLP retry exhaustion is retryable only when it exhausted on real
+        // drift. A pre-admission cause keeps ITS OWN sqlstate — telling a client
+        // to retry a deterministic failure just burns another round trip — and a
+        // refused admission gate is transient like any other load rejection.
+        crate::Error::OllpExhausted { cause, .. } => match cause {
+            OllpExhaustedCause::PredicateDrift => {
+                ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+            }
+            OllpExhaustedCause::PreAdmission(inner) => {
+                let (severity, code, _) = error_to_sqlstate(inner);
+                (severity, code, err.to_string())
+            }
+            OllpExhaustedCause::AdmissionRefused { .. } => {
+                ("ERROR", sqlstate::TOO_MANY_CONNECTIONS, err.to_string())
+            }
+        },
         crate::Error::RemoteTyped { code, message } => {
             ("ERROR", numeric_code_to_sqlstate(*code), message.clone())
         }
@@ -141,7 +152,7 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         // Mirrors the `RejectedConstraint` arm.
         Ec::CONSTRAINT_VIOLATION => sqlstate::UNIQUE_VIOLATION,
         // Mirrors the `ConflictRetry` / `CalvinSerializationConflict` /
-        // `SourceFrozen` / `OllpExhausted` arms.
+        // `SourceFrozen` arms, and `OllpExhausted` when it exhausted on drift.
         Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
         // Mirrors the `DeadlineExceeded` arm.
         Ec::DEADLINE_EXCEEDED => sqlstate::QUERY_CANCELED,
