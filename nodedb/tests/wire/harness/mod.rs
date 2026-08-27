@@ -15,7 +15,6 @@ mod types;
 
 pub mod insert_returning_engines;
 
-// Mirrors the whole `TestServer` API surface `pgwire_harness` exposes, so
-// porting a test file is an import swap; unused parts have no caller yet.
-#[allow(unused_imports)]
-pub use types::{TestClient, TestDataDir, TestServer};
+// Mirrors the `TestServer` API surface `pgwire_harness` exposes, so porting a
+// test file is an import swap.
+pub use types::TestServer;
