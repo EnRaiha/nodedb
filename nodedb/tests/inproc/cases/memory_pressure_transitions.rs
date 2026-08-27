@@ -6,9 +6,6 @@
 //! `make_governor_at` from `pressure.rs` is inlined here — it is trivial (four
 //! lines of book-keeping) and inlining avoids any production API surface change.
 
-#[path = "executor_tests/helpers.rs"]
-mod helpers;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -56,7 +53,7 @@ fn make_governor_at(engine: EngineId, utilization_percent: u8) -> Arc<MemoryGove
 
 #[test]
 fn normal_pressure_read_depth_unchanged_and_no_suspension() {
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     core.set_governor(make_governor_at(EngineId::Vector, 50));
     core.apply_spsc_pressure();
 
@@ -76,7 +73,7 @@ fn normal_pressure_read_depth_unchanged_and_no_suspension() {
 
 #[test]
 fn warning_pressure_read_depth_unchanged_and_no_suspension() {
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     core.set_governor(make_governor_at(EngineId::Vector, 75));
     core.apply_spsc_pressure();
 
@@ -95,7 +92,7 @@ fn warning_pressure_read_depth_unchanged_and_no_suspension() {
 
 #[test]
 fn critical_pressure_halves_read_depth_and_increments_metric() {
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
     core.set_governor(make_governor_at(EngineId::Vector, 88));
@@ -140,7 +137,7 @@ fn critical_check_engine_pressure_increments_metric() {
     use nodedb_types::{Surrogate, TraceId};
     use std::time::{Duration, Instant};
 
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
     core.set_governor(make_governor_at(EngineId::Vector, 88));
@@ -202,7 +199,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
     use nodedb_types::{Surrogate, TraceId};
     use std::time::{Duration, Instant};
 
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
     core.set_governor(make_governor_at(EngineId::Vector, 96));
@@ -270,7 +267,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
 
 #[test]
 fn hysteresis_clears_suspension_and_restores_read_depth_after_n_ticks() {
-    let (mut core, _tx, _rx, _dir) = helpers::make_core();
+    let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
 
     // Drive the core into Emergency to establish the suspended state.
     core.set_governor(make_governor_at(EngineId::Vector, 96));

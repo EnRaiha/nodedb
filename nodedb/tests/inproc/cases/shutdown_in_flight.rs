@@ -7,9 +7,6 @@
 //! a network error (server closed connection). The server must NEVER hang
 //! indefinitely and must exit cleanly.
 
-#[path = "../../support/mod.rs"]
-mod support;
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -77,7 +74,7 @@ async fn sigterm_during_in_flight_query_does_not_hang() {
     let mut cmd = std::process::Command::new(bin);
     // Runs the production O_DIRECT WAL wherever the data directory supports it,
     // so shutdown is exercised against the write path a deployment uses.
-    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    super::support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
     let mut child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")

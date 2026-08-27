@@ -5,9 +5,6 @@
 //! Send two SIGTERM signals in quick succession. Assert: exit code == 0,
 //! no panic, no double-free. Uses real binary.
 
-#[path = "../../support/mod.rs"]
-mod support;
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -75,7 +72,7 @@ fn double_sigterm_is_idempotent_no_panic() {
     let mut cmd = std::process::Command::new(bin);
     // Repeated-SIGTERM handling must hold for the production WAL, so direct I/O
     // stays on wherever the data directory supports it.
-    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    super::support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
     let mut child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")

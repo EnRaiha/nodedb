@@ -27,10 +27,7 @@
 //! mis-keyed owner row (wrong tenant, wrong object_type) and would
 //! still trip the integrity walker on the next restart.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
-use catalog_integrity_helpers::TENANT;
+use super::catalog_integrity_helpers::TENANT;
 use nodedb::control::cluster::recovery_check::integrity::verify_redb_integrity;
 use nodedb::control::security::catalog::SystemCatalog;
 use nodedb::control::security::catalog::auth_types::StoredOwner;

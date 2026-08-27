@@ -8,9 +8,6 @@
 //!
 //! Real process. Real signal. Real timer. No mocks.
 
-#[path = "../../support/mod.rs"]
-mod support;
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -83,7 +80,7 @@ fn real_nodedb_binary_exits_within_1_second_of_sigterm() {
     let mut cmd = std::process::Command::new(bin);
     // The shutdown budget must hold for the WAL a deployment actually runs, so
     // direct I/O stays on wherever the data directory supports it.
-    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    super::support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
     let mut child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")

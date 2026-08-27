@@ -4,10 +4,7 @@
 //! divergences) plus the end-to-end clean-integrity test that applies
 //! every parent-replicated `Put<T>` variant and asserts zero violations.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
-use catalog_integrity_helpers::*;
+use super::catalog_integrity_helpers::*;
 use nodedb::control::catalog_entry::CatalogEntry;
 use nodedb::control::catalog_entry::apply::apply_to;
 use nodedb::control::cluster::recovery_check::divergence::DivergenceKind;

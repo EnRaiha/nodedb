@@ -6,10 +6,7 @@
 //! of every `CatalogEntry` variant so a new type cannot land without
 //! declaring its integrity-check status here.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
-use catalog_integrity_helpers::*;
+use super::catalog_integrity_helpers::*;
 use nodedb::control::catalog_entry::CatalogEntry;
 use nodedb::control::cluster::recovery_check::integrity::verify_redb_integrity;
 use nodedb::control::security::catalog::auth_types::StoredOwner;

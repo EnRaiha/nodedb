@@ -5,10 +5,7 @@
 //! to redb. If it does not, the next restart's integrity check aborts
 //! boot with an `OrphanRow` divergence.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
-use catalog_integrity_helpers::*;
+use super::catalog_integrity_helpers::*;
 use nodedb::control::catalog_entry::CatalogEntry;
 use nodedb::control::catalog_entry::apply::apply_to;
 use nodedb::control::cluster::recovery_check::integrity::verify_redb_integrity;

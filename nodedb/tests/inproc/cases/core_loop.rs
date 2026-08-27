@@ -3,7 +3,7 @@
 //! Integration tests for CoreLoop execution across all engines.
 
 #[path = "executor_tests/helpers.rs"]
-mod helpers;
+pub(in crate::cases) mod helpers;
 #[path = "executor_tests/test_aggregate_aliases.rs"]
 mod test_aggregate_aliases;
 #[path = "executor_tests/test_aggregate_chunk_limit.rs"]

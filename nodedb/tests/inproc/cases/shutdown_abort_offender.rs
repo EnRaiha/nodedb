@@ -10,9 +10,6 @@
 //!
 //! Uses real binary + stderr capture.
 
-#[path = "../../support/mod.rs"]
-mod support;
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -80,7 +77,7 @@ fn offender_task_aborted_at_500ms_budget() {
     let mut cmd = std::process::Command::new(bin);
     // Offender detection has to hold for the production WAL, so direct I/O
     // stays on wherever the data directory supports it.
-    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    super::support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
     let child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")

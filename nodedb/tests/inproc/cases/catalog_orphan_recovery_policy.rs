@@ -26,12 +26,9 @@
 //! These tests assert the spec, not the implementation choice
 //! between auto-repair and quarantine. Both pass.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
 use std::sync::Arc;
 
-use catalog_integrity_helpers::*;
+use super::catalog_integrity_helpers::*;
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::catalog_entry::CatalogEntry;
 use nodedb::control::catalog_entry::apply::apply_to;

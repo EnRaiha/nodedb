@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+// Helper modules several cases share. Declared once here: a file loaded
+// as a module from two places is compiled twice under two paths.
+#[path = "catalog_integrity_helpers/mod.rs"]
+mod catalog_integrity_helpers;
+#[path = "snapshot_rt_common/mod.rs"]
+mod snapshot_rt_common;
+#[path = "../../support/mod.rs"]
+mod support;
+
 mod array_cluster_sync;
 mod array_codec_roundtrip;
 mod array_sql;

@@ -11,13 +11,10 @@
 //! and in `nodedb-wal/tests/wal_collection_tombstone.rs` on the
 //! replay path.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
 use nodedb::control::security::catalog::SystemCatalog;
 use nodedb::data::executor::handlers::reclaim;
 
-use catalog_integrity_helpers::{TENANT, make_catalog, make_collection};
+use super::catalog_integrity_helpers::{TENANT, make_catalog, make_collection};
 
 /// `delete_collection` is idempotent per its doc comment. The
 /// `drop_collection` handler short-circuits re-runs by checking

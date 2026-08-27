@@ -8,9 +8,6 @@
 //!
 //! WAL segment naming: `wal-{lsn:020}.seg` under `<data_dir>/wal/`.
 
-#[path = "../../support/mod.rs"]
-mod support;
-
 use std::fs;
 use std::time::Duration;
 
@@ -30,7 +27,7 @@ fn spawn_and_wait(
     // cases fail-stop against the same WAL a deployment opens. The opt-out is
     // set only when the probe proves the filesystem cannot do it — otherwise
     // every case here would exit non-zero for the wrong reason.
-    support::direct_io::apply_wal_direct_io(&mut cmd, data_dir);
+    super::support::direct_io::apply_wal_direct_io(&mut cmd, data_dir);
     let mut child = cmd
         .env("NODEDB_DATA_DIR", data_dir)
         .env("RUST_LOG", "error")

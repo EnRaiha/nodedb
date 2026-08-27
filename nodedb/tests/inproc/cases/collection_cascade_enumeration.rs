@@ -5,9 +5,6 @@
 //! `catalog_integrity_helpers` and exercises `collect_dependents`
 //! end-to-end against every supported dependent kind.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
 use std::collections::HashSet;
 
 use nodedb::control::cascade::{
@@ -20,7 +17,7 @@ use nodedb::control::security::catalog::rls::StoredRlsPolicy;
 use nodedb::event::cdc::stream_def::ChangeStreamDef;
 use nodedb::types::DatabaseId;
 
-use catalog_integrity_helpers::{
+use super::catalog_integrity_helpers::{
     TENANT, make_catalog, make_mv_sourced, make_schedule, make_sequence, make_stream, make_trigger,
 };
 

@@ -2,10 +2,7 @@
 
 //! Regression coverage for `DROP USER` ownership/grant cleanup and recovery.
 
-#[path = "catalog_integrity_helpers/mod.rs"]
-mod catalog_integrity_helpers;
-
-use catalog_integrity_helpers::{
+use super::catalog_integrity_helpers::{
     TENANT, make_collection, make_function, make_mv_sourced, make_procedure, make_schedule,
     make_sequence, make_stream, make_trigger,
 };

@@ -27,9 +27,7 @@ use nodedb::control::cluster::snapshot_applier::DataPlaneSnapshotApplier;
 use nodedb::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder;
 use nodedb_cluster::SnapshotBuilder;
 
-#[path = "snapshot_rt_common/mod.rs"]
-mod snapshot_rt_common;
-use snapshot_rt_common::{DATA_GROUP_ID, first_value, single_node_routing};
+use super::snapshot_rt_common::{DATA_GROUP_ID, first_value, single_node_routing};
 
 #[tokio::test]
 async fn boot_restore_reinstalls_persisted_snapshot() {
