@@ -130,22 +130,22 @@ impl SyncSession {
             );
 
         let entry = CatalogEntry::PutCollectionIfAbsent(Box::new(stored));
-        let log_index =
-            match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    warn!(
-                        session = %self.session_id,
-                        collection = %msg.descriptor.name,
-                        error = %e,
-                        "CollectionSchema: failed to propose PutCollectionIfAbsent; \
-                         collection not materialized"
-                    );
-                    return None;
-                }
-            };
+        let outcome = match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry)
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(
+                    session = %self.session_id,
+                    collection = %msg.descriptor.name,
+                    error = %e,
+                    "CollectionSchema: failed to propose PutCollectionIfAbsent; \
+                     collection not materialized"
+                );
+                return None;
+            }
+        };
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            shared, &entry, log_index,
+            shared, &entry, outcome,
         );
         None
     }

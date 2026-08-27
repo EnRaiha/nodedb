@@ -5,7 +5,7 @@
 //! Ported from the pgwire `ddl::continuous_agg::create` handler. The catalog
 //! path (`propose_and_apply` for the `PutContinuousAggregate` entry, then the
 //! target-collection `propose_and_apply` + `dispatch_register_from_stored`, then
-//! the `log_index == 0` single-node `RegisterContinuousAggregate` sync dispatch),
+//! the `LocalOnly` single-node `RegisterContinuousAggregate` sync dispatch),
 //! the source-existence / timeseries / duplicate checks, the def serialization,
 //! and the target-collection descriptor are preserved verbatim; only the result
 //! construction changed from pgwire `Response` / `PgWireError` to the
@@ -165,7 +165,7 @@ pub async fn create_continuous_aggregate(
     let entry = crate::control::catalog_entry::CatalogEntry::PutContinuousAggregate(Box::new(
         stored.clone(),
     ));
-    let log_index = propose_and_apply(state, &entry)?;
+    let outcome = propose_and_apply(state, &entry)?;
 
     // Create the target collection so `SELECT * FROM <ca_name>` resolves
     // like any other relation. Schemaless document by parity with
@@ -232,10 +232,10 @@ pub async fn create_continuous_aggregate(
     }
 
     // Single-node / no-applier path: the async post-apply dispatcher
-    // only fires for `log_index > 0` (the raft-applier path). Mirror
+    // only fires on the raft-applier path. Mirror
     // the dispatch here so the local `continuous_agg_mgr` registers
     // immediately, matching the cluster behaviour.
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state.permissions.install_replicated_owner(&StoredOwner {
             database_id: stored.database_id,
             object_type:

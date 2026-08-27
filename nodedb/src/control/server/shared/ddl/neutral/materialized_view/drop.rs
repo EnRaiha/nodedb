@@ -71,12 +71,12 @@ pub fn drop_materialized_view(
             tenant_id: tenant_id.as_u64(),
             name: name.clone(),
         };
-        let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
             .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, log_index,
+            state, &entry, outcome,
         );
-        if log_index == 0 {
+        if outcome.needs_local_apply() {
             state
                 .mv_registry
                 .unregister(database_id, tenant_id.as_u64(), &name);
@@ -135,9 +135,9 @@ pub fn drop_materialized_view(
     } else {
         None
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         // No metadata Raft is active, so apply the same compound catalog
         // deletion locally and synchronously reclaim the implementation-owned
         // target collection. A reclaim failure after catalog deletion is

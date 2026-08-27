@@ -34,11 +34,10 @@ impl SystemTxnScope {
             .load(std::sync::atomic::Ordering::Acquire);
 
         // Deliberately no `ddl_buffer::activate()`, unlike the client BEGIN
-        // path. That buffer is thread-local and is only sound where the whole
-        // transaction runs on one thread; a system transaction runs on the
-        // Event Plane, where an await can move it between worker threads. A
-        // system action carries DML, so DDL buffering has nothing to do here
-        // and any DDL it did contain proposes through the normal path.
+        // path. That buffer is scoped to a client connection future, and a
+        // system transaction runs on the Event Plane outside any such scope.
+        // A system action carries DML, so DDL buffering has nothing to do
+        // here and any DDL it did contain proposes through the normal path.
         sessions
             .begin(session_id, snapshot_lsn, snapshot_epoch)
             .map_err(|detail| crate::Error::BadRequest {

@@ -3,7 +3,7 @@
 //! Protocol-neutral `DROP SCHEDULE` DDL handler.
 //!
 //! Ported from the pgwire `ddl::schedule::drop` handler. The original
-//! `propose_catalog_entry` + `log_index == 0` local-delete fallback (direct
+//! `propose_catalog_entry` + `LocalOnly` local-delete fallback (direct
 //! `catalog.delete_schedule` + in-memory registry unregister), the `_schedules`
 //! CRDT-sync tombstone delta, and the `audit_record` call are preserved
 //! verbatim; only the result construction changed from pgwire `Response` /
@@ -79,12 +79,14 @@ pub fn drop_schedule(
         tenant_id,
         name: name.clone(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let _ = catalog
             .delete_schedule_in_database(database_id, tenant_id, &name)
             .map_err(|e| DdlError {

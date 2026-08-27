@@ -141,12 +141,14 @@ fn drop_user_inner(
     let entry = crate::control::catalog_entry::CatalogEntry::DropUser {
         username: username.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    let dropped = if log_index == 0 {
+    let dropped = if outcome.needs_local_apply() {
         // Single-node fallback.
         state
             .credentials

@@ -204,11 +204,11 @@ pub fn create_oidc_provider(
     };
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog.put_oidc_provider(&provider).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog write: {e}"),
@@ -264,11 +264,11 @@ pub fn alter_oidc_provider_claim_mapping(
     provider.claim_mapping = stored_mappings;
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog.put_oidc_provider(&provider).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog write: {e}"),
@@ -319,11 +319,11 @@ pub fn drop_oidc_provider(
     let entry = CatalogEntry::DeleteOidcProvider {
         name: name.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog.delete_oidc_provider(name).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog delete: {e}"),

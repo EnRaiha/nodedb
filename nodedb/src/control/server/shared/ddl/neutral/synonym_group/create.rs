@@ -70,9 +70,9 @@ pub async fn create_synonym_group(
 
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_synonym_group(&stored)
             .map_err(|e| err("XX000", format!("catalog write: {e}")))?;

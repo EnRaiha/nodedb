@@ -47,9 +47,9 @@ pub fn propose_index_record(
         is_active: true,
     };
     let entry = CatalogEntry::PutIndexRecord(Box::new(record.clone()));
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| registry_err(format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()
@@ -73,9 +73,9 @@ pub fn propose_delete_index_record(
         name: name.to_string(),
         collection: collection.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| registry_err(format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()

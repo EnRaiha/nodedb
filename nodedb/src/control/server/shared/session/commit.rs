@@ -16,7 +16,7 @@ use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::connection::SessionId;
-use super::ddl_buffer;
+use super::ddl_flush;
 use super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 use super::overlay_drop::drop_txn_overlay;
 use super::read_set::ReadSetEntry;
@@ -272,7 +272,7 @@ pub async fn run_commit(
     drop(lease_scopes);
 
     // Flush any buffered DDL entries as a single atomic batch.
-    if let Some(reason) = ddl_buffer::flush(state) {
+    if let Some(reason) = ddl_flush::flush(state) {
         return CommitOutcome::Aborted { reason };
     }
 

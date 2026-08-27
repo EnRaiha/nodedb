@@ -63,11 +63,11 @@ fn propose_grant(
         .permissions
         .prepare_permission(target, grantee, perm, granted_by);
     let entry = CatalogEntry::PutPermission(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog.put_permission(&stored).map_err(|e| DdlError {
@@ -92,11 +92,11 @@ fn propose_revoke(
         grantee: grantee.to_string(),
         permission: perm_str.clone(),
     };
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

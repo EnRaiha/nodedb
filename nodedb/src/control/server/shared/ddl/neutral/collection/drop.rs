@@ -270,9 +270,9 @@ pub fn drop_collection(
     } else {
         None
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|error| err("XX000", error.to_string()))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         if purge {
             let purge_lsn = state.wal.next_lsn().as_u64();
@@ -350,9 +350,15 @@ pub fn drop_collection(
     // dies after propose returned but before this line, the pre-propose
     // intent record alone is enough to reconstruct the history.
     let completion = if purge {
-        format!("purged collection '{name}' (log_index={log_index})")
+        format!(
+            "purged collection '{name}' (log_index={})",
+            outcome.log_index()
+        )
     } else {
-        format!("dropped collection '{name}' (log_index={log_index})")
+        format!(
+            "dropped collection '{name}' (log_index={})",
+            outcome.log_index()
+        )
     };
     state.audit_record(
         AuditEvent::AdminAction,

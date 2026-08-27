@@ -164,9 +164,9 @@ pub fn drop_type(
         tenant_id,
         name: name.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .delete_custom_type(tenant_id, name)
             .map_err(|e| err("XX000", &format!("catalog delete: {e}")))?;
@@ -260,9 +260,9 @@ fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result
 
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCustomType(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_custom_type(&stored)
             .map_err(|e| err("XX000", &format!("catalog write: {e}")))?;

@@ -70,8 +70,8 @@ pub fn drop_trigger(
         tenant_id,
         name: name.clone(),
     };
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         crate::control::catalog_entry::post_apply::trigger::delete(
             database_id,
             tenant_id,
@@ -151,8 +151,8 @@ pub fn alter_trigger(
 
     trigger.enabled = enabled;
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
     }
     emit_trigger_put(state, &trigger);
@@ -211,8 +211,8 @@ fn alter_trigger_owner(
     let old_owner = trigger.owner.clone();
     trigger.owner = new_owner.clone();
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
     }
     emit_trigger_put(state, &trigger);

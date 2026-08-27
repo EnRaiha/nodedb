@@ -106,13 +106,13 @@ pub fn mirror_database(
     };
 
     // Propose through Raft; fall back to direct write in single-node mode.
-    let proposed = propose_catalog_entry(
+    let outcome = propose_catalog_entry(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
     .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
             .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;

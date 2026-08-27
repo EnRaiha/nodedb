@@ -4,7 +4,7 @@
 //!
 //! Ported from the pgwire `ddl::procedure::drop` handler. The catalog path
 //! (existence pre-check so `IF EXISTS` on a missing procedure never touches
-//! raft, `propose_catalog_entry` + `log_index == 0` local-delete fallback, Lite
+//! raft, `propose_catalog_entry` + `LocalOnly` local-delete fallback, Lite
 //! definition-sync broadcast, and the `audit_record` call) is preserved
 //! verbatim; only the result construction changed from pgwire `Response` /
 //! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
@@ -79,12 +79,14 @@ pub fn drop_procedure(
         tenant_id,
         name: name.clone(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let _ = catalog
             .delete_procedure_in_database(database_id, tenant_id, &name)
             .map_err(|e| DdlError {

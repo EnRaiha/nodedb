@@ -70,7 +70,7 @@ pub fn grant_database(
     };
 
     for priv_name in &privileges {
-        let proposed = propose_catalog_entry(
+        let outcome = propose_catalog_entry(
             state,
             &CatalogEntry::PutDatabaseGrant {
                 db_id: db_id.as_u64(),
@@ -83,7 +83,7 @@ pub fn grant_database(
             message: format!("catalog propose: {e}"),
         })?;
 
-        if proposed == 0 {
+        if outcome.needs_local_apply() {
             catalog
                 .put_database_grant(db_id, user_record.user_id, priv_name)
                 .map_err(|e| DdlError {
@@ -141,7 +141,7 @@ pub fn revoke_database(
     };
 
     for priv_name in &privileges {
-        let proposed = propose_catalog_entry(
+        let outcome = propose_catalog_entry(
             state,
             &CatalogEntry::DeleteDatabaseGrant {
                 db_id: db_id.as_u64(),
@@ -154,7 +154,7 @@ pub fn revoke_database(
             message: format!("catalog propose: {e}"),
         })?;
 
-        if proposed == 0 {
+        if outcome.needs_local_apply() {
             catalog
                 .delete_database_grant(db_id, user_record.user_id, priv_name)
                 .map_err(|e| DdlError {

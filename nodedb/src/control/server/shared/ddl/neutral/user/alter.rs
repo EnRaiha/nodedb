@@ -6,7 +6,7 @@
 //! Ported from the pgwire `ddl::user::alter` handler. All non-return logic
 //! (self-vs-admin permission gates, per-op `prepare_*` credential mutations,
 //! ISO-8601 expiry parsing, session-invalidation reasons, default-database
-//! resolution, catalog propose + single-node `log_index == 0` fallback +
+//! resolution, catalog propose + single-node `LocalOnly` fallback +
 //! `install_replicated_user`, and `audit_record`) is preserved verbatim; only
 //! the result construction changed from pgwire `Response` / `PgWireError` to
 //! [`DdlResult`] / [`DdlError`].
@@ -257,12 +257,14 @@ fn propose_and_install(
     invalidation: Option<crate::control::security::buses::SessionInvalidationReason>,
 ) -> Result<(), DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog.put_user(&stored).map_err(|e| DdlError {

@@ -3,7 +3,7 @@
 //! Protocol-neutral `DROP CHANGE STREAM` DDL handler.
 //!
 //! Ported from the pgwire `ddl::change_stream::drop` handler. The catalog path
-//! (`propose_catalog_entry` + `log_index == 0` local delete / registry /
+//! (`propose_catalog_entry` + `LocalOnly` local delete / registry /
 //! cdc-router cleanup, the local-only webhook task stop, and the `audit_record`
 //! call) is preserved verbatim; only the result construction changed from pgwire
 //! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
@@ -79,12 +79,14 @@ pub fn drop_change_stream(
         tenant_id,
         name: name.clone(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let _ = catalog
             .delete_change_stream(database_id, tenant_id, &name)
             .map_err(|e| DdlError {

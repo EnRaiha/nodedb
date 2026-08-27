@@ -78,16 +78,16 @@ pub async fn run(
         collections: collections.clone(),
     };
 
-    let proposed = propose_catalog_entry(state, &entry).map_err(|e| {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| {
         NodeDbError::move_tenant_cutover_failed(
             tenant_id.as_u64().to_string(),
             format!("Raft proposal failed: {e}"),
         )
     })?;
 
-    // Single-node path (proposed == 0): Raft is absent; apply directly.
+    // Single-node path (`LocalOnly`): Raft is absent; apply directly.
     // Clustered path: the entry was applied after quorum commit.
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         apply_to(&entry, catalog).map_err(|e| {
             NodeDbError::move_tenant_cutover_failed(

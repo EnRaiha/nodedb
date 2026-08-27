@@ -97,9 +97,9 @@ pub async fn upload_wasm(
     // `func` was fetched using `database_id`; retaining that descriptor in
     // the proposal keeps the update within the authenticated database scope.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(func));
-    let log_index =
+    let outcome =
         match crate::control::metadata_proposer::propose_catalog_entry(&state.shared, &entry) {
-            Ok(index) => index,
+            Ok(outcome) => outcome,
             Err(e) => {
                 return Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,7 +111,7 @@ pub async fn upload_wasm(
     crate::control::catalog_entry::apply::local::apply_locally_if_needed(
         &state.shared,
         &entry,
-        log_index,
+        outcome,
     );
 
     state.shared.audit_record_with_db(

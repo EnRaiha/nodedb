@@ -26,17 +26,17 @@ use super::CatalogEntry;
 ///   times out, which presents as a database that starts cleanly and fails
 ///   every query.
 ///
-/// `log_index == 0` means no metadata raft handle (single-node or
-/// mixed-version compat mode); the applier is bypassed there, so the caller's
-/// record is written through locally — mirroring the DDL handlers.
+/// `LocalOnly` means no metadata raft handle (single-node or mixed-version
+/// compat mode); the applier is bypassed there, so the caller's record is
+/// written through locally — mirroring the DDL handlers.
 pub fn persist_collection_replicated(
     state: &SharedState,
     database_id: DatabaseId,
     coll: &StoredCollection,
 ) -> crate::Result<()> {
     let entry = CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-    if log_index == 0 {
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
+    if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()

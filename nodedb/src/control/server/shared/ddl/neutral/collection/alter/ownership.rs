@@ -84,9 +84,9 @@ pub(super) fn alter_collection_owner(
         };
     stored.owner = new_owner.to_string();
     let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_collection(database_id, &stored)
             .map_err(|e| err("XX000", format!("catalog write: {e}")))?;

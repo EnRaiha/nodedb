@@ -214,7 +214,7 @@ pub fn drop_database(
     );
 
     // Propose the delete through Raft; fall back to direct write in single-node mode.
-    let proposed = propose_catalog_entry(
+    let outcome = propose_catalog_entry(
         state,
         &CatalogEntry::DeleteDatabase {
             db_id: db_id.as_u64(),
@@ -222,7 +222,7 @@ pub fn drop_database(
     )
     .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .delete_database(db_id)
             .map_err(|e| ddl_err("XX000", format!("catalog delete failed: {e}")))?;

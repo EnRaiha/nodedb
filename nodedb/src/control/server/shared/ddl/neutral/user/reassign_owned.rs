@@ -29,6 +29,7 @@
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::{StoredOwner, SystemCatalog};
 use crate::control::state::SharedState;
@@ -148,7 +149,7 @@ pub(super) fn reassign_owned_and_sweep_grants(
 
 /// Reassign a single owned object to `admin_name`. Re-proposes the
 /// object's `Put<Kind>` catalog entry with the rewritten in-band owner
-/// so followers converge; in single-node mode (`log_index == 0`) the
+/// so followers converge; in single-node mode (`LocalOnly`) the
 /// primary row, the `StoredOwner` row, and the in-memory owner map are
 /// all rewritten directly, since no raft apply runs to do it.
 fn reassign_one(
@@ -171,7 +172,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
             let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_collection(database_id, &stored)
                     .map_err(|e| ddl_err(format!("put collection '{name}': {e}")))?;
@@ -197,7 +198,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutFunction(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_function(&s)
                     .map_err(|e| ddl_err(format!("put function '{name}': {e}")))?;
@@ -223,7 +224,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutProcedure(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_procedure(&s)
                     .map_err(|e| ddl_err(format!("put procedure '{name}': {e}")))?;
@@ -249,7 +250,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutTrigger(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_trigger(&s)
                     .map_err(|e| ddl_err(format!("put trigger '{name}': {e}")))?;
@@ -271,7 +272,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutMaterializedView(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_materialized_view(&s)
                     .map_err(|e| ddl_err(format!("put materialized_view '{name}': {e}")))?;
@@ -291,7 +292,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 crate::control::catalog_entry::apply::apply_to(&entry, catalog)
                     .map_err(|e| ddl_err(format!("catalog apply: {e}")))?;
                 state.mv_registry.register(s);
@@ -313,7 +314,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutSequence(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_sequence(&s)
                     .map_err(|e| ddl_err(format!("put sequence '{name}': {e}")))?;
@@ -332,7 +333,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutSchedule(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_schedule(&s)
                     .map_err(|e| ddl_err(format!("put schedule '{name}': {e}")))?;
@@ -354,7 +355,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutChangeStream(Box::new(s.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_change_stream(&s)
                     .map_err(|e| ddl_err(format!("put change_stream '{name}': {e}")))?;
@@ -376,7 +377,7 @@ fn reassign_one(
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
             let entry = CatalogEntry::PutContinuousAggregate(Box::new(stored.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 catalog
                     .put_continuous_aggregate(&stored)
                     .map_err(|e| ddl_err(format!("put continuous_aggregate '{name}': {e}")))?;
@@ -402,7 +403,7 @@ fn reassign_one(
                 owner_username: admin_name.to_string(),
             };
             let entry = CatalogEntry::PutOwner(Box::new(stored.clone()));
-            if propose(state, &entry)? == 0 {
+            if propose(state, &entry)?.needs_local_apply() {
                 persist_owner_local_in_database(
                     state,
                     catalog,
@@ -435,7 +436,7 @@ pub(super) fn sweep_grants(
             grantee: grantee.clone(),
             permission: grant.permission.clone(),
         };
-        if propose(state, &entry)? == 0 {
+        if propose(state, &entry)?.needs_local_apply() {
             catalog
                 .delete_permission(&grant.target, &grantee, &grant.permission)
                 .map_err(|e| ddl_err(format!("delete permission on '{}': {e}", grant.target)))?;
@@ -483,7 +484,10 @@ fn persist_owner_local_in_database(
     Ok(())
 }
 
-pub(super) fn propose(state: &SharedState, entry: &CatalogEntry) -> Result<u64, DdlError> {
+pub(super) fn propose(
+    state: &SharedState,
+    entry: &CatalogEntry,
+) -> Result<ProposeOutcome, DdlError> {
     propose_catalog_entry(state, entry).map_err(|e| ddl_err(format!("metadata propose: {e}")))
 }
 

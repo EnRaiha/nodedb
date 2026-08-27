@@ -179,9 +179,9 @@ pub fn create_tenant(
         tenant: Box::new(stored.clone()),
         admin: Box::new(admin.clone()),
     };
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()

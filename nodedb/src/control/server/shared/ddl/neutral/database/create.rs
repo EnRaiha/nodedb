@@ -107,16 +107,16 @@ pub fn create_database(
 
     // Propose through metadata Raft group 0 so all replicas apply the
     // descriptor atomically. In single-node mode `propose_catalog_entry`
-    // returns Ok(0) immediately and falls through to the direct write below.
-    let proposed = propose_catalog_entry(
+    // reports `LocalOnly` and falls through to the direct write below.
+    let outcome = propose_catalog_entry(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
     .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
-    // Direct write for single-node mode (proposed == 0) or as a fallback
+    // Direct write for single-node mode (`LocalOnly`) or as a fallback
     // when the cluster is in mixed-version compat mode.
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
             .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;

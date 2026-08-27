@@ -51,11 +51,11 @@ fn propose_user_with_roles(
             message: e.to_string(),
         })?;
     let entry = CatalogEntry::PutUser(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog.put_user(&stored).map_err(|e| DdlError {

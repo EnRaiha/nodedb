@@ -161,7 +161,13 @@ impl Drop for NativeTxnCleanupGuard {
 impl NativeSession {
     /// Run the session. The guard begins detached cleanup on normal return,
     /// panic unwinding, or task cancellation; normal completion waits for it.
-    pub async fn run(mut self) -> crate::Result<()> {
+    pub async fn run(self) -> crate::Result<()> {
+        // The connection-scoped slots wrap the cleanup guard too, so its
+        // synchronous discard still targets this connection's DDL buffer.
+        crate::control::server::shared::session::conn_scope::scoped(self.run_guarded()).await
+    }
+
+    async fn run_guarded(mut self) -> crate::Result<()> {
         let guard = NativeTxnCleanupGuard::new(Arc::clone(&self.cleanup));
         let result = self.run_loop().await;
         guard.finish().await;

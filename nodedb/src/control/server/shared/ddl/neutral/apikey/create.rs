@@ -125,9 +125,9 @@ pub fn create_api_key(
                 accessible_databases,
             });
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog
             .put_api_key(&stored)

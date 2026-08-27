@@ -144,12 +144,14 @@ pub fn undrop_collection(
     stored.is_active = true;
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         // Single-node fallback: run the same applier the replicated path runs
         // on every node, so the restore carries every invariant of a
         // `PutCollection` apply — the collection row, its owner row, and the
@@ -159,7 +161,7 @@ pub fn undrop_collection(
     }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)
-        .with_log_index(log_index)
+        .with_log_index(outcome.log_index())
         .to_json();
     state.audit_record(
         AuditEvent::AdminAction,

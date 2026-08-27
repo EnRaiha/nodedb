@@ -32,6 +32,7 @@ pub mod notify_bus;
 pub mod otel;
 pub mod planner;
 pub mod promql;
+pub mod propose_outcome;
 pub mod request_tracker;
 pub mod rolling_upgrade;
 pub mod router;

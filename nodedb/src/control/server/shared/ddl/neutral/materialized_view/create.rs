@@ -277,10 +277,10 @@ async fn create_streaming_mv(
     let entry = crate::control::catalog_entry::CatalogEntry::PutStreamingMaterializedView(
         Box::new(def.clone()),
     );
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
-    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, log_index);
-    if log_index == 0 {
+    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
+    if outcome.needs_local_apply() {
         state.permissions.install_replicated_owner(
             &crate::control::security::catalog::StoredOwner {
                 database_id: database_id.as_u64(),

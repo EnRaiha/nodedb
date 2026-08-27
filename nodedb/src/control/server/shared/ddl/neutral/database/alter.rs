@@ -65,12 +65,12 @@ pub fn alter_database(
                 }
             }
             descriptor.name = new_name.clone();
-            let proposed = propose_catalog_entry(
+            let outcome = propose_catalog_entry(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
             )
             .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if proposed == 0 {
+            if outcome.needs_local_apply() {
                 catalog
                     .put_database(&descriptor)
                     .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
@@ -163,12 +163,12 @@ pub fn alter_database(
             )?;
             // Update the descriptor's `audit_dml` field and persist it.
             descriptor.audit_dml = *mode;
-            let proposed = propose_catalog_entry(
+            let outcome = propose_catalog_entry(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
             )
             .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if proposed == 0 {
+            if outcome.needs_local_apply() {
                 catalog
                     .put_database(&descriptor)
                     .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
@@ -197,12 +197,12 @@ pub fn alter_database(
             )?;
             let before = descriptor.idle_session_timeout_secs;
             descriptor.idle_session_timeout_secs = *secs;
-            let proposed = propose_catalog_entry(
+            let outcome = propose_catalog_entry(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
             )
             .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if proposed == 0 {
+            if outcome.needs_local_apply() {
                 catalog
                     .put_database(&descriptor)
                     .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;

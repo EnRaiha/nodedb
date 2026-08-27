@@ -68,9 +68,9 @@ pub fn propose_owner_in_database(
     let mut stored = prepare_owner(object_type, tenant_id, object_name, owner_username);
     stored.database_id = database_id;
     let entry = CatalogEntry::PutOwner(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
@@ -107,9 +107,9 @@ pub fn propose_delete_owner_in_database(
         tenant_id: tenant_id.as_u64(),
         object_name: object_name.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

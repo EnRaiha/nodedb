@@ -62,9 +62,9 @@ pub fn reap_materialized_collection(params: ReapParams<'_>) -> crate::Result<()>
     // fast path skip the `cloned_from` lookup entirely.
     desc.cloned_from = None;
 
-    let proposed =
+    let outcome =
         propose_catalog_entry(state, &CatalogEntry::PutCollection(Box::new(desc.clone())))?;
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog.put_collection(db_id, &desc)?;
     }
 

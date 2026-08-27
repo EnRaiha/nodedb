@@ -145,8 +145,8 @@ pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Res
                     name: coll.name.clone(),
                 };
                 match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
-                    Ok(log_index) => {
-                        if log_index == 0 {
+                    Ok(outcome) => {
+                        if outcome.needs_local_apply() {
                             let mut lifecycle = Some(
                                 shared
                                     .quiesce

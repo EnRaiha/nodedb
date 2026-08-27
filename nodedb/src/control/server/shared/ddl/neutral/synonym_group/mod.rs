@@ -4,7 +4,7 @@
 //!
 //! Ported from the pgwire `ddl::synonym_group` handlers. All non-return logic
 //! (tenant-admin gate, duplicate / existence checks against the in-memory
-//! `synonym_registry`, the `propose_catalog_entry` + `log_index == 0` manual
+//! `synonym_registry`, the `propose_catalog_entry` + `LocalOnly` manual
 //! catalog write, the in-memory registry update, and the Data-Plane FTS
 //! `PutSynonymGroup` / `DeleteSynonymGroup` dispatch) is preserved verbatim;
 //! only the result construction changed from pgwire `Response` / `PgWireError`

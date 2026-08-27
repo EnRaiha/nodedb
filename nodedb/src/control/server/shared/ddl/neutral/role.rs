@@ -6,7 +6,7 @@
 //! Ported from the pgwire `ddl::role` handlers. All non-return logic
 //! (tenant-admin gate, IF [NOT] EXISTS short-circuits, `prepare_role`,
 //! parent-existence + inheritance-cycle validation, catalog propose +
-//! single-node `log_index == 0` fallback, `install_replicated_role`,
+//! single-node `LocalOnly` fallback, `install_replicated_role`,
 //! `drop_role`, and `audit_record`) is preserved verbatim; only the result
 //! construction changed from pgwire `Response` / `PgWireError` to the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
@@ -62,12 +62,14 @@ pub fn create_role(
         })?;
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog.put_role(&stored).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
@@ -122,12 +124,14 @@ pub fn drop_role(
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteRole {
         name: name.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    let dropped = if log_index == 0 {
+    let dropped = if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         state
             .roles
@@ -272,12 +276,14 @@ pub fn set_role_parent(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         catalog.put_role(&stored).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),

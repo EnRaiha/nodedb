@@ -123,9 +123,9 @@ pub(super) fn apply_metadata_sections(
                     // same applier — we must NOT also put locally (double-put).
                     let entry =
                         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll));
-                    let log_index =
+                    let outcome =
                         crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-                    if log_index == 0 {
+                    if outcome.needs_local_apply() {
                         // Single-node / no-cluster fallback: apply the
                         // catalog mutation directly, matching what the
                         // applier would have done on a clustered deployment.
@@ -158,9 +158,9 @@ pub(super) fn apply_metadata_sections(
                         collection: t.collection,
                         purge_lsn: t.purge_lsn,
                     };
-                    let log_index =
+                    let outcome =
                         crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-                    if log_index == 0 {
+                    if outcome.needs_local_apply() {
                         // Single-node / no-cluster fallback: apply directly,
                         // matching the applier. A failure here is FATAL — a
                         // silently-skipped tombstone means purged writes resurrect

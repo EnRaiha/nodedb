@@ -172,17 +172,17 @@ pub fn clone_database(
         source_db_id: source_db_id.as_u64(),
     };
 
-    let proposed = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
-    // Single-node fast path (returned 0 means "no Raft, apply directly").
+    // Single-node fast path (`LocalOnly` means "no Raft, apply directly").
     //
     // Order matters for partial-failure safety: write the lineage edge first,
     // then the descriptor. If lineage succeeds and descriptor fails we roll the
     // lineage entry back — leaving no partial state. If we reversed the order,
     // a descriptor-then-lineage failure would create a clone that DROP DATABASE
     // on the source would not see as a dependent, allowing unsafe drops.
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .add_clone_child(source_db_id, target_db_id)
             .map_err(|e| ddl_err("XX000", format!("lineage write failed: {e}")))?;

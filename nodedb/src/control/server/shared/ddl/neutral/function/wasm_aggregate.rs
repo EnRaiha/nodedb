@@ -112,8 +112,8 @@ pub fn create_wasm_aggregate(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         crate::control::catalog_entry::post_apply::function::put(stored.clone(), state);
     }
     emit_function_put(state, &stored);

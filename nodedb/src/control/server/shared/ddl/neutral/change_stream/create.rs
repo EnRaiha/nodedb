@@ -4,7 +4,7 @@
 //!
 //! Ported from the pgwire `ddl::change_stream::create` handler. All non-return
 //! logic (WITH-clause parsing, `ChangeStreamDef` build, `propose_and_apply` +
-//! `log_index == 0` local registry refresh, webhook / kafka task startup, and
+//! `LocalOnly` local registry refresh, webhook / kafka task startup, and
 //! the `audit_record` call) is preserved verbatim; only the result construction
 //! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
 //! [`DdlResult`] / [`DdlError`].
@@ -170,8 +170,8 @@ pub fn create_change_stream(
     let kafka_config = def.kafka.clone();
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutChangeStream(Box::new(def.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         state.stream_registry.register(def.clone());
     }
 

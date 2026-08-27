@@ -106,7 +106,13 @@ pub(crate) async fn run(
     factory: Arc<NodeDbPgHandlerFactory>,
     context: PgConnectionContext,
 ) -> ConnectionOutcome {
-    isolate_connection_future(run_inner(stream, tls_acceptor, factory, context)).await
+    // Session slots are installed for the whole connection, not per statement:
+    // a transaction's statements are polled on whichever worker tokio picks,
+    // so the DDL buffer must follow the task across every await.
+    crate::control::server::shared::session::conn_scope::scoped(isolate_connection_future(
+        run_inner(stream, tls_acceptor, factory, context),
+    ))
+    .await
 }
 
 async fn isolate_connection_future<F>(future: F) -> ConnectionOutcome

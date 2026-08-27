@@ -56,9 +56,9 @@ pub async fn drop_synonym_group(
         tenant_id: tenant_id_u64,
         name: name.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .delete_synonym_group(tenant_id_u64, name)
             .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;

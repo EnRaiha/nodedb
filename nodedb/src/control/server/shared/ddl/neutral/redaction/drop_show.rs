@@ -49,11 +49,11 @@ pub fn drop_redaction_policy(
         collection: collection.to_string(),
         for_role: for_role.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

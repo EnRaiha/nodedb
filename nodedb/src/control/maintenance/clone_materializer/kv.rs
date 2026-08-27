@@ -57,11 +57,11 @@ pub(super) async fn materialize_kv_collection(
             bytes_done: 0,
             bytes_total: 0,
         };
-        let proposed = propose_catalog_entry(
+        let outcome = propose_catalog_entry(
             state,
             &CatalogEntry::PutCollection(Box::new(updated.clone())),
         )?;
-        if proposed == 0 {
+        if outcome.needs_local_apply() {
             catalog.put_collection(db_id, &updated)?;
         }
     }
@@ -176,11 +176,11 @@ fn checkpoint_progress(
         bytes_done: copied,
         bytes_total: total_seen,
     };
-    let proposed = propose_catalog_entry(
+    let outcome = propose_catalog_entry(
         state,
         &CatalogEntry::PutCollection(Box::new(updated.clone())),
     )?;
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog.put_collection(db_id, &updated)?;
     }
     Ok(())

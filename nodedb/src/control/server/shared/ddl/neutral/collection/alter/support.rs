@@ -11,6 +11,7 @@
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::catalog_entry::apply::local::apply_locally_if_needed;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
@@ -36,23 +37,22 @@ pub(super) fn status(command: &str) -> Vec<DdlResult> {
 /// Neutral mirror of the pgwire `ddl::catalog_propose::propose_and_apply`.
 ///
 /// Propose `entry` through the metadata raft group and, when the proposer
-/// reports `Ok(0)` (single-node / no-applier path), apply the entry locally so
+/// reports `LocalOnly`, apply the entry locally so
 /// the primary row and the companion `StoredOwner` row both land in redb.
-/// Returns the committed `log_index`.
 pub(super) fn propose_and_apply(
     state: &SharedState,
     entry: &CatalogEntry,
-) -> Result<u64, DdlError> {
-    let log_index = propose_catalog_entry(state, entry)
+) -> Result<ProposeOutcome, DdlError> {
+    let outcome = propose_catalog_entry(state, entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    apply_locally_if_needed(state, entry, log_index);
-    Ok(log_index)
+    apply_locally_if_needed(state, entry, outcome);
+    Ok(outcome)
 }
 
 /// Async variant of [`propose_and_apply`] for online DDL that runs
 /// concurrently with ingest.
 ///
-/// The local catalog apply (`log_index == 0` path) performs a redb write
+/// The local catalog apply (`LocalOnly` path) performs a redb write
 /// transaction whose `commit()` issues an `fsync`; that fsync can take tens
 /// of milliseconds. Running it inline on the Tokio worker would monopolise
 /// the worker for the duration of the flush, stalling every concurrent
@@ -66,10 +66,10 @@ pub(super) fn propose_and_apply(
 pub(super) async fn propose_and_apply_async(
     state: &SharedState,
     entry: CatalogEntry,
-) -> Result<u64, DdlError> {
-    let log_index = propose_catalog_entry(state, &entry)
+) -> Result<ProposeOutcome, DdlError> {
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         // Clone only the cheap `Arc<Database>` handle (not `SharedState`) so
         // the blocking closure owns exactly what the apply needs.
         let catalog = state.credentials.catalog().clone();
@@ -80,5 +80,5 @@ pub(super) async fn propose_and_apply_async(
         .map_err(|e| err("XX000", format!("catalog apply join: {e}")))?
         .map_err(|e| err("XX000", format!("catalog apply: {e}")))?;
     }
-    Ok(log_index)
+    Ok(outcome)
 }

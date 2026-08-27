@@ -12,7 +12,7 @@
 //! Semantics:
 //!
 //! 1. If no cluster is configured (`shared.metadata_raft` not
-//!    installed), returns `Ok(0)` immediately. The caller's legacy
+//!    installed), returns `ProposeOutcome::LocalOnly`. The caller's
 //!    single-node direct-write path stays authoritative.
 //! 2. If this node is the metadata-group leader, proposes the
 //!    entry, blocks until its local applied watermark reaches the
@@ -34,6 +34,7 @@ use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry
 use nodedb_cluster::AppliedIndexWatcher;
 
 use crate::control::catalog_entry::{self, CatalogEntry};
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::state::SharedState;
 use crate::error::Error;
 
@@ -298,9 +299,13 @@ fn lock_ddl_preparation(shared: &SharedState) -> Result<std::sync::MutexGuard<'_
 /// Propose a `CatalogEntry` and block until the local applied-index
 /// watcher confirms the entry has been applied on this node.
 ///
-/// In single-node / no-cluster mode, returns `Ok(0)` immediately so
-/// the caller can fall back to the legacy direct-write path.
-pub fn propose_catalog_entry(shared: &SharedState, entry: &CatalogEntry) -> Result<u64, Error> {
+/// The returned [`ProposeOutcome`] tells the caller whether to write the
+/// catalog itself, leave it to the applier, or do nothing because the entry
+/// is held for COMMIT.
+pub fn propose_catalog_entry(
+    shared: &SharedState,
+    entry: &CatalogEntry,
+) -> Result<ProposeOutcome, Error> {
     propose_catalog_entry_with_timeout(shared, entry, DEFAULT_PROPOSE_TIMEOUT)
 }
 
@@ -309,9 +314,18 @@ pub fn propose_catalog_entry_with_timeout(
     shared: &SharedState,
     entry: &CatalogEntry,
     timeout: Duration,
-) -> Result<u64, Error> {
+) -> Result<ProposeOutcome, Error> {
+    // Buffering is decided first, ahead of every replication-mode gate: an open
+    // transaction owns the entry regardless of whether this deployment
+    // replicates DDL, and COMMIT re-runs the mode choice for the whole batch.
+    // Entries also stay unstamped until then, so repeated mutations of one
+    // descriptor receive distinct versions in commit order.
+    if crate::control::server::shared::session::ddl_buffer::try_buffer(entry.clone()) {
+        return Ok(ProposeOutcome::Buffered);
+    }
+
     let Some(handle) = shared.metadata_raft.get() else {
-        return Ok(0);
+        return Ok(ProposeOutcome::LocalOnly);
     };
 
     // Rolling-upgrade gate: until every node in the cluster reports
@@ -320,24 +334,17 @@ pub fn propose_catalog_entry_with_timeout(
     // replicated and direct paths during a partial upgrade would
     // diverge catalog state across nodes — see
     // `control/rolling_upgrade.rs`.
+    if !shared
+        .cluster_version_view()
+        .can_activate_feature(crate::control::rolling_upgrade::DISTRIBUTED_CATALOG_VERSION)
     {
-        let vs = shared.cluster_version_view();
-        if !vs.can_activate_feature(crate::control::rolling_upgrade::DISTRIBUTED_CATALOG_VERSION) {
-            tracing::warn!(
-                min_version = vs.min_version,
-                required = crate::control::rolling_upgrade::DISTRIBUTED_CATALOG_VERSION,
-                "metadata propose: cluster in compat mode (mixed-version), \
-                 falling back to legacy direct-write path"
-            );
-            return Ok(0);
-        }
-    }
-
-    // Transactional DDL must remain unstamped until COMMIT: the batch
-    // preparation path stamps entries sequentially so repeated mutations of
-    // one descriptor receive distinct versions.
-    if crate::control::server::shared::session::ddl_buffer::try_buffer(entry.clone()) {
-        return Ok(0);
+        tracing::warn!(
+            min_version = shared.cluster_version_view().min_version,
+            required = crate::control::rolling_upgrade::DISTRIBUTED_CATALOG_VERSION,
+            "metadata propose: cluster in compat mode (mixed-version), \
+             falling back to legacy direct-write path"
+        );
+        return Ok(ProposeOutcome::LocalOnly);
     }
 
     // Serialize preparation through local apply confirmation. Without this,
@@ -433,7 +440,7 @@ pub fn propose_catalog_entry_with_timeout(
             if shared.metadata_ddl_applied_token.load(Ordering::Acquire)
                 == distributed_ddl_guard.token() =>
         {
-            Ok(log_index)
+            Ok(ProposeOutcome::Replicated { log_index })
         }
         WaitOutcome::Reached => Err(Error::Config {
             detail: "metadata DDL preparation ownership was superseded before apply".into(),

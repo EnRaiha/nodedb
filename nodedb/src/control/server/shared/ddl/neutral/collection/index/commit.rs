@@ -26,9 +26,9 @@ pub(super) async fn commit_collection_mutation(
     database_id: DatabaseId,
 ) -> Result<(), DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", e.to_string()))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

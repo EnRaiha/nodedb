@@ -91,13 +91,13 @@ pub fn promote_database(
     // Persist atomically through Raft. On restart the descriptor is reloaded
     // with status=Active + origin.status=Promoted, so the database remains
     // writable without any further intervention.
-    let proposed = propose_catalog_entry(
+    let outcome = propose_catalog_entry(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
     .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
-    if proposed == 0 {
+    if outcome.needs_local_apply() {
         catalog
             .put_database(&descriptor)
             .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;

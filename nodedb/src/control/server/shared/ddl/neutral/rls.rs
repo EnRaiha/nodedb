@@ -213,11 +213,11 @@ pub fn create_rls_policy(
     })?;
 
     let entry = CatalogEntry::PutRlsPolicy(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog.put_rls_policy(&stored).map_err(|e| DdlError {
@@ -273,11 +273,11 @@ pub fn drop_rls_policy(
         collection: qualified_collection.clone(),
         name: name.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("metadata propose: {e}"),
     })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

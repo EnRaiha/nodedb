@@ -140,8 +140,8 @@ pub fn create_function(
     // `propose_and_apply` runs the same applier locally so the
     // OWNERS row lands too.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         // The no-Raft fallback still uses the CatalogEntry applier for the
         // durable row. Run the matching post-apply hook so its owner and
         // function-cache effects match a replicated apply.

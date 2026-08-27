@@ -44,18 +44,18 @@ pub(super) fn purge_owned_for_tenant_teardown(
             purge_collection_redaction_policies(state, catalog, tenant, &owner.object_name)?;
         }
         let entry = teardown_delete_entry(kind, tenant, &owner);
-        let log_index = propose(state, &entry)?;
+        let outcome = propose(state, &entry)?;
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, log_index,
+            state, &entry, outcome,
         );
         // A `PurgeCollection` apply only deactivates the catalog row — the
         // durable owner/collection deletion and storage reclaim are the
         // post-apply half. On the clustered path the metadata applier schedules
-        // that reclaim on every node; on the single-node path (`log_index == 0`)
-        // there is no applier, so drive the same reclaim `drop.rs` runs inline.
-        // Without this the teardown leaves the owner row and never reclaims the
+        // that reclaim on every node; on the local-only path there is no
+        // applier, so drive the same reclaim `drop.rs` runs inline. Without
+        // this the teardown leaves the owner row and never reclaims the
         // collection's storage. Other owner kinds delete fully in their apply.
-        if kind == OwnerKind::Collection && log_index == 0 {
+        if kind == OwnerKind::Collection && outcome.needs_local_apply() {
             let purge_lsn = state.wal.next_lsn().as_u64();
             let reclaim = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(
@@ -76,7 +76,7 @@ pub(super) fn purge_owned_for_tenant_teardown(
                 ))
             })?;
         }
-        if log_index == 0 {
+        if outcome.needs_local_apply() {
             if kind == OwnerKind::StreamingMaterializedView {
                 state.mv_registry.unregister(
                     crate::types::DatabaseId::new(owner.database_id),
@@ -122,11 +122,11 @@ fn purge_collection_rls_policies(
             collection: qualified_collection.clone(),
             name: policy.name.clone(),
         };
-        let log_index = propose(state, &entry)?;
+        let outcome = propose(state, &entry)?;
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, log_index,
+            state, &entry, outcome,
         );
-        if log_index == 0 {
+        if outcome.needs_local_apply() {
             state.rls.install_replicated_drop_policy(
                 tenant_id,
                 &qualified_collection,
@@ -159,11 +159,11 @@ fn purge_collection_redaction_policies(
             collection: collection.to_string(),
             for_role: for_role.clone(),
         };
-        let log_index = propose(state, &entry)?;
+        let outcome = propose(state, &entry)?;
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, log_index,
+            state, &entry, outcome,
         );
-        if log_index == 0 {
+        if outcome.needs_local_apply() {
             state
                 .redaction
                 .install_replicated_drop_policy(tenant_id, collection, &for_role);

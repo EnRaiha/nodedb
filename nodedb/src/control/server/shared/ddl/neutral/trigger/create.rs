@@ -3,7 +3,7 @@
 //! Protocol-neutral `CREATE TRIGGER` DDL handler.
 //!
 //! Ported from the pgwire `ddl::trigger::create` handler. The catalog path
-//! (`propose_and_apply` + `log_index == 0` local registry refresh, the
+//! (`propose_and_apply` + `LocalOnly` local registry refresh, the
 //! `emit_trigger_put` definition-sync broadcast, and the `audit_record` call)
 //! is preserved verbatim; only the result construction changed from pgwire
 //! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
@@ -140,8 +140,8 @@ pub fn create_trigger(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(stored.clone()));
-    let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = super::super::super::catalog::propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         // The local fallback has already applied the durable CatalogEntry.
         // Mirror the applier's registry and ownership effects through its
         // post-apply hook rather than writing the registry directly.

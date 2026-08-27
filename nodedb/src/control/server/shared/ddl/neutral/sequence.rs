@@ -129,8 +129,8 @@ pub fn create_sequence(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(def.clone()));
-    let log_index = propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         state.sequence_registry.create(def).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: e.to_string(),
@@ -205,12 +205,14 @@ fn alter_restart(
         period_key: String::new(),
     };
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequenceState(Box::new(new_state));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state
             .sequence_registry
             .restart(tenant_id, name, restart_value)
@@ -250,8 +252,8 @@ fn alter_format(
     if let Some(mut def) = state.sequence_registry.get_def(tenant_id, name) {
         def.format_template = Some(tokens);
         let entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(def.clone()));
-        let log_index = propose_and_apply(state, &entry)?;
-        if log_index == 0 {
+        let outcome = propose_and_apply(state, &entry)?;
+        if outcome.needs_local_apply() {
             let _ = state.sequence_registry.remove(tenant_id, name);
             let _ = state.sequence_registry.create(def);
         }
@@ -288,12 +290,14 @@ pub fn drop_sequence(
         tenant_id,
         name: name.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback.
         {
             let catalog = state.credentials.catalog();

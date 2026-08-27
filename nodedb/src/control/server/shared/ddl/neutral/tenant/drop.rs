@@ -105,9 +105,9 @@ pub fn drop_tenant(
     reconcile_tenant_users(state, identity, tenant_id)?;
 
     let entry = CatalogEntry::DeleteTenant { tenant_id: tid };
-    let log_index = propose_catalog_entry(state, &entry)
+    let outcome = propose_catalog_entry(state, &entry)
         .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog

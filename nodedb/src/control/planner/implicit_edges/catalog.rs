@@ -24,7 +24,7 @@ use crate::types::{DatabaseId, TenantId};
 /// CREATE/ALTER COLLECTION. A bare local `put_collection` would only update the
 /// proposing node's catalog, so a DELETE coordinated on a different node would
 /// not observe the flag and would skip implicit-edge cleanup — the bug this
-/// routing gate exists to prevent. The `log_index == 0` single-node path
+/// routing gate exists to prevent. The `LocalOnly` single-node path
 /// bypasses the applier, so it writes through locally (mirrors the DDL handlers).
 pub async fn mark_collection_edge_bearing(
     state: &SharedState,
@@ -45,8 +45,8 @@ pub async fn mark_collection_edge_bearing(
     coll.has_implicit_edges = true;
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-    if log_index == 0 {
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
+    if outcome.needs_local_apply() {
         // Single-node path: the metadata applier's post-apply hook is bypassed,
         // so write through to the local catalog directly.
         catalog.put_collection(database_id, &coll)?;

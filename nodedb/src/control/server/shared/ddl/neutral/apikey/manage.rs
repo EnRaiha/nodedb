@@ -53,9 +53,9 @@ pub fn revoke_api_key(
     let entry = crate::control::catalog_entry::CatalogEntry::RevokeApiKey {
         key_id: key_id.to_string(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    let revoked = if log_index == 0 {
+    let revoked = if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         state
             .api_keys

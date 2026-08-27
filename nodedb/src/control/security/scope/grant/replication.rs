@@ -29,12 +29,12 @@ use super::types::{ScopeGrant, ScopeGrantParams, grant_key};
 ///
 /// A grant that only reached the node that decided on it would authorize there
 /// and nowhere else, so the catalog write is the applier's job on every node.
-/// The `log_index == 0` branch is the standalone-origin path, where there is
+/// The `LocalOnly` branch is the standalone-origin path, where there is
 /// no raft group to apply the entry.
 pub(crate) fn propose_grant(state: &SharedState, stored: &StoredScopeGrant) -> crate::Result<()> {
     let entry = CatalogEntry::PutScopeGrant(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_catalog_entry(state, &entry)?;
+    if outcome.needs_local_apply() {
         state.credentials.catalog().put_scope_grant(stored)?;
         state.scope_grants.install_replicated_grant(stored);
     }
@@ -53,8 +53,8 @@ pub(crate) fn propose_revoke(
         grantee_type: grantee_type.to_string(),
         grantee_id: grantee_id.to_string(),
     };
-    let log_index = propose_catalog_entry(state, &entry)?;
-    if log_index == 0 {
+    let outcome = propose_catalog_entry(state, &entry)?;
+    if outcome.needs_local_apply() {
         state
             .credentials
             .catalog()

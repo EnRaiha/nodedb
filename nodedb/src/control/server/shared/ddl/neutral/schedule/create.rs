@@ -3,7 +3,7 @@
 //! Protocol-neutral `CREATE SCHEDULE` DDL handler.
 //!
 //! Ported from the pgwire `ddl::schedule::create` handler. The catalog path
-//! (`propose_and_apply` + `log_index == 0` local registry refresh, the
+//! (`propose_and_apply` + `LocalOnly` local registry refresh, the
 //! `_schedules` CRDT-sync delta enqueue, and the `audit_record` call) is
 //! preserved verbatim; only the result construction changed from pgwire
 //! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
@@ -115,8 +115,8 @@ pub fn create_schedule(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
-    let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
-    if log_index == 0 {
+    let outcome = super::super::super::catalog::propose_and_apply(state, &entry)?;
+    if outcome.needs_local_apply() {
         state.schedule_registry.register(def.clone());
     }
 

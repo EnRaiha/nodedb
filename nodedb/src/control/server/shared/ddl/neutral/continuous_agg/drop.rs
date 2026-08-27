@@ -4,7 +4,7 @@
 //!
 //! Ported from the pgwire `ddl::continuous_agg::drop` handler. The catalog path
 //! (`propose_and_apply` for the `DeleteContinuousAggregate` entry, then the
-//! `log_index == 0` single-node `UnregisterContinuousAggregate` sync dispatch),
+//! `LocalOnly` single-node `UnregisterContinuousAggregate` sync dispatch),
 //! the `parts[3]` name extraction, and the arity check are preserved verbatim;
 //! only the result construction changed from pgwire `Response` / `PgWireError` to
 //! the protocol-neutral [`DdlResult`] / [`DdlError`]. The
@@ -95,12 +95,12 @@ pub async fn drop_continuous_aggregate(
         tenant_id: tenant_id.as_u64(),
         name: name.clone(),
     };
-    let log_index = propose_and_apply(state, &entry)?;
+    let outcome = propose_and_apply(state, &entry)?;
 
     // Single-node / no-applier path: mirror the unregister dispatch the
     // raft-applier path would have done so the local manager forgets the
     // aggregate immediately.
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         state
             .permissions
             .install_replicated_remove_owner_in_database(

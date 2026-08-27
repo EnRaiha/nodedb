@@ -84,12 +84,14 @@ pub fn drop_function(
         tenant_id,
         name: name.clone(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, log_index);
+    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
 
     // Broadcast deletion to connected Lite sessions.
     {

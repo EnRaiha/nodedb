@@ -4,7 +4,7 @@
 //!
 //! Ported from the pgwire `ddl::user::create` handler. All non-return logic
 //! (tenant-admin gate, IF NOT EXISTS short-circuit, tenant-selector
-//! resolution, `prepare_user`, catalog propose + single-node `log_index == 0`
+//! resolution, `prepare_user`, catalog propose + single-node `LocalOnly`
 //! fallback, cluster-mode `get_user` truncation retry, `install_replicated_user`,
 //! and `audit_record`) is preserved verbatim; only the result construction
 //! changed from pgwire `Response` / `PgWireError` to [`DdlResult`] / [`DdlError`].
@@ -104,12 +104,14 @@ pub fn create_user(
         })?;
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
+    let outcome =
+        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
+            DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("metadata propose: {e}"),
+            }
         })?;
-    if log_index == 0 {
+    if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback: install into the
         // in-memory cache so subsequent reads see the user.
         // Persist to redb when a catalog is wired up — the
@@ -126,7 +128,7 @@ pub fn create_user(
         }
         // CREATE USER: no open sessions exist for a brand-new user.
         state.credentials.install_replicated_user(&stored, None);
-    } else {
+    } else if outcome.is_replicated() {
         // Cluster mode: `propose_catalog_entry` waits for the
         // entry to be applied on THIS node, which runs the
         // synchronous post_apply (`install_replicated_user`)
@@ -148,6 +150,9 @@ pub fn create_user(
             });
         }
     }
+    // A `Buffered` outcome falls through: the open transaction owns the entry
+    // until COMMIT, so neither the cache install nor the truncation check
+    // applies — the user does not exist yet and must not.
 
     state.audit_record(
         AuditEvent::PrivilegeChange,
