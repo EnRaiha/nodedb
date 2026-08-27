@@ -31,13 +31,16 @@ pub fn event_test_deps(dir: &tempfile::TempDir) -> EventTestDeps {
     let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
     let catalog_path = dir.path().join("catalog.redb");
     let shared_state = SharedState::open(
-        dispatcher,
+        crate::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: crate::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: crate::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: Arc::new(crate::control::metrics::SystemMetrics::new()),
+        },
         Arc::clone(&wal),
         &catalog_path,
         &crate::config::auth::AuthConfig::default(),
         Default::default(),
-        crate::bridge::quiesce::CollectionQuiesce::new(),
-        crate::control::array_catalog::ArrayCatalog::handle(),
     )
     .unwrap();
     let cdc_router = Arc::clone(&shared_state.cdc_router);

@@ -18,4 +18,5 @@ pub mod idle_timeout_cache;
 pub use self::calvin_apply::CalvinApplyResult;
 pub use self::calvin_counters::CalvinCounters;
 pub use self::fields::SharedState;
+pub use self::init_prod::DataPlaneHandles;
 pub use self::tenant_request::TenantRequestGuard;

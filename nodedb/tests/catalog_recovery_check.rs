@@ -665,13 +665,16 @@ async fn redaction_policy_survives_restart_via_boot_load() {
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+        },
         wal,
         &catalog_path,
         &AuthConfig::default(),
         Default::default(),
-        nodedb::bridge::quiesce::CollectionQuiesce::new(),
-        nodedb::control::array_catalog::ArrayCatalog::handle(),
     )
     .expect("shared_state reopen");
 

@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_types::DatabaseId;
 
-use crate::control::metrics::SystemMetrics;
 use crate::control::security::apikey::ApiKeyStore;
 use crate::control::security::audit::AuditLog;
 use crate::control::security::blacklist::store::BlacklistStore;
@@ -65,7 +64,6 @@ pub(super) struct ProdBootstrap {
     pub(super) shutdown: Arc<ShutdownWatch>,
     pub(super) loop_registry: Arc<LoopRegistry>,
     pub(super) startup_gate: Arc<StartupGate>,
-    pub(super) system_metrics: Arc<SystemMetrics>,
     pub(super) prod_session_registry: Arc<SessionRegistry>,
     pub(super) si_bus: SessionInvalidationBus,
     pub(super) uc_bus: UserChangeBus,
@@ -293,11 +291,6 @@ pub(super) fn run(
     // it after `open()` returns by swapping via `Arc::get_mut`, installing
     // the real gate from the `StartupSequencer` it constructs.
     let startup_gate = StartupGate::pre_fired();
-    // Create system metrics up-front so the CDC router can register
-    // per-stream drop counters into the same registry that the HTTP
-    // /metrics endpoint reads.
-    let system_metrics = Arc::new(SystemMetrics::new());
-
     let shared_audit = Arc::new(Mutex::new(audit_log));
     let prod_session_registry = Arc::new(SessionRegistry::new());
     let (si_bus, uc_bus, bus_consumer_task) = super::super::buses_init::init_security_buses(
@@ -342,7 +335,6 @@ pub(super) fn run(
         shutdown,
         loop_registry,
         startup_gate,
-        system_metrics,
         prod_session_registry,
         si_bus,
         uc_bus,

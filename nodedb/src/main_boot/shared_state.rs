@@ -52,15 +52,19 @@ pub(crate) async fn open_and_wire_state(
         root_span,
     } = inputs;
 
-    // Create shared state with persistent system catalog.
+    // Create shared state with persistent system catalog. `system_metrics` is
+    // the registry the Data-Plane cores already hold, so `/metrics` reads it.
     let mut shared = SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: Arc::clone(&quiesce),
+            array_catalog: Arc::clone(&array_catalog),
+            system_metrics: Arc::clone(&system_metrics),
+        },
         Arc::clone(&wal),
         &config.catalog_path(),
         &config.auth,
         config.tuning.clone(),
-        Arc::clone(&quiesce),
-        Arc::clone(&array_catalog),
     )?;
 
     // Install startup gate, wire subsystems and cluster handles into SharedState.
@@ -72,7 +76,6 @@ pub(crate) async fn open_and_wire_state(
         bootstrap::state_wiring::SharedStateComponents {
             quarantine_registry: Arc::clone(&quarantine_registry),
             governor: Arc::clone(&governor),
-            system_metrics: Arc::clone(&system_metrics),
             array_catalog: Arc::clone(&array_catalog),
             maintenance_budget: Arc::clone(&maintenance_budget),
         },

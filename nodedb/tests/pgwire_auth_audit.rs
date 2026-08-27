@@ -22,13 +22,16 @@ fn open_with_catalog() -> (Arc<SharedState>, tempfile::TempDir) {
     let catalog_path = dir.path().join("system.redb");
     let auth_config = nodedb::config::auth::AuthConfig::default();
     let state = SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+        },
         wal,
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
-        nodedb::bridge::quiesce::CollectionQuiesce::new(),
-        nodedb::control::array_catalog::ArrayCatalog::handle(),
     )
     .unwrap();
     (state, dir)
@@ -81,13 +84,16 @@ async fn audit_flush_persists_to_catalog() {
     let auth_config = nodedb::config::auth::AuthConfig::default();
     let (dispatcher, _sides) = Dispatcher::new(1, 64);
     let state = SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+        },
         wal,
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
-        nodedb::bridge::quiesce::CollectionQuiesce::new(),
-        nodedb::control::array_catalog::ArrayCatalog::handle(),
     )
     .unwrap();
 
@@ -120,13 +126,16 @@ async fn audit_sequence_survives_restart() {
         let wal = Arc::new(nodedb::wal::WalManager::open_for_testing(&wal_path).unwrap());
         let (dispatcher, _sides) = Dispatcher::new(1, 64);
         let state = SharedState::open(
-            dispatcher,
+            nodedb::control::state::DataPlaneHandles {
+                dispatcher,
+                quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+                array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+                system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+            },
             wal,
             &catalog_path,
             &auth_config,
             nodedb_types::config::TuningConfig::default(),
-            nodedb::bridge::quiesce::CollectionQuiesce::new(),
-            nodedb::control::array_catalog::ArrayCatalog::handle(),
         )
         .unwrap();
 
@@ -149,13 +158,16 @@ async fn audit_sequence_survives_restart() {
         let wal = Arc::new(nodedb::wal::WalManager::open_for_testing(&wal_path).unwrap());
         let (dispatcher, _sides) = Dispatcher::new(1, 64);
         let state = SharedState::open(
-            dispatcher,
+            nodedb::control::state::DataPlaneHandles {
+                dispatcher,
+                quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+                array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+                system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+            },
             wal,
             &catalog_path,
             &auth_config,
             nodedb_types::config::TuningConfig::default(),
-            nodedb::bridge::quiesce::CollectionQuiesce::new(),
-            nodedb::control::array_catalog::ArrayCatalog::handle(),
         )
         .unwrap();
 

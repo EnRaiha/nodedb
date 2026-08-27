@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_types::config::TuningConfig;
 
-use crate::bridge::dispatch::Dispatcher;
 use crate::control::request_tracker::RequestTracker;
 use crate::control::security::metering::config::MeteringConfig;
 use crate::control::security::metering::quota::QuotaManager;
@@ -18,19 +17,24 @@ use crate::control::security::tenant::{TenantIsolation, TenantQuota};
 use crate::control::server::sync::dlq::{DlqConfig, SyncDlq};
 use crate::wal::WalManager;
 
+use super::handles::DataPlaneHandles;
 use crate::control::state::SharedState;
 
 impl SharedState {
     /// Create shared state with persistent credential store (for production).
     pub fn open(
-        dispatcher: Dispatcher,
+        handles: DataPlaneHandles,
         wal: Arc<WalManager>,
         catalog_path: &std::path::Path,
         auth_config: &crate::config::auth::AuthConfig,
         tuning: TuningConfig,
-        quiesce: Arc<crate::bridge::quiesce::CollectionQuiesce>,
-        array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     ) -> crate::Result<Arc<Self>> {
+        let DataPlaneHandles {
+            dispatcher,
+            quiesce,
+            array_catalog,
+            system_metrics,
+        } = handles;
         let super::bootstrap::ProdBootstrap {
             credentials,
             producer_registry,
@@ -60,7 +64,6 @@ impl SharedState {
             shutdown,
             loop_registry,
             startup_gate,
-            system_metrics,
             prod_session_registry,
             si_bus,
             uc_bus,
@@ -492,13 +495,16 @@ mod tests {
         let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
         let catalog_path = dir.join("catalog.redb");
         SharedState::open(
-            dispatcher,
+            DataPlaneHandles {
+                dispatcher,
+                quiesce: crate::bridge::quiesce::CollectionQuiesce::new(),
+                array_catalog: crate::control::array_catalog::ArrayCatalog::handle(),
+                system_metrics: Arc::new(crate::control::metrics::SystemMetrics::new()),
+            },
             wal,
             &catalog_path,
             auth_config,
             TuningConfig::default(),
-            crate::bridge::quiesce::CollectionQuiesce::new(),
-            crate::control::array_catalog::ArrayCatalog::handle(),
         )
         .expect("open shared state")
     }

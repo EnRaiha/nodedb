@@ -29,13 +29,16 @@ fn open_state(siem: Option<SiemConfig>) -> (Arc<SharedState>, tempfile::TempDir)
         ..AuthConfig::default()
     };
     let state = SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+        },
         wal,
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
-        nodedb::bridge::quiesce::CollectionQuiesce::new(),
-        nodedb::control::array_catalog::ArrayCatalog::handle(),
     )
     .expect("shared state opens");
     (state, dir)

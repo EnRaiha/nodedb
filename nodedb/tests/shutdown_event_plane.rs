@@ -68,13 +68,16 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
         let catalog_path = dir.path().join("catalog.redb");
         let shared = SharedState::open(
-            dispatcher,
+            nodedb::control::state::DataPlaneHandles {
+                dispatcher,
+                quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+                array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+                system_metrics: Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+            },
             Arc::clone(&wal),
             &catalog_path,
             &AuthConfig::default(),
             Default::default(),
-            nodedb::bridge::quiesce::CollectionQuiesce::new(),
-            nodedb::control::array_catalog::ArrayCatalog::handle(),
         )
         .expect("shared_state");
         let cdc_router = Arc::clone(&shared.cdc_router);

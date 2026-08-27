@@ -140,13 +140,16 @@ fn open_state(
         ..AuthConfig::default()
     };
     SharedState::open(
-        dispatcher,
+        nodedb::control::state::DataPlaneHandles {
+            dispatcher,
+            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
+            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
+            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
+        },
         wal,
         &dir.path().join("system.redb"),
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
-        nodedb::bridge::quiesce::CollectionQuiesce::new(),
-        nodedb::control::array_catalog::ArrayCatalog::handle(),
     )
 }
 

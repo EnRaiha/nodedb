@@ -17,7 +17,6 @@ use crate::storage::quarantine::QuarantineRegistry;
 pub struct SharedStateComponents {
     pub quarantine_registry: Arc<QuarantineRegistry>,
     pub governor: Arc<nodedb_mem::MemoryGovernor>,
-    pub system_metrics: Arc<crate::control::metrics::SystemMetrics>,
     pub array_catalog: ArrayCatalogHandle,
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
 }
@@ -43,7 +42,6 @@ pub async fn wire_state(
     let SharedStateComponents {
         quarantine_registry,
         governor,
-        system_metrics,
         array_catalog,
         maintenance_budget,
     } = components;
@@ -260,6 +258,9 @@ pub async fn wire_state(
     // requires strong count 1 AND weak count 0 — the gateway's own `Weak`
     // violates the latter). `gateway`/`gateway_invalidator` are therefore
     // `OnceLock`s, set through `&self` exactly once here at boot.
+    //
+    // That weak reference outlives this call, so every `Arc::get_mut` install
+    // above depends on running BEFORE this block: one placed after it no-ops.
     {
         let gateway = Arc::new(crate::control::gateway::Gateway::new(Arc::clone(shared)));
         let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
@@ -303,11 +304,6 @@ pub async fn wire_state(
                 }
             }
         }
-    }
-
-    // Wire system metrics into shared state.
-    if let Some(state) = Arc::get_mut(shared) {
-        state.system_metrics = Some(Arc::clone(&system_metrics));
     }
 
     Ok(())
