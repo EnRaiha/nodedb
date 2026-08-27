@@ -15,9 +15,7 @@
 //! - A conforming ingest applies: the gate is not a blanket ingest ban.
 //! - A collection with no write policy behaves exactly as before.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "ts-write-rls-secret-42";
 

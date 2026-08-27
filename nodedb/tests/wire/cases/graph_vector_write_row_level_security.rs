@@ -31,9 +31,7 @@
 //!   inserts on the strength of their own mirror.
 //! - Collections with no write policy are untouched.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use nodedb_types::id::{DatabaseId, VShardId};
 
 const PASSWORD: &str = "graph-vector-write-rls-secret-42";

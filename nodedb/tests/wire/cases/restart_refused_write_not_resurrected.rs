@@ -40,9 +40,7 @@
 //! real server binary under `kill -9` in
 //! `crash_refused_write_not_resurrected.rs`.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "restart-refused-write-secret-3";
 

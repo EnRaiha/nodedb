@@ -17,4 +17,5 @@ pub mod insert_returning_engines;
 
 // Mirrors the `TestServer` API surface `pgwire_harness` exposes, so porting a
 // test file is an import swap.
+pub(crate) use config_toml::TEST_BACKUP_KEK;
 pub use types::TestServer;

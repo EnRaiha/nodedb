@@ -28,9 +28,7 @@
 //!   check fails closed on a format mismatch rather than on policy, and an
 //!   FTS search under any read policy returns nothing at all.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "fts-body-secret-41";
 

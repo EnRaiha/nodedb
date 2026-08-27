@@ -5,9 +5,7 @@
 //!
 //! KV, Columnar, and Timeseries tests are in `pgwire_extended_query_engines.rs`.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::types::Type;
 
 // ── Spatial engine ───────────────────────────────────────────────────────────

@@ -18,9 +18,7 @@
 //! through this same DSL path, not the typed SQL `INSERT ... ON CONFLICT`
 //! path, so it belongs in this suite now that the DSL path is gated.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 fn command_count(msgs: &[SimpleQueryMessage]) -> Option<u64> {

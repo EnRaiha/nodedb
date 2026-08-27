@@ -2,9 +2,7 @@
 
 //! Extended-protocol database authorization and catalog-scope regressions.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 #[tokio::test]
 async fn prepared_parse_uses_authorized_session_database_catalog() {

@@ -22,9 +22,7 @@
 //! are currently broken will fail until the fixes land — that red is the
 //! intended regression surface for the handler rewrite.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 // ── 1. GRAPH PATH returns a path, not a BFS frontier ─────────────────

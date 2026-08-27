@@ -15,9 +15,7 @@
 //! reflected mid-transaction. Every assertion below that reads within the
 //! transaction fails on the pre-fix code.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a

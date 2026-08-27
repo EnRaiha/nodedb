@@ -10,16 +10,12 @@
 //! and the deserialization-hardening guarantees that apply on every
 //! deployment shape.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::{TEST_BACKUP_KEK, TestServer};
 
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
 use nodedb_types::backup_envelope::{EnvelopeMeta, EnvelopeWriter, HEADER_LEN, MAGIC, TRAILER_LEN};
-
-/// Fixed test KEK injected into `TestServer::start()` via `pgwire_harness`.
-const TEST_KEK: [u8; 32] = [0x42u8; 32];
 
 const TENANT: u64 = 1;
 
@@ -205,7 +201,7 @@ async fn rejects_tenant_mismatch() {
     });
     writer.push_section(0, vec![]).unwrap();
     let bytes = writer
-        .finalize_encrypted(&TEST_KEK)
+        .finalize_encrypted(&TEST_BACKUP_KEK)
         .expect("finalize_encrypted");
     let err = push_restore(&server, TENANT, bytes, false)
         .await

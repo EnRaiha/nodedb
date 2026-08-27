@@ -19,9 +19,7 @@
 //!   read, so the gate is not a blanket in-transaction write ban.
 //! - Nothing a refused statement touched survives the transaction.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 const PASSWORD: &str = "col-tx-rls-secret-42";

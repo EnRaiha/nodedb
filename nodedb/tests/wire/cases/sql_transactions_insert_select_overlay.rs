@@ -7,9 +7,7 @@
 //! transaction's own later reads observe the copied rows before COMMIT.
 //! COMMIT's buffered plan replay remains the sole durable apply.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a simple-query

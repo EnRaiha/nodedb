@@ -9,10 +9,8 @@
 //! than what exists, and it would bypass the read gate every other `RETURNING`
 //! passes through.
 
-mod common;
-
-use common::insert_returning_engines;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
+use crate::harness::insert_returning_engines;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Number of RESULT SETS in a simple-query response: PostgreSQL emits exactly

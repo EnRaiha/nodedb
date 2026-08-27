@@ -5,9 +5,7 @@
 //! violations at the offending statement, while COMMIT remains the sole
 //! durable apply (a post-commit SELECT sees the writes; ROLLBACK sees none).
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a simple-query

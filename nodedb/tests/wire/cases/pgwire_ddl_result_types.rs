@@ -18,9 +18,7 @@
 //! `DataRow`'s raw text bytes, then asserts they match the OIDs the DDL
 //! field builders declare today.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 

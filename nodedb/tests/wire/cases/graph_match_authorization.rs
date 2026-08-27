@@ -14,9 +14,7 @@
 //! against every collection it could touch and refuses while any read policy
 //! applies to the caller.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "match-authz-secret-7";
 

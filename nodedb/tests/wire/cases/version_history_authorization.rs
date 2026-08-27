@@ -16,9 +16,7 @@
 //! three refuse while a read policy applies rather than returning a payload the
 //! policy cannot narrow.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "version-authz-secret-7";
 

@@ -11,6 +11,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// Fixed 32-byte backup KEK written to every spawned test server's key
+/// file. Test cases that hand-craft an encrypted envelope (rather than
+/// going through `BACKUP TENANT`) must encrypt with this exact key or the
+/// server rejects it as `WrongBackupKek` before reaching the check under
+/// test.
+pub(crate) const TEST_BACKUP_KEK: [u8; 32] = [0x42u8; 32];
+
 /// Which pgwire authentication mode the spawned server boots into.
 #[derive(Clone, Copy)]
 pub(super) enum AuthMode {
@@ -68,7 +75,7 @@ pub(super) fn write_config(
 /// outside this temp dir reads these backups.
 fn write_backup_kek(dir: &Path) -> PathBuf {
     let path = dir.join("backup.key");
-    std::fs::write(&path, [0u8; 32]).expect("write backup key file");
+    std::fs::write(&path, TEST_BACKUP_KEK).expect("write backup key file");
     path
 }
 

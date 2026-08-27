@@ -8,7 +8,7 @@
 //! directly, but pins the same observable behavior the resolved path
 //! preserves.
 
-use nodedb::types::{DatabaseId, VShardId};
+use nodedb_types::id::{DatabaseId, VShardId};
 
 use crate::harness::TestServer;
 

@@ -3,11 +3,9 @@
 //! End-to-end tests for trigger execution: CREATE/DROP lifecycle,
 //! BEFORE validation, INSTEAD OF, ALTER ENABLE/DISABLE, SECURITY DEFINER.
 
-mod common;
-
 use std::time::Duration;
 
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// CREATE TRIGGER succeeds and DROP removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -15,9 +15,7 @@
 //! aggregate / time-bucket branch is committed-only (continuous-aggregate
 //! correctness), which the `..._aggregate_is_committed_only` test pins.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a

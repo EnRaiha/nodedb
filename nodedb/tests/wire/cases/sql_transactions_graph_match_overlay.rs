@@ -29,9 +29,7 @@
 //! `staged_only_node_expands_as_source` instead, where the overlay is exercised
 //! without the SQL staging gate.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 async fn create_collection(server: &TestServer) {

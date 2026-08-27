@@ -8,9 +8,7 @@
 //! plan against the wrong tenant's catalog. Also covers Trust-mode accepting
 //! usernames that were never created as if they were superusers.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// Helper: superuser-side bootstrap — create a tenant and a tenant-scoped
 /// user, plus a collection owned by that tenant. The harness's default

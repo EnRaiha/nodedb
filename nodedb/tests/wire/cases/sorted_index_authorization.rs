@@ -15,9 +15,7 @@
 //! or a list of keys, never a row body — so a read policy makes the answer
 //! unrepresentable rather than smaller, and the read fails closed.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "sidx-secret-42";
 

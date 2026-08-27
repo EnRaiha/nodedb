@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use crate::harness::TestServer;
+mod common;
+
+use common::pgwire_harness::TestServer;
 use nodedb::event::watermark::WatermarkStore;
 use nodedb::types::Lsn;
 

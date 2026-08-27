@@ -11,9 +11,7 @@
 //! Every predicate here is on the NON-PK column `n`, so the plan compiles to
 //! `BulkUpdate` / `BulkDelete` rather than the point-write path.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a simple-query

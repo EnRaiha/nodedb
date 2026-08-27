@@ -11,9 +11,7 @@
 //! filter has nothing to evaluate. They therefore refuse under a read policy
 //! rather than leaking the topology of rows whose contents are protected.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "probe-secret-99";
 

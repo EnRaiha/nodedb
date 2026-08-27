@@ -9,9 +9,7 @@
 //!
 //! KV is the first non-Document engine wired into the staging overlay.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// Affected-row count carried by the first `CommandComplete` in a simple-query

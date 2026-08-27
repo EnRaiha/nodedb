@@ -10,9 +10,7 @@
 //! Scope: value + TTL overlay on Document (schemaless/strict) and KV. Graph
 //! overlay and the native protocol are separate units and not exercised here.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 /// The `n` column of the first row returned by `sql`, run on the transaction's

@@ -14,9 +14,7 @@
 //! both halves: the write is refused, and values that *are* accepted survive a
 //! binary round-trip at the declared width.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// The narrowest value that does not fit each declared width.
 const OVER_I32: i64 = i32::MAX as i64 + 1;

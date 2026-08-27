@@ -18,9 +18,7 @@
 //! an in-tx spatial `SELECT` cannot observe a same-transaction `DELETE`
 //! until `COMMIT`. This file does not test that case for that reason.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
 
 fn rows_of(msgs: &[SimpleQueryMessage], col: &str) -> Vec<String> {

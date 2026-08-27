@@ -7,9 +7,7 @@
 //! is a simple-query contract. The extended-query path must emit
 //! column-shaped rows natively so ORMs and pg drivers can read results.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::types::Type;
 
 /// Strict-document SELECT by parameterised primary key must return

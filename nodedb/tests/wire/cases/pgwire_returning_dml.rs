@@ -7,9 +7,7 @@
 //! RETURNING clause, and asserts that the correct columns and values come
 //! back as a multi-column row result.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 use tokio_postgres::types::Type;
 
 // ---------------------------------------------------------------------------

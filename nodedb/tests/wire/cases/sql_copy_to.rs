@@ -7,9 +7,7 @@
 //! NDJSON, JSON array, and CSV export paths, path-traversal rejection,
 //! missing-collection rejection, and full round-trips through COPY FROM.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 

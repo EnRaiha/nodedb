@@ -21,9 +21,7 @@
 //! applies to it, so it is checked here against the privilege the other
 //! node-wide audit readers require.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "qfn-secret-71";
 /// The role the harness superuser holds, which a redaction policy's `FOR ROLE`

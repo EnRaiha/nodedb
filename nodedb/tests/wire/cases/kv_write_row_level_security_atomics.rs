@@ -28,9 +28,7 @@
 //!   them.
 //! - A collection with no write policy behaves exactly as before.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "kv-write-rls-secret-42";
 

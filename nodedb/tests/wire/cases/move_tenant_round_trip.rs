@@ -7,9 +7,7 @@
 //! - The tenant's collections no longer exist in the source database.
 //! - Queries routed against the target database see the original data.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 /// Helper: extract the first column of the first `Row` message.
 fn first_value(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<String> {

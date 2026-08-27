@@ -14,9 +14,7 @@
 //! on builds without jemalloc per-arena stats). Either way the call must
 //! not panic and must return a valid `VectorIndexStats`.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 fn row_columns(msg: &tokio_postgres::SimpleQueryMessage) -> Option<Vec<String>> {
     if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {

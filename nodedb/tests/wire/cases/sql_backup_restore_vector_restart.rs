@@ -14,8 +14,7 @@
 //! from a straddling WAL record being replayed on top of an already-applied
 //! insert.
 
-mod common;
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 use bytes::Bytes;
 use futures::SinkExt;

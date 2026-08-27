@@ -30,9 +30,7 @@
 //!   gate, and a conforming row must never be reported as a policy denial.
 //! - A collection with no policy is unaffected on every one of those forms.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "objlit-rls-secret-42";
 

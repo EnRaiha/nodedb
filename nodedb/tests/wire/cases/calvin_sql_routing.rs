@@ -6,7 +6,7 @@
 //! a real or mocked sequencer with full Raft.
 
 use crate::harness::TestServer;
-use nodedb::types::VShardId;
+use nodedb_types::id::VShardId;
 
 /// Find two collection names whose vShards differ. Deterministic within a process.
 fn find_two_distinct_collections() -> (String, String) {
@@ -14,7 +14,7 @@ fn find_two_distinct_collections() -> (String, String) {
     for i in 0u32..512 {
         let name = format!("col_{i}");
         let vshard =
-            VShardId::from_collection_in_database(nodedb::types::DatabaseId::DEFAULT, &name)
+            VShardId::from_collection_in_database(nodedb_types::id::DatabaseId::DEFAULT, &name)
                 .as_u32();
         if let Some((ref fname, fv)) = first {
             if fv != vshard {

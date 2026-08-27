@@ -13,9 +13,7 @@
 //! read policy applies to the caller, and narrows its rows to the collections
 //! the caller may actually read.
 
-mod common;
-
-use common::pgwire_harness::TestServer;
+use crate::harness::TestServer;
 
 const PASSWORD: &str = "analytics-authz-secret-7";
 
