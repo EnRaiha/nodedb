@@ -201,6 +201,7 @@ mod strict_bitemporal_select_star;
 mod strict_schema_restart;
 mod timeseries_declared_time_key;
 mod transactional_ddl_atomicity;
+mod txn_ddl_commit_registry_sync;
 mod vector_index_bulk_delete_reindex;
 mod vector_index_bulk_update_reindex;
 mod vector_index_merge_reindex;

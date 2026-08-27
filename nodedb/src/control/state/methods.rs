@@ -51,6 +51,19 @@ impl SharedState {
             })
     }
 
+    /// Recover a strong `Arc<SharedState>` from `&self` by upgrading the
+    /// gateway's `Weak` back-reference. Always succeeds on a booted node;
+    /// returns a typed error while racing teardown, or on a state built
+    /// without `state_wiring` (unit fixtures).
+    pub(crate) fn self_arc(&self) -> crate::Result<Arc<SharedState>> {
+        let gateway = self.gateway.get().ok_or_else(|| crate::Error::Internal {
+            detail: "SharedState::self_arc: gateway back-reference is not installed; \
+                     this state was built without `bootstrap::state_wiring`"
+                .into(),
+        })?;
+        gateway.shared()
+    }
+
     /// Whether this node is the leader of the metadata Raft group.
     ///
     /// Reuses the installed `raft_status_fn` snapshot (set by `start_raft`),

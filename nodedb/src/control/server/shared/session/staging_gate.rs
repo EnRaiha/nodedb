@@ -273,7 +273,7 @@ where
     // closure. Compare the sibling non-stageable `Buffered` route in
     // `route_in_tx_write` above: that one performs no dispatch at all until
     // COMMIT, so it is metered there instead
-    // (`session::commit::meter_committed_buffered_writes`).
+    // (`session::commit::metering::meter_committed_buffered_writes`).
     //
     // `sessions.identity` is `None` only for a session that reached this
     // point (inside a transaction block, mid-write) with no identity ever
