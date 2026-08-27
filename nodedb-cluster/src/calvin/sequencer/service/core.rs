@@ -384,7 +384,19 @@ impl SequencerService {
     /// Delegates the (heavily reasoned) safety gate to
     /// [`super::epoch_seed::derive_epoch_seed`]; `None` means it is not yet
     /// safe to mint an epoch on this node and the caller must skip the tick.
+    ///
+    /// Publishes the outcome to `metrics.epoch_seeded` so the readiness probe
+    /// can tell whether a Calvin submit landing here can be sequenced.
     fn ensure_epoch_seeded(&mut self) -> Option<u64> {
+        let seed = self.derive_or_cached_epoch();
+        self.metrics
+            .epoch_seeded
+            .store(seed.is_some(), Ordering::Relaxed);
+        seed
+    }
+
+    /// The seed itself, without the readiness publication.
+    fn derive_or_cached_epoch(&mut self) -> Option<u64> {
         // Checked ahead of the cached seed, not just before deriving one: a halt
         // can land long after the seed was taken. A halted state machine refuses
         // every epoch batch, so a minted epoch would only manufacture identities
@@ -857,6 +869,40 @@ mod tests {
             Some(0),
             "an empty sequencer group must mint epoch 0 without waiting for an entry"
         );
+    }
+
+    /// `metrics.epoch_seeded` is what the readiness probe reads to decide
+    /// whether a Calvin submit landing here can be sequenced, so it must track
+    /// the seed gate in BOTH directions, not just latch true once.
+    #[test]
+    fn epoch_seeded_metric_tracks_the_seed_gate() {
+        let mut harness = make_harness();
+        assert!(!harness.service.metrics.epoch_seeded.load(Ordering::Relaxed));
+
+        assert_eq!(harness.service.ensure_epoch_seeded(), Some(0));
+        assert!(harness.service.metrics.epoch_seeded.load(Ordering::Relaxed));
+
+        // Re-minting an epoch already consumed here halts the state machine,
+        // which refuses every later batch — the seed is no longer usable.
+        {
+            let mut sm = harness
+                .state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            sm.apply(1, &epoch_batch_bytes(0));
+            sm.apply(2, &epoch_batch_bytes(0));
+        }
+        assert!(
+            harness
+                .state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_halted(),
+            "re-applying an already-consumed epoch must halt the state machine"
+        );
+
+        assert_eq!(harness.service.ensure_epoch_seeded(), None);
+        assert!(!harness.service.metrics.epoch_seeded.load(Ordering::Relaxed));
     }
 
     /// Deferring the epoch seed must defer ONLY minting. Leadership is Raft

@@ -9,9 +9,13 @@
 //! | `/health/ready`   | GET    | WAL recovered               | readiness alt |
 //! | `/health/drain`   | POST   | Trigger graceful drain      | preStop hook  |
 
+use std::sync::atomic::Ordering;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use nodedb_cluster::ClusterInfoSnapshot;
+use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use serde_json::json;
 
 use super::super::admission::{admit_without_rate_limit, identity_database};
@@ -31,9 +35,12 @@ pub async fn live() -> impl IntoResponse {
 /// GET /healthz — k8s-style readiness probe.
 ///
 /// Returns `200 OK` when the node has reached `GatewayEnable`, is
-/// serving traffic, and is NOT draining/decommissioned. Returns
-/// `503 Service Unavailable` during startup, after startup failure,
-/// or when the node is being decommissioned.
+/// serving traffic, is NOT draining/decommissioned, and — on a node that
+/// runs a Calvin sequencer — can actually sequence a cross-shard write.
+/// Returns `503 Service Unavailable` otherwise.
+///
+/// Every condition is evaluated live on each call, not latched: sequencer
+/// leadership and the epoch seed can both be lost long after `GatewayEnable`.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // The coordinator signals this canonical watch before progressing drain
     // phases, so readiness must fail immediately even before lifecycle state
@@ -46,9 +53,17 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
     }
 
+    // One snapshot, shared by the decommission check and the sequencer
+    // serve-readiness check below — it walks every hosted Raft group, and
+    // `/healthz` is polled.
+    let cluster = state
+        .shared
+        .cluster_observer
+        .get()
+        .map(|obs| obs.snapshot());
+
     // Check decommission state via the cluster observer (if present).
-    if let Some(obs) = state.shared.cluster_observer.get() {
-        let snap = obs.snapshot();
+    if let Some(snap) = cluster.as_ref() {
         let label = snap.lifecycle_label();
         if label == "draining" || label == "decommissioned" || label == "failed" {
             let body = json!({
@@ -96,7 +111,60 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 
     let health = crate::control::startup::health::observe(&state.shared.startup);
     let (status, body) = crate::control::startup::health::to_http_response(&health);
+    // Checked only once the startup gate is otherwise green, so a node still
+    // advancing through phases keeps reporting the phase it is stuck in.
+    if status == StatusCode::OK
+        && let Some(reason) = sequencer_not_servable(&state, cluster.as_ref())
+    {
+        let body = json!({
+            "status": "starting",
+            "reason": reason,
+            "node_id": state.shared.node_id,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
     (status, axum::Json(body))
+}
+
+/// Why a cross-shard Calvin write would be refused on this node right now,
+/// or `None` when one would be accepted.
+///
+/// Mirrors the two refusals `control::planner::calvin::submit` raises before a
+/// transaction ever reaches the inbox, so a client that waits for `/healthz`
+/// and then writes cannot be told "ready" and then rejected.
+fn sequencer_not_servable(
+    state: &AppState,
+    cluster: Option<&ClusterInfoSnapshot>,
+) -> Option<&'static str> {
+    // No Calvin stack on this node (embedded / local boot with the sequencer
+    // never started): nothing to wait for, readiness is unchanged.
+    state.shared.sequencer_inbox.get()?;
+
+    // Same resolution `submit_calvin_routed` performs: a missing group entry is
+    // leader 0, which is exactly the state that refuses a submit.
+    let leader = cluster?
+        .groups
+        .iter()
+        .find(|g| g.group_id == SEQUENCER_GROUP_ID)
+        .map(|g| g.leader_id)
+        .unwrap_or(0);
+    if leader == 0 {
+        return Some("sequencer_leader_pending");
+    }
+
+    // A remote leader owns its own seed and queues the forwarded submit until
+    // it holds one; only a submit sequenced HERE needs this node's seed.
+    if leader == state.shared.node_id {
+        let seeded = state
+            .shared
+            .sequencer_metrics
+            .get()
+            .is_some_and(|m| m.epoch_seeded.load(Ordering::Relaxed));
+        if !seeded {
+            return Some("sequencer_epoch_seed_pending");
+        }
+    }
+    None
 }
 
 /// GET /health/ready — readiness check (WAL recovered, cores initialized).

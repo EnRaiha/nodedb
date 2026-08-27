@@ -14,6 +14,9 @@ use super::types::{TestClient, TestDataDir, TestServer};
 
 impl TestServer {
     /// Spawn a single-core NodeDB server and connect via pgwire (trust mode).
+    /// The `/healthz` wait in `process.rs` covers Calvin sequencer readiness,
+    /// so a cross-shard write issued right after this returns cannot lose the
+    /// post-boot election race.
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);

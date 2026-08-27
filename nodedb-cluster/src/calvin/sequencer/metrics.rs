@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Key for the per-context conflict breakdown metric.
 ///
@@ -67,6 +67,14 @@ pub struct SequencerMetrics {
     ///
     /// Updated by the inbox on every submit (+1) and every drain (−1).
     pub inbox_depth: AtomicU64,
+    /// Whether this node's sequencer holds a usable epoch seed.
+    ///
+    /// Written on every leader tick by `SequencerService::ensure_epoch_seeded`:
+    /// `true` once the seed is derived, `false` while the sequencer group is
+    /// still replaying or the state machine has halted. Stays `false` on a
+    /// follower, whose service never mints. Read by the readiness probe to tell
+    /// whether a Calvin submit landing here can actually be sequenced.
+    pub epoch_seeded: AtomicBool,
 }
 
 impl SequencerMetrics {
@@ -174,6 +182,19 @@ impl SequencerMetrics {
             self.inbox_depth.load(Ordering::Relaxed)
         );
 
+        // Epoch-seed readiness gauge.
+        let _ = writeln!(
+            out,
+            "# HELP nodedb_sequencer_epoch_seeded \
+             1 when this node's sequencer holds a usable epoch seed, 0 otherwise."
+        );
+        let _ = writeln!(out, "# TYPE nodedb_sequencer_epoch_seeded gauge");
+        let _ = writeln!(
+            out,
+            "nodedb_sequencer_epoch_seeded {}",
+            u8::from(self.epoch_seeded.load(Ordering::Relaxed))
+        );
+
         // Epoch duration histogram.
         let _ = writeln!(
             out,
@@ -253,6 +274,7 @@ impl Default for SequencerMetrics {
             epoch_duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             epoch_duration_sum_ms: AtomicU64::new(0),
             inbox_depth: AtomicU64::new(0),
+            epoch_seeded: AtomicBool::new(false),
         }
     }
 }
