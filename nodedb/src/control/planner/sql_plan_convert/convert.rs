@@ -156,6 +156,23 @@ impl ConvertContext {
         assigner.assign(self.database_id, self.tenant_id, collection, pk_bytes)
     }
 
+    /// Resolve an EXISTING pk → surrogate binding read-only, yielding
+    /// `Surrogate::ZERO` when the key is unbound. Used by writes that mutate
+    /// rows they never create (PK UPDATE / DELETE): allocating there would mint
+    /// a node-local phantom binding for a key no replica agrees on.
+    pub fn surrogate_for_existing_pk(
+        &self,
+        collection: &str,
+        pk_bytes: &[u8],
+    ) -> crate::Result<nodedb_types::Surrogate> {
+        let Some(assigner) = self.surrogate_assigner.as_ref() else {
+            return Ok(nodedb_types::Surrogate::ZERO);
+        };
+        Ok(assigner
+            .lookup(self.database_id, self.tenant_id, collection, pk_bytes)?
+            .unwrap_or(nodedb_types::Surrogate::ZERO))
+    }
+
     /// Allocate a new surrogate only while producing executable work.
     /// Metadata plans use a zero placeholder because no fresh identity exists.
     pub fn fresh_surrogate(&self, collection: &str) -> crate::Result<nodedb_types::Surrogate> {

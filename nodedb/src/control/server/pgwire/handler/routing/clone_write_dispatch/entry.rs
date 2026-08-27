@@ -29,11 +29,19 @@ impl NodeDbPgHandler {
     /// holds needs the source row suppressed too.
     pub(in crate::control::server::pgwire::handler::routing) async fn maybe_intercept_clone_write(
         &self,
-        task: &PhysicalTask,
+        task: &mut PhysicalTask,
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
     ) -> PgWireResult<CloneWriteOutcome> {
-        match &task.plan {
+        // Classify first: the shape check borrows the plan, and the document
+        // arm needs it mutably (a copy-up retargets the plan's surrogate).
+        enum Shape {
+            Document,
+            KvMutate,
+            KvInsert,
+            None,
+        }
+        let shape = match &task.plan {
             PhysicalPlan::Document(
                 DocumentOp::PointUpdate { .. }
                 | DocumentOp::PointDelete { .. }
@@ -41,22 +49,28 @@ impl NodeDbPgHandler {
                 | DocumentOp::PointPut { .. }
                 | DocumentOp::Upsert { .. }
                 | DocumentOp::BatchInsert { .. },
-            ) => {
-                self.intercept_doc_clone_write(task, identity, tenant_id)
-                    .await
-            }
-            PhysicalPlan::Kv(KvOp::FieldSet { .. } | KvOp::Delete { .. }) => {
-                self.intercept_kv_clone_write(task, identity, tenant_id)
-                    .await
-            }
+            ) => Shape::Document,
+            PhysicalPlan::Kv(KvOp::FieldSet { .. } | KvOp::Delete { .. }) => Shape::KvMutate,
             PhysicalPlan::Kv(
                 KvOp::Put { .. }
                 | KvOp::Insert { .. }
                 | KvOp::InsertIfAbsent { .. }
                 | KvOp::InsertOnConflictUpdate { .. }
                 | KvOp::BatchPut { .. },
-            ) => self.intercept_kv_clone_insert(task, tenant_id).await,
-            _ => Ok(CloneWriteOutcome::Passthrough),
+            ) => Shape::KvInsert,
+            _ => Shape::None,
+        };
+        match shape {
+            Shape::Document => {
+                self.intercept_doc_clone_write(task, identity, tenant_id)
+                    .await
+            }
+            Shape::KvMutate => {
+                self.intercept_kv_clone_write(task, identity, tenant_id)
+                    .await
+            }
+            Shape::KvInsert => self.intercept_kv_clone_insert(task, tenant_id).await,
+            Shape::None => Ok(CloneWriteOutcome::Passthrough),
         }
     }
 }

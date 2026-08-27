@@ -306,7 +306,7 @@ impl NodeDbPgHandler {
         {
             use super::clone_write_dispatch::CloneWriteOutcome;
             match self
-                .maybe_intercept_clone_write(&task, identity, tenant_id)
+                .maybe_intercept_clone_write(&mut task, identity, tenant_id)
                 .await?
             {
                 CloneWriteOutcome::Handled(resp) => {

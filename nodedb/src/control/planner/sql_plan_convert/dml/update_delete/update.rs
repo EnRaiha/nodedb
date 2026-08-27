@@ -237,9 +237,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         for key in target_keys {
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
-            // Idempotent on `(db, tenant, collection, pk)`; unbound row_key affects 0 rows.
-            let surrogate = ctx.surrogate_for_pk(collection, &pk_bytes)?;
             let plan = if let Some(fields_json) = crdt_fields_json.as_ref() {
+                // An upsert CREATES the row when the key is absent, so it owns
+                // a real identity and allocates one.
+                let surrogate = ctx.surrogate_for_pk(collection, &pk_bytes)?;
                 PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                     collection: collection.into(),
                     document_id: pk_string,
@@ -250,6 +251,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     rls_filters: Vec::new(),
                 })
             } else {
+                // Read-only resolution: a task always exists (the write hook
+                // still runs, an unbound row_key affects 0 rows, and the clone
+                // CoW resolver intercepts the ZERO sentinel), but an UPDATE
+                // creates no row, so it must never mint a binding.
+                let surrogate = ctx.surrogate_for_existing_pk(collection, &pk_bytes)?;
                 PhysicalPlan::Document(DocumentOp::PointUpdate {
                     collection: collection.into(),
                     document_id: pk_string,

@@ -133,11 +133,20 @@ fn source_surrogate(
         .map_err(|e| write_err(&format!("clone write source surrogate lookup: {e}")))
 }
 
+/// Point a `PointUpdate` plan at the surrogate the copy-up bound in the target
+/// database. The plan resolved the pk read-only, so before the copy-up there
+/// was no target binding to carry and the plan holds `Surrogate::ZERO`.
+fn retarget_point_update(plan: &mut PhysicalPlan, target: Surrogate) {
+    if let PhysicalPlan::Document(DocumentOp::PointUpdate { surrogate, .. }) = plan {
+        *surrogate = target;
+    }
+}
+
 impl NodeDbPgHandler {
     /// Handle Document CoW write interception.
     pub(super) async fn intercept_doc_clone_write(
         &self,
-        task: &PhysicalTask,
+        task: &mut PhysicalTask,
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
     ) -> PgWireResult<CloneWriteOutcome> {
@@ -321,7 +330,7 @@ impl NodeDbPgHandler {
                     return Ok(CloneWriteOutcome::Passthrough);
                 };
 
-                perform_clone_copyup(CopyUpParams {
+                let target_surrogate = perform_clone_copyup(CopyUpParams {
                     state: &Arc::clone(&self.state),
                     tenant_id,
                     target_db_id: db_id,
@@ -333,6 +342,10 @@ impl NodeDbPgHandler {
                 .await
                 .map_err(|e| write_err(&format!("clone copyup: {e}")))?;
 
+                // The copied-up row lives under a target surrogate the plan
+                // could not know: hand it to the passthrough dispatch so the
+                // UPDATE lands on that row instead of an unbound key.
+                retarget_point_update(&mut task.plan, target_surrogate);
                 Ok(CloneWriteOutcome::Passthrough)
             }
         }
