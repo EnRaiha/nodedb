@@ -135,9 +135,9 @@ pub struct GatherOutcome {
 /// All per-core sends are issued before any response is awaited (`join_all`).
 /// `NotFound` errors from individual cores are treated as "no rows" (the
 /// collection shard simply has no matching data on that core).  Any other
-/// error status from a core is noted, but only surfaces as an error if no
-/// rows were gathered at all — partial results from healthy cores are returned
-/// as-is.
+/// error status from a core fails the whole gather: a fan-out that lost one
+/// core's contribution answers a different question than the one asked, so a
+/// truncated row set must never reach the client as a success.
 pub(crate) async fn gather_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -210,7 +210,7 @@ pub(crate) async fn gather_all_cores(
     let mut shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
     // First error seen across cores, kept as a TYPED `crate::Error` so a code
     // like `DivisionByZero` surfaces as SQLSTATE 22012 rather than collapsing
-    // to a generic `Dispatch` (XX000). Only surfaced if no core produced data.
+    // to a generic `Dispatch` (XX000).
     let mut first_error: Option<crate::Error> = None;
 
     for (core_id, result) in results {
@@ -225,15 +225,10 @@ pub(crate) async fn gather_all_cores(
         };
 
         if resp.status == Status::Error {
-            if let Some(ec) = resp.error_code.as_deref() {
-                match ec {
-                    crate::bridge::envelope::ErrorCode::NotFound => continue,
-                    _ => {
-                        if first_error.is_none() {
-                            first_error = Some(ec.to_dispatch_error());
-                        }
-                    }
-                }
+            if let Err(e) = crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
             }
             continue;
         }
@@ -259,10 +254,7 @@ pub(crate) async fn gather_all_cores(
         all_elements.extend(extract_msgpack_elements(payload_bytes));
     }
 
-    if all_elements.is_empty()
-        && raw.is_empty()
-        && let Some(err) = first_error
-    {
+    if let Some(err) = first_error {
         return Err(err);
     }
 
@@ -429,12 +421,11 @@ pub(crate) async fn gather_all_vshards(
     // terminates at runtime (the plan is Exchange-free, so the re-entrant
     // resolve is a no-op), but the future must be heap-indirected so its size
     // is finite.
+    // The gateway already fails with a typed `crate::Error` — a shard's
+    // `Error::DataPlane` code included. Re-wrapping it in `Dispatch` would
+    // rewrite every such verdict as SQLSTATE XX000, so it passes through.
     let (payloads, shard_watermarks, read_version_lsn): (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn) =
-        Box::pin(gateway.execute_internal_with_watermarks(&ctx, plan))
-            .await
-            .map_err(|e| crate::Error::Dispatch {
-                detail: format!("cross-node gather via gateway: {e}"),
-            })?;
+        Box::pin(gateway.execute_internal_with_watermarks(&ctx, plan)).await?;
 
     let mut all_elements: Vec<Vec<u8>> = Vec::new();
     let mut raw = Vec::new();

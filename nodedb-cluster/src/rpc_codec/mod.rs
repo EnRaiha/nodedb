@@ -11,6 +11,7 @@
 pub mod auth_envelope;
 pub mod calvin_submit;
 pub mod cluster_mgmt;
+pub mod data_plane_error;
 pub mod data_propose;
 pub mod discriminants;
 pub mod execute;
@@ -36,6 +37,7 @@ pub use cluster_mgmt::{
     JoinGroupInfo, JoinNodeInfo, JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX, PingRequest,
     PongResponse, TopologyAck, TopologyUpdate,
 };
+pub use data_plane_error::DataPlaneErrorCode;
 pub use data_propose::{DataProposeRequest, DataProposeResponse};
 pub use execute::{
     DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd,

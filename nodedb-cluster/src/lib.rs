@@ -126,12 +126,13 @@ pub use rebalancer::{
 pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
-    AssignSurrogateRequest, AssignSurrogateResponse, JoinKeyPair, MacKey, PartNodeEntry, RaftRpc,
-    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
-    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
-    ShufflePushEnd, ShufflePushRequest, SortKey, SubmitCalvinInboxRequest,
-    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
+    AssignSurrogateRequest, AssignSurrogateResponse, DataPlaneErrorCode, JoinKeyPair, MacKey,
+    PartNodeEntry, RaftRpc, ReleaseReservationRequest, ReleaseReservationResponse,
+    ReserveReadRequest, ReserveReadResponse, ShuffleAggregateConsumeRequest,
+    ShuffleAggregateConsumeResponse, ShuffleConsumeRequest, ShuffleConsumeResponse,
+    ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
+    ShufflePushRequest, SortKey, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse,
+    SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{

@@ -6,6 +6,7 @@ mod change_events;
 mod collect;
 mod dispatch;
 mod durability_barrier;
+mod error_status;
 mod submit_write;
 mod types;
 mod write_abort;
@@ -22,6 +23,7 @@ pub(crate) use dispatch::{
     dispatch_trusted_internal_write_to_data_plane,
 };
 pub use durability_barrier::writes_acked_without_durability;
+pub(crate) use error_status::reject_data_plane_error;
 pub(crate) use submit_write::{
     ChangeFeedOwner, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering, submit_write,
 };

@@ -382,5 +382,8 @@ fn map_typed_error(err: TypedClusterError, node_id: u64) -> Error {
                 "backup node {node_id}: descriptor mismatch on collection {collection}"
             ),
         },
+        // Keep the shard's verdict typed: a backup snapshot refused by the
+        // Data Plane must not read as a generic internal backup fault.
+        TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
     }
 }

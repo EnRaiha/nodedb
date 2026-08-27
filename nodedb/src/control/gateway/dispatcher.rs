@@ -14,7 +14,9 @@ use nodedb_cluster::rpc_codec::TypedClusterError;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
+use crate::control::server::dispatch_utils::{
+    dispatch_to_data_plane_with_txn, reject_data_plane_error,
+};
 use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
@@ -281,6 +283,7 @@ async fn dispatch_local(
                 .await
             })
             .await?;
+        reject_data_plane_error(&resp)?;
         return Ok(DispatchOutcome {
             payloads: vec![resp.payload.to_vec()],
             shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
@@ -319,6 +322,11 @@ async fn dispatch_local(
         txn_id,
     )
     .await?;
+    // The remote sibling turns `ExecuteResponse.error` into `Err`; the local
+    // route must reject its own error status the same way. Keeping only the
+    // payload would hand a post-scan operator's failed expression back as an
+    // empty success — an error status is not an empty result set.
+    reject_data_plane_error(&resp)?;
     Ok(DispatchOutcome {
         payloads: vec![resp.payload.to_vec()],
         shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
@@ -362,6 +370,9 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
         TypedClusterError::DeadlineExceeded { .. } => Error::DeadlineExceeded {
             request_id: crate::types::RequestId::new(0),
         },
+        // Remote Data-Plane verdict: keep the code so the client sees the
+        // SQLSTATE local execution renders, not a generic internal error.
+        TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
         TypedClusterError::Internal { message, .. } => Error::Internal { detail: message },
     }
 }

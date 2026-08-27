@@ -23,7 +23,7 @@ use crate::types::DatabaseId;
 
 use super::plan_decode::decode_plan;
 use super::request_validation::validate_request;
-use super::support::{PLAN_DECODE_FAILED, SinkOutcome, stream_error_to_typed};
+use super::support::{PLAN_DECODE_FAILED, SinkOutcome, execution_error_to_typed};
 
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), TypedClusterError> {
     if matches!(
@@ -308,10 +308,9 @@ impl LocalPlanExecutor {
                         // Replicated writes carry no read watermark → 0: it floors a
                         // session's later reads, and this RPC seam has no session.
                         Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
-                        Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
-                            code: PLAN_DECODE_FAILED,
-                            message: e.to_string(),
-                        }),
+                        // A replicated write's apply verdict is a Data-Plane
+                        // verdict: carry its code, never flatten to internal.
+                        Err(e) => ExecuteResponse::err(execution_error_to_typed(e)),
                     };
                 }
                 Ok(None) => {}
@@ -336,10 +335,7 @@ impl LocalPlanExecutor {
                 result.watermark_lsn.as_u64(),
                 result.read_version_lsn.as_u64(),
             ),
-            Ok(Err(e)) => ExecuteResponse::err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: e.to_string(),
-            }),
+            Ok(Err(e)) => ExecuteResponse::err(execution_error_to_typed(e)),
             Err(_) => ExecuteResponse::err(TypedClusterError::DeadlineExceeded {
                 elapsed_ms: deadline.as_millis() as u64,
             }),
@@ -385,12 +381,7 @@ impl LocalPlanExecutor {
             req.txn_id,
         ) {
             Ok(s) => s,
-            Err(e) => {
-                return Some(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: e.to_string(),
-                });
-            }
+            Err(e) => return Some(execution_error_to_typed(e)),
         };
 
         let stream_fut = async {
@@ -410,7 +401,7 @@ impl LocalPlanExecutor {
                         }
                     }
                     Err(e) => {
-                        return SinkOutcome::StreamError(stream_error_to_typed(e));
+                        return SinkOutcome::StreamError(execution_error_to_typed(e));
                     }
                 }
             }

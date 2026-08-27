@@ -14,8 +14,10 @@
 //! collection, so this returns the identical row set a broadcast would have,
 //! minus the empty cores' spurious contributions.
 
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Status};
-use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::dispatch_utils::{
+    dispatch_to_data_plane_with_txn, reject_data_plane_error,
+};
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
@@ -103,21 +105,10 @@ pub async fn gather_single_owning_core(
     ))
     .await?;
 
-    // Propagate a Data-Plane error status the same way `gather_all_cores` does:
-    // a `NotFound` from the owning core means "no such slice here" and reads
-    // back as an empty (still validatable) observation; any OTHER error status
-    // must surface as a dispatch error rather than being silently swallowed as
-    // an empty success (e.g. an FTS query-validation rejection, a constraint
-    // error, or a deadline). Without this the owning-core path would drop every
-    // Data-Plane error on a single-vShard read.
-    if resp.status == Status::Error
-        && let Some(ec) = resp.error_code.as_deref()
-        && !matches!(ec, ErrorCode::NotFound)
-    {
-        // Preserve typed codes (e.g. `DivisionByZero` → SQLSTATE 22012) instead
-        // of collapsing every Data-Plane error to a generic `Dispatch` (XX000).
-        return Err(ec.to_dispatch_error());
-    }
+    // Shared boundary rule: `NotFound` reads back as an empty (still
+    // validatable) observation; any other error status surfaces with its typed
+    // code rather than being swallowed as an empty success.
+    reject_data_plane_error(&resp)?;
 
     let payload_bytes: &[u8] = resp.payload.as_ref();
     let all_elements = extract_msgpack_elements(payload_bytes);

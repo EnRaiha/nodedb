@@ -41,7 +41,7 @@ use futures::future::join_all;
 use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
 use nodedb_cluster::{
     PartNodeEntry, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
-    ShuffleProduceRequest, SortKey,
+    ShuffleProduceRequest, SortKey, TypedClusterError,
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
@@ -354,6 +354,12 @@ async fn send_consume(
             rows,
             error: None,
         })) => Ok(rows),
+        // A shard's Data-Plane verdict keeps its code so the client sees the
+        // SQLSTATE a single-node aggregate renders.
+        Ok(RaftRpc::ShuffleAggregateConsumeResponse(ShuffleAggregateConsumeResponse {
+            error: Some(TypedClusterError::DataPlane { code }),
+            ..
+        })) => Err(crate::Error::DataPlane(code.into())),
         Ok(RaftRpc::ShuffleAggregateConsumeResponse(ShuffleAggregateConsumeResponse {
             error: Some(e),
             ..

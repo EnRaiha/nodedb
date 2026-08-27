@@ -33,7 +33,7 @@ use futures::future::{join, join_all};
 use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
 use nodedb_cluster::{
     JoinKeyPair, PartNodeEntry, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse,
-    ShuffleProduceRequest,
+    ShuffleProduceRequest, TypedClusterError,
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
@@ -363,6 +363,12 @@ async fn send_consume(
         Ok(RaftRpc::ShuffleConsumeResponse(ShuffleConsumeResponse { rows, error: None })) => {
             Ok(rows)
         }
+        // A shard's Data-Plane verdict keeps its code so the client sees the
+        // SQLSTATE a single-node join renders.
+        Ok(RaftRpc::ShuffleConsumeResponse(ShuffleConsumeResponse {
+            error: Some(TypedClusterError::DataPlane { code }),
+            ..
+        })) => Err(crate::Error::DataPlane(code.into())),
         Ok(RaftRpc::ShuffleConsumeResponse(ShuffleConsumeResponse { error: Some(e), .. })) => {
             Err(crate::Error::Internal {
                 detail: format!("shuffle consume failed for part {part} on node {node}: {e:?}"),

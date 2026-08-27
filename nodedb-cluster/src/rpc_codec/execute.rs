@@ -6,6 +6,7 @@
 
 use nodedb_types::id::TxnId;
 
+use super::data_plane_error::DataPlaneErrorCode;
 use super::discriminants::*;
 use super::header::write_frame;
 use super::raft_rpc::RaftRpc;
@@ -87,6 +88,12 @@ pub enum TypedClusterError {
     Internal {
         code: u32,
         message: String,
+    },
+    /// Verbatim Data-Plane verdict from the executing shard, so the
+    /// coordinator renders the same SQLSTATE local execution renders.
+    /// Appended last: variant order is the wire ABI.
+    DataPlane {
+        code: DataPlaneErrorCode,
     },
 }
 
@@ -406,6 +413,42 @@ mod tests {
                 assert!(message.contains("plan"));
             }
             other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_execute_response_data_plane_verdict() {
+        let resp = ExecuteResponse::err(TypedClusterError::DataPlane {
+            code: DataPlaneErrorCode::DivisionByZero,
+        });
+        let decoded = roundtrip_resp(resp);
+        match decoded.error {
+            Some(TypedClusterError::DataPlane { code }) => {
+                assert_eq!(code, DataPlaneErrorCode::DivisionByZero);
+            }
+            other => panic!("expected DataPlane, got {other:?}"),
+        }
+    }
+
+    /// Payload-bearing verdicts keep every field across the hop — the detail
+    /// string is what the client reads back.
+    #[test]
+    fn roundtrip_execute_response_data_plane_payload() {
+        let resp = ExecuteResponse::err(TypedClusterError::DataPlane {
+            code: DataPlaneErrorCode::RejectedConstraint {
+                constraint: "unique".into(),
+                detail: "key (id)=(7) already exists".into(),
+            },
+        });
+        let decoded = roundtrip_resp(resp);
+        match decoded.error {
+            Some(TypedClusterError::DataPlane {
+                code: DataPlaneErrorCode::RejectedConstraint { constraint, detail },
+            }) => {
+                assert_eq!(constraint, "unique");
+                assert!(detail.contains("(id)=(7)"));
+            }
+            other => panic!("expected DataPlane RejectedConstraint, got {other:?}"),
         }
     }
 

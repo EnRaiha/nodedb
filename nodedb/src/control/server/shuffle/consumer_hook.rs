@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 use nodedb_cluster::{ShuffleConsumeRequest, ShuffleConsumeResponse, TypedClusterError};
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
-use crate::bridge::envelope::{Priority, Request, Status};
+use crate::bridge::envelope::{ErrorCode, Priority, Request, Status};
+use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
 use crate::control::server::dispatch_utils::{DispatchCollectError, collect_bounded_response};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId};
@@ -209,15 +210,18 @@ impl RegistryShuffleConsumer {
         {
             Ok(Ok(resp)) => {
                 if resp.status == Status::Error {
-                    let msg = resp
-                        .error_code
-                        .as_ref()
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "unknown error".into());
-                    Err(TypedClusterError::Internal {
-                        code: 0,
-                        message: format!("shuffle consume join failed: {msg}"),
-                    })
+                    // Carry the shard's verdict code across the hop; an error
+                    // status with no code fails closed as an internal verdict
+                    // rather than reading as an empty join result.
+                    let code = match resp.error_code.as_deref() {
+                        Some(code) => code.clone(),
+                        None => ErrorCode::Internal {
+                            detail: "shuffle consume join: data plane returned an error \
+                                     status with no error code"
+                                .into(),
+                        },
+                    };
+                    Err(execution_error_to_typed(crate::Error::DataPlane(code)))
                 } else {
                     // The payload is a msgpack array of join-result rows — exactly
                     // the `ShuffleConsumeResponse.rows` shape.

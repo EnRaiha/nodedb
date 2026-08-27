@@ -37,7 +37,7 @@ use nodedb_cluster::calvin::types::TxClass;
 use nodedb_cluster::calvin::{AttemptOutcome, SEQUENCER_GROUP_ID, TxnId};
 use nodedb_cluster::{
     RaftRpc, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
-    SubmitCalvinTxnResponse,
+    SubmitCalvinTxnResponse, TypedClusterError,
 };
 
 use crate::Error;
@@ -315,6 +315,13 @@ pub async fn submit_calvin_routed(
             // coordinator emits DATA-ROW output; `None` for plain writes.
             Ok(payload_bytes.map(synthetic_returning_response))
         }
+        // A Data-Plane verdict from the sequencer leader keeps its code, so a
+        // constraint violation on a routed write reaches the client as its own
+        // SQLSTATE instead of a generic internal error.
+        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
+            error: Some(TypedClusterError::DataPlane { code }),
+            ..
+        })) => Err(Error::DataPlane(code.into())),
         Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
             error: Some(e), ..
         })) => Err(Error::Internal {

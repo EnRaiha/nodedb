@@ -20,8 +20,8 @@
 //!    completion through `submit_and_await_calvin_with_timeout`, bounded by the
 //!    forwarded `deadline_remaining_ms` so it cannot outlive the coordinator's
 //!    remaining budget;
-//! 3. maps `Ok(())` → `error: None` and `Err` → a typed
-//!    [`TypedClusterError::Internal`] — never a silent drop.
+//! 3. maps `Ok(())` → `error: None` and `Err` → a typed cluster error that
+//!    keeps the Data-Plane verdict's code — never a silent drop.
 //!
 //! # Plane discipline
 //!
@@ -37,6 +37,7 @@ use std::time::Duration;
 use nodedb_cluster::calvin::types::TxClass;
 use nodedb_cluster::{SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError};
 
+use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
 use crate::control::planner::calvin::submit_and_await_calvin_with_timeout;
 use crate::control::state::SharedState;
 
@@ -86,11 +87,11 @@ impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
                 error: None,
                 payload_bytes: applied.map(|r| r.payload.to_vec()),
             },
+            // The awaited apply verdict is a Data-Plane verdict: carry its
+            // code so the coordinator renders the SQLSTATE a local write
+            // renders, instead of an uncoded internal error.
             Err(e) => SubmitCalvinTxnResponse {
-                error: Some(TypedClusterError::Internal {
-                    code: 0,
-                    message: format!("calvin-submit local submit-and-await failed: {e}"),
-                }),
+                error: Some(execution_error_to_typed(e)),
                 payload_bytes: None,
             },
         }

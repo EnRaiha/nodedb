@@ -151,6 +151,9 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
             TypedClusterError::DeadlineExceeded { .. } => Error::DeadlineExceeded {
                 request_id: crate::types::RequestId::new(0),
             },
+            // A remote shard's Data-Plane verdict, verbatim: rebuilding the
+            // code keeps the SQLSTATE `error_classify` renders locally.
+            TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
             TypedClusterError::Internal { code, message } => {
                 // Legacy or unknown codes retain their message without panicking.
                 match u16::try_from(code) {
@@ -193,6 +196,9 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 code: u32::from(code.0),
                 message,
             },
+            // Keep the verdict typed across a further hop instead of
+            // degrading it to a numeric class on the second forward.
+            Error::DataPlane(code) => TypedClusterError::DataPlane { code: code.into() },
             other => {
                 // Preserve classification across multi-hop forwarding.
                 let message = other.to_string();
@@ -280,6 +286,21 @@ mod tests {
                 assert!(message.contains("secret_vault"));
             }
             other => panic!("expected Error::RemoteTyped, got {other:?}"),
+        }
+    }
+
+    /// A shard's Data-Plane verdict crosses the node hop verbatim: the code
+    /// itself survives, so the coordinator renders `22012`, not `XX000`.
+    #[test]
+    fn data_plane_verdict_round_trips_with_its_code() {
+        let original = Error::DataPlane(crate::bridge::envelope::ErrorCode::DivisionByZero);
+        let wire: TypedClusterError = original.into();
+        assert!(matches!(wire, TypedClusterError::DataPlane { .. }));
+        match Error::from(wire) {
+            Error::DataPlane(code) => {
+                assert_eq!(code, crate::bridge::envelope::ErrorCode::DivisionByZero);
+            }
+            other => panic!("expected Error::DataPlane, got {other:?}"),
         }
     }
 }

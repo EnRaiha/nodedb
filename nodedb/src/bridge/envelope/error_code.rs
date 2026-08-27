@@ -195,29 +195,11 @@ impl From<crate::Error> for ErrorCode {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
             crate::Error::DivisionByZero => Self::DivisionByZero,
+            // Already a Data-Plane verdict: hand back the same code rather
+            // than re-wrapping it as `Internal` and losing its SQLSTATE.
+            crate::Error::DataPlane(code) => code,
             other => Self::Internal {
                 detail: other.to_string(),
-            },
-        }
-    }
-}
-
-impl ErrorCode {
-    /// Map a Data-Plane error [`ErrorCode`] (carried on an error [`Response`])
-    /// back to a typed [`crate::Error`].
-    ///
-    /// Control-plane consumers that collapse a shard `Response` into a single
-    /// `crate::Result` (the single-vShard `owning_core` read path, the
-    /// scatter-gather merge) must not degrade a typed code to a generic
-    /// `Dispatch` — that surfaces at pgwire as SQLSTATE `XX000` instead of the
-    /// code's real SQLSTATE. Codes with a dedicated `crate::Error` variant
-    /// round-trip (e.g. `DivisionByZero` → `22012`); the rest keep the prior
-    /// behavior of a `Dispatch` carrying the code's debug name.
-    pub(crate) fn to_dispatch_error(&self) -> crate::Error {
-        match self {
-            ErrorCode::DivisionByZero => crate::Error::DivisionByZero,
-            other => crate::Error::Dispatch {
-                detail: format!("{other:?}"),
             },
         }
     }

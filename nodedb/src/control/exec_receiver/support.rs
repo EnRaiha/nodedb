@@ -22,20 +22,7 @@ pub(super) enum SinkOutcome {
     StreamError(TypedClusterError),
 }
 
-/// Map a coordinator-side [`crate::Error`] from the result stream to a
-/// [`TypedClusterError`] for the terminal `ExecuteStreamEnd` frame.
-///
-/// The numeric code is always derived from the error's real classification
-/// via `NodeDbError::from(err).code()` — never hardcoded. A mid-stream
-/// constraint violation or any other domain error must carry its own code,
-/// not `PLAN_DECODE_FAILED` (that const is reserved for genuine plan-decode
-/// failure sites elsewhere; using it as a catch-all here mislabels every
-/// other error).
-pub(super) fn stream_error_to_typed(err: crate::Error) -> TypedClusterError {
-    let message = err.to_string();
-    let code = u32::from(nodedb_types::error::NodeDbError::from(err).code().0);
-    TypedClusterError::Internal { code, message }
-}
+pub(super) use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
 
 /// Returns `true` if `plan` or any nested child plan still carries a
 /// `QueryOp::Exchange` node.

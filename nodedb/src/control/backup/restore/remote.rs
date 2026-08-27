@@ -79,6 +79,9 @@ pub(super) fn map_typed_error(err: TypedClusterError, node_id: u64) -> Error {
                 "restore node {node_id}: descriptor mismatch on collection {collection}"
             ),
         },
+        // Keep the shard's verdict typed: a restore refused by the Data Plane
+        // must not read as a generic internal restore fault.
+        TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
     }
 }
 

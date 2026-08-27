@@ -24,6 +24,7 @@ pub mod array_executor;
 pub mod boot_restore;
 pub mod bootstrap_listener;
 pub mod calvin;
+pub mod data_plane_error_wire;
 pub mod decommission_bridge;
 pub mod handle;
 pub mod init;
