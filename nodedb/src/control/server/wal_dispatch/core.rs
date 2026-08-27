@@ -342,4 +342,72 @@ mod tests {
         assert_eq!(decoded.collection, "places");
         assert_eq!(decoded.field, "loc");
     }
+
+    /// Whether the on-disk WAL segments hold a `VectorIndexDrop` record.
+    /// Reads the files, never the writer's buffer, so this is exactly what a
+    /// restart would replay.
+    fn drop_record_on_disk(wal: &WalManager) -> bool {
+        wal.replay().expect("read wal").iter().any(|r| {
+            nodedb_wal::record::RecordType::from_raw(r.logical_record_type())
+                == Some(nodedb_wal::record::RecordType::VectorIndexDrop)
+        })
+    }
+
+    /// `DROP INDEX` on a vector index is not durable until its WAL record is
+    /// fsynced: the records it cancels were already synced by the writes that
+    /// acked them, so a buffered-only drop is lost and replay resurrects it.
+    #[tokio::test]
+    async fn vector_index_drop_reaches_disk_only_after_the_durability_barrier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+
+        // Stand in for the writes the drop cancels: appended, then fsynced by
+        // their own acknowledgement, so the segment already holds records.
+        let created = PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection: "docs".to_string(),
+            field: "loc".to_string(),
+            surrogate: Surrogate::new(1),
+            geometry: Geometry::point(1.0, 2.0),
+            provenance: None,
+        });
+        wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &created,
+        )
+        .expect("append");
+        wal.sync().expect("sync wal");
+
+        let plan = PhysicalPlan::Vector(nodedb_physical::physical_plan::VectorOp::DropIndex {
+            collection: "docs".to_string(),
+            field_name: "emb".to_string(),
+        });
+
+        let lsn = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append")
+        .lsn
+        .expect("VectorOp::DropIndex must mint a WAL record");
+
+        assert!(
+            !drop_record_on_disk(&wal),
+            "an appended drop record is buffered only; nothing is on disk yet"
+        );
+        assert!(wal.durable_through() < lsn.as_u64());
+
+        wal.wait_durable(lsn).await.expect("group-commit fsync");
+
+        assert!(wal.durable_through() >= lsn.as_u64());
+        assert!(
+            drop_record_on_disk(&wal),
+            "after the barrier the drop record must be replayable from disk"
+        );
+    }
 }

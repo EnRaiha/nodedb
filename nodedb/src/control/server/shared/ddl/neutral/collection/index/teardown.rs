@@ -125,7 +125,7 @@ async fn vector(
     // index the user just dropped.
     let vshard =
         crate::types::VShardId::from_collection_in_database(database_id, &record.collection);
-    crate::control::server::wal_dispatch::wal_append_if_write(
+    let appended = crate::control::server::wal_dispatch::wal_append_if_write(
         &state.wal,
         tenant_id,
         vshard,
@@ -133,6 +133,18 @@ async fn vector(
         &plan,
     )
     .map_err(|e| err("XX000", format!("persist vector index drop to WAL: {e}")))?;
+
+    // An append only buffers. The records this drop cancels were already
+    // fsynced by the writes that acked them, so a buffered-only drop is lost on
+    // restart while replay still rebuilds the index from those records.
+    let lsn = appended
+        .lsn
+        .ok_or_else(|| err("XX000", "vector index drop minted no WAL record"))?;
+    state
+        .wal
+        .wait_durable(lsn)
+        .await
+        .map_err(|e| err("XX000", format!("fsync vector index drop: {e}")))?;
 
     dispatch(state, tenant_id, database_id, &record.collection, plan).await?;
 
