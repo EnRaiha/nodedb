@@ -93,7 +93,12 @@ pub(super) async fn try_string(
     if upper.starts_with("SELECT RANK(") || upper.starts_with("SELECT RANK (") {
         return Some(kv_sorted_index::select_rank(state, identity, database_id, sql).await);
     }
-    if upper.contains("TOPK(") || upper.contains("TOPK (") {
+    // TOPK is recognized as a *call*, not by substring: `contains("TOPK(")`
+    // also matched string literals and identifiers in doc-object UPSERTs
+    // (e.g. name: 'merge_from_topk()') and misrouted them into select_topk,
+    // which then failed with "TOPK requires 2 arguments". Require a real
+    // identifier boundary and skip quoted literals.
+    if has_topk_call(upper) {
         return Some(kv_sorted_index::select_topk(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT SORTED_COUNT(") || upper.starts_with("SELECT SORTED_COUNT (") {
@@ -352,10 +357,63 @@ fn crdt_transaction_error() -> DdlError {
     )
 }
 
+/// True when `sql_upper` contains a real `TOPK(...)` call: the token must sit
+/// at an identifier boundary (not `x_topk(`) and outside single-quoted
+/// string literals (so a doc-object value like `name: 'merge_from_topk()'`
+/// in an UPSERT is not misrouted to the sorted-index TOPK handler).
+fn has_topk_call(sql_upper: &str) -> bool {
+    let bytes = sql_upper.as_bytes();
+    let mut in_literal = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                in_literal = !in_literal;
+                i += 1;
+            }
+            b'T' if !in_literal && bytes[i..].starts_with(b"TOPK") => {
+                let after = &bytes[i + 4..];
+                let call = after.starts_with(b"(") || after.starts_with(b" (");
+                let boundary = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if call && boundary {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::server::shared::session::{SessionId, SessionStore};
+
+    #[test]
+    fn topk_call_detection_respects_identifier_boundary_and_literals() {
+        // Real TOPK calls — with and without the SELECT * FROM prefix.
+        assert!(has_topk_call("SELECT * FROM TOPK(sidx, 5)"));
+        assert!(has_topk_call("SELECT TOPK(sidx, 5)"));
+        assert!(has_topk_call("SELECT * FROM TOPK (sidx, 5)"));
+        // Identifier suffix is not a call: `x_topk(` must not route.
+        assert!(!has_topk_call("SELECT x_topk(1)"));
+        assert!(!has_topk_call("SELECT merge_from_topk()"));
+        // Doc-object string literal values must not be treated as calls.
+        assert!(!has_topk_call(
+            "UPSERT INTO code2g_nodes { id: 'x', name: 'merge_from_topk()' }"
+        ));
+        assert!(!has_topk_call("UPSERT INTO c { name: 'TOPK(a, b)' }"));
+        // A genuine call after a quoted literal still routes.
+        assert!(has_topk_call("SELECT 'lit', TOPK(sidx, 3)"));
+        // Router passes the uppercase mirror; lowercase input is not a match.
+        assert!(has_topk_call("SELECT * FROM TOPK(sidx, 5)"));
+        assert!(!has_topk_call("select * from topk(sidx, 5)"));
+        // No call at all.
+        assert!(!has_topk_call("SELECT * FROM code2g_nodes"));
+    }
 
     #[test]
     fn crdt_apply_and_merge_are_forbidden_in_active_or_failed_transactions() {
