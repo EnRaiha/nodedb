@@ -185,15 +185,17 @@ pub(super) fn wire_proposers(
                     // retry loop can re-propose against the new leader
                     // — wrapping it in `Dispatch` would hide the
                     // retryable signal and surface as silent INSERT
-                    // success. Other errors stay wrapped for
-                    // diagnostics.
-                    .map_err(|e| match e {
-                        crate::Error::RetryableLeaderChange { .. } | crate::Error::DataPlane(_) => {
+                    // success. Only machinery failures stay wrapped for
+                    // diagnostics; a classified apply verdict keeps its
+                    // client-visible classification.
+                    .map_err(|e| {
+                        if crate::error_classify::is_unclassified_failure(&e) {
+                            crate::Error::Dispatch {
+                                detail: format!("apply error: {e}"),
+                            }
+                        } else {
                             e
                         }
-                        other => crate::Error::Dispatch {
-                            detail: format!("apply error: {other}"),
-                        },
                     })
                     // Carry out the write-version the APPLY side stamped, not
                     // `log_index`. The tracker resolves on the node that applied

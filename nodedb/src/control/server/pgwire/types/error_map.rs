@@ -119,6 +119,11 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::MaterializedSumTargetNotFound { .. } => {
             ("ERROR", sqlstate::BALANCE_VIOLATION, err.to_string())
         }
+        // A Data Plane verdict that travelled back as a typed code keeps the
+        // SQLSTATE it would have had on the direct dispatch path.
+        crate::Error::DataPlane(code) => {
+            crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code)
+        }
         _ => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
     }
 }

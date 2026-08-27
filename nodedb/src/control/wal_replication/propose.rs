@@ -27,7 +27,8 @@ const BACKOFF_MS: [u64; 5] = [10, 25, 50, 100, 200];
 /// previous leader's entry was overwritten by a new leader's election no-op, so
 /// the same write payload is re-proposed against the new leader. The encoded
 /// `ReplicatedEntry` carries enough identity (collection, PK, surrogate) to be
-/// replayable. Other propose errors map to [`crate::Error::Dispatch`].
+/// replayable. Only propose-layer machinery failures map to
+/// [`crate::Error::Dispatch`]; a classified apply verdict passes through.
 pub(crate) async fn propose_replicated_entry(
     state: &SharedState,
     proposer: &Arc<AsyncRaftProposer>,
@@ -65,12 +66,14 @@ pub(crate) async fn propose_replicated_entry(
                 tokio::time::sleep(std::time::Duration::from_millis(*backoff_ms)).await;
                 continue;
             }
-            Err(other @ crate::Error::DataPlane(_)) => return Err(other),
-            Err(other) => {
+            // Only a machinery failure is re-wrapped. A state-machine verdict
+            // (constraint, authz, conflict) carries the client's SQLSTATE.
+            Err(other) if crate::error_classify::is_unclassified_failure(&other) => {
                 return Err(crate::Error::Dispatch {
                     detail: format!("raft propose failed: {other}"),
                 });
             }
+            Err(other) => return Err(other),
         }
     }
     payload.ok_or_else(|| {

@@ -38,18 +38,23 @@ fn committed_response_result(
     if response.status == Status::Ok {
         return Ok(AppliedWrite::from_response(response));
     }
-    if let Some(error @ crate::bridge::envelope::ErrorCode::CrdtFrontierMismatch { .. }) =
-        response.error_code.as_deref()
-    {
-        return Err(crate::Error::DataPlane(error.clone()));
+    // The typed code carries the client's classification (constraint, authz,
+    // conflict); stringifying it here would leave the caller only XX000.
+    match response.error_code.as_deref() {
+        Some(code) => {
+            tracing::warn!(reason = ?code, "applying committed write failed");
+            Err(crate::Error::DataPlane(code.clone()))
+        }
+        None => {
+            tracing::warn!(
+                reason = "execution error",
+                "applying committed write failed"
+            );
+            Err(crate::Error::Internal {
+                detail: "execution error".to_owned(),
+            })
+        }
     }
-    let reason = response
-        .error_code
-        .as_ref()
-        .map(|code| format!("{code:?}"))
-        .unwrap_or_else(|| "execution error".into());
-    tracing::warn!(reason = %reason, "applying committed write failed");
-    Err(crate::Error::Internal { detail: reason })
 }
 
 fn deterministic_crdt_fence_noop(result: &crate::Result<AppliedWrite>) -> bool {
@@ -415,9 +420,9 @@ pub async fn run_apply_loop(
                         error = %e,
                         "applying committed write failed"
                     );
-                    Err(crate::Error::Internal {
-                        detail: e.to_string(),
-                    })
+                    // Passed through: the typed error already carries the
+                    // caller's classification.
+                    Err(e)
                 }
             };
 

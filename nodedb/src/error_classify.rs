@@ -269,6 +269,34 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
     }
 }
 
+/// True when the error carries neither a client-matchable classification from
+/// [`classify`] nor a retry contract a caller matches by variant. Only these
+/// may be re-wrapped in a transport error.
+pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Wal(_)
+            | Error::Dispatch { .. }
+            | Error::Storage { .. }
+            | Error::ColdStorage { .. }
+            | Error::Serialization { .. }
+            | Error::Codec { .. }
+            | Error::SegmentCorrupted { .. }
+            | Error::Crdt(_)
+            | Error::Io(_)
+            | Error::Config { .. }
+            | Error::Encryption { .. }
+            | Error::Bridge { .. }
+            | Error::VersionCompat { .. }
+            | Error::Internal { .. }
+            | Error::DescriptorVersionAnomaly { .. }
+            | Error::CatalogIntegrityViolation { .. }
+            | Error::CollectionPurgeRowMissing { .. }
+            | Error::MaterializedSumResolutionMissing { .. }
+            | Error::CascadeCycle { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_types::error::ErrorCode;
@@ -305,5 +333,25 @@ mod tests {
         assert!(classify(&err).is_auth_denied());
         assert!(classify(&err).is_auth_denied());
         assert!(err.to_string().contains("secret_vault"));
+    }
+
+    /// Verdicts the state machine reached must never be re-wrapped as
+    /// transport failures; machinery failures may be.
+    #[test]
+    fn only_machinery_failures_are_unclassified() {
+        assert!(!super::is_unclassified_failure(
+            &Error::RejectedConstraint {
+                collection: "docs".to_owned(),
+                constraint: "unique".to_owned(),
+                detail: "duplicate key value 'dup'".to_owned(),
+            }
+        ));
+        assert!(!super::is_unclassified_failure(&Error::RejectedAuthz {
+            tenant_id: TenantId::new(1),
+            resource: "docs".to_owned(),
+        }));
+        assert!(super::is_unclassified_failure(&Error::Internal {
+            detail: "apply error".to_owned(),
+        }));
     }
 }

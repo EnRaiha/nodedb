@@ -54,7 +54,8 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispat
         )
         .await
     {
-        return Some(Err(ddl_err("XX000", error.to_string())));
+        let (_, sqlstate, message) = error_to_sqlstate(&error);
+        return Some(Err(ddl_err(sqlstate, message)));
     }
     None
 }
@@ -161,7 +162,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         TraceId::ZERO,
     )
     .await
-    .map_err(|error| ddl_err("XX000", error.to_string()))?;
+    .map_err(|error| {
+        let (_, sqlstate, message) = error_to_sqlstate(&error);
+        ddl_err(sqlstate, message)
+    })?;
 
     // The entries cover the row images every cross-shard balance this pass
     // settled was folded from. They travel on the dispatch read-set so the
@@ -176,7 +180,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             TraceId::ZERO,
         )
         .await
-        .map_err(|error| ddl_err("XX000", error.to_string()))?;
+        .map_err(|error| {
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
+            ddl_err(sqlstate, message)
+        })?;
 
     crate::control::planner::materialized_sum::append_cross_shard_balance_tasks(
         state,
@@ -184,7 +191,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         tenant_id,
         database_id,
     )
-    .map_err(|error| ddl_err("XX000", error.to_string()))?;
+    .map_err(|error| {
+        let (_, sqlstate, message) = error_to_sqlstate(&error);
+        ddl_err(sqlstate, message)
+    })?;
 
     let authorized_tasks = authorize_final_task_set(state, identity, &tasks)?;
     // Admission follows final authorization so an implicit-edge target denied
@@ -215,7 +225,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             None,
         )
         .await
-        .map_err(|error| ddl_err("XX000", error.to_string()))?;
+        .map_err(|error| {
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
+            ddl_err(sqlstate, message)
+        })?;
         // A cross-shard Calvin dispatch returns no per-task payload here, so
         // there is no stored row to project. Refused rather than answered with
         // an empty row set, which would read as "the write matched nothing".
@@ -279,7 +292,8 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 continue;
             }
             Err(StagingGateError::Dispatch(error)) => {
-                return Err(ddl_err("XX000", error.to_string()));
+                let (_, sqlstate, message) = error_to_sqlstate(&error);
+                return Err(ddl_err(sqlstate, message));
             }
             Err(StagingGateError::Rejected { code }) => {
                 let (_, sqlstate, message) = match code {
@@ -299,20 +313,21 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 TraceId::ZERO,
             )
             .await
-            .map_err(|error| ddl_err("XX000", error.to_string()))?;
+            .map_err(|error| {
+                let (_, sqlstate, message) = error_to_sqlstate(&error);
+                ddl_err(sqlstate, message)
+            })?;
 
         if response.status == crate::bridge::envelope::Status::Error {
-            let detail = match response.error_code.as_deref() {
-                Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
-                Some(other) => format!("{other:?}"),
-                None => String::from_utf8_lossy(&response.payload).into_owned(),
+            let (_, sqlstate, message) = match response.error_code.as_deref() {
+                Some(code) => error_code_to_sqlstate(code),
+                None => (
+                    "ERROR",
+                    "XX000",
+                    String::from_utf8_lossy(&response.payload).into_owned(),
+                ),
             };
-            let sqlstate = if detail.to_lowercase().contains("unique") {
-                "23505"
-            } else {
-                "XX000"
-            };
-            return Err(ddl_err(sqlstate, detail));
+            return Err(ddl_err(sqlstate, message));
         }
 
         // Shape the STORED rows the write returned, redacted for the caller —

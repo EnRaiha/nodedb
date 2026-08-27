@@ -30,8 +30,8 @@ use crate::control::wal_replication::{AsyncRaftProposer, ReplicatedEntry};
 /// to determine the idempotency gate verdict.
 ///
 /// Retries transparently up to five times on [`crate::Error::RetryableLeaderChange`]
-/// (leader failover during the propose). Any other error is mapped to
-/// [`crate::Error::Dispatch`].
+/// (leader failover during the propose). Only propose-layer machinery failures
+/// map to [`crate::Error::Dispatch`]; a classified apply verdict passes through.
 pub(crate) async fn propose_sync_write(
     state: &SharedState,
     entry: ReplicatedEntry,
@@ -73,12 +73,14 @@ pub(crate) async fn propose_sync_write(
                 tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
                 continue;
             }
-            Err(other @ crate::Error::DataPlane(_)) => return Err(other),
-            Err(other) => {
+            // Only a machinery failure is re-wrapped. A state-machine verdict
+            // (constraint, authz, conflict) carries the client's SQLSTATE.
+            Err(other) if crate::error_classify::is_unclassified_failure(&other) => {
                 return Err(crate::Error::Dispatch {
                     detail: format!("raft propose failed: {other}"),
                 });
             }
+            Err(other) => return Err(other),
         }
     }
 
