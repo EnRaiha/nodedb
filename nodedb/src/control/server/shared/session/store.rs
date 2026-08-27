@@ -278,6 +278,7 @@ impl SessionStore {
             session.tx_reservation_owner = None;
             session.savepoints.clear();
             session.pending_offset_commits.clear();
+            session.pending_field_inference.clear();
             session.pending_notifies.clear();
             // Cursors may retain rows from the previous database, including
             // WITH HOLD cursors, so no cursor can survive a database switch.

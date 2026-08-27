@@ -91,38 +91,6 @@ impl NodeDbPgHandler {
                 ))));
             }
 
-            // ClusterArray plans are handled entirely on the Control Plane by the
-            // ArrayCoordinator — they must never reach the SPSC bridge or
-            // trigger/DML machinery. Intercept them here and short-circuit.
-            if matches!(
-                task.plan,
-                nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(_)
-            ) {
-                let authorized = self
-                    .authorize_tasks(identity, std::slice::from_ref(&task))?
-                    .into_tasks()
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "XX000".to_owned(),
-                            "ClusterArray authorization returned no capability".to_owned(),
-                        )))
-                    })?;
-                let response = self
-                    .dispatch_cluster_array_task(
-                        authorized,
-                        projection,
-                        result_formats,
-                        session_id,
-                        auth_ctx,
-                    )
-                    .await?;
-                responses.push(response);
-                continue;
-            }
-
             // Whether this task would answer with rows, read BEFORE the
             // routing gate consumes the task: a buffered or staged write
             // reports only a command tag, and a statement that asked for rows
@@ -158,6 +126,40 @@ impl NodeDbPgHandler {
                 }
             }
 
+            // ClusterArray plans are handled entirely on the Control Plane by
+            // the ArrayCoordinator — they must never reach the SPSC bridge or
+            // trigger/DML machinery. Intercepted AFTER the routing gate, so an
+            // in-transaction write is buffered (reshaped into per-shard
+            // `ArrayOp` plans) instead of applying here and surviving ROLLBACK.
+            if matches!(
+                task.plan,
+                nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(_)
+            ) {
+                let authorized = self
+                    .authorize_tasks(identity, std::slice::from_ref(&task))?
+                    .into_tasks()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "XX000".to_owned(),
+                            "ClusterArray authorization returned no capability".to_owned(),
+                        )))
+                    })?;
+                let response = self
+                    .dispatch_cluster_array_task(
+                        authorized,
+                        projection,
+                        result_formats,
+                        session_id,
+                        auth_ctx,
+                    )
+                    .await?;
+                responses.push(response);
+                continue;
+            }
+
             let plan_kind = describe_plan(&task.plan);
             let resp_post_set_op = task.post_set_op;
             let task_database_id = task.database_id;
@@ -168,8 +170,8 @@ impl NodeDbPgHandler {
             // succeeds. Only covers the "normal dispatch" branch at the
             // bottom of this loop; the streaming fast path
             // (`maybe_stream_select`) and the `ClusterArray` short-circuit
-            // above dispatch through entirely separate code paths and are
-            // not metered here.
+            // dispatch through entirely separate code paths and are not
+            // metered here.
             let plan_metering_info =
                 metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_response));
 

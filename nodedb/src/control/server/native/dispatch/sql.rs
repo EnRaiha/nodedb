@@ -18,6 +18,7 @@ use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
 use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::write_admission::all_writes_bufferable;
 
 use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_session_show};
 use super::sql_loop::run_dispatch_loop;
@@ -305,11 +306,14 @@ async fn execute_planned(
     ) {
         DispatchClass::SingleShard { .. } => {}
         DispatchClass::MultiShard { .. } => {
-            // Reject a cross-shard write inside an explicit transaction block,
-            // matching pgwire's `CrossShardInExplicitTransaction` semantics.
-            // Native buffers in-block writes per task below; a multi-shard
-            // write cannot be buffered atomically, so reject up front.
-            if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock {
+            // Dispatching to Calvin here applies the statement durably at
+            // statement time, escaping the transaction buffer. Inside a block,
+            // fall through to the per-task staging gate when the gate can
+            // buffer every write — COMMIT flushes the whole buffer through
+            // Calvin. Anything else is refused, matching pgwire.
+            let in_txn_block =
+                ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock;
+            if in_txn_block && !all_writes_bufferable(&tasks) {
                 return resp(error_to_native(
                     seq,
                     &crate::Error::CrossShardInExplicitTransaction,
@@ -321,7 +325,7 @@ async fn execute_planned(
             // defaults to `CrossShardTxnMode::Strict` (the documented default),
             // so native multi-shard writes route through Calvin by default.
             let cross_shard_mode = ctx.sessions.cross_shard_txn_mode(ctx.peer_addr);
-            if cross_shard_mode == CrossShardTxnMode::Strict {
+            if !in_txn_block && cross_shard_mode == CrossShardTxnMode::Strict {
                 return match dispatch_authorized_tasks_to_calvin(
                     ctx.state,
                     authorized_tasks,
@@ -351,7 +355,8 @@ async fn execute_planned(
                     Err(e) => resp(error_to_native(seq, &e)),
                 };
             }
-            // BestEffortNonAtomic falls through to the per-task loop below.
+            // An in-block statement and `BestEffortNonAtomic` both fall
+            // through to the per-task loop below.
         }
     }
 

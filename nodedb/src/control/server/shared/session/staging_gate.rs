@@ -35,6 +35,7 @@ use super::connection::SessionId;
 use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::state::TransactionState;
 use super::store::SessionStore;
+use super::txn_expand::expand_for_buffering;
 pub use crate::control::server::shared::sql::staging_predicates::StagedTagKind;
 
 /// Outcome of routing a single task through the in-transaction staging gate.
@@ -176,9 +177,13 @@ where
 
     // Point writes execute at STATEMENT time via the staging overlay (real
     // tag + statement-time constraint errors); the plan is still buffered so
-    // COMMIT stays the sole durable apply. Other writes keep buffer + "OK".
+    // COMMIT stays the sole durable apply. Other writes keep buffer + "OK",
+    // reshaped first into the per-shard plans COMMIT can replay.
     if !is_stageable_write(&task.plan) {
-        sessions.buffer_write(session_id, task);
+        let buffered = expand_for_buffering(task).map_err(StagingGateError::Dispatch)?;
+        for shard_task in buffered {
+            sessions.buffer_write(session_id, shard_task);
+        }
         return Ok(InTxnRoute::Buffered);
     }
 

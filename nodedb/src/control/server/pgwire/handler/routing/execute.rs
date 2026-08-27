@@ -14,6 +14,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionId;
+use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::types::TenantId;
 
 use super::super::super::types::error_to_sqlstate;
@@ -204,33 +205,41 @@ impl NodeDbPgHandler {
                 // genuine multi-shard bulk writes need OLLP. Fall through.
             }
             DispatchClass::MultiShard { .. } => {
+                // Dispatching to Calvin here would apply the statement durably
+                // at statement time, escaping the transaction buffer. Inside a
+                // block, fall through to the per-task staging gate when the gate
+                // can buffer every write — COMMIT then flushes the whole buffer
+                // through Calvin. Anything else is refused, never applied.
                 if tx_state == crate::control::server::shared::session::TransactionState::InBlock {
-                    let (severity, code, message) =
-                        error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    ))));
-                }
-
-                let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
-                if cross_shard_mode
-                    == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
-                {
-                    return self
-                        .dispatch_calvin_multishard(
-                            tasks,
-                            tenant_id,
-                            super::calvin_dispatch::CalvinDispatchSession {
-                                identity,
-                                session_id,
-                                result_formats: shaping.formats,
-                                auth: &auth_ctx,
-                            },
-                            &sum_target_reads,
-                        )
-                        .await;
+                    if !all_writes_bufferable(&tasks) {
+                        let (severity, code, message) =
+                            error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        ))));
+                    }
+                    // Bufferable: fall through to the staging gate below.
+                } else {
+                    let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
+                    if cross_shard_mode
+                        == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
+                    {
+                        return self
+                            .dispatch_calvin_multishard(
+                                tasks,
+                                tenant_id,
+                                super::calvin_dispatch::CalvinDispatchSession {
+                                    identity,
+                                    session_id,
+                                    result_formats: shaping.formats,
+                                    auth: &auth_ctx,
+                                },
+                                &sum_target_reads,
+                            )
+                            .await;
+                    }
                 }
             }
         }

@@ -15,7 +15,7 @@ use crate::types::{Lsn, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::read_set::ReadSetEntry;
-use super::state::{PendingOffsetCommit, SavepointEntry, TransactionState};
+use super::state::{PendingFieldInference, PendingOffsetCommit, SavepointEntry, TransactionState};
 use super::store::SessionStore;
 
 pub type CommitDrain = (Vec<PhysicalTask>, Vec<Option<Arc<QueryLeaseScope>>>);
@@ -200,8 +200,9 @@ impl SessionStore {
     /// COMMIT — drain the write buffer and pending offset commits, return to idle.
     ///
     /// Returns buffered write tasks and their aligned descriptor-lease scope
-    /// holders. The caller must retain the holders through its complete commit
-    /// response and cleanup lifecycle.
+    /// holders. The caller retains the holders until its durable batch has
+    /// flushed, then releases them before any step that drains prior-version
+    /// leases — a hold the committing session still owns can never drain.
     pub fn commit(&self, addr: impl Into<SessionId>) -> Result<CommitDrain, &'static str> {
         self.write_session(addr, |session| {
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
@@ -215,9 +216,10 @@ impl SessionStore {
             session.tx_reservation_vshards.clear();
             session.tx_reservation_owner = None;
             session.savepoints.clear();
-            // Note: pending_sequence_reservations are taken separately via
-            // take_pending_reservations() so the caller can finalize them
-            // with the GAP_FREE manager (which requires Arc<SequenceRegistry>).
+            // Note: pending_sequence_reservations and pending_field_inference
+            // are taken separately (take_pending_reservations /
+            // take_pending_field_inference) so the caller can finalize them
+            // against services this borrow has no access to.
             Ok((buffer, lease_scopes))
         })
         .unwrap_or(Ok((Vec::new(), Vec::new())))
@@ -259,6 +261,39 @@ impl SessionStore {
             }
         })
         .unwrap_or(false)
+    }
+
+    /// Take the schema fields this transaction's writes inferred (called after
+    /// a successful COMMIT dispatch).
+    pub fn take_pending_field_inference(
+        &self,
+        addr: impl Into<SessionId>,
+    ) -> Vec<PendingFieldInference> {
+        self.write_session(addr, |session| {
+            std::mem::take(&mut session.pending_field_inference)
+        })
+        .unwrap_or_default()
+    }
+
+    /// Defer recording inferred schema fields until the current transaction
+    /// commits. Outside a block nothing is deferred and `pending` is handed
+    /// back, for the caller to record immediately.
+    pub fn defer_field_inference(
+        &self,
+        addr: impl Into<SessionId>,
+        pending: PendingFieldInference,
+    ) -> Option<PendingFieldInference> {
+        // Carried rather than moved into the closure: an unknown session never
+        // runs it, and dropping `pending` there would silently lose the fields.
+        let mut carried = Some(pending);
+        let _ran = self.write_session(addr, |session| {
+            if session.tx_state == TransactionState::InBlock
+                && let Some(pending) = carried.take()
+            {
+                session.pending_field_inference.push(pending);
+            }
+        });
+        carried
     }
 
     /// Buffer a write task during a transaction block.
@@ -372,6 +407,7 @@ impl SessionStore {
                 session.tx_reservation_owner = None;
                 session.savepoints.clear();
                 session.pending_offset_commits.clear();
+                session.pending_field_inference.clear();
                 std::mem::take(&mut session.pending_sequence_reservations)
             })
             .unwrap_or_default();
@@ -402,10 +438,12 @@ impl SessionStore {
         self.write_session(addr, |session| {
             let buffer_len = session.tx_buffer.len();
             let pending_offset_len = session.pending_offset_commits.len();
+            let pending_inference_len = session.pending_field_inference.len();
             session.savepoints.push(SavepointEntry {
                 name,
                 buffer_len,
                 pending_offset_len,
+                pending_inference_len,
                 markers,
             });
         });
@@ -455,6 +493,7 @@ impl SessionStore {
                 })?;
             let buffer_len = session.savepoints[pos].buffer_len;
             let pending_offset_len = session.savepoints[pos].pending_offset_len;
+            let pending_inference_len = session.savepoints[pos].pending_inference_len;
             let markers = session.savepoints[pos].markers.clone();
             if session.tx_buffer.len() != session.tx_lease_scopes.len() {
                 return Err(crate::Error::Internal {
@@ -464,6 +503,9 @@ impl SessionStore {
             session.tx_buffer.truncate(buffer_len);
             session.tx_lease_scopes.truncate(buffer_len);
             session.pending_offset_commits.truncate(pending_offset_len);
+            session
+                .pending_field_inference
+                .truncate(pending_inference_len);
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             session.savepoints.truncate(pos + 1);
             Ok(markers)

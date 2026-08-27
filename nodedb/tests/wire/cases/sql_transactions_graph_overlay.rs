@@ -7,21 +7,29 @@
 //! A plain `INSERT INTO <document_schemaless collection> { _from, _to,
 //! _type }` is mirrored by the Control Plane as an implicit `GraphOp::EdgePut`
 //! task appended to the SAME task list as the document write
-//! (`append_implicit_edge_tasks`). `classify_dispatch` requires every task in
-//! that list to resolve to the SAME `VShardId` for the STATEMENT to proceed
-//! inside an explicit `BEGIN` (a genuine cross-shard write is rejected with
-//! `CrossShardInExplicitTransaction`). Every edge below is a SELF-LOOP whose
-//! document id, `_from`, and `_to` are all the SAME string, which trivially
-//! guarantees the implicit-edge task and its document write share one
-//! `VShardId` regardless of the routing function in use -- so the
-//! implicit-edge task classifies as `DispatchClass::SingleShard` and flows
-//! through the ordinary per-task in-transaction staging gate
-//! (`route_task_in_txn` / `is_stageable_write`), exactly like a KV or
-//! Document point write, landing in the new `GraphTxnOverlay`
-//! (`execute_stage_graph`). `GRAPH NEIGHBORS` carries the session's active
-//! `TxnId` (see `graph_ops::traverse::neighbors`), so the Data Plane's
-//! `execute_graph_neighbors` merges that overlay into the durable CSR result
-//! before responding.
+//! (`append_implicit_edge_tasks`). The two tasks do NOT share a `VShardId`:
+//! the document write homes on `VShardId::from_collection_in_database`, the
+//! edge on `VShardId::from_key(src)` -- for `g_tx` / `staged_rollback` that is
+//! 348 vs 797. A self-loop does not change that, and cannot: the two homing
+//! functions take different inputs. So the statement classifies as
+//! `DispatchClass::MultiShard`.
+//!
+//! Inside an explicit `BEGIN` a multi-shard statement is NOT dispatched to
+//! Calvin as autocommit -- that would apply it durably at statement time and
+//! survive ROLLBACK. Every write here is one the staging gate can buffer
+//! (`all_writes_bufferable`), so the statement falls through to the ordinary
+//! per-task gate (`route_task_in_txn` / `is_stageable_write`), exactly like a
+//! KV or Document point write; COMMIT flushes the whole buffer through Calvin.
+//! The edge task lands in `GraphTxnOverlay` (`execute_stage_graph`).
+//!
+//! The SELF-LOOP (document id, `_from`, and `_to` all the SAME string) earns
+//! its place for a different reason: `from_key(src) == from_key(dst)`, so the
+//! edge's forward and reverse rows share ONE vShard and therefore one overlay.
+//! A single in-tx `GRAPH NEIGHBORS` from that node observes the staged edge
+//! without depending on dual-home staging. `GRAPH NEIGHBORS` carries the
+//! session's active `TxnId` (see `graph_ops::traverse::neighbors`), so the
+//! Data Plane's `execute_graph_neighbors` merges that overlay into the durable
+//! CSR result before responding.
 //!
 //! NOTE on DELETE: deleting an implicit edge document routes through the
 //! OLLP/Calvin edge-cleanup coordinator regardless of transaction state (see

@@ -20,6 +20,7 @@ use crate::control::server::shared::returning;
 use crate::control::server::shared::session::{
     DmlTxnCtx, InTxnRoute, StagingGateError, route_in_tx_write,
 };
+use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 
@@ -206,7 +207,21 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             ddl_err(sqlstate, message)
         })?);
 
-    if state.sequencer_inbox.get().is_some()
+    // A statement dispatched to Calvin as autocommit escapes the transaction
+    // buffer entirely: it applies durably at statement time and ROLLBACK cannot
+    // undo it. Inside a block the per-task staging gate below buffers each task
+    // instead, and COMMIT flushes the whole buffer through Calvin. A write the
+    // gate cannot buffer is refused rather than silently applied.
+    let in_txn_block = txn_ctx.sessions.transaction_state(txn_ctx.session_id)
+        == crate::control::server::shared::session::TransactionState::InBlock;
+    if in_txn_block && !all_writes_bufferable(&tasks) {
+        let (_, sqlstate, message) =
+            error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
+        return Err(ddl_err(sqlstate, message));
+    }
+
+    if !in_txn_block
+        && state.sequencer_inbox.get().is_some()
         && matches!(
             crate::control::planner::calvin::classify_dispatch(
                 &tasks,

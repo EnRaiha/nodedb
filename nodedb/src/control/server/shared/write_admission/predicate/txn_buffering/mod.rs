@@ -66,6 +66,14 @@
 //!    `rollback_undo_log`. Spatial, Text, and bulk Document writes already
 //!    ride this exact path.
 //!
+//! `ClusterArrayOp::{Put, Delete}` also classifies `true` while
+//! `to_replicated_entry` has no encoder arm for either: they are Control-Plane
+//! routing wrappers, and `session::txn_expand` reshapes each into per-shard
+//! `ArrayOp::{Put, Delete}` plans before they enter the buffer, so COMMIT
+//! replays those (already encoded) and never the wrapper. Without buffering,
+//! an `INSERT INTO ARRAY` inside a transaction applied immediately and
+//! survived ROLLBACK.
+//!
 //! A second, inverse divergence exists in the opposite direction:
 //! `DocumentOp::Truncate` and `KvOp::{Truncate, RegisterIndex, DropIndex}`
 //! classify `false` here (not buffered) even though `to_replicated_entry` has
@@ -85,5 +93,7 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 pub mod classify;
+pub mod task_set;
 
 pub use classify::plan_requires_txn_buffering;
+pub use task_set::all_writes_bufferable;

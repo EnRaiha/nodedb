@@ -32,6 +32,7 @@ pub mod temp_tables;
 #[cfg(test)]
 mod tests;
 mod transaction;
+pub mod txn_expand;
 
 pub mod plan_cache;
 pub mod prepared_cache;
@@ -55,7 +56,9 @@ pub use self::staging_gate::{
     route_in_tx_write,
 };
 pub(crate) use self::state::now_unix_ms;
-pub use self::state::{ConnSession, CursorState, PendingOffsetCommit, TransactionState};
+pub use self::state::{
+    ConnSession, CursorState, PendingFieldInference, PendingOffsetCommit, TransactionState,
+};
 pub use self::store::SessionStore;
 pub use self::temp_tables::TempTableEntry;
 pub use self::transaction::CommitDrain;

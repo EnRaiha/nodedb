@@ -11,6 +11,7 @@ use nodedb_array::types::ArrayId;
 use nodedb_cluster::distributed_array::wire::{ArrayShardDeleteReq, ArrayShardPutReq};
 use nodedb_cluster::error::{ClusterError, Result};
 
+use super::cells::flatten_blob_vec;
 use super::executor::DataPlaneArrayExecutor;
 use crate::control::server::dispatch_utils::{
     ChangeFeedOwner, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering, submit_write,
@@ -25,25 +26,14 @@ impl DataPlaneArrayExecutor {
                 detail: format!("array_id decode in exec_put: {e}"),
             })?;
 
-        // Coordinator encodes cells as a blob-vec of separately-encoded
-        // `ArrayPutCell`s; the Data Plane wants a flat msgpack array. Decode
-        // the outer blob-vec, parse each blob, re-encode.
-        let cell_blobs: Vec<Vec<u8>> =
-            zerompk::from_msgpack(&req.cells_msgpack).map_err(|e| ClusterError::Codec {
-                detail: format!("cell blob-vec decode in exec_put: {e}"),
-            })?;
-
-        let cells: Vec<crate::engine::array::wal::ArrayPutCell> = cell_blobs
-            .iter()
-            .map(|blob| {
-                zerompk::from_msgpack(blob).map_err(|e| ClusterError::Codec {
-                    detail: format!("ArrayPutCell decode in exec_put: {e}"),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let cells_msgpack = zerompk::to_msgpack_vec(&cells).map_err(|e| ClusterError::Codec {
-            detail: format!("cells re-encode in exec_put: {e}"),
+        // The coordinator sends a bucket of separately-encoded `ArrayPutCell`s;
+        // the Data Plane decodes one flat msgpack array.
+        let cells_msgpack = flatten_blob_vec::<crate::engine::array::wal::ArrayPutCell>(
+            &req.cells_msgpack,
+            "exec_put",
+        )
+        .map_err(|e| ClusterError::Codec {
+            detail: e.to_string(),
         })?;
 
         let plan = PhysicalPlan::Array(ArrayOp::Put {
@@ -67,9 +57,19 @@ impl DataPlaneArrayExecutor {
                 detail: format!("array_id decode in exec_delete: {e}"),
             })?;
 
+        // Same bucket-to-flat reshape the put path performs: the Data Plane
+        // decodes `coords_msgpack` as one `Vec<ArrayDeleteCell>`.
+        let coords_msgpack = flatten_blob_vec::<crate::engine::array::wal::ArrayDeleteCell>(
+            &req.coords_msgpack,
+            "exec_delete",
+        )
+        .map_err(|e| ClusterError::Codec {
+            detail: e.to_string(),
+        })?;
+
         let plan = PhysicalPlan::Array(ArrayOp::Delete {
             array_id: array_id.clone(),
-            coords_msgpack: req.coords_msgpack.clone(),
+            coords_msgpack,
             wal_lsn: req.wal_lsn,
             provenance: None,
         });

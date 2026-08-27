@@ -356,10 +356,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. }) => {
             false
         }
-        // Write-but-unbuffered: buffering would route through `TransactionBatch` to
-        // `DataPlaneVisitor::cluster_array`'s hard `unreachable!()` and panic.
+        // Buffered but unencoded: `session::txn_expand` reshapes the routing
+        // wrapper into per-shard `ArrayOp::Put`/`Delete` before it enters the
+        // buffer, so COMMIT replays those and never the wrapper itself.
         PhysicalPlan::ClusterArray(ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. }) => {
-            false
+            true
         }
         PhysicalPlan::ClusterEvent(_) => false,
     }
@@ -1939,30 +1940,17 @@ mod tests {
                 system_as_of: None,
                 valid_at_ms: None,
             }),
-            // Not flipped: buffering would panic at COMMIT via `cluster_array`'s
-            // `unreachable!()`. Both sides `false`.
-            PhysicalPlan::ClusterArray(ClusterArrayOp::Put {
-                array_id: array_id.clone(),
-                array_id_msgpack: Vec::new(),
-                cells: Vec::new(),
-                wal_lsn: 0,
-                prefix_bits: 0,
-            }),
-            PhysicalPlan::ClusterArray(ClusterArrayOp::Delete {
-                array_id: array_id.clone(),
-                array_id_msgpack: Vec::new(),
-                coords: Vec::new(),
-                wal_lsn: 0,
-                prefix_bits: 0,
-            }),
+            // `ClusterArrayOp::Put`/`Delete` are flipped (buffered, unencoded)
+            // and pinned by `flipped_variants_are_buffered_and_unencoded`.
         ];
         for p in &plans {
             assert_matches_oracle(p);
         }
     }
 
-    /// Pin the oracle divergence for flipped variants (Document, Crdt, Array):
-    /// classified `true` while `to_replicated_entry` has no encoder arm.
+    /// Pin the oracle divergence for flipped variants (Document, Crdt,
+    /// ClusterArray): classified `true` while `to_replicated_entry` has no
+    /// encoder arm.
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
         let plans = vec![
@@ -1999,6 +1987,23 @@ mod tests {
                 document_id: "d".into(),
                 target_version_json: "{}".into(),
                 surrogate: Surrogate::ZERO,
+            }),
+            // `session::txn_expand` reshapes these into per-shard `ArrayOp`
+            // writes before they enter the buffer, so the wrapper itself needs
+            // no encoder arm.
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Put {
+                array_id: ArrayId::new(tenant(), "a"),
+                array_id_msgpack: Vec::new(),
+                cells: Vec::new(),
+                wal_lsn: 0,
+                prefix_bits: 0,
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Delete {
+                array_id: ArrayId::new(tenant(), "a"),
+                array_id_msgpack: Vec::new(),
+                coords: Vec::new(),
+                wal_lsn: 0,
+                prefix_bits: 0,
             }),
         ];
         for p in &plans {

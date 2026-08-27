@@ -11,6 +11,8 @@ use crate::control::planner::calvin::{
 };
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
+use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::types::TraceId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -328,56 +330,65 @@ pub(crate) async fn handle_direct_op(
             return dispatch_single_task(ctx, seq, task).await;
         }
 
-        // Cross-shard goes through Calvin atomically; single-shard dispatches each task
-        // sequentially, returning the document task's response.
         let _request = ctx.state.tenant_request_guard(tenant_id);
+        // Dispatching to Calvin applies the write durably at statement time,
+        // escaping the transaction buffer. Inside a block the per-task loop
+        // buffers each task instead, and COMMIT flushes the whole buffer
+        // through Calvin. A write the gate cannot buffer is refused here.
+        let in_txn_block =
+            ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock;
+        if in_txn_block && !all_writes_bufferable(&tasks) {
+            return error_to_native(seq, &crate::Error::CrossShardInExplicitTransaction);
+        }
         // Only reads to widen with are those materialized-sum settlement stamped
         // on the source rows its shipped balances folded from.
-        match classify_dispatch(
-            &tasks,
-            &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
-        ) {
-            DispatchClass::MultiShard { .. } => {
-                match dispatch_authorized_tasks_to_calvin(
-                    ctx.state,
-                    authorized_tasks,
-                    tenant_id,
-                    CrossShardTxnMode::Strict,
-                    TxnDispatchPosition::Autocommit,
-                    &sum_target_reads,
-                    None,
-                )
-                .await
-                {
-                    // No RETURNING possible here, so the Response carries no rows —
-                    // report one row-affected per task.
-                    Ok(_apply) => {
-                        let mut r = NativeResponse::ok(seq);
-                        r.rows_affected = Some(tasks.len() as u64);
-                        r
-                    }
-                    Err(e) => error_to_native(seq, &e),
+        let route_to_calvin = !in_txn_block
+            && matches!(
+                classify_dispatch(
+                    &tasks,
+                    &crate::control::planner::calvin::read_vshards_of(&sum_target_reads),
+                ),
+                DispatchClass::MultiShard { .. }
+            );
+        if route_to_calvin {
+            match dispatch_authorized_tasks_to_calvin(
+                ctx.state,
+                authorized_tasks,
+                tenant_id,
+                CrossShardTxnMode::Strict,
+                TxnDispatchPosition::Autocommit,
+                &sum_target_reads,
+                None,
+            )
+            .await
+            {
+                // No RETURNING possible here, so the Response carries no rows —
+                // report one row-affected per task.
+                Ok(_apply) => {
+                    let mut r = NativeResponse::ok(seq);
+                    r.rows_affected = Some(tasks.len() as u64);
+                    r
+                }
+                Err(e) => error_to_native(seq, &e),
+            }
+        } else {
+            // Document task is first; its response is returned to the caller.
+            needs_top_level_metering = false;
+            let mut doc_response: Option<NativeResponse> = None;
+            let mut error: Option<NativeResponse> = None;
+            for task in authorized_tasks.into_tasks() {
+                let resp = dispatch_single_task(ctx, seq, task).await;
+                if resp.status == nodedb_types::protocol::ResponseStatus::Error {
+                    error = Some(resp);
+                    break;
+                }
+                if doc_response.is_none() {
+                    doc_response = Some(resp);
                 }
             }
-            DispatchClass::SingleShard { .. } => {
-                // Document task is first; its response is returned to the caller.
-                needs_top_level_metering = false;
-                let mut doc_response: Option<NativeResponse> = None;
-                let mut error: Option<NativeResponse> = None;
-                for task in authorized_tasks.into_tasks() {
-                    let resp = dispatch_single_task(ctx, seq, task).await;
-                    if resp.status == nodedb_types::protocol::ResponseStatus::Error {
-                        error = Some(resp);
-                        break;
-                    }
-                    if doc_response.is_none() {
-                        doc_response = Some(resp);
-                    }
-                }
-                error
-                    .or(doc_response)
-                    .unwrap_or_else(|| NativeResponse::ok(seq))
-            }
+            error
+                .or(doc_response)
+                .unwrap_or_else(|| NativeResponse::ok(seq))
         }
     }
     .await;

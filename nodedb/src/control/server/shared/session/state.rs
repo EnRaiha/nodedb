@@ -37,6 +37,8 @@ pub struct SavepointEntry {
     pub buffer_len: usize,
     /// `pending_offset_commits` length captured when the savepoint was established.
     pub pending_offset_len: usize,
+    /// `pending_field_inference` length captured when the savepoint was established.
+    pub pending_inference_len: usize,
     /// Per-vShard `(value_marker, graph_marker)` overlay journal markers.
     pub markers: BTreeMap<VShardId, (usize, usize)>,
 }
@@ -61,6 +63,20 @@ pub struct PendingOffsetCommit {
     pub group: String,
     pub partition_id: u32,
     pub offset: CdcOffset,
+}
+
+/// Schema fields a transaction's writes inferred, deferred until it commits.
+///
+/// Recording them at statement time would move the descriptor version out from
+/// under the transaction's own buffered writes, which `commit_fence` then
+/// rejects, and would drain against a lease the same session still holds.
+#[derive(Debug)]
+pub struct PendingFieldInference {
+    pub database_id: DatabaseId,
+    pub tenant_id: u64,
+    pub collection: String,
+    /// `(field, sql_type)` pairs, unioned into the descriptor at COMMIT.
+    pub fields: Vec<(String, String)>,
 }
 
 /// Server-side cursor state.
@@ -164,6 +180,9 @@ pub struct ConnSession {
     /// Pending consumer offset commits deferred until COMMIT. Flushed
     /// atomically on COMMIT and discarded on ROLLBACK.
     pub pending_offset_commits: Vec<PendingOffsetCommit>,
+    /// Schema fields this transaction's writes inferred, recorded on COMMIT
+    /// and discarded on ROLLBACK.
+    pub pending_field_inference: Vec<PendingFieldInference>,
     /// Server-side cursors: name → (cached result rows as JSON strings, current position).
     pub cursors: HashMap<String, CursorState>,
     /// LIVE SELECT subscriptions: active change stream subscriptions for this connection.
@@ -280,6 +299,7 @@ impl ConnSession {
             tx_reservation_owner: None,
             savepoints: Vec::new(),
             pending_offset_commits: Vec::new(),
+            pending_field_inference: Vec::new(),
             cursors: HashMap::new(),
             live_subscriptions: Vec::new(),
             listen_handles: Vec::new(),

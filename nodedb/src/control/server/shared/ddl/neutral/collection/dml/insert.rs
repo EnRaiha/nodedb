@@ -12,7 +12,7 @@ use nodedb_types::DatabaseId;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
-use crate::control::server::shared::session::DmlTxnCtx;
+use crate::control::server::shared::session::{DmlTxnCtx, PendingFieldInference};
 use crate::control::state::SharedState;
 
 use super::parse::{
@@ -195,41 +195,34 @@ pub async fn insert_document(
         Err(e) => return Some(Err(e)),
     };
 
-    // Track field names in catalog for schemaless collections.
-    let catalog = state.credentials.catalog();
+    // Track field names in catalog for schemaless collections. Learned fields
+    // are part of the replicated descriptor, so they go out through the
+    // metadata path with a stamped version; a bare `put_collection` would leave
+    // the local record byte-different at the same version and wedge the applier.
     if parsed
         .collection_type
         .as_ref()
         .is_none_or(|ct| ct.is_schemaless())
-        && let Ok(Some(mut coll)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
-        let mut changed = false;
-        for (name, val) in &fields {
-            if name == "id" {
-                continue;
-            }
-            if !coll.fields.iter().any(|(n, _)| n == name) {
-                let type_str = match val {
-                    nodedb_types::Value::Float(_) => "FLOAT",
-                    nodedb_types::Value::Integer(_) => "INT",
-                    nodedb_types::Value::Bool(_) => "BOOL",
-                    _ => "TEXT",
-                };
-                coll.fields.push((name.clone(), type_str.to_string()));
-                changed = true;
-            }
-        }
-        // Learned fields are part of the replicated descriptor, so they go out
-        // through the metadata path with a stamped version. A bare
-        // `put_collection` here left the local record at the same version as
-        // the replicated entry but with different bytes, which wedges the
-        // metadata apply loop on the next restart.
-        if changed
-            && let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
+        // Inside a transaction the merge is deferred to COMMIT. Bumping the
+        // descriptor now would move the version out from under this
+        // transaction's own buffered writes and drain against the lease this
+        // very session is holding for them, which can never clear.
+        let pending = PendingFieldInference {
+            database_id,
+            tenant_id: tenant_id.as_u64(),
+            collection: parsed.coll_name.clone(),
+            fields: inferred_field_types(&fields),
+        };
+        if let Some(pending) = txn_ctx
+            .sessions
+            .defer_field_inference(txn_ctx.session_id, pending)
+            && let Err(e) = crate::control::catalog_entry::merge_collection_fields_replicated(
                 state,
-                database_id,
-                &coll,
+                pending.database_id,
+                pending.tenant_id,
+                &pending.collection,
+                &pending.fields,
             )
         {
             return Some(Err(ddl_err(
@@ -317,6 +310,27 @@ pub async fn insert_document(
         command: "INSERT".to_string(),
         rows_affected: Some(1),
     }]))
+}
+
+/// The `(field, sql_type)` pairs a schemaless write contributes to the
+/// collection's inferred projection. `id` is the document key, never a
+/// projected column.
+fn inferred_field_types(
+    fields: &std::collections::HashMap<String, nodedb_types::Value>,
+) -> Vec<(String, String)> {
+    fields
+        .iter()
+        .filter(|(name, _)| name.as_str() != "id")
+        .map(|(name, value)| {
+            let sql_type = match value {
+                nodedb_types::Value::Float(_) => "FLOAT",
+                nodedb_types::Value::Integer(_) => "INT",
+                nodedb_types::Value::Bool(_) => "BOOL",
+                _ => "TEXT",
+            };
+            (name.clone(), sql_type.to_string())
+        })
+        .collect()
 }
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.

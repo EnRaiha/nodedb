@@ -12,13 +12,20 @@
 //! read later in the SAME transaction no longer observes the buffered write
 //! until COMMIT (read-your-own-writes is lost for these ops specifically).
 //!
-//! `ClusterArrayOp::{Put, Delete}` has no direct single-node SQL surface
-//! (it is the Control-Plane multi-shard array coordinator's own physical
-//! plan, never constructed by `plan_sql()`), so it is not covered here.
-//! `CrdtOp` and `VectorOp` flipped variants likewise have no direct SQL
-//! entry point exercised by the existing pgwire surface at the time of this
-//! change, so the fix is pinned via the Array and Document cases below,
-//! which exercise the identical `exec_tx_passthrough` COMMIT-replay path.
+//! `CrdtOp` and `VectorOp` flipped variants have no direct SQL entry point on
+//! the existing pgwire surface, so the fix is pinned via the Array and
+//! Document cases below, which exercise the identical `exec_tx_passthrough`
+//! COMMIT-replay path.
+//!
+//! `INSERT INTO ARRAY` / `DELETE FROM ARRAY` do not plan as `ArrayOp` here.
+//! Whenever a cluster topology exists -- which the server binary always has,
+//! since `server.single_node_calvin` defaults on -- `plan_sql()` emits the
+//! Control-Plane routing wrapper `ClusterArrayOp::{Put, Delete}` instead
+//! (`array_convert/dml.rs`, gated on `ctx.cluster_enabled`). The wrapper has
+//! no Data-Plane handler, so the staging gate reshapes it into one
+//! `ArrayOp::{Put, Delete}` per owning vShard before buffering
+//! (`session::txn_expand`); COMMIT replays those. The cases below therefore
+//! exercise the wrapper end to end, not just the single-node `ArrayOp` form.
 
 use crate::harness::TestServer;
 

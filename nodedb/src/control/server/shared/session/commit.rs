@@ -182,10 +182,10 @@ pub async fn run_commit(
     )
     .await;
     // Transition the session out of the block NOW — this drains the write buffer
-    // and clears snapshot/txn state, moving the session to `Idle`. Keep the
-    // aligned descriptor-lease scope holders owned here through every remaining
-    // cleanup step and response construction below.
-    let (_drained_tasks, _lease_scopes) = match sessions.commit(session_id) {
+    // and clears snapshot/txn state, moving the session to `Idle`. The aligned
+    // descriptor-lease scope holders stay owned here until the drain-bearing
+    // flushes below, which cannot wait on a hold this session still owns.
+    let (_drained_tasks, lease_scopes) = match sessions.commit(session_id) {
         Ok(drained) => drained,
         Err(_msg) => {
             return CommitOutcome::Aborted {
@@ -265,9 +265,36 @@ pub async fn run_commit(
         }
     }
 
+    // The durable batch has flushed, so these holds have no remaining job.
+    // Released BEFORE the two flushes below: each proposes a descriptor version
+    // bump, which drains every lease at the prior version — including one this
+    // committing session still owns, which would never drain.
+    drop(lease_scopes);
+
     // Flush any buffered DDL entries as a single atomic batch.
     if let Some(reason) = ddl_buffer::flush(state) {
         return CommitOutcome::Aborted { reason };
+    }
+
+    // Record the schema fields this transaction's writes inferred, deferred
+    // from statement time (`staging_gate`-buffered writes are planned against
+    // the descriptor version a statement-time bump would invalidate). The
+    // transaction is already durable, so a failure here is logged, not raised:
+    // the projection is rebuildable and the next write re-supplies the fields.
+    for pending in sessions.take_pending_field_inference(session_id) {
+        if let Err(error) = crate::control::catalog_entry::merge_collection_fields_replicated(
+            state,
+            pending.database_id,
+            pending.tenant_id,
+            &pending.collection,
+            &pending.fields,
+        ) {
+            tracing::warn!(
+                collection = %pending.collection,
+                error = %error,
+                "failed to record inferred schema fields after commit"
+            );
+        }
     }
 
     // Close non-WITH-HOLD cursors on transaction end.

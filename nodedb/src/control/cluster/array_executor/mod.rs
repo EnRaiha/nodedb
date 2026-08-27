@@ -29,9 +29,11 @@
 //!   the response-row parsers.
 //! - [`write`]: write handlers (put, delete).
 
+pub mod cells;
 mod executor;
 mod read;
 mod trait_impl;
 mod write;
 
+pub use cells::flatten_blob_vec;
 pub use executor::DataPlaneArrayExecutor;
