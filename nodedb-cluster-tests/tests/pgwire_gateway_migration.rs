@@ -185,9 +185,9 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
             returning: None,
             rls_filters: Vec::new(),
         });
-        let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+        let put_checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
         gateway
-            .execute(&ctx, put_authorized)
+            .execute(&ctx, put_checked)
             .await
             .expect("initial KvPut");
 
@@ -200,12 +200,8 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
                 surrogate_ceiling: None,
             }))
         };
-        let authorize_plan = |plan: &PhysicalPlan| {
-            Ok(common::authorize_gateway_plan(
-                &node.shared,
-                &ctx,
-                plan.clone(),
-            ))
+        let authorize_plan = |plan: PhysicalPlan| async {
+            Ok(common::authorize_gateway_plan(&node.shared, &ctx, plan).await)
         };
 
         // Record size before calls.

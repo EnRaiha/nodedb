@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod native_clone_write_intercept;
 mod native_create_then_dml;
 mod native_direct_op_txn_overlay;
 mod native_dml_affected_counts;

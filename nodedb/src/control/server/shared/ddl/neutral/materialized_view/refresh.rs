@@ -136,14 +136,24 @@ async fn execute_select(
         })?;
 
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-    for task in tasks.into_tasks() {
-        let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-            state,
-            task,
-            TraceId::ZERO,
-        )
-        .await
-        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    for task in tasks {
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        let response =
+            crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
+                crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                    state,
+                    task,
+                    identity,
+                    tenant_id: identity.tenant_id,
+                    permissions: &state.permissions,
+                    roles: &state.roles,
+                    emitter: &emitter,
+                },
+                TraceId::ZERO,
+            )
+            .await
+            .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
         require_ok_response(&response)?;
 
         let payload = response.payload.as_ref();
@@ -255,18 +265,47 @@ async fn dispatch_sql(
             sqlstate: error.sqlstate,
             message: format!("plan '{sql}': {}", error.message),
         })?;
-    for task in tasks.into_tasks() {
+    for task in tasks {
+        // Clone-check, then authorize, before the WAL append below: a
+        // `Shadowed`/`Materializing` target's `INSERT` (and the `TRUNCATE`
+        // this fires from) must copy-up/tombstone through the same
+        // protocol-neutral gate every other write path runs — otherwise a
+        // refresh against a clone target silently writes straight through it.
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state,
+                task,
+                identity,
+                tenant_id: identity.tenant_id,
+                permissions: &state.permissions,
+                roles: &state.roles,
+                emitter: &emitter,
+            },
+        )
+        .await
+        .map_err(|e| err("XX000", format!("clone-check: {e}")))?
+        {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
+                require_ok_response(&resp)?;
+                continue;
+            }
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+                checked
+            }
+        };
         crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
             identity.tenant_id,
-            task.vshard_id(),
-            task.database_id(),
-            task.plan(),
+            checked.vshard_id(),
+            checked.database_id(),
+            checked.plan(),
         )
         .map_err(|e| err("58030", format!("wal append: {e}")))?;
         let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            task,
+            checked,
             TraceId::ZERO,
         )
         .await

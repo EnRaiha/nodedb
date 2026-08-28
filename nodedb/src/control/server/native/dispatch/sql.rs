@@ -270,7 +270,23 @@ async fn execute_planned(
 
     let mut tasks = admission.tasks;
     let output_schema = admission.output_schema;
-    let mut authorized_tasks = admission.authorized_tasks;
+    // Re-derived here rather than carried from `admission`: Calvin dispatch
+    // and implicit-edge reconciliation are trusted internal mechanisms that
+    // never reach the clone-checked dispatch boundary (they don't call
+    // `dispatch_authorized_to_data_plane` / `Gateway::execute`), so a plain
+    // batch authorize is correct for them. `run_dispatch_loop` below clone-checks
+    // and authorizes each task itself, immediately before its own dispatch.
+    let mut authorized_tasks =
+        match crate::control::server::shared::authorization::authorize_task_set(
+            ctx.identity,
+            &tasks,
+            &ctx.state.permissions,
+            &ctx.state.roles,
+            &ArcAuditEmitter(Arc::clone(&ctx.state.audit)),
+        ) {
+            Ok(authorized) => authorized,
+            Err(error) => return resp(error_to_native(seq, &crate::Error::from(error))),
+        };
     let mut lease_scope = Some(admission.lease_scope);
     // Covers the images every cross-shard materialized-sum balance in `tasks`
     // was settled from, so Calvin's OCC check aborts rather than committing a

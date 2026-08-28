@@ -25,7 +25,7 @@ use crate::control::planner::descriptor_set::DescriptorVersionSet;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::schema::OutputSchema;
-use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_task_set;
 use crate::control::server::shared::retry::retry_on_schema_change;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
@@ -33,13 +33,15 @@ use crate::types::TraceId;
 /// Everything a statement needs before dispatch can begin.
 pub struct PlanAdmission {
     /// The planned task list, including any appended implicit-edge tasks.
+    /// The caller clone-checks and authorizes each task itself, immediately
+    /// before dispatch, via `shared::clone_write::intercept_and_authorize` —
+    /// this set is NOT pre-authorized, so a batch-authorize-then-loop cannot
+    /// silently reintroduce the retarget-before-clone-check bug.
     pub tasks: Vec<PhysicalTask>,
     /// Output schema for the planned statement.
     pub output_schema: OutputSchema,
     /// Descriptor versions this statement was planned against.
     pub versions: DescriptorVersionSet,
-    /// Authorization capability for the FINAL task set.
-    pub authorized_tasks: AuthorizedTaskSet,
     /// Descriptor lease holds; must stay alive for the whole execution.
     pub lease_scope: crate::control::lease::QueryLeaseScope,
     /// Read-set entries covering the row images every CROSS-SHARD
@@ -144,7 +146,10 @@ async fn plan_authorize_and_admit_once(
         database_id,
     )?;
 
-    let authorized_tasks =
+    // Deliberate gate: proves the final task set is authorizable before a
+    // descriptor lease is acquired. The caller re-derives the capability per
+    // task through the clone-check gate, immediately before each dispatch.
+    let _authorized_tasks =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)?;
 
     // Admission follows authorization so a denied statement never consumes a
@@ -155,7 +160,6 @@ async fn plan_authorize_and_admit_once(
         tasks,
         output_schema,
         versions,
-        authorized_tasks,
         lease_scope,
         sum_target_reads,
     })

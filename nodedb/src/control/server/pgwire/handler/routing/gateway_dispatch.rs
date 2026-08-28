@@ -53,6 +53,45 @@ fn meter_gateway_task(
     meter_dispatch(state, &scope, &info, rows);
 }
 
+/// Shape one payload the same way a normal gateway response payload is
+/// shaped, and push the result onto `responses`. Shared by the forwarded
+/// per-payload loop and the clone-write `Handled` short-circuit, which
+/// carries exactly one payload.
+fn push_shaped_response(
+    responses: &mut Vec<Response>,
+    payload: &[u8],
+    projection: Option<&OutputSchema>,
+    result_formats: &[FieldFormat],
+    redaction: &QueryRedaction,
+    state: &crate::control::state::SharedState,
+) -> PgWireResult<()> {
+    if payload.is_empty() {
+        responses.push(Response::Execution(Tag::new("OK")));
+        return Ok(());
+    }
+    match compose::shape_payload_no_plan(
+        payload,
+        PlanKind::MultiRow,
+        projection,
+        Some(redaction.ctx(&state.redaction)),
+    )
+    .map_err(|e| sqlstate_error("XX000", e.message()))?
+    {
+        ShapeOutcome::Rows(shaped) => {
+            let (response, notice) = shape_encode::shaped_query_response(shaped, result_formats);
+            debug_assert!(
+                notice.is_none(),
+                "MultiRow gateway response must not carry a NOTICE"
+            );
+            responses.push(response);
+        }
+        ShapeOutcome::Passthrough => {
+            responses.push(multirow_payload_to_response(payload).response);
+        }
+    }
+    Ok(())
+}
+
 /// Everything a gateway dispatch needs besides the tasks themselves.
 ///
 /// These travel together because they all describe the same request: the
@@ -73,10 +112,14 @@ impl NodeDbPgHandler {
     /// Execute all tasks via the gateway. Each task's plan is dispatched
     /// through `gateway.execute()` which ships the pre-planned physical
     /// plan to the target node via `ExecuteRequest`.
+    ///
+    /// Clone-check runs here, per task, immediately before forwarding — the
+    /// remote leader's own receive side never re-runs it (see
+    /// `exec_receiver::executor`), so the sending node is the only place the
+    /// copy-up can happen for a task headed off-node.
     pub(super) async fn dispatch_tasks_via_gateway(
         &self,
         tasks: Vec<PhysicalTask>,
-        authorized_tasks: crate::control::server::shared::authorization::AuthorizedTaskSet,
         params: GatewayDispatchParams<'_>,
     ) -> PgWireResult<Vec<Response>> {
         let GatewayDispatchParams {
@@ -105,22 +148,73 @@ impl NodeDbPgHandler {
         };
 
         let mut responses: Vec<Response> = Vec::with_capacity(tasks.len());
-        for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
-            let payloads = gateway
-                .execute(&gw_ctx, authorized_task)
+        for task in tasks {
+            let plan_for_metering = task.plan.clone();
+            let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+                &self.state.audit,
+            ));
+            let checked =
+                match crate::control::server::shared::clone_write::intercept_and_authorize(
+                    crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                        state: &self.state,
+                        task,
+                        identity,
+                        tenant_id,
+                        permissions: &self.state.permissions,
+                        roles: &self.state.roles,
+                        emitter: &emitter,
+                    },
+                )
                 .await
                 .map_err(|e| {
-                    let (code, msg) = GatewayErrorMap::to_pgwire(&e);
+                    let (severity, code, message) =
+                        super::super::super::types::error_to_sqlstate(&e);
                     PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
+                        severity.to_owned(),
                         code.to_owned(),
-                        msg,
+                        message,
                     )))
-                })?;
+                })? {
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(
+                        resp,
+                    ) => {
+                        // The clone-write hook fully handled this task locally —
+                        // never forwarded — so shape its response the same way a
+                        // single-payload gateway response would be.
+                        let payload = resp.payload.to_vec();
+                        push_shaped_response(
+                            &mut responses,
+                            &payload,
+                            projection,
+                            result_formats,
+                            &redaction,
+                            &self.state,
+                        )?;
+                        meter_gateway_task(
+                            &self.state,
+                            identity,
+                            database_id,
+                            &plan_for_metering,
+                            None,
+                        );
+                        continue;
+                    }
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                        checked,
+                    ) => checked,
+                };
+            let payloads = gateway.execute(&gw_ctx, checked).await.map_err(|e| {
+                let (code, msg) = GatewayErrorMap::to_pgwire(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    code.to_owned(),
+                    msg,
+                )))
+            })?;
 
             if payloads.is_empty() {
                 responses.push(Response::Execution(Tag::new("OK")));
-                meter_gateway_task(&self.state, identity, database_id, &task.plan, None);
+                meter_gateway_task(&self.state, identity, database_id, &plan_for_metering, None);
             } else {
                 // One task can yield several payloads (e.g. a multi-page
                 // scan). Metered once per task below, on the total row count
@@ -154,7 +248,13 @@ impl NodeDbPgHandler {
                         }
                     }
                 }
-                meter_gateway_task(&self.state, identity, database_id, &task.plan, task_rows);
+                meter_gateway_task(
+                    &self.state,
+                    identity,
+                    database_id,
+                    &plan_for_metering,
+                    task_rows,
+                );
             }
         }
 

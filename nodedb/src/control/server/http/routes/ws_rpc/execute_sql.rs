@@ -63,7 +63,6 @@ pub async fn execute_sql(
     })
     .await?;
     let tasks = admission.tasks;
-    let authorized_tasks = admission.authorized_tasks.into_tasks();
     let _lease_scope = admission.lease_scope;
 
     let _request = shared.tenant_request_guard(tenant_id);
@@ -77,7 +76,7 @@ pub async fn execute_sql(
     // Checked once, not per task: keeps per-task extraction a no-op when metering
     // is disabled (the default).
     let metering_enabled = shared.metering_config.enabled;
-    for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
+    for task in tasks {
         // Extracted before `task.plan` is cloned/moved; `results.len()` gives this
         // task's row-count baseline for the delta metered below.
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
@@ -87,12 +86,14 @@ pub async fn execute_sql(
             admit_quota_for_dispatch(shared, &scope, info)?;
         }
         let rows_before = results.len();
+
         // `INSERT ... SELECT` orchestrates on the Control Plane, never dispatched
-        // to the Data Plane as a single op.
+        // to the Data Plane as a single op, and is never a clone-write shape.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
         ) = &task.plan
         {
+            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
             match crate::control::insert_select::run_authorized_insert_select(
                 shared,
                 authorized_task,
@@ -138,6 +139,7 @@ pub async fn execute_sql(
             },
         ) = &task.plan
         {
+            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
             match crate::control::merge_orchestrator::run_authorized_merge(shared, authorized_task)
                 .await
             {
@@ -180,6 +182,7 @@ pub async fn execute_sql(
             },
         ) = &task.plan
         {
+            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
             match crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                 shared,
                 authorized_task,
@@ -211,6 +214,7 @@ pub async fn execute_sql(
         if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
             && shared.async_raft_proposer().is_some()
         {
+            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
             match crate::control::write_resolve::run_authorized_write_resolve(
                 shared,
                 authorized_task,
@@ -238,22 +242,57 @@ pub async fn execute_sql(
             continue;
         }
 
+        // Clone CoW write-path interception, then authorization, run once per
+        // task before dispatch — same protocol-neutral gate every transport runs.
+        let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&shared.audit));
+        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: shared,
+                task,
+                identity,
+                tenant_id,
+                permissions: &shared.permissions,
+                roles: &shared.roles,
+                emitter: &emitter,
+            },
+        )
+        .await?
+        {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
+                let payload = resp.payload.to_vec();
+                if !payload.is_empty() {
+                    let json =
+                        crate::data::executor::response_codec::decode_payload_to_json(&payload);
+                    match sonic_rs::from_str::<serde_json::Value>(&json) {
+                        Ok(mut v) => {
+                            redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                            results.push(v);
+                        }
+                        Err(_) => results.push(serde_json::Value::String(json)),
+                    }
+                }
+                meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                continue;
+            }
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+                checked
+            }
+        };
+
         let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
-                    tenant_id: task.tenant_id,
+                    tenant_id: checked.tenant_id(),
                     trace_id,
-                    database_id: task.database_id,
+                    database_id: checked.database_id(),
                     txn_id: None,
                 };
-                gw.execute(&gw_ctx, authorized_task).await
+                gw.execute(&gw_ctx, checked).await
             }
             None => {
                 // Single-node boot: gateway not yet initialised — dispatch locally.
                 crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-                    shared,
-                    authorized_task,
-                    trace_id,
+                    shared, checked, trace_id,
                 )
                 .await
                 .map(|r| vec![r.payload.to_vec()])
@@ -289,6 +328,32 @@ pub async fn execute_sql(
             .unwrap_or(serde_json::Value::Null)),
         _ => Ok(serde_json::Value::Array(results)),
     }
+}
+
+/// Authorize one task with no clone-write check — used only by the
+/// Control-Plane orchestrator branches ahead of the general dispatch tail,
+/// whose plan shapes (`InsertSelect`, `Merge`, `UpdateFromJoin`, a governed
+/// predicate resolution) are never clone-write shapes.
+fn authorize_ws_rpc_task(
+    shared: &SharedState,
+    identity: &AuthenticatedIdentity,
+    task: &nodedb_physical::physical_task::PhysicalTask,
+) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        identity,
+        std::slice::from_ref(task),
+        &shared.permissions,
+        &shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
 }
 
 /// Meter one task's dispatch after its rows are pushed onto `results` —

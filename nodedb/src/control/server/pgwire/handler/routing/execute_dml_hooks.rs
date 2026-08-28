@@ -300,15 +300,22 @@ impl NodeDbPgHandler {
             };
 
         // --- Clone write-path interception ---
-        // For PointUpdate / PointDelete on Shadowed/Materializing clones,
-        // apply copy-up or tombstone before (or instead of) normal dispatch.
-        // Non-cloned collections and Materialized clones short-circuit here.
+        // Protocol-neutral hook (`shared::clone_write`); native, RESP, and
+        // HTTP each run it once at their own dispatch entry point instead.
         {
-            use super::clone_write_dispatch::CloneWriteOutcome;
-            match self
-                .maybe_intercept_clone_write(&mut task, identity, tenant_id)
-                .await?
-            {
+            use crate::control::server::shared::clone_write::{
+                CloneWriteOutcome, maybe_intercept_clone_write,
+            };
+            match maybe_intercept_clone_write(&self.state, &mut task, identity, tenant_id)
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })? {
                 CloneWriteOutcome::Handled(resp) => {
                     use crate::control::server::response_shape::compose::{
                         ShapeOutcome, shape_payload_no_plan,

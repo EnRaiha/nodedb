@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::control::security::audit::NoopAuditEmitter;
 use nodedb::control::server::broadcast::broadcast_call_count;
-use nodedb::control::server::shared::authorization::authorize_task_set;
+use nodedb::control::server::shared::clone_write::{
+    CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
+};
 use nodedb::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -47,18 +49,21 @@ async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, cou
         txn_id: None,
     };
     let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
-    let authorized = authorize_task_set(
-        &identity,
-        std::slice::from_ref(&task),
-        &server.shared.permissions,
-        &server.shared.roles,
-        &NoopAuditEmitter,
-    )
-    .expect("authorize graph seed batch")
-    .into_tasks()
-    .into_iter()
-    .next()
-    .expect("graph seed authorization capability");
+    let authorized = match intercept_and_authorize(InterceptAndAuthorizeParams {
+        state: &server.shared,
+        task,
+        identity: &identity,
+        tenant_id,
+        permissions: &server.shared.permissions,
+        roles: &server.shared.roles,
+        emitter: &NoopAuditEmitter,
+    })
+    .await
+    .expect("clone-check and authorize graph seed batch")
+    {
+        CloneCheckedOutcome::Proceed(checked) => checked,
+        CloneCheckedOutcome::Handled(_) => panic!("graph seed batch must not be clone-intercepted"),
+    };
     let gateway = nodedb::control::gateway::Gateway::new(std::sync::Arc::clone(&server.shared));
     gateway
         .execute(

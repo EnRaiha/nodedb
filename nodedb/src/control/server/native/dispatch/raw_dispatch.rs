@@ -7,32 +7,11 @@ use std::sync::Arc;
 
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 
 use super::super::super::dispatch_utils;
 use super::DispatchCtx;
-
-pub(super) fn authorize_single_task(
-    ctx: &DispatchCtx<'_>,
-    task: nodedb_physical::physical_task::PhysicalTask,
-) -> crate::Result<AuthorizedTask> {
-    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&ctx.state.audit));
-    crate::control::server::shared::authorization::authorize_task_set(
-        ctx.identity,
-        std::slice::from_ref(&task),
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "authorization returned an empty capability set".into(),
-    })
-}
 
 pub(super) async fn dispatch_authorized_single_task(
     ctx: &DispatchCtx<'_>,
@@ -59,7 +38,25 @@ pub(super) async fn dispatch_authorized_single_task(
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
         txn_id,
     };
-    let authorized = authorize_single_task(ctx, task)?;
+    // Clone CoW write-path interception, then authorization, run once per
+    // task before dispatch — same protocol-neutral gate pgwire and RESP run.
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&ctx.state.audit));
+    let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state: ctx.state,
+            task,
+            identity: ctx.identity,
+            tenant_id,
+            permissions: &ctx.state.permissions,
+            roles: &ctx.state.roles,
+            emitter: &emitter,
+        },
+    )
+    .await?
+    {
+        CloneCheckedOutcome::Handled(resp) => return Ok(resp),
+        CloneCheckedOutcome::Proceed(checked) => checked,
+    };
     match ctx.state.gateway.get() {
         Some(gateway) => {
             let query = GatewayQueryContext {
@@ -69,7 +66,7 @@ pub(super) async fn dispatch_authorized_single_task(
                 txn_id,
             };
             gateway
-                .execute(&query, authorized)
+                .execute(&query, checked)
                 .await
                 .map(gateway_payloads_to_response)
                 .map_err(|error| {
@@ -77,7 +74,7 @@ pub(super) async fn dispatch_authorized_single_task(
                     crate::Error::Dispatch { detail }
                 })
         }
-        None => dispatch_without_gateway(ctx, authorized).await,
+        None => dispatch_without_gateway(ctx, checked).await,
     }
 }
 
@@ -166,17 +163,17 @@ async fn dispatch_external_crdt_apply(
 
 pub(super) async fn dispatch_without_gateway(
     ctx: &DispatchCtx<'_>,
-    authorized: crate::control::server::shared::authorization::AuthorizedTask,
+    checked: crate::control::server::shared::clone_write::CloneCheckedTask,
 ) -> crate::Result<Response> {
-    let vshard_id = authorized.vshard_id();
-    let frontier_mutation = authorized.txn_id().is_none()
+    let vshard_id = checked.vshard_id();
+    let frontier_mutation = checked.txn_id().is_none()
         && matches!(
-            authorized.plan(),
+            checked.plan(),
             PhysicalPlan::Crdt(op)
                 if crate::control::crdt_admission::changes_crdt_frontier(op)
         );
     let write = || async move {
-        dispatch_utils::dispatch_authorized_autocommit_write(ctx.state, authorized, TraceId::ZERO)
+        dispatch_utils::dispatch_authorized_autocommit_write(ctx.state, checked, TraceId::ZERO)
             .await
     };
     if frontier_mutation {

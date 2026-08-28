@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::security::audit::NoopAuditEmitter;
-use nodedb::control::server::shared::authorization::authorize_task_set;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::*;
@@ -97,21 +96,28 @@ impl TestStack {
             txn_id: None,
         };
         let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
-        let authorized = authorize_task_set(
-            &identity,
-            std::slice::from_ref(&task),
-            &self.shared.permissions,
-            &self.shared.roles,
-            &NoopAuditEmitter,
+        let checked = match nodedb::control::server::shared::clone_write::intercept_and_authorize(
+            nodedb::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: &self.shared,
+                task,
+                identity: &identity,
+                tenant_id,
+                permissions: &self.shared.permissions,
+                roles: &self.shared.roles,
+                emitter: &NoopAuditEmitter,
+            },
         )
-        .expect("authorize test task")
-        .into_tasks()
-        .into_iter()
-        .next()
-        .expect("one authorized task");
+        .await
+        .expect("clone-check and authorize test task")
+        {
+            nodedb::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(t) => t,
+            nodedb::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_) => {
+                panic!("timeseries write must not be clone-intercepted")
+            }
+        };
         let resp = nodedb::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             &self.shared,
-            authorized,
+            checked,
             TraceId::ZERO,
         )
         .await

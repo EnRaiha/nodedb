@@ -30,7 +30,6 @@ use crate::control::server::response_shape::compose::shape_decoded_rows;
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
-use crate::control::server::shared::authorization::authorize_task_set;
 use crate::control::server::shared::metering::DetachedMeterGuard;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -65,21 +64,34 @@ pub(super) async fn try_open_stream(
     };
     let mut child_task = task.clone();
     child_task.plan = child_plan.clone();
+    let tenant_id = child_task.tenant_id;
     let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
-    let authorized_child = authorize_task_set(
-        identity,
-        std::slice::from_ref(&child_task),
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
+    let checked_child = match crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state: &state.shared,
+            task: child_task,
+            identity,
+            tenant_id,
+            permissions: &state.shared.permissions,
+            roles: &state.shared.roles,
+            emitter: &emitter,
+        },
     )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "stream authorization returned no capability".into(),
-    })?;
+    .await?
+    {
+        // A streamable child is always a plain unordered scan (see
+        // `streamable_gather_child`), never a clone-write plan shape, so this
+        // is unreachable in practice — surfaced as a typed error rather than
+        // silently accommodated as either a stream or a materialized response.
+        crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_) => {
+            return Err(crate::Error::Internal {
+                detail: "clone-write hook unexpectedly intercepted a streamable scan".into(),
+            });
+        }
+        crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+            checked
+        }
+    };
 
     let stream = if let Some(gw) = state.shared.gateway.get() {
         let ctx = QueryContext {
@@ -88,9 +100,9 @@ pub(super) async fn try_open_stream(
             database_id,
             txn_id: None,
         };
-        gw.execute_stream(&ctx, authorized_child).await
+        gw.execute_stream(&ctx, checked_child).await
     } else {
-        gather_all_cores_stream_authorized(&state.shared, authorized_child, trace_id)
+        gather_all_cores_stream_authorized(&state.shared, checked_child.into_authorized(), trace_id)
     }?;
 
     Ok(Some((stream, limit)))

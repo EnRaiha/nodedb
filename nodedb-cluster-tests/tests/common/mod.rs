@@ -10,16 +10,19 @@ pub use nodedb_test_support::{
     pgwire_harness, tx_batch_helpers,
 };
 
-/// Mint the same exact-plan authorization capability required by production
-/// gateway entry points, using a trusted superuser identity scoped to `ctx`.
+/// Mint the same exact-plan clone-checked dispatch capability required by
+/// production gateway entry points, using a trusted superuser identity scoped
+/// to `ctx`.
 #[allow(dead_code)]
-pub fn authorize_gateway_plan(
+pub async fn authorize_gateway_plan(
     shared: &nodedb::control::state::SharedState,
     ctx: &nodedb::control::gateway::core::QueryContext,
     plan: nodedb_physical::physical_plan::PhysicalPlan,
-) -> nodedb::control::server::shared::authorization::AuthorizedTask {
+) -> nodedb::control::server::shared::clone_write::CloneCheckedTask {
     use nodedb::control::security::audit::NoopAuditEmitter;
-    use nodedb::control::server::shared::authorization::authorize_task_set;
+    use nodedb::control::server::shared::clone_write::{
+        CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
+    };
     use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
     let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
@@ -31,16 +34,21 @@ pub fn authorize_gateway_plan(
         post_set_op: PostSetOp::None,
         txn_id: ctx.txn_id,
     };
-    authorize_task_set(
-        &identity,
-        std::slice::from_ref(&task),
-        &shared.permissions,
-        &shared.roles,
-        &NoopAuditEmitter,
-    )
-    .expect("authorize cluster gateway plan")
-    .into_tasks()
-    .into_iter()
-    .next()
-    .expect("one authorized cluster gateway plan")
+    match intercept_and_authorize(InterceptAndAuthorizeParams {
+        state: shared,
+        task,
+        identity: &identity,
+        tenant_id: ctx.tenant_id,
+        permissions: &shared.permissions,
+        roles: &shared.roles,
+        emitter: &NoopAuditEmitter,
+    })
+    .await
+    .expect("clone-check and authorize cluster gateway plan")
+    {
+        CloneCheckedOutcome::Proceed(checked) => checked,
+        CloneCheckedOutcome::Handled(_) => {
+            panic!("gateway test plan must not be clone-intercepted")
+        }
+    }
 }

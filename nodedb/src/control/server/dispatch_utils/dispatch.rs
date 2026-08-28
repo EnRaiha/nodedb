@@ -5,7 +5,7 @@
 //! write admission, the WAL append, the enqueue, and the response collect.
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedTask;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
@@ -14,13 +14,13 @@ use super::submit_write::{
 };
 use super::types::{AutocommitWrite, DataPlaneDispatch, WriteDispatch};
 
-/// Dispatch a capability-bearing external task to the Data Plane.
+/// Dispatch a clone-checked, capability-bearing external task to the Data Plane.
 pub async fn dispatch_authorized_to_data_plane(
     shared: &SharedState,
-    authorized: AuthorizedTask,
+    checked: CloneCheckedTask,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
-    let task = authorized.into_physical_task();
+    let task = checked.into_authorized().into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
         DataPlaneDispatch {
@@ -40,13 +40,13 @@ pub async fn dispatch_authorized_to_data_plane(
     .await
 }
 
-/// Dispatch a capability-bearing external autocommit write.
+/// Dispatch a clone-checked, capability-bearing external autocommit write.
 pub async fn dispatch_authorized_autocommit_write(
     shared: &SharedState,
-    authorized: AuthorizedTask,
+    checked: CloneCheckedTask,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
-    let task = authorized.into_physical_task();
+    let task = checked.into_authorized().into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
         DataPlaneDispatch {
@@ -72,11 +72,11 @@ pub async fn dispatch_authorized_autocommit_write(
 /// a synced write does not re-fire AFTER triggers on the receiving node.
 pub(crate) async fn dispatch_authorized_autocommit_write_with_source(
     shared: &SharedState,
-    authorized: AuthorizedTask,
+    checked: CloneCheckedTask,
     trace_id: TraceId,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
-    let task = authorized.into_physical_task();
+    let task = checked.into_authorized().into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
         DataPlaneDispatch {
@@ -463,18 +463,25 @@ mod tests {
                     true,
                 ),
             );
-        let authorized = crate::control::server::shared::authorization::authorize_task_set(
-            &identity,
-            std::slice::from_ref(&task),
-            &state.permissions,
-            &state.roles,
-            &crate::control::security::audit::NoopAuditEmitter,
+        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: &state,
+                task,
+                identity: &identity,
+                tenant_id,
+                permissions: &state.permissions,
+                roles: &state.roles,
+                emitter: &crate::control::security::audit::NoopAuditEmitter,
+            },
         )
-        .expect("authorize test task")
-        .into_tasks()
-        .into_iter()
-        .next()
-        .expect("one authorized task");
+        .await
+        .expect("clone-check and authorize test task")
+        {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(t) => t,
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_) => {
+                panic!("array put must not be clone-intercepted")
+            }
+        };
 
         let stamped = Arc::new(std::sync::Mutex::new(None));
         let responder = tokio::spawn(respond_once_capturing_lsn(
@@ -484,7 +491,7 @@ mod tests {
         ));
         let response = dispatch_authorized_autocommit_write_with_source(
             &state,
-            authorized,
+            checked,
             crate::types::TraceId::ZERO,
             crate::event::EventSource::CrdtSync,
         )

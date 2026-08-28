@@ -6,18 +6,24 @@
 //! `Gateway::execute` which handles cluster-aware routing, typed `NotLeader`
 //! retry, and plan caching. The `None` fallback retains the original
 //! `dispatch_to_data_plane` path for single-node boot before the gateway is
-//! wired.
+//! wired. This is native's SQL-TEXT opcode path — distinct from
+//! `raw_dispatch.rs`, which serves only native's direct-op opcodes.
 
 use crate::bridge::envelope::{Payload, Response, Status};
 use std::sync::Arc;
 
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::types::{Lsn, RequestId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::DispatchCtx;
 
+/// Authorize one task with no clone-write check — used only by the
+/// Control-Plane orchestrator branches ahead of this file's gateway dispatch,
+/// whose plan shapes (`InsertSelect`, `Merge`, `UpdateFromJoin`, a governed
+/// predicate resolution, `DropArray`) are never clone-write shapes.
 pub(super) fn authorize_native_task(
     ctx: &DispatchCtx<'_>,
     task: &PhysicalTask,
@@ -48,10 +54,28 @@ pub(super) async fn dispatch_task_via_gateway(
     ctx: &DispatchCtx<'_>,
     task: PhysicalTask,
 ) -> crate::Result<Response> {
-    let authorized = authorize_native_task(ctx, &task)?;
-    let tenant_id = authorized.tenant_id();
-    let database_id = authorized.database_id();
-    let txn_id = authorized.txn_id();
+    let tenant_id = task.tenant_id;
+    // Clone CoW write-path interception, then authorization, run once per
+    // task before dispatch — same protocol-neutral gate raw_dispatch runs.
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&ctx.state.audit));
+    let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state: ctx.state,
+            task,
+            identity: ctx.identity,
+            tenant_id,
+            permissions: &ctx.state.permissions,
+            roles: &ctx.state.roles,
+            emitter: &emitter,
+        },
+    )
+    .await?
+    {
+        CloneCheckedOutcome::Handled(resp) => return Ok(resp),
+        CloneCheckedOutcome::Proceed(checked) => checked,
+    };
+    let database_id = checked.database_id();
+    let txn_id = checked.txn_id();
 
     match ctx.state.gateway.get() {
         Some(gw) => {
@@ -63,7 +87,7 @@ pub(super) async fn dispatch_task_via_gateway(
                 // dispatch resolves the per-txn staging overlay.
                 txn_id,
             };
-            gw.execute(&gw_ctx, authorized)
+            gw.execute(&gw_ctx, checked)
                 .await
                 .map_err(|e| {
                     let (code, msg) = GatewayErrorMap::to_native(&e);
@@ -76,7 +100,7 @@ pub(super) async fn dispatch_task_via_gateway(
         None => {
             crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
                 ctx.state,
-                authorized,
+                checked,
                 TraceId::generate(),
             )
             .await

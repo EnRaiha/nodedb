@@ -164,8 +164,6 @@ async fn execute_and_collect(
             message: format!("COPY TO: {}", error.message),
         })?;
 
-    let tasks = tasks.into_tasks();
-
     // Resolved once per export from the planned tasks' own plans, never per
     // task and never per row. Taking the sources from the plans rather than
     // from the `COPY` target covers the `COPY (<query>) TO` form too, whose
@@ -181,15 +179,24 @@ async fn execute_and_collect(
     let redaction = QueryRedaction::for_plans(
         identity.tenant_id,
         scope.auth(),
-        tasks.iter().map(|task| task.plan()),
+        tasks.iter().map(|task| &task.plan),
     );
 
     let mut all_rows: Vec<serde_json::Value> = Vec::new();
 
     for task in tasks {
-        let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-            state,
-            task,
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        let resp = crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state,
+                task,
+                identity,
+                tenant_id: identity.tenant_id,
+                permissions: &state.permissions,
+                roles: &state.roles,
+                emitter: &emitter,
+            },
             TraceId::ZERO,
         )
         .await

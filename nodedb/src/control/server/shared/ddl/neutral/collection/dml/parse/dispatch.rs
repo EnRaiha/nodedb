@@ -12,7 +12,7 @@ use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::{PlanKind, ShapedRows};
 use crate::control::server::shared::authorization::{
-    AuthorizationError, AuthorizedTask, AuthorizedTaskSet, authorize_collection, authorize_task_set,
+    AuthorizationError, AuthorizedTaskSet, authorize_collection, authorize_task_set,
 };
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
@@ -42,15 +42,36 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispat
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
         txn_id: None,
     };
-    let authorized = match authorize_final_task(state, identity, &task) {
-        Ok(authorized) => authorized,
-        Err(error) => return Some(Err(error)),
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state,
+            task,
+            identity,
+            tenant_id: identity.tenant_id,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            emitter: &emitter,
+        },
+    )
+    .await
+    {
+        Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_)) => {
+            return None;
+        }
+        Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked)) => {
+            checked
+        }
+        Err(error) => {
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
+            return Some(Err(ddl_err(sqlstate, message)));
+        }
     };
 
     if let Err(error) =
         crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
             state,
-            authorized,
+            checked,
             TraceId::ZERO,
         )
         .await
@@ -264,15 +285,34 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             txn_ctx.sessions,
             txn_ctx.session_id,
             task,
-            |staged| {
-                let authorized = authorize_final_task_crate_error(state, identity, &staged);
-                async move {
-                    crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+            |staged| async move {
+                let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+                match crate::control::server::shared::clone_write::intercept_and_authorize(
+                    crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
                         state,
-                        authorized?,
-                        TraceId::ZERO,
-                    )
-                    .await
+                        task: staged,
+                        identity,
+                        tenant_id,
+                        permissions: &state.permissions,
+                        roles: &state.roles,
+                        emitter: &emitter,
+                    },
+                )
+                .await?
+                {
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(
+                        resp,
+                    ) => Ok(resp),
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                        checked,
+                    ) => {
+                        crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                            state,
+                            checked,
+                            TraceId::ZERO,
+                        )
+                        .await
+                    }
                 }
             },
         )
@@ -320,18 +360,37 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         };
 
         drop(initial_authorized);
-        let authorized = authorize_final_task(state, identity, &task)?;
-        let response =
-            crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+        let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+        let response = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
                 state,
-                authorized,
-                TraceId::ZERO,
-            )
-            .await
-            .map_err(|error| {
-                let (_, sqlstate, message) = error_to_sqlstate(&error);
-                ddl_err(sqlstate, message)
-            })?;
+                task: task.clone(),
+                identity,
+                tenant_id,
+                permissions: &state.permissions,
+                roles: &state.roles,
+                emitter: &emitter,
+            },
+        )
+        .await
+        .map_err(|error| {
+            let (_, sqlstate, message) = error_to_sqlstate(&error);
+            ddl_err(sqlstate, message)
+        })? {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => resp,
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+                crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+                    state,
+                    checked,
+                    TraceId::ZERO,
+                )
+                .await
+                .map_err(|error| {
+                    let (_, sqlstate, message) = error_to_sqlstate(&error);
+                    ddl_err(sqlstate, message)
+                })?
+            }
+        };
 
         if response.status == crate::bridge::envelope::Status::Error {
             let (_, sqlstate, message) = match response.error_code.as_deref() {
@@ -383,40 +442,6 @@ fn authorize_final_task_set(
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
     authorize_task_set(identity, tasks, &state.permissions, &state.roles, &emitter)
         .map_err(authorization_error_to_ddl)
-}
-
-fn authorize_final_task(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    task: &nodedb_physical::physical_task::PhysicalTask,
-) -> Result<AuthorizedTask, DdlError> {
-    authorize_final_task_set(state, identity, std::slice::from_ref(task))?
-        .into_tasks()
-        .into_iter()
-        .next()
-        .ok_or_else(|| ddl_err("XX000", "authorization returned no task capability"))
-}
-
-fn authorize_final_task_crate_error(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    task: &nodedb_physical::physical_task::PhysicalTask,
-) -> crate::Result<AuthorizedTask> {
-    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-    authorize_task_set(
-        identity,
-        std::slice::from_ref(task),
-        &state.permissions,
-        &state.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "authorization returned no task capability".into(),
-    })
 }
 
 fn authorization_error_to_ddl(error: AuthorizationError) -> DdlError {

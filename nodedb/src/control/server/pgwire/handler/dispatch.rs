@@ -49,6 +49,30 @@ impl NodeDbPgHandler {
         })
     }
 
+    /// Clone-check, then authorize, one task at the Data-Plane dispatch
+    /// boundary — the only way to obtain a `CloneCheckedTask` on this path.
+    async fn intercept_and_authorize_for_dispatch(
+        &self,
+        identity: &AuthenticatedIdentity,
+        task: PhysicalTask,
+    ) -> crate::Result<crate::control::server::shared::clone_write::CloneCheckedOutcome> {
+        let tenant_id = task.tenant_id;
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.state.audit));
+        crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: &self.state,
+                task,
+                identity,
+                tenant_id,
+                permissions: &self.state.permissions,
+                roles: &self.state.roles,
+                emitter: &emitter,
+            },
+        )
+        .await
+    }
+
     /// Dispatch a single physical task and wait for the response.
     ///
     /// In cluster mode, writes propose to Raft first and execute only after
@@ -291,14 +315,22 @@ impl NodeDbPgHandler {
         }
 
         reject_unadmitted_crdt_apply(&task.plan)?;
-        let authorized = self.authorize_for_dispatch(identity, &task)?;
+        let checked = self
+            .intercept_and_authorize_for_dispatch(identity, task)
+            .await?;
+        let checked = match checked {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
+                return Ok(resp);
+            }
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(t) => t,
+        };
         if let Some(async_proposer) = self.state.async_raft_proposer()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-                authorized.tenant_id(),
-                authorized.database_id(),
-                authorized.vshard_id(),
+                checked.tenant_id(),
+                checked.database_id(),
+                checked.vshard_id(),
                 &crate::control::wal_replication::ReplicableWrite::decide_for_replication(
-                    authorized.plan(),
+                    checked.plan(),
                 )?,
             )?
         {
@@ -306,11 +338,11 @@ impl NodeDbPgHandler {
                 .dispatch_replicated_write(ReplicatedWrite {
                     entry,
                     proposer: async_proposer,
-                    authorized,
+                    authorized: checked.into_authorized(),
                 })
                 .await;
         }
-        self.dispatch_local(authorized, user_id).await
+        self.dispatch_local(checked, user_id).await
     }
 
     /// Dispatch a write through Raft: propose → register waiter → await apply.
@@ -364,11 +396,11 @@ impl NodeDbPgHandler {
     /// before enqueue, so LSN order equals apply order. Reads bypass the WAL entirely.
     async fn dispatch_local(
         &self,
-        authorized: crate::control::server::shared::authorization::AuthorizedTask,
+        checked: crate::control::server::shared::clone_write::CloneCheckedTask,
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
         self.submit_authorized_to_data_plane(
-            authorized,
+            checked,
             user_id,
             WalDurability::AppendHere { now_override: None },
         )

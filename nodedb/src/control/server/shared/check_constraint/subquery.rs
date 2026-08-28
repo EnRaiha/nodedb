@@ -52,15 +52,25 @@ pub(super) async fn enforce_subquery_check(
             "CHECK match query did not produce exactly one task",
         ));
     }
-    let task = tasks.into_tasks().into_iter().next().ok_or_else(|| {
+    let task = tasks.into_iter().next().ok_or_else(|| {
         evaluation_error(
             constraint,
             "CHECK match query did not produce an executable task",
         )
     })?;
-    let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-        state,
-        task,
+    let tenant_id = identity.tenant_id;
+    let emitter =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    let response = crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state,
+            task,
+            identity,
+            tenant_id,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            emitter: &emitter,
+        },
         TraceId::ZERO,
     )
     .await

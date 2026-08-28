@@ -28,14 +28,15 @@ pub(super) struct SubmitArgs {
 }
 
 impl NodeDbPgHandler {
-    /// Consume an authorization capability at the local Data Plane boundary.
+    /// Consume a clone-checked authorization capability at the local Data
+    /// Plane boundary.
     pub(super) async fn submit_authorized_to_data_plane(
         &self,
-        authorized: crate::control::server::shared::authorization::AuthorizedTask,
+        checked: crate::control::server::shared::clone_write::CloneCheckedTask,
         user_id: Option<Arc<str>>,
         durability: WalDurability,
     ) -> crate::Result<Response> {
-        let task = authorized.into_physical_task();
+        let task = checked.into_authorized().into_physical_task();
         self.submit_to_data_plane(SubmitArgs {
             tenant_id: task.tenant_id,
             vshard_id: task.vshard_id,

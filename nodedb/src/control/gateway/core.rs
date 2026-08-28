@@ -25,7 +25,7 @@ use std::time::SystemTime;
 use tracing::{Instrument, debug, info_span};
 
 use crate::Error;
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedTask;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
@@ -58,9 +58,9 @@ pub struct QueryContext {
 
 pub(super) fn authorized_plan_for_context(
     ctx: &QueryContext,
-    authorized: AuthorizedTask,
+    checked: CloneCheckedTask,
 ) -> Result<PhysicalPlan, Error> {
-    let task = authorized.into_physical_task();
+    let task = checked.into_authorized().into_physical_task();
     if task.tenant_id != ctx.tenant_id
         || task.database_id != ctx.database_id
         || task.txn_id != ctx.txn_id
@@ -135,9 +135,9 @@ impl Gateway {
     pub async fn execute(
         &self,
         ctx: &QueryContext,
-        authorized: AuthorizedTask,
+        checked: CloneCheckedTask,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        self.execute_with_watermarks(ctx, authorized)
+        self.execute_with_watermarks(ctx, checked)
             .await
             .map(|(payloads, _watermarks, _read_version)| payloads)
     }
@@ -177,9 +177,9 @@ impl Gateway {
     pub async fn execute_with_watermarks(
         &self,
         ctx: &QueryContext,
-        authorized: AuthorizedTask,
+        checked: CloneCheckedTask,
     ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
-        let plan = authorized_plan_for_context(ctx, authorized)?;
+        let plan = authorized_plan_for_context(ctx, checked)?;
         self.execute_plan_with_watermarks(ctx, plan).await
     }
 

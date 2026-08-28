@@ -142,20 +142,27 @@ pub async fn remote_write(
         }
         let emitter =
             crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.shared.audit));
-        let authorized = match crate::control::server::shared::authorization::authorize_task_set(
-            &identity.0,
-            std::slice::from_ref(&task),
-            &state.shared.permissions,
-            &state.shared.roles,
-            &emitter,
-        ) {
-            Ok(set) => match set.into_tasks().into_iter().next() {
-                Some(task) => task,
-                None => {
-                    total_rejected += ts.samples.len() as u64;
-                    continue;
-                }
+        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: &state.shared,
+                task,
+                identity: &identity.0,
+                tenant_id,
+                permissions: &state.shared.permissions,
+                roles: &state.shared.roles,
+                emitter: &emitter,
             },
+        )
+        .await
+        {
+            Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                checked,
+            )) => checked,
+            Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_)) => {
+                // A timeseries ingest is never a clone-write shape.
+                total_accepted += ts.samples.len() as u64;
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(error = ?error, collection = %collection, "remote write denied");
                 total_rejected += ts.samples.len() as u64;
@@ -173,11 +180,11 @@ pub async fn remote_write(
                     database_id: nodedb_types::id::DatabaseId::DEFAULT,
                     txn_id: None,
                 };
-                gw.execute(&gw_ctx, authorized).await
+                gw.execute(&gw_ctx, checked).await
             }
             None => crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
                 &state.shared,
-                authorized,
+                checked,
                 TraceId::generate(),
             )
             .await

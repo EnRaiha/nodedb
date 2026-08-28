@@ -174,9 +174,9 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
         rls_filters: Vec::new(),
     });
     let ctx = test_ctx();
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
     gateway
-        .execute(&ctx, authorized)
+        .execute(&ctx, checked)
         .await
         .expect("direct gateway Put must succeed");
 
@@ -236,9 +236,9 @@ async fn http_not_leader_gateway_error_mapping() {
         rls_filters: Vec::new(),
     });
     let ctx = test_ctx();
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
     gateway
-        .execute(&ctx, authorized)
+        .execute(&ctx, checked)
         .await
         .expect("Put via shared.gateway");
 
@@ -304,9 +304,9 @@ async fn resp_not_leader_gateway_error_mapping() {
         rls_filters: Vec::new(),
     });
     let ctx = test_ctx();
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
     gateway
-        .execute(&ctx, authorized)
+        .execute(&ctx, checked)
         .await
         .expect("Put via shared.gateway");
 
@@ -435,9 +435,9 @@ async fn native_not_leader_gateway_error_mapping() {
         rls_filters: Vec::new(),
     });
     let ctx = test_ctx();
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
     gateway
-        .execute(&ctx, authorized)
+        .execute(&ctx, checked)
         .await
         .expect("Put via shared.gateway");
 

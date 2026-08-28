@@ -17,6 +17,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::dispatch_utils;
+use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::state::SharedState;
@@ -58,23 +59,29 @@ pub(super) async fn dispatch_kv(
     if let Some(info) = &plan_metering_info {
         admit_resp_quota(state, session, database_id, info)?;
     }
-    let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")?;
+    let checked =
+        intercept_and_authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")
+            .await?;
+    let checked = match checked {
+        CloneCheckedOutcome::Handled(resp) => return Ok(resp),
+        CloneCheckedOutcome::Proceed(checked) => checked,
+    };
     let result = match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,
                 trace_id: TraceId::generate(),
-                database_id: authorized.database_id(),
+                database_id: checked.database_id(),
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, authorized)
+            gw.execute(&gw_ctx, checked)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => dispatch_utils::dispatch_authorized_to_data_plane(state, authorized, TraceId::ZERO)
+        None => dispatch_utils::dispatch_authorized_to_data_plane(state, checked, TraceId::ZERO)
             .await
             .map_err(map_busy_error),
     };
@@ -112,27 +119,33 @@ pub(super) async fn dispatch_kv_write(
     if let Some(info) = &plan_metering_info {
         admit_resp_quota(state, session, database_id, info)?;
     }
-    let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_put")?;
+    // Clone CoW write-path interception, then authorization, run once per
+    // task before dispatch — same protocol-neutral gate pgwire and native run.
+    let checked =
+        intercept_and_authorize_resp_task(state, session, plan, vshard, database_id, "kv_put")
+            .await?;
+    let checked = match checked {
+        CloneCheckedOutcome::Handled(resp) => return Ok(resp),
+        CloneCheckedOutcome::Proceed(checked) => checked,
+    };
     let result = match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,
                 trace_id: TraceId::generate(),
-                database_id: authorized.database_id(),
+                database_id: checked.database_id(),
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, authorized)
+            gw.execute(&gw_ctx, checked)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => {
-            dispatch_utils::dispatch_authorized_autocommit_write(state, authorized, TraceId::ZERO)
-                .await
-                .map_err(map_busy_error)
-        }
+        None => dispatch_utils::dispatch_authorized_autocommit_write(state, checked, TraceId::ZERO)
+            .await
+            .map_err(map_busy_error),
     };
     if result.is_ok()
         && let Some(info) = &plan_metering_info
@@ -208,7 +221,7 @@ fn authorize_resp_task(
     vshard_id: VShardId,
     database_id: DatabaseId,
     operation: &str,
-) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+) -> crate::Result<PhysicalTask> {
     let identity = session
         .identity
         .as_ref()
@@ -258,29 +271,49 @@ fn authorize_resp_task(
         &state.redaction,
     )?;
 
-    let task = PhysicalTask {
+    Ok(PhysicalTask {
         tenant_id: session.tenant_id,
         vshard_id,
         database_id: scope.database_id(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id: None,
-    };
-    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.audit));
-    crate::control::server::shared::authorization::authorize_task_set(
-        identity,
-        std::slice::from_ref(&task),
-        &state.permissions,
-        &state.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "authorization returned an empty capability set".into(),
     })
+}
+
+/// Build the RESP task, then clone-check and authorize it — the single entry
+/// point through which every RESP command reaches a `CloneCheckedOutcome`.
+async fn intercept_and_authorize_resp_task(
+    state: &SharedState,
+    session: &RespSession,
+    plan: PhysicalPlan,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    operation: &str,
+) -> crate::Result<CloneCheckedOutcome> {
+    let task = authorize_resp_task(state, session, plan, vshard_id, database_id, operation)?;
+    // Checked above: `authorize_resp_task` already fails closed when absent.
+    let identity = session
+        .identity
+        .as_ref()
+        .ok_or_else(|| crate::Error::RejectedAuthz {
+            tenant_id: session.tenant_id,
+            resource: "RESP AUTH required before data access".into(),
+        })?;
+    let tenant_id = session.tenant_id;
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.audit));
+    crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state,
+            task,
+            identity,
+            tenant_id,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            emitter: &emitter,
+        },
+    )
+    .await
 }
 
 /// Resolve the request-scoped auth contract for a RESP identity.

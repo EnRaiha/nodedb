@@ -7,8 +7,6 @@
 //! read path consults this table before falling back to source storage, so
 //! subsequent reads correctly return "not found."
 
-use std::sync::Arc;
-
 use nodedb_types::{DatabaseId, Surrogate};
 
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
@@ -16,7 +14,7 @@ use crate::control::state::SharedState;
 
 /// Parameters for a tombstone write.
 pub struct TombstoneParams<'a> {
-    pub state: &'a Arc<SharedState>,
+    pub state: &'a SharedState,
     /// The database ID of the clone (target).
     pub target_db_id: DatabaseId,
     /// The plain collection name (not db_qualified).
@@ -27,7 +25,7 @@ pub struct TombstoneParams<'a> {
 
 /// Parameters for a KV tombstone write.
 pub struct KvTombstoneParams<'a> {
-    pub state: &'a Arc<SharedState>,
+    pub state: &'a SharedState,
     /// The database ID of the clone (target).
     pub target_db_id: DatabaseId,
     /// The plain collection name (not db_qualified).

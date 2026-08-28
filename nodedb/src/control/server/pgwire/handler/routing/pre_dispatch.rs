@@ -166,10 +166,10 @@ impl NodeDbPgHandler {
             .sessions
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        let authorized_tasks = self.authorize_tasks(identity, tasks)?;
+        // Clone-check and authorization now run per task, inside
+        // `dispatch_tasks_via_gateway`, immediately before each task forwards.
         self.dispatch_tasks_via_gateway(
             tasks.to_vec(),
-            authorized_tasks,
             super::gateway_dispatch::GatewayDispatchParams {
                 identity,
                 tenant_id,

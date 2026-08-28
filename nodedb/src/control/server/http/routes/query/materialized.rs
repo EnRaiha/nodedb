@@ -127,7 +127,6 @@ pub async fn query(
     .map_err(ApiError::from)?;
     let tasks = admission.tasks;
     let output_schema = admission.output_schema;
-    let authorized_tasks = admission.authorized_tasks.into_tasks();
     let _lease_scope = admission.lease_scope;
 
     if tasks.is_empty() {
@@ -147,7 +146,7 @@ pub async fn query(
     let metering_enabled = state.shared.metering_config.enabled;
 
     async {
-        for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
+        for task in tasks {
             // Extracted before `task.plan` is cloned/moved into any branch below.
             let plan_metering_info =
                 metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
@@ -159,12 +158,16 @@ pub async fn query(
             let rows_before = result_rows.len();
             // `INSERT ... SELECT` orchestrates on the Control Plane and issues its own
             // WAL-backed writes, so the outer per-task WAL append is skipped for it.
+            // Never a clone-write shape.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
             ) = &task.plan
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
+                let authorized_task =
+                    authorize_materialized_task(&state.shared, &identity, &task)
+                        .map_err(gateway_error)?;
                 let resp = crate::control::insert_select::run_authorized_insert_select(
                     &state.shared,
                     authorized_task,
@@ -213,6 +216,9 @@ pub async fn query(
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
+                let authorized_task =
+                    authorize_materialized_task(&state.shared, &identity, &task)
+                        .map_err(gateway_error)?;
                 let resp = crate::control::merge_orchestrator::run_authorized_merge(
                     &state.shared,
                     authorized_task,
@@ -261,6 +267,9 @@ pub async fn query(
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
+                let authorized_task =
+                    authorize_materialized_task(&state.shared, &identity, &task)
+                        .map_err(gateway_error)?;
                 let resp = crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                     &state.shared,
                     authorized_task,
@@ -295,6 +304,9 @@ pub async fn query(
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
+                let authorized_task =
+                    authorize_materialized_task(&state.shared, &identity, &task)
+                        .map_err(gateway_error)?;
                 let resp = crate::control::write_resolve::run_authorized_write_resolve(
                     &state.shared,
                     authorized_task,
@@ -329,17 +341,65 @@ pub async fn query(
             // Resolved once per task, reused for every payload it produced.
             let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
 
+            // Clone CoW write-path interception, then authorization, run once
+            // per task before dispatch — same protocol-neutral gate every
+            // transport runs.
+            let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(
+                &state.shared.audit,
+            ));
+            let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+                crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                    state: &state.shared,
+                    task,
+                    identity: &identity,
+                    tenant_id,
+                    permissions: &state.shared.permissions,
+                    roles: &state.shared.roles,
+                    emitter: &emitter,
+                },
+            )
+            .await
+            .map_err(gateway_error)?
+            {
+                crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
+                    append_response(
+                        &mut result_rows,
+                        resp,
+                        ShapedAppend {
+                            plan: &plan_for_shape,
+                            plan_kind,
+                            output_schema: &output_schema,
+                            state: &state,
+                            database_id,
+                            tenant_id,
+                            redaction: &redaction,
+                        },
+                    )?;
+                    meter_task_dispatch(
+                        &state.shared,
+                        &scope,
+                        &plan_metering_info,
+                        rows_before,
+                        &result_rows,
+                    );
+                    continue;
+                }
+                crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                    checked,
+                ) => checked,
+            };
+
             // Prefer gateway (cluster-aware, owns WAL durability), else fall back to
             // local SPSC dispatch, where WAL append precedes enqueue so LSN order matches.
             let payloads = match state.shared.gateway.get() {
                 Some(gw) => {
                     let gw_ctx = QueryContext {
-                        tenant_id: task.tenant_id,
+                        tenant_id: checked.tenant_id(),
                         trace_id,
                         database_id,
                         txn_id: None,
                     };
-                    gw.execute(&gw_ctx, authorized_task)
+                    gw.execute(&gw_ctx, checked)
                         .await
                         .map_err(gateway_error)?
                 }
@@ -347,7 +407,7 @@ pub async fn query(
                     // Single-node boot: gateway not yet initialised — dispatch locally.
                     let response = crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
                         &state.shared,
-                        authorized_task,
+                        checked,
                         trace_id,
                     )
                         .await
@@ -384,6 +444,32 @@ pub async fn query(
         Ok((rate_limit_headers, axum::Json(HttpQueryResponse::ok(result_rows))))
     }
     .await
+}
+
+/// Authorize one task with no clone-write check — used only by the
+/// Control-Plane orchestrator branches ahead of the general dispatch tail,
+/// whose plan shapes (`InsertSelect`, `Merge`, `UpdateFromJoin`, a governed
+/// predicate resolution) are never clone-write shapes.
+fn authorize_materialized_task(
+    shared: &crate::control::state::SharedState,
+    identity: &crate::control::security::identity::AuthenticatedIdentity,
+    task: &nodedb_physical::physical_task::PhysicalTask,
+) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        identity,
+        std::slice::from_ref(task),
+        &shared.permissions,
+        &shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
 }
 
 fn ddl_error_to_api(error: crate::control::server::shared::ddl::DdlError) -> ApiError {

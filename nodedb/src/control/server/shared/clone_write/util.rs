@@ -3,8 +3,6 @@
 //! Small response/error-shaping helpers shared by the Document and KV clone
 //! write-interception paths.
 
-use pgwire::error::{ErrorInfo, PgWireError};
-
 use nodedb_types::{DatabaseId, Lsn};
 
 use crate::bridge::envelope::{Response, Status};
@@ -50,11 +48,7 @@ pub(super) fn strip_db_prefix(db_id: DatabaseId, qualified: &str) -> &str {
     qualified.strip_prefix(prefix.as_str()).unwrap_or(qualified)
 }
 
-/// Convert a clone write error to a PgWireError.
-pub(super) fn write_err(msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        "XX000".to_owned(),
-        msg.to_owned(),
-    )))
+/// Wrap a clone write-path failure as a typed dispatch error.
+pub(super) fn write_err(msg: impl Into<String>) -> crate::Error {
+    crate::Error::Dispatch { detail: msg.into() }
 }

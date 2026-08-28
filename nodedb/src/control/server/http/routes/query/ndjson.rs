@@ -120,7 +120,6 @@ pub async fn query_ndjson(
     };
     let tasks = admission.tasks;
     let output_schema = admission.output_schema;
-    let authorized_tasks = admission.authorized_tasks.into_tasks();
     let mut lease_scope = Some(admission.lease_scope);
 
     let trace_id = crate::control::trace_context::generate_trace_id();
@@ -178,16 +177,10 @@ pub async fn query_ndjson(
     // Checked once, not per task: keeps per-task extraction a no-op when metering is
     // disabled. This fallback fully materializes the body, so it meters like `/v1/query`.
     let metering_enabled = state.shared.metering_config.enabled;
-    for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
-        // Captured before dispatch moves `task.plan` — needed by shaping below.
-        let plan_kind = describe_plan(&task.plan);
-        let plan_for_shape = task.plan.clone();
-        // Resolved once per task, reused for every payload it produced.
-        let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
-        let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
-
+    for task in tasks {
         // A spent hard quota refuses the task before it runs; reported as an error
         // line and the task skipped, matching this stream's error reporting.
+        let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
         if let Some(info) = &plan_metering_info
             && let Err(e) = admit_quota_for_dispatch(&state.shared, &scope, info)
         {
@@ -196,18 +189,27 @@ pub async fn query_ndjson(
             continue;
         }
 
+        // Captured before dispatch moves `task.plan` — needed by shaping below.
+        let plan_kind = describe_plan(&task.plan);
+        let plan_for_shape = task.plan.clone();
+        // Resolved once per task, reused for every payload it produced.
+        let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
+
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = if matches!(
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
             )
         ) {
-            crate::control::insert_select::run_authorized_insert_select(
-                &state.shared,
-                authorized_task,
-            )
-            .await
-            .map(|response| vec![response.payload.to_vec()])
+            match authorize_ndjson_task(&state.shared, &identity, &task) {
+                Ok(authorized_task) => crate::control::insert_select::run_authorized_insert_select(
+                    &state.shared,
+                    authorized_task,
+                )
+                .await
+                .map(|response| vec![response.payload.to_vec()]),
+                Err(e) => Err(e),
+            }
         } else if matches!(
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
@@ -217,9 +219,15 @@ pub async fn query_ndjson(
                 }
             )
         ) {
-            crate::control::merge_orchestrator::run_authorized_merge(&state.shared, authorized_task)
+            match authorize_ndjson_task(&state.shared, &identity, &task) {
+                Ok(authorized_task) => crate::control::merge_orchestrator::run_authorized_merge(
+                    &state.shared,
+                    authorized_task,
+                )
                 .await
-                .map(|response| vec![response.payload.to_vec()])
+                .map(|response| vec![response.payload.to_vec()]),
+                Err(e) => Err(e),
+            }
         } else if matches!(
             &task.plan,
             crate::bridge::envelope::PhysicalPlan::Document(
@@ -229,42 +237,78 @@ pub async fn query_ndjson(
                 }
             )
         ) {
-            crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
-                &state.shared,
-                authorized_task,
-            )
-            .await
-            .map(|response| vec![response.payload.to_vec()])
+            match authorize_ndjson_task(&state.shared, &identity, &task) {
+                Ok(authorized_task) => {
+                    crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+                        &state.shared,
+                        authorized_task,
+                    )
+                    .await
+                    .map(|response| vec![response.payload.to_vec()])
+                }
+                Err(e) => Err(e),
+            }
         } else if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
             && state.shared.async_raft_proposer().is_some()
         {
             // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
             // before proposing; local (non-Raft) path skips this branch.
-            crate::control::write_resolve::run_authorized_write_resolve(
-                &state.shared,
-                authorized_task,
-                resolver,
-            )
-            .await
-            .map(|response| vec![response.payload.to_vec()])
-        } else {
-            match state.shared.gateway.get() {
-                Some(gw) => {
-                    let gw_ctx = QueryContext {
-                        tenant_id: task.tenant_id,
-                        trace_id,
-                        database_id,
-                        txn_id: None,
-                    };
-                    gw.execute(&gw_ctx, authorized_task).await
-                }
-                None => crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+            match authorize_ndjson_task(&state.shared, &identity, &task) {
+                Ok(authorized_task) => crate::control::write_resolve::run_authorized_write_resolve(
                     &state.shared,
                     authorized_task,
-                    trace_id,
+                    resolver,
                 )
                 .await
                 .map(|response| vec![response.payload.to_vec()]),
+                Err(e) => Err(e),
+            }
+        } else {
+            // Clone CoW write-path interception, then authorization, run once
+            // per task before dispatch — same protocol-neutral gate every
+            // transport runs.
+            let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+                &state.shared.audit,
+            ));
+            match crate::control::server::shared::clone_write::intercept_and_authorize(
+                crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                    state: &state.shared,
+                    task,
+                    identity: &identity,
+                    tenant_id,
+                    permissions: &state.shared.permissions,
+                    roles: &state.shared.roles,
+                    emitter: &emitter,
+                },
+            )
+            .await
+            {
+                Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(
+                    resp,
+                )) => Ok(vec![resp.payload.to_vec()]),
+                Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                    checked,
+                )) => match state.shared.gateway.get() {
+                    Some(gw) => {
+                        let gw_ctx = QueryContext {
+                            tenant_id: checked.tenant_id(),
+                            trace_id,
+                            database_id,
+                            txn_id: None,
+                        };
+                        gw.execute(&gw_ctx, checked).await
+                    }
+                    None => {
+                        crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                            &state.shared,
+                            checked,
+                            trace_id,
+                        )
+                        .await
+                        .map(|response| vec![response.payload.to_vec()])
+                    }
+                },
+                Err(e) => Err(e),
             }
         };
 
@@ -322,4 +366,30 @@ pub async fn query_ndjson(
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response());
     response.headers_mut().extend(rate_limit_headers);
     response
+}
+
+/// Authorize one task with no clone-write check — used only by the
+/// Control-Plane orchestrator branches ahead of the general dispatch tail,
+/// whose plan shapes (`InsertSelect`, `Merge`, `UpdateFromJoin`, a governed
+/// predicate resolution) are never clone-write shapes.
+fn authorize_ndjson_task(
+    shared: &crate::control::state::SharedState,
+    identity: &crate::control::security::identity::AuthenticatedIdentity,
+    task: &nodedb_physical::physical_task::PhysicalTask,
+) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        identity,
+        std::slice::from_ref(task),
+        &shared.permissions,
+        &shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
 }

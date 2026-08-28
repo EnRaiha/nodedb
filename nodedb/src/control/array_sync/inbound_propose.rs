@@ -178,35 +178,43 @@ impl OriginArrayInbound {
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
+        let tenant_id = task.tenant_id;
         let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
             &self.shared().audit,
         ));
-        let authorized = crate::control::server::shared::authorization::authorize_task_set(
-            self.identity(),
-            std::slice::from_ref(&task),
-            &self.shared().permissions,
-            &self.shared().roles,
-            &emitter,
+        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
+            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                state: self.shared(),
+                task,
+                identity: self.identity(),
+                tenant_id,
+                permissions: &self.shared().permissions,
+                roles: &self.shared().roles,
+                emitter: &emitter,
+            },
         )
+        .await
         .map_err(|error| {
             Some(build_reject(
                 &op.header.array,
                 op.header.hlc,
                 ArrayRejectReason::EngineRejected,
-                error.resource().to_string(),
+                error.to_string(),
             ))
-        })?
-        .into_tasks()
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            Some(build_reject(
-                &op.header.array,
-                op.header.hlc,
-                ArrayRejectReason::EngineRejected,
-                "authorization returned no array task".to_string(),
-            ))
-        })?;
+        })? {
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+                checked
+            }
+            // An array write is never a clone-write shape.
+            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_) => {
+                return Err(Some(build_reject(
+                    &op.header.array,
+                    op.header.hlc,
+                    ArrayRejectReason::EngineRejected,
+                    "unexpected clone-write interception of an array task".to_string(),
+                )));
+            }
+        };
 
         // This is the only durability this op will ever get: nothing appended a
         // redo for it upstream (no Raft entry on this path), and the reply below
@@ -218,7 +226,7 @@ impl OriginArrayInbound {
         let response =
             match crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write_with_source(
                 self.shared(),
-                authorized,
+                checked,
                 TraceId::ZERO,
                 crate::event::EventSource::CrdtSync,
             )

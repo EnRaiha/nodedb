@@ -76,11 +76,8 @@ async fn pgwire_gateway_smoke_cache_hit() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    gateway
-        .execute(&ctx, authorized)
-        .await
-        .expect("gateway Put");
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     // Manually populate the plan cache to test hit counting.
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
@@ -143,11 +140,8 @@ async fn http_gateway_smoke_cache_hit() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    gateway
-        .execute(&ctx, authorized)
-        .await
-        .expect("gateway Put");
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
         collection: "gw_smoke_http".into(),
@@ -204,11 +198,8 @@ async fn resp_gateway_smoke_cache_hit() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    gateway
-        .execute(&ctx, authorized)
-        .await
-        .expect("gateway Put");
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
         collection: "gw_smoke_resp".into(),
@@ -268,11 +259,8 @@ async fn ilp_gateway_smoke_cache_hit() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    gateway
-        .execute(&ctx, authorized)
-        .await
-        .expect("gateway Put");
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
         collection: "gw_smoke_ilp".into(),
@@ -329,11 +317,8 @@ async fn native_gateway_smoke_cache_hit() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    gateway
-        .execute(&ctx, authorized)
-        .await
-        .expect("gateway Put");
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
         collection: "gw_smoke_native".into(),

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::Error;
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
@@ -17,16 +17,21 @@ use super::version_set::{permission_tree_version_key, rls_version_key};
 impl Gateway {
     /// Execute SQL through the two-phase, descriptor-version-aware plan cache.
     ///
-    /// `plan_fn` runs at most once on a cache miss. `authorize_fn` mints the
-    /// exact capability for either the cached plan or the newly planned value.
-    pub async fn execute_sql(
+    /// `plan_fn` runs at most once on a cache miss. `authorize_fn` clone-checks
+    /// and authorizes the exact plan — the cached plan or the newly planned
+    /// value — the same way every other dispatch entry point does.
+    pub async fn execute_sql<Authorize, AuthorizeFut>(
         &self,
         ctx: &QueryContext,
         sql: &str,
         placeholder_types: &[&str],
         plan_fn: impl FnOnce() -> Result<PhysicalPlan, Error>,
-        authorize_fn: impl Fn(&PhysicalPlan) -> Result<AuthorizedTask, Error>,
-    ) -> Result<Vec<Vec<u8>>, Error> {
+        authorize_fn: Authorize,
+    ) -> Result<Vec<Vec<u8>>, Error>
+    where
+        Authorize: Fn(PhysicalPlan) -> AuthorizeFut,
+        AuthorizeFut: std::future::Future<Output = Result<CloneCheckedTask, Error>>,
+    {
         let sql_hash = hash_sql(sql);
         let ph_hash = hash_placeholder_types(placeholder_types);
         let sql_key = SqlKey {
@@ -73,8 +78,8 @@ impl Gateway {
                 };
                 if let Some(cached_plan) = self.plan_cache.get(&full_key) {
                     debug!(sql = %sql, "gateway: plan cache hit (two-phase)");
-                    let authorized = authorize_fn(cached_plan.as_ref())?;
-                    let plan = authorized_plan_for_context(ctx, authorized)?;
+                    let checked = authorize_fn(cached_plan.as_ref().clone()).await?;
+                    let plan = authorized_plan_for_context(ctx, checked)?;
                     return self
                         .execute_with_version_set(ctx, plan, stored_vs)
                         .await
@@ -97,8 +102,8 @@ impl Gateway {
             .insert_version_set(sql_key, actual_vs.clone());
         self.plan_cache.insert(actual_key, Arc::new(plan.clone()));
 
-        let authorized = authorize_fn(&plan)?;
-        let plan = authorized_plan_for_context(ctx, authorized)?;
+        let checked = authorize_fn(plan.clone()).await?;
+        let plan = authorized_plan_for_context(ctx, checked)?;
         self.execute_with_version_set(ctx, plan, actual_vs)
             .await
             .map(|(payloads, _watermarks, _read_version)| payloads)

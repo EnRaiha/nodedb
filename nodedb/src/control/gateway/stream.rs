@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use crate::Error;
 use crate::control::server::result_stream::ResultStream;
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
@@ -43,9 +43,9 @@ impl Gateway {
     pub async fn execute_stream(
         &self,
         ctx: &QueryContext,
-        authorized: AuthorizedTask,
+        checked: CloneCheckedTask,
     ) -> Result<ResultStream, Error> {
-        let plan = authorized_plan_for_context(ctx, authorized)?;
+        let plan = authorized_plan_for_context(ctx, checked)?;
         self.execute_stream_internal(ctx, plan).await
     }
 

@@ -71,8 +71,8 @@ async fn resp_gateway_migration_single_node_set_get() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    let put_result = gateway.execute(&ctx, put_authorized).await;
+    let put_checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    let put_result = gateway.execute(&ctx, put_checked).await;
     assert!(
         put_result.is_ok(),
         "SET via gateway failed: {:?}",
@@ -86,8 +86,8 @@ async fn resp_gateway_migration_single_node_set_get() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
-    let get_result = gateway.execute(&ctx, get_authorized).await;
+    let get_checked = common::authorize_gateway_plan(&node.shared, &ctx, get_plan).await;
+    let get_result = gateway.execute(&ctx, get_checked).await;
     assert!(
         get_result.is_ok(),
         "GET via gateway failed: {:?}",
@@ -137,9 +137,10 @@ async fn resp_gateway_migration_cross_node_get() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let put_authorized = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan);
+    let put_checked =
+        common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan).await;
     leader_gw
-        .execute(&ctx, put_authorized)
+        .execute(&ctx, put_checked)
         .await
         .expect("seed PUT on leader");
 
@@ -153,8 +154,9 @@ async fn resp_gateway_migration_cross_node_get() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_authorized = common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, get_plan);
-    let get_result = follower_gw.execute(&ctx, get_authorized).await;
+    let get_checked =
+        common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, get_plan).await;
+    let get_result = follower_gw.execute(&ctx, get_checked).await;
     assert!(
         get_result.is_ok(),
         "cross-node GET via gateway failed: {:?}",

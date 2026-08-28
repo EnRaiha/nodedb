@@ -74,8 +74,8 @@ async fn http_gateway_migration_single_node_query() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    let put_result = gateway.execute(&ctx, put_authorized).await;
+    let put_checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    let put_result = gateway.execute(&ctx, put_checked).await;
     assert!(
         put_result.is_ok(),
         "PUT via gateway failed: {:?}",
@@ -89,8 +89,8 @@ async fn http_gateway_migration_single_node_query() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
-    let get_result = gateway.execute(&ctx, get_authorized).await;
+    let get_checked = common::authorize_gateway_plan(&node.shared, &ctx, get_plan).await;
+    let get_result = gateway.execute(&ctx, get_checked).await;
     assert!(
         get_result.is_ok(),
         "GET via gateway failed: {:?}",
@@ -147,8 +147,8 @@ async fn http_gateway_migration_cross_node_query() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let put_authorized = common::authorize_gateway_plan(&follower.shared, &ctx, put_plan);
-    let put_result = gateway.execute(&ctx, put_authorized).await;
+    let put_checked = common::authorize_gateway_plan(&follower.shared, &ctx, put_plan).await;
+    let put_result = gateway.execute(&ctx, put_checked).await;
     assert!(
         put_result.is_ok(),
         "cross-node PUT via gateway failed: {:?}",
@@ -181,12 +181,8 @@ async fn http_gateway_migration_cross_node_query() {
                         surrogate_ceiling: None,
                     }))
                 },
-                |plan| {
-                    Ok(common::authorize_gateway_plan(
-                        &follower.shared,
-                        &ctx,
-                        plan.clone(),
-                    ))
+                |plan| async {
+                    Ok(common::authorize_gateway_plan(&follower.shared, &ctx, plan).await)
                 },
             )
             .await;

@@ -10,19 +10,21 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::Response;
+use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::shared::session::SessionId;
 
 use super::super::super::types::error_to_sqlstate;
+use super::super::super::types::sqlstate_error;
 use super::super::core::NodeDbPgHandler;
-use super::super::plan::PlanKind;
+use super::super::plan::{PlanKind, multirow_payload_to_response};
 use super::super::stream_response;
 use super::result_shaping::ResultShaping;
 
@@ -95,19 +97,70 @@ impl NodeDbPgHandler {
         let child_plan = (**child).clone();
         let mut child_task = task.clone();
         child_task.plan = child_plan.clone();
-        let authorized_child = self
-            .authorize_tasks(identity, std::slice::from_ref(&child_task))?
-            .into_tasks()
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    "stream authorization returned no capability".to_owned(),
-                )))
-            })?;
+        let tenant_id = child_task.tenant_id;
         let state = std::sync::Arc::clone(&self.state);
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        let checked_child =
+            match crate::control::server::shared::clone_write::intercept_and_authorize(
+                crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                    state: &state,
+                    task: child_task,
+                    identity,
+                    tenant_id,
+                    permissions: &state.permissions,
+                    roles: &state.roles,
+                    emitter: &emitter,
+                },
+            )
+            .await
+            .map_err(|e| {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })? {
+                // The clone-write hook fully handled this write locally — return
+                // its shaped response directly rather than opening a stream. A
+                // streamable child is a plain unordered scan in every eligible
+                // case here (the eligibility gate above only admits `Gather` over
+                // `is_streamable_unordered_scan`), so this is unreachable in
+                // practice; it is still handled because `Response` can represent
+                // it, unlike the native/HTTP streaming siblings.
+                crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
+                    let payload = resp.payload.as_ref();
+                    let response = if payload.is_empty() {
+                        Response::Execution(Tag::new("OK"))
+                    } else {
+                        let redaction = QueryRedaction::for_plan(task.tenant_id, auth, &child_plan);
+                        match compose::shape_payload_no_plan(
+                            payload,
+                            plan_kind,
+                            shaping.projection,
+                            Some(redaction.ctx(&state.redaction)),
+                        )
+                        .map_err(|e| sqlstate_error("XX000", e.message()))?
+                        {
+                            ShapeOutcome::Rows(shaped) => {
+                                let (response, _notice) = crate::control::server::pgwire::handler::shape_encode::shaped_query_response(
+                                shaped,
+                                shaping.formats,
+                            );
+                                response
+                            }
+                            ShapeOutcome::Passthrough => {
+                                multirow_payload_to_response(payload).response
+                            }
+                        }
+                    };
+                    return Ok(Some(response));
+                }
+                crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                    checked,
+                ) => checked,
+            };
 
         // Single-node fans to local cores directly; cluster routes the scan to
         // its owning vShard (local or remote over the L4 QUIC streaming
@@ -119,11 +172,11 @@ impl NodeDbPgHandler {
                 database_id: task.database_id,
                 txn_id: None,
             };
-            gw.execute_stream(&ctx, authorized_child).await
+            gw.execute_stream(&ctx, checked_child).await
         } else {
             crate::control::server::exchange::gather::gather_all_cores_stream_authorized(
                 &state,
-                authorized_child,
+                checked_child.into_authorized(),
                 crate::types::TraceId::ZERO,
             )
         }

@@ -128,35 +128,49 @@ pub(crate) async fn try_open_sql_stream(
 
     let mut child_task = task.clone();
     child_task.plan = child_plan.clone();
+    let tenant_id = child_task.tenant_id;
     let emitter =
         crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&ctx.state.audit));
-    let authorized_child = crate::control::server::shared::authorization::authorize_task_set(
-        ctx.identity,
-        std::slice::from_ref(&child_task),
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
+    let checked_child = match crate::control::server::shared::clone_write::intercept_and_authorize(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state: ctx.state,
+            task: child_task,
+            identity: ctx.identity,
+            tenant_id,
+            permissions: &ctx.state.permissions,
+            roles: &ctx.state.roles,
+            emitter: &emitter,
+        },
     )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "stream authorization returned no capability".into(),
-    })?;
+    .await?
+    {
+        // A streamable child is always a plain unordered scan (see
+        // `streamable_gather_child`), never a clone-write plan shape, so this
+        // is unreachable in practice — surfaced as a typed error rather than
+        // silently accommodated as either a stream or a materialized response.
+        crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_) => {
+            return Err(crate::Error::Internal {
+                detail: "clone-write hook unexpectedly intercepted a streamable scan".into(),
+            });
+        }
+        crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+            checked
+        }
+    };
 
-    let stream = if let Some(gw) = ctx.state.gateway.get() {
+    let gateway = ctx.state.gateway.get();
+    let stream = if let Some(gw) = gateway {
         let gw_ctx = QueryContext {
             tenant_id: task.tenant_id,
             trace_id: crate::types::TraceId::ZERO,
             database_id,
             txn_id: task.txn_id,
         };
-        gw.execute_stream(&gw_ctx, authorized_child).await?
+        gw.execute_stream(&gw_ctx, checked_child).await?
     } else {
         gather_all_cores_stream_authorized(
             ctx.state,
-            authorized_child,
+            checked_child.into_authorized(),
             crate::types::TraceId::ZERO,
         )?
     };

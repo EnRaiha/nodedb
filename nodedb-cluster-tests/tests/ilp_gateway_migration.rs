@@ -80,8 +80,8 @@ async fn ilp_gateway_migration_single_node_ingest() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, plan);
-    let result = gw.execute(&ctx, authorized).await;
+    let checked = common::authorize_gateway_plan(&node.shared, &ctx, plan).await;
+    let result = gw.execute(&ctx, checked).await;
     assert!(
         result.is_ok(),
         "gateway ILP ingest failed: {:?}",
@@ -129,8 +129,8 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let authorized1 = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, plan1);
-    let result1 = leader_gw.execute(&ctx, authorized1).await;
+    let checked1 = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, plan1).await;
+    let result1 = leader_gw.execute(&ctx, checked1).await;
     assert!(
         result1.is_ok(),
         "node 1 (leader) ILP gateway ingest failed: {:?}",
@@ -156,8 +156,8 @@ async fn ilp_gateway_migration_cross_node_ingest() {
     });
     // Retry once on RetryableSchemaChanged: the descriptor may not yet be in
     // the follower catalog when the gateway snapshot was taken.
-    let authorized2 = common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, plan2);
-    let result2 = match follower_gw.execute(&ctx, authorized2).await {
+    let checked2 = common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, plan2).await;
+    let result2 = match follower_gw.execute(&ctx, checked2).await {
         Err(nodedb::Error::RetryableSchemaChanged { .. }) => {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let plan2b = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
@@ -171,9 +171,9 @@ async fn ilp_gateway_migration_cross_node_ingest() {
                 returning: None,
                 rls_filters: Vec::new(),
             });
-            let authorized2b =
-                common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, plan2b);
-            follower_gw.execute(&ctx, authorized2b).await
+            let checked2b =
+                common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, plan2b).await;
+            follower_gw.execute(&ctx, checked2b).await
         }
         other => other,
     };

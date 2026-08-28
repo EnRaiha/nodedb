@@ -56,7 +56,7 @@ impl NodeDbPgHandler {
         // Admission still follows the explicit authorization boundary, so a
         // rejected cursor declaration consumes no descriptor lease. The scope
         // remains live while every cursor-materialization task is dispatched.
-        let (authorized_tasks, _lease_scope) = retry_on_schema_change(move || async move {
+        let (tasks, _lease_scope) = retry_on_schema_change(move || async move {
             let perm_cache = self.state.permission_cache.read().await;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
@@ -73,35 +73,49 @@ impl NodeDbPgHandler {
                 .map_err(StatementSetupError::from)?;
             drop(perm_cache);
 
-            let authorized_tasks = self
+            // Deliberate gate: proves the planned set is authorizable before the
+            // descriptor lease is acquired. Dispatch below re-derives the
+            // capability per task through the clone-check gate.
+            let _preauthorized_tasks = self
                 .authorize_tasks(identity, &tasks)
-                .map_err(StatementSetupError::from)?
-                .into_tasks();
+                .map_err(StatementSetupError::from)?;
 
             let lease_scope = self
                 .state
                 .acquire_plan_lease_scope(&versions)
                 .map_err(StatementSetupError::from)?;
-            Ok::<_, StatementSetupError>((authorized_tasks, lease_scope))
+            Ok::<_, StatementSetupError>((tasks, lease_scope))
         })
         .await
         .map_err(PgWireError::from)?;
 
         let mut rows = Vec::new();
-        for authorized in authorized_tasks {
-            let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-                &self.state,
-                authorized,
-                TraceId::ZERO,
-            )
-            .await
-            .map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    e.to_string(),
-                )))
-            })?;
+        for task in tasks {
+            let tenant_id = task.tenant_id;
+            let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+                &self.state.audit,
+            ));
+            let resp =
+                crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
+                    crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                        state: &self.state,
+                        task,
+                        identity,
+                        tenant_id,
+                        permissions: &self.state.permissions,
+                        roles: &self.state.roles,
+                        emitter: &emitter,
+                    },
+                    TraceId::ZERO,
+                )
+                .await
+                .map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        e.to_string(),
+                    )))
+                })?;
 
             if !resp.payload.is_empty() {
                 let json =

@@ -13,7 +13,7 @@ use sonic_rs;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
-use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
@@ -316,22 +316,16 @@ pub async fn fetch_old_row(
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    let authorized = authorize_task_set(
-        identity,
-        std::slice::from_ref(&task),
-        &state.permissions,
-        &state.roles,
-        &audit,
-    )?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "authorization returned no task capability for OLD-row fetch".into(),
-    })?;
-    let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-        state,
-        authorized,
+    let resp = crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
+        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+            state,
+            task,
+            identity,
+            tenant_id,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            emitter: &audit,
+        },
         TraceId::ZERO,
     )
     .await?;

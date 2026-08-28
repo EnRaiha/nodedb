@@ -76,8 +76,8 @@ async fn gateway_execute_kv_put_get_single_node() {
         returning: None,
         rls_filters: Vec::new(),
     });
-    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
-    let put_result = gateway.execute(&ctx, put_authorized).await;
+    let put_checked = common::authorize_gateway_plan(&node.shared, &ctx, put_plan).await;
+    let put_result = gateway.execute(&ctx, put_checked).await;
     assert!(
         put_result.is_ok(),
         "KvOp::Put failed: {:?}",
@@ -91,8 +91,8 @@ async fn gateway_execute_kv_put_get_single_node() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
-    let get_result = gateway.execute(&ctx, get_authorized).await;
+    let get_checked = common::authorize_gateway_plan(&node.shared, &ctx, get_plan).await;
+    let get_result = gateway.execute(&ctx, get_checked).await;
     assert!(
         get_result.is_ok(),
         "KvOp::Get failed: {:?}",
@@ -147,12 +147,8 @@ async fn gateway_execute_sql_plan_cache_populated() {
 
     // First call: cache miss — plan_fn is invoked; cache grows to 1.
     let _ = gateway
-        .execute_sql(&ctx, sql, &[], make_plan, |plan| {
-            Ok(common::authorize_gateway_plan(
-                &node.shared,
-                &ctx,
-                plan.clone(),
-            ))
+        .execute_sql(&ctx, sql, &[], make_plan, |plan| async {
+            Ok(common::authorize_gateway_plan(&node.shared, &ctx, plan).await)
         })
         .await
         .expect("first execute_sql");
@@ -166,12 +162,8 @@ async fn gateway_execute_sql_plan_cache_populated() {
     // Second call with same SQL + same descriptor versions: the actual key is
     // identical, so insert is a no-op and len stays 1.
     let _ = gateway
-        .execute_sql(&ctx, sql, &[], make_plan, |plan| {
-            Ok(common::authorize_gateway_plan(
-                &node.shared,
-                &ctx,
-                plan.clone(),
-            ))
+        .execute_sql(&ctx, sql, &[], make_plan, |plan| async {
+            Ok(common::authorize_gateway_plan(&node.shared, &ctx, plan).await)
         })
         .await
         .expect("second execute_sql");

@@ -12,7 +12,6 @@
 //!
 //! Steps 2-3 are performed inside the existing WAL group-commit boundary.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
@@ -24,7 +23,7 @@ use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
 /// Parameters for a KV copy-up operation.
 pub struct KvCopyUpParams<'a> {
-    pub state: &'a Arc<SharedState>,
+    pub state: &'a SharedState,
     pub tenant_id: TenantId,
     pub target_db_id: DatabaseId,
     /// Plain (non-db_qualified) collection name.
@@ -129,7 +128,7 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
 
 /// Parameters for a copy-up operation.
 pub struct CopyUpParams<'a> {
-    pub state: &'a Arc<SharedState>,
+    pub state: &'a SharedState,
     pub tenant_id: TenantId,
     pub target_db_id: DatabaseId,
     /// Plain (non-db_qualified) collection name.
