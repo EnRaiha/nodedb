@@ -73,6 +73,9 @@ impl ErrorCode {
     pub const CLONE_DEPENDENCY: Self = Self(1502);
     /// A bitemporal `AS OF` query timestamp predates the clone's creation LSN.
     pub const CLONE_PREDATES_QUERY_TIME: Self = Self(1503);
+    /// A write targeted a `Shadowed`/`Materializing` clone collection whose
+    /// engine has no copy-on-write support; `MATERIALIZE` the clone first.
+    pub const CLONE_WRITE_REQUIRES_MATERIALIZE: Self = Self(1504);
 
     // Mirror (1700–1799)
 

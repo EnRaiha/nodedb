@@ -250,4 +250,34 @@ impl NodeDbError {
             cause: None,
         }
     }
+
+    /// Write rejected: `collection` (engine `engine`) is a `Shadowed` or
+    /// `Materializing` clone in `database` — merging target and source rows
+    /// without a suppression record would silently duplicate them on read.
+    /// `reason` names why no suppression record can be written: the engine
+    /// has no copy-up/tombstone module at all, or this write's shape is
+    /// outside the module it does have.
+    pub fn clone_write_requires_materialize(
+        collection: impl Into<String>,
+        engine: impl Into<String>,
+        database: impl Into<String>,
+        reason: &str,
+    ) -> Self {
+        let collection = collection.into();
+        let engine = engine.into();
+        let database = database.into();
+        Self {
+            code: ErrorCode::CLONE_WRITE_REQUIRES_MATERIALIZE,
+            message: format!(
+                "collection '{collection}' (engine '{engine}') {reason}; \
+                 run `ALTER DATABASE {database} MATERIALIZE` before writing to it"
+            ),
+            details: ErrorDetails::CloneWriteRequiresMaterialize {
+                collection,
+                engine,
+                database,
+            },
+            cause: None,
+        }
+    }
 }

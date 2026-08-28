@@ -227,6 +227,20 @@ pub enum Error {
     #[error("database {database_id} is frozen for clone materialization; retry shortly")]
     SourceFrozen { database_id: DatabaseId },
 
+    /// Write refused on a `Shadowed`/`Materializing` clone. `reason` names
+    /// which case: the engine has no copy-up/tombstone module at all, or it
+    /// has one but this write's shape is outside its point-op protocol.
+    #[error(
+        "collection '{collection}' (engine '{engine}') {reason}; run \
+         `ALTER DATABASE {database} MATERIALIZE` before writing to it"
+    )]
+    CloneWriteRequiresMaterialize {
+        collection: String,
+        engine: String,
+        database: String,
+        reason: &'static str,
+    },
+
     // --- Client input errors ---
     #[error("bad request: {detail}")]
     BadRequest { detail: String },

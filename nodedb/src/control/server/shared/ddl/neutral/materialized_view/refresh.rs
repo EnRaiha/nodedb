@@ -25,8 +25,11 @@
 //! [`DdlError`].
 
 use nodedb_types::DatabaseId;
+use nodedb_types::error::sqlstate;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::types::error_to_sqlstate;
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use crate::types::TraceId;
@@ -55,11 +58,14 @@ pub async fn refresh_materialized_view(
             Ok(Some(v)) => v,
             Ok(None) => {
                 return Err(err(
-                    "42P01",
+                    sqlstate::UNDEFINED_TABLE,
                     format!("materialized view '{name}' does not exist"),
                 ));
             }
-            Err(e) => return Err(err("XX000", e.to_string())),
+            Err(e) => {
+                let (_, code, message) = error_to_sqlstate(&e);
+                return Err(err(code, message));
+            }
         }
     };
 
@@ -153,7 +159,10 @@ async fn execute_select(
                 TraceId::ZERO,
             )
             .await
-            .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+            .map_err(|e| {
+                let (_, code, message) = error_to_sqlstate(&e);
+                err(code, format!("dispatch: {message}"))
+            })?;
         require_ok_response(&response)?;
 
         let payload = response.payload.as_ref();
@@ -164,8 +173,12 @@ async fn execute_select(
         if json.is_empty() {
             continue;
         }
-        let parsed: serde_json::Value = sonic_rs::from_str(&json)
-            .map_err(|e| err("XX000", format!("decode scan payload: {e}")))?;
+        let parsed: serde_json::Value = sonic_rs::from_str(&json).map_err(|e| {
+            err(
+                sqlstate::INTERNAL_ERROR,
+                format!("decode scan payload: {e}"),
+            )
+        })?;
 
         collect_rows(parsed, &mut rows);
     }
@@ -212,7 +225,7 @@ fn build_insert_sql(
 ) -> Result<String, DdlError> {
     if row.is_empty() {
         return Err(err(
-            "XX000",
+            sqlstate::INTERNAL_ERROR,
             "materialized view SELECT produced an empty row (no columns)".to_string(),
         ));
     }
@@ -240,8 +253,12 @@ fn json_value_to_sql_literal(v: &serde_json::Value) -> Result<String, DdlError> 
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => ::nodedb_types::quote_literal(s),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            let s = sonic_rs::to_string(v)
-                .map_err(|e| err("XX000", format!("encode nested value: {e}")))?;
+            let s = sonic_rs::to_string(v).map_err(|e| {
+                err(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("encode nested value: {e}"),
+                )
+            })?;
             ::nodedb_types::quote_literal(&s)
         }
     })
@@ -266,11 +283,8 @@ async fn dispatch_sql(
             message: format!("plan '{sql}': {}", error.message),
         })?;
     for task in tasks {
-        // Clone-check, then authorize, before the WAL append below: a
-        // `Shadowed`/`Materializing` target's `INSERT` (and the `TRUNCATE`
-        // this fires from) must copy-up/tombstone through the same
-        // protocol-neutral gate every other write path runs — otherwise a
-        // refresh against a clone target silently writes straight through it.
+        // Mandatory chokepoint every write dispatch site runs (same gate as
+        // pgwire/native/HTTP) — not a refresh-specific feature.
         let emitter =
             crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
         let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
@@ -285,8 +299,10 @@ async fn dispatch_sql(
             },
         )
         .await
-        .map_err(|e| err("XX000", format!("clone-check: {e}")))?
-        {
+        .map_err(|e| {
+            let (_, code, message) = error_to_sqlstate(&e);
+            err(code, format!("clone-check: {message}"))
+        })? {
             crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
                 require_ok_response(&resp)?;
                 continue;
@@ -302,14 +318,14 @@ async fn dispatch_sql(
             checked.database_id(),
             checked.plan(),
         )
-        .map_err(|e| err("58030", format!("wal append: {e}")))?;
+        .map_err(|e| err(sqlstate::IO_ERROR, format!("wal append: {e}")))?;
         let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
             checked,
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| err("08006", format!("dispatch: {e}")))?;
+        .map_err(|e| err(sqlstate::CONNECTION_FAILURE, format!("dispatch: {e}")))?;
         require_ok_response(&response)?;
     }
     Ok(())
@@ -320,14 +336,22 @@ fn require_ok_response(response: &crate::bridge::envelope::Response) -> Result<(
         return Ok(());
     }
 
-    let detail = response.error_code.as_deref().map_or_else(
-        || String::from_utf8_lossy(response.payload.as_ref()).into_owned(),
-        |code| format!("{code:?}"),
-    );
-    Err(err(
-        "XX000",
-        format!("data-plane refresh task failed: {detail}"),
-    ))
+    match response.error_code.as_deref() {
+        Some(code) => {
+            let (_, sqlstate_code, message) = error_code_to_sqlstate(code);
+            Err(err(
+                sqlstate_code,
+                format!("data-plane refresh task failed: {message}"),
+            ))
+        }
+        None => {
+            let detail = String::from_utf8_lossy(response.payload.as_ref()).into_owned();
+            Err(err(
+                sqlstate::INTERNAL_ERROR,
+                format!("data-plane refresh task failed: {detail}"),
+            ))
+        }
+    }
 }
 
 fn parse_refresh_target(sql: &str) -> Result<String, DdlError> {
@@ -338,7 +362,7 @@ fn parse_refresh_target(sql: &str) -> Result<String, DdlError> {
         .filter(|candidate| candidate.eq_ignore_ascii_case(PREFIX))
         .ok_or_else(|| {
             err(
-                "42601",
+                sqlstate::SYNTAX_ERROR,
                 "syntax: REFRESH MATERIALIZED VIEW <name>".to_string(),
             )
         })?;
@@ -349,7 +373,7 @@ fn parse_refresh_target(sql: &str) -> Result<String, DdlError> {
             .is_some_and(char::is_whitespace)
     {
         return Err(err(
-            "42601",
+            sqlstate::SYNTAX_ERROR,
             "syntax: REFRESH MATERIALIZED VIEW <name>".to_string(),
         ));
     }
@@ -358,7 +382,7 @@ fn parse_refresh_target(sql: &str) -> Result<String, DdlError> {
     let trailing = rest.trim();
     if !trailing.is_empty() && trailing != ";" {
         return Err(err(
-            "42601",
+            sqlstate::SYNTAX_ERROR,
             "unexpected trailing tokens after materialized view name".to_string(),
         ));
     }
@@ -367,13 +391,19 @@ fn parse_refresh_target(sql: &str) -> Result<String, DdlError> {
 
 fn parse_identifier_token(input: &str) -> Result<(String, &str), DdlError> {
     if input.is_empty() {
-        return Err(err("42601", "missing materialized view name".to_string()));
+        return Err(err(
+            sqlstate::SYNTAX_ERROR,
+            "missing materialized view name".to_string(),
+        ));
     }
     if let Some(mut rest) = input.strip_prefix('"') {
         let mut value = String::new();
         loop {
             let Some(ch) = rest.chars().next() else {
-                return Err(err("42601", "unterminated quoted identifier".to_string()));
+                return Err(err(
+                    sqlstate::SYNTAX_ERROR,
+                    "unterminated quoted identifier".to_string(),
+                ));
             };
             rest = &rest[ch.len_utf8()..];
             if ch == '"' {
@@ -384,7 +414,7 @@ fn parse_identifier_token(input: &str) -> Result<(String, &str), DdlError> {
                 }
                 if value.chars().any(char::is_control) {
                     return Err(err(
-                        "42601",
+                        sqlstate::SYNTAX_ERROR,
                         "identifier contains a control character".to_string(),
                     ));
                 }
@@ -405,7 +435,10 @@ fn parse_identifier_token(input: &str) -> Result<(String, &str), DdlError> {
             .next()
             .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
     {
-        return Err(err("42601", "invalid materialized view name".to_string()));
+        return Err(err(
+            sqlstate::SYNTAX_ERROR,
+            "invalid materialized view name".to_string(),
+        ));
     }
     Ok((name.to_lowercase(), &input[end..]))
 }

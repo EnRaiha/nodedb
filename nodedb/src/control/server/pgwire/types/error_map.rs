@@ -79,6 +79,11 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::SourceFrozen { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
+        crate::Error::CloneWriteRequiresMaterialize { .. } => (
+            "ERROR",
+            sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE,
+            err.to_string(),
+        ),
         crate::Error::RejectedAuthz { .. } => {
             ("ERROR", sqlstate::INSUFFICIENT_PRIVILEGE, err.to_string())
         }
@@ -184,6 +189,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::NO_LEADER => sqlstate::LOCK_NOT_AVAILABLE,
         // Mirrors the `NotLeader` arm.
         Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
+        // Mirrors the `CloneWriteRequiresMaterialize` arm.
+        Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE,
         _ => sqlstate::INTERNAL_ERROR,
     }
 }

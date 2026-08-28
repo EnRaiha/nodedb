@@ -144,6 +144,11 @@ error_code_table! {
     CANNOT_CLONE_MIRROR => CannotCloneMirror { database: String::new() },
     CLONE_DEPENDENCY => CloneDependency { dependents: Vec::new() },
     CLONE_PREDATES_QUERY_TIME => ClonePredatesQueryTime { as_of_lsn: 0, created_at_lsn: 0 },
+    CLONE_WRITE_REQUIRES_MATERIALIZE => CloneWriteRequiresMaterialize {
+        collection: String::new(),
+        engine: String::new(),
+        database: String::new(),
+    },
 
     // Backup / Restore.
     BACKUP_TENANT_MISMATCH => BackupTenantMismatch { expected: 0, actual: 0 },
@@ -216,6 +221,7 @@ mod tests {
             ErrorCode::ARRAY,
             ErrorCode::QUOTA_OVERCOMMIT,
             ErrorCode::CLONE_DEPTH_EXCEEDED,
+            ErrorCode::CLONE_WRITE_REQUIRES_MATERIALIZE,
             ErrorCode::MOVE_TENANT_DRAIN_TIMEOUT,
             ErrorCode::MIRROR_READ_ONLY,
             ErrorCode::BACKUP_TENANT_MISMATCH,

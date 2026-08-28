@@ -236,6 +236,17 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::RoleInheritanceDepthExceeded { depth, limit } => NodeDbError::bad_request(format!(
             "role inheritance depth {depth} exceeds the maximum allowed depth of {limit}"
         )),
+        Error::CloneWriteRequiresMaterialize {
+            collection,
+            engine,
+            database,
+            reason,
+        } => NodeDbError::clone_write_requires_materialize(
+            collection.clone(),
+            engine.clone(),
+            database.clone(),
+            reason,
+        ),
         Error::MirrorReadOnly { database } => NodeDbError::mirror_read_only(database.clone()),
         Error::StaleReadNotLeader {
             database,

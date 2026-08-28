@@ -304,6 +304,14 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                     created_at_lsn,
                 })
             }
+            TAG_CLONE_WRITE_REQUIRES_MATERIALIZE => {
+                let (collection, engine, database) = read3_str_tolerant(reader, field_count)?;
+                Ok(ErrorDetails::CloneWriteRequiresMaterialize {
+                    collection,
+                    engine,
+                    database,
+                })
+            }
             TAG_MOVE_TENANT_DRAIN_TIMEOUT => {
                 let (tenant, source_db) = read2_str_tolerant(reader, field_count)?;
                 Ok(ErrorDetails::MoveTenantDrainTimeout { tenant, source_db })
@@ -694,6 +702,16 @@ mod tests {
     fn serialization_roundtrip() {
         let v = ErrorDetails::Serialization {
             format: "msgpack".into(),
+        };
+        assert_eq!(roundtrip(&v), v);
+    }
+
+    #[test]
+    fn clone_write_requires_materialize_roundtrip() {
+        let v = ErrorDetails::CloneWriteRequiresMaterialize {
+            collection: "metrics".into(),
+            engine: "columnar".into(),
+            database: "clone_db".into(),
         };
         assert_eq!(roundtrip(&v), v);
     }

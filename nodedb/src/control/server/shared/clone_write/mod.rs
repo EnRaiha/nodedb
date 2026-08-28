@@ -6,7 +6,10 @@
 //! obtain a [`CloneCheckedTask`] — the only capability the Data-Plane dispatch
 //! boundary accepts. For a `Shadowed`/`Materializing` clone it applies
 //! copy-up/tombstone so the source is never modified. `entry` routes by plan
-//! shape; `document`/`kv`/`kv_insert` hold each engine's protocol.
+//! shape; `document`/`kv`/`kv_insert` hold each engine's protocol. A write
+//! shape none of them claims is refused outright rather than dispatched
+//! unprotected — merging an un-suppressed source row into a target read is
+//! only sound where copy-up/tombstone maintains that invariant.
 
 mod document;
 mod entry;

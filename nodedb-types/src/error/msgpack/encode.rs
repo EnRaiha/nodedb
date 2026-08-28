@@ -258,6 +258,17 @@ impl ToMessagePack for ErrorDetails {
                 as_of_lsn,
                 created_at_lsn,
             ),
+            ErrorDetails::CloneWriteRequiresMaterialize {
+                collection,
+                engine,
+                database,
+            } => write3(
+                writer,
+                TAG_CLONE_WRITE_REQUIRES_MATERIALIZE,
+                collection,
+                engine,
+                database,
+            ),
             ErrorDetails::MoveTenantDrainTimeout { tenant, source_db } => {
                 write2(writer, TAG_MOVE_TENANT_DRAIN_TIMEOUT, tenant, source_db)
             }

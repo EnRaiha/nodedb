@@ -146,26 +146,15 @@ async fn native_update_on_shadowed_clone_copies_up_source_row() {
     srv.graceful_shutdown().await;
 }
 
-/// `REFRESH MATERIALIZED VIEW` against a view whose target collection was
-/// cloned (`Shadowed`) must copy-up/tombstone through the same
-/// protocol-neutral gate every other write path runs, not dispatch its
-/// synthesized `TRUNCATE` + per-row `INSERT` straight through the clone.
-///
-/// Runs entirely over pgwire (`USE DATABASE` is a normal pgwire statement),
-/// so it has none of the native session's database-binding restriction.
-///
-/// The refresh's own internal scan (`refresh.rs::execute_select`) dispatches
-/// straight to the Data Plane and has no clone read-merge — it only ever sees
-/// rows physically local to the target, never rows the target virtually
-/// inherits from its source. So the view's source collection is seeded with a
-/// row directly IN THE CLONE (not just in `mvw_src`) before refreshing, and
-/// the view's own backing collection is left holding a stale row of the same
-/// id from the refresh that ran in `mvw_src` before cloning. Skipping the
-/// clone-write gate on the refresh's synthesized `INSERT` then leaves that
-/// stale source-side row un-tombstoned, so it leaks back into a merged read
-/// alongside the fresh row — a concrete, wrong row count and a stale value.
+/// `REFRESH MATERIALIZED VIEW` against a view whose target collection is a
+/// `Shadowed` clone is refused at its `TRUNCATE` step (SQLSTATE `55006`),
+/// before the synthesized per-row `INSERT`s ever run — `TRUNCATE` clears
+/// only target-local rows with no tombstone, so silently letting it through
+/// would leave the clone's stale source rows readable after a "successful"
+/// refresh. Reads against the same view stay unaffected by the refusal.
+/// `ALTER DATABASE ... MATERIALIZE` clears the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn refresh_materialized_view_against_shadowed_clone_target() {
+async fn refresh_materialized_view_truncate_refused_on_shadowed_clone_target() {
     let srv = TestServer::start().await;
 
     srv.exec("CREATE DATABASE mvw_src")
@@ -197,35 +186,72 @@ async fn refresh_materialized_view_against_shadowed_clone_target() {
     srv.exec("USE DATABASE mvw_tgt")
         .await
         .expect("use cloned database");
-    // A `Shadowed` clone starts with zero local rows: `mv_src_coll` here has
-    // none of its own until this INSERT gives it one directly in the clone,
-    // under the same id the source-side refresh above already used. This is
-    // the only row the refresh's internal (clone-unaware) scan will find.
-    srv.exec("INSERT INTO mv_src_coll (id, v) VALUES ('a', 99)")
-        .await
-        .expect("seed a row directly in the clone's source collection");
 
-    // The view's own backing collection was cloned too, and still carries
-    // `mvw_src`'s stale row ('a', 1) from the refresh that ran before
-    // cloning. This refresh recomputes id 'a' as ('a', 99) from the row just
-    // inserted above and re-`INSERT`s it — the write under test. Without the
-    // clone-write gate's tombstone step, the stale source-side ('a', 1) is
-    // never suppressed and survives the next read alongside the fresh row.
-    let refresh = srv.exec("REFRESH MATERIALIZED VIEW mv_view").await;
-    assert!(
-        refresh.is_ok(),
-        "refresh against a Shadowed clone target must succeed via the clone-write gate: {refresh:?}"
-    );
-
+    // Reads must keep working against the Shadowed clone's view: delegated
+    // through to the source row the initial refresh wrote.
     let rows = srv
         .query_rows("SELECT id, v FROM mv_view")
         .await
-        .expect("scan refreshed clone view");
+        .expect("read on shadowed clone view must still succeed");
     assert_eq!(
         rows,
-        vec![vec!["a".to_string(), "99".to_string()]],
-        "the merged read must show exactly the refreshed row, not a stale \
-         duplicate leaked from the un-tombstoned clone source: {rows:?}"
+        vec![vec!["a".to_string(), "1".to_string()]],
+        "expected exactly the delegated source row: {rows:?}"
+    );
+
+    // The write is refused: SQLSTATE 55006 (CLONE_WRITE_REQUIRES_MATERIALIZE),
+    // checked as a code, not a message substring. If the refusal were
+    // removed, this REFRESH would report success — the old, broken
+    // behaviour — so asserting the code is what actually falsifies the fix.
+    let refresh_err = srv
+        .client
+        .simple_query("REFRESH MATERIALIZED VIEW mv_view")
+        .await
+        .expect_err("refresh against a Shadowed clone target must be refused");
+    let sqlstate = refresh_err
+        .as_db_error()
+        .expect("refusal must be a structured database error")
+        .code()
+        .code();
+    assert_eq!(
+        sqlstate, "55006",
+        "expected CLONE_WRITE_REQUIRES_MATERIALIZE, got: {refresh_err:?}"
+    );
+
+    // The refusal must not have truncated the target: the view still reads
+    // the one delegated source row, unchanged.
+    let rows = srv
+        .query_rows("SELECT id, v FROM mv_view")
+        .await
+        .expect("read after refused refresh must still succeed");
+    assert_eq!(
+        rows,
+        vec![vec!["a".to_string(), "1".to_string()]],
+        "refused refresh must not have truncated the view: {rows:?}"
+    );
+
+    // Materialize the clone, then the same refresh must succeed.
+    srv.exec("USE DATABASE default")
+        .await
+        .expect("use default database");
+    srv.exec("ALTER DATABASE mvw_tgt MATERIALIZE")
+        .await
+        .expect("materialize the clone");
+    srv.exec("USE DATABASE mvw_tgt")
+        .await
+        .expect("use materialized clone database");
+
+    srv.exec("REFRESH MATERIALIZED VIEW mv_view")
+        .await
+        .expect("refresh after MATERIALIZE must succeed");
+    let rows = srv
+        .query_rows("SELECT id, v FROM mv_view")
+        .await
+        .expect("scan refreshed materialized view");
+    assert_eq!(
+        rows,
+        vec![vec!["a".to_string(), "1".to_string()]],
+        "materialized refresh must leave exactly the one row: {rows:?}"
     );
 
     srv.graceful_shutdown().await;

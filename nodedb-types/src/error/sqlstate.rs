@@ -216,6 +216,14 @@ pub const CLONE_PREDATES_QUERY_TIME: &str = "22023";
 /// in both cases.
 pub const STALE_READ_NOT_LEADER: &str = "55P03";
 
+/// `55006` — NodeDB extension: a write targeted a `Shadowed`/`Materializing`
+/// clone collection whose engine has no copy-on-write support.
+///
+/// Uses Class 55 "Object Not In Prerequisite State", same as
+/// [`CLONE_DEPENDENCY`] — the collection is valid but not yet in the state
+/// (materialized) the write needs.
+pub const CLONE_WRITE_REQUIRES_MATERIALIZE: &str = "55006";
+
 // ── Backup / Restore (Class 22 / 28) ────────────────────────────────────────
 
 /// `22023` — NodeDB extension: RESTORE's target tenant does not match the
@@ -248,6 +256,17 @@ pub const MOVE_TENANT_CUTOVER_FAILED: &str = "XX000";
 /// `02000` — `no_data`: tenant is already present in the target database;
 /// the `MOVE TENANT` is a no-op (idempotent retry of a completed move).
 pub const MOVE_TENANT_ALREADY_AT_TARGET: &str = "02000";
+
+// ── Class 08 — Connection Exception ──────────────────────────────────────────
+
+/// `08006` — `connection_failure`: a Control-to-Data-Plane dispatch could not
+/// reach the target core (bridge closed, core panic, timeout).
+pub const CONNECTION_FAILURE: &str = "08006";
+
+// ── Class 58 — System Error ──────────────────────────────────────────────────
+
+/// `58030` — `io_error`: a WAL append or filesystem operation failed.
+pub const IO_ERROR: &str = "58030";
 
 // ── Class XX — Internal Error ────────────────────────────────────────────────
 
@@ -306,6 +325,9 @@ mod tests {
             CLONE_DEPENDENCY,
             CLONE_PREDATES_QUERY_TIME,
             STALE_READ_NOT_LEADER,
+            CLONE_WRITE_REQUIRES_MATERIALIZE,
+            CONNECTION_FAILURE,
+            IO_ERROR,
         ];
         for code in &codes {
             assert_eq!(

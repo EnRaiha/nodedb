@@ -198,6 +198,14 @@ pub enum ErrorDetails {
     CloneDependency { dependents: Vec<String> },
     #[serde(rename = "clone_predates_query_time")]
     ClonePredatesQueryTime { as_of_lsn: u64, created_at_lsn: u64 },
+    /// Write refused: the collection's engine has no copy-on-write support,
+    /// so a `Shadowed`/`Materializing` clone cannot safely accept writes.
+    #[serde(rename = "clone_write_requires_materialize")]
+    CloneWriteRequiresMaterialize {
+        collection: String,
+        engine: String,
+        database: String,
+    },
 
     // Backup / Restore
     /// RESTORE targeted `expected` but the envelope belongs to `actual`.

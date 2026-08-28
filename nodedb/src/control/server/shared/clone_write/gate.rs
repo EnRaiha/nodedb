@@ -88,9 +88,11 @@ pub struct InterceptAndAuthorizeParams<'a> {
 /// can produce a [`CloneCheckedTask`].
 ///
 /// `classify()` inside [`maybe_intercept_clone_write`] is `O(1)` with no I/O
-/// for a plan shape that is not clone-relevant (`ANALYZE`, `COPY TO`, cursor
-/// reads), so every caller pays this gate uniformly rather than special-casing
-/// itself out of it.
+/// for a read plan (`ANALYZE`, `COPY TO`, cursor reads never reach a catalog
+/// lookup here). A write shape none of `document`/`kv`/`kv_insert` claims
+/// does one collection lookup to decide whether it must be refused as an
+/// unsupported clone write. Every caller pays this gate uniformly rather
+/// than special-casing itself out of it.
 pub async fn intercept_and_authorize(
     params: InterceptAndAuthorizeParams<'_>,
 ) -> crate::Result<CloneCheckedOutcome> {
