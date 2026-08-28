@@ -238,6 +238,16 @@ pub(crate) fn acquire_ddl_prepare_lease<'a>(
                     if shared.is_metadata_leader()
                         && acquired_at.elapsed() >= DDL_PREPARE_LEASE =>
                 {
+                    // Cancel the dead owner's pending record before releasing its
+                    // lease, so it never lingers visible-but-unresolved past the lease.
+                    if shared.pending_ddl.contains(current) {
+                        propose_metadata_and_wait(
+                            shared,
+                            handle,
+                            &MetadataEntry::DdlPendingCancel { token: current },
+                            DEFAULT_PROPOSE_TIMEOUT,
+                        )?;
+                    }
                     propose_metadata_and_wait(
                         shared,
                         handle,
@@ -370,6 +380,10 @@ pub fn propose_catalog_entry_with_timeout(
             descriptor_id,
             prior_version,
             DEFAULT_DRAIN_TIMEOUT,
+            // No transactional lease scope of its own: this is a bare,
+            // unbuffered DDL statement, not a COMMIT finalizing buffered DDL
+            // alongside a buffered write to the same descriptor.
+            0,
         )?;
     }
 

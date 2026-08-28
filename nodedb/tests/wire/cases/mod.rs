@@ -246,6 +246,7 @@ mod strict_schema_restart;
 mod timeseries_declared_time_key;
 mod timeseries_write_row_level_security;
 mod transactional_ddl_atomicity;
+mod transactional_ddl_compensation;
 mod transactional_ddl_visibility;
 mod transactional_ddl_visibility_routines;
 mod transactional_ddl_visibility_sequence;

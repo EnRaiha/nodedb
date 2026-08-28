@@ -130,7 +130,24 @@ pub(super) async fn dispatch_single_shard(
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    classify_batch_dispatch(dp.dispatch_no_wal(batch_task, wal_lsn).await)
+    classify_batch_dispatch(dispatch_batch(dp, batch_task, wal_lsn).await)
+}
+
+/// The transaction batch's Data-Plane dispatch, with a fail point ahead of
+/// the real call so a test can force this exact synchronous-failure branch
+/// (`Option<AbortReason>` back to `run_commit`, which compensates a
+/// finalized DDL) without a real Data-Plane rejection or touching disk.
+/// Compiles to a bare `dp.dispatch_no_wal` call outside the `failpoints`
+/// feature.
+async fn dispatch_batch(
+    dp: &impl TxnDataPlane,
+    batch_task: PhysicalTask,
+    wal_lsn: Option<crate::types::Lsn>,
+) -> crate::Result<Response> {
+    crate::fail_point_err!("commit::single_shard_batch_dispatch", |detail| {
+        crate::Error::Internal { detail }
+    });
+    dp.dispatch_no_wal(batch_task, wal_lsn).await
 }
 
 /// Convert a transaction-batch dispatch result into a commit abort reason, if

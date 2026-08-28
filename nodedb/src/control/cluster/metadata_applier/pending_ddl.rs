@@ -3,10 +3,12 @@
 //! Host-side apply logic for `DdlPendingPropose` / `DdlPendingFinalize` /
 //! `DdlPendingCancel`.
 //!
-//! Builds the primitives `propose_pending` / `finalize_pending` will use —
-//! nothing calls them yet. Finalize and cancel are idempotent: applying
-//! either twice, or applying either for a token with no pending record, is
-//! a no-op. Raft replay relies on exactly that shape.
+//! Applies the entries `ddl_flush::begin_commit` / `finalize_pending` propose
+//! at COMMIT, and the ones `metadata_proposer::acquire_ddl_prepare_lease`
+//! proposes to reclaim a dead owner's stranded record. Finalize and cancel
+//! are idempotent: applying either twice, or applying either for a token
+//! with no pending record, is a no-op. Raft replay relies on exactly that
+//! shape.
 
 use tracing::debug;
 

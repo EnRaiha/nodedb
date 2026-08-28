@@ -305,7 +305,9 @@ async fn drain_timeout_clears_state() {
     let shared = Arc::clone(&leader.shared);
     let drain_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        nodedb::control::lease::drain_for_ddl(&shared, drain_id, 1, Duration::from_millis(200))
+        // 0 own holds: the lease under test belongs to another holder, so
+        // nothing here may be excluded from the drain.
+        nodedb::control::lease::drain_for_ddl(&shared, drain_id, 1, Duration::from_millis(200), 0)
     })
     .await
     .expect("join");

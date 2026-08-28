@@ -120,10 +120,25 @@ pub(super) fn spawn(
     columnar_flush_threshold: Option<usize>,
     cores: usize,
 ) -> SpawnedServer {
+    spawn_with_failpoints(data_dir, auth_mode, columnar_flush_threshold, cores, None)
+}
+
+/// Spawn with `NODEDB_FAILPOINTS` set from `failpoints` (see
+/// `nodedb_types::fail_point::FAILPOINTS_ENV`) — the only way a test reaches
+/// into a spawned server process's fail points, since the in-process `set`
+/// API cannot reach a process the test only supervises. A binary built
+/// without the `failpoints` Cargo feature ignores the variable entirely.
+pub(super) fn spawn_with_failpoints(
+    data_dir: &Path,
+    auth_mode: AuthMode,
+    columnar_flush_threshold: Option<usize>,
+    cores: usize,
+    failpoints: Option<&str>,
+) -> SpawnedServer {
     let config_path = config_toml::write_config(data_dir, auth_mode, columnar_flush_threshold);
     let mut last_failure = String::new();
     for _ in 0..START_ATTEMPTS {
-        match try_spawn(data_dir, &config_path, cores) {
+        match try_spawn(data_dir, &config_path, cores, failpoints) {
             Ok(server) => return server,
             Err((reason, log)) => last_failure = format!("{reason}\n--- server log ---\n{log}"),
         }
@@ -139,6 +154,7 @@ fn try_spawn(
     data_dir: &Path,
     config_path: &Path,
     cores: usize,
+    failpoints: Option<&str>,
 ) -> Result<SpawnedServer, (String, String)> {
     let ports = ServerPorts::allocate();
 
@@ -150,7 +166,14 @@ fn try_spawn(
         .expect("open server log");
     let log_err = log.try_clone().expect("clone server log handle");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_nodedb"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nodedb"));
+    if let Some(spec) = failpoints {
+        // Mirrors `nodedb_types::fail_point::FAILPOINTS_ENV`, not imported
+        // directly: that constant only exists under the `failpoints`
+        // Cargo feature, and this harness must still build without it.
+        command.env("NODEDB_FAILPOINTS", spec);
+    }
+    let child = command
         .env("NODEDB_DATA_DIR", data_dir)
         .env("NODEDB_DATA_PLANE_CORES", cores.to_string())
         .env("NODEDB_CONFIG", config_path)

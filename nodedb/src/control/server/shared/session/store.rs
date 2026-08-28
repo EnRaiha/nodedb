@@ -320,6 +320,29 @@ impl SessionStore {
             .get_mut(&id.into())
             .map(|entry| f(&mut entry.session))
     }
+
+    /// Count of this session's own currently-held lease-scope entries for
+    /// `descriptor` at a version `<= up_to_version`. A session with no open
+    /// transaction, or none registered under `id`, holds none. Used by the
+    /// DDL drain to exclude the requesting transaction's own hold from what
+    /// it waits on — a session cannot conflict with itself.
+    pub(super) fn own_lease_hold_count(
+        &self,
+        id: impl Into<SessionId>,
+        descriptor: &nodedb_cluster::DescriptorId,
+        up_to_version: u64,
+    ) -> u32 {
+        self.read_session(id, |session| {
+            session
+                .tx_lease_scopes
+                .iter()
+                .flatten()
+                .flat_map(|scope| scope.descriptor_versions().iter())
+                .filter(|(held, version)| held == descriptor && *version <= up_to_version)
+                .count() as u32
+        })
+        .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

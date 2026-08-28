@@ -121,6 +121,47 @@ async fn rollback_discards_every_statement_of_a_multi_ddl_transaction() {
     }
 }
 
+/// A collection created and written to in the SAME transaction survives
+/// COMMIT with both the catalog row and the data row intact — the atomic
+/// cutover this exercises: the DDL finalizes to the catalog before the
+/// buffered INSERT dispatches, so a crash between them still leaves a real,
+/// cataloged, empty collection rather than an undispatched or orphaned row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_persists_collection_created_and_written_in_the_same_transaction() {
+    let server = TestServer::start().await;
+
+    server.exec("BEGIN").await.unwrap();
+    hop_workers().await;
+    server
+        .exec(
+            "CREATE COLLECTION txn_ddl_create_then_insert (id TEXT PRIMARY KEY, val INT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    hop_workers().await;
+    server
+        .exec("INSERT INTO txn_ddl_create_then_insert (id, val) VALUES ('a', 1)")
+        .await
+        .unwrap();
+    hop_workers().await;
+    server.exec("COMMIT").await.unwrap();
+
+    assert!(
+        exists(&server, "txn_ddl_create_then_insert").await,
+        "the collection created inside the transaction must survive COMMIT"
+    );
+    let rows = server
+        .query_text("SELECT id, val FROM txn_ddl_create_then_insert WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the row inserted in the same transaction must survive COMMIT alongside the collection"
+    );
+}
+
 /// DDL and DML in one transaction roll back together: neither the new
 /// collection nor the row written into a pre-existing one survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -160,4 +201,58 @@ async fn rollback_discards_mixed_ddl_and_dml() {
         .await
         .unwrap();
     assert!(rows.is_empty(), "rolled-back row must not be visible");
+}
+
+/// Regression pin for the descriptor-lease self-drain fix: a transaction
+/// that ALTERs a collection and, in the SAME transaction, writes to that
+/// SAME collection must not wait on its own statement-time lease hold.
+///
+/// `finalize_pending` (which runs the ALTER's descriptor-version drain)
+/// executes before the buffered INSERT dispatches, so the drain would see
+/// this session's own INSERT-time lease as an unreleased hold on the exact
+/// descriptor it is draining — without excluding the requester's own hold,
+/// this wedges for `DEFAULT_DRAIN_TIMEOUT` (35s) and then aborts the COMMIT
+/// with a drain-timeout error. The bounded `timeout` below turns that wedge
+/// into a fast, unambiguous test failure instead of a 35s hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_survives_altering_and_writing_the_same_collection_in_one_transaction() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION txn_ddl_self_drain (id TEXT PRIMARY KEY, val INT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec("ALTER COLLECTION txn_ddl_self_drain ADD COLUMN note TEXT DEFAULT 'n/a'")
+        .await
+        .unwrap();
+    hop_workers().await;
+    server
+        .exec("INSERT INTO txn_ddl_self_drain (id, val, note) VALUES ('a', 1, 'hi')")
+        .await
+        .unwrap();
+    hop_workers().await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.exec("COMMIT"))
+        .await
+        .expect(
+            "COMMIT must not wedge waiting on this transaction's own buffered-write \
+             lease hold on the descriptor it just ALTERed",
+        )
+        .unwrap();
+
+    let rows = server
+        .query_text("SELECT id, note FROM txn_ddl_self_drain WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the row written in the altering transaction must survive COMMIT"
+    );
 }

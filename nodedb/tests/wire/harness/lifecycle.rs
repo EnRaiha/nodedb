@@ -41,6 +41,20 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Password).await
     }
 
+    /// Spawn a single-core NodeDB server with `NODEDB_FAILPOINTS=spec` set on
+    /// the subprocess (see `nodedb_types::fail_point::FAILPOINTS_ENV`
+    /// format), so a fail point compiled in under the `failpoints` Cargo
+    /// feature fires inside the spawned server. Only meaningful when the
+    /// `nodedb` binary under test was itself built with `--features
+    /// failpoints` — a plain build ignores the variable and the fail point
+    /// never fires, since `fail_point_err!` compiles to nothing without it.
+    pub async fn start_with_failpoints(spec: &str) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawned =
+            process::spawn_with_failpoints(dir.path(), AuthMode::Trust, None, 1, Some(spec));
+        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
+    }
+
     /// Spawn a single-core NodeDB server with a lowered
     /// `columnar_flush_threshold` so tests can observe segment-flush
     /// behaviour on small datasets without inserting 65k rows.

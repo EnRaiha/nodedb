@@ -35,7 +35,7 @@ impl MetadataCommitApplier {
         if let Some(weak) = self.shared.get()
             && let Some(shared) = weak.upgrade()
             && let Some(drained_id) =
-                crate::control::lease::drain_propose::descriptor_id_for_implicit_clear(stamped)
+                crate::control::lease::descriptor_id_for_implicit_clear(stamped)
         {
             shared.lease_drain.install_end(&drained_id);
         }
