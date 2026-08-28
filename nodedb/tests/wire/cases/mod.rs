@@ -136,6 +136,7 @@ mod scope_grant_conditions;
 mod scope_quota_enforcement;
 mod serial_sequence_rollback_no_leak;
 mod session_handle_security;
+mod session_plan_cache_permission_tree_revoke;
 mod session_plan_cache_rls_revoke;
 mod sorted_index_authorization;
 mod spatial_cp_dp_query;
