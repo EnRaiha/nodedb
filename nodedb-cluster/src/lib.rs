@@ -154,8 +154,9 @@ pub use metadata_group::{
     CacheApplier, Compensation, DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease,
     DescriptorState, METADATA_GROUP_ID, MetadataApplier, MetadataCache, MetadataEntry,
     MigrationCheckpointPayload, MigrationId, MigrationPhaseTag, NoopMetadataApplier,
-    PersistedMigrationCheckpoint, RoutingChange, SharedMigrationStateTable, TopologyChange,
-    apply_migration_abort, apply_migration_checkpoint, decode_entry, encode_entry, new_shared,
+    PendingDdlObject, PersistedMigrationCheckpoint, RoutingChange, SharedMigrationStateTable,
+    TopologyChange, apply_migration_abort, apply_migration_checkpoint, decode_entry, encode_entry,
+    new_shared,
 };
 pub use migration_executor::recover_in_flight_migrations;
 pub use quic_transport::{QuicTransport, QuicTransportConfig};

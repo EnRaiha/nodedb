@@ -22,7 +22,7 @@ pub use cache::{MetadataCache, apply_migration_abort, apply_migration_checkpoint
 pub use codec::{decode_entry, encode_entry};
 pub use compensation::Compensation;
 pub use descriptors::{DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease};
-pub use entry::{MetadataEntry, RoutingChange, TopologyChange};
+pub use entry::{MetadataEntry, PendingDdlObject, RoutingChange, TopologyChange};
 pub use migration_recovery::{
     DEFAULT_ABORT_TIMEOUT, RecoveryDecision, compensations_for_phase, recover_in_flight_migrations,
 };

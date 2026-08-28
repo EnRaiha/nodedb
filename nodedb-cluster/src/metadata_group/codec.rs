@@ -30,7 +30,10 @@ pub fn decode_entry(data: &[u8]) -> Result<MetadataEntry, ClusterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_group::entry::{MetadataEntry, RoutingChange, TopologyChange};
+    use crate::metadata_group::entry::{
+        MetadataEntry, PendingDdlObject, RoutingChange, TopologyChange,
+    };
+    use nodedb_types::Hlc;
 
     #[test]
     fn metadata_entry_versioned_roundtrip() {
@@ -49,6 +52,46 @@ mod tests {
             group_id: 3,
             placement: vec![10, 20, 30],
         });
+        let bytes = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&bytes).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn ddl_pending_propose_roundtrip() {
+        let entry = MetadataEntry::DdlPendingPropose {
+            token: 7,
+            objects: vec![
+                PendingDdlObject::Create {
+                    entry: Box::new(MetadataEntry::CatalogDdl {
+                        payload: vec![1, 2, 3],
+                    }),
+                },
+                PendingDdlObject::Alter {
+                    entry: Box::new(MetadataEntry::CatalogDdl {
+                        payload: vec![4, 5],
+                    }),
+                    before_image: vec![9, 9, 9],
+                },
+            ],
+            proposed_at: Hlc::default(),
+        };
+        let bytes = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&bytes).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn ddl_pending_finalize_roundtrip() {
+        let entry = MetadataEntry::DdlPendingFinalize { token: 11 };
+        let bytes = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&bytes).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn ddl_pending_cancel_roundtrip() {
+        let entry = MetadataEntry::DdlPendingCancel { token: 12 };
         let bytes = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&bytes).unwrap();
         assert_eq!(entry, decoded);

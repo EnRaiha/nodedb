@@ -24,6 +24,8 @@
 //! - [`sync_and_routing`]: Lite sync-producer register/fence + live
 //!   routing-table `SetPlacement`.
 //! - [`catalog_ddl`]: `CatalogDdl` / `CatalogDdlAudited` decode + apply.
+//! - [`pending_ddl`]: `DdlPendingPropose` / `DdlPendingFinalize` /
+//!   `DdlPendingCancel` apply.
 //! - [`dispatch`]: the recursive `apply_host_side_effects` entry point
 //!   and `impl MetadataApplier for MetadataCommitApplier`.
 //! - [`audit`]: audit and CA-trust helpers (kept as its own file; used
@@ -35,6 +37,7 @@ mod audit;
 mod catalog_ddl;
 mod dispatch;
 mod lease_events;
+mod pending_ddl;
 mod surrogate;
 mod sync_and_routing;
 mod types;

@@ -141,6 +141,14 @@ impl MetadataCache {
                 // The host-side applier unwraps and fences this entry. The cache
                 // owns no preparation outcome state.
             }
+            MetadataEntry::DdlPendingPropose { .. }
+            | MetadataEntry::DdlPendingFinalize { .. }
+            | MetadataEntry::DdlPendingCancel { .. } => {
+                // Host-side only: the production applier owns the pending-DDL
+                // table (`nodedb::control::pending_ddl::PendingDdlTable`),
+                // rebuilt entirely by replay. The cluster cache has no state
+                // to track beyond `applied_index`.
+            }
             MetadataEntry::CaTrustChange { .. } => {
                 // CA trust mutations are host-side only: the production
                 // applier in the nodedb crate writes/deletes

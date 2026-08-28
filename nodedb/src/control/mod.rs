@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod mirror;
 pub mod notify_bus;
 pub mod otel;
+pub mod pending_ddl;
 pub mod planner;
 pub mod promql;
 pub mod propose_outcome;

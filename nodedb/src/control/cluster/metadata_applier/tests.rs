@@ -4,13 +4,18 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::broadcast;
 
-use nodedb_cluster::{MetadataApplier, MetadataCache, MetadataEntry, encode_entry};
-use nodedb_types::DatabaseId;
+use nodedb_cluster::{
+    MetadataApplier, MetadataCache, MetadataEntry, PendingDdlObject, encode_entry,
+};
+use nodedb_types::{DatabaseId, Hlc};
 
+use crate::bridge::dispatch::Dispatcher;
 use crate::control::catalog_entry;
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::credential::CredentialStore;
+use crate::control::state::SharedState;
+use crate::wal::WalManager;
 
 use super::types::MetadataCommitApplier;
 
@@ -36,6 +41,139 @@ fn put_collection_entry(name: &str) -> MetadataEntry {
     MetadataEntry::CatalogDdl {
         payload: catalog_entry::encode(&catalog_entry).unwrap(),
     }
+}
+
+fn pending_create_object(name: &str) -> PendingDdlObject {
+    PendingDdlObject::Create {
+        entry: Box::new(put_collection_entry(name)),
+    }
+}
+
+/// An applier wired to a real `SharedState` (weak handle installed), the
+/// only shape under which `DdlPendingPropose` / `DdlPendingFinalize` /
+/// `DdlPendingCancel` do anything — they are no-ops without it, matching
+/// every other `self.shared`-gated apply path in this module.
+fn make_applier_with_shared() -> (MetadataCommitApplier, Arc<SharedState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let wal =
+        Arc::new(WalManager::open_for_testing(&tmp.path().join("test.wal")).expect("open wal"));
+    let credentials =
+        Arc::new(CredentialStore::open(&tmp.path().join("system.redb")).expect("open catalog"));
+    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
+        .expect("construct shared state");
+    let (tx, _rx) = broadcast::channel(16);
+    let token_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let applier = MetadataCommitApplier::new(
+        state.metadata_cache.clone(),
+        tx,
+        state.credentials.clone(),
+        token_state,
+    );
+    applier.install_shared(Arc::downgrade(&state));
+    (applier, state, tmp)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn propose_then_finalize_applies_and_clears_the_record() {
+    let (applier, state, _tmp) = make_applier_with_shared();
+    let token = 1;
+    let propose = MetadataEntry::DdlPendingPropose {
+        token,
+        objects: vec![pending_create_object("pending_orders")],
+        proposed_at: Hlc::default(),
+    };
+    assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+    assert!(
+        state.pending_ddl.contains(token),
+        "propose reserves the record"
+    );
+    assert!(
+        state
+            .credentials
+            .catalog()
+            .get_collection(DatabaseId::DEFAULT, 7, "pending_orders")
+            .unwrap()
+            .is_none(),
+        "propose alone must not write the catalog"
+    );
+
+    let finalize = MetadataEntry::DdlPendingFinalize { token };
+    assert_eq!(applier.apply(&[(2, encode_entry(&finalize).unwrap())]), 2);
+    assert!(
+        !state.pending_ddl.contains(token),
+        "finalize clears the record"
+    );
+    assert!(
+        state
+            .credentials
+            .catalog()
+            .get_collection(DatabaseId::DEFAULT, 7, "pending_orders")
+            .unwrap()
+            .is_some(),
+        "finalize replays the reserved object's host-side effects"
+    );
+
+    // Double-apply (Raft re-delivery): no record left, so this must be a
+    // silent no-op rather than an error or a repeat write.
+    assert_eq!(applier.apply(&[(3, encode_entry(&finalize).unwrap())]), 3);
+    assert!(!state.pending_ddl.contains(token));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn propose_then_cancel_clears_without_touching_the_catalog() {
+    let (applier, state, _tmp) = make_applier_with_shared();
+    let token = 2;
+    let propose = MetadataEntry::DdlPendingPropose {
+        token,
+        objects: vec![pending_create_object("pending_widgets")],
+        proposed_at: Hlc::default(),
+    };
+    assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+    assert!(state.pending_ddl.contains(token));
+
+    let cancel = MetadataEntry::DdlPendingCancel { token };
+    assert_eq!(applier.apply(&[(2, encode_entry(&cancel).unwrap())]), 2);
+    assert!(
+        !state.pending_ddl.contains(token),
+        "cancel clears the record"
+    );
+    assert!(
+        state
+            .credentials
+            .catalog()
+            .get_collection(DatabaseId::DEFAULT, 7, "pending_widgets")
+            .unwrap()
+            .is_none(),
+        "cancel must never write the catalog"
+    );
+
+    // Double-apply (Raft re-delivery): no record left, must stay a no-op.
+    assert_eq!(applier.apply(&[(3, encode_entry(&cancel).unwrap())]), 3);
+    assert!(!state.pending_ddl.contains(token));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finalize_and_cancel_for_an_unknown_token_are_noops() {
+    let (applier, state, _tmp) = make_applier_with_shared();
+    let unknown = 999;
+    assert_eq!(
+        applier.apply(&[(
+            1,
+            encode_entry(&MetadataEntry::DdlPendingFinalize { token: unknown }).unwrap()
+        )]),
+        1,
+        "finalize with no matching propose must not wedge the watermark"
+    );
+    assert_eq!(
+        applier.apply(&[(
+            2,
+            encode_entry(&MetadataEntry::DdlPendingCancel { token: unknown }).unwrap()
+        )]),
+        2,
+        "cancel with no matching propose must not wedge the watermark"
+    );
+    assert!(!state.pending_ddl.contains(unknown));
 }
 
 #[test]

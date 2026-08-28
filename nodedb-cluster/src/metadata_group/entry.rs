@@ -111,6 +111,31 @@ pub enum MetadataEntry {
         token: u64,
     },
 
+    /// Reserve `objects` under `token` before any DML in the same
+    /// transaction dispatches. Applied by inserting into the node-local
+    /// pending-DDL table; nothing is written to the catalog yet. A crash
+    /// after this applies but before the matching finalize leaves the
+    /// pending record for a future reconciliation pass, never orphaned
+    /// catalog state.
+    DdlPendingPropose {
+        token: u64,
+        objects: Vec<PendingDdlObject>,
+        proposed_at: Hlc,
+    },
+    /// Commit the objects `token`'s `DdlPendingPropose` reserved: replay
+    /// each object's host-side effects, then drop the pending record.
+    /// Idempotent — a record already finalized, or absent, is a no-op, so
+    /// Raft re-delivery is always safe.
+    DdlPendingFinalize {
+        token: u64,
+    },
+    /// Abandon the objects `token`'s `DdlPendingPropose` reserved and drop
+    /// the pending record. Idempotent for the same reason as
+    /// `DdlPendingFinalize`.
+    DdlPendingCancel {
+        token: u64,
+    },
+
     // ── Topology / routing ─────────────────────────────────────────────
     TopologyChange(TopologyChange),
     RoutingChange(RoutingChange),
@@ -359,6 +384,33 @@ pub enum JoinTokenTransitionKind {
     MarkExpired,
     /// Explicitly invalidated by an operator.
     MarkAborted,
+}
+
+/// One catalog object targeted by a `DdlPendingPropose`, distinguishing a
+/// brand-new object from an overwrite of an existing one so compensation
+/// never has to guess which case a missing before-image means.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum PendingDdlObject {
+    /// A brand-new object: no committed prior state existed at propose
+    /// time. Cancel compensation is deletion — there is nothing to restore.
+    Create { entry: Box<MetadataEntry> },
+    /// An existing object about to be overwritten. `before_image` is its
+    /// committed value at propose time, opaque host-serialized bytes in
+    /// the same shape `entry`'s payload carries. Cancel compensation
+    /// re-proposes it as-is.
+    Alter {
+        entry: Box<MetadataEntry>,
+        before_image: Vec<u8>,
+    },
 }
 
 /// Topology mutations proposed through the metadata group.

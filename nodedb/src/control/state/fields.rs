@@ -124,6 +124,9 @@ pub struct SharedState {
     pub metadata_ddl_applied_token: AtomicU64,
     /// Per-node uniqueness component for descriptor-preparation lease tokens.
     pub metadata_ddl_token_seq: AtomicU64,
+    /// Node-local table of in-flight `DdlPendingPropose` records, rebuilt by
+    /// metadata Raft log replay like `metadata_ddl_owner` above.
+    pub pending_ddl: crate::control::pending_ddl::PendingDdlTable,
     /// Set once when the metadata applier halts on a failure that re-delivery
     /// cannot clear. The readiness probe reads it so a wedged node stops
     /// reporting itself healthy while every query dies on a lease timeout.

@@ -92,6 +92,19 @@ impl MetadataCommitApplier {
                 }
                 return Ok(());
             }
+            MetadataEntry::DdlPendingPropose {
+                token,
+                objects,
+                proposed_at,
+            } => {
+                return self.apply_ddl_pending_propose(*token, objects, *proposed_at);
+            }
+            MetadataEntry::DdlPendingFinalize { token } => {
+                return self.apply_ddl_pending_finalize(*token, raft_index);
+            }
+            MetadataEntry::DdlPendingCancel { token } => {
+                return self.apply_ddl_pending_cancel(*token);
+            }
             MetadataEntry::DdlPrepareRelease { token } => {
                 if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
                     let mut owner = shared
