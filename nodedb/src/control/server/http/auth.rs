@@ -314,6 +314,13 @@ pub enum ApiError {
     },
     /// Arbitrary HTTP status from gateway error mapping.
     HttpStatus(u16, String),
+    /// An error with its NodeDB numeric code preserved (e.g. a DDL refusal),
+    /// so the client's typed reconstruction gets more than a bare message.
+    Coded {
+        status: StatusCode,
+        message: String,
+        code: nodedb_types::error::ErrorCode,
+    },
 }
 
 impl IntoResponse for ApiError {
@@ -332,6 +339,14 @@ impl IntoResponse for ApiError {
                 }
                 resp
             }
+            ApiError::Coded {
+                status,
+                message,
+                code,
+            } => {
+                let body = HttpError::with_code(message, code.to_string());
+                (status, axum::Json(body)).into_response()
+            }
             other => {
                 let (status, message) = match other {
                     ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -339,6 +354,7 @@ impl IntoResponse for ApiError {
                     ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
                     ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
                     ApiError::RateLimited { .. } => unreachable!(),
+                    ApiError::Coded { .. } => unreachable!(),
                     ApiError::HttpStatus(code, msg) => (
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                         msg,

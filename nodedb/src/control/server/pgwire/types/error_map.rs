@@ -81,7 +81,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         }
         crate::Error::CloneWriteRequiresMaterialize { .. } => (
             "ERROR",
-            sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE,
+            sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
             err.to_string(),
         ),
         crate::Error::RejectedAuthz { .. } => {
@@ -190,7 +190,7 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         // Mirrors the `NotLeader` arm.
         Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
         // Mirrors the `CloneWriteRequiresMaterialize` arm.
-        Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE,
+        Ec::CLONE_WRITE_REQUIRES_MATERIALIZE => sqlstate::CLONE_WRITE_REQUIRES_MATERIALIZE.0,
         _ => sqlstate::INTERNAL_ERROR,
     }
 }

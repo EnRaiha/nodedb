@@ -23,10 +23,7 @@ use super::super::auth_support::{require_tenant_admin, status};
 const ALERT_RULES_CRDT_COLLECTION: &str = "_alert_rules";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Existence check used by the `DROP ALERT IF EXISTS` short-circuit in the

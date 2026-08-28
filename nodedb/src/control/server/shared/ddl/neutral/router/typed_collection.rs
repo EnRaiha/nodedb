@@ -65,10 +65,7 @@ pub(super) async fn try_typed(
                     collection::dispatch_register_by_name(state, identity, name, database_id)
                         .await
                         .map(|()| resp)
-                        .map_err(|e| DdlError {
-                            sqlstate: "XX000".to_string(),
-                            message: e.to_string(),
-                        })
+                        .map_err(|e| DdlError::new("XX000", e.to_string()))
                 }
                 Err(e) => Err(e),
             };
@@ -109,10 +106,7 @@ pub(super) async fn try_typed(
                     collection::dispatch_register_by_name(state, identity, name, database_id)
                         .await
                         .map(|()| resp)
-                        .map_err(|e| DdlError {
-                            sqlstate: "XX000".to_string(),
-                            message: e.to_string(),
-                        })
+                        .map_err(|e| DdlError::new("XX000", e.to_string()))
                 }
                 Err(e) => Err(e),
             };

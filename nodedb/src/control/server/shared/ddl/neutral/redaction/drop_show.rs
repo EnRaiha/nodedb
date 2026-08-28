@@ -38,10 +38,10 @@ pub fn drop_redaction_policy(
         if if_exists {
             return Ok(status("DROP REDACTION POLICY"));
         }
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("no redaction policy on '{collection}' for role '{for_role}'"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("no redaction policy on '{collection}' for role '{for_role}'"),
+        ));
     }
 
     let entry = CatalogEntry::DeleteRedactionPolicy {
@@ -49,19 +49,14 @@ pub fn drop_redaction_policy(
         collection: collection.to_string(),
         for_role: for_role.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_redaction_policy(tenant_id, collection, for_role)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog write: {e}"),
-                })?;
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state
             .redaction

@@ -26,10 +26,7 @@ use crate::types::TenantId;
 use super::result::DdlError;
 
 fn owner_err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Propose `PutOwner` through raft, falling back to a direct redb

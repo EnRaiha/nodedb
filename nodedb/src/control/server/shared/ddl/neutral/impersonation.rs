@@ -28,10 +28,7 @@ use crate::control::state::SharedState;
 use super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 fn status(command: &str) -> Vec<DdlResult> {

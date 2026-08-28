@@ -79,8 +79,7 @@ pub async fn handle_move_tenant(
     if recovery::tenant_already_in_target(catalog, tenant_id, source_db_id, target_db_id)
         .map_err(|e| ddl_err("XX000", format!("idempotency check: {e}")))?
     {
-        return Err(ddl_err(
-            sqlstate::MOVE_TENANT_ALREADY_AT_TARGET,
+        return Err(DdlError::move_tenant_already_at_target(
             nodedb_types::NodeDbError::move_tenant_already_at_target(tenant_name, to_db).message(),
         ));
     }
@@ -116,7 +115,7 @@ pub async fn handle_move_tenant(
     if let Err(ref e) = drain_result {
         // Compensate: remove journal entry so state is clean.
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(ddl_err(sqlstate::MOVE_TENANT_DRAIN_TIMEOUT, e.message()));
+        return Err(DdlError::move_tenant_drain_timeout(e.message()));
     }
 
     // Update journal to Snapshot phase.
@@ -132,7 +131,7 @@ pub async fn handle_move_tenant(
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            return Err(ddl_err(sqlstate::MOVE_TENANT_SNAPSHOT_FAILED, e.message()));
+            return Err(DdlError::move_tenant_snapshot_failed(e.message()));
         }
     };
 
@@ -161,7 +160,7 @@ pub async fn handle_move_tenant(
         drain::release(state, tenant_id, source_db_id);
         let _ = snapshot::delete_temp(state, &temp_key).await;
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(ddl_err(sqlstate::MOVE_TENANT_CUTOVER_FAILED, e.message()));
+        return Err(DdlError::move_tenant_cutover_failed(e.message()));
     }
 
     // ── Phase 5: Resume ───────────────────────────────────────────────────────

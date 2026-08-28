@@ -53,23 +53,17 @@ pub(super) async fn dispatch_authorized_read(
         &state.roles,
         &audit,
     )
-    .map_err(|error| DdlError {
-        sqlstate: "42501".to_string(),
-        message: format!("permission denied: {}", error.resource()),
-    })?;
+    .map_err(|error| DdlError::new("42501", format!("permission denied: {}", error.resource())))?;
 
     let Some(authorized_task) = authorized.into_tasks().pop() else {
-        return Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "version-history read lost its authorized task".to_string(),
-        });
+        return Err(DdlError::new(
+            "XX000",
+            "version-history read lost its authorized task",
+        ));
     };
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     dispatch_authorized(state, authorized_task, collection, timeout)
         .await
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("dispatch: {e}"),
-        })
+        .map_err(|e| DdlError::new("XX000", format!("dispatch: {e}")))
 }

@@ -195,8 +195,5 @@ pub async fn transfer_item(
 // ── Helpers ────────────────────────────────────────────────────────────
 
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }

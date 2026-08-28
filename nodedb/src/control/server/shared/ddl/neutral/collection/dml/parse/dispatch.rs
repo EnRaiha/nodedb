@@ -445,10 +445,10 @@ fn authorize_final_task_set(
 }
 
 fn authorization_error_to_ddl(error: AuthorizationError) -> DdlError {
-    DdlError {
-        sqlstate: nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE.to_owned(),
-        message: error.resource().to_owned(),
-    }
+    DdlError::new(
+        nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE,
+        error.resource().to_owned(),
+    )
 }
 
 #[cfg(test)]

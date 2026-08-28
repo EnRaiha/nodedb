@@ -27,10 +27,7 @@ const FIELD_KEYWORDS: &[&str] = &["TYPE", "DEFAULT", "VALUE", "ASSERT", "READONL
 
 /// Build a [`DdlError`] from a SQLSTATE + message.
 fn err(sqlstate: &str, message: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parse and store a DEFINE FIELD statement.

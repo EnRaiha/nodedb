@@ -35,10 +35,7 @@ use nodedb_physical::physical_plan::MetaOp;
 use super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// CONVERT COLLECTION <name> TO <target_type> [(<col_defs>)]

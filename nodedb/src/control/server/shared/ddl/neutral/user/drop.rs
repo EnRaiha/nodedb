@@ -58,19 +58,16 @@ fn drop_user_inner(
     let (if_exists, parts) = strip_if_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP USER [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: DROP USER [IF EXISTS] <name>",
+        ));
     }
 
     let username = parts[2];
 
     if username == identity.username {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "cannot drop your own user".to_string(),
-        });
+        return Err(DdlError::new("42501", "cannot drop your own user"));
     }
 
     // Look up user's tenant before dropping (for ownership reassignment).
@@ -88,27 +85,22 @@ fn drop_user_inner(
         if if_exists {
             return Ok(status("DROP USER"));
         }
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("user '{username}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("user '{username}' does not exist"),
+        ));
     }
 
     let authoritative_admin = state
         .credentials
         .catalog()
         .authoritative_tenant_admin(user_tenant.as_u64())
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("load tenant administrator: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("load tenant administrator: {e}")))?;
     if !tenant_teardown && authoritative_admin.as_deref() == Some(username) {
-        return Err(DdlError {
-            sqlstate: "55006".to_string(),
-            message: format!(
-                "cannot drop user '{username}': it is the authoritative tenant administrator"
-            ),
-        });
+        return Err(DdlError::new(
+            "55006",
+            format!("cannot drop user '{username}': it is the authoritative tenant administrator"),
+        ));
     }
 
     // Reassign every object owned by the user (all owner-bearing
@@ -141,22 +133,14 @@ fn drop_user_inner(
     let entry = crate::control::catalog_entry::CatalogEntry::DropUser {
         username: username.to_string(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     let dropped = if outcome.needs_local_apply() {
         // Single-node fallback.
         state
             .credentials
             .drop_user(username)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            })?
+            .map_err(|e| DdlError::new("XX000", e.to_string()))?
     } else {
         // Cluster mode: the raft entry committed, so the
         // drop WILL be applied on every node. The
@@ -189,9 +173,9 @@ fn drop_user_inner(
         );
         Ok(status("DROP USER"))
     } else {
-        Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("user '{username}' does not exist"),
-        })
+        Err(DdlError::new(
+            "42704",
+            format!("user '{username}' does not exist"),
+        ))
     }
 }

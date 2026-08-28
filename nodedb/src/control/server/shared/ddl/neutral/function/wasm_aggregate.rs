@@ -39,51 +39,35 @@ pub fn create_wasm_aggregate(
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function_in_database(database_id, tenant_id, &parsed.name)
     {
-        return Err(DdlError {
-            sqlstate: "42723".to_string(),
-            message: format!("function '{}' already exists", parsed.name),
-        });
+        return Err(DdlError::new(
+            "42723",
+            format!("function '{}' already exists", parsed.name),
+        ));
     }
 
     // Decode base64 binary.
     use base64::Engine;
     let wasm_bytes = base64::engine::general_purpose::STANDARD
         .decode(&parsed.base64_body)
-        .map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid base64: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("42601", format!("invalid base64: {e}")))?;
 
     // Validate before proposal; the applier stores the blob on every node.
     let config = wasm::WasmConfig::default();
-    let hash =
-        wasm::store::validate_wasm_binary(&wasm_bytes, config.max_binary_size).map_err(|e| {
-            DdlError {
-                sqlstate: "42601".to_string(),
-                message: e.to_string(),
-            }
-        })?;
+    let hash = wasm::store::validate_wasm_binary(&wasm_bytes, config.max_binary_size)
+        .map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     // Validate aggregate exports (init, accumulate, merge, finalize).
-    let runtime = wasm::runtime::WasmRuntime::new().map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
-    let module = runtime.get_or_compile(&wasm_bytes).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
-    wasm::wit::validate_aggregate_exports(&module).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: e.to_string(),
-    })?;
+    let runtime =
+        wasm::runtime::WasmRuntime::new().map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    let module = runtime
+        .get_or_compile(&wasm_bytes)
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
+    wasm::wit::validate_aggregate_exports(&module)
+        .map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock"))?
         .as_secs();
 
     // Store as a function with language=WASM. The "aggregate" nature is
@@ -160,16 +144,12 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
                 .unwrap_or_default(),
         )
     } else {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected CREATE AGGREGATE FUNCTION".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected CREATE AGGREGATE FUNCTION"));
     };
 
-    let paren_open = after.find('(').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "expected '('".to_string(),
-    })?;
+    let paren_open = after
+        .find('(')
+        .ok_or_else(|| DdlError::new("42601", "expected '('"))?;
     let name = after
         .get(..paren_open)
         .unwrap_or_default()
@@ -177,10 +157,8 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
         .to_lowercase();
     validate_identifier(&name)?;
 
-    let paren_close = find_matching_paren(after, paren_open).ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '('".to_string(),
-    })?;
+    let paren_close = find_matching_paren(after, paren_open)
+        .ok_or_else(|| DdlError::new("42601", "unmatched '('"))?;
     let params_str = after.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_parameters(params_str)?;
 
@@ -190,18 +168,12 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
         .get(.."RETURNS ".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURNS "))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected RETURNS <type>".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected RETURNS <type>"));
     }
     let after_returns = rest.get("RETURNS ".len()..).unwrap_or_default().trim();
 
-    let lang_pos =
-        find_ascii_case_insensitive(after_returns, "LANGUAGE").ok_or_else(|| DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected LANGUAGE WASM".to_string(),
-        })?;
+    let lang_pos = find_ascii_case_insensitive(after_returns, "LANGUAGE")
+        .ok_or_else(|| DdlError::new("42601", "expected LANGUAGE WASM"))?;
     let return_type = after_returns
         .get(..lang_pos)
         .unwrap_or_default()
@@ -216,10 +188,7 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
         .get(.."WASM".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WASM"))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected LANGUAGE WASM".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected LANGUAGE WASM"));
     }
     let after_wasm = after_lang.get("WASM".len()..).unwrap_or_default().trim();
 
@@ -227,10 +196,7 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
         .get(.."AS".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected AS '<base64>'".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected AS '<base64>'"));
     }
     let body = after_wasm.get("AS".len()..).unwrap_or_default().trim();
     let base64_body = if body.starts_with('\'') && body.ends_with('\'') && body.len() >= 2 {

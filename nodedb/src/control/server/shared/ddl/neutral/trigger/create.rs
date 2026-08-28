@@ -70,17 +70,15 @@ pub fn create_trigger(
     if !or_replace
         && let Ok(Some(_)) = catalog.get_trigger_in_database(database_id, tenant_id, name)
     {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("trigger '{name}' already exists"),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("trigger '{name}' already exists"),
+        ));
     }
 
     // Validate the trigger body parses as procedural SQL.
-    crate::control::planner::procedural::parse_block(body_sql).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("trigger body parse error: {e}"),
-    })?;
+    crate::control::planner::procedural::parse_block(body_sql)
+        .map_err(|e| DdlError::new("42601", format!("trigger body parse error: {e}")))?;
 
     let execution_mode_enum = parse_execution_mode(execution_mode);
     let timing_enum = parse_timing(timing);
@@ -104,10 +102,7 @@ pub fn create_trigger(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock before UNIX epoch".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
         .as_secs();
 
     let batch_mode = crate::control::trigger::batch::classify::classify_trigger_body(body_sql);
@@ -262,16 +257,15 @@ fn parse_security(s: Option<&str>) -> Result<TriggerSecurity, DdlError> {
     };
     match mode.to_uppercase().as_str() {
         "DEFINER" => Ok(TriggerSecurity::Definer),
-        "INVOKER" => Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message: "SECURITY INVOKER is not supported for triggers: bodies execute \
+        "INVOKER" => Err(DdlError::new(
+            "0A000",
+            "SECURITY INVOKER is not supported for triggers: bodies execute \
                       asynchronously from a write event that carries no invoking identity. \
-                      Use SECURITY DEFINER (the default)."
-                .to_string(),
-        }),
-        other => Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("unrecognised trigger SECURITY mode '{other}'"),
-        }),
+                      Use SECURITY DEFINER (the default).",
+        )),
+        other => Err(DdlError::new(
+            "42601",
+            format!("unrecognised trigger SECURITY mode '{other}'"),
+        )),
     }
 }

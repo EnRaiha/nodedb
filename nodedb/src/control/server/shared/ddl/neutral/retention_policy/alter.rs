@@ -25,10 +25,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::require_tenant_admin;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 fn parse_auto_tier(value: &str) -> Result<bool, DdlError> {

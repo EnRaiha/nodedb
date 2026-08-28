@@ -50,16 +50,13 @@ pub fn drop_trigger(
     // trigger returns a clean success without touching raft).
     let exists_before = catalog
         .get_trigger_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog read: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
         .is_some();
     if !exists_before && !if_exists {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("trigger '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("trigger '{name}' does not exist"),
+        ));
     }
     if !exists_before {
         return Ok(status("DROP TRIGGER"));
@@ -125,10 +122,10 @@ pub fn alter_trigger(
         "ENABLE" => true,
         "DISABLE" => false,
         _ => {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("expected ENABLE, DISABLE, or OWNER TO, got '{action}'"),
-            });
+            return Err(DdlError::new(
+                "42601",
+                format!("expected ENABLE, DISABLE, or OWNER TO, got '{action}'"),
+            ));
         }
     };
 
@@ -140,14 +137,8 @@ pub fn alter_trigger(
 
     let mut trigger = catalog
         .get_trigger_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("trigger '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .ok_or_else(|| DdlError::new("42704", format!("trigger '{name}' does not exist")))?;
 
     trigger.enabled = enabled;
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
@@ -175,10 +166,7 @@ fn alter_trigger_owner(
     new_owner: Option<&str>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let new_owner = new_owner
-        .ok_or_else(|| DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: ALTER TRIGGER <name> OWNER TO <new_owner>".to_string(),
-        })?
+        .ok_or_else(|| DdlError::new("42601", "syntax: ALTER TRIGGER <name> OWNER TO <new_owner>"))?
         .trim_end_matches(';')
         .to_string();
 
@@ -190,22 +178,16 @@ fn alter_trigger_owner(
 
     let mut trigger = catalog
         .get_trigger_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("trigger '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .ok_or_else(|| DdlError::new("42704", format!("trigger '{name}' does not exist")))?;
 
     // Do not mutate a definition until the target principal is known to
     // exist. The tenant-admin gate in `alter_trigger` authorizes the transfer.
     if state.credentials.get_user(&new_owner).is_none() {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("user '{new_owner}' not found"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("user '{new_owner}' not found"),
+        ));
     }
 
     let old_owner = trigger.owner.clone();
@@ -229,10 +211,10 @@ fn alter_trigger_owner(
 
 fn parse_drop_trigger(parts: &[&str]) -> Result<(String, bool), DdlError> {
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP TRIGGER [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: DROP TRIGGER [IF EXISTS] <name>",
+        ));
     }
     let mut idx = 2;
     let if_exists = if parts.len() > 4
@@ -245,10 +227,7 @@ fn parse_drop_trigger(parts: &[&str]) -> Result<(String, bool), DdlError> {
         false
     };
     if idx >= parts.len() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "trigger name required".to_string(),
-        });
+        return Err(DdlError::new("42601", "trigger name required"));
     }
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
     Ok((name, if_exists))

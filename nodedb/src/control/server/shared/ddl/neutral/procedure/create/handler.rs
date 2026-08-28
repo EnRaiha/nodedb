@@ -38,24 +38,19 @@ pub fn create_procedure(
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_procedure_in_database(database_id, tenant_id, &parsed.name)
     {
-        return Err(DdlError {
-            sqlstate: "42723".to_string(),
-            message: format!("procedure '{}' already exists", parsed.name),
-        });
+        return Err(DdlError::new(
+            "42723",
+            format!("procedure '{}' already exists", parsed.name),
+        ));
     }
 
     // Validate body parses as procedural SQL.
-    crate::control::planner::procedural::parse_block(&parsed.body_sql).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("procedure body parse error: {e}"),
-    })?;
+    crate::control::planner::procedural::parse_block(&parsed.body_sql)
+        .map_err(|e| DdlError::new("42601", format!("procedure body parse error: {e}")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock before UNIX epoch".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
         .as_secs();
 
     let routability = extract_routability(&parsed.body_sql);

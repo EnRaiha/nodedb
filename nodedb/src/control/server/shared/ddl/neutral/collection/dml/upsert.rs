@@ -90,10 +90,7 @@ pub async fn upsert_document(
                 )
         {
             let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(DdlError {
-                sqlstate: code.to_owned(),
-                message,
-            }));
+            return Some(Err(DdlError::new(code.to_owned(), message)));
         }
 
         // General CHECK constraints (Control Plane enforcement, may have subqueries).
@@ -166,10 +163,7 @@ pub async fn upsert_document(
         .map_err(|error| {
             let (_, sqlstate, message) =
                 crate::control::server::pgwire::types::error_to_sqlstate(&error);
-            DdlError {
-                sqlstate: sqlstate.to_owned(),
-                message,
-            }
+            DdlError::new(sqlstate.to_owned(), message)
         });
         match row {
             Ok(row) if row.is_empty() => None,
@@ -251,8 +245,5 @@ pub async fn upsert_document(
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }

@@ -16,10 +16,7 @@ use crate::types::{DatabaseId, TenantId};
 use super::result::DdlError;
 
 fn registry_err(message: String) -> DdlError {
-    DdlError {
-        sqlstate: "XX000".to_string(),
-        message,
-    }
+    DdlError::new("XX000", message)
 }
 
 /// The identity of one index, as its creating statement declared it.

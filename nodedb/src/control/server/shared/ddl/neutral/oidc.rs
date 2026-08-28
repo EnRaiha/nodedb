@@ -53,10 +53,10 @@ fn require_superuser(
             &identity.username,
             action,
         );
-        Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: format!("permission denied: {action} requires superuser"),
-        })
+        Err(DdlError::new(
+            "42501",
+            format!("permission denied: {action} requires superuser"),
+        ))
     }
 }
 
@@ -76,11 +76,10 @@ fn validate_claim_mapping_roles(claim_mappings: &[OidcClaimMappingClause]) -> Re
         .flat_map(|mapping| mapping.add_roles.iter())
         .any(|role| role == "superuser")
     {
-        return Err(DdlError {
-            sqlstate: "22023".to_string(),
-            message: "OIDC claim mappings cannot grant the database-owned superuser role"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "22023",
+            "OIDC claim mappings cannot grant the database-owned superuser role",
+        ));
     }
     Ok(())
 }
@@ -112,16 +111,10 @@ pub fn create_oidc_provider(
     require_superuser(state, identity, "create OIDC providers")?;
 
     if issuer.is_empty() {
-        return Err(DdlError {
-            sqlstate: "22023".to_string(),
-            message: "ISSUER must not be empty".to_string(),
-        });
+        return Err(DdlError::new("22023", "ISSUER must not be empty"));
     }
     if jwks_uri.is_empty() {
-        return Err(DdlError {
-            sqlstate: "22023".to_string(),
-            message: "JWKS_URI must not be empty".to_string(),
-        });
+        return Err(DdlError::new("22023", "JWKS_URI must not be empty"));
     }
     validate_claim_mapping_roles(claim_mappings)?;
 
@@ -129,33 +122,27 @@ pub fn create_oidc_provider(
 
     let tenant_exists = catalog
         .load_all_tenants()
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("tenant lookup: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("tenant lookup: {e}")))?
         .iter()
         .any(|tenant| tenant.tenant_id == tenant_id);
     if !tenant_exists {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("tenant '{tenant_id}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("tenant '{tenant_id}' does not exist"),
+        ));
     }
 
     // Check for duplicate by provider name.
     match catalog.get_oidc_provider(name) {
         Ok(Some(_)) => {
-            return Err(DdlError {
-                sqlstate: "42710".to_string(),
-                message: format!("OIDC provider '{name}' already exists"),
-            });
+            return Err(DdlError::new(
+                "42710",
+                format!("OIDC provider '{name}' already exists"),
+            ));
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog read: {e}"),
-            });
+            return Err(DdlError::new("XX000", format!("catalog read: {e}")));
         }
     }
 
@@ -166,19 +153,16 @@ pub fn create_oidc_provider(
             if providers.iter().any(|p| {
                 p.issuer == issuer && has_ambiguous_issuer_route(p.audience.as_deref(), audience)
             }) {
-                return Err(DdlError {
-                    sqlstate: "42710".to_string(),
-                    message: format!(
+                return Err(DdlError::new(
+                    "42710",
+                    format!(
                         "OIDC provider issuer/audience route for issuer '{issuer}' is ambiguous or already exists"
                     ),
-                });
+                ));
             }
         }
         Err(e) => {
-            return Err(DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog list: {e}"),
-            });
+            return Err(DdlError::new("XX000", format!("catalog list: {e}")));
         }
     }
 
@@ -204,15 +188,12 @@ pub fn create_oidc_provider(
     };
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
-        catalog.put_oidc_provider(&provider).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog write: {e}"),
-        })?;
+        catalog
+            .put_oidc_provider(&provider)
+            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
     }
 
     state.audit_record(
@@ -240,14 +221,8 @@ pub fn alter_oidc_provider_claim_mapping(
 
     let mut provider = catalog
         .get_oidc_provider(name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog read: {e}"),
-        })?
-        .ok_or(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("OIDC provider '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+        .ok_or_else(|| DdlError::new("42704", format!("OIDC provider '{name}' does not exist")))?;
     validate_claim_mapping_roles(claim_mappings)?;
 
     let stored_mappings: Vec<StoredClaimMappingRule> = claim_mappings
@@ -264,15 +239,12 @@ pub fn alter_oidc_provider_claim_mapping(
     provider.claim_mapping = stored_mappings;
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
-        catalog.put_oidc_provider(&provider).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog write: {e}"),
-        })?;
+        catalog
+            .put_oidc_provider(&provider)
+            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
     }
 
     state.audit_record(
@@ -301,33 +273,27 @@ pub fn drop_oidc_provider(
 
     if catalog
         .get_oidc_provider(name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog read: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
         .is_none()
     {
         if if_exists {
             return Ok(status("DROP OIDC PROVIDER"));
         }
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("OIDC provider '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("OIDC provider '{name}' does not exist"),
+        ));
     }
 
     let entry = CatalogEntry::DeleteOidcProvider {
         name: name.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
-        catalog.delete_oidc_provider(name).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog delete: {e}"),
-        })?;
+        catalog
+            .delete_oidc_provider(name)
+            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
     }
 
     state.audit_record(
@@ -349,10 +315,9 @@ pub fn show_oidc_providers(
 
     let catalog = state.credentials.catalog();
 
-    let providers = catalog.list_oidc_providers().map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("catalog list: {e}"),
-    })?;
+    let providers = catalog
+        .list_oidc_providers()
+        .map_err(|e| DdlError::new("XX000", format!("catalog list: {e}")))?;
 
     let columns = vec![
         "name".to_string(),

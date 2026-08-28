@@ -32,10 +32,7 @@ use super::super::result::{DdlError, DdlResult};
 
 /// Build a `DdlError` from a SQLSTATE code and message.
 fn err(code: &str, msg: &str) -> DdlError {
-    DdlError {
-        sqlstate: code.to_string(),
-        message: msg.to_string(),
-    }
+    DdlError::new(code, msg)
 }
 
 /// Build a single-tag status result.

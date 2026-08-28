@@ -120,10 +120,10 @@ pub fn show_schedule_history(
         .get(database_id, tenant_id, &name)
         .is_none()
     {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("schedule \"{name}\" does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("schedule \"{name}\" does not exist"),
+        ));
     }
 
     let columns = vec![

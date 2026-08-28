@@ -14,10 +14,7 @@ use super::super::super::super::super::result::DdlError;
 use super::validate::canonical_list;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parse and validate the `WITH (engine='...')` option from `sql`.

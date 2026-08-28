@@ -5,10 +5,7 @@
 use super::super::super::result::DdlError;
 
 pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 pub(super) fn parse_sort_columns(cols_str: &str) -> Result<Vec<(String, String)>, DdlError> {

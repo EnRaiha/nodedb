@@ -76,6 +76,11 @@
 // |  68 | DivisionByZero            |
 // |  71 | DatabaseNotFound          |
 // |  72 | CloneWriteRequiresMaterialize |
+// |  73 | UndefinedObject           |
+// |  74 | AlreadyExists             |
+// |  75 | ObjectNotReady            |
+// |  76 | NotFound                  |
+// |  77 | CannotDropDefaultDatabase |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -149,3 +154,8 @@ pub(super) const TAG_BACKUP_TENANT_MISMATCH: u16 = 69;
 pub(super) const TAG_BACKUP_KEY_MISMATCH: u16 = 70;
 pub(super) const TAG_DATABASE_NOT_FOUND: u16 = 71;
 pub(super) const TAG_CLONE_WRITE_REQUIRES_MATERIALIZE: u16 = 72;
+pub(super) const TAG_UNDEFINED_OBJECT: u16 = 73;
+pub(super) const TAG_ALREADY_EXISTS: u16 = 74;
+pub(super) const TAG_OBJECT_NOT_READY: u16 = 75;
+pub(super) const TAG_NOT_FOUND: u16 = 76;
+pub(super) const TAG_CANNOT_DROP_DEFAULT_DATABASE: u16 = 77;

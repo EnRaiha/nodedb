@@ -53,10 +53,10 @@ pub(super) async fn try_string(
         || upper.starts_with("DELETE AUDIT")
         || upper.starts_with("CLEAR AUDIT")
     {
-        return Some(Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "audit log cannot be manually truncated. Entries are pruned automatically by the retention policy (audit_retention_days in config).".to_string(),
-        }));
+        return Some(Err(DdlError::new(
+            "42501",
+            "audit log cannot be manually truncated. Entries are pruned automatically by the retention policy (audit_retention_days in config).",
+        )));
     }
     if upper.starts_with("SHOW USERS") {
         return Some(inspect::show_users(state, identity));
@@ -85,10 +85,10 @@ pub(super) async fn try_string(
         let db_name = if parts.len() >= 5 {
             parts[4]
         } else {
-            return Some(Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: "syntax: SHOW AUDIT IN DATABASE <name> [LIMIT <n>]".to_string(),
-            }));
+            return Some(Err(DdlError::new(
+                "42601",
+                "syntax: SHOW AUDIT IN DATABASE <name> [LIMIT <n>]",
+            )));
         };
         let limit = if parts.len() >= 7 && parts[5].eq_ignore_ascii_case("LIMIT") {
             parts[6].parse::<usize>().unwrap_or(100)
@@ -115,10 +115,10 @@ pub(super) async fn try_string(
                 match value.parse::<usize>() {
                     Ok(limit) => limit,
                     Err(_) => {
-                        return Some(Err(DdlError {
-                            sqlstate: "42601".to_string(),
-                            message: "syntax: SHOW TRIGGER DLQ [LIMIT <n>]".to_string(),
-                        }));
+                        return Some(Err(DdlError::new(
+                            "42601",
+                            "syntax: SHOW TRIGGER DLQ [LIMIT <n>]",
+                        )));
                     }
                 }
             }
@@ -130,10 +130,10 @@ pub(super) async fn try_string(
     if upper.starts_with("REQUEUE TRIGGER DLQ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         let Some(entry_id) = parts.get(3).and_then(|id| id.parse::<u64>().ok()) else {
-            return Some(Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: "syntax: REQUEUE TRIGGER DLQ <entry_id>".to_string(),
-            }));
+            return Some(Err(DdlError::new(
+                "42601",
+                "syntax: REQUEUE TRIGGER DLQ <entry_id>",
+            )));
         };
         return Some(inspect::requeue_trigger_dlq(state, identity, entry_id));
     }

@@ -24,17 +24,11 @@ pub async fn drop_topic(
 
     // parts: ["DROP", "TOPIC", "<name>"]
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected DROP TOPIC <name>".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected DROP TOPIC <name>"));
     }
 
     let name = parts[2].to_lowercase();
-    validate_topic_name(&name).map_err(|message| DdlError {
-        sqlstate: "42601".to_string(),
-        message: message.to_string(),
-    })?;
+    validate_topic_name(&name).map_err(|message| DdlError::new("42601", message.to_string()))?;
     let tenant_id = identity.tenant_id.as_u64();
     let lifecycle_lock = state
         .ep_topic_registry
@@ -58,9 +52,11 @@ pub async fn drop_topic(
     }
     for group_name in catalog
         .topic_consumer_group_names(database_id, tenant_id, &name)
-        .map_err(|error| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog enumerate topic consumer groups: {error}"),
+        .map_err(|error| {
+            DdlError::new(
+                "XX000",
+                format!("catalog enumerate topic consumer groups: {error}"),
+            )
         })?
     {
         group_names.insert(group_name);
@@ -96,24 +92,20 @@ pub async fn drop_topic(
     state
         .offset_store
         .delete_groups(database_id, tenant_id, &offset_groups)
-        .map_err(|error| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("durable topic offset cleanup: {error}"),
+        .map_err(|error| {
+            DdlError::new("XX000", format!("durable topic offset cleanup: {error}"))
         })?;
 
     // Definition, retained messages, and both consumer-group identities share
     // one catalog transaction. There is no best-effort path after this point.
     let existed = catalog
         .delete_ep_topic_with_consumer_groups(database_id, tenant_id, &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog delete: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
     if !existed {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("topic '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("topic '{name}' does not exist"),
+        ));
     }
 
     state

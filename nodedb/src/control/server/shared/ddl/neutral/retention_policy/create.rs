@@ -33,10 +33,7 @@ use super::RETENTION_POLICIES_CRDT_COLLECTION;
 use super::parse::parse_create_retention_policy;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 fn assemble_retention_parser_input(

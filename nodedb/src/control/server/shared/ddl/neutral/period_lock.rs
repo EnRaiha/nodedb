@@ -31,10 +31,7 @@ use super::super::result::{DdlError, DdlResult};
 /// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
 /// the pgwire handlers produced.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Handle `ALTER COLLECTION x ADD PERIOD LOCK ON col REFERENCES table(pk) ...`

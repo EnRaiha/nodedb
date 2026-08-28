@@ -29,10 +29,7 @@ use super::super::result::{DdlError, DdlResult};
 const DEFAULT_WARNING_THRESHOLD: f64 = 0.8;
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 const DEFINE_SYNTAX: &str = "syntax: DEFINE QUOTA ON SCOPE '<scope>' MAX <tokens> TOKENS \

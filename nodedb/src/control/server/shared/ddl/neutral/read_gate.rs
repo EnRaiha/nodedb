@@ -49,10 +49,7 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
 fn gate_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// The per-request authorization context a hand-built read runs under.

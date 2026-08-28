@@ -42,12 +42,11 @@ pub fn create_change_stream(
     require_tenant_admin(identity, "create change streams")?;
 
     if state.event_plane_budget.should_reject_new_streams() {
-        return Err(DdlError {
-            sqlstate: "53000".to_string(),
-            message: "Event Plane memory budget exceeded — cannot create new change streams. \
-             Existing streams continue with reduced retention."
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "53000",
+            "Event Plane memory budget exceeded — cannot create new change streams. \
+             Existing streams continue with reduced retention.",
+        ));
     }
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -55,10 +54,10 @@ pub fn create_change_stream(
     let catalog = state.credentials.catalog();
 
     if let Ok(Some(_)) = catalog.get_change_stream(database_id, tenant_id, name) {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("change stream '{name}' already exists"),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("change stream '{name}' already exists"),
+        ));
     }
 
     // Parse WITH clause options.
@@ -131,10 +130,7 @@ pub fn create_change_stream(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock before UNIX epoch".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
         .as_secs();
 
     // Capture the creating principal's roles onto the subscription record.

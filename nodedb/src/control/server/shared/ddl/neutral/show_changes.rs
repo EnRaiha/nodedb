@@ -40,10 +40,7 @@ pub fn show_changes(
             match crate::control::server::shared::ddl::sql_parse::parse_since_timestamp(since_str) {
                 Ok(ms) => ms,
                 Err(msg) => {
-                    return Err(DdlError {
-                        sqlstate: "22007".to_string(),
-                        message: msg.to_string(),
-                    });
+                    return Err(DdlError::new("22007", msg.to_string()));
                 }
             }
         } else {
@@ -71,9 +68,8 @@ pub fn show_changes(
             &state.roles,
             &audit,
         )
-        .map_err(|error| DdlError {
-            sqlstate: "42501".into(),
-            message: format!("permission denied: {}", error.resource()),
+        .map_err(|error| {
+            DdlError::new("42501", format!("permission denied: {}", error.resource()))
         })?;
 
         let changes = state
@@ -85,9 +81,8 @@ pub fn show_changes(
                 ReplayStart::Timestamp(since_ms),
                 limit,
             )
-            .map_err(|_| DdlError {
-                sqlstate: "55000".into(),
-                message: "change stream replay cursor unexpectedly expired".into(),
+            .map_err(|_| {
+                DdlError::new("55000", "change stream replay cursor unexpectedly expired")
             })?
             .events;
 
@@ -140,10 +135,10 @@ pub fn show_changes(
         })]);
     }
 
-    Err(DdlError {
-        sqlstate: "42601".to_string(),
-        message: "syntax: SHOW CHANGES FOR <collection> [SINCE <timestamp>]".to_string(),
-    })
+    Err(DdlError::new(
+        "42601",
+        "syntax: SHOW CHANGES FOR <collection> [SINCE <timestamp>]",
+    ))
 }
 
 #[cfg(test)]

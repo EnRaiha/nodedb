@@ -18,10 +18,7 @@ use crate::control::state::SharedState;
 /// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
 /// the pgwire handlers produced.
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Build the single `Status` result every `ALTER` sub-command returns. `command`

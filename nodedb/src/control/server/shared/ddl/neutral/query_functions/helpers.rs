@@ -18,10 +18,7 @@ use super::super::super::result::{DdlError, DdlResult};
 
 /// Construct a protocol-neutral DDL error (SQLSTATE + message).
 pub fn err(sqlstate: &str, message: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 pub fn extract_function_args<'a>(sql: &'a str, func_name: &str) -> Result<Vec<&'a str>, DdlError> {

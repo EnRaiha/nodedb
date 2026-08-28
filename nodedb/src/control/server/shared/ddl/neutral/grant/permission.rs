@@ -46,10 +46,10 @@ fn canonicalize_grantee(state: &SharedState, raw: &str) -> Result<String, DdlErr
     if is_known_role {
         return Ok(parsed.to_string());
     }
-    Err(DdlError {
-        sqlstate: "42704".to_string(),
-        message: format!("grantee '{raw}' is neither a user nor a role"),
-    })
+    Err(DdlError::new(
+        "42704",
+        format!("grantee '{raw}' is neither a user nor a role"),
+    ))
 }
 
 fn propose_grant(
@@ -63,17 +63,14 @@ fn propose_grant(
         .permissions
         .prepare_permission(target, grantee, perm, granted_by);
     let entry = CatalogEntry::PutPermission(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
-            catalog.put_permission(&stored).map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
+            catalog
+                .put_permission(&stored)
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state.permissions.install_replicated_permission(&stored);
     }
@@ -92,19 +89,14 @@ fn propose_revoke(
         grantee: grantee.to_string(),
         permission: perm_str.clone(),
     };
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_permission(target, grantee, &perm_str)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog write: {e}"),
-                })?;
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state
             .permissions
@@ -122,18 +114,14 @@ fn resolve_tenant_id(state: &SharedState, name: &str) -> Result<TenantId, DdlErr
         return Ok(TenantId::new(id));
     }
     let catalog = state.credentials.catalog();
-    let tenants = catalog.load_all_tenants().map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("tenant lookup: {e}"),
-    })?;
+    let tenants = catalog
+        .load_all_tenants()
+        .map_err(|e| DdlError::new("XX000", format!("tenant lookup: {e}")))?;
     tenants
         .into_iter()
         .find(|t| t.name.eq_ignore_ascii_case(name))
         .map(|t| TenantId::new(t.tenant_id))
-        .ok_or_else(|| DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("tenant '{name}' does not exist"),
-        })
+        .ok_or_else(|| DdlError::new("42704", format!("tenant '{name}' does not exist")))
 }
 
 /// Resolve a `(target_type, target_name)` pair into the canonical grant
@@ -164,12 +152,10 @@ fn resolve_target(
         // A tenant admin may only manage grants within their own tenant;
         // granting across tenant boundaries requires superuser.
         if tenant_id != identity.tenant_id && !identity.is_superuser {
-            return Err(DdlError {
-                sqlstate: "42501".to_string(),
-                message:
-                    "permission denied: managing permissions on another tenant requires superuser"
-                        .to_string(),
-            });
+            return Err(DdlError::new(
+                "42501",
+                "permission denied: managing permissions on another tenant requires superuser",
+            ));
         }
         Ok((tenant_target(tenant_id), format!("tenant '{target_name}'")))
     } else {
@@ -194,10 +180,8 @@ fn resolve_permissions(permissions: &[String]) -> Result<Vec<Permission>, DdlErr
                 Permission::Alter,
             ]);
         } else {
-            let perm = parse_permission(p).ok_or_else(|| DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("unknown permission: {p}"),
-            })?;
+            let perm = parse_permission(p)
+                .ok_or_else(|| DdlError::new("42601", format!("unknown permission: {p}")))?;
             out.push(perm);
         }
     }

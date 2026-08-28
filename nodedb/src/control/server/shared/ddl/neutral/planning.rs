@@ -50,10 +50,7 @@ pub async fn plan_authorized_sql(
     let (tasks, output_schema, versions, _) = query_ctx
         .plan_sql_with_rls_and_versions(sql, identity.tenant_id, database_id, &sec, false)
         .await
-        .map_err(|error| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("query planning failed: {error}"),
-        })?;
+        .map_err(|error| DdlError::new("42601", format!("query planning failed: {error}")))?;
 
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
     // Deliberate gate: proves the planned set is authorizable before a
@@ -61,9 +58,11 @@ pub async fn plan_authorized_sql(
     // task through the clone-check gate, immediately before each dispatch.
     let _preauthorized_tasks =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter).map_err(
-            |error| DdlError {
-                sqlstate: nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE.to_string(),
-                message: error.resource().to_string(),
+            |error| {
+                DdlError::new(
+                    nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE.to_string(),
+                    error.resource().to_string(),
+                )
             },
         )?;
 
@@ -73,10 +72,7 @@ pub async fn plan_authorized_sql(
     let lease_scope = state.acquire_plan_lease_scope(&versions).map_err(|error| {
         let (_, sqlstate, message) =
             crate::control::server::pgwire::types::error_to_sqlstate(&error);
-        DdlError {
-            sqlstate: sqlstate.to_string(),
-            message,
-        }
+        DdlError::new(sqlstate.to_string(), message)
     })?;
 
     Ok((tasks, output_schema, lease_scope))

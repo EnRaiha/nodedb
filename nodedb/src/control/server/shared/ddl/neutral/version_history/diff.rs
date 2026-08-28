@@ -22,10 +22,7 @@ use super::dispatch::dispatch_authorized_read;
 const DIFF_WHAT: &str = "a version diff, which returns the CRDT oplog delta between two versions";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// SELECT DIFF(collection, 'doc-id', 'version_a', 'version_b')

@@ -57,16 +57,12 @@ pub fn create_schedule(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Validate cron expression.
-    CronExpr::parse(cron_expr).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("invalid cron expression: {e}"),
-    })?;
+    CronExpr::parse(cron_expr)
+        .map_err(|e| DdlError::new("42601", format!("invalid cron expression: {e}")))?;
 
     // Validate SQL body parses.
-    crate::control::planner::procedural::parse_block(body_sql).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("schedule body parse error: {e}"),
-    })?;
+    crate::control::planner::procedural::parse_block(body_sql)
+        .map_err(|e| DdlError::new("42601", format!("schedule body parse error: {e}")))?;
 
     // Check for duplicate.
     if state
@@ -74,18 +70,15 @@ pub fn create_schedule(
         .get(database_id, tenant_id, name)
         .is_some()
     {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("schedule '{name}' already exists"),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("schedule '{name}' already exists"),
+        ));
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock error".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock error"))?
         .as_secs();
 
     let target_collection = extract_target_collection(body_sql);

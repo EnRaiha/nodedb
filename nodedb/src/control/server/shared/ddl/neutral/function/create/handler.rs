@@ -45,61 +45,47 @@ pub fn create_function(
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function_in_database(database_id, tenant_id, &parsed.name)
     {
-        return Err(DdlError {
-            sqlstate: "42723".to_string(),
-            message: format!("function '{}' already exists", parsed.name),
-        });
+        return Err(DdlError::new(
+            "42723",
+            format!("function '{}' already exists", parsed.name),
+        ));
     }
 
     // Detect body kind and compile/validate accordingly.
     use crate::control::planner::procedural::ast::BodyKind;
-    let compiled_body_sql =
-        match BodyKind::detect(&parsed.body_sql) {
-            BodyKind::Expression => {
-                validate_function_body(&parsed)?;
-                None
-            }
-            BodyKind::Procedural => {
-                let block = crate::control::planner::procedural::parse_block(&parsed.body_sql)
-                    .map_err(|e| DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: format!("procedural parse error: {e}"),
-                    })?;
+    let compiled_body_sql = match BodyKind::detect(&parsed.body_sql) {
+        BodyKind::Expression => {
+            validate_function_body(&parsed)?;
+            None
+        }
+        BodyKind::Procedural => {
+            let block = crate::control::planner::procedural::parse_block(&parsed.body_sql)
+                .map_err(|e| DdlError::new("42601", format!("procedural parse error: {e}")))?;
 
-                crate::control::planner::procedural::validate_function_block(&block).map_err(
-                    |e| DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: format!("procedural validation: {e}"),
-                    },
-                )?;
+            crate::control::planner::procedural::validate_function_block(&block)
+                .map_err(|e| DdlError::new("42601", format!("procedural validation: {e}")))?;
 
-                let compiled = crate::control::planner::procedural::compile_to_sql(&block)
-                    .map_err(|e| DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: format!("procedural compile: {e}"),
-                    })?;
+            let compiled = crate::control::planner::procedural::compile_to_sql(&block)
+                .map_err(|e| DdlError::new("42601", format!("procedural compile: {e}")))?;
 
-                // Validate the compiled expression via DataFusion.
-                let compiled_parsed = ParsedCreateFunction {
-                    or_replace: parsed.or_replace,
-                    name: parsed.name.clone(),
-                    parameters: parsed.parameters.clone(),
-                    return_type: parsed.return_type.clone(),
-                    volatility: parsed.volatility,
-                    body_sql: compiled.clone(),
-                };
-                validate_function_body(&compiled_parsed)?;
+            // Validate the compiled expression via DataFusion.
+            let compiled_parsed = ParsedCreateFunction {
+                or_replace: parsed.or_replace,
+                name: parsed.name.clone(),
+                parameters: parsed.parameters.clone(),
+                return_type: parsed.return_type.clone(),
+                volatility: parsed.volatility,
+                body_sql: compiled.clone(),
+            };
+            validate_function_body(&compiled_parsed)?;
 
-                Some(compiled)
-            }
-        };
+            Some(compiled)
+        }
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock before UNIX epoch".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
         .as_secs();
 
     let mut stored = StoredFunction {

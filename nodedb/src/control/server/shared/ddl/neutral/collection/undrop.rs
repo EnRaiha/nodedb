@@ -34,10 +34,7 @@ pub fn undrop_collection(
     database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: UNDROP COLLECTION <name>".to_string(),
-        });
+        return Err(DdlError::new("42601", "syntax: UNDROP COLLECTION <name>"));
     }
 
     let name_lower = parts[2].to_lowercase();
@@ -53,9 +50,8 @@ pub fn undrop_collection(
             state
                 .quiesce
                 .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
-                .ok_or_else(|| DdlError {
-                    sqlstate: "55006".to_string(),
-                    message: format!("collection '{name}' lifecycle is busy"),
+                .ok_or_else(|| {
+                    DdlError::new("55006", format!("collection '{name}' lifecycle is busy"))
                 })?,
         )
     } else {
@@ -71,25 +67,22 @@ pub fn undrop_collection(
     let mut stored = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return Err(DdlError {
-                sqlstate: "42P01".to_string(),
-                message: format!(
+            return Err(DdlError::new(
+                "42P01",
+                format!(
                     "collection '{name}' not found (retention window elapsed or never existed)"
                 ),
-            });
+            ));
         }
         Err(e) => {
-            return Err(DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            });
+            return Err(DdlError::new("XX000", e.to_string()));
         }
     };
     if stored.is_active {
-        return Err(DdlError {
-            sqlstate: "42P07".to_string(),
-            message: format!("collection '{name}' is already active"),
-        });
+        return Err(DdlError::new(
+            "42P07",
+            format!("collection '{name}' is already active"),
+        ));
     }
 
     // Authorization: preserved owner OR admin.
@@ -103,12 +96,10 @@ pub fn undrop_collection(
     let is_admin = identity.is_superuser || identity.has_role(&Role::TenantAdmin);
 
     if !is_preserved_owner && !is_admin {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message:
-                "permission denied: only the preserved owner, superuser, or tenant_admin may UNDROP"
-                    .to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "permission denied: only the preserved owner, superuser, or tenant_admin may UNDROP",
+        ));
     }
 
     // If the preserved-owner user no longer exists, only admin may restore.
@@ -116,12 +107,10 @@ pub fn undrop_collection(
         .as_deref()
         .is_some_and(|u| state.credentials.get_user(u).is_none());
     if owner_user_missing && !is_admin {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message:
-                "preserved-owner user no longer exists — only superuser or tenant_admin may UNDROP"
-                    .to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "preserved-owner user no longer exists — only superuser or tenant_admin may UNDROP",
+        ));
     }
 
     // Audit intent BEFORE the catalog mutation (symmetric with drop;
@@ -144,13 +133,8 @@ pub fn undrop_collection(
     stored.is_active = true;
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored.clone()));
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
     if outcome.needs_local_apply() {
         // Single-node fallback: run the same applier the replicated path runs
         // on every node, so the restore carries every invariant of a

@@ -298,6 +298,15 @@ impl ToMessagePack for ErrorDetails {
                 write2(writer, TAG_BACKUP_TENANT_MISMATCH, expected, actual)
             }
             ErrorDetails::BackupKeyMismatch => write_unit(writer, TAG_BACKUP_KEY_MISMATCH),
+            ErrorDetails::UndefinedObject { object } => {
+                write1(writer, TAG_UNDEFINED_OBJECT, object)
+            }
+            ErrorDetails::AlreadyExists { object } => write1(writer, TAG_ALREADY_EXISTS, object),
+            ErrorDetails::ObjectNotReady { object } => write1(writer, TAG_OBJECT_NOT_READY, object),
+            ErrorDetails::NotFound { detail } => write1(writer, TAG_NOT_FOUND, detail),
+            ErrorDetails::CannotDropDefaultDatabase => {
+                write_unit(writer, TAG_CANNOT_DROP_DEFAULT_DATABASE)
+            }
         }
     }
 }

@@ -10,6 +10,16 @@
 //! Add new codes here when a new error path needs one; never inline a literal
 //! elsewhere — a typo in a SQLSTATE string is undetectable at compile time.
 
+/// A SQLSTATE string shared by more than one [`crate::error::ErrorCode`]
+/// meaning at the `DdlError` construction sites that actually use it.
+///
+/// Deliberately not `&str`: passing one to `DdlError::new`, which derives
+/// the code from the SQLSTATE string, does not compile. Construct through
+/// the paired `DdlError::<name>` constructor instead, which supplies the
+/// code explicitly rather than guessing it from the wire string.
+#[derive(Debug, Clone, Copy)]
+pub struct AmbiguousSqlstate(pub &'static str);
+
 // ── Class 00 — Successful Completion ────────────────────────────────────────
 
 /// `00000` — `successful_completion`
@@ -32,8 +42,10 @@ pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
 /// `0A000` — Cannot drop the built-in `default` database, which is immutable.
 /// Aliased to `feature_not_supported` per the PostgreSQL convention for
-/// unsupported DDL operations on reserved objects.
-pub const CANNOT_DROP_DEFAULT_DATABASE: &str = "0A000";
+/// unsupported DDL operations on reserved objects. Ambiguous with
+/// `FEATURE_NOT_SUPPORTED` and `CANNOT_CLONE_MIRROR` — see
+/// [`AmbiguousSqlstate`].
+pub const CANNOT_DROP_DEFAULT_DATABASE: AmbiguousSqlstate = AmbiguousSqlstate("0A000");
 
 // ── Class 22 — Data Exception ────────────────────────────────────────────────
 
@@ -187,15 +199,18 @@ pub const CLONE_DEPTH_EXCEEDED: &str = "54011";
 /// `0A000` — NodeDB extension: a mirror database cannot be cloned.
 ///
 /// Aliased to `feature_not_supported` — cloning a mirror creates ambiguous
-/// lineage; the operator must promote the mirror to a writable database first.
-pub const CANNOT_CLONE_MIRROR: &str = "0A000";
+/// lineage; the operator must promote the mirror to a writable database
+/// first. Ambiguous with `FEATURE_NOT_SUPPORTED` and
+/// `CANNOT_DROP_DEFAULT_DATABASE` — see [`AmbiguousSqlstate`].
+pub const CANNOT_CLONE_MIRROR: AmbiguousSqlstate = AmbiguousSqlstate("0A000");
 
 /// `55006` — NodeDB extension: source database has active clone dependents.
 ///
 /// Uses Class 55 "Object Not In Prerequisite State" because the source is in
-/// the correct state for normal use but cannot be dropped until dependents are
-/// resolved.
-pub const CLONE_DEPENDENCY: &str = "55006";
+/// the correct state for normal use but cannot be dropped until dependents
+/// are resolved. Ambiguous with the generic "object busy" use of `55006` —
+/// see [`AmbiguousSqlstate`].
+pub const CLONE_DEPENDENCY: AmbiguousSqlstate = AmbiguousSqlstate("55006");
 
 /// `22023` — NodeDB extension: `AS OF` timestamp predates the clone's
 /// creation point; the database did not exist at that time.
@@ -221,8 +236,8 @@ pub const STALE_READ_NOT_LEADER: &str = "55P03";
 ///
 /// Uses Class 55 "Object Not In Prerequisite State", same as
 /// [`CLONE_DEPENDENCY`] — the collection is valid but not yet in the state
-/// (materialized) the write needs.
-pub const CLONE_WRITE_REQUIRES_MATERIALIZE: &str = "55006";
+/// (materialized) the write needs. Ambiguous — see [`AmbiguousSqlstate`].
+pub const CLONE_WRITE_REQUIRES_MATERIALIZE: AmbiguousSqlstate = AmbiguousSqlstate("55006");
 
 // ── Backup / Restore (Class 22 / 28) ────────────────────────────────────────
 
@@ -241,21 +256,29 @@ pub const BACKUP_KEY_MISMATCH: &str = "28000";
 
 /// `57014` — `query_canceled`: drain phase timed out; client should re-try after
 /// ensuring the tenant has no active connections on the source database.
-pub const MOVE_TENANT_DRAIN_TIMEOUT: &str = "57014";
+/// Ambiguous with `QUERY_CANCELED` (deadline exceeded) — see
+/// [`AmbiguousSqlstate`].
+pub const MOVE_TENANT_DRAIN_TIMEOUT: AmbiguousSqlstate = AmbiguousSqlstate("57014");
 
 /// `55P02` — `lock_not_available`: pre-flight check found schema incompatibility
 /// between the source and target databases; no state was mutated.
 pub const MOVE_TENANT_PREFLIGHT_FAILED: &str = "55P02";
 
 /// `XX000` — internal error during snapshot phase; source left unchanged.
-pub const MOVE_TENANT_SNAPSHOT_FAILED: &str = "XX000";
+/// Ambiguous with the generic internal-error use of `XX000` — see
+/// [`AmbiguousSqlstate`].
+pub const MOVE_TENANT_SNAPSHOT_FAILED: AmbiguousSqlstate = AmbiguousSqlstate("XX000");
 
 /// `XX000` — internal error during cutover phase; source still holds data.
-pub const MOVE_TENANT_CUTOVER_FAILED: &str = "XX000";
+/// Ambiguous with the generic internal-error use of `XX000` — see
+/// [`AmbiguousSqlstate`].
+pub const MOVE_TENANT_CUTOVER_FAILED: AmbiguousSqlstate = AmbiguousSqlstate("XX000");
 
 /// `02000` — `no_data`: tenant is already present in the target database;
 /// the `MOVE TENANT` is a no-op (idempotent retry of a completed move).
-pub const MOVE_TENANT_ALREADY_AT_TARGET: &str = "02000";
+/// Ambiguous with the generic "no data found" use of `02000` — see
+/// [`AmbiguousSqlstate`].
+pub const MOVE_TENANT_ALREADY_AT_TARGET: AmbiguousSqlstate = AmbiguousSqlstate("02000");
 
 // ── Class 08 — Connection Exception ──────────────────────────────────────────
 
@@ -316,16 +339,12 @@ mod tests {
             CANNOT_CONNECT_NOW,
             DATABASE_DROPPED,
             INTERNAL_ERROR,
-            CANNOT_DROP_DEFAULT_DATABASE,
             QUOTA_OVERCOMMIT,
             QUOTA_EXCEEDED,
             SERVER_OVERLOAD,
             CLONE_DEPTH_EXCEEDED,
-            CANNOT_CLONE_MIRROR,
-            CLONE_DEPENDENCY,
             CLONE_PREDATES_QUERY_TIME,
             STALE_READ_NOT_LEADER,
-            CLONE_WRITE_REQUIRES_MATERIALIZE,
             CONNECTION_FAILURE,
             IO_ERROR,
         ];
@@ -334,6 +353,25 @@ mod tests {
                 code.len(),
                 5,
                 "SQLSTATE '{code}' must be exactly 5 characters"
+            );
+        }
+
+        let ambiguous = [
+            CANNOT_DROP_DEFAULT_DATABASE,
+            CANNOT_CLONE_MIRROR,
+            CLONE_DEPENDENCY,
+            CLONE_WRITE_REQUIRES_MATERIALIZE,
+            MOVE_TENANT_DRAIN_TIMEOUT,
+            MOVE_TENANT_SNAPSHOT_FAILED,
+            MOVE_TENANT_CUTOVER_FAILED,
+            MOVE_TENANT_ALREADY_AT_TARGET,
+        ];
+        for code in &ambiguous {
+            assert_eq!(
+                code.0.len(),
+                5,
+                "SQLSTATE '{}' must be exactly 5 characters",
+                code.0
             );
         }
     }
@@ -346,5 +384,17 @@ mod tests {
         assert_eq!(QUERY_CANCELED, "57014");
         assert_eq!(INTERNAL_ERROR, "XX000");
         assert_eq!(FEATURE_NOT_SUPPORTED, "0A000");
+    }
+
+    #[test]
+    fn ambiguous_sqlstates_alias_their_documented_string() {
+        assert_eq!(CANNOT_DROP_DEFAULT_DATABASE.0, "0A000");
+        assert_eq!(CANNOT_CLONE_MIRROR.0, "0A000");
+        assert_eq!(CLONE_DEPENDENCY.0, "55006");
+        assert_eq!(CLONE_WRITE_REQUIRES_MATERIALIZE.0, "55006");
+        assert_eq!(MOVE_TENANT_DRAIN_TIMEOUT.0, "57014");
+        assert_eq!(MOVE_TENANT_SNAPSHOT_FAILED.0, "XX000");
+        assert_eq!(MOVE_TENANT_CUTOVER_FAILED.0, "XX000");
+        assert_eq!(MOVE_TENANT_ALREADY_AT_TARGET.0, "02000");
     }
 }

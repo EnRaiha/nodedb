@@ -61,6 +61,21 @@ pub enum ErrorDetails {
         collection: String,
         document_id: String,
     },
+    /// A named catalog object other than a collection or database was not
+    /// found (type, role, index, alert, tenant, …).
+    #[serde(rename = "undefined_object")]
+    UndefinedObject { object: String },
+    /// A named catalog object already exists under that name.
+    #[serde(rename = "already_exists")]
+    AlreadyExists { object: String },
+    /// The target object exists but is not in a state that accepts this
+    /// operation (locked, busy, mid-transition).
+    #[serde(rename = "object_not_ready")]
+    ObjectNotReady { object: String },
+    /// A requested value/record does not exist, outside the
+    /// collection/document shape of `DocumentNotFound`.
+    #[serde(rename = "not_found")]
+    NotFound { detail: String },
     #[serde(rename = "collection_draining")]
     CollectionDraining { collection: String },
     #[serde(rename = "collection_deactivated")]
@@ -229,6 +244,9 @@ pub enum ErrorDetails {
     /// Operation requires the database to be a promoted mirror.
     #[serde(rename = "mirror_not_promoted")]
     MirrorNotPromoted { database: String },
+    /// `DROP DATABASE` targeted the built-in `default` database.
+    #[serde(rename = "cannot_drop_default_database")]
+    CannotDropDefaultDatabase,
 
     // Move Tenant DDL
     #[serde(rename = "move_tenant_drain_timeout")]

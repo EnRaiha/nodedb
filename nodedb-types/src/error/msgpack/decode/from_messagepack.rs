@@ -347,6 +347,26 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (database,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::MirrorNotPromoted { database })
             }
+            TAG_UNDEFINED_OBJECT => {
+                let (object,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::UndefinedObject { object })
+            }
+            TAG_ALREADY_EXISTS => {
+                let (object,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::AlreadyExists { object })
+            }
+            TAG_OBJECT_NOT_READY => {
+                let (object,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::ObjectNotReady { object })
+            }
+            TAG_NOT_FOUND => {
+                let (detail,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::NotFound { detail })
+            }
+            TAG_CANNOT_DROP_DEFAULT_DATABASE => {
+                skip_fields(reader, field_count)?;
+                Ok(ErrorDetails::CannotDropDefaultDatabase)
+            }
             _unknown => {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::Internal {
@@ -383,6 +403,7 @@ mod tests {
             ErrorDetails::MigrationInProgress,
             ErrorDetails::NodeUnreachable,
             ErrorDetails::Cluster,
+            ErrorDetails::CannotDropDefaultDatabase,
         ] {
             assert_eq!(roundtrip(&v), v, "unit variant roundtrip failed: {v:?}");
         }
@@ -640,6 +661,18 @@ mod tests {
             },
             ErrorDetails::NotLeader {
                 leader_addr: "10.0.0.1:6432".into(),
+            },
+            ErrorDetails::UndefinedObject {
+                object: "custom_type 'geo_point'".into(),
+            },
+            ErrorDetails::AlreadyExists {
+                object: "tenant 'acme'".into(),
+            },
+            ErrorDetails::ObjectNotReady {
+                object: "collection 'orders'".into(),
+            },
+            ErrorDetails::NotFound {
+                detail: "exchange rate for USD/EUR".into(),
             },
         ];
         for v in variants {

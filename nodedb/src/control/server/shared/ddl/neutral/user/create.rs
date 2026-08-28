@@ -31,14 +31,8 @@ fn resolve_tenant_selector(
             let catalog = state.credentials.catalog();
             let stored = catalog
                 .find_tenant_by_name(name)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog read: {e}"),
-                })?
-                .ok_or_else(|| DdlError {
-                    sqlstate: "42704".to_string(),
-                    message: format!("tenant '{name}' not found"),
-                })?;
+                .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
+                .ok_or_else(|| DdlError::new("42704", format!("tenant '{name}' not found")))?;
             Ok(TenantId::new(stored.tenant_id))
         }
     }
@@ -58,12 +52,10 @@ pub fn create_user(
     require_tenant_admin(identity, "create users")?;
 
     if username.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message:
-                "syntax: CREATE USER <name> WITH PASSWORD '<password>' [ROLE <role>] [TENANT <id>]"
-                    .to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: CREATE USER <name> WITH PASSWORD '<password>' [ROLE <role>] [TENANT <id>]",
+        ));
     }
 
     // `IF NOT EXISTS`: re-creating an existing user is a no-op success.
@@ -72,19 +64,16 @@ pub fn create_user(
     }
 
     if password.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "password must be a single-quoted string".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "password must be a single-quoted string",
+        ));
     }
 
     let role = role_name.map(parse_role).unwrap_or(Role::ReadWrite);
     let tenant_id = if let Some(selector) = tenant {
         if !identity.is_superuser {
-            return Err(DdlError {
-                sqlstate: "42501".to_string(),
-                message: "only superuser can assign tenants".to_string(),
-            });
+            return Err(DdlError::new("42501", "only superuser can assign tenants"));
         }
         resolve_tenant_selector(state, selector)?
     } else {
@@ -98,19 +87,11 @@ pub fn create_user(
     let stored = state
         .credentials
         .prepare_user(username, password, tenant_id, vec![role])
-        .map_err(|e| DdlError {
-            sqlstate: "42710".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("42710", e.to_string()))?;
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback: install into the
         // in-memory cache so subsequent reads see the user.
@@ -121,10 +102,9 @@ pub fn create_user(
         // catalog and still get correct read-after-write.
         {
             let catalog = state.credentials.catalog();
-            catalog.put_user(&stored).map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
+            catalog
+                .put_user(&stored)
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         // CREATE USER: no open sessions exist for a brand-new user.
         state.credentials.install_replicated_user(&stored, None);
@@ -144,10 +124,10 @@ pub fn create_user(
         // retryable error so `exec_ddl_on_any_leader` re-proposes
         // on the next attempt against whoever is now leader.
         if state.credentials.get_user(username).is_none() {
-            return Err(DdlError {
-                sqlstate: "40001".to_string(),
-                message: "transient: metadata entry truncated by leader change, retry".to_string(),
-            });
+            return Err(DdlError::new(
+                "40001",
+                "transient: metadata entry truncated by leader change, retry",
+            ));
         }
     }
     // A `Buffered` outcome falls through: the open transaction owns the entry

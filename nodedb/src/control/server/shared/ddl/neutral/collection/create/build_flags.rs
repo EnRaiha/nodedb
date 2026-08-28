@@ -8,10 +8,7 @@
 use super::super::super::super::result::DdlError;
 
 pub(super) fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parse a `WITH (crdt=...)` option value as a boolean, accepting

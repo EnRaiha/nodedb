@@ -70,6 +70,10 @@ error_code_table! {
     // Read path.
     COLLECTION_NOT_FOUND => CollectionNotFound { collection: String::new() },
     DATABASE_NOT_FOUND => DatabaseNotFound { database: String::new() },
+    UNDEFINED_OBJECT => UndefinedObject { object: String::new() },
+    ALREADY_EXISTS => AlreadyExists { object: String::new() },
+    OBJECT_NOT_READY => ObjectNotReady { object: String::new() },
+    NOT_FOUND => NotFound { detail: message.to_owned() },
     DOCUMENT_NOT_FOUND => DocumentNotFound { collection: String::new(), document_id: String::new() },
     COLLECTION_DRAINING => CollectionDraining { collection: String::new() },
     COLLECTION_DEACTIVATED => CollectionDeactivated {
@@ -161,6 +165,7 @@ error_code_table! {
         source_cluster: String::new(),
     },
     MIRROR_NOT_PROMOTED => MirrorNotPromoted { database: String::new() },
+    CANNOT_DROP_DEFAULT_DATABASE => CannotDropDefaultDatabase,
 
     // Move Tenant DDL.
     MOVE_TENANT_DRAIN_TIMEOUT => MoveTenantDrainTimeout { tenant: String::new(), source_db: String::new() },
@@ -217,6 +222,11 @@ mod tests {
         for code in [
             ErrorCode::CONSTRAINT_VIOLATION,
             ErrorCode::DATABASE_NOT_FOUND,
+            ErrorCode::UNDEFINED_OBJECT,
+            ErrorCode::ALREADY_EXISTS,
+            ErrorCode::OBJECT_NOT_READY,
+            ErrorCode::NOT_FOUND,
+            ErrorCode::CANNOT_DROP_DEFAULT_DATABASE,
             ErrorCode::COLLECTION_DEACTIVATED,
             ErrorCode::ARRAY,
             ErrorCode::QUOTA_OVERCOMMIT,

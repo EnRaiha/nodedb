@@ -116,13 +116,15 @@ pub(super) fn reassign_owned_and_sweep_grants(
     let admin_name = catalog
         .resolve_ownership_fallback(user_tenant.as_u64(), username)
         .map_err(|e| ddl_err(format!("resolve ownership fallback: {e}")))?
-        .ok_or_else(|| DdlError {
-            sqlstate: "55000".to_string(),
-            message: format!(
-                "cannot drop user '{username}': tenant {} has no active administrative \
-                 principal available for ownership reassignment",
-                user_tenant.as_u64()
-            ),
+        .ok_or_else(|| {
+            DdlError::new(
+                "55000",
+                format!(
+                    "cannot drop user '{username}': tenant {} has no active administrative \
+                     principal available for ownership reassignment",
+                    user_tenant.as_u64()
+                ),
+            )
         })?;
     for owner in &owned {
         let kind = OwnerKind::from_object_type(&owner.object_type).ok_or_else(|| {
@@ -499,8 +501,5 @@ fn missing(object_type: &str, name: &str) -> DdlError {
 }
 
 pub(super) fn ddl_err(message: String) -> DdlError {
-    DdlError {
-        sqlstate: "XX000".to_string(),
-        message,
-    }
+    DdlError::new("XX000", message)
 }

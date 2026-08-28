@@ -36,6 +36,18 @@ impl ErrorCode {
     pub const COLLECTION_DEACTIVATED: Self = Self(1103);
     /// The named database does not exist.
     pub const DATABASE_NOT_FOUND: Self = Self(1110);
+    /// A named catalog object (type, role, index, alert, …) other than a
+    /// collection or database does not exist. Generic: use the object name
+    /// in the message for specifics.
+    pub const UNDEFINED_OBJECT: Self = Self(1111);
+    /// A named catalog object already exists under that name.
+    pub const ALREADY_EXISTS: Self = Self(1112);
+    /// The target object exists but is not in a state that accepts this
+    /// operation (locked, busy, mid-transition).
+    pub const OBJECT_NOT_READY: Self = Self(1113);
+    /// A requested value/record does not exist. Generic: use for lookups
+    /// that don't fit `DOCUMENT_NOT_FOUND`'s collection/id shape.
+    pub const NOT_FOUND: Self = Self(1114);
 
     // Query (1200–1299)
     pub const PLAN_ERROR: Self = Self(1200);
@@ -86,6 +98,11 @@ impl ErrorCode {
     pub const STALE_READ_NOT_LEADER: Self = Self(1701);
     /// Operation requires the mirror to be promoted, but it has not been.
     pub const MIRROR_NOT_PROMOTED: Self = Self(1702);
+    /// `DROP DATABASE` targeted the built-in `default` database, which is
+    /// immutable. Shares SQLSTATE `0A000` with `SQL_NOT_ENABLED` and
+    /// `CANNOT_CLONE_MIRROR`, so it must be constructed explicitly rather
+    /// than derived from the bare SQLSTATE string.
+    pub const CANNOT_DROP_DEFAULT_DATABASE: Self = Self(1710);
 
     // Move Tenant (1600–1699)
 

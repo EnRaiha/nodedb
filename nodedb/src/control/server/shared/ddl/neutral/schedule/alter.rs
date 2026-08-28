@@ -35,10 +35,7 @@ pub fn alter_schedule(
     let mut def = state
         .schedule_registry
         .get(database_id, tenant_id, name)
-        .ok_or_else(|| DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("schedule \"{name}\" does not exist"),
-        })?;
+        .ok_or_else(|| DdlError::new("42704", format!("schedule \"{name}\" does not exist")))?;
 
     match action {
         "ENABLE" => {
@@ -48,23 +45,23 @@ pub fn alter_schedule(
             def.enabled = false;
         }
         "SET" => {
-            let new_cron = cron_expr.ok_or_else(|| DdlError {
-                sqlstate: "42601".to_string(),
-                message: "ALTER SCHEDULE SET CRON requires a quoted cron expression".to_string(),
+            let new_cron = cron_expr.ok_or_else(|| {
+                DdlError::new(
+                    "42601",
+                    "ALTER SCHEDULE SET CRON requires a quoted cron expression",
+                )
             })?;
 
-            CronExpr::parse(new_cron).map_err(|e| DdlError {
-                sqlstate: "22023".to_string(),
-                message: format!("invalid cron expression: {e}"),
-            })?;
+            CronExpr::parse(new_cron)
+                .map_err(|e| DdlError::new("22023", format!("invalid cron expression: {e}")))?;
 
             def.cron_expr = new_cron.to_string();
         }
         _ => {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: "ALTER SCHEDULE supports: ENABLE, DISABLE, SET CRON 'expr'".to_string(),
-            });
+            return Err(DdlError::new(
+                "42601",
+                "ALTER SCHEDULE supports: ENABLE, DISABLE, SET CRON 'expr'",
+            ));
         }
     }
 

@@ -36,10 +36,10 @@ pub struct CreateRedactionPolicyRequest<'a> {
 /// Translate the AST rule specs into runtime [`RedactionRule`]s.
 fn compile_rules(specs: &[RedactionRuleSpec]) -> Result<Vec<RedactionRule>, DdlError> {
     if specs.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "CREATE REDACTION POLICY requires at least one field rule".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "CREATE REDACTION POLICY requires at least one field rule",
+        ));
     }
     specs
         .iter()
@@ -48,19 +48,17 @@ fn compile_rules(specs: &[RedactionRuleSpec]) -> Result<Vec<RedactionRule>, DdlE
                 "HASH" => RedactionMode::Hash,
                 "NULL" => RedactionMode::Null,
                 "MASK" => {
-                    let literal = spec.mask.clone().ok_or(DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: "MASK requires a replacement literal".to_string(),
-                    })?;
+                    let literal = spec.mask.clone().ok_or(DdlError::new(
+                        "42601",
+                        "MASK requires a replacement literal",
+                    ))?;
                     RedactionMode::Mask(literal)
                 }
                 other => {
-                    return Err(DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: format!(
-                            "invalid redaction mode '{other}'. Expected MASK, HASH, or NULL"
-                        ),
-                    });
+                    return Err(DdlError::new(
+                        "42601",
+                        format!("invalid redaction mode '{other}'. Expected MASK, HASH, or NULL"),
+                    ));
                 }
             };
             Ok(RedactionRule {
@@ -104,12 +102,10 @@ pub fn create_redaction_policy(
         if if_not_exists {
             return Ok(status("CREATE REDACTION POLICY"));
         }
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!(
-                "a redaction policy already exists on '{collection}' for role '{for_role}'"
-            ),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("a redaction policy already exists on '{collection}' for role '{for_role}'"),
+        ));
     }
 
     let policy = RedactionPolicy {
@@ -120,25 +116,18 @@ pub fn create_redaction_policy(
         rules,
     };
 
-    let stored = StoredRedactionPolicy::from_runtime(&policy).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("redaction serialize: {e}"),
-    })?;
+    let stored = StoredRedactionPolicy::from_runtime(&policy)
+        .map_err(|e| DdlError::new("XX000", format!("redaction serialize: {e}")))?;
 
     let entry = CatalogEntry::PutRedactionPolicy(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .put_redaction_policy(&stored)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog write: {e}"),
-                })?;
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state.redaction.install_replicated_policy(policy);
     }

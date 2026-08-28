@@ -41,10 +41,7 @@ pub fn describe_collection(
     database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 2 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DESCRIBE <collection>".to_string(),
-        });
+        return Err(DdlError::new("42601", "syntax: DESCRIBE <collection>"));
     }
 
     let name_lower = parts[1].to_lowercase();
@@ -56,10 +53,10 @@ pub fn describe_collection(
     let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) if c.is_active => c,
         _ => {
-            return Err(DdlError {
-                sqlstate: "42P01".to_string(),
-                message: format!("collection '{name}' not found"),
-            });
+            return Err(DdlError::new(
+                "42P01",
+                format!("collection '{name}' not found"),
+            ));
         }
     };
 

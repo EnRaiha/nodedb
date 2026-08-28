@@ -5,10 +5,7 @@
 use super::super::super::super::super::result::DdlError;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// The seven canonical engine names. Anything else is `42601`.

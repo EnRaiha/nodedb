@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use serde_json::Value as JsonValue;
 
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
@@ -25,20 +25,33 @@ use super::command_tag::dml_tag;
 use super::numeric_narrow::checked_narrow_f32;
 use super::types::{
     bool_field, bytea_field, float4_array_field, float4_field, float8_array_field, float8_field,
-    int2_field, int4_field, int8_field, json_field, jsonb_field, sqlstate_error, text_field,
-    timestamp_field, timestamptz_field, varchar_field,
+    int2_field, int4_field, int8_field, json_field, jsonb_field, text_field, timestamp_field,
+    timestamptz_field, varchar_field,
 };
 
 /// Encode a protocol-neutral DDL dispatch result into pgwire responses.
 ///
 /// An `Err(DdlError)` maps to a pgwire `UserError` carrying the SQLSTATE +
 /// message; each `DdlResult` maps to exactly one `Response`.
+///
+/// The PostgreSQL wire `ErrorResponse` has no field for a NodeDB numeric
+/// code, so it travels in `routine` as `ErrorCode`'s `NDB-XXXX` display
+/// form — the same convention a client-side reader can parse regardless of
+/// which entrypoint produced the error.
 pub fn ddl_results_to_pgwire(
     result: Result<Vec<DdlResult>, DdlError>,
 ) -> PgWireResult<Vec<Response>> {
     let results = match result {
         Ok(results) => results,
-        Err(DdlError { sqlstate, message }) => return Err(sqlstate_error(&sqlstate, &message)),
+        Err(DdlError {
+            sqlstate,
+            code,
+            message,
+        }) => {
+            let mut info = ErrorInfo::new("ERROR".to_owned(), sqlstate, message);
+            info.routine = Some(code.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
     };
 
     let mut responses = Vec::with_capacity(results.len());
@@ -182,4 +195,45 @@ pub(in crate::control::server::pgwire) fn col_type_to_field_with_format(
 ) -> FieldInfo {
     let base = col_type_to_field(name, ct);
     FieldInfo::new(name.to_owned(), None, None, base.datatype().clone(), format)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use pgwire::messages::Message;
+    use pgwire::messages::response::ErrorResponse;
+
+    use super::*;
+
+    /// Round-trips through the actual PostgreSQL wire bytes `ErrorResponse`
+    /// encodes and a client's `pgwire` codec decodes — proving the code
+    /// reaches the wire, not just that the server set it.
+    #[test]
+    fn ddl_error_code_survives_pgwire_wire_bytes() {
+        let result: Result<Vec<DdlResult>, DdlError> =
+            Err(DdlError::new("42501", "write permission denied"));
+
+        let err = ddl_results_to_pgwire(result).expect_err("must map to a pgwire error");
+        let PgWireError::UserError(info) = err else {
+            panic!("expected a UserError carrying ErrorInfo");
+        };
+
+        let response = ErrorResponse::from(*info);
+        let mut buf = BytesMut::new();
+        response.encode(&mut buf).expect("encode ErrorResponse");
+        // Strip the wire header (1-byte type tag + 4-byte length) that
+        // `encode` writes ahead of `encode_body`'s field bytes, mirroring
+        // what a client's frame reader strips before decoding the body.
+        bytes::Buf::advance(&mut buf, 5);
+        let decoded = ErrorResponse::decode_body(&mut buf, 0, &Default::default())
+            .expect("decode ErrorResponse body");
+        let decoded_info: pgwire::error::ErrorInfo = decoded.into();
+
+        assert_eq!(decoded_info.code, "42501");
+        assert_eq!(decoded_info.message, "write permission denied");
+        assert_eq!(
+            decoded_info.routine,
+            Some(nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.to_string())
+        );
+    }
 }

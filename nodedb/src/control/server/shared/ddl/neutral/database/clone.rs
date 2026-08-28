@@ -78,14 +78,11 @@ pub fn clone_database(
     // subsystem is wired; when mirrors land, this helper will inspect the
     // descriptor's status.
     if is_mirror_database(&source_descriptor) {
-        return Err(ddl_err(
-            nodedb_types::error::sqlstate::CANNOT_CLONE_MIRROR,
-            format!(
-                "database '{}' is a mirror and cannot be cloned; \
-                 promote it with ALTER DATABASE {} PROMOTE first",
-                params.source_name, params.source_name,
-            ),
-        ));
+        return Err(DdlError::cannot_clone_mirror(format!(
+            "database '{}' is a mirror and cannot be cloned; \
+             promote it with ALTER DATABASE {} PROMOTE first",
+            params.source_name, params.source_name,
+        )));
     }
 
     // ── Enforce MAX_CLONE_DEPTH ────────────────────────────────────────────────

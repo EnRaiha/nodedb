@@ -43,8 +43,5 @@ pub async fn enforce_check_constraints(
 
 /// Build a [`DdlError`] with the given SQLSTATE + message.
 pub(super) fn ddl_err(sqlstate: &str, msg: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: msg.to_string(),
-    }
+    DdlError::new(sqlstate, msg)
 }

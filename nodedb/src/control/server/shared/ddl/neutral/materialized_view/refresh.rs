@@ -37,10 +37,7 @@ use crate::types::TraceId;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 pub async fn refresh_materialized_view(
@@ -136,9 +133,8 @@ async fn execute_select(
             database_id,
         )
         .await
-        .map_err(|error| DdlError {
-            sqlstate: error.sqlstate,
-            message: format!("plan '{sql}': {}", error.message),
+        .map_err(|error| {
+            DdlError::new(error.sqlstate, format!("plan '{sql}': {}", error.message))
         })?;
 
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
@@ -278,9 +274,8 @@ async fn dispatch_sql(
             database_id,
         )
         .await
-        .map_err(|error| DdlError {
-            sqlstate: error.sqlstate,
-            message: format!("plan '{sql}': {}", error.message),
+        .map_err(|error| {
+            DdlError::new(error.sqlstate, format!("plan '{sql}': {}", error.message))
         })?;
     for task in tasks {
         // Mandatory chokepoint every write dispatch site runs (same gate as

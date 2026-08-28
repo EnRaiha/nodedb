@@ -24,9 +24,8 @@ fn attach_wasm_payload_for_reproposal(
     if func.language != crate::control::security::catalog::FunctionLanguage::Wasm {
         return Ok(());
     }
-    let hash = func.wasm_hash.as_deref().ok_or_else(|| DdlError {
-        sqlstate: "55000".to_string(),
-        message: "WASM function metadata is missing its module hash".to_string(),
+    let hash = func.wasm_hash.as_deref().ok_or_else(|| {
+        DdlError::new("55000", "WASM function metadata is missing its module hash")
     })?;
     func.wasm_module = Some(
         crate::control::planner::wasm::store::load_verified_wasm_binary(
@@ -34,11 +33,13 @@ fn attach_wasm_payload_for_reproposal(
             hash,
             crate::control::planner::wasm::WasmConfig::default().max_binary_size,
         )
-        .map_err(|error| DdlError {
-            sqlstate: "55000".to_string(),
-            message: format!(
-                "cannot alter WASM function: local module '{hash}' is unavailable or invalid: {error}"
-            ),
+        .map_err(|error| {
+            DdlError::new(
+                "55000",
+                format!(
+                    "cannot alter WASM function: local module '{hash}' is unavailable or invalid: {error}"
+                ),
+            )
         })?,
     );
     Ok(())
@@ -53,11 +54,10 @@ pub fn alter_function(
     require_tenant_admin(identity, "alter functions")?;
 
     if parts.len() < 4 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: ALTER FUNCTION <name> OWNER TO <user> | SET (FUEL=N, MEMORY=N)"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: ALTER FUNCTION <name> OWNER TO <user> | SET (FUEL=N, MEMORY=N)",
+        ));
     }
 
     let name = parts[2].to_lowercase();
@@ -70,11 +70,10 @@ pub fn alter_function(
 
     // ALTER FUNCTION <name> OWNER TO <new_owner>
     if action != "OWNER" || parts.len() < 6 || !parts[4].eq_ignore_ascii_case("TO") {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: ALTER FUNCTION <name> OWNER TO <user> | SET (FUEL=N, MEMORY=N)"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: ALTER FUNCTION <name> OWNER TO <user> | SET (FUEL=N, MEMORY=N)",
+        ));
     }
 
     let new_owner = parts[5].trim_end_matches(';').to_string();
@@ -87,14 +86,8 @@ pub fn alter_function(
 
     let mut func = catalog
         .get_function_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| DdlError {
-            sqlstate: "42883".to_string(),
-            message: format!("function '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .ok_or_else(|| DdlError::new("42883", format!("function '{name}' does not exist")))?;
 
     let old_owner = func.owner.clone();
     func.owner = new_owner.clone();
@@ -135,14 +128,8 @@ fn alter_function_limits(
 
     let mut func = catalog
         .get_function_in_database(database_id, tenant_id, name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| DdlError {
-            sqlstate: "42883".to_string(),
-            message: format!("function '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .ok_or_else(|| DdlError::new("42883", format!("function '{name}' does not exist")))?;
 
     // Parse SET (...) from remaining parts.
     let rest = parts[4..].join(" ");

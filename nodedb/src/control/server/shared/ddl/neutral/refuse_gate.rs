@@ -105,13 +105,13 @@ impl<'a> RefusingReadGate<'a> {
         if self.auth().is_superuser() || !self.tenant_has_read_policy() {
             return Ok(());
         }
-        Err(DdlError {
-            sqlstate: FEATURE_NOT_SUPPORTED.to_string(),
-            message: format!(
+        Err(DdlError::new(
+            FEATURE_NOT_SUPPORTED,
+            format!(
                 "RLS is not supported with {what} while a read policy applies to this identity \
                  and the read names no collection"
             ),
-        })
+        ))
     }
 
     /// Fail closed unless the caller holds `Read` on every active collection of
@@ -165,11 +165,11 @@ impl<'a> RefusingReadGate<'a> {
         let catalog = self.state.credentials.catalog();
         let records = catalog
             .load_collections_for_tenant(self.database_id, self.tenant_id().as_u64())
-            .map_err(|error| DdlError {
-                sqlstate: SYSTEM_ERROR.to_string(),
-                message: format!(
-                    "unable to resolve the tenant's collections to authorize: {error}"
-                ),
+            .map_err(|error| {
+                DdlError::new(
+                    SYSTEM_ERROR,
+                    format!("unable to resolve the tenant's collections to authorize: {error}"),
+                )
             })?;
         Ok(records
             .into_iter()

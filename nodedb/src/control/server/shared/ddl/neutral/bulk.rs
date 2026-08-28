@@ -22,10 +22,9 @@ pub async fn copy_from(
     _identity: &AuthenticatedIdentity,
     _parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    Err(DdlError {
-        sqlstate: "0A000".to_string(),
-        message: "use `COPY <collection> FROM STDIN [WITH (FORMAT csv|json|ndjson)]` \
-         and stream the file from the client"
-            .to_string(),
-    })
+    Err(DdlError::new(
+        "0A000",
+        "use `COPY <collection> FROM STDIN [WITH (FORMAT csv|json|ndjson)]` \
+         and stream the file from the client",
+    ))
 }

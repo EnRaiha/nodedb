@@ -17,10 +17,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::create::SYNONYM_SENTINEL_COLLECTION;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Handle `DROP SYNONYM GROUP [IF EXISTS] <name>`.

@@ -22,10 +22,7 @@ use super::super::auth_support::{require_tenant_admin, status};
 const ALERT_RULES_CRDT_COLLECTION: &str = "_alert_rules";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parsed `CREATE ALERT` request — fields extracted by the nodedb-sql parser.
@@ -243,10 +240,9 @@ fn parse_notify_targets_raw(raw: &str) -> Result<Vec<NotifyTarget>, DdlError> {
             .get(..12)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT INTO "))
         {
-            let after_insert = part.get(12..).ok_or_else(|| DdlError {
-                sqlstate: "42601".to_string(),
-                message: "expected INSERT INTO target".to_string(),
-            })?;
+            let after_insert = part
+                .get(12..)
+                .ok_or_else(|| DdlError::new("42601", "expected INSERT INTO target"))?;
             let (table, columns) = parse_insert_target(after_insert)?;
             targets.push(NotifyTarget::InsertInto { table, columns });
         }

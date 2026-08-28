@@ -17,10 +17,7 @@ use super::super::super::result::DdlError;
 /// Construct a [`DdlError`] with the given SQLSTATE and message, preserving the
 /// exact codes and messages the pgwire handlers produced.
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parse `WITH SCOPES 'scope1', 'scope2'` from DDL parts.

@@ -246,10 +246,7 @@ fn find_next_keyword(s: &str) -> usize {
 
 /// Build a protocol-neutral [`DdlError`] with the given SQLSTATE + message.
 pub(super) fn err(code: &str, msg: &str) -> DdlError {
-    DdlError {
-        sqlstate: code.to_owned(),
-        message: msg.to_owned(),
-    }
+    DdlError::new(code, msg)
 }
 
 #[cfg(test)]

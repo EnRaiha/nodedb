@@ -312,8 +312,5 @@ fn parse_ttl_seconds(s: &str) -> Result<u64, DdlError> {
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 pub(crate) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }

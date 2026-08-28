@@ -40,22 +40,19 @@ pub(super) fn sql_type_to_arrow(sql_type: &str) -> Option<DataType> {
 /// Validate that a name is a legal SQL identifier (alphanumeric + underscore).
 pub(super) fn validate_identifier(name: &str) -> Result<(), DdlError> {
     if name.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "identifier cannot be empty".to_string(),
-        });
+        return Err(DdlError::new("42601", "identifier cannot be empty"));
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid identifier: '{name}'"),
-        });
+        return Err(DdlError::new(
+            "42601",
+            format!("invalid identifier: '{name}'"),
+        ));
     }
     if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("identifier cannot start with digit: '{name}'"),
-        });
+        return Err(DdlError::new(
+            "42601",
+            format!("identifier cannot start with digit: '{name}'"),
+        ));
     }
     Ok(())
 }
@@ -75,20 +72,20 @@ pub(super) fn parse_parameters(params_str: &str) -> Result<Vec<FunctionParam>, D
         }
         let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.len() < 2 {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("parameter must have name and type: '{part}'"),
-            });
+            return Err(DdlError::new(
+                "42601",
+                format!("parameter must have name and type: '{part}'"),
+            ));
         }
         let param_name = tokens[0].to_lowercase();
         validate_identifier(&param_name)?;
         // Type may be multi-word (e.g., "DOUBLE PRECISION", "FLOAT[]").
         let param_type = tokens[1..].join(" ").to_uppercase();
         if sql_type_to_arrow(&param_type).is_none() {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("unsupported parameter type: '{param_type}'"),
-            });
+            return Err(DdlError::new(
+                "42601",
+                format!("unsupported parameter type: '{param_type}'"),
+            ));
         }
         params.push(FunctionParam {
             name: param_name,
@@ -164,35 +161,26 @@ pub(super) fn parse_function_header(
             trimmed.get("CREATE FUNCTION ".len()..).unwrap_or_default(),
         )
     } else {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected CREATE FUNCTION".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected CREATE FUNCTION"));
     };
 
     // Name
-    let paren_open = after.find('(').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "expected '(' after function name".to_string(),
-    })?;
+    let paren_open = after
+        .find('(')
+        .ok_or_else(|| DdlError::new("42601", "expected '(' after function name"))?;
     let name = after
         .get(..paren_open)
         .unwrap_or_default()
         .trim()
         .to_lowercase();
     if name.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "function name is required".to_string(),
-        });
+        return Err(DdlError::new("42601", "function name is required"));
     }
     validate_identifier(&name)?;
 
     // Parameters
-    let paren_close = find_matching_paren(after, paren_open).ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '(' in parameter list".to_string(),
-    })?;
+    let paren_close = find_matching_paren(after, paren_open)
+        .ok_or_else(|| DdlError::new("42601", "unmatched '(' in parameter list"))?;
     let params_str = after.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_parameters(params_str)?;
 
@@ -202,10 +190,7 @@ pub(super) fn parse_function_header(
         .get(.."RETURNS ".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURNS "))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected RETURNS <type>".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected RETURNS <type>"));
     }
     let after_returns = after_params
         .get("RETURNS ".len()..)
@@ -242,10 +227,7 @@ pub(super) fn parse_function_header(
         .to_string();
 
     if return_type.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "return type is required".to_string(),
-        });
+        return Err(DdlError::new("42601", "return type is required"));
     }
 
     Ok(FunctionHeader {

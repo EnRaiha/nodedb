@@ -33,10 +33,8 @@ pub fn propose_and_apply(
     state: &SharedState,
     entry: &CatalogEntry,
 ) -> Result<ProposeOutcome, DdlError> {
-    let outcome = propose_catalog_entry(state, entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     apply_locally_if_needed(state, entry, outcome);
     Ok(outcome)
 }

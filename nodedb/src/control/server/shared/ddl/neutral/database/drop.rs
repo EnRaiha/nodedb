@@ -12,7 +12,6 @@
 
 use nodedb_types::DatabaseId;
 use nodedb_types::MirrorStatus;
-use nodedb_types::error::sqlstate;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::maintenance::clone_materializer::{
@@ -39,8 +38,7 @@ pub fn drop_database(
 ) -> Result<Vec<DdlResult>, DdlError> {
     // `default` is immutable — cannot be dropped.
     if name.eq_ignore_ascii_case("default") {
-        return Err(ddl_err(
-            sqlstate::CANNOT_DROP_DEFAULT_DATABASE,
+        return Err(DdlError::cannot_drop_default_database(
             "cannot drop the built-in 'default' database",
         ));
     }
@@ -75,8 +73,7 @@ pub fn drop_database(
 
     // Guard: `default` identity check by id (rename resilience).
     if db_id == DatabaseId::DEFAULT {
-        return Err(ddl_err(
-            sqlstate::CANNOT_DROP_DEFAULT_DATABASE,
+        return Err(DdlError::cannot_drop_default_database(
             "cannot drop the built-in 'default' database",
         ));
     }
@@ -142,16 +139,13 @@ pub fn drop_database(
                 .iter()
                 .map(|id| id.as_u64().to_string())
                 .collect();
-            return Err(ddl_err(
-                sqlstate::CLONE_DEPENDENCY,
-                format!(
-                    "database '{}' cannot be dropped: {} clone(s) depend on it \
-                     (database ids: {}); use FORCE or CASCADE to materialize them first",
-                    name,
-                    dependent_ids.len(),
-                    id_list.join(", ")
-                ),
-            ));
+            return Err(DdlError::clone_dependency(format!(
+                "database '{}' cannot be dropped: {} clone(s) depend on it \
+                 (database ids: {}); use FORCE or CASCADE to materialize them first",
+                name,
+                dependent_ids.len(),
+                id_list.join(", ")
+            )));
         }
 
         // FORCE path: block-materialize each dependent clone so it is no longer

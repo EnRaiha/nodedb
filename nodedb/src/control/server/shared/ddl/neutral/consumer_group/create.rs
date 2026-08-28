@@ -59,10 +59,10 @@ pub async fn create_consumer_group(
         .is_some();
     let is_topic = stream_name.starts_with("topic:");
     if !is_stream && !is_topic {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("change stream or topic '{stream_name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("change stream or topic '{stream_name}' does not exist"),
+        ));
     }
 
     let lifecycle_lock =
@@ -87,18 +87,15 @@ pub async fn create_consumer_group(
         &stream_name,
         &group_name,
     ) {
-        return Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("consumer-group migration: {error}"),
-        });
+        return Err(DdlError::new(
+            "XX000",
+            format!("consumer-group migration: {error}"),
+        ));
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock error".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock error"))?
         .as_secs();
 
     let def = ConsumerGroupDef {
@@ -114,17 +111,12 @@ pub async fn create_consumer_group(
 
     let inserted = catalog
         .put_consumer_group_if_absent(&def)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog write: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
     if !inserted {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!(
-                "consumer group '{group_name}' already exists on stream '{stream_name}'"
-            ),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("consumer group '{group_name}' already exists on stream '{stream_name}'"),
+        ));
     }
 
     state.group_registry.register(def);

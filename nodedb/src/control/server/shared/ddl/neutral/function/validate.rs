@@ -24,10 +24,8 @@ pub(super) fn validate_function_body(parsed: &ParsedCreateFunction) -> Result<()
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let _statements =
         // reconstructed-sql: parser-only validates stored function syntax without execution
-        sqlparser::parser::Parser::parse_sql(&dialect, &test_sql).map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid function body: {e}"),
-        })?;
+        sqlparser::parser::Parser::parse_sql(&dialect, &test_sql)
+            .map_err(|e| DdlError::new("42601", format!("invalid function body: {e}")))?;
 
     Ok(())
 }

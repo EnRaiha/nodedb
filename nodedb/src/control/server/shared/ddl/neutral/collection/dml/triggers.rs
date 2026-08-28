@@ -151,8 +151,5 @@ pub(super) async fn fire_before_triggers(
 }
 
 fn ddl_err(sqlstate: &str, msg: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: msg.to_string(),
-    }
+    DdlError::new(sqlstate, msg)
 }

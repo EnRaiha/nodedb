@@ -31,10 +31,7 @@ fn current_roles(state: &SharedState, username: &str) -> Result<Vec<Role>, DdlEr
         .credentials
         .get_user(username)
         .map(|r| r.roles)
-        .ok_or_else(|| DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("user '{username}' not found"),
-        })
+        .ok_or_else(|| DdlError::new("42704", format!("user '{username}' not found")))
 }
 
 fn propose_user_with_roles(
@@ -46,22 +43,16 @@ fn propose_user_with_roles(
     let stored = state
         .credentials
         .prepare_user_update(username, None, Some(new_roles))
-        .map_err(|e| DdlError {
-            sqlstate: "42704".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("42704", e.to_string()))?;
     let entry = CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
-            catalog.put_user(&stored).map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
+            catalog
+                .put_user(&stored)
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state
             .credentials
@@ -85,10 +76,7 @@ pub fn grant_role(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "grant roles")?;
     if roles.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "GRANT: missing role name".to_string(),
-        });
+        return Err(DdlError::new("42601", "GRANT: missing role name"));
     }
 
     if state.credentials.get_user(grantee).is_some() {
@@ -96,10 +84,10 @@ pub fn grant_role(
     } else if state.roles.get_role(grantee).is_some() {
         grant_role_to_role(state, identity, roles, grantee)
     } else {
-        Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("grantee '{grantee}' is not a known user or role"),
-        })
+        Err(DdlError::new(
+            "42704",
+            format!("grantee '{grantee}' is not a known user or role"),
+        ))
     }
 }
 
@@ -113,10 +101,10 @@ fn grant_roles_to_user(
     for name in role_names {
         let role = parse_role(name);
         if matches!(role, Role::Superuser) && !identity.is_superuser {
-            return Err(DdlError {
-                sqlstate: "42501".to_string(),
-                message: "only superuser can grant superuser role".to_string(),
-            });
+            return Err(DdlError::new(
+                "42501",
+                "only superuser can grant superuser role",
+            ));
         }
         if !roles.contains(&role) {
             roles.push(role);
@@ -149,11 +137,10 @@ fn grant_role_to_role(
     child: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if role_names.len() != 1 {
-        return Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message: "a role can inherit from only one parent role; grant one role at a time"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "0A000",
+            "a role can inherit from only one parent role; grant one role at a time",
+        ));
     }
     let parent = &role_names[0];
     super::super::role::set_role_parent(state, child, Some(parent))?;
@@ -177,10 +164,7 @@ pub fn revoke_role(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "revoke roles")?;
     if roles.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "REVOKE: missing role name".to_string(),
-        });
+        return Err(DdlError::new("42601", "REVOKE: missing role name"));
     }
 
     // Reject self-superuser revocation before resolving the grantee — an
@@ -191,10 +175,10 @@ pub fn revoke_role(
             .iter()
             .any(|r| matches!(parse_role(r), Role::Superuser))
     {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "cannot revoke your own superuser role".to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "cannot revoke your own superuser role",
+        ));
     }
 
     if state.credentials.get_user(grantee).is_some() {
@@ -202,10 +186,10 @@ pub fn revoke_role(
     } else if state.roles.get_role(grantee).is_some() {
         revoke_role_from_role(state, identity, roles, grantee)
     } else {
-        Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("grantee '{grantee}' is not a known user or role"),
-        })
+        Err(DdlError::new(
+            "42704",
+            format!("grantee '{grantee}' is not a known user or role"),
+        ))
     }
 }
 
@@ -219,10 +203,10 @@ fn revoke_roles_from_user(
     let revoked: Vec<Role> = role_names.iter().map(|n| parse_role(n)).collect();
     for role in &revoked {
         if !roles.contains(role) {
-            return Err(DdlError {
-                sqlstate: "42704".to_string(),
-                message: format!("user '{username}' does not have role '{role}'"),
-            });
+            return Err(DdlError::new(
+                "42704",
+                format!("user '{username}' does not have role '{role}'"),
+            ));
         }
     }
     roles.retain(|r| !revoked.contains(r));
@@ -253,19 +237,18 @@ fn revoke_role_from_role(
     child: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if role_names.len() != 1 {
-        return Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message: "a role inherits from at most one parent role; revoke one role at a time"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "0A000",
+            "a role inherits from at most one parent role; revoke one role at a time",
+        ));
     }
     let parent = &role_names[0];
     let current_parent = state.roles.get_role(child).and_then(|r| r.parent);
     if current_parent.as_deref() != Some(parent.as_str()) {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("role '{child}' does not inherit from '{parent}'"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("role '{child}' does not inherit from '{parent}'"),
+        ));
     }
     super::super::role::set_role_parent(state, child, None)?;
 

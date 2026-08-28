@@ -28,10 +28,10 @@ pub fn show_consumer_groups(
 ) -> Result<Vec<DdlResult>, DdlError> {
     // parts: ["SHOW", "CONSUMER", "GROUPS", "ON", "<stream>"]
     if parts.len() < 5 || !parts[3].eq_ignore_ascii_case("ON") {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected SHOW CONSUMER GROUPS ON <stream>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "expected SHOW CONSUMER GROUPS ON <stream>",
+        ));
     }
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -91,10 +91,10 @@ pub fn show_partitions(
 ) -> Result<Vec<DdlResult>, DdlError> {
     // parts: ["SHOW", "PARTITIONS", "ON", "<stream>"]
     if parts.len() < 4 || !parts[2].eq_ignore_ascii_case("ON") {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected SHOW PARTITIONS ON <stream>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "expected SHOW PARTITIONS ON <stream>",
+        ));
     }
 
     let tenant_id = identity.tenant_id.as_u64();

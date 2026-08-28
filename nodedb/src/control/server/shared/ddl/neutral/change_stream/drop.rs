@@ -47,10 +47,10 @@ pub fn drop_change_stream(
     } else if parts.len() >= 4 {
         (false, parts[3].to_lowercase())
     } else {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected DROP CHANGE STREAM [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "expected DROP CHANGE STREAM [IF EXISTS] <name>",
+        ));
     };
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -65,10 +65,10 @@ pub fn drop_change_stream(
         .map(|opt| opt.is_some())
         .unwrap_or(false);
     if !existed_before && !if_exists {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("change stream '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("change stream '{name}' does not exist"),
+        ));
     }
     if !existed_before {
         return Ok(status("DROP CHANGE STREAM"));
@@ -79,20 +79,12 @@ pub fn drop_change_stream(
         tenant_id,
         name: name.clone(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_change_stream(database_id, tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog delete: {e}"),
-            })?;
+            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
         state
             .stream_registry
             .unregister(database_id, tenant_id, &name);

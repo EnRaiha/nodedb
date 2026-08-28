@@ -164,10 +164,7 @@ pub fn execute_chunk_text(sql: &str) -> Result<Vec<DdlResult>, DdlError> {
 
 /// Build a [`DdlError`] from a SQLSTATE + message.
 fn err(sqlstate: &str, message: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Split a comma-separated argument string, respecting single-quoted strings.

@@ -23,7 +23,6 @@ use super::super::support::{ddl_err, status};
 use super::entry::SNAPSHOT_TIMEOUT;
 use super::journal;
 use super::{cutover, drain, snapshot};
-use nodedb_types::error::sqlstate;
 
 /// Check whether the source database has already been emptied by a prior move.
 ///
@@ -66,28 +65,22 @@ pub async fn resume_or_compensate(
             // Journal recorded but drain never completed.
             // Compensate: remove journal, return error asking operator to retry.
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            Err(ddl_err(
-                sqlstate::MOVE_TENANT_DRAIN_TIMEOUT,
-                format!(
-                    "MOVE TENANT '{}' was interrupted during drain and has been rolled back; \
-                     please retry the operation",
-                    entry.tenant_name
-                ),
-            ))
+            Err(DdlError::move_tenant_drain_timeout(format!(
+                "MOVE TENANT '{}' was interrupted during drain and has been rolled back; \
+                 please retry the operation",
+                entry.tenant_name
+            )))
         }
         MovePhase::Snapshot => {
             // Drain completed but snapshot was interrupted.
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            Err(ddl_err(
-                sqlstate::MOVE_TENANT_SNAPSHOT_FAILED,
-                format!(
-                    "MOVE TENANT '{}' was interrupted during snapshot and has been rolled back; \
-                     please retry the operation",
-                    entry.tenant_name
-                ),
-            ))
+            Err(DdlError::move_tenant_snapshot_failed(format!(
+                "MOVE TENANT '{}' was interrupted during snapshot and has been rolled back; \
+                 please retry the operation",
+                entry.tenant_name
+            )))
         }
         MovePhase::Cutover => {
             // Snapshot succeeded but cutover was interrupted. Check if cutover
@@ -123,7 +116,7 @@ pub async fn resume_or_compensate(
                 Err(ref e) => {
                     drain::release(state, tenant_id, source_db_id);
                     journal::delete_journal_entry_logged(catalog, tenant_id);
-                    return Err(ddl_err(sqlstate::MOVE_TENANT_SNAPSHOT_FAILED, e.message()));
+                    return Err(DdlError::move_tenant_snapshot_failed(e.message()));
                 }
             };
 
@@ -143,7 +136,7 @@ pub async fn resume_or_compensate(
                     let _ = snapshot::delete_temp(state, key).await;
                 }
                 journal::delete_journal_entry_logged(catalog, tenant_id);
-                return Err(ddl_err(sqlstate::MOVE_TENANT_CUTOVER_FAILED, e.message()));
+                return Err(DdlError::move_tenant_cutover_failed(e.message()));
             }
 
             if let Some(ref key) = entry.temp_snapshot_key {

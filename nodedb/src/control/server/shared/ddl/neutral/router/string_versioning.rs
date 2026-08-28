@@ -60,10 +60,10 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
         if restore_forbidden_in_transaction(txn_ctx) {
-            return Some(Err(DdlError {
-                sqlstate: "25001".to_owned(),
-                message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
-            }));
+            return Some(Err(DdlError::new(
+                "25001",
+                crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+            )));
         }
         return Some(
             version_history::restore::restore_version(state, identity, database_id, sql).await,
@@ -211,10 +211,10 @@ pub(super) async fn try_string(
                 ));
             }
         }
-        return Some(Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "usage: SELECT VECTOR_METADATA('collection', 'column')".to_string(),
-        }));
+        return Some(Err(DdlError::new(
+            "42601",
+            "usage: SELECT VECTOR_METADATA('collection', 'column')",
+        )));
     }
 
     // Graph index and tree operations: CREATE GRAPH INDEX / TREE_SUM /

@@ -33,10 +33,7 @@ pub struct CopyToOptions<'a> {
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Execute `COPY <source> TO '<path>' [WITH (...)]`.
@@ -159,10 +156,7 @@ async fn execute_and_collect(
             database_id,
         )
         .await
-        .map_err(|error| DdlError {
-            sqlstate: error.sqlstate,
-            message: format!("COPY TO: {}", error.message),
-        })?;
+        .map_err(|error| DdlError::new(error.sqlstate, format!("COPY TO: {}", error.message)))?;
 
     // Resolved once per export from the planned tasks' own plans, never per
     // task and never per row. Taking the sources from the plans rather than

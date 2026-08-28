@@ -61,10 +61,7 @@ pub fn show_indexes(
         .credentials
         .catalog()
         .list_index_records(database_id.as_u64(), tenant_id.as_u64())
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
     records.retain(StoredIndexRecord::is_visible);
     if let Some(collection) = filter_collection.as_deref() {
         records.retain(|r| r.collection == collection);

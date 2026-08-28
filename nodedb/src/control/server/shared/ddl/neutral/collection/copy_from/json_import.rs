@@ -18,10 +18,7 @@ use super::import_ctx::ImportCtx;
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Import from an NDJSON file (one JSON object per non-empty line).

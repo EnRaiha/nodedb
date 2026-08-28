@@ -18,10 +18,7 @@ use nodedb_physical::physical_plan::CrdtOp;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// COMPACT HISTORY ON collection WHERE id = 'doc-id' BEFORE 'checkpoint'

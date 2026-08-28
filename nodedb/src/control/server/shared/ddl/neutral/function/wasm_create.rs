@@ -38,37 +38,26 @@ pub fn create_wasm_function(
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function_in_database(database_id, tenant_id, &parsed.name)
     {
-        return Err(DdlError {
-            sqlstate: "42723".to_string(),
-            message: format!("function '{}' already exists", parsed.name),
-        });
+        return Err(DdlError::new(
+            "42723",
+            format!("function '{}' already exists", parsed.name),
+        ));
     }
 
     // Decode base64 binary.
     use base64::Engine;
     let wasm_bytes = base64::engine::general_purpose::STANDARD
         .decode(&parsed.base64_body)
-        .map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid base64: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("42601", format!("invalid base64: {e}")))?;
 
     // Validate before proposal; the applier stores the blob on every node.
     let config = wasm::WasmConfig::default();
-    let hash =
-        wasm::store::validate_wasm_binary(&wasm_bytes, config.max_binary_size).map_err(|e| {
-            DdlError {
-                sqlstate: "42601".to_string(),
-                message: e.to_string(),
-            }
-        })?;
+    let hash = wasm::store::validate_wasm_binary(&wasm_bytes, config.max_binary_size)
+        .map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock before UNIX epoch".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock before UNIX epoch"))?
         .as_secs();
 
     let stored = StoredFunction {
@@ -142,10 +131,7 @@ fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
         .get(.."WASM".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WASM"))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected LANGUAGE WASM".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected LANGUAGE WASM"));
     }
     let after_wasm = after_lang.get("WASM".len()..).unwrap_or_default().trim();
 
@@ -157,10 +143,7 @@ fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
         .get(.."AS".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected AS '<base64>'".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected AS '<base64>'"));
     }
     let body_part = after_with.get("AS".len()..).unwrap_or_default().trim();
 
@@ -176,10 +159,7 @@ fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
         };
 
     if base64_body.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "WASM binary body is empty".to_string(),
-        });
+        return Err(DdlError::new("42601", "WASM binary body is empty"));
     }
 
     Ok(ParsedWasmCreate {
@@ -204,10 +184,9 @@ fn parse_wasm_with(s: &str) -> Result<(Option<u64>, Option<usize>, &str), DdlErr
     if !after.starts_with('(') {
         return Ok((None, None, s));
     }
-    let close = after.find(')').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '(' in WITH".to_string(),
-    })?;
+    let close = after
+        .find(')')
+        .ok_or_else(|| DdlError::new("42601", "unmatched '(' in WITH"))?;
     let inner = after.get(1..close).unwrap_or_default();
     let rest = after.get(close + 1..).unwrap_or_default().trim();
 

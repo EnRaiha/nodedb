@@ -84,16 +84,13 @@ pub async fn estimate_count(
                     })]);
                 }
                 Err(e) => {
-                    return Err(DdlError {
-                        sqlstate: "XX000".to_string(),
-                        message: e.to_string(),
-                    });
+                    return Err(DdlError::new("XX000", e.to_string()));
                 }
             }
         }
     }
-    Err(DdlError {
-        sqlstate: "42601".to_string(),
-        message: "usage: SELECT ESTIMATE_COUNT('collection', 'field')".to_string(),
-    })
+    Err(DdlError::new(
+        "42601",
+        "usage: SELECT ESTIMATE_COUNT('collection', 'field')",
+    ))
 }

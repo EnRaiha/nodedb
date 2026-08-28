@@ -24,10 +24,10 @@ pub fn drop_procedure(
     require_tenant_admin(identity, "drop procedures")?;
 
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP PROCEDURE [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: DROP PROCEDURE [IF EXISTS] <name>",
+        ));
     }
 
     let mut idx = 2;
@@ -42,10 +42,7 @@ pub fn drop_procedure(
     };
 
     if idx >= parts.len() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "procedure name required".to_string(),
-        });
+        return Err(DdlError::new("42601", "procedure name required"));
     }
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
     let tenant_id = identity.tenant_id.as_u64();
@@ -59,16 +56,13 @@ pub fn drop_procedure(
     // a clean no-op that never touches raft.
     let exists_before = catalog
         .get_procedure_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog read: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
         .is_some();
     if !exists_before && !if_exists {
-        return Err(DdlError {
-            sqlstate: "42883".to_string(),
-            message: format!("procedure '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42883",
+            format!("procedure '{name}' does not exist"),
+        ));
     }
     if !exists_before {
         return Ok(status("DROP PROCEDURE"));
@@ -79,20 +73,12 @@ pub fn drop_procedure(
         tenant_id,
         name: name.clone(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_procedure_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
+            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
     }
 
     // Broadcast deletion to connected Lite sessions.

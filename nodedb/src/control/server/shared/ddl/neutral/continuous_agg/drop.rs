@@ -24,10 +24,7 @@ use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Whether a continuous aggregate exists in the in-memory registry for the

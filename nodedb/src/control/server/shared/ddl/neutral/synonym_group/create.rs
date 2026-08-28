@@ -26,10 +26,7 @@ use super::super::super::result::{DdlError, DdlResult};
 pub(super) const SYNONYM_SENTINEL_COLLECTION: &str = "_synonym_groups";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Handle `CREATE SYNONYM GROUP <name> AS ('term1', ...)`.

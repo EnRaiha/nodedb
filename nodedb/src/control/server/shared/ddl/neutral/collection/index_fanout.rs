@@ -31,10 +31,7 @@ use nodedb_physical::physical_plan::wire as plan_wire;
 use super::super::super::result::DdlError;
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Remaining budget for per-peer RPCs. Chosen to cover backfill on

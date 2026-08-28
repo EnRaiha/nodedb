@@ -124,10 +124,7 @@ pub async fn insert_document(
                 )
         {
             let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(DdlError {
-                sqlstate: code.to_owned(),
-                message,
-            }));
+            return Some(Err(DdlError::new(code, message)));
         }
 
         // General CHECK constraints (Control Plane enforcement, may have subqueries).
@@ -335,10 +332,7 @@ fn inferred_field_types(
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 #[cfg(test)]

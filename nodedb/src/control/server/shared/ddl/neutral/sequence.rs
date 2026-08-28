@@ -86,19 +86,13 @@ pub fn create_sequence(
         def.cache_size = c;
     }
     if let Some(fmt) = req.format_template_raw {
-        let tokens =
-            crate::control::sequence::format::parse_format_template(fmt).map_err(|e| DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("invalid FORMAT: {e}"),
-            })?;
+        let tokens = crate::control::sequence::format::parse_format_template(fmt)
+            .map_err(|e| DdlError::new("42601", format!("invalid FORMAT: {e}")))?;
         def.format_template = Some(tokens);
     }
     if let Some(reset) = req.reset_period_raw {
-        def.reset_scope =
-            crate::control::sequence::format::ResetScope::parse(reset).map_err(|e| DdlError {
-                sqlstate: "42601".to_string(),
-                message: e.to_string(),
-            })?;
+        def.reset_scope = crate::control::sequence::format::ResetScope::parse(reset)
+            .map_err(|e| DdlError::new("42601", e.to_string()))?;
     }
     def.gap_free = req.gap_free;
 
@@ -116,25 +110,23 @@ pub fn create_sequence(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    def.validate().map_err(|e| DdlError {
-        sqlstate: "42P17".to_string(),
-        message: e.to_string(),
-    })?;
+    def.validate()
+        .map_err(|e| DdlError::new("42P17", e.to_string()))?;
 
     if state.sequence_registry.exists(tenant_id, &def.name) {
-        return Err(DdlError {
-            sqlstate: "42P07".to_string(),
-            message: format!("sequence \"{}\" already exists", def.name),
-        });
+        return Err(DdlError::new(
+            "42P07",
+            format!("sequence \"{}\" already exists", def.name),
+        ));
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(def.clone()));
     let outcome = propose_and_apply(state, &entry)?;
     if outcome.needs_local_apply() {
-        state.sequence_registry.create(def).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?;
+        state
+            .sequence_registry
+            .create(def)
+            .map_err(|e| DdlError::new("XX000", e.to_string()))?;
     }
 
     state.schema_version.bump();
@@ -153,19 +145,19 @@ pub fn alter_sequence(
     let tenant_id = identity.tenant_id.as_u64();
 
     if !state.sequence_registry.exists(tenant_id, name) {
-        return Err(DdlError {
-            sqlstate: "42P01".to_string(),
-            message: format!("sequence \"{name}\" does not exist"),
-        });
+        return Err(DdlError::new(
+            "42P01",
+            format!("sequence \"{name}\" does not exist"),
+        ));
     }
 
     match action.to_uppercase().as_str() {
         "RESTART" => alter_restart(state, tenant_id, name, with_value),
         "FORMAT" => alter_format(state, tenant_id, name, with_value),
-        _ => Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "ALTER SEQUENCE supports: RESTART [WITH value], FORMAT 'template'".to_string(),
-        }),
+        _ => Err(DdlError::new(
+            "42601",
+            "ALTER SEQUENCE supports: RESTART [WITH value], FORMAT 'template'",
+        )),
     }
 }
 
@@ -192,10 +184,10 @@ fn alter_restart(
     let def = state
         .sequence_registry
         .get_def(tenant_id, name)
-        .ok_or(DdlError {
-            sqlstate: "42P01".to_string(),
-            message: format!("sequence \"{name}\" does not exist"),
-        })?;
+        .ok_or(DdlError::new(
+            "42P01",
+            format!("sequence \"{name}\" does not exist"),
+        ))?;
     let new_state = crate::control::security::catalog::sequence_types::SequenceState {
         tenant_id,
         name: name.to_string(),
@@ -205,21 +197,13 @@ fn alter_restart(
         period_key: String::new(),
     };
     let entry = crate::control::catalog_entry::CatalogEntry::PutSequenceState(Box::new(new_state));
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
     if outcome.needs_local_apply() {
         state
             .sequence_registry
             .restart(tenant_id, name, restart_value)
-            .map_err(|e| DdlError {
-                sqlstate: "22023".to_string(),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| DdlError::new("22023", e.to_string()))?;
         {
             let catalog = state.credentials.catalog();
             state.sequence_registry.persist_all(catalog);
@@ -240,11 +224,8 @@ fn alter_format(
         return Ok(status("ALTER SEQUENCE"));
     };
     let raw = raw.trim_matches('\'').trim_matches('"');
-    let tokens =
-        crate::control::sequence::format::parse_format_template(raw).map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid FORMAT: {e}"),
-        })?;
+    let tokens = crate::control::sequence::format::parse_format_template(raw)
+        .map_err(|e| DdlError::new("42601", format!("invalid FORMAT: {e}")))?;
 
     // FORMAT alters the stored *definition*, not the counter — ship the whole
     // updated `StoredSequence` through `PutSequence` and let every node's
@@ -278,10 +259,10 @@ pub fn drop_sequence(
         if if_exists {
             return Ok(status("DROP SEQUENCE"));
         }
-        return Err(DdlError {
-            sqlstate: "42P01".to_string(),
-            message: format!("sequence \"{name}\" does not exist"),
-        });
+        return Err(DdlError::new(
+            "42P01",
+            format!("sequence \"{name}\" does not exist"),
+        ));
     }
 
     // Propose the delete through the metadata raft group. Every node's applier
@@ -290,13 +271,8 @@ pub fn drop_sequence(
         tenant_id,
         name: name.to_string(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
     if outcome.needs_local_apply() {
         // Single-node / no-cluster fallback.
         {
@@ -361,10 +337,10 @@ pub fn describe_sequence(
     let def = state
         .sequence_registry
         .get_def(tenant_id, &name)
-        .ok_or(DdlError {
-            sqlstate: "42P01".to_string(),
-            message: format!("sequence \"{name}\" does not exist"),
-        })?;
+        .ok_or(DdlError::new(
+            "42P01",
+            format!("sequence \"{name}\" does not exist"),
+        ))?;
 
     let format_str = def
         .format_template

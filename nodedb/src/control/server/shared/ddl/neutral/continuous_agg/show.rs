@@ -71,27 +71,26 @@ pub async fn show_continuous_aggregates(
     // the failure away — so every aggregate reported watermark 0, zero rows
     // aggregated, zero materialized buckets, and the catalog's stale flag
     // instead of the live one, on every node, always.
-    let runtime_infos: Vec<AggregateInfo> =
-        match sync_dispatch::dispatch_system(
-            state,
-            sync_dispatch::SystemTask::new(
-                sync_dispatch::SystemReason::CatalogMaintenance,
-                tenant_id,
-                database_id,
-                "__system",
-                PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
-            ),
-            Duration::from_secs(5),
-        )
-        .await
-        {
-            Ok(payload) => crate::data::executor::response_codec::decode_payload(&payload)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("continuous aggregate runtime stats: {e}"),
-                })?,
-            Err(_) => Vec::new(),
-        };
+    let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_system(
+        state,
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            "__system",
+            PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
+        ),
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(payload) => {
+            crate::data::executor::response_codec::decode_payload(&payload).map_err(|e| {
+                DdlError::new("XX000", format!("continuous aggregate runtime stats: {e}"))
+            })?
+        }
+        Err(_) => Vec::new(),
+    };
 
     let columns = vec![
         "name".to_string(),

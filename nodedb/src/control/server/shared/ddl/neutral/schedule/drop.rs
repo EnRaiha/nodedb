@@ -47,10 +47,10 @@ pub fn drop_schedule(
     } else if parts.len() >= 3 {
         (false, parts[2].to_lowercase())
     } else {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected DROP SCHEDULE [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "expected DROP SCHEDULE [IF EXISTS] <name>",
+        ));
     };
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -65,10 +65,10 @@ pub fn drop_schedule(
         .get(database_id, tenant_id, &name)
         .is_some();
     if !existed_before && !if_exists {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("schedule '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("schedule '{name}' does not exist"),
+        ));
     }
     if !existed_before {
         return Ok(status("DROP SCHEDULE"));
@@ -79,26 +79,15 @@ pub fn drop_schedule(
         tenant_id,
         name: name.clone(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         let _ = catalog
             .delete_schedule_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog delete: {e}"),
-            })?;
+            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
         catalog
             .delete_owner("schedule", database_id.as_u64(), tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog owner delete: {e}"),
-            })?;
+            .map_err(|e| DdlError::new("XX000", format!("catalog owner delete: {e}")))?;
         state
             .schedule_registry
             .unregister(database_id, tenant_id, &name);

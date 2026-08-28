@@ -82,8 +82,5 @@ pub fn explain_tiers(
 
 /// Build a [`DdlError`] from a SQLSTATE + message.
 fn err(sqlstate: &str, message: &str) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new(sqlstate, message)
 }

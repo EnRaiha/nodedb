@@ -33,14 +33,8 @@ pub async fn call_procedure(
 
     let proc = catalog
         .get_procedure_in_database(database_id, tenant_id.as_u64(), &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| DdlError {
-            sqlstate: "42883".to_string(),
-            message: format!("procedure '{name}' does not exist"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?
+        .ok_or_else(|| DdlError::new("42883", format!("procedure '{name}' does not exist")))?;
 
     // Validate argument count matches IN parameters.
     let in_params: Vec<_> = proc
@@ -50,15 +44,15 @@ pub async fn call_procedure(
         .collect();
 
     if args.len() != in_params.len() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!(
+        return Err(DdlError::new(
+            "42601",
+            format!(
                 "procedure '{}' expects {} argument(s), got {}",
                 name,
                 in_params.len(),
                 args.len()
             ),
-        });
+        ));
     }
 
     // Build parameter bindings: param_name → argument value (as SQL literal).
@@ -69,11 +63,8 @@ pub async fn call_procedure(
     let bindings = RowBindings::with_params(param_map);
 
     // Parse the procedure body.
-    let block =
-        crate::control::planner::procedural::parse_block(&proc.body_sql).map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("procedure body parse error: {e}"),
-        })?;
+    let block = crate::control::planner::procedural::parse_block(&proc.body_sql)
+        .map_err(|e| DdlError::new("42601", format!("procedure body parse error: {e}")))?;
 
     // Execute with fuel metering, timeout, and transaction context.
     let mut budget = ExecutionBudget::new(proc.max_iterations, proc.timeout_secs);
@@ -90,10 +81,7 @@ pub async fn call_procedure(
     executor
         .execute_block_with_budget(&block, &bindings, &mut budget)
         .await
-        .map_err(|e| DdlError {
-            sqlstate: "P0001".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("P0001", e.to_string()))?;
 
     // Check for OUT parameter values.
     let out_params: Vec<_> = proc
@@ -160,18 +148,14 @@ fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
         .get(.."CALL ".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CALL "))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected CALL <procedure>(...)".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected CALL <procedure>(...)"));
     }
     let after_call = trimmed.get("CALL ".len()..).unwrap_or_default().trim();
 
     // Find the paren that starts the argument list.
-    let paren_pos = after_call.find('(').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "expected '(' after procedure name in CALL".to_string(),
-    })?;
+    let paren_pos = after_call
+        .find('(')
+        .ok_or_else(|| DdlError::new("42601", "expected '(' after procedure name in CALL"))?;
 
     let name = after_call
         .get(..paren_pos)
@@ -179,17 +163,12 @@ fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
         .trim()
         .to_lowercase();
     if name.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "procedure name required in CALL".to_string(),
-        });
+        return Err(DdlError::new("42601", "procedure name required in CALL"));
     }
 
     // Extract arguments between parens.
-    let close_paren = find_matching_paren(after_call, paren_pos).ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '(' in CALL".to_string(),
-    })?;
+    let close_paren = find_matching_paren(after_call, paren_pos)
+        .ok_or_else(|| DdlError::new("42601", "unmatched '(' in CALL"))?;
 
     let args_str = after_call
         .get(paren_pos + 1..close_paren)

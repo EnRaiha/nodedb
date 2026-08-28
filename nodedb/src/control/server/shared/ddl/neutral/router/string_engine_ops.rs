@@ -346,10 +346,10 @@ fn crdt_apply_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
 }
 
 fn crdt_transaction_error() -> DdlError {
-    DdlError {
-        sqlstate: "25001".to_owned(),
-        message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
-    }
+    DdlError::new(
+        "25001",
+        crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+    )
 }
 
 #[cfg(test)]

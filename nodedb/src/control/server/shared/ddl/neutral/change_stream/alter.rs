@@ -37,20 +37,20 @@ pub fn alter_change_stream(
     require_tenant_admin(identity, "alter change streams")?;
 
     match action {
-        "ENABLE" | "DISABLE" | "SUSPEND" | "RESUME" | "PAUSE" => Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message: format!(
+        "ENABLE" | "DISABLE" | "SUSPEND" | "RESUME" | "PAUSE" => Err(DdlError::new(
+            "0A000",
+            format!(
                 "ALTER CHANGE STREAM {name} {action} is not yet supported; \
                      stream pause/resume requires a schema migration to add the \
                      'paused' field to ChangeStreamDef"
             ),
-        }),
-        _ => Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!(
+        )),
+        _ => Err(DdlError::new(
+            "42601",
+            format!(
                 "unknown ALTER CHANGE STREAM action '{action}'; \
                  expected ENABLE, DISABLE, SUSPEND, or RESUME"
             ),
-        }),
+        )),
     }
 }

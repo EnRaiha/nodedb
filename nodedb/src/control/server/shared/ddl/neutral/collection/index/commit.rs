@@ -8,10 +8,7 @@ use crate::types::DatabaseId;
 use super::super::super::super::result::DdlError;
 
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Commit a mutated [`StoredCollection`] through the replicated metadata

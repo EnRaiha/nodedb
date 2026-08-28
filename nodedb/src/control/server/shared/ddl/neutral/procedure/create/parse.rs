@@ -52,33 +52,24 @@ pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlErr
             trimmed.get("CREATE PROCEDURE ".len()..).unwrap_or_default(),
         )
     } else {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected CREATE PROCEDURE".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected CREATE PROCEDURE"));
     };
 
     // Find param list in parens.
-    let paren_open = rest.find('(').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "expected '(' after procedure name".to_string(),
-    })?;
+    let paren_open = rest
+        .find('(')
+        .ok_or_else(|| DdlError::new("42601", "expected '(' after procedure name"))?;
     let name = rest
         .get(..paren_open)
         .unwrap_or_default()
         .trim()
         .to_lowercase();
     if name.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "procedure name required".to_string(),
-        });
+        return Err(DdlError::new("42601", "procedure name required"));
     }
 
-    let paren_close = find_matching_paren(rest, paren_open).ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '(' in parameter list".to_string(),
-    })?;
+    let paren_close = find_matching_paren(rest, paren_open)
+        .ok_or_else(|| DdlError::new("42601", "unmatched '(' in parameter list"))?;
     let params_str = rest.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_procedure_params(params_str)?;
 
@@ -107,10 +98,10 @@ pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlErr
             .get(.."BEGIN".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BEGIN"))
     {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "procedure body must start with BEGIN".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "procedure body must start with BEGIN",
+        ));
     }
 
     Ok(ParsedCreateProcedure {
@@ -147,10 +138,10 @@ fn parse_procedure_params(params_str: &str) -> Result<Vec<ProcedureParam>, DdlEr
         };
 
         if name_idx + 1 >= tokens.len() {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("parameter must have name and type: '{}'", part.trim()),
-            });
+            return Err(DdlError::new(
+                "42601",
+                format!("parameter must have name and type: '{}'", part.trim()),
+            ));
         }
 
         let name = tokens[name_idx].to_lowercase();
@@ -181,10 +172,9 @@ fn parse_with_clause(s: &str) -> Result<(u64, u64, &str), DdlError> {
         return Ok((1_000_000, 60, s));
     }
 
-    let close = after_with.find(')').ok_or_else(|| DdlError {
-        sqlstate: "42601".to_string(),
-        message: "unmatched '(' in WITH clause".to_string(),
-    })?;
+    let close = after_with
+        .find(')')
+        .ok_or_else(|| DdlError::new("42601", "unmatched '(' in WITH clause"))?;
     let inner = after_with.get(1..close).unwrap_or_default();
     let rest = after_with.get(close + 1..).unwrap_or_default().trim();
 
@@ -198,16 +188,14 @@ fn parse_with_clause(s: &str) -> Result<(u64, u64, &str), DdlError> {
         }
         match kv[0].to_uppercase().as_str() {
             "MAX_ITERATIONS" => {
-                max_iter = kv[1].parse().map_err(|_| DdlError {
-                    sqlstate: "42601".to_string(),
-                    message: "invalid MAX_ITERATIONS value".to_string(),
-                })?;
+                max_iter = kv[1]
+                    .parse()
+                    .map_err(|_| DdlError::new("42601", "invalid MAX_ITERATIONS value"))?;
             }
             "TIMEOUT" => {
-                timeout = kv[1].parse().map_err(|_| DdlError {
-                    sqlstate: "42601".to_string(),
-                    message: "invalid TIMEOUT value".to_string(),
-                })?;
+                timeout = kv[1]
+                    .parse()
+                    .map_err(|_| DdlError::new("42601", "invalid TIMEOUT value"))?;
             }
             _ => {}
         }

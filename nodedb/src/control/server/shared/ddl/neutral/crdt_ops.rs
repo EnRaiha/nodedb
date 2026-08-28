@@ -59,10 +59,10 @@ pub async fn crdt_state(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql);
     if args.len() < 2 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: SELECT crdt_state('collection', 'doc_id')".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: SELECT crdt_state('collection', 'doc_id')",
+        ));
     }
 
     let collection = &args[0];
@@ -95,10 +95,7 @@ pub async fn crdt_state(
         },
     )
     .await
-    .map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
+    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
 
     let columns = vec!["crdt_state".to_string()];
     let column_types = vec![DdlColType::Text];
@@ -135,30 +132,23 @@ pub async fn crdt_apply(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql);
     if args.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: SELECT crdt_apply('collection', 'doc_id', 'delta_hex_or_base64')"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: SELECT crdt_apply('collection', 'doc_id', 'delta_hex_or_base64')",
+        ));
     }
 
     let collection = &args[0];
     let document_id = &args[1];
     let delta_str = &args[2];
     if delta_str.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES.saturating_mul(2) {
-        return Err(DdlError {
-            sqlstate: "54000".into(),
-            message: "CRDT delta exceeds maximum size".into(),
-        });
+        return Err(DdlError::new("54000", "CRDT delta exceeds maximum size"));
     }
 
     // Try hex decode first, then treat as raw bytes.
     let delta = hex_decode(delta_str).unwrap_or_else(|| delta_str.as_bytes().to_vec());
     if delta.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
-        return Err(DdlError {
-            sqlstate: "54000".into(),
-            message: "CRDT delta exceeds maximum size".into(),
-        });
+        return Err(DdlError::new("54000", "CRDT delta exceeds maximum size"));
     }
 
     let tenant_id = identity.tenant_id;
@@ -172,18 +162,12 @@ pub async fn crdt_apply(
         &state.roles,
         &audit,
     )
-    .map_err(|error| DdlError {
-        sqlstate: "42501".into(),
-        message: format!("permission denied: {}", error.resource()),
-    })?;
+    .map_err(|error| DdlError::new("42501", format!("permission denied: {}", error.resource())))?;
 
     let surrogate = state
         .surrogate_assigner
         .assign(database_id, tenant_id, collection, document_id.as_bytes())
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("XX000", e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: collection.clone(),
@@ -212,17 +196,11 @@ pub async fn crdt_apply(
         &state.roles,
         &audit,
     )
-    .map_err(|error| DdlError {
-        sqlstate: "42501".into(),
-        message: format!("permission denied: {}", error.resource()),
-    })?
+    .map_err(|error| DdlError::new("42501", format!("permission denied: {}", error.resource())))?
     .into_tasks()
     .into_iter()
     .next()
-    .ok_or_else(|| DdlError {
-        sqlstate: "XX000".into(),
-        message: "authorization returned no capability".into(),
-    })?;
+    .ok_or_else(|| DdlError::new("XX000", "authorization returned no capability"))?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving
@@ -247,10 +225,7 @@ pub async fn crdt_apply(
         },
     )
     .await
-    .map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
+    .map_err(|e| DdlError::new("XX000", e.to_string()))?;
 
     let columns = vec!["result".to_string()];
     let column_types = vec![DdlColType::Text];

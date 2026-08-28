@@ -473,10 +473,15 @@ fn authorize_materialized_task(
 }
 
 fn ddl_error_to_api(error: crate::control::server::shared::ddl::DdlError) -> ApiError {
-    if error.sqlstate == "42501" {
-        ApiError::Forbidden(error.message)
+    let status = if error.sqlstate == "42501" {
+        axum::http::StatusCode::FORBIDDEN
     } else {
-        ApiError::BadRequest(error.message)
+        axum::http::StatusCode::BAD_REQUEST
+    };
+    ApiError::Coded {
+        status,
+        message: error.message,
+        code: error.code,
     }
 }
 
@@ -557,14 +562,37 @@ mod tests {
 
     #[test]
     fn ddl_insufficient_privilege_maps_to_forbidden() {
-        let error = crate::control::server::shared::ddl::DdlError {
-            sqlstate: "42501".into(),
-            message: "write permission denied".into(),
-        };
+        let error =
+            crate::control::server::shared::ddl::DdlError::new("42501", "write permission denied");
 
         assert!(matches!(
             ddl_error_to_api(error),
-            ApiError::Forbidden(message) if message == "write permission denied"
+            ApiError::Coded { status, message, code }
+                if status == axum::http::StatusCode::FORBIDDEN
+                    && message == "write permission denied"
+                    && code == nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED
         ));
+    }
+
+    /// Round-trips through the actual JSON response body `into_response()`
+    /// produces — not just the pre-serialization `ApiError` — so this proves
+    /// the code reaches the client, not merely that the server set it.
+    #[tokio::test]
+    async fn ddl_error_code_survives_into_response_json() {
+        let error =
+            crate::control::server::shared::ddl::DdlError::new("42501", "write permission denied");
+
+        let response = ddl_error_to_api(error).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+        assert_eq!(
+            json["code"],
+            nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.to_string()
+        );
+        assert_eq!(json["error"], "write permission denied");
     }
 }

@@ -13,10 +13,7 @@ use crate::engine::timeseries::retention_policy::types::{
 };
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 pub(super) struct ParsedRetentionPolicy {

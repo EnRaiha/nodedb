@@ -20,10 +20,7 @@ use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// `CREATE MATERIALIZED VIEW <name> ON <source> AS SELECT ... [WITH (...)]`

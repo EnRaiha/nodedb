@@ -24,10 +24,7 @@ const AT_VERSION_WHAT: &str =
     "a historical document read, which returns merged CRDT state at a version";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// SELECT * FROM collection AT VERSION 'checkpoint' WHERE id = 'doc-id'

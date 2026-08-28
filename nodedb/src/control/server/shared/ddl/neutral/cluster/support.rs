@@ -11,10 +11,7 @@ use super::super::super::result::DdlError;
 /// produced (via `sqlstate_error`), so error parity stays byte-identical
 /// after the migration off the pgwire router.
 pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Render a [`nodedb_cluster::NodeState`] the same way the pgwire

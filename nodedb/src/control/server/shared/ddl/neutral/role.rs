@@ -32,10 +32,10 @@ pub fn create_role(
     let (if_not_exists, parts) = strip_if_not_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: CREATE ROLE [IF NOT EXISTS] <name> [INHERIT <parent>]".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: CREATE ROLE [IF NOT EXISTS] <name> [INHERIT <parent>]",
+        ));
     }
 
     let name = parts[2];
@@ -56,25 +56,16 @@ pub fn create_role(
     let stored = state
         .roles
         .prepare_role(name, identity.tenant_id, parent)
-        .map_err(|e| DdlError {
-            sqlstate: "42710".to_string(),
-            message: e.to_string(),
-        })?;
+        .map_err(|e| DdlError::new("42710", e.to_string()))?;
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
-        catalog.put_role(&stored).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog write: {e}"),
-        })?;
+        catalog
+            .put_role(&stored)
+            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         state.roles.install_replicated_role(&stored);
     }
 
@@ -102,10 +93,10 @@ pub fn drop_role(
     let (if_exists, parts) = strip_if_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP ROLE [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: DROP ROLE [IF EXISTS] <name>",
+        ));
     }
 
     let name = parts[2];
@@ -115,31 +106,23 @@ pub fn drop_role(
         if if_exists {
             return Ok(status("DROP ROLE"));
         }
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("role '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("role '{name}' does not exist"),
+        ));
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteRole {
         name: name.to_string(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     let dropped = if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
         state
             .roles
             .drop_role(name, Some(catalog))
-            .map_err(|e| DdlError {
-                sqlstate: "42704".to_string(),
-                message: e.to_string(),
-            })?
+            .map_err(|e| DdlError::new("42704", e.to_string()))?
     } else {
         // Cluster mode: the raft entry committed, trust the
         // log index. The in-memory cache update runs in a
@@ -156,10 +139,10 @@ pub fn drop_role(
         );
         Ok(status("DROP ROLE"))
     } else {
-        Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("role '{name}' does not exist"),
-        })
+        Err(DdlError::new(
+            "42704",
+            format!("role '{name}' does not exist"),
+        ))
     }
 }
 
@@ -177,10 +160,10 @@ pub fn alter_role_typed(
     require_tenant_admin(identity, "alter roles")?;
 
     // The role must exist before we mutate it.
-    state.roles.get_role(role_name).ok_or_else(|| DdlError {
-        sqlstate: "42704".to_string(),
-        message: format!("role '{role_name}' not found"),
-    })?;
+    state
+        .roles
+        .get_role(role_name)
+        .ok_or_else(|| DdlError::new("42704", format!("role '{role_name}' not found")))?;
 
     match sub_op {
         AlterRoleOp::Grant {
@@ -237,10 +220,10 @@ pub fn set_role_parent(
     role_name: &str,
     parent: Option<&str>,
 ) -> Result<(), DdlError> {
-    let old_role = state.roles.get_role(role_name).ok_or_else(|| DdlError {
-        sqlstate: "42704".to_string(),
-        message: format!("role '{role_name}' not found"),
-    })?;
+    let old_role = state
+        .roles
+        .get_role(role_name)
+        .ok_or_else(|| DdlError::new("42704", format!("role '{role_name}' not found")))?;
 
     if let Some(parent) = parent {
         let parent_is_builtin = matches!(
@@ -248,20 +231,17 @@ pub fn set_role_parent(
             "superuser" | "tenant_admin" | "readwrite" | "readonly" | "monitor"
         );
         if !parent_is_builtin && state.roles.get_role(parent).is_none() {
-            return Err(DdlError {
-                sqlstate: "42704".to_string(),
-                message: format!("parent role '{parent}' does not exist"),
-            });
+            return Err(DdlError::new(
+                "42704",
+                format!("parent role '{parent}' does not exist"),
+            ));
         }
         // Reject self-inheritance and multi-hop cycles, and enforce the
         // inheritance-depth cap — the same invariant `CREATE ROLE` checks.
         state
             .roles
             .check_inheritance_cycle(role_name, parent)
-            .map_err(|e| DdlError {
-                sqlstate: "42P16".to_string(),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| DdlError::new("42P16", e.to_string()))?;
     }
 
     let now = std::time::SystemTime::now()
@@ -276,19 +256,13 @@ pub fn set_role_parent(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         let catalog = state.credentials.catalog();
-        catalog.put_role(&stored).map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog write: {e}"),
-        })?;
+        catalog
+            .put_role(&stored)
+            .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         state.roles.install_replicated_role(&stored);
     }
     Ok(())

@@ -49,10 +49,8 @@ pub async fn match_query(
     txn_id: Option<TxnId>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Parse the MATCH query.
-    let query = crate::engine::graph::pattern::compiler::parse(sql).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("MATCH parse error: {e}"),
-    })?;
+    let query = crate::engine::graph::pattern::compiler::parse(sql)
+        .map_err(|e| DdlError::new("42601", format!("MATCH parse error: {e}")))?;
 
     // Both dispatch shapes below reach the Data Plane without a single plan for
     // the planner's authorization and RLS passes to inspect, so both are
@@ -109,13 +107,13 @@ pub async fn match_query(
                     for triple in &chain.triples {
                         let hops = triple.edge.max_hops;
                         if hops > limit as usize {
-                            return Err(DdlError {
-                                sqlstate: "42P17".to_string(),
-                                message: format!(
+                            return Err(DdlError::new(
+                                "42P17",
+                                format!(
                                     "MATCH traversal depth {hops} exceeds tenant quota \
                                      max_graph_depth={limit}"
                                 ),
-                            });
+                            ));
                         }
                     }
                 }
@@ -136,10 +134,8 @@ pub async fn match_query(
     };
 
     // Serialize the MatchQuery for SPSC transport.
-    let query_bytes = zerompk::to_msgpack_vec(&query).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("serialize match query: {e}"),
-    })?;
+    let query_bytes = zerompk::to_msgpack_vec(&query)
+        .map_err(|e| DdlError::new("XX000", format!("serialize match query: {e}")))?;
 
     let tenant_id = identity.tenant_id;
 
@@ -157,10 +153,7 @@ pub async fn match_query(
         gate.auth(),
         &state.redaction,
     )
-    .map_err(|e| DdlError {
-        sqlstate: "0A000".to_string(),
-        message: e.to_string(),
-    })?;
+    .map_err(|e| DdlError::new("0A000", e.to_string()))?;
 
     // Single-node mode: keep the direct path byte-identical — broadcast the `Match`
     // plan with `cluster_mode = false` to all local cores. The Data Plane emits
@@ -190,18 +183,12 @@ pub async fn match_query(
                 // result is surfaced fail-closed rather than silently truncated.
                 let _frontier = outcome.frontier;
                 if outcome.partial {
-                    Err(DdlError {
-                        sqlstate: "54001".to_string(),
-                        message: MATCH_INCOMPLETE_MESSAGE.to_string(),
-                    })
+                    Err(DdlError::new("54001", MATCH_INCOMPLETE_MESSAGE))
                 } else {
                     match_payload_to_rows(&outcome.rows_payload, &column_names)
                 }
             }
-            Err(e) => Err(DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            }),
+            Err(e) => Err(DdlError::new("XX000", e.to_string())),
         };
     }
 
@@ -229,18 +216,12 @@ pub async fn match_query(
             // still pending: the result set is INCOMPLETE. Surface it
             // fail-closed so a client never mistakes it for a complete result.
             if outcome.partial {
-                Err(DdlError {
-                    sqlstate: "54001".to_string(),
-                    message: MATCH_INCOMPLETE_MESSAGE.to_string(),
-                })
+                Err(DdlError::new("54001", MATCH_INCOMPLETE_MESSAGE))
             } else {
                 match_payload_to_rows(&outcome.rows_payload, &column_names)
             }
         }
-        Err(e) => Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
-        }),
+        Err(e) => Err(DdlError::new("XX000", e.to_string())),
     }
 }
 
@@ -262,10 +243,8 @@ fn match_payload_to_rows(
     }
 
     let json_text = response_codec::decode_payload_to_json(payload);
-    let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("invalid match result JSON: {e}"),
-    })?;
+    let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text)
+        .map_err(|e| DdlError::new("XX000", format!("invalid match result JSON: {e}")))?;
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {

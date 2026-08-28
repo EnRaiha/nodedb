@@ -202,16 +202,13 @@ fn check_engine_support(
 /// a pgwire `PgWireError`), so this wraps the same type — only the message is
 /// decorated with the row number, matching the original pgwire behavior.
 pub(super) fn wrap_row_error(e: DdlError, line_no: usize, fmt: &str) -> DdlError {
-    DdlError {
-        sqlstate: e.sqlstate,
-        message: format!("COPY: {fmt} row {line_no}: {}", e.message),
-    }
+    DdlError::new(
+        e.sqlstate,
+        format!("COPY: {fmt} row {line_no}: {}", e.message),
+    )
 }
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }

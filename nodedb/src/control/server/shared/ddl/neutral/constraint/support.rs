@@ -6,8 +6,5 @@ use crate::control::server::shared::ddl::result::DdlError;
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and message.
 pub(super) fn err(code: &str, msg: &str) -> DdlError {
-    DdlError {
-        sqlstate: code.to_owned(),
-        message: msg.to_owned(),
-    }
+    DdlError::new(code, msg)
 }

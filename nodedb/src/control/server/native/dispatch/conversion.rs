@@ -133,17 +133,22 @@ pub(crate) fn error_code_to_native(
 /// becomes a single-column status row, a row result becomes a columns+rows
 /// frame, an empty result or an empty vec becomes a bare OK).
 ///
-/// `DdlError` is authored as a SQLSTATE and a message and never holds a
-/// classified `Error`, so the numeric code the client rebuilds its typed error
-/// from comes from `sqlstate_code`. Without it every DDL refusal — a `DROP
-/// TABLE` naming a collection that does not exist, a denied `GRANT` — reaches
-/// the client as a generic internal failure.
+/// `DdlError` carries its own numeric `code` (see
+/// `crate::control::server::shared::ddl::result`), so the frame's `ndb_code`
+/// comes directly from it rather than a bare-SQLSTATE re-derivation. Without
+/// it every DDL refusal — a `DROP TABLE` naming a collection that does not
+/// exist, a denied `GRANT` — reaches the client as a generic internal
+/// failure.
 pub(crate) fn ddl_result_to_native(
     seq: u64,
     result: Result<Vec<DdlResult>, DdlError>,
 ) -> NativeResponse {
     match result {
-        Err(DdlError { sqlstate, message }) => sqlstate_error(seq, sqlstate, message),
+        Err(DdlError {
+            sqlstate,
+            code,
+            message,
+        }) => NativeResponse::error_with_code(seq, sqlstate, message, code.0),
         // Unknown pgwire response variants are dropped during translation, so
         // the first element is the first meaningful result — mirroring the
         // previous bridge, which returned on the first known variant.
@@ -348,25 +353,39 @@ mod tests {
     /// ships `ndb_code == 0` and a `DROP TABLE` naming an absent collection
     /// arrives as a generic internal failure while the identical `SELECT`
     /// arrives typed.
+    ///
+    /// Round-trips through actual msgpack bytes and `NodeDbError::from_wire`
+    /// — proving the code reaches the client, not just that the server set
+    /// it.
     #[test]
     fn ddl_refusals_carry_their_numeric_code() {
         let response = ddl_result_to_native(
             1,
-            Err(DdlError {
-                sqlstate: "42P01".to_owned(),
-                message: "collection 'missing' does not exist".to_owned(),
-            }),
+            Err(DdlError::new(
+                "42P01",
+                "collection 'missing' does not exist",
+            )),
         );
 
-        let error = response
-            .error
-            .expect("error responses must carry a payload");
+        let bytes = zerompk::to_msgpack_vec(&response).expect("encode native response");
+        let decoded: NativeResponse =
+            zerompk::from_msgpack(&bytes).expect("decode native response");
+        let error = decoded.error.expect("error responses must carry a payload");
         assert_eq!(error.code, "42P01");
         assert_eq!(
             error.ndb_code,
             nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND.0
         );
         assert_eq!(error.message, "collection 'missing' does not exist");
+
+        let client_err = nodedb_types::NodeDbError::from_wire(
+            nodedb_types::error::ErrorCode(error.ndb_code),
+            error.message,
+        );
+        assert_eq!(
+            client_err.code(),
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND
+        );
     }
 
     /// A site that renders a more specific SQLSTATE than the error implies

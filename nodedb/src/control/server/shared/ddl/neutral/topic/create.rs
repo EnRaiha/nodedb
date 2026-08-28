@@ -34,17 +34,11 @@ pub async fn create_topic(
 
     // parts: ["CREATE", "TOPIC", "<name>", ...]
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected CREATE TOPIC <name>".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected CREATE TOPIC <name>"));
     }
 
     let name = parts[2].to_lowercase();
-    validate_topic_name(&name).map_err(|message| DdlError {
-        sqlstate: "42601".to_string(),
-        message: message.to_string(),
-    })?;
+    validate_topic_name(&name).map_err(|message| DdlError::new("42601", message.to_string()))?;
     let tenant_id = identity.tenant_id.as_u64();
     let lifecycle_lock = state
         .ep_topic_registry
@@ -77,10 +71,7 @@ pub async fn create_topic(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system clock error".to_string(),
-        })?
+        .map_err(|_| DdlError::new("XX000", "system clock error"))?
         .as_secs();
 
     let def = TopicDef {
@@ -96,14 +87,14 @@ pub async fn create_topic(
 
     let catalog = state.credentials.catalog();
 
-    if !catalog.create_ep_topic(&def).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("catalog write: {e}"),
-    })? {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("topic '{name}' already exists"),
-        });
+    if !catalog
+        .create_ep_topic(&def)
+        .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?
+    {
+        return Err(DdlError::new(
+            "42710",
+            format!("topic '{name}' already exists"),
+        ));
     }
 
     state.ep_topic_registry.register(def);

@@ -164,26 +164,22 @@ pub(super) async fn try_typed(
 
         // Tenant backup/restore stream bytes over the COPY protocol; the bare
         // statement forms are rejected so callers use the streaming COPY forms.
-        NodedbStatement::Database(DatabaseStmt::BackupTenant { .. }) => Some(Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message:
-                "use `COPY (BACKUP TENANT <id>) TO STDOUT` to stream backup bytes to the client"
-                    .to_string(),
-        })),
+        NodedbStatement::Database(DatabaseStmt::BackupTenant { .. }) => Some(Err(DdlError::new(
+            "0A000",
+            "use `COPY (BACKUP TENANT <id>) TO STDOUT` to stream backup bytes to the client",
+        ))),
 
-        NodedbStatement::Database(DatabaseStmt::RestoreTenant { .. }) => Some(Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message:
-                "use `COPY tenant_restore(<id>) FROM STDIN` to stream backup bytes from the client"
-                    .to_string(),
-        })),
+        NodedbStatement::Database(DatabaseStmt::RestoreTenant { .. }) => Some(Err(DdlError::new(
+            "0A000",
+            "use `COPY tenant_restore(<id>) FROM STDIN` to stream backup bytes from the client",
+        ))),
 
         // USE DATABASE is intercepted in `execute_single_sql` before the DDL
         // router runs; reaching this arm means the intercept did not fire.
-        NodedbStatement::Database(DatabaseStmt::UseDatabase { name }) => Some(Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("USE DATABASE {name}: reached router after expected intercept"),
-        })),
+        NodedbStatement::Database(DatabaseStmt::UseDatabase { name }) => Some(Err(DdlError::new(
+            "XX000",
+            format!("USE DATABASE {name}: reached router after expected intercept"),
+        ))),
 
         _ => None,
     }

@@ -43,8 +43,5 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn extract_vect
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }

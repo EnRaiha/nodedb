@@ -35,10 +35,7 @@ pub fn parse_create_function(sql: &str) -> Result<ParsedCreateFunction, DdlError
 
     let body_sql = body_part.trim().trim_end_matches(';').trim().to_string();
     if body_sql.is_empty() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "function body is empty".to_string(),
-        });
+        return Err(DdlError::new("42601", "function body is empty"));
     }
 
     Ok(ParsedCreateFunction {
@@ -75,15 +72,9 @@ fn extract_volatility_and_body(s: &str) -> Result<(FunctionVolatility, &str), Dd
         .is_some_and(|byte| byte.is_ascii_whitespace());
     if !has_as || !has_as_separator {
         if has_as {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: "expected function body after AS".to_string(),
-            });
+            return Err(DdlError::new("42601", "expected function body after AS"));
         }
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected AS <body>".to_string(),
-        });
+        return Err(DdlError::new("42601", "expected AS <body>"));
     }
     let body = rest.get("AS".len()..).unwrap_or_default().trim();
 

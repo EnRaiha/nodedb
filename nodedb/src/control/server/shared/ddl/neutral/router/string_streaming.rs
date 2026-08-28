@@ -158,10 +158,10 @@ pub(super) async fn try_string(
             || !parts[5].eq_ignore_ascii_case("CONSUMER")
             || !parts[6].eq_ignore_ascii_case("GROUP")
         {
-            return Some(Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: "expected SELECT * FROM TOPIC <topic> CONSUMER GROUP <group>".to_string(),
-            }));
+            return Some(Err(DdlError::new(
+                "42601",
+                "expected SELECT * FROM TOPIC <topic> CONSUMER GROUP <group>",
+            )));
         }
         let prefixed_name = format!("topic:{}", parts[4].to_lowercase());
         let stream_keyword = "STREAM";

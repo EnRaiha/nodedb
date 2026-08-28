@@ -32,10 +32,10 @@ pub async fn drop_consumer_group(
 
     // parts: ["DROP", "CONSUMER", "GROUP", "<name>", "ON", "<stream>"]
     if parts.len() < 6 || !parts[4].eq_ignore_ascii_case("ON") {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected DROP CONSUMER GROUP <name> ON <stream>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "expected DROP CONSUMER GROUP <name> ON <stream>",
+        ));
     }
 
     let group_name = parts[3].to_lowercase();
@@ -73,28 +73,23 @@ pub async fn drop_consumer_group(
         &stream_name,
         &group_name,
     ) {
-        return Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("consumer-group migration: {error}"),
-        });
+        return Err(DdlError::new(
+            "XX000",
+            format!("consumer-group migration: {error}"),
+        ));
     }
 
     let catalog = state.credentials.catalog();
 
     let existed = catalog
         .delete_consumer_group(database_id, tenant_id, &stream_name, &group_name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog delete: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
 
     if !existed {
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!(
-                "consumer group '{group_name}' does not exist on stream '{stream_name}'"
-            ),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
+        ));
     }
 
     state

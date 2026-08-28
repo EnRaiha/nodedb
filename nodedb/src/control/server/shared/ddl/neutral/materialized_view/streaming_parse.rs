@@ -18,10 +18,7 @@ use nodedb_sql::parser::preprocess::lex::{
 use super::super::super::result::DdlError;
 
 fn parse_err(message: &str) -> DdlError {
-    DdlError {
-        sqlstate: "42601".to_string(),
-        message: message.to_string(),
-    }
+    DdlError::new("42601", message)
 }
 
 /// Parsed pieces of a streaming materialized view definition.

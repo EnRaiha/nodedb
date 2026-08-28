@@ -99,10 +99,7 @@ pub fn create_spatial_index(
         .credentials
         .catalog()
         .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("{CONTEXT}: read index registry: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("{CONTEXT}: read index registry: {e}")))?
     {
         if stmt.header.if_not_exists && taken.kind == IndexKind::Spatial {
             return Ok(vec![DdlResult::Status {
@@ -110,14 +107,14 @@ pub fn create_spatial_index(
                 rows_affected: None,
             }]);
         }
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!(
+        return Err(DdlError::new(
+            "42710",
+            format!(
                 "{CONTEXT}: index '{index_name}' already exists on '{}' ({})",
                 taken.collection,
                 taken.kind.display_type()
             ),
-        });
+        ));
     }
 
     propose_index_record(
@@ -172,22 +169,20 @@ fn resolve_precision(
     if index_type != "geohash" {
         return match requested {
             None => Ok(None),
-            Some(_) => Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("{CONTEXT}: PRECISION applies only to USING GEOHASH"),
-            }),
+            Some(_) => Err(DdlError::new(
+                "42601",
+                format!("{CONTEXT}: PRECISION applies only to USING GEOHASH"),
+            )),
         };
     }
 
     match requested {
         None => Ok(Some(DEFAULT_GEOHASH_PRECISION)),
         Some(p) if (1..=MAX_GEOHASH_PRECISION).contains(&p) => Ok(Some(p)),
-        Some(p) => Err(DdlError {
-            sqlstate: "22023".to_string(),
-            message: format!(
-                "{CONTEXT}: PRECISION must be between 1 and {MAX_GEOHASH_PRECISION}, got {p}"
-            ),
-        }),
+        Some(p) => Err(DdlError::new(
+            "22023",
+            format!("{CONTEXT}: PRECISION must be between 1 and {MAX_GEOHASH_PRECISION}, got {p}"),
+        )),
     }
 }
 

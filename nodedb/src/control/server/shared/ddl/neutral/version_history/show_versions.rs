@@ -21,10 +21,7 @@ const SHOW_VERSIONS_WHAT: &str =
     "a checkpoint listing, which returns version metadata about a document";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// SHOW VERSIONS OF collection WHERE id = 'doc-id' [LIMIT N]

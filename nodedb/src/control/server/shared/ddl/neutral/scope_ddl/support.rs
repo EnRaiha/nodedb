@@ -7,10 +7,7 @@ use super::super::super::result::{DdlError, DdlResult};
 /// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
 /// the pgwire scope handlers produced (via `sqlstate_error`).
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Build a single-tag status result.

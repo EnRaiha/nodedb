@@ -29,10 +29,7 @@ use super::super::result::{DdlError, DdlResult};
 /// produced (via `sqlstate_error`), so error parity stays byte-identical
 /// after the migration off the pgwire router.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// DEFINE METERING DIMENSION '<name>' UNIT '<unit>'

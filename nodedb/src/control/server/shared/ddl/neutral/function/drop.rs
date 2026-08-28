@@ -36,17 +36,14 @@ pub fn drop_function(
     // Check if function exists.
     let func_exists = catalog
         .get_function_in_database(database_id, tenant_id, &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("catalog read: {e}"),
-        })?
+        .map_err(|e| DdlError::new("XX000", format!("catalog read: {e}")))?
         .is_some();
 
     if !func_exists && !if_exists {
-        return Err(DdlError {
-            sqlstate: "42883".to_string(),
-            message: format!("function '{name}' does not exist"),
-        });
+        return Err(DdlError::new(
+            "42883",
+            format!("function '{name}' does not exist"),
+        ));
     }
 
     if !func_exists {
@@ -57,22 +54,19 @@ pub fn drop_function(
     // Check dependencies: block DROP if other objects depend on this function.
     let dependents = catalog
         .find_dependents(database_id, tenant_id, "function", &name)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("dependency check: {e}"),
-        })?;
+        .map_err(|e| DdlError::new("XX000", format!("dependency check: {e}")))?;
     if !dependents.is_empty() {
         let dep_list: Vec<String> = dependents
             .iter()
             .map(|(t, n)| format!("{t} '{n}'"))
             .collect();
-        return Err(DdlError {
-            sqlstate: "2BP01".to_string(),
-            message: format!(
+        return Err(DdlError::new(
+            "2BP01",
+            format!(
                 "cannot drop function '{name}': depended on by {}",
                 dep_list.join(", ")
             ),
-        });
+        ));
     }
 
     // Delete function definition (including its dependencies) + ownership.
@@ -84,13 +78,8 @@ pub fn drop_function(
         tenant_id,
         name: name.clone(),
     };
-    let outcome =
-        crate::control::metadata_proposer::propose_catalog_entry(state, &entry).map_err(|e| {
-            DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("metadata propose: {e}"),
-            }
-        })?;
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
 
     // Broadcast deletion to connected Lite sessions.
@@ -121,10 +110,10 @@ pub fn drop_function(
 fn parse_drop_function(parts: &[&str]) -> Result<(String, bool), DdlError> {
     // parts[0] = "DROP", parts[1] = "FUNCTION", ...
     if parts.len() < 3 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP FUNCTION [IF EXISTS] <name>".to_string(),
-        });
+        return Err(DdlError::new(
+            "42601",
+            "syntax: DROP FUNCTION [IF EXISTS] <name>",
+        ));
     }
 
     let mut idx = 2;
@@ -139,10 +128,7 @@ fn parse_drop_function(parts: &[&str]) -> Result<(String, bool), DdlError> {
     };
 
     if idx >= parts.len() {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "function name required".to_string(),
-        });
+        return Err(DdlError::new("42601", "function name required"));
     }
 
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();

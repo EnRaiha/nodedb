@@ -20,10 +20,7 @@ use crate::control::state::SharedState;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// SHOW ALERTS — list all alert rules for the tenant.

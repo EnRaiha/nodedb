@@ -91,10 +91,7 @@ pub async fn try_dispatch(
                 | nodedb_sql::SqlError::ConflictingEngineClause { .. } => "0A000",
                 _ => "42601",
             };
-            return Some(Err(DdlError {
-                sqlstate: sqlstate.to_string(),
-                message: e.to_string(),
-            }));
+            return Some(Err(DdlError::new(sqlstate, e.to_string())));
         }
         None => {
             // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The

@@ -53,10 +53,7 @@ fn authorize_offset_commit(
         &emitter,
     )
     .map_err(crate::Error::from)
-    .map_err(|error| DdlError {
-        sqlstate: "42501".to_string(),
-        message: error.to_string(),
-    })
+    .map_err(|error| DdlError::new("42501", error.to_string()))
 }
 
 fn migrate_legacy_group(
@@ -74,10 +71,7 @@ fn migrate_legacy_group(
         group_name,
     )
     .map(|_| ())
-    .map_err(|error| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("consumer-group migration: {error}"),
-    })
+    .map_err(|error| DdlError::new("XX000", format!("consumer-group migration: {error}")))
 }
 
 /// Handle `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`.
@@ -99,19 +93,15 @@ pub async fn commit_offset(
         && parts[8].eq_ignore_ascii_case("CONSUMER")
         && parts[9].eq_ignore_ascii_case("GROUP")
     {
-        let partition_id: u32 = parts[3].parse().map_err(|_| DdlError {
-            sqlstate: "42601".to_string(),
-            message: format!("invalid partition: '{}'", parts[3]),
-        })?;
+        let partition_id: u32 = parts[3]
+            .parse()
+            .map_err(|_| DdlError::new("42601", format!("invalid partition: '{}'", parts[3])))?;
         let offset: CdcOffset =
             parts[5]
                 .parse()
-                .map_err(
-                    |error: crate::event::cdc::offset::ParseCdcOffsetError| DdlError {
-                        sqlstate: "42601".to_string(),
-                        message: error.to_string(),
-                    },
-                )?;
+                .map_err(|error: crate::event::cdc::offset::ParseCdcOffsetError| {
+                    DdlError::new("42601", error.to_string())
+                })?;
         let requested_stream = parts[7];
         let mut stream_name =
             canonical_stream_name(state, database_id, tenant_id, requested_stream);
@@ -149,12 +139,10 @@ pub async fn commit_offset(
             .get(database_id, tenant_id, &stream_name, &group_name)
             .is_none()
         {
-            return Err(DdlError {
-                sqlstate: "42704".to_string(),
-                message: format!(
-                    "consumer group '{group_name}' does not exist on stream '{stream_name}'"
-                ),
-            });
+            return Err(DdlError::new(
+                "42704",
+                format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
+            ));
         }
 
         state
@@ -168,14 +156,8 @@ pub async fn commit_offset(
                 offset,
             )
             .map_err(|e| match e {
-                crate::Error::OffsetRegression { .. } => DdlError {
-                    sqlstate: "22023".to_string(),
-                    message: e.to_string(),
-                },
-                _ => DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("offset commit: {e}"),
-                },
+                crate::Error::OffsetRegression { .. } => DdlError::new("22023", e.to_string()),
+                _ => DdlError::new("XX000", format!("offset commit: {e}")),
             })?;
 
         return Ok(status("COMMIT OFFSET"));
@@ -226,12 +208,10 @@ pub async fn commit_offset(
             .get(database_id, tenant_id, &stream_name, &group_name)
             .is_none()
         {
-            return Err(DdlError {
-                sqlstate: "42704".to_string(),
-                message: format!(
-                    "consumer group '{group_name}' does not exist on stream '{stream_name}'"
-                ),
-            });
+            return Err(DdlError::new(
+                "42704",
+                format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
+            ));
         }
 
         // Use the buffer's per-partition tail tracker — NOT a full
@@ -265,21 +245,16 @@ pub async fn commit_offset(
                         partition_id,
                         offset,
                     )
-                    .map_err(|e| DdlError {
-                        sqlstate: "XX000".to_string(),
-                        message: format!("offset commit: {e}"),
-                    })?;
+                    .map_err(|e| DdlError::new("XX000", format!("offset commit: {e}")))?;
             }
         }
 
         return Ok(status("COMMIT OFFSETS"));
     }
 
-    Err(DdlError {
-        sqlstate: "42601".to_string(),
-        message:
-            "expected COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>, \
-         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>; bare <lsn> is legacy whole-LSN acknowledgement"
-                .to_string(),
-    })
+    Err(DdlError::new(
+        "42601",
+        "expected COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>, \
+         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>; bare <lsn> is legacy whole-LSN acknowledgement",
+    ))
 }

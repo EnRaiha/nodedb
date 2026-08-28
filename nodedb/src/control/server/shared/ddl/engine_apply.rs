@@ -41,8 +41,5 @@ pub(crate) async fn apply_in_engine(
     )
     .await
     .map(|_| ())
-    .map_err(|e| DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: format!("{context}: {e}"),
-    })
+    .map_err(|e| DdlError::new(sqlstate, format!("{context}: {e}")))
 }

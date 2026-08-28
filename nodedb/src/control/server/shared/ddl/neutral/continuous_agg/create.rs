@@ -29,10 +29,7 @@ use super::super::collection;
 use super::parse::{extract_with_options, parse_create_sql};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parsed `CREATE CONTINUOUS AGGREGATE` request.

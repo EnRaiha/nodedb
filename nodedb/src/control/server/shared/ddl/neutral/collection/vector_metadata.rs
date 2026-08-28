@@ -27,10 +27,7 @@ use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Handle `ALTER COLLECTION x SET VECTOR METADATA ON column (model = '...', dimensions = N, ...)`.

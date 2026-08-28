@@ -27,10 +27,10 @@ pub(super) fn require_tenant_admin(
     if identity.is_superuser || identity.has_role(&Role::TenantAdmin) {
         Ok(())
     } else {
-        Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: format!("permission denied: only superuser or tenant_admin can {action}"),
-        })
+        Err(DdlError::new(
+            "42501",
+            format!("permission denied: only superuser or tenant_admin can {action}"),
+        ))
     }
 }
 

@@ -23,10 +23,7 @@ use nodedb_types::Surrogate;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// RESTORE collection SET VERSION = 'checkpoint' WHERE id = 'doc-id'

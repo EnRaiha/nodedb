@@ -39,14 +39,11 @@ pub async fn handle_publish(
                 crate::Error::Dispatch { .. } => "58000",
                 _ => "XX000",
             };
-            Err(DdlError {
-                sqlstate: sqlstate.to_string(),
-                message: e.to_string(),
-            })
+            Err(DdlError::new(sqlstate.to_string(), e.to_string()))
         }
-        Ok(None) => Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected PUBLISH TO <topic> '<payload>'".to_string(),
-        }),
+        Ok(None) => Err(DdlError::new(
+            "42601",
+            "expected PUBLISH TO <topic> '<payload>'",
+        )),
     }
 }

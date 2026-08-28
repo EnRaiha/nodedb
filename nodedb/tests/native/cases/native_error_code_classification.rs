@@ -346,11 +346,10 @@ async fn native_duplicate_ddl_keeps_its_sqlstate_and_message() {
     let create = send_sql(&mut stream, 1, "CREATE COLLECTION native_err_dup").await;
     assert_eq!(create.status, ResponseStatus::Ok, "create the target");
 
-    // `42P07` has no `ErrorDetails` variant to map onto, so it stays
-    // unclassified rather than being forced onto an approximate one. This
-    // pins that the fallback is still exactly what shipped before — same
-    // SQLSTATE, same message, `ndb_code == 0` — so an unmapped SQLSTATE is
-    // never made worse by the table that classifies the mapped ones.
+    // `42P07` is `duplicate_table`, which `ErrorDetails::AlreadyExists`
+    // now names exactly, so it classifies instead of reaching a client as
+    // an opaque internal error. The SQLSTATE and message still survive
+    // verbatim alongside the code.
     let resp = send_sql(&mut stream, 2, "CREATE COLLECTION native_err_dup").await;
 
     assert_eq!(
@@ -366,7 +365,8 @@ async fn native_duplicate_ddl_keeps_its_sqlstate_and_message() {
         err.message
     );
     assert_eq!(
-        err.ndb_code, 0,
-        "a SQLSTATE with no NodeDB variant must stay unclassified, not be guessed at"
+        err.ndb_code,
+        nodedb_types::error::ErrorCode::ALREADY_EXISTS.0,
+        "a duplicate-object SQLSTATE must reach the client as its own code"
     );
 }

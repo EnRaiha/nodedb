@@ -59,14 +59,9 @@ fn compile_rls_predicate(
     predicate_str: &str,
     on_deny_raw: Option<&str>,
 ) -> Result<CompiledPredicate, DdlError> {
-    let compiled = parse_predicate(predicate_str).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: format!("predicate parse error: {e}"),
-    })?;
-    validate_auth_refs(&compiled).map_err(|e| DdlError {
-        sqlstate: "42601".to_string(),
-        message: e.to_string(),
-    })?;
+    let compiled = parse_predicate(predicate_str)
+        .map_err(|e| DdlError::new("42601", format!("predicate parse error: {e}")))?;
+    validate_auth_refs(&compiled).map_err(|e| DdlError::new("42601", e.to_string()))?;
 
     let on_deny = if let Some(deny_text) = on_deny_raw {
         let deny_parts: Vec<&str> = deny_text.split_whitespace().collect();
@@ -80,10 +75,7 @@ fn compile_rls_predicate(
         } else {
             &deny_parts[..]
         };
-        deny::parse_on_deny(slice).map_err(|e| DdlError {
-            sqlstate: "42601".to_string(),
-            message: e.to_string(),
-        })?
+        deny::parse_on_deny(slice).map_err(|e| DdlError::new("42601", e.to_string()))?
     } else {
         DenyMode::default()
     };
@@ -111,20 +103,19 @@ fn authorize_rls_scope(
     tenant_id_override: Option<u64>,
 ) -> Result<u64, DdlError> {
     if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied: requires superuser or tenant_admin".to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "permission denied: requires superuser or tenant_admin",
+        ));
     }
 
     let own_tenant_id = identity.tenant_id.as_u64();
     let tenant_id = tenant_id_override.unwrap_or(own_tenant_id);
     if tenant_id != own_tenant_id && !identity.is_superuser {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied: cross-tenant RLS administration requires superuser"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "permission denied: cross-tenant RLS administration requires superuser",
+        ));
     }
     Ok(tenant_id)
 }
@@ -162,10 +153,10 @@ pub fn create_rls_policy(
         "WRITE" => crate::control::security::rls::PolicyType::Write,
         "ALL" => crate::control::security::rls::PolicyType::All,
         other => {
-            return Err(DdlError {
-                sqlstate: "42601".to_string(),
-                message: format!("invalid policy type: {other}. Expected READ, WRITE, or ALL"),
-            });
+            return Err(DdlError::new(
+                "42601",
+                format!("invalid policy type: {other}. Expected READ, WRITE, or ALL"),
+            ));
         }
     };
 
@@ -184,10 +175,10 @@ pub fn create_rls_policy(
         .rls
         .policy_exists(tenant_id, &qualified_collection, name)
     {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("RLS policy '{}' already exists on '{}'", name, collection),
-        });
+        return Err(DdlError::new(
+            "42710",
+            format!("RLS policy '{}' already exists on '{}'", name, collection),
+        ));
     }
 
     let policy = RlsPolicy {
@@ -207,23 +198,18 @@ pub fn create_rls_policy(
             .as_secs(),
     };
 
-    let stored = StoredRlsPolicy::from_runtime(&policy).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("rls serialize: {e}"),
-    })?;
+    let stored = StoredRlsPolicy::from_runtime(&policy)
+        .map_err(|e| DdlError::new("XX000", format!("rls serialize: {e}")))?;
 
     let entry = CatalogEntry::PutRlsPolicy(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
-            catalog.put_rls_policy(&stored).map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
+            catalog
+                .put_rls_policy(&stored)
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state.rls.install_replicated_policy(policy);
     }
@@ -262,10 +248,10 @@ pub fn drop_rls_policy(
         if if_exists {
             return Ok(status("DROP RLS POLICY"));
         }
-        return Err(DdlError {
-            sqlstate: "42704".to_string(),
-            message: format!("RLS policy '{name}' not found on '{collection}'"),
-        });
+        return Err(DdlError::new(
+            "42704",
+            format!("RLS policy '{name}' not found on '{collection}'"),
+        ));
     }
 
     let entry = CatalogEntry::DeleteRlsPolicy {
@@ -273,19 +259,14 @@ pub fn drop_rls_policy(
         collection: qualified_collection.clone(),
         name: name.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("metadata propose: {e}"),
-    })?;
+    let outcome = propose_catalog_entry(state, &entry)
+        .map_err(|e| DdlError::new("XX000", format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         {
             let catalog = state.credentials.catalog();
             catalog
                 .delete_rls_policy(tenant_id, &qualified_collection, name)
-                .map_err(|e| DdlError {
-                    sqlstate: "XX000".to_string(),
-                    message: format!("catalog write: {e}"),
-                })?;
+                .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state
             .rls

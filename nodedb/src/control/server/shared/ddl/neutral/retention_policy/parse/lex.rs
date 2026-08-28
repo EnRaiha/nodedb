@@ -5,10 +5,7 @@
 use super::DdlError;
 
 fn err(message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: "42601".to_string(),
-        message: message.into(),
-    }
+    DdlError::new("42601", message)
 }
 
 pub(super) fn split_top_level_commas(input: &str) -> Result<Vec<&str>, DdlError> {

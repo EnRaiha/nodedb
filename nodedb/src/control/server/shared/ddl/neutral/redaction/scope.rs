@@ -26,20 +26,19 @@ pub(super) fn authorize_redaction_scope(
     tenant_id_override: Option<u64>,
 ) -> Result<u64, DdlError> {
     if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied: requires superuser or tenant_admin".to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "permission denied: requires superuser or tenant_admin",
+        ));
     }
 
     let own_tenant_id = identity.tenant_id.as_u64();
     let tenant_id = tenant_id_override.unwrap_or(own_tenant_id);
     if tenant_id != own_tenant_id && !identity.is_superuser {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied: cross-tenant redaction administration requires superuser"
-                .to_string(),
-        });
+        return Err(DdlError::new(
+            "42501",
+            "permission denied: cross-tenant redaction administration requires superuser",
+        ));
     }
     Ok(tenant_id)
 }
@@ -72,14 +71,14 @@ pub(super) fn reject_array_collection(
         })
     };
     if is_array {
-        return Err(DdlError {
-            sqlstate: "0A000".to_string(),
-            message: format!(
+        return Err(DdlError::new(
+            "0A000",
+            format!(
                 "'{collection}' is an array: column redaction does not cover array attributes, \
                  whose cells are delivered without a subscriber identity to resolve the policy \
                  role against. Refusing rather than persisting a policy that would never apply."
             ),
-        });
+        ));
     }
     Ok(())
 }

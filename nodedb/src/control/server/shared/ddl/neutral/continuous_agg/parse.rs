@@ -25,10 +25,7 @@ const KW_GROUP_BY: &str = "GROUP BY ";
 const KW_AS: &str = " AS ";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message,
-    }
+    DdlError::new(sqlstate, message)
 }
 
 /// Parse CREATE CONTINUOUS AGGREGATE SQL.
