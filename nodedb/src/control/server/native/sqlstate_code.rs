@@ -32,9 +32,10 @@
 //!
 //! - **Overloaded SQLSTATEs.** `53400` is `QUOTA_OVERCOMMIT`,
 //!   `TENANT_QUOTA_EXCEEDED`, `DATABASE_QUOTA_EXCEEDED` and `SERVER_OVERLOAD`;
-//!   `0A000` is `SQL_NOT_ENABLED`, `CANNOT_DROP_DEFAULT_DATABASE` and
-//!   `CANNOT_CLONE_MIRROR`. A caller that knows which one it is passes the
-//!   code explicitly instead of routing through this table.
+//!   `0A000` is `SQL_NOT_ENABLED` and `CANNOT_CLONE_MIRROR` (the default-
+//!   database drop guard also sends `0A000` but has no numeric code at all).
+//!   A caller that knows which one it is passes the code explicitly instead
+//!   of routing through this table.
 //! - **SQLSTATEs with no NodeDB variant.** `42P07` (duplicate table), `42704`
 //!   (undefined object), `25P02` (aborted transaction), `3B001` (no such
 //!   savepoint). These need new `ErrorCode`/`ErrorDetails` variants to type at

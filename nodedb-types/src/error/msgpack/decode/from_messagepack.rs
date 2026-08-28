@@ -88,6 +88,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (collection,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::CollectionNotFound { collection })
             }
+            TAG_DATABASE_NOT_FOUND => {
+                let (database,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::DatabaseNotFound { database })
+            }
             TAG_DOCUMENT_NOT_FOUND => {
                 let (collection, document_id) = read2_str(reader, field_count)?;
                 Ok(ErrorDetails::DocumentNotFound {
@@ -613,6 +617,9 @@ mod tests {
             },
             ErrorDetails::CollectionNotFound {
                 collection: "users".into(),
+            },
+            ErrorDetails::DatabaseNotFound {
+                database: "tenant_db".into(),
             },
             ErrorDetails::AuthorizationDenied {
                 resource: "orders.*".into(),

@@ -459,29 +459,4 @@ impl NodeDbError {
             cause: None,
         }
     }
-
-    /// Preserve a numeric `ErrorCode` received from a remote node verbatim.
-    ///
-    /// Unlike every other constructor here, the code is a caller-supplied
-    /// argument rather than a fixed `ErrorCode::*` const: this ctor exists
-    /// specifically for cluster RPC replies, where the *remote* node already
-    /// classified the failure (e.g. `CONSTRAINT_VIOLATION`) and the local
-    /// process must relay that classification rather than re-deriving or
-    /// discarding it. There is no dedicated `ErrorDetails` variant for this
-    /// case — the remote code is opaque data at this layer, not a locally
-    /// understood condition — so `details` reuses `Internal` with a
-    /// `"remote"` component tag to keep it machine-matchable without a wider
-    /// `ErrorDetails` ripple.
-    pub fn remote_typed(code: ErrorCode, message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            code,
-            details: ErrorDetails::Internal {
-                component: "remote".into(),
-                detail: message.clone(),
-            },
-            message,
-            cause: None,
-        }
-    }
 }

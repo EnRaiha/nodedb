@@ -127,6 +127,9 @@ impl ToMessagePack for ErrorDetails {
             ErrorDetails::CollectionNotFound { collection } => {
                 write1(writer, TAG_COLLECTION_NOT_FOUND, collection)
             }
+            ErrorDetails::DatabaseNotFound { database } => {
+                write1(writer, TAG_DATABASE_NOT_FOUND, database)
+            }
             ErrorDetails::DocumentNotFound {
                 collection,
                 document_id,

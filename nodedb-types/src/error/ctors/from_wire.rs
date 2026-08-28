@@ -51,126 +51,10 @@ impl NodeDbError {
     }
 }
 
-/// Map a numeric code onto the details variant that carries its category.
+/// Map a numeric code onto the details variant that carries its category,
+/// via the shared [`super::super::code_table`] pairing table.
 fn wire_details(code: ErrorCode, message: &str) -> ErrorDetails {
-    let empty = String::new;
-    match code {
-        // Write path.
-        ErrorCode::CONSTRAINT_VIOLATION => ErrorDetails::ConstraintViolation {
-            collection: empty(),
-        },
-        ErrorCode::WRITE_CONFLICT => ErrorDetails::WriteConflict {
-            collection: empty(),
-            document_id: empty(),
-        },
-        ErrorCode::DEADLINE_EXCEEDED => ErrorDetails::DeadlineExceeded,
-        ErrorCode::PREVALIDATION_REJECTED => ErrorDetails::PrevalidationRejected {
-            constraint: empty(),
-        },
-        ErrorCode::APPEND_ONLY_VIOLATION => ErrorDetails::AppendOnlyViolation {
-            collection: empty(),
-        },
-        ErrorCode::BALANCE_VIOLATION => ErrorDetails::BalanceViolation {
-            collection: empty(),
-        },
-        ErrorCode::PERIOD_LOCKED => ErrorDetails::PeriodLocked {
-            collection: empty(),
-        },
-        ErrorCode::STATE_TRANSITION_VIOLATION => ErrorDetails::StateTransitionViolation {
-            collection: empty(),
-        },
-        ErrorCode::TRANSITION_CHECK_VIOLATION => ErrorDetails::TransitionCheckViolation {
-            collection: empty(),
-        },
-        ErrorCode::RETENTION_VIOLATION => ErrorDetails::RetentionViolation {
-            collection: empty(),
-        },
-        ErrorCode::LEGAL_HOLD_ACTIVE => ErrorDetails::LegalHoldActive {
-            collection: empty(),
-        },
-        ErrorCode::TYPE_MISMATCH => ErrorDetails::TypeMismatch {
-            collection: empty(),
-        },
-        ErrorCode::OVERFLOW => ErrorDetails::Overflow {
-            collection: empty(),
-        },
-        ErrorCode::INSUFFICIENT_BALANCE => ErrorDetails::InsufficientBalance {
-            collection: empty(),
-        },
-        ErrorCode::RATE_EXCEEDED => ErrorDetails::RateExceeded { gate: empty() },
-        ErrorCode::TYPE_GUARD_VIOLATION => ErrorDetails::TypeGuardViolation {
-            collection: empty(),
-        },
-
-        // Read path.
-        ErrorCode::COLLECTION_NOT_FOUND => ErrorDetails::CollectionNotFound {
-            collection: empty(),
-        },
-        ErrorCode::DOCUMENT_NOT_FOUND => ErrorDetails::DocumentNotFound {
-            collection: empty(),
-            document_id: empty(),
-        },
-        ErrorCode::COLLECTION_DRAINING => ErrorDetails::CollectionDraining {
-            collection: empty(),
-        },
-
-        // Query.
-        ErrorCode::PLAN_ERROR => ErrorDetails::PlanError {
-            phase: "remote".into(),
-            detail: message.to_owned(),
-        },
-        ErrorCode::FAN_OUT_EXCEEDED => ErrorDetails::FanOutExceeded {
-            shards_touched: 0,
-            limit: 0,
-        },
-        ErrorCode::SQL_NOT_ENABLED => ErrorDetails::SqlNotEnabled,
-        ErrorCode::UNDEFINED_FUNCTION => ErrorDetails::UndefinedFunction { name: empty() },
-        ErrorCode::DIVISION_BY_ZERO => ErrorDetails::DivisionByZero,
-
-        // Quota.
-        ErrorCode::TENANT_QUOTA_EXCEEDED | ErrorCode::DATABASE_QUOTA_EXCEEDED => {
-            ErrorDetails::QuotaExceeded { scope: empty() }
-        }
-        ErrorCode::SERVER_OVERLOAD => ErrorDetails::ServerOverload,
-
-        // Auth / security.
-        ErrorCode::AUTHORIZATION_DENIED => ErrorDetails::AuthorizationDenied { resource: empty() },
-        ErrorCode::AUTH_EXPIRED => ErrorDetails::AuthExpired,
-
-        // Storage / infrastructure.
-        ErrorCode::STORAGE => ErrorDetails::Storage {
-            component: "remote".into(),
-            op: empty(),
-            detail: message.to_owned(),
-        },
-        ErrorCode::WAL => ErrorDetails::Wal {
-            stage: "remote".into(),
-            detail: message.to_owned(),
-        },
-
-        // Config.
-        ErrorCode::CONFIG => ErrorDetails::Config,
-        ErrorCode::BAD_REQUEST => ErrorDetails::BadRequest,
-
-        // Cluster.
-        ErrorCode::NO_LEADER => ErrorDetails::NoLeader,
-        ErrorCode::NOT_LEADER => ErrorDetails::NotLeader {
-            leader_addr: empty(),
-        },
-        ErrorCode::MIGRATION_IN_PROGRESS => ErrorDetails::MigrationInProgress,
-        ErrorCode::NODE_UNREACHABLE => ErrorDetails::NodeUnreachable,
-        ErrorCode::CLUSTER => ErrorDetails::Cluster,
-
-        // Memory.
-        ErrorCode::MEMORY_EXHAUSTED => ErrorDetails::MemoryExhausted { engine: empty() },
-
-        // Anything this build does not recognise, including the `0` a peer
-        // older than the numeric-code field sends.
-        _ => ErrorDetails::Internal {
-            component: "remote".into(),
-            detail: message.to_owned(),
-        },
-    }
+    super::super::code_table::details_for_code(code, message)
 }
 
 #[cfg(test)]
@@ -207,5 +91,40 @@ mod tests {
         let e = NodeDbError::from_wire(ErrorCode(0), "boom");
         assert!(e.is_internal());
         assert!(e.message().contains("boom"));
+    }
+
+    #[test]
+    fn previously_unmapped_codes_now_survive_the_wire() {
+        for code in [
+            ErrorCode::COLLECTION_DEACTIVATED,
+            ErrorCode::ARRAY,
+            ErrorCode::MOVE_TENANT_DRAIN_TIMEOUT,
+            ErrorCode::MIRROR_READ_ONLY,
+            ErrorCode::BACKUP_KEY_MISMATCH,
+            ErrorCode::HANDSHAKE_FAILED,
+            ErrorCode::ENCRYPTION,
+            ErrorCode::BRIDGE,
+        ] {
+            let e = NodeDbError::from_wire(code, "detail");
+            assert!(
+                !e.is_internal(),
+                "{code} should no longer collapse to Internal"
+            );
+            assert_eq!(e.code(), code);
+        }
+    }
+
+    #[test]
+    fn genuinely_unmapped_codes_still_fall_back_to_internal() {
+        assert!(NodeDbError::from_wire(ErrorCode(65000), "x").is_internal());
+    }
+
+    #[test]
+    fn database_not_found_survives_the_wire() {
+        let e =
+            NodeDbError::from_wire(ErrorCode::DATABASE_NOT_FOUND, "database 'x' does not exist");
+        assert!(matches!(e.details(), ErrorDetails::DatabaseNotFound { .. }));
+        assert!(e.is_not_found());
+        assert_eq!(e.code(), ErrorCode::DATABASE_NOT_FOUND);
     }
 }

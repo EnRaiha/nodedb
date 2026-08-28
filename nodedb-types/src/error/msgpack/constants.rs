@@ -74,6 +74,7 @@
 // |  66 | MirrorNotPromoted         |
 // |  67 | UndefinedFunction         |
 // |  68 | DivisionByZero            |
+// |  71 | DatabaseNotFound          |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -145,3 +146,4 @@ pub(super) const TAG_UNDEFINED_FUNCTION: u16 = 67;
 pub(super) const TAG_DIVISION_BY_ZERO: u16 = 68;
 pub(super) const TAG_BACKUP_TENANT_MISMATCH: u16 = 69;
 pub(super) const TAG_BACKUP_KEY_MISMATCH: u16 = 70;
+pub(super) const TAG_DATABASE_NOT_FOUND: u16 = 71;

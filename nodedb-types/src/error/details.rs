@@ -53,6 +53,9 @@ pub enum ErrorDetails {
     // Read path
     #[serde(rename = "collection_not_found")]
     CollectionNotFound { collection: String },
+    /// The named database does not exist.
+    #[serde(rename = "database_not_found")]
+    DatabaseNotFound { database: String },
     #[serde(rename = "document_not_found")]
     DocumentNotFound {
         collection: String,

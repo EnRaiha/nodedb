@@ -36,8 +36,6 @@ impl ErrorCode {
     pub const COLLECTION_DEACTIVATED: Self = Self(1103);
     /// The named database does not exist.
     pub const DATABASE_NOT_FOUND: Self = Self(1110);
-    /// Attempted to drop the built-in `default` database, which is immutable.
-    pub const CANNOT_DROP_DEFAULT_DATABASE: Self = Self(1111);
 
     // Query (1200–1299)
     pub const PLAN_ERROR: Self = Self(1200);

@@ -11,11 +11,13 @@
 //! - [`from_wire`] — rebuilds a typed error from a numeric code decoded off
 //!   the wire, for the receiving side that no longer holds the context.
 //! - [`backup`] — 1800-range backup/restore envelope errors.
+//! - [`remote_code`] — `RemoteTyped` reconstruction for cluster RPC replies.
 
 pub mod backup;
 pub mod from_wire;
 pub mod mirror;
 pub mod move_tenant;
 pub mod read_query_auth;
+pub mod remote_code;
 pub mod sync_infra;
 pub mod write_path;

@@ -115,7 +115,9 @@ impl NodeDbError {
     pub fn is_not_found(&self) -> bool {
         matches!(
             self.details,
-            ErrorDetails::CollectionNotFound { .. } | ErrorDetails::DocumentNotFound { .. }
+            ErrorDetails::CollectionNotFound { .. }
+                | ErrorDetails::DocumentNotFound { .. }
+                | ErrorDetails::DatabaseNotFound { .. }
         )
     }
     pub fn is_auth_denied(&self) -> bool {

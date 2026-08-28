@@ -40,6 +40,7 @@
 //! | 9000–9099   | Internal      |
 
 pub mod code;
+pub mod code_table;
 pub mod ctors;
 pub mod details;
 pub mod msgpack;
