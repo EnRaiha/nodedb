@@ -99,6 +99,7 @@ pub(super) async fn try_typed(
                 rules,
                 if_not_exists: *if_not_exists,
                 tenant_id_override: *tenant_id_override,
+                database_id,
             },
         )),
 
@@ -110,6 +111,7 @@ pub(super) async fn try_typed(
         }) => Some(redaction::drop_redaction_policy(
             state,
             identity,
+            database_id,
             collection,
             for_role,
             *if_exists,
@@ -122,6 +124,7 @@ pub(super) async fn try_typed(
         }) => Some(redaction::show_redaction_policies(
             state,
             identity,
+            database_id,
             collection.as_deref(),
             *tenant_id_override,
         )),

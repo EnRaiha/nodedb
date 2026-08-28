@@ -12,8 +12,10 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::StoredRedactionPolicy;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 pub fn put(stored: StoredRedactionPolicy, shared: Arc<SharedState>) {
     match stored.to_runtime() {
@@ -46,10 +48,18 @@ pub fn put(stored: StoredRedactionPolicy, shared: Arc<SharedState>) {
 /// (and refusing aggregates over) columns nobody asked to protect. Called from
 /// the shared `PurgeCollection` reclaim path, so it runs on every node and on
 /// the single-node inline purge alike.
-pub fn purge_for_collection(shared: &SharedState, tenant_id: u64, collection: &str) {
+pub fn purge_for_collection(
+    shared: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: u64,
+    collection: &str,
+) {
     let catalog = shared.credentials.catalog();
     let roles = match crate::control::cascade::redaction::find_redaction_policies_on(
-        catalog, tenant_id, collection,
+        catalog,
+        database_id,
+        tenant_id,
+        collection,
     ) {
         Ok(roles) => roles,
         Err(e) => {
@@ -62,8 +72,10 @@ pub fn purge_for_collection(shared: &SharedState, tenant_id: u64, collection: &s
             return;
         }
     };
+    let qualified_collection = db_qualified(database_id, collection);
     for for_role in roles {
-        if let Err(e) = catalog.delete_redaction_policy(tenant_id, collection, &for_role) {
+        if let Err(e) = catalog.delete_redaction_policy(tenant_id, &qualified_collection, &for_role)
+        {
             warn!(
                 collection = %collection,
                 for_role = %for_role,
@@ -72,9 +84,11 @@ pub fn purge_for_collection(shared: &SharedState, tenant_id: u64, collection: &s
                 "post_apply: redaction policy row delete failed on collection purge"
             );
         }
-        shared
-            .redaction
-            .install_replicated_drop_policy(tenant_id, collection, &for_role);
+        shared.redaction.install_replicated_drop_policy(
+            tenant_id,
+            &qualified_collection,
+            &for_role,
+        );
     }
 }
 

@@ -10,11 +10,13 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::redaction::RedactionMode;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::scope::{authorize_redaction_scope, status};
@@ -24,16 +26,18 @@ use super::scope::{authorize_redaction_scope, status};
 pub fn drop_redaction_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     for_role: &str,
     if_exists: bool,
     tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = authorize_redaction_scope(identity, tenant_id_override)?;
+    let qualified_collection = db_qualified(database_id, collection);
 
     if !state
         .redaction
-        .policy_exists(tenant_id, collection, for_role)
+        .policy_exists(tenant_id, &qualified_collection, for_role)
     {
         if if_exists {
             return Ok(status("DROP REDACTION POLICY"));
@@ -46,7 +50,7 @@ pub fn drop_redaction_policy(
 
     let entry = CatalogEntry::DeleteRedactionPolicy {
         tenant_id,
-        collection: collection.to_string(),
+        collection: qualified_collection.clone(),
         for_role: for_role.to_string(),
     };
     let outcome = propose_catalog_entry(state, &entry)
@@ -55,12 +59,12 @@ pub fn drop_redaction_policy(
         {
             let catalog = state.credentials.catalog();
             catalog
-                .delete_redaction_policy(tenant_id, collection, for_role)
+                .delete_redaction_policy(tenant_id, &qualified_collection, for_role)
                 .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
         }
         state
             .redaction
-            .install_replicated_drop_policy(tenant_id, collection, for_role);
+            .install_replicated_drop_policy(tenant_id, &qualified_collection, for_role);
     }
 
     state.audit_record(
@@ -77,13 +81,16 @@ pub fn drop_redaction_policy(
 pub fn show_redaction_policies(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: Option<&str>,
     tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = authorize_redaction_scope(identity, tenant_id_override)?;
 
     let policies = match collection {
-        Some(coll) => state.redaction.policies_for_collection(tenant_id, coll),
+        Some(coll) => state
+            .redaction
+            .policies_for_collection(tenant_id, &db_qualified(database_id, coll)),
         None => state.redaction.policies_for_tenant(tenant_id),
     };
 
@@ -112,7 +119,7 @@ pub fn show_redaction_policies(
         row.insert("name".to_string(), JsonValue::String(policy.name.clone()));
         row.insert(
             "collection".to_string(),
-            JsonValue::String(policy.collection.clone()),
+            JsonValue::String(policy.display_collection.clone()),
         );
         row.insert(
             "for_role".to_string(),

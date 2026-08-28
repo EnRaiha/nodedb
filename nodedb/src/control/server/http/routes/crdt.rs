@@ -150,10 +150,18 @@ pub async fn crdt_apply(
     // — lost to followers and entirely on leader failover. This handler is scoped
     // to the default database (matching its surrogate assignment above).
     let _request = state.shared.tenant_request_guard(identity.tenant_id);
+    // RLS write policies are stored keyed by `db_qualified(database_id,
+    // collection)`; this handler is pinned to `DatabaseId::DEFAULT`, for which
+    // qualification is the identity transform, but the policy is handed the
+    // qualified key regardless so this call matches every other admission site.
+    let qualified_collection = crate::control::planner::sql_plan_convert::convert::db_qualified(
+        crate::types::DatabaseId::DEFAULT,
+        &collection,
+    );
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         identity.tenant_id,
         crate::types::DatabaseId::DEFAULT,
-        &collection,
+        &qualified_collection,
         &identity,
         "http".into(),
         &state.shared.rls,

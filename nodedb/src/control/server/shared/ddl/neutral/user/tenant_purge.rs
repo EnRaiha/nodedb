@@ -41,7 +41,13 @@ pub(super) fn purge_owned_for_tenant_teardown(
                 crate::types::DatabaseId::new(owner.database_id),
                 &owner.object_name,
             )?;
-            purge_collection_redaction_policies(state, catalog, tenant, &owner.object_name)?;
+            purge_collection_redaction_policies(
+                state,
+                catalog,
+                tenant,
+                crate::types::DatabaseId::new(owner.database_id),
+                &owner.object_name,
+            )?;
         }
         let entry = teardown_delete_entry(kind, tenant, &owner);
         let outcome = propose(state, &entry)?;
@@ -146,17 +152,25 @@ fn purge_collection_redaction_policies(
     state: &SharedState,
     catalog: &SystemCatalog,
     tenant: TenantId,
+    database_id: crate::types::DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
     let tenant_id = tenant.as_u64();
+    // Redaction policies are keyed by `db_qualified(database_id, collection)`,
+    // not the bare collection name the owner catalog carries — match on that.
+    let qualified_collection =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection);
     let roles = crate::control::cascade::redaction::find_redaction_policies_on(
-        catalog, tenant_id, collection,
+        catalog,
+        database_id,
+        tenant_id,
+        collection,
     )
     .map_err(|e| ddl_err(format!("load redaction policies: {e}")))?;
     for for_role in roles {
         let entry = CatalogEntry::DeleteRedactionPolicy {
             tenant_id,
-            collection: collection.to_string(),
+            collection: qualified_collection.clone(),
             for_role: for_role.clone(),
         };
         let outcome = propose(state, &entry)?;
@@ -164,9 +178,11 @@ fn purge_collection_redaction_policies(
             state, &entry, outcome,
         );
         if outcome.needs_local_apply() {
-            state
-                .redaction
-                .install_replicated_drop_policy(tenant_id, collection, &for_role);
+            state.redaction.install_replicated_drop_policy(
+                tenant_id,
+                &qualified_collection,
+                &for_role,
+            );
         }
     }
     Ok(())

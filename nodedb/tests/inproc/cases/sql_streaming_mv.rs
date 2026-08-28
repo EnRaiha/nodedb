@@ -129,6 +129,7 @@ fn install_mask(server: &TestServer, collection: &str, field: &str) {
     let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
         tenant_id: TENANT_ID,
         collection: collection.to_string(),
+        display_collection: collection.to_string(),
         for_role: "support".to_string(),
         name: format!("mask_{collection}_{field}"),
         rules_json: format!(r#"[{{"field":"{field}","mode":{{"Mask":"***"}}}}]"#),

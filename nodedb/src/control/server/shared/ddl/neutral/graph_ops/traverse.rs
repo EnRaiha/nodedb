@@ -102,9 +102,12 @@ fn authorize_traversal(
 
     // Column redaction is refused here for the same reason and on the same
     // seam: the traversal returns topology, so there are no stored columns in
-    // its result for the redaction hook to mask.
+    // its result for the redaction hook to mask. Redaction policies are
+    // stored keyed by `db_qualified(database_id, collection)`, so the lookup
+    // must use the same key or it silently misses a policy on a non-default
+    // database (and collides with a same-named collection on another one).
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_collection(
-        collection,
+        &crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection),
         gate.tenant_id(),
         gate.auth(),
         &state.redaction,

@@ -306,6 +306,7 @@ mod tests {
             name: format!("{collection}_{role}_{field}"),
             tenant_id: TENANT,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: role.into(),
             rules: vec![RedactionRule {
                 field: field.into(),

@@ -26,10 +26,22 @@ pub(super) const REDACTION_POLICIES: TableDefinition<&str, &[u8]> =
 /// Catalog-shape redaction policy. `rules_json` is the sonic_rs-encoded
 /// version of the runtime `Vec<RedactionRule>` so zerompk can derive the
 /// encoder for the rest of the record.
+///
+/// Map-encoded (`#[msgpack(map)]`) so `display_collection` could be added
+/// with `#[msgpack(default)]`: records written before that field decode
+/// with `display_collection = ""` instead of failing outright.
 #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack, Debug, Clone)]
+#[msgpack(map)]
 pub struct StoredRedactionPolicy {
     pub tenant_id: u64,
+    /// `db_qualified` collection — the storage/lookup key. Never shown to a
+    /// user; see `display_collection`.
     pub collection: String,
+    /// The collection name as the user wrote it, unqualified. Display-only:
+    /// falls back to `collection` when empty (records written before this
+    /// field existed).
+    #[msgpack(default)]
+    pub display_collection: String,
     pub for_role: String,
     pub name: String,
     /// JSON-serialized `Vec<RedactionRule>`.
@@ -43,6 +55,7 @@ impl StoredRedactionPolicy {
         Ok(Self {
             tenant_id: p.tenant_id,
             collection: p.collection.clone(),
+            display_collection: p.display_collection.clone(),
             for_role: p.for_role.clone(),
             name: p.name.clone(),
             rules_json,
@@ -52,10 +65,18 @@ impl StoredRedactionPolicy {
     pub fn to_runtime(&self) -> crate::Result<RedactionPolicy> {
         let rules: Vec<RedactionRule> = sonic_rs::from_str(&self.rules_json)
             .map_err(|e| catalog_err("deser redaction rules", e))?;
+        // Records written before `display_collection` existed decode it
+        // empty; fall back to `collection`, which was unqualified then.
+        let display_collection = if self.display_collection.is_empty() {
+            self.collection.clone()
+        } else {
+            self.display_collection.clone()
+        };
         Ok(RedactionPolicy {
             name: self.name.clone(),
             tenant_id: self.tenant_id,
             collection: self.collection.clone(),
+            display_collection,
             for_role: self.for_role.clone(),
             rules,
         })
@@ -184,6 +205,7 @@ mod tests {
             name: format!("policy_{for_role}"),
             tenant_id,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: for_role.into(),
             rules: vec![
                 RedactionRule {

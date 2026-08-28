@@ -239,6 +239,7 @@ async fn redaction_policy_orphan_refuses_startup() {
     let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
         tenant_id: 1,
         collection: "users".to_string(),
+        display_collection: "users".to_string(),
         for_role: "support".to_string(),
         name: "mask_pii".to_string(),
         rules_json: "[]".to_string(),
@@ -267,6 +268,7 @@ async fn redaction_policy_value_mismatch_detected() {
     let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
         tenant_id: 1,
         collection: "users".to_string(),
+        display_collection: "users".to_string(),
         for_role: "support".to_string(),
         name: "mask_pii".to_string(),
         rules_json: r#"[{"field":"email","mode":{"Mask":"***"}}]"#.to_string(),
@@ -301,6 +303,7 @@ async fn redaction_policy_mode_change_detected_at_same_rule_count() {
     let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
         tenant_id: 1,
         collection: "users".to_string(),
+        display_collection: "users".to_string(),
         for_role: "support".to_string(),
         name: "mask_pii".to_string(),
         rules_json: r#"[{"field":"email","mode":{"Mask":"***@***.com"}}]"#.to_string(),
@@ -653,6 +656,7 @@ async fn redaction_policy_survives_restart_via_boot_load() {
         let stored = StoredRedactionPolicy {
             tenant_id: 1,
             collection: "users".to_string(),
+            display_collection: "users".to_string(),
             for_role: "support".to_string(),
             name: "mask_pii".to_string(),
             rules_json: "[]".to_string(),

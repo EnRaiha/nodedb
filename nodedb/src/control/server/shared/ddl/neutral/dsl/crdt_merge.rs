@@ -135,10 +135,18 @@ pub async fn crdt_merge(
 
     // Route the merge result through the Raft proposer gate so the applied delta
     // is quorum-durable under replication, not lost to followers on failover.
+    //
+    // RLS write policies are stored keyed by `db_qualified(database_id,
+    // collection)`, so the policy is handed that same key or it silently
+    // misses a policy on a non-default database. `collection` itself stays
+    // bare: it also feeds vShard routing and the admission request's equality
+    // check against this same (unqualified) plan.
+    let qualified_collection =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection);
     let policy = ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         database_id,
-        collection,
+        &qualified_collection,
         identity,
         "sql".into(),
         &state.rls,

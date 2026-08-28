@@ -12,11 +12,13 @@ use nodedb_sql::ddl_ast::statement::RedactionRuleSpec;
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredRedactionPolicy;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::redaction::{RedactionMode, RedactionPolicy, RedactionRule};
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::scope::{authorize_redaction_scope, reject_array_collection, status};
@@ -31,6 +33,10 @@ pub struct CreateRedactionPolicyRequest<'a> {
     pub rules: &'a [RedactionRuleSpec],
     pub if_not_exists: bool,
     pub tenant_id_override: Option<u64>,
+    /// Database the statement ran against. Column redaction is enforced
+    /// against `db_qualified(database_id, collection)` (the same key
+    /// physical plan ops carry), so the policy must be stored there too.
+    pub database_id: DatabaseId,
 }
 
 /// Translate the AST rule specs into runtime [`RedactionRule`]s.
@@ -86,9 +92,15 @@ pub fn create_redaction_policy(
         rules,
         if_not_exists,
         tenant_id_override,
+        database_id,
     } = *req;
     let tenant_id = authorize_redaction_scope(identity, tenant_id_override)?;
     reject_array_collection(state, tenant_id, collection)?;
+
+    // Store and key under the same qualified name enforcement looks up
+    // (`db_qualified`, applied to every op's `collection` field). Keep the
+    // bare, user-typed name only for display (`SHOW REDACTION POLICIES`).
+    let qualified_collection = db_qualified(database_id, collection);
 
     let rules = compile_rules(rules)?;
     let rule_count = rules.len();
@@ -97,7 +109,7 @@ pub fn create_redaction_policy(
     // SQLSTATE instead of going through raft only to be a silent overwrite.
     if state
         .redaction
-        .policy_exists(tenant_id, collection, for_role)
+        .policy_exists(tenant_id, &qualified_collection, for_role)
     {
         if if_not_exists {
             return Ok(status("CREATE REDACTION POLICY"));
@@ -111,7 +123,8 @@ pub fn create_redaction_policy(
     let policy = RedactionPolicy {
         name: name.to_string(),
         tenant_id,
-        collection: collection.to_string(),
+        collection: qualified_collection,
+        display_collection: collection.to_string(),
         for_role: for_role.to_string(),
         rules,
     };

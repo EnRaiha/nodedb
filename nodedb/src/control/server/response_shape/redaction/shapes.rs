@@ -329,6 +329,7 @@ mod tests {
             name: format!("{collection}_{role}_{field}"),
             tenant_id: 1,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: role.into(),
             rules: vec![RedactionRule {
                 field: field.into(),
@@ -547,6 +548,7 @@ mod tests {
             name: "cache_support_value".into(),
             tenant_id: 1,
             collection: "cache".into(),
+            display_collection: "cache".into(),
             for_role: "support".into(),
             rules: vec![RedactionRule {
                 field: "value".into(),

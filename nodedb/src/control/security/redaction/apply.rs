@@ -166,6 +166,7 @@ mod tests {
             name: format!("{collection}_{role}"),
             tenant_id: 1,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: role.into(),
             rules,
         });

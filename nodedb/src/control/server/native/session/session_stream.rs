@@ -379,6 +379,7 @@ mod tests {
             name: "mask_id".into(),
             tenant_id: 1,
             collection: "docs".into(),
+            display_collection: "docs".into(),
             for_role: "support".into(),
             rules: vec![RedactionRule {
                 field: "id".into(),

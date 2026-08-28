@@ -288,6 +288,7 @@ mod tests {
             name: name.into(),
             tenant_id,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: for_role.into(),
             rules,
         }

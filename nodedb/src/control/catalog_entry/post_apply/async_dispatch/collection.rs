@@ -91,7 +91,10 @@ pub(crate) async fn reclaim_collection_storage(
     // no collection generation, so a survivor would re-attach to a same-name
     // collection created later and redact columns nobody protected.
     crate::control::catalog_entry::post_apply::redaction::purge_for_collection(
-        shared, tenant_id, name,
+        shared,
+        DatabaseId::new(database_id),
+        tenant_id,
+        name,
     );
 
     // 2. Append to local WAL. Both durable tombstone surfaces are required

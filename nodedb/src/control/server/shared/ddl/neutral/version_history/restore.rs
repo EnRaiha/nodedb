@@ -64,10 +64,17 @@ pub async fn restore_version(
         .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    // RLS write policies are stored keyed by `db_qualified(database_id,
+    // collection)`, so the policy is handed that same key or it silently
+    // misses a policy on a non-default database. `collection` itself stays
+    // bare: it feeds vShard routing and the restore-op collection field the
+    // admission workflow builds internally, which must stay self-consistent.
+    let qualified_collection =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, &collection);
     let policy = ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         database_id,
-        &collection,
+        &qualified_collection,
         identity,
         "sql".into(),
         &state.rls,

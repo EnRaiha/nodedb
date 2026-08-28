@@ -127,10 +127,19 @@ async fn dispatch_external_crdt_apply(
     .ok_or_else(|| crate::Error::Internal {
         detail: "authorization returned no capability".into(),
     })?;
+    // RLS write policies are stored keyed by `db_qualified(database_id,
+    // collection)`, so the policy is handed that same key or it silently
+    // misses a policy on a non-default database. `collection` itself stays
+    // bare here: it also feeds the admission request's catalog lookup and its
+    // equality check against this same (unqualified) plan, and vShard routing.
+    let qualified_collection = crate::control::planner::sql_plan_convert::convert::db_qualified(
+        ctx.database_id(),
+        &collection,
+    );
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         ctx.database_id(),
-        &collection,
+        &qualified_collection,
         ctx.identity,
         "native".into(),
         &ctx.state.rls,

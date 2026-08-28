@@ -12,8 +12,13 @@ pub struct RedactionPolicy {
     pub name: String,
     /// Tenant scope.
     pub tenant_id: u64,
-    /// Collection this policy applies to.
+    /// Collection this policy applies to, `db_qualified` — the same key
+    /// physical plan ops carry, so lookups against a plan's collection field
+    /// match regardless of which database it was created in.
     pub collection: String,
+    /// The bare, user-typed collection name, for `SHOW REDACTION POLICIES`
+    /// output — a user must never see the internal `{db_id}/{name}` form.
+    pub display_collection: String,
     /// Role this policy applies to (e.g., "support").
     pub for_role: String,
     /// Field → redaction rule.

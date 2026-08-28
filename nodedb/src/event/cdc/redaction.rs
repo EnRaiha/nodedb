@@ -360,6 +360,7 @@ mod tests {
             name: format!("{collection}_{role}_{field}"),
             tenant_id: 1,
             collection: collection.into(),
+            display_collection: collection.into(),
             for_role: role.into(),
             rules: vec![RedactionRule {
                 field: field.into(),
@@ -745,6 +746,7 @@ mod tests {
             name: "users_support_email".into(),
             tenant_id: 1,
             collection: "users".into(),
+            display_collection: "users".into(),
             for_role: "support".into(),
             rules: vec![RedactionRule {
                 field: "email".into(),

@@ -14,6 +14,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
@@ -205,10 +206,15 @@ pub async fn crdt_apply(
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving
     // node only — it would be lost to every follower and entirely on failover.
+    //
+    // RLS write policies are stored keyed by `db_qualified(database_id,
+    // collection)`, so the policy must be handed that same key or it silently
+    // misses a policy on a non-default database.
+    let qualified_collection = db_qualified(database_id, collection);
     let policy = ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         database_id,
-        collection,
+        &qualified_collection,
         identity,
         "sql".into(),
         &state.rls,
