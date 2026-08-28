@@ -26,10 +26,9 @@ pub(super) fn log_vector_fields(collection_name: &str, fields: &[(String, String
     }
 }
 
-/// Materialise one `StoredSequence` per `SERIAL` column declared on
-/// the new collection. Each sequence rides the same propose+apply
-/// path as a standalone `CREATE SEQUENCE` so the OWNERS row lands
-/// alongside it.
+/// Materialise one `StoredSequence` per `SERIAL` column, via the same
+/// propose+apply path as `CREATE SEQUENCE`, gated the same way: shared-registry
+/// install only on `needs_local_apply`, so a `Buffered` outcome cannot leak it.
 pub(super) fn create_serial_sequences(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -51,8 +50,10 @@ pub(super) fn create_serial_sequences(
         // SEQUENCE has, applied to SERIAL columns.
         let seq_entry =
             crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(seq_def.clone()));
-        propose_and_apply(state, &seq_entry)?;
-        let _ = state.sequence_registry.create(seq_def);
+        let outcome = propose_and_apply(state, &seq_entry)?;
+        if outcome.needs_local_apply() {
+            let _ = state.sequence_registry.create(seq_def);
+        }
         tracing::info!(
             collection = %collection_name,
             field = %field_name,

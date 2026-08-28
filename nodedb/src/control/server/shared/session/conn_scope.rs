@@ -13,12 +13,17 @@ use std::future::Future;
 
 use super::audit_context::AuditCtx;
 use super::ddl_buffer::DdlBuffer;
+use super::ephemeral_sequence::EphemeralSequences;
 
 /// Per-connection session slots. Each field is owned by its own module, which
 /// exposes the accessors; nothing outside reaches through this struct.
 pub(super) struct ConnScope {
     pub(super) ddl_buffer: RefCell<Option<DdlBuffer>>,
     pub(super) audit: RefCell<Option<AuditCtx>>,
+    /// Sequences materialized from this connection's own buffered `CREATE
+    /// SEQUENCE`, not yet visible in the shared registry. See
+    /// `ephemeral_sequence` and `control::sequence::ddl_overlay`.
+    pub(super) ephemeral_sequences: RefCell<EphemeralSequences>,
 }
 
 impl ConnScope {
@@ -26,6 +31,7 @@ impl ConnScope {
         Self {
             ddl_buffer: RefCell::new(None),
             audit: RefCell::new(None),
+            ephemeral_sequences: RefCell::new(EphemeralSequences::new()),
         }
     }
 }

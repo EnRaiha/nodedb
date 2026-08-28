@@ -34,7 +34,29 @@ impl SystemCatalog {
     pub fn get_trigger(&self, tenant_id: u64, name: &str) -> crate::Result<Option<StoredTrigger>> {
         self.get_trigger_in_database(DatabaseId::DEFAULT, tenant_id, name)
     }
+    /// Get a trigger in an exact database scope, with the calling
+    /// connection's buffered transactional DDL merged in — a `CREATE
+    /// TRIGGER` this same transaction has buffered but not yet committed
+    /// resolves here too.
     pub fn get_trigger_in_database(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredTrigger>> {
+        let committed = self.get_committed_trigger_in_database(database_id, tenant_id, name)?;
+        Ok(crate::control::catalog_overlay::resolve_trigger(
+            database_id,
+            tenant_id,
+            name,
+            committed,
+        ))
+    }
+
+    /// Committed-only read, bypassing the transaction DDL overlay. The
+    /// descriptor stamper reads through this — see
+    /// `get_committed_collection` for why.
+    pub fn get_committed_trigger_in_database(
         &self,
         database_id: DatabaseId,
         tenant_id: u64,

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Uncommitted-DDL overlay over the committed system catalog.
+//! Uncommitted-DDL overlay for collections.
 //!
 //! DDL inside an explicit transaction is buffered per connection and lands in
 //! the catalog only at COMMIT. Without an overlay every later statement in that
 //! same transaction resolves names against the committed catalog and misses its
-//! own `CREATE`. This module replays the connection's buffered entries over a
-//! committed catalog read, so the transaction sees its own DDL in statement
-//! order while every other session still sees only committed state.
+//! own `CREATE`. [`resolve_collection`] replays the connection's buffered
+//! entries over a committed catalog read, so the transaction sees its own DDL
+//! in statement order while every other session still sees only committed
+//! state.
 //!
 //! The overlay is derived from the buffer, never a second copy of it: ROLLBACK
 //! discards the buffer and the overlay vanishes with it, and COMMIT takes the
@@ -69,27 +70,11 @@ pub fn resolve_collection(
     name: &str,
     committed: Option<StoredCollection>,
 ) -> Option<StoredCollection> {
-    let overlaid = ddl_buffer::with_buffered(|buffered| {
-        let mut touched = false;
-        let mut current = None;
-        for item in buffered {
-            if !targets(&item.entry, database_id, tenant_id, name) {
-                continue;
-            }
-            if !touched {
-                // Cloned only once the name is actually buffered, so an
-                // untouched name pays nothing beyond the scan.
-                current = committed.clone();
-                touched = true;
-            }
-            current = step(current, &item.entry);
-        }
-        touched.then_some(current)
-    });
-    match overlaid {
-        Some(Some(resolved)) => resolved,
-        Some(None) | None => committed,
-    }
+    super::core::resolve(
+        committed,
+        |entry| targets(entry, database_id, tenant_id, name),
+        step,
+    )
 }
 
 /// Merge this connection's uncommitted DDL into a committed tenant listing.

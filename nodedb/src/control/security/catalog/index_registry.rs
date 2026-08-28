@@ -43,8 +43,26 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
-    /// Read one index record by name.
+    /// Read one index record by name, with the calling connection's buffered
+    /// transactional DDL merged in — a `CREATE INDEX` this same transaction
+    /// has buffered but not yet committed resolves here too.
     pub fn get_index_record(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredIndexRecord>> {
+        let committed = self.get_committed_index_record(database_id, tenant_id, name)?;
+        Ok(crate::control::catalog_overlay::resolve_index_record(
+            database_id,
+            tenant_id,
+            name,
+            committed,
+        ))
+    }
+
+    /// Committed-only read, bypassing the transaction DDL overlay.
+    pub fn get_committed_index_record(
         &self,
         database_id: u64,
         tenant_id: u64,

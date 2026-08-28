@@ -108,8 +108,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutCollectionIfAbsent(stored)
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
+            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
-                .get_materialized_view(stored.tenant_id, &stored.name)
+                .get_committed_materialized_view(stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|v| v.descriptor_version)
@@ -119,8 +120,13 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutMaterializedView(stored)
         }
         CatalogEntry::PutFunction(mut stored) => {
+            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
-                .get_function_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .get_committed_function_in_database(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                )
                 .ok()
                 .flatten()
                 .map(|f| f.descriptor_version)
@@ -130,8 +136,13 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutFunction(stored)
         }
         CatalogEntry::PutProcedure(mut stored) => {
+            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
-                .get_procedure_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .get_committed_procedure_in_database(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                )
                 .ok()
                 .flatten()
                 .map(|p| p.descriptor_version)
@@ -141,8 +152,13 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutProcedure(stored)
         }
         CatalogEntry::PutTrigger(mut stored) => {
+            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
-                .get_trigger_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .get_committed_trigger_in_database(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                )
                 .ok()
                 .flatten()
                 .map(|t| t.descriptor_version)

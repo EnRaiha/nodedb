@@ -79,7 +79,9 @@ pub fn with_buffered<T>(f: impl FnOnce(&[BufferedDdl]) -> T) -> Option<T> {
 /// Take the accumulated buffer contents and deactivate. Returns
 /// `None` if the buffer was never activated.
 pub fn take() -> Option<DdlBuffer> {
-    with_slot(None, |b| b.borrow_mut().take())
+    let taken = with_slot(None, |b| b.borrow_mut().take());
+    super::ephemeral_sequence::clear();
+    taken
 }
 
 /// Deactivate and discard the buffer without returning its contents.
@@ -87,6 +89,7 @@ pub fn discard() {
     with_slot((), |b| {
         let _ = b.borrow_mut().take();
     });
+    super::ephemeral_sequence::clear();
 }
 
 /// Returns `true` if a DDL buffer is currently active on this connection.
@@ -108,6 +111,7 @@ pub fn truncate(len: usize) {
             buf.truncate(len);
         }
     });
+    super::ephemeral_sequence::clear();
 }
 
 #[cfg(test)]

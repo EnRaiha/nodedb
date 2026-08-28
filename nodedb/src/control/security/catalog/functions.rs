@@ -171,9 +171,30 @@ impl SystemCatalog {
         self.get_function_in_database(DatabaseId::DEFAULT, tenant_id, name)
     }
 
-    /// Get a function in an exact database scope. DEFAULT also reads legacy
-    /// tenant/name records, whose missing database field decodes as DEFAULT.
+    /// Get a function in an exact database scope, with the calling
+    /// connection's buffered transactional DDL merged in — a `CREATE
+    /// FUNCTION` this same transaction has buffered but not yet committed
+    /// resolves here too. DEFAULT also reads legacy tenant/name records,
+    /// whose missing database field decodes as DEFAULT.
     pub fn get_function_in_database(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredFunction>> {
+        let committed = self.get_committed_function_in_database(database_id, tenant_id, name)?;
+        Ok(crate::control::catalog_overlay::resolve_function(
+            database_id,
+            tenant_id,
+            name,
+            committed,
+        ))
+    }
+
+    /// Committed-only read, bypassing the transaction DDL overlay. The
+    /// descriptor stamper reads through this — see
+    /// `get_committed_collection` for why.
+    pub fn get_committed_function_in_database(
         &self,
         database_id: DatabaseId,
         tenant_id: u64,

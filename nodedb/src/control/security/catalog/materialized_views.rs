@@ -26,8 +26,25 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
-    /// Get a materialized view by name.
+    /// Get a materialized view by name, with the calling connection's
+    /// buffered transactional DDL merged in — a `CREATE MATERIALIZED VIEW`
+    /// this same transaction has buffered but not yet committed resolves
+    /// here too.
     pub fn get_materialized_view(
+        &self,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredMaterializedView>> {
+        let committed = self.get_committed_materialized_view(tenant_id, name)?;
+        Ok(crate::control::catalog_overlay::resolve_materialized_view(
+            tenant_id, name, committed,
+        ))
+    }
+
+    /// Committed-only read, bypassing the transaction DDL overlay. The
+    /// descriptor stamper reads through this — see
+    /// `get_committed_collection` for why.
+    pub fn get_committed_materialized_view(
         &self,
         tenant_id: u64,
         name: &str,

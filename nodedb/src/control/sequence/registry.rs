@@ -90,18 +90,28 @@ impl SequenceRegistry {
     }
 
     /// Get the next value from a sequence (lock-free on the hot path).
+    ///
+    /// Falls back to this connection's ephemeral overlay (see
+    /// `ddl_overlay::resolve`) when the shared map has no entry yet — a
+    /// `CREATE SEQUENCE` this same transaction has buffered but not
+    /// committed.
     pub fn nextval(&self, tenant_id: u64, name: &str) -> Result<i64, SequenceError> {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
-
-        let handle = map.get(&key).ok_or_else(|| SequenceError::NotFound {
-            name: name.to_string(),
-        })?;
-
-        // Check period reset before advancing.
-        self.check_period_reset(handle);
-
-        handle.nextval()
+        if let Some(handle) = map.get(&key) {
+            self.check_period_reset(handle);
+            return handle.nextval();
+        }
+        drop(map);
+        super::ddl_overlay::resolve(tenant_id, name, |handle| {
+            self.check_period_reset(handle);
+            handle.nextval()
+        })
+        .unwrap_or_else(|| {
+            Err(SequenceError::NotFound {
+                name: name.to_string(),
+            })
+        })
     }
 
     /// Get the next value, returning a formatted string if format is defined.
@@ -117,23 +127,42 @@ impl SequenceRegistry {
     ) -> Result<SequenceValue, SequenceError> {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(handle) = map.get(&key) {
+            self.check_period_reset(handle);
+            let raw = handle.nextval()?;
+            return Ok(Self::format_nextval(handle, raw, tenant_code, session_vars));
+        }
+        drop(map);
+        super::ddl_overlay::resolve(
+            tenant_id,
+            name,
+            |handle| -> Result<SequenceValue, SequenceError> {
+                self.check_period_reset(handle);
+                let raw = handle.nextval()?;
+                Ok(Self::format_nextval(handle, raw, tenant_code, session_vars))
+            },
+        )
+        .unwrap_or_else(|| {
+            Err(SequenceError::NotFound {
+                name: name.to_string(),
+            })
+        })
+    }
 
-        let handle = map.get(&key).ok_or_else(|| SequenceError::NotFound {
-            name: name.to_string(),
-        })?;
-
-        // Check period reset before advancing.
-        self.check_period_reset(handle);
-
-        let raw = handle.nextval()?;
-
+    /// Format a freshly-advanced `raw` value per `handle`'s `FORMAT` template,
+    /// or return it unformatted when the sequence has none.
+    fn format_nextval(
+        handle: &SequenceHandle,
+        raw: i64,
+        tenant_code: &str,
+        session_vars: &std::collections::HashMap<String, String>,
+    ) -> SequenceValue {
         match &handle.def.format_template {
             Some(tokens) => {
                 let ctx = FormatContext::now(raw, tenant_code, session_vars);
-                let formatted = format::format_sequence_value(tokens, &ctx);
-                Ok(SequenceValue::Formatted(formatted))
+                SequenceValue::Formatted(format::format_sequence_value(tokens, &ctx))
             }
-            None => Ok(SequenceValue::Int(raw)),
+            None => SequenceValue::Int(raw),
         }
     }
 
@@ -196,24 +225,32 @@ impl SequenceRegistry {
     pub fn currval(&self, tenant_id: u64, name: &str) -> Result<i64, SequenceError> {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
-
-        let handle = map.get(&key).ok_or_else(|| SequenceError::NotFound {
-            name: name.to_string(),
-        })?;
-
-        handle.currval()
+        if let Some(handle) = map.get(&key) {
+            return handle.currval();
+        }
+        drop(map);
+        super::ddl_overlay::resolve(tenant_id, name, SequenceHandle::currval).unwrap_or_else(|| {
+            Err(SequenceError::NotFound {
+                name: name.to_string(),
+            })
+        })
     }
 
     /// Set the counter to a specific value.
     pub fn setval(&self, tenant_id: u64, name: &str, value: i64) -> Result<i64, SequenceError> {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
-
-        let handle = map.get(&key).ok_or_else(|| SequenceError::NotFound {
-            name: name.to_string(),
-        })?;
-
-        handle.setval(value)
+        if let Some(handle) = map.get(&key) {
+            return handle.setval(value);
+        }
+        drop(map);
+        super::ddl_overlay::resolve(tenant_id, name, |handle| handle.setval(value)).unwrap_or_else(
+            || {
+                Err(SequenceError::NotFound {
+                    name: name.to_string(),
+                })
+            },
+        )
     }
 
     /// Restart a sequence at a new value (ALTER SEQUENCE ... RESTART WITH).
@@ -281,18 +318,28 @@ impl SequenceRegistry {
         self.sequences.read().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Check if a sequence exists.
+    /// Check if a sequence exists, including one this connection has
+    /// buffered a not-yet-committed `CREATE SEQUENCE` for.
     pub fn exists(&self, tenant_id: u64, name: &str) -> bool {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
-        map.contains_key(&key)
+        if map.contains_key(&key) {
+            return true;
+        }
+        drop(map);
+        super::ddl_overlay::resolve(tenant_id, name, |_| ()).is_some()
     }
 
-    /// Get a sequence definition (for SHOW SEQUENCES detail).
+    /// Get a sequence definition (for SHOW SEQUENCES detail), including one
+    /// this connection has buffered a not-yet-committed `CREATE SEQUENCE` for.
     pub fn get_def(&self, tenant_id: u64, name: &str) -> Option<StoredSequence> {
         let key = registry_key(tenant_id, name);
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
-        map.get(&key).map(|h| h.def.clone())
+        if let Some(handle) = map.get(&key) {
+            return Some(handle.def.clone());
+        }
+        drop(map);
+        super::ddl_overlay::resolve(tenant_id, name, |handle| handle.def.clone())
     }
 
     /// Reset all sequences attached to a collection back to their start values.
@@ -337,4 +384,72 @@ pub enum SequenceValue {
 
 fn registry_key(tenant_id: u64, name: &str) -> String {
     format!("{tenant_id}:{name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::catalog_entry::CatalogEntry;
+    use crate::control::server::shared::session::{conn_scope, ddl_buffer};
+
+    fn put(tenant_id: u64, name: &str) -> CatalogEntry {
+        CatalogEntry::PutSequence(Box::new(StoredSequence::new(
+            tenant_id,
+            name.to_owned(),
+            "alice".into(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn shared_map_miss_falls_back_to_a_buffered_create() {
+        let registry = SequenceRegistry::new();
+        conn_scope::scoped(async {
+            ddl_buffer::activate();
+            assert!(ddl_buffer::try_buffer(put(1, "orders_seq")));
+
+            assert!(registry.exists(1, "orders_seq"));
+            assert_eq!(
+                registry.get_def(1, "orders_seq").map(|d| d.name),
+                Some("orders_seq".to_owned())
+            );
+            assert_eq!(registry.nextval(1, "orders_seq").unwrap(), 1);
+            assert_eq!(registry.nextval(1, "orders_seq").unwrap(), 2);
+            assert_eq!(registry.currval(1, "orders_seq").unwrap(), 2);
+            assert_eq!(registry.setval(1, "orders_seq", 10).unwrap(), 10);
+            assert_eq!(registry.currval(1, "orders_seq").unwrap(), 10);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shared_map_entry_wins_over_a_buffered_create_of_the_same_name() {
+        let registry = SequenceRegistry::new();
+        registry
+            .create(StoredSequence::new(1, "orders_seq".into(), "alice".into()))
+            .unwrap();
+        registry.nextval(1, "orders_seq").unwrap(); // advances the shared handle to 1
+
+        conn_scope::scoped(async {
+            ddl_buffer::activate();
+            assert!(ddl_buffer::try_buffer(put(1, "orders_seq")));
+            // The shared (committed) handle already has this name, so the
+            // buffered fallback must never shadow it with a fresh counter.
+            assert_eq!(registry.nextval(1, "orders_seq").unwrap(), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn no_buffer_and_no_shared_entry_is_not_found() {
+        let registry = SequenceRegistry::new();
+        conn_scope::scoped(async {
+            assert!(!registry.exists(1, "ghost_seq"));
+            assert!(registry.get_def(1, "ghost_seq").is_none());
+            assert!(matches!(
+                registry.nextval(1, "ghost_seq"),
+                Err(SequenceError::NotFound { .. })
+            ));
+        })
+        .await;
+    }
 }

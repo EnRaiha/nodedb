@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod ddl_overlay;
 pub mod format;
 pub mod gap_free;
 pub mod log;
