@@ -54,6 +54,16 @@ pub(crate) async fn open_and_wire_state(
 
     // Create shared state with persistent system catalog. `system_metrics` is
     // the registry the Data-Plane cores already hold, so `/metrics` reads it.
+    //
+    // `is_cluster` is the static, deployment-time signal for surrogate
+    // registry mode: whether this process was configured with a `[cluster]`
+    // section at all — never a property of the seed list's length, and
+    // never inferred from live topology gossip observed after `start_raft`
+    // runs. A single-voter cluster (one seed, `[cluster]` present) is still
+    // `Cluster` mode: it commits through Raft like any other group size.
+    // No `[cluster]` section means no cluster transport and no way to ever
+    // join a group, so it stays `Local` for the process lifetime.
+    let is_cluster = config.cluster.is_some();
     let mut shared = SharedState::open(
         nodedb::control::state::DataPlaneHandles {
             dispatcher,
@@ -65,6 +75,7 @@ pub(crate) async fn open_and_wire_state(
         &config.catalog_path(),
         &config.auth,
         config.tuning.clone(),
+        is_cluster,
     )?;
 
     // Install startup gate, wire subsystems and cluster handles into SharedState.

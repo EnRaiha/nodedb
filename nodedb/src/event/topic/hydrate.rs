@@ -116,7 +116,7 @@ mod tests {
                 .expect("persist topic");
             let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
             let state =
-                SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+                SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                     .expect("state");
             assert_eq!(
                 publish_to_topic(
@@ -146,8 +146,9 @@ mod tests {
 
         let credentials = Arc::new(CredentialStore::open(&catalog_path).expect("reopen catalog"));
         let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
-        let state = SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
-            .expect("restarted state");
+        let state =
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
+                .expect("restarted state");
         let buffer = state
             .cdc_router
             .get_buffer(database_id, tenant_id, "topic:events")

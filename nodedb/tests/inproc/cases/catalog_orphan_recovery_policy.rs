@@ -51,7 +51,8 @@ fn make_shared() -> (tempfile::TempDir, Arc<SharedState>, Arc<CredentialStore>) 
     let credentials = Arc::new(CredentialStore::open(&catalog_path).unwrap());
     put_admin_user(credentials.catalog());
     let shared =
-        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials)).unwrap();
+        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials), false)
+            .unwrap();
     (dir, shared, credentials)
 }
 

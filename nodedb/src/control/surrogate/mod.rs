@@ -18,6 +18,7 @@ pub use assign::{SurrogateAssigner, SurrogateRegistryHandle};
 pub use bootstrap::bootstrap_registry;
 pub use persist::{SURROGATE_HWM, SurrogateHwmPersist, SystemCatalogHwm};
 pub use registry::{
-    FLUSH_ELAPSED_THRESHOLD, FLUSH_OPS_THRESHOLD, SurrogateAllocError, SurrogateRegistry,
+    FLUSH_ELAPSED_THRESHOLD, FLUSH_OPS_THRESHOLD, RESERVE_BATCH_SIZE, SurrogateAllocError,
+    SurrogatePromotionError, SurrogateRegistry, SurrogateRegistryMode,
 };
 pub use wal_appender::{NoopWalAppender, SurrogateWalAppender, WalSurrogateAppender};

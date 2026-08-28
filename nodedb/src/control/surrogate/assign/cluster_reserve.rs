@@ -2,21 +2,17 @@
 
 //! Cross-node HiLo reservation path for the surrogate assigner.
 //!
-//! In a multi-node cluster every surrogate must be globally unique, so a
-//! node cannot just `alloc_one` from its local counter — it would collide
-//! with peers. Instead each node reserves a disjoint `[start, end)` batch
-//! from the metadata-Raft-replicated global watermark `G` and hands those
-//! out locally (lock-free) until the batch drains, then reserves another.
+//! Each node reserves a disjoint `[start, end)` batch from the
+//! metadata-Raft-replicated global watermark `G` and hands those out
+//! locally (lock-free) until the batch drains, then reserves another.
+//! [`SurrogateAssigner::run_refill_loop`] owns the blocking reservation
+//! round-trip off the latency-critical `assign` insert path; the
+//! synchronous [`ensure_batch`] refill is a rare liveness safety net.
 //!
-//! The reservation itself is a BLOCKING metadata-Raft round-trip. To keep
-//! that off the latency-critical `assign` insert path, reservation is owned
-//! by a per-node background task ([`SurrogateAssigner::run_refill_loop`],
-//! spawned in `start_raft`): it eagerly reserves the first batch at startup
-//! and tops the batch up whenever the hot path nudges it below
-//! [`RESERVE_LOW_WATERMARK`]. The hot path itself only ever performs the
-//! lock-free `try_alloc_reserved` draw; the synchronous [`ensure_batch`]
-//! refill remains solely as a rare safety net to preserve liveness if the
-//! refiller has not yet caught up.
+//! Which path a node uses (`Local` `alloc_one` vs `Cluster` HiLo
+//! reservation) is decided once, at process start, by
+//! [`SurrogateRegistry`]'s static mode — never inferred here from live
+//! topology.
 //!
 //! [`ensure_batch`]: SurrogateAssigner::ensure_batch
 
@@ -28,7 +24,7 @@ use tokio::sync::oneshot;
 
 use nodedb_types::Surrogate;
 
-use super::super::registry::{RESERVE_BATCH_SIZE, SurrogateRegistry};
+use super::super::registry::{RESERVE_BATCH_SIZE, SurrogateRegistry, SurrogateRegistryMode};
 use super::core::SurrogateAssigner;
 use crate::control::state::SharedState;
 
@@ -52,29 +48,30 @@ const REFILL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 impl SurrogateAssigner {
     /// Allocate one surrogate from the registry under the write guard,
-    /// branching on whether the cross-node reservation path is required
-    /// (`should_use_reservation`).
+    /// dispatching on the registry's static mode.
     ///
-    /// - Local path (single-member metadata group or no metadata Raft):
-    ///   `alloc_one`. Returns `Ok(Some(s))` or propagates `Exhausted`.
-    /// - Reservation path (multi-member metadata group):
-    ///   `try_alloc_reserved`. `Ok(Some(s))` when the batch has capacity;
-    ///   `Ok(None)` when it is empty — the caller must drop the lock and
-    ///   call `ensure_batch`. Never calls `alloc_one` so the global
-    ///   watermark is advanced ONLY by `SurrogateReserve` apply.
+    /// - `Local`: `alloc_one`. Returns `Ok(Some(s))` or propagates
+    ///   `Exhausted`.
+    /// - `Cluster`: `try_alloc_reserved`. `Ok(Some(s))` when the batch has
+    ///   capacity; `Ok(None)` when it is empty — the caller must drop the
+    ///   lock and call `ensure_batch`. `ClusterCounter` has no `alloc_one`,
+    ///   so `G` can only ever advance via `SurrogateReserve` apply.
     pub(super) fn alloc_locked(
         &self,
         registry: &SurrogateRegistry,
     ) -> crate::Result<Option<Surrogate>> {
-        if self.should_use_reservation() {
-            Ok(registry.try_alloc_reserved())
-        } else {
-            Ok(Some(registry.alloc_one()?))
+        match registry.mode() {
+            SurrogateRegistryMode::Local(local) => {
+                let s = local.alloc_one()?;
+                registry.record_allocs(1);
+                Ok(Some(s))
+            }
+            SurrogateRegistryMode::Cluster(cluster) => Ok(cluster.try_alloc_reserved()),
         }
     }
 
-    /// Proactive top-up trigger. When the reservation path is active and the
-    /// node's reserved batch has dipped below the low-watermark, nudge the
+    /// Proactive top-up trigger. When in `Cluster` mode and the node's
+    /// reserved batch has dipped below the low-watermark, nudge the
     /// background refiller so it reserves the next batch BEFORE the current
     /// one drains. This is the mechanism that keeps the blocking
     /// metadata-Raft round-trip off the hot `assign` path in steady state.
@@ -84,10 +81,10 @@ impl SurrogateAssigner {
     /// non-blocking and coalescing — a nudge while the refiller is already
     /// reserving is remembered as a single pending permit.
     pub(super) fn nudge_refill_if_low(&self, registry: &SurrogateRegistry) {
-        if !self.should_use_reservation() {
+        let SurrogateRegistryMode::Cluster(cluster) = registry.mode() else {
             return;
-        }
-        if registry.remaining_reserved() < RESERVE_LOW_WATERMARK {
+        };
+        if cluster.remaining_reserved() < RESERVE_LOW_WATERMARK {
             self.refill_notify.notify_one();
         }
     }
@@ -96,10 +93,9 @@ impl SurrogateAssigner {
     /// reservation so the latency-critical `assign` path never blocks on the
     /// metadata-Raft round-trip in the common case.
     ///
-    /// Spawned once per node by `start_raft`. Self-gates via
-    /// `should_use_reservation`, so it is a cheap no-op on single-node /
-    /// single-member deployments (those allocate locally via `alloc_one` and
-    /// never reserve). On a genuine multi-node cluster it:
+    /// Spawned once per node by `start_raft`. Self-gates on the
+    /// registry's static `Cluster` mode, so it is a cheap no-op on a
+    /// `Local`-mode (single-node) deployment. On a `Cluster`-mode node it:
     ///
     ///   1. Eagerly reserves the first batch on its very first iteration so a
     ///      batch is ready before any insert arrives.
@@ -128,20 +124,17 @@ impl SurrogateAssigner {
                 return;
             }
 
-            // Self-gate: only multi-node clusters use the reservation path.
-            // Single-node nodes never need a background batch; just park
-            // until something (a future promotion) nudges us again.
-            if !self.should_use_reservation() {
-                continue;
-            }
-
-            // Only reserve when the batch is genuinely low. Coalesced nudges
-            // may wake us after the batch is already full again.
-            let remaining = self
-                .registry
-                .read()
-                .map(|r| r.remaining_reserved())
-                .unwrap_or_else(|p| p.into_inner().remaining_reserved());
+            // Self-gate + low-watermark check in one registry read:
+            // `Local`-mode nodes have no background batch to maintain;
+            // `Cluster`-mode nodes skip until the batch is genuinely low
+            // (coalesced nudges may wake us after it's already full again).
+            let remaining = {
+                let guard = self.registry.read().unwrap_or_else(|p| p.into_inner());
+                match guard.mode() {
+                    SurrogateRegistryMode::Local(_) => continue,
+                    SurrogateRegistryMode::Cluster(cluster) => cluster.remaining_reserved(),
+                }
+            };
             if remaining >= RESERVE_LOW_WATERMARK {
                 continue;
             }
@@ -161,111 +154,6 @@ impl SurrogateAssigner {
                 }
             }
         }
-    }
-
-    /// True when surrogate allocation must go through the HiLo
-    /// cross-node reservation path instead of the fast local
-    /// `alloc_one`.
-    ///
-    /// The reservation exists for ONE reason: to prevent CROSS-NODE
-    /// surrogate collisions. A reservation costs a once-per-batch
-    /// BLOCKING metadata-Raft round-trip; with the background refiller this
-    /// is paid OFF the `assign()` hot path (see module docs). On a
-    /// single-node-with-Raft deployment that round-trip contends with the
-    /// shared raft tick loop that also drives other groups (e.g. the Calvin
-    /// sequencer), so we must NOT pay it when there is no peer to collide
-    /// with. Concretely we return `true` only when BOTH hold:
-    ///   (a) `metadata_raft` is present, AND
-    ///   (b) the METADATA Raft group (group 0) has MORE THAN ONE member.
-    /// A single-member metadata group has no collision risk → fast local
-    /// path. If the member count is unavailable for any reason we treat
-    /// the node as single-node (return `false`, the safe local path).
-    /// The read is cheap and read-only.
-    ///
-    /// DECLARED, OUT-OF-SCOPE FOLLOW-UPS (surfaced, not buried):
-    ///
-    /// (1) **single→multi-node transition barrier.** A node that
-    ///     allocated surrogates via the local `alloc_one` path and then
-    ///     gains a peer could collide: the first multi-node reservation
-    ///     must start PAST every locally-allocated surrogate. The
-    ///     node-add / rebalance flow must, at join time, flush this
-    ///     node's local hwm into the metadata watermark `G` (a barrier
-    ///     owned by that flow) before the first reservation is carved.
-    ///     Until that barrier exists, do not promote a single node that
-    ///     has been allocating locally into a multi-node group.
-    ///
-    /// (2) **blocking once-per-batch round-trip on the hot path — RESOLVED.**
-    ///     Batch reservation is now owned by a per-node background task
-    ///     (`run_refill_loop`, spawned in `start_raft`): it eagerly reserves
-    ///     the first batch at startup and tops up whenever the hot path
-    ///     nudges it (`refill_notify`) below `RESERVE_LOW_WATERMARK`. The
-    ///     hot path only ever does the lock-free `try_alloc_reserved`; the
-    ///     synchronous `ensure_batch` call remains solely as a rare
-    ///     safety-net fallback for the (now near-impossible) case where the
-    ///     refiller has not caught up, preserving liveness.
-    pub(super) fn should_use_reservation(&self) -> bool {
-        // Monotonic latch: this is on the per-row allocation hot path
-        // (every `assign` on the coordinator AND on every node's apply
-        // loop). Once the node has observed a genuine multi-node cluster
-        // we cache that decision and never re-read the contended topology /
-        // routing RwLocks again — a cluster that became multi-node stays
-        // on the reservation path (staying there is always correct, just
-        // unoptimized, even if it later shrinks). This keeps steady-state
-        // allocation free of Arc upgrade + RwLock + membership lookup.
-        if self.reservation_latched.load(Ordering::Relaxed) {
-            return true;
-        }
-        let Some(shared) = self.shared.get().and_then(|w| w.upgrade()) else {
-            return false;
-        };
-        // (a) metadata Raft must be present at all.
-        if shared.metadata_raft.get().is_none() {
-            return false;
-        }
-        // Topology is the collision-risk source of truth. During join/startup
-        // a node's routing table can still show metadata group 0 as
-        // single-member, while topology already knows there are peer nodes
-        // receiving logs. Latch from topology first so those nodes don't fall
-        // back to local `alloc_one` and periodic `SurrogateAlloc` flushes.
-        if let Some(topology) = shared.cluster_topology.as_ref() {
-            let member_count = match topology.read() {
-                Ok(guard) => guard
-                    .all_nodes()
-                    .filter(|node| node.state.receives_log())
-                    .count(),
-                Err(_poisoned) => return false,
-            };
-            if member_count > 1 {
-                self.reservation_latched.store(true, Ordering::Relaxed);
-                return true;
-            }
-        }
-        // (b) the metadata group (group 0) must have more than one
-        // member. Unavailable routing → treat as single-node.
-        let Some(routing) = shared.cluster_routing.as_ref() else {
-            return false;
-        };
-        let member_count = match routing.read() {
-            Ok(guard) => guard
-                .group_info(nodedb_cluster::METADATA_GROUP_ID)
-                .map(|info| info.members.len())
-                .unwrap_or(0),
-            Err(_poisoned) => return false,
-        };
-        let multi = member_count > 1;
-        if multi {
-            // Latch so subsequent hot-path calls skip the RwLock read.
-            self.reservation_latched.store(true, Ordering::Relaxed);
-        }
-        multi
-    }
-
-    /// Latch the assigner into cluster reservation mode from startup wiring
-    /// that already has authoritative topology membership. This avoids making
-    /// the per-row allocator infer cluster shape from a routing table that may
-    /// not yet be fully visible on every node.
-    pub fn enable_reservation_mode(&self) {
-        self.reservation_latched.store(true, Ordering::Relaxed);
     }
 
     /// Cluster-mode batch refill. Serialized so only one reservation is
@@ -303,13 +191,11 @@ impl SurrogateAssigner {
         // After acquiring the gate, another reservation may have already
         // refilled the batch. Re-check before proposing to avoid wasting
         // a batch.
-        if self
-            .registry
-            .read()
-            .map(|r| r.has_reserved())
-            .unwrap_or_else(|p| p.into_inner().has_reserved())
         {
-            return Ok(());
+            let guard = self.registry.read().unwrap_or_else(|p| p.into_inner());
+            if matches!(guard.mode(), SurrogateRegistryMode::Cluster(c) if c.has_reserved()) {
+                return Ok(());
+            }
         }
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -399,8 +285,10 @@ impl SurrogateAssigner {
         {
             // Live reservation: install the batch FIRST so the woken
             // allocator immediately sees a non-empty batch, THEN wake it.
-            if let Ok(reg) = self.registry.read() {
-                reg.set_reserved_batch(start, end);
+            if let Ok(reg) = self.registry.read()
+                && let SurrogateRegistryMode::Cluster(cluster) = reg.mode()
+            {
+                cluster.set_reserved_batch(start, end);
             }
             // Receiver may have already gone (timeout); ignore send error.
             let _ = tx.send((start, end));

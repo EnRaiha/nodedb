@@ -116,8 +116,20 @@ impl TestClusterNode {
         // stored identity. Without this every node rejects the harness connect
         // with `trust auth: user 'nodedb' does not exist`.
         credentials.bootstrap_trust_superuser(HARNESS_SUPERUSER)?;
-        let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)?;
+        // Static, deployment-time surrogate-registry mode — same predicate as
+        // production's `config.cluster.is_some()`. `single_node_calvin` here
+        // takes the `init_single_node_calvin` synthesis below (never joinable,
+        // mirrors production's default standalone path); every other branch
+        // builds a real `ClusterSettings` and joins/bootstraps a genuine Raft
+        // group, so it must start in `Cluster` mode from construction — this
+        // node was never going to promote into it later.
+        let is_cluster = !config.single_node_calvin;
+        let mut shared = SharedState::new_with_credentials(
+            dispatcher,
+            Arc::clone(&wal),
+            credentials,
+            is_cluster,
+        )?;
 
         // Acquire the cluster handle. The single-node-Calvin path drives the
         // production `init_single_node_calvin` synthesis (which binds its own

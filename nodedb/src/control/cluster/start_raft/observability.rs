@@ -134,28 +134,18 @@ pub(super) fn finish_observability(
     shared
         .surrogate_assigner
         .install_shared(Arc::downgrade(shared));
-    // Routing can lag or be self-only during cluster bring-up, but
-    // topology already tells us whether this process can collide with
-    // peer allocators. Latch HiLo mode before the eager refiller starts.
-    let cluster_member_count = handle
-        .topology
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .all_nodes()
-        .filter(|node| node.state.receives_log())
-        .count();
-    if cluster_member_count > 1 {
-        shared.surrogate_assigner.enable_reservation_mode();
-    }
 
     // Spawn the per-node surrogate reservation refiller. It owns ALL batch
     // reservation so the latency-critical `assign` insert path never blocks
     // on the metadata-Raft round-trip in steady state: it eagerly reserves
     // the first batch on its first iteration (before inserts arrive) and
     // tops the batch up whenever the hot path nudges it below the
-    // low-watermark. The loop self-gates via `should_use_reservation`, so it
-    // is a cheap park on single-node / single-member deployments. Same
-    // lifetime/shutdown pattern as the sequencer ticker below.
+    // low-watermark. The loop self-gates on the registry's static
+    // Local/Cluster mode (decided at process start from whether
+    // `config.cluster` is present, before this function runs) — this
+    // function only runs at all when it is, so the registry is always
+    // `Cluster` here; the gate is defense-in-depth, not the primary check.
+    // Same lifetime/shutdown pattern as the sequencer ticker below.
     let refiller = shared.surrogate_assigner.clone();
     let refiller_shared = Arc::downgrade(shared);
     crate::control::shutdown::spawn_loop(

@@ -77,6 +77,7 @@ pub(super) fn run(
     wal: &Arc<crate::wal::WalManager>,
     catalog_path: &std::path::Path,
     auth_config: &crate::config::auth::AuthConfig,
+    is_cluster: bool,
 ) -> crate::Result<ProdBootstrap> {
     let mut credentials = CredentialStore::open(catalog_path)?;
     credentials
@@ -229,21 +230,16 @@ pub(super) fn run(
         crate::control::database::DatabaseRegistry::from_persisted_hwm(hwm)
     };
 
-    // Bootstrap the global surrogate registry from the persisted
-    // hwm. On a fresh database this seeds `next = 1`; on restart
-    // it seeds `next = persisted_hwm + 1` so post-restart
-    // allocations cannot collide with pre-restart ones.
+    // Bootstrap the global surrogate registry from the persisted hwm. On
+    // a fresh database this seeds `next = 1`; on restart it seeds `next
+    // = persisted_hwm + 1` so post-restart allocations cannot collide
+    // with pre-restart ones. `is_cluster` is the static, deployment-time
+    // choice (from `[cluster]` section presence, not seed-list length)
+    // between `Local` and `Cluster` mode — see `SurrogateRegistryMode`.
     let surrogate_registry_handle: SurrogateRegistryHandle = {
         let initial = {
-            // Seed BOTH the global watermark `G` and the applied-reserve
-            // cursor so cluster-mode metadata-log replay skips every
-            // `SurrogateReserve` already folded into `G` (no restart
-            // double-count). Single-node history has cursor 0, so the
-            // single-node path (which never proposes `SurrogateReserve`)
-            // is unaffected.
             let catalog = credentials.catalog();
             let hwm = catalog.get_surrogate_hwm()?;
-            let reserve_index = catalog.get_surrogate_reserve_index()?;
             // The singleton is flushed lazily and no engine contributes a
             // "surrogate durable through" floor to WAL truncation, so a
             // checkpoint can truncate the `SurrogateAlloc` / `SurrogateBind`
@@ -252,7 +248,16 @@ pub(super) fn run(
             // allocator can never start below — re-issuing one already bound to
             // a live row would corrupt cross-engine identity.
             let bound_floor = catalog.max_bound_surrogate()?.as_u32();
-            SurrogateRegistry::from_persisted(hwm.max(bound_floor), reserve_index)
+            let floor = hwm.max(bound_floor);
+            if is_cluster {
+                // Seed BOTH the global watermark `G` and the applied-reserve
+                // cursor so metadata-log replay skips every `SurrogateReserve`
+                // already folded into `G` (no restart double-count).
+                let reserve_index = catalog.get_surrogate_reserve_index()?;
+                SurrogateRegistry::from_persisted_cluster(floor, reserve_index)
+            } else {
+                SurrogateRegistry::from_persisted_hwm(floor)
+            }
         };
         Arc::new(std::sync::RwLock::new(initial))
     };

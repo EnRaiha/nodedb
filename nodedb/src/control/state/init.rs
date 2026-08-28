@@ -34,10 +34,18 @@ impl SharedState {
     }
 
     /// Create shared state with a pre-built credential store (for tests that need catalog).
+    ///
+    /// `is_cluster` is the static, deployment-time surrogate-registry mode
+    /// choice — same predicate as `SharedState::open`'s `is_cluster`
+    /// (whether this node's caller is about to wire it into a real Raft
+    /// cluster), not a property of the credential store. Almost every
+    /// caller is a single-process fixture and passes `false`; the cluster
+    /// test harness passes `true`.
     pub fn new_with_credentials(
         dispatcher: Dispatcher,
         wal: Arc<WalManager>,
         credentials: Arc<CredentialStore>,
+        is_cluster: bool,
     ) -> crate::Result<Arc<Self>> {
         let wal_for_assigner = Arc::clone(&wal);
         let mut state = Self::new_inner(dispatcher, wal)?;
@@ -57,16 +65,24 @@ impl SharedState {
             // The catalog-derived floor mirrors the production bootstrap: the
             // singleton is flushed lazily, so the highest surrogate any live
             // binding refers to is the value the allocator can never start
-            // below.
+            // below. Mode selection mirrors `init_prod/bootstrap.rs::run`:
+            // `is_cluster` (never seed-list length) picks `Cluster` vs
+            // `Local`, seeding the applied-reserve cursor only in the
+            // former.
             if let Ok(hwm) = catalog.get_surrogate_hwm()
-                && let Ok(reserve_index) = catalog.get_surrogate_reserve_index()
                 && let Ok(bound_floor) = catalog.max_bound_surrogate()
                 && let Ok(mut reg) = registry.write()
             {
-                *reg = crate::control::surrogate::SurrogateRegistry::from_persisted(
-                    hwm.max(bound_floor.as_u32()),
-                    reserve_index,
-                );
+                let floor = hwm.max(bound_floor.as_u32());
+                *reg = if is_cluster {
+                    let reserve_index = catalog.get_surrogate_reserve_index().unwrap_or(0);
+                    crate::control::surrogate::SurrogateRegistry::from_persisted_cluster(
+                        floor,
+                        reserve_index,
+                    )
+                } else {
+                    crate::control::surrogate::SurrogateRegistry::from_persisted_hwm(floor)
+                };
             }
             let wal_appender: Arc<dyn crate::control::surrogate::SurrogateWalAppender> = Arc::new(
                 crate::control::surrogate::WalSurrogateAppender::new(wal_for_assigner),

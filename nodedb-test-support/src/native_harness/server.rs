@@ -74,8 +74,9 @@ impl NativeTestServer {
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so the default connection database works in tests.
         let _ = credentials.catalog().bootstrap_default_database();
-        let shared = SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
-            .expect("build shared state");
+        let shared =
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
+                .expect("build shared state");
 
         let data_side = data_sides.into_iter().next().expect("data side");
         let core_dir = dir.path().to_path_buf();

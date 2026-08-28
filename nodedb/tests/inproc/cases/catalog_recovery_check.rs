@@ -32,7 +32,8 @@ fn make_shared(data_dir: &std::path::Path) -> (Arc<SharedState>, Arc<CredentialS
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let credentials = Arc::new(CredentialStore::open(&catalog_path).unwrap());
     let shared =
-        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials)).unwrap();
+        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials), false)
+            .unwrap();
     (shared, credentials)
 }
 
@@ -497,7 +498,7 @@ async fn credential_ghost_refuses_startup() {
 
     // Memory-only store — no users loaded.
     let empty_creds = Arc::new(CredentialStore::new().expect("build credential store"));
-    let shared = SharedState::new_with_credentials(dispatcher, wal, empty_creds).unwrap();
+    let shared = SharedState::new_with_credentials(dispatcher, wal, empty_creds, false).unwrap();
 
     let result = verify_registries(&shared, catalog).unwrap();
     let c = result.counts.get("credentials").expect("credentials entry");
@@ -675,6 +676,7 @@ async fn redaction_policy_survives_restart_via_boot_load() {
         &catalog_path,
         &AuthConfig::default(),
         Default::default(),
+        false,
     )
     .expect("shared_state reopen");
 

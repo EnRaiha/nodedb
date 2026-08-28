@@ -41,7 +41,8 @@ pub fn make_state_with_catalog() -> Arc<SharedState> {
     );
     let _ = credentials.catalog().bootstrap_default_database();
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    SharedState::new_with_credentials(dispatcher, wal, credentials).expect("build shared state")
+    SharedState::new_with_credentials(dispatcher, wal, credentials, false)
+        .expect("build shared state")
     // `dir` drops here. On Linux, file handles held by `wal` and the redb
     // catalog keep both files readable for the test's lifetime even after
     // the directory entry is removed (open-then-unlink semantics).

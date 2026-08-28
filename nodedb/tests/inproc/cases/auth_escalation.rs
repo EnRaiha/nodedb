@@ -48,6 +48,7 @@ fn open_state(dir: &Path, escalation: Option<EscalationConfig>) -> Arc<SharedSta
         &dir.join("system.redb"),
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
+        false,
     )
     .expect("shared state opens")
 }

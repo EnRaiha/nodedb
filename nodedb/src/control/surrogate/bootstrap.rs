@@ -13,6 +13,9 @@
 use super::persist::SurrogateHwmPersist;
 use super::registry::SurrogateRegistry;
 
+#[cfg(test)]
+use super::registry::SurrogateRegistryMode;
+
 /// Read the persisted hwm and return a registry seeded past it.
 ///
 /// On a fresh database (no checkpoint yet) the persist layer returns `0`,
@@ -33,13 +36,28 @@ mod tests {
     use super::*;
     use crate::control::security::catalog::SystemCatalog;
 
+    /// `bootstrap_registry` always returns `Local` mode; unwrap it for tests.
+    fn local_alloc_one(reg: &SurrogateRegistry) -> Surrogate {
+        let SurrogateRegistryMode::Local(local) = reg.mode() else {
+            panic!("bootstrap_registry must return Local mode");
+        };
+        local.alloc_one().unwrap()
+    }
+
+    fn local_alloc(reg: &SurrogateRegistry, n: u32) {
+        let SurrogateRegistryMode::Local(local) = reg.mode() else {
+            panic!("bootstrap_registry must return Local mode");
+        };
+        local.alloc(n).unwrap();
+    }
+
     #[test]
     fn fresh_database_starts_at_one() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(SystemCatalog::open(&dir.path().join("system.redb")).unwrap());
         let persist = SystemCatalogHwm::new(catalog);
         let reg = bootstrap_registry(&persist).unwrap();
-        assert_eq!(reg.alloc_one().unwrap(), Surrogate::new(1));
+        assert_eq!(local_alloc_one(&reg), Surrogate::new(1));
     }
 
     #[test]
@@ -52,7 +70,7 @@ mod tests {
             let catalog = Arc::new(SystemCatalog::open(&path).unwrap());
             let persist = SystemCatalogHwm::new(catalog);
             let reg = bootstrap_registry(&persist).unwrap();
-            let _ = reg.alloc(5000).unwrap();
+            local_alloc(&reg, 5000);
             assert_eq!(reg.current_hwm(), 5000);
             reg.flush(&persist).unwrap();
         }
@@ -62,7 +80,7 @@ mod tests {
             let catalog = Arc::new(SystemCatalog::open(&path).unwrap());
             let persist = SystemCatalogHwm::new(catalog);
             let reg = bootstrap_registry(&persist).unwrap();
-            assert_eq!(reg.alloc_one().unwrap(), Surrogate::new(5001));
+            assert_eq!(local_alloc_one(&reg), Surrogate::new(5001));
         }
     }
 
@@ -90,6 +108,6 @@ mod tests {
         }
 
         let reg = bootstrap_registry(&ReplayPersist(decoded.hi)).unwrap();
-        assert_eq!(reg.alloc_one().unwrap(), Surrogate::new(10_000));
+        assert_eq!(local_alloc_one(&reg), Surrogate::new(10_000));
     }
 }

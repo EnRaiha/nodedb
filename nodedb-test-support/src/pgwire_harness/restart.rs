@@ -193,7 +193,7 @@ impl TestServer {
             }
         }
         let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
         if let Some(s) = Arc::get_mut(&mut shared) {
             s.backup_kek = Some(Arc::new([0x42u8; 32]));

@@ -30,6 +30,7 @@ fn open_with_catalog() -> (Arc<SharedState>, tempfile::TempDir) {
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
+        false,
     )
     .unwrap();
     (state, dir)
@@ -92,6 +93,7 @@ async fn audit_flush_persists_to_catalog() {
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
+        false,
     )
     .unwrap();
 
@@ -134,6 +136,7 @@ async fn audit_sequence_survives_restart() {
             &catalog_path,
             &auth_config,
             nodedb_types::config::TuningConfig::default(),
+            false,
         )
         .unwrap();
 
@@ -166,6 +169,7 @@ async fn audit_sequence_survives_restart() {
             &catalog_path,
             &auth_config,
             nodedb_types::config::TuningConfig::default(),
+            false,
         )
         .unwrap();
 

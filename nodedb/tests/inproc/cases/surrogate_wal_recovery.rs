@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use nodedb::control::security::catalog::SystemCatalog;
 use nodedb::control::security::credential::CredentialStore;
 use nodedb::control::surrogate::{
-    SurrogateAssigner, SurrogateRegistry, SurrogateRegistryHandle, SurrogateWalAppender,
-    WalSurrogateAppender,
+    SurrogateAssigner, SurrogateRegistry, SurrogateRegistryHandle, SurrogateRegistryMode,
+    SurrogateWalAppender, WalSurrogateAppender,
 };
 use nodedb::wal::WalManager;
 use nodedb::wal::replay::replay_surrogate_records;
@@ -28,6 +28,15 @@ fn open_wal_appender(path: &std::path::Path) -> (Arc<WalManager>, Arc<dyn Surrog
 
 fn fresh_registry() -> SurrogateRegistryHandle {
     Arc::new(RwLock::new(SurrogateRegistry::new()))
+}
+
+/// This suite is single-node only, so every registry is `Local` mode.
+fn local_alloc_one(registry: &SurrogateRegistryHandle) -> Surrogate {
+    let guard = registry.read().unwrap();
+    let SurrogateRegistryMode::Local(local) = guard.mode() else {
+        panic!("expected Local mode");
+    };
+    local.alloc_one().unwrap()
 }
 
 #[test]
@@ -143,7 +152,7 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
         "post-replay hwm {post_replay_hwm} must cover max issued {max_issued}",
     );
 
-    let next = registry.read().unwrap().alloc_one().unwrap();
+    let next = local_alloc_one(&registry);
     assert_eq!(
         next.as_u32(),
         post_replay_hwm + 1,
@@ -212,6 +221,6 @@ fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
     let post_replay_hwm = registry.read().unwrap().current_hwm();
     assert!(post_replay_hwm >= last);
 
-    let next = registry.read().unwrap().alloc_one().unwrap();
+    let next = local_alloc_one(&registry);
     assert!(next.as_u32() > last);
 }

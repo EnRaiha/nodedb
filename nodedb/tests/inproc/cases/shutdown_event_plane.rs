@@ -76,6 +76,7 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
             &catalog_path,
             &AuthConfig::default(),
             Default::default(),
+            false,
         )
         .expect("shared_state");
         let cdc_router = Arc::clone(&shared.cdc_router);

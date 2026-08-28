@@ -220,7 +220,7 @@ impl TestServer {
         // Idempotent: no-op if the descriptor is already there.
         let _ = credentials.catalog().bootstrap_default_database();
         let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
         // Inject a fixed test KEK so backup tests produce encrypted envelopes.
         // Deterministic 32-byte key — same value every test run.

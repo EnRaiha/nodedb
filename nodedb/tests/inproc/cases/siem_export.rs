@@ -39,6 +39,7 @@ fn open_state(siem: Option<SiemConfig>) -> (Arc<SharedState>, tempfile::TempDir)
         &catalog_path,
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
+        false,
     )
     .expect("shared state opens");
     (state, dir)

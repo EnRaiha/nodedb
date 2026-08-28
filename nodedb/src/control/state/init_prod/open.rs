@@ -22,12 +22,18 @@ use crate::control::state::SharedState;
 
 impl SharedState {
     /// Create shared state with persistent credential store (for production).
+    ///
+    /// `is_cluster` is the static, deployment-time choice (from
+    /// `config.cluster.is_some()` — presence of a `[cluster]` section,
+    /// not seed-list length) between `Local` and `Cluster`
+    /// surrogate-registry mode — see `SurrogateRegistryMode`.
     pub fn open(
         handles: DataPlaneHandles,
         wal: Arc<WalManager>,
         catalog_path: &std::path::Path,
         auth_config: &crate::config::auth::AuthConfig,
         tuning: TuningConfig,
+        is_cluster: bool,
     ) -> crate::Result<Arc<Self>> {
         let DataPlaneHandles {
             dispatcher,
@@ -68,7 +74,7 @@ impl SharedState {
             si_bus,
             uc_bus,
             bus_consumer_handle,
-        } = super::bootstrap::run(&wal, catalog_path, auth_config)?;
+        } = super::bootstrap::run(&wal, catalog_path, auth_config, is_cluster)?;
 
         // `auth_config.metering` is `None` unless the operator configured a
         // `[metering]` section; fall back to `MeteringConfig::default()` so
@@ -505,6 +511,7 @@ mod tests {
             &catalog_path,
             auth_config,
             TuningConfig::default(),
+            false,
         )
         .expect("open shared state")
     }

@@ -150,6 +150,7 @@ fn open_state(
         &dir.path().join("system.redb"),
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
+        false,
     )
 }
 

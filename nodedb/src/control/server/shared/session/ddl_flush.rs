@@ -231,7 +231,7 @@ mod tests {
             CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store"),
         );
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let state = SharedState::new_with_credentials(dispatcher, wal, credentials)
+        let state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
             .expect("construct shared state");
         let gateway = Arc::new(Gateway::new(Arc::clone(&state)));
         assert!(state.gateway.set(gateway).is_ok(), "gateway installs once");

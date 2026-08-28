@@ -26,7 +26,7 @@ mod tests {
     use nodedb_types::Surrogate;
 
     use super::*;
-    use crate::control::surrogate::SurrogateRegistry;
+    use crate::control::surrogate::{SurrogateRegistry, SurrogateRegistryMode};
 
     #[test]
     fn alloc_advances_registry() {
@@ -52,7 +52,11 @@ mod tests {
             Arc::new(RwLock::new(SurrogateRegistry::from_persisted_hwm(7)));
         let payload = SurrogateAllocPayload::new(7).to_bytes();
         apply_surrogate_alloc(&payload, &reg).unwrap();
-        let s = reg.read().unwrap().alloc_one().unwrap();
+        let guard = reg.read().unwrap();
+        let SurrogateRegistryMode::Local(local) = guard.mode() else {
+            panic!("expected Local mode");
+        };
+        let s = local.alloc_one().unwrap();
         assert_eq!(s, Surrogate::new(8));
     }
 }

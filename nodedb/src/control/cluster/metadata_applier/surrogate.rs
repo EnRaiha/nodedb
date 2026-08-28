@@ -5,6 +5,8 @@
 
 use tracing::{debug, warn};
 
+use crate::control::surrogate::SurrogateRegistryMode;
+
 use super::types::MetadataCommitApplier;
 
 impl MetadataCommitApplier {
@@ -73,7 +75,7 @@ impl MetadataCommitApplier {
     ///      hwm AND the applied-reserve cursor (`raft_index`) are
     ///      persisted to the catalog ATOMICALLY on first
     ///      application; on restart the registry is seeded with both
-    ///      via `from_persisted`, and `reserve_at_index` skips every
+    ///      via `from_persisted_cluster`, and `reserve_at_index` skips every
     ///      reservation whose index `<= cursor` (already folded into
     ///      the seeded `G`). Entries committed-but-not-yet-persisted
     ///      before a crash have index `> cursor` and are re-applied
@@ -120,20 +122,47 @@ impl MetadataCommitApplier {
             // must be deterministic across nodes incl. replay: an
             // exhaustion error must NOT advance the apply watermark past
             // this entry, or replicas would diverge on `G`. Surface it
-            // so Raft re-delivers.
-            let reserved = match reg.reserve_at_index(raft_index, batch_size) {
-                Ok(r) => r,
-                Err(e) => {
+            // so Raft re-delivers. This apply path only runs when
+            // `start_raft` is active, which only happens when
+            // `config.cluster.is_some()` — the same condition that puts
+            // the registry in `Cluster` mode — so `Local` here means that
+            // invariant broke. That is also a hard, retried-forever
+            // error, not a silent fallback.
+            let reserved = match reg.mode() {
+                SurrogateRegistryMode::Cluster(cluster) => {
+                    match cluster.reserve_at_index(raft_index, batch_size) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            drop(reg);
+                            warn!(
+                                node_id,
+                                request_id,
+                                batch_size,
+                                error = %e,
+                                "surrogate_reserve apply: reserve_at_index failed — halting watermark for retry"
+                            );
+                            return Err(crate::Error::Internal {
+                                detail: format!(
+                                    "surrogate_reserve apply: reserve_at_index failed: {e}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                SurrogateRegistryMode::Local(_) => {
                     drop(reg);
                     warn!(
                         node_id,
                         request_id,
-                        batch_size,
-                        error = %e,
-                        "surrogate_reserve apply: reserve_at_index failed — halting watermark for retry"
+                        "surrogate_reserve apply: registry is Local-mode but received a \
+                         SurrogateReserve entry — this apply path should only run when \
+                         config.cluster.is_some(), which also selects Cluster mode"
                     );
                     return Err(crate::Error::Internal {
-                        detail: format!("surrogate_reserve apply: reserve_at_index failed: {e}"),
+                        detail: "surrogate_reserve apply: registry is Local-mode but the \
+                                 metadata Raft apply path is running (should be impossible \
+                                 when config.cluster.is_some() selects Cluster mode)"
+                            .into(),
                     });
                 }
             };

@@ -59,11 +59,6 @@ pub struct SurrogateAssigner {
     /// that all observe an empty batch would each propose a reservation,
     /// over-reserving and wasting surrogate space.
     pub(in crate::control::surrogate::assign) reserve_gate: tokio::sync::Mutex<()>,
-    /// Monotonic cache for `should_use_reservation`: set once the node
-    /// first observes a multi-member metadata group, after which the
-    /// per-row hot path skips the contended `cluster_topology` /
-    /// `cluster_routing` RwLock reads.
-    pub(in crate::control::surrogate::assign) reservation_latched: std::sync::atomic::AtomicBool,
     /// Wakes the background refill loop. The hot path nudges it (via
     /// `notify_one`) whenever a draw fails or the batch dips below the
     /// low-watermark; the refiller then performs the blocking reservation
@@ -87,7 +82,6 @@ impl SurrogateAssigner {
             pending_reservations: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             reserve_gate: tokio::sync::Mutex::new(()),
-            reservation_latched: std::sync::atomic::AtomicBool::new(false),
             refill_notify: Arc::new(Notify::new()),
         }
     }

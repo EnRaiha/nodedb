@@ -26,26 +26,19 @@ impl SurrogateAssigner {
     }
 
     /// Local flush trigger: durably checkpoint the new hwm if the ops or
-    /// elapsed-time threshold has tripped. This runs whenever the node is
-    /// NOT using the cross-node reservation path — i.e. on a single-node
-    /// (no Raft) deployment OR a single-member-with-Raft deployment. In
-    /// the latter case the flush's `CombinedPersist` also proposes
-    /// `SurrogateAlloc { hwm }` so the metadata watermark `G` stays in
-    /// sync with the locally-allocated hwm; this gives a future node-join
-    /// a correct base to advance past (see `should_use_reservation`
-    /// follow-up (1)).
+    /// elapsed-time threshold has tripped. Runs only for a `Local`-mode
+    /// registry; `CombinedPersist` also proposes `SurrogateAlloc { hwm }`
+    /// so peers advance their watermark in step.
     ///
-    /// When the reservation path IS in use (multi-member metadata group)
-    /// this is a no-op — the global watermark is advanced and persisted
-    /// by the `SurrogateReserve` apply path, so running the local flush
-    /// here would double-advance `counter` (which is `G` in that mode)
-    /// and corrupt determinism.
+    /// A `Cluster`-mode registry is a no-op here — its watermark is
+    /// advanced and persisted by the `SurrogateReserve` apply path, so a
+    /// local flush would double-advance `G` and corrupt determinism.
     pub(in crate::control::surrogate::assign) fn maybe_flush(
         &self,
         registry: &SurrogateRegistry,
         catalog: &SystemCatalog,
     ) -> crate::Result<()> {
-        if self.should_use_reservation() {
+        if registry.mode().is_cluster() {
             return Ok(());
         }
         if registry.should_flush() {
