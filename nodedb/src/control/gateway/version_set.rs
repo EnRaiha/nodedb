@@ -19,12 +19,43 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GatewayVersionSet(Vec<(String, u64)>);
 
+/// Prefix for the synthetic entry carrying a tenant's permission-tree
+/// version. `\0` makes it unrepresentable as a real collection name, so it
+/// can never collide with one.
+const PERMISSION_TREE_VERSION_KEY_PREFIX: &str = "\0__permission_tree_version::";
+
+/// Prefix for the synthetic entry carrying a tenant's RLS policy version.
+const RLS_VERSION_KEY_PREFIX: &str = "\0__rls_version::";
+
+/// The synthetic pseudo-collection key a tenant's permission-tree version is
+/// folded into the set under, so a revoked grant makes a cached gateway plan
+/// unlookupable exactly like a bumped descriptor does.
+pub fn permission_tree_version_key(tenant_id: u64) -> String {
+    format!("{PERMISSION_TREE_VERSION_KEY_PREFIX}{tenant_id}")
+}
+
+/// The synthetic pseudo-collection key a tenant's RLS policy version is
+/// folded into the set under.
+pub fn rls_version_key(tenant_id: u64) -> String {
+    format!("{RLS_VERSION_KEY_PREFIX}{tenant_id}")
+}
+
 impl GatewayVersionSet {
     /// Construct from explicit (name, version) pairs.
     pub fn from_pairs(mut pairs: Vec<(String, u64)>) -> Self {
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs.dedup_by(|a, b| a.0 == b.0);
         Self(pairs)
+    }
+
+    /// Fold one more `(name, version)` pair into the set, re-sorting and
+    /// re-deduping. Used to add the permission-tree / RLS pseudo-entries
+    /// alongside the real collection entries `from_plan` already collected.
+    pub fn with_extra(mut self, name: String, version: u64) -> Self {
+        self.0.push((name, version));
+        self.0.sort_by(|a, b| a.0.cmp(&b.0));
+        self.0.dedup_by(|a, b| a.0 == b.0);
+        self
     }
 
     /// Re-look-up the current descriptor version for every collection already
@@ -489,6 +520,39 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+
+    #[test]
+    fn with_extra_folds_in_a_pseudo_entry_and_stays_deterministic() {
+        let vs = GatewayVersionSet::from_pairs(vec![("orders".into(), 4)])
+            .with_extra(permission_tree_version_key(7), 2)
+            .with_extra(rls_version_key(7), 9);
+        assert_eq!(vs.len(), 3);
+        assert!(vs.matches(&permission_tree_version_key(7), 2));
+        assert!(vs.matches(&rls_version_key(7), 9));
+        assert!(vs.matches("orders", 4));
+    }
+
+    /// The plan-cache key is stale the instant the tenant's stamped
+    /// permission-tree version diverges from what's live, exactly like a
+    /// bumped collection descriptor.
+    #[test]
+    fn with_extra_pseudo_entry_participates_in_equality() {
+        let a = GatewayVersionSet::from_pairs(vec![("orders".into(), 4)])
+            .with_extra(permission_tree_version_key(7), 1);
+        let b = GatewayVersionSet::from_pairs(vec![("orders".into(), 4)])
+            .with_extra(permission_tree_version_key(7), 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pseudo_keys_are_scoped_per_tenant() {
+        assert_ne!(
+            permission_tree_version_key(1),
+            permission_tree_version_key(2)
+        );
+        assert_ne!(rls_version_key(1), rls_version_key(2));
+        assert_ne!(permission_tree_version_key(1), rls_version_key(1));
+    }
 
     #[test]
     fn from_plan_kv_get() {

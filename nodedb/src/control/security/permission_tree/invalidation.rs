@@ -17,6 +17,7 @@ use super::types::PermissionGrant;
 /// determine the cache key; the `level` and `inherited` are the new values.
 pub fn on_grant_upsert(cache: &mut PermissionCache, tenant_id: u64, grant: &PermissionGrant) {
     cache.put_grant(tenant_id, grant);
+    cache.bump_tenant_version(tenant_id);
     debug!(
         tenant_id,
         resource_id = %grant.resource_id,
@@ -37,6 +38,7 @@ pub fn on_grant_delete(
     grantee: &str,
 ) {
     cache.remove_grant(tenant_id, resource_id, grantee);
+    cache.bump_tenant_version(tenant_id);
     debug!(
         tenant_id,
         resource_id, grantee, "permission_tree: grant deleted"
@@ -56,6 +58,7 @@ pub fn on_edge_upsert(
     // Remove old edge first (if child was previously under a different parent).
     cache.remove_edge(tenant_id, child_id);
     cache.put_edge(tenant_id, child_id, parent_id);
+    cache.bump_tenant_version(tenant_id);
     debug!(
         tenant_id,
         child_id, parent_id, "permission_tree: edge upserted"
@@ -68,6 +71,7 @@ pub fn on_edge_upsert(
 /// is being deleted entirely).
 pub fn on_edge_delete(cache: &mut PermissionCache, tenant_id: u64, child_id: &str) {
     cache.remove_edge(tenant_id, child_id);
+    cache.bump_tenant_version(tenant_id);
     debug!(tenant_id, child_id, "permission_tree: edge deleted");
 }
 
@@ -83,6 +87,7 @@ pub fn full_reload(
 ) {
     cache.load_edges(tenant_id, edges);
     cache.load_grants(tenant_id, grants);
+    cache.bump_tenant_version(tenant_id);
     debug!(
         tenant_id,
         edges = edges.len(),
@@ -94,6 +99,36 @@ pub fn full_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mutator_bumps_the_tenant_version() {
+        let mut cache = PermissionCache::new();
+        assert_eq!(cache.tenant_version(1), 0);
+
+        let grant = PermissionGrant {
+            resource_id: "doc-1".into(),
+            grantee: "user-1".into(),
+            level: "editor".into(),
+            inherited: false,
+        };
+        on_grant_upsert(&mut cache, 1, &grant);
+        assert_eq!(cache.tenant_version(1), 1);
+
+        on_grant_delete(&mut cache, 1, "doc-1", "user-1");
+        assert_eq!(cache.tenant_version(1), 2);
+
+        on_edge_upsert(&mut cache, 1, "doc-1", "folder-a");
+        assert_eq!(cache.tenant_version(1), 3);
+
+        on_edge_delete(&mut cache, 1, "doc-1");
+        assert_eq!(cache.tenant_version(1), 4);
+
+        full_reload(&mut cache, 1, &[], &[]);
+        assert_eq!(cache.tenant_version(1), 5);
+
+        // An unrelated tenant is never touched.
+        assert_eq!(cache.tenant_version(2), 0);
+    }
 
     #[test]
     fn grant_upsert_and_delete() {

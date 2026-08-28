@@ -298,8 +298,21 @@ impl QueryContext {
         crate::control::planner::descriptor_set::DescriptorVersionSet,
         nodedb_sql::types::PlanCacheEligibility,
     )> {
-        let (mut tasks, output_schema, version_set, cache_eligibility) =
+        let (mut tasks, output_schema, mut version_set, cache_eligibility) =
             self.plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, purpose)?;
+
+        // Versions read BEFORE injection, never after: injection reads live
+        // policy/grant state under its own lock, and a mutation racing in
+        // between would otherwise let a post-injection read stamp a version
+        // newer than what was actually filtered against, making a plan built
+        // from stale state compare as fresh forever. A pre-injection read
+        // only ever under-states freshness (an extra harmless replan), never
+        // over-states it.
+        let permission_tree_version = sec
+            .permission_cache
+            .map(|c| c.tenant_version(tenant_id.as_u64()))
+            .unwrap_or(0);
+        let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
 
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
@@ -318,6 +331,9 @@ impl QueryContext {
                 &mut tasks, cache, sec.auth,
             )?;
         }
+
+        version_set.set_permission_tree_version(permission_tree_version);
+        version_set.set_rls_version(rls_version);
 
         Ok((tasks, output_schema, version_set, cache_eligibility))
     }
@@ -429,6 +445,14 @@ impl QueryContext {
         let mut tasks =
             crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
 
+        // Versions read BEFORE injection — see the comment on the sibling
+        // planning path in this file for why a post-injection read is unsafe.
+        let permission_tree_version = sec
+            .permission_cache
+            .map(|c| c.tenant_version(tenant_id.as_u64()))
+            .unwrap_or(0);
+        let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
+
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
 
@@ -446,7 +470,9 @@ impl QueryContext {
             )?;
         }
 
-        let version_set = catalog.take_recorded_versions();
+        let mut version_set = catalog.take_recorded_versions();
+        version_set.set_permission_tree_version(permission_tree_version);
+        version_set.set_rls_version(rls_version);
         Ok((tasks, output_schema, version_set))
     }
 }

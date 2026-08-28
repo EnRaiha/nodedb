@@ -55,8 +55,9 @@ impl Gateway {
         plan: PhysicalPlan,
     ) -> Result<ResultStream, Error> {
         let shared = self.shared()?;
-        let version_set =
-            self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
+        let version_set = self
+            .collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)
+            .await?;
 
         let routes = self.compute_routes(plan, ctx)?;
 

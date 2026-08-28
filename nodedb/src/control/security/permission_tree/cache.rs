@@ -27,6 +27,11 @@ struct TenantPermissions {
     /// Reverse children map: `parent_id → set of child_ids`.
     /// Used for cache invalidation: when a grant changes, evict all descendants.
     children_map: HashMap<String, HashSet<String>>,
+
+    /// Monotonic version, bumped on every grant or edge mutation for this
+    /// tenant. A cached physical plan stamps this at build time so a plan
+    /// cache can detect a revoked grant instead of replaying a frozen filter.
+    version: u64,
 }
 
 /// Central permission cache shared across all sessions.
@@ -258,6 +263,21 @@ impl PermissionCache {
             .iter()
             .any(|((tid, coll), _)| *tid == tenant_id && coll == collection)
     }
+
+    /// Bump and return the per-tenant permission version. Called from every
+    /// mutator in `invalidation.rs`, in the same critical section as the
+    /// state change, so a stamped plan cache entry goes stale on the spot.
+    pub fn bump_tenant_version(&mut self, tenant_id: u64) -> u64 {
+        let tenant = self.tenants.entry(tenant_id).or_default();
+        tenant.version += 1;
+        tenant.version
+    }
+
+    /// Current permission version for a tenant. `0` if the tenant has never
+    /// been mutated.
+    pub fn tenant_version(&self, tenant_id: u64) -> u64 {
+        self.tenants.get(&tenant_id).map(|t| t.version).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +355,18 @@ mod tests {
 
         assert_eq!(cache.get_parent(1, "doc-1"), Some("folder-1"));
         assert_eq!(cache.get_parent(2, "doc-1"), Some("folder-2"));
+    }
+
+    #[test]
+    fn tenant_version_bumps_and_is_isolated_per_tenant() {
+        let mut cache = PermissionCache::new();
+        assert_eq!(cache.tenant_version(1), 0);
+        assert_eq!(cache.bump_tenant_version(1), 1);
+        assert_eq!(cache.bump_tenant_version(1), 2);
+        assert_eq!(cache.tenant_version(1), 2);
+        // A different tenant's bumps do not affect this one's version.
+        assert_eq!(cache.bump_tenant_version(2), 1);
+        assert_eq!(cache.tenant_version(1), 2);
     }
 
     #[test]

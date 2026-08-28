@@ -195,8 +195,9 @@ impl Gateway {
             tenant_id = ctx.tenant_id.as_u64()
         );
         let start = SystemTime::now();
-        let version_set =
-            self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
+        let version_set = self
+            .collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)
+            .await?;
         let result = self
             .execute_with_version_set(ctx, plan, version_set)
             .instrument(span)
@@ -426,7 +427,10 @@ impl Gateway {
     ///
     /// `database_id` scopes the catalog lookup to the session's current database
     /// so that a plan from one database cannot be served under another.
-    pub(super) fn collect_version_set(
+    ///
+    /// Also folds in the tenant's permission-tree / RLS versions as pseudo
+    /// entries (see [`super::version_set::permission_tree_version_key`]).
+    pub(super) async fn collect_version_set(
         &self,
         plan: &PhysicalPlan,
         tenant_id: u64,
@@ -435,13 +439,27 @@ impl Gateway {
         let shared = self.shared()?;
         let catalog = Some(shared.credentials.catalog());
 
-        Ok(GatewayVersionSet::from_plan(plan, |name| {
+        let vs = GatewayVersionSet::from_plan(plan, |name| {
             catalog
                 .and_then(|c| c.get_collection(database_id, tenant_id, name).ok())
                 .flatten()
                 .map(|col| col.descriptor_version.max(1))
                 .unwrap_or(0)
-        }))
+        });
+
+        let permission_tree_version = shared
+            .permission_cache
+            .read()
+            .await
+            .tenant_version(tenant_id);
+        let rls_version = shared.rls.tenant_version(tenant_id);
+
+        Ok(vs
+            .with_extra(
+                super::version_set::permission_tree_version_key(tenant_id),
+                permission_tree_version,
+            )
+            .with_extra(super::version_set::rls_version_key(tenant_id), rls_version))
     }
 }
 

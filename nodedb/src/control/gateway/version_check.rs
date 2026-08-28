@@ -67,6 +67,15 @@ where
     I: IntoIterator<Item = (&'a str, u64)>,
 {
     for (collection, expected_version) in entries {
+        // A `GatewayVersionSet` also carries synthetic, non-collection
+        // entries (permission-tree / RLS tenant versions) so the plan cache
+        // can fence on them too — see `version_set::with_extra`. They are
+        // never real catalog descriptors, so there is nothing to re-compare
+        // here: the gateway plan cache's own key equality already fenced
+        // the plan against them at lookup time.
+        if collection.starts_with('\0') {
+            continue;
+        }
         match catalog.get_collection(database_id, tenant_id, collection) {
             Ok(Some(stored)) => {
                 // A collection created before the metadata applier stamped it
@@ -170,6 +179,15 @@ mod tests {
     fn matching_version_passes() {
         let catalog = catalog_with(&[("orders", 4)]);
         assert!(check(&catalog, &[("orders", 4)]).is_ok());
+    }
+
+    /// A pseudo entry (permission-tree / RLS tenant version, folded into
+    /// `GatewayVersionSet` by `with_extra`) names no real catalog descriptor,
+    /// so it is never compared here — regardless of its value.
+    #[test]
+    fn pseudo_entry_is_skipped_regardless_of_value() {
+        let catalog = catalog_with(&[("orders", 4)]);
+        assert!(check(&catalog, &[("orders", 4), ("\0__rls_version::7", 999)]).is_ok());
     }
 
     #[test]

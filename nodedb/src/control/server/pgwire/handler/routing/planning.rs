@@ -196,24 +196,32 @@ impl NodeDbPgHandler {
 
         // Cache key isn't session-knob-scoped, so bypass entirely under a strategy
         // override — else a plan built for one join strategy serves a differently-tuned query.
-        //
-        // A cached plan carries the RLS predicates injected when it was built,
-        // and policy writes bump no descriptor version, so a plan compiled
-        // before a policy existed would keep serving rows the policy now hides.
-        // While the tenant holds any policy, every statement is replanned and
-        // re-injected against the live store.
-        let bypass_cache = override_flags.bypass_plan_cache()
-            || self.state.rls.tenant_has_any_policy(tenant_id.as_u64());
+        let bypass_cache = override_flags.bypass_plan_cache();
+
+        // A cached plan carries the RLS predicates and permission-tree filter
+        // injected when it was built. Both stores keep a per-tenant version
+        // bumped on every mutation; a cache hit re-validates the stamped
+        // versions against these live values so a revoked grant or dropped
+        // policy evicts the entry instead of replaying a frozen filter.
+        let current_permission_tree_version = {
+            let perm_cache = self.state.permission_cache.read().await;
+            perm_cache.tenant_version(tenant_id.as_u64())
+        };
+        let current_rls_version = self.state.rls.tenant_version(tenant_id.as_u64());
+
         let cached_tasks = if bypass_cache {
             None
         } else {
             let state = Arc::clone(&self.state);
             let tenant = tenant_id.as_u64();
             let db = database_id;
-            self.sessions
-                .get_cached_plan(session_id, &clean_sql, move |id| {
-                    current_descriptor_version(&state, tenant, db, id)
-                })
+            self.sessions.get_cached_plan(
+                session_id,
+                &clean_sql,
+                move |id| current_descriptor_version(&state, tenant, db, id),
+                current_permission_tree_version,
+                current_rls_version,
+            )
         };
 
         let (tasks, output_schema, versions) = if !params.is_empty() {

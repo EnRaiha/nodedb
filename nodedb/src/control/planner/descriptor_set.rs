@@ -35,11 +35,36 @@ use nodedb_cluster::DescriptorId;
 pub struct DescriptorVersionSet {
     /// Sorted by `(kind, database_id, tenant_id, name)`.
     entries: Vec<(DescriptorId, u64)>,
+    /// The tenant's permission-tree version observed at plan-build time.
+    /// `0` when no permission cache was consulted. Compared in
+    /// [`Self::all_fresh`] alongside the descriptor entries so a revoked
+    /// grant evicts the plan exactly like a bumped descriptor does.
+    permission_tree_version: u64,
+    /// The tenant's RLS policy-store version observed at plan-build time.
+    rls_version: u64,
 }
 
 impl DescriptorVersionSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the permission-tree version this plan was built against.
+    pub fn set_permission_tree_version(&mut self, version: u64) {
+        self.permission_tree_version = version;
+    }
+
+    /// Record the RLS policy-store version this plan was built against.
+    pub fn set_rls_version(&mut self, version: u64) {
+        self.rls_version = version;
+    }
+
+    pub fn permission_tree_version(&self) -> u64 {
+        self.permission_tree_version
+    }
+
+    pub fn rls_version(&self) -> u64 {
+        self.rls_version
     }
 
     /// Record a descriptor read at the given version. O(log n)
@@ -88,12 +113,21 @@ impl DescriptorVersionSet {
     ///
     /// Used by the plan cache on every hit — a cached plan is
     /// only reusable while every descriptor it was built
-    /// against still exists at the same version.
-    pub fn all_fresh<F>(&self, current: F) -> bool
+    /// against still exists at the same version, AND the
+    /// tenant's permission-tree and RLS policy state has not
+    /// changed since the plan was built.
+    pub fn all_fresh<F>(
+        &self,
+        current: F,
+        current_permission_tree_version: u64,
+        current_rls_version: u64,
+    ) -> bool
     where
         F: Fn(&DescriptorId) -> Option<u64>,
     {
-        self.entries.iter().all(|(id, v)| current(id) == Some(*v))
+        self.permission_tree_version == current_permission_tree_version
+            && self.rls_version == current_rls_version
+            && self.entries.iter().all(|(id, v)| current(id) == Some(*v))
     }
 }
 
@@ -171,7 +205,7 @@ mod tests {
             "b" => Some(2),
             _ => None,
         };
-        assert!(set.all_fresh(lookup));
+        assert!(set.all_fresh(lookup, 0, 0));
     }
 
     #[test]
@@ -184,7 +218,7 @@ mod tests {
             "b" => Some(3), // bumped
             _ => None,
         };
-        assert!(!set.all_fresh(lookup));
+        assert!(!set.all_fresh(lookup, 0, 0));
     }
 
     #[test]
@@ -192,14 +226,35 @@ mod tests {
         let mut set = DescriptorVersionSet::new();
         set.record(id("a"), 1);
         let lookup = |_: &DescriptorId| None;
-        assert!(!set.all_fresh(lookup));
+        assert!(!set.all_fresh(lookup, 0, 0));
     }
 
     #[test]
     fn empty_set_is_always_fresh() {
         let set = DescriptorVersionSet::new();
         let lookup = |_: &DescriptorId| None;
-        assert!(set.all_fresh(lookup));
+        assert!(set.all_fresh(lookup, 0, 0));
+    }
+
+    #[test]
+    fn all_fresh_false_on_permission_tree_version_mismatch() {
+        let mut set = DescriptorVersionSet::new();
+        set.set_permission_tree_version(3);
+        let lookup = |_: &DescriptorId| None;
+        assert!(set.all_fresh(lookup, 3, 0));
+        assert!(
+            !set.all_fresh(lookup, 4, 0),
+            "a revoked grant bumps the tenant's permission version, so a stale stamp must not read as fresh"
+        );
+    }
+
+    #[test]
+    fn all_fresh_false_on_rls_version_mismatch() {
+        let mut set = DescriptorVersionSet::new();
+        set.set_rls_version(5);
+        let lookup = |_: &DescriptorId| None;
+        assert!(set.all_fresh(lookup, 0, 5));
+        assert!(!set.all_fresh(lookup, 0, 6));
     }
 
     #[test]

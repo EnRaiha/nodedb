@@ -12,6 +12,7 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 use super::plan_cache::{PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
+use super::version_set::{permission_tree_version_key, rls_version_key};
 
 impl Gateway {
     /// Execute SQL through the two-phase, descriptor-version-aware plan cache.
@@ -38,9 +39,27 @@ impl Gateway {
         if let Some(stored_vs) = self.plan_cache.lookup_version_set(&sql_key) {
             let shared = self.shared()?;
             let catalog = shared.credentials.catalog();
+            let tenant_id = ctx.tenant_id.as_u64();
+            // Read before reverify runs, not derived per-name inside it: both
+            // pseudo-entries share one live tenant snapshot the same way the
+            // real collection entries share one catalog snapshot.
+            let permission_tree_version = shared
+                .permission_cache
+                .read()
+                .await
+                .tenant_version(tenant_id);
+            let rls_version = shared.rls.tenant_version(tenant_id);
+            let ptree_key = permission_tree_version_key(tenant_id);
+            let rls_key = rls_version_key(tenant_id);
             let current_vs = stored_vs.reverify(|name| {
+                if name == ptree_key.as_str() {
+                    return permission_tree_version;
+                }
+                if name == rls_key.as_str() {
+                    return rls_version;
+                }
                 catalog
-                    .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), name)
+                    .get_collection(ctx.database_id, tenant_id, name)
                     .ok()
                     .flatten()
                     .map(|collection| collection.descriptor_version.max(1))
@@ -65,7 +84,9 @@ impl Gateway {
         }
 
         let plan = plan_fn()?;
-        let actual_vs = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
+        let actual_vs = self
+            .collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)
+            .await?;
         let actual_key = PlanCacheKey {
             sql_text_hash: sql_hash,
             placeholder_types_hash: ph_hash,
