@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The dispatch capability gate: clone-write interception and authorization
-//! merged into one step, so a caller can only reach the Data-Plane dispatch
-//! boundary through [`intercept_and_authorize`]. A caller holding a bare
-//! `AuthorizedTask` has no way to produce a [`CloneCheckedTask`] itself, so an
-//! entry point that forgets the clone-write hook fails to compile instead of
-//! silently bypassing it.
+//! The dispatch capability gate: clone-write interception, clone-read
+//! interception, and authorization merged into one step, so a caller can
+//! only reach the Data-Plane dispatch boundary through
+//! [`intercept_and_authorize`]. A caller holding a bare `AuthorizedTask` has
+//! no way to produce a [`CloneCheckedTask`] itself, so an entry point that
+//! forgets either clone hook fails to compile instead of silently bypassing it.
 
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::security::audit::AuditEmitter;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission, required_permission};
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::role::RoleStore;
 use crate::control::server::shared::authorization::{AuthorizedTask, authorize_task_set};
@@ -107,6 +107,23 @@ pub async fn intercept_and_authorize(
     } = params;
     if let CloneWriteOutcome::Handled(resp) =
         maybe_intercept_clone_write(state, &mut task, identity, tenant_id).await?
+    {
+        return Ok(CloneCheckedOutcome::Handled(resp));
+    }
+    if required_permission(&task.plan) == Permission::Read
+        && let super::super::clone_read::CloneReadOutcome::Handled(resp) =
+            super::super::clone_read::maybe_intercept_clone_read(
+                super::super::clone_read::CloneReadInterceptParams {
+                    state,
+                    task: &task,
+                    identity,
+                    tenant_id,
+                    permissions,
+                    roles,
+                    emitter,
+                },
+            )
+            .await?
     {
         return Ok(CloneCheckedOutcome::Handled(resp));
     }

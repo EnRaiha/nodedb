@@ -305,10 +305,11 @@ async fn set_operation_over_shadowed_clone_is_refused() {
     );
 }
 
-/// `UNION ALL` across two collections carries no `post_set_op`: only the
-/// first task's collection has its clone origin resolved.
+/// `UNION ALL` gives each collection its own `PhysicalTask`, so the
+/// per-task gate resolves each branch's clone origin independently — unlike
+/// the old batch resolver, which answered every branch but the first target-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multi_collection_read_over_shadowed_clone_is_refused() {
+async fn multi_collection_read_over_shadowed_clone_resolves_each_branch() {
     let server = TestServer::start().await;
     exec_all(
         &server,
@@ -327,8 +328,22 @@ async fn multi_collection_read_over_shadowed_clone_is_refused() {
     .await;
 
     let query = "SELECT id FROM ua_one UNION ALL SELECT id FROM ua_two";
-    server.expect_error(query, REFUSAL).await;
 
+    // Values, not just count: 2 duplicate rows from one collection would
+    // also pass a bare length check.
+    let rows = server
+        .query_rows(query)
+        .await
+        .expect("UNION ALL over a Shadowed clone must read through, not refuse");
+    let mut ids: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["o1", "t1"],
+        "each branch must independently resolve its own collection's source-only row: {rows:?}"
+    );
+
+    // Control: materializing must not change the answer.
     exec_all(
         &server,
         &[
@@ -342,5 +357,11 @@ async fn multi_collection_read_over_shadowed_clone_is_refused() {
         .query_rows(query)
         .await
         .expect("UNION ALL on a materialized clone");
-    assert_eq!(rows.len(), 2, "one row from each collection: {rows:?}");
+    let mut ids: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["o1", "t1"],
+        "materialized clone must still return one row from each collection: {rows:?}"
+    );
 }

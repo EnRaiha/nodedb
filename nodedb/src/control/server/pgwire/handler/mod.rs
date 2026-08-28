@@ -8,6 +8,7 @@ mod current_setting;
 mod cursor_cmds;
 mod cursor_query;
 mod dispatch;
+mod dispatch_clone_read;
 mod facet;
 mod in_flight;
 mod listen_notify_exec;

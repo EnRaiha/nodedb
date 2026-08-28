@@ -49,30 +49,6 @@ impl NodeDbPgHandler {
         })
     }
 
-    /// Clone-check, then authorize, one task at the Data-Plane dispatch
-    /// boundary — the only way to obtain a `CloneCheckedTask` on this path.
-    async fn intercept_and_authorize_for_dispatch(
-        &self,
-        identity: &AuthenticatedIdentity,
-        task: PhysicalTask,
-    ) -> crate::Result<crate::control::server::shared::clone_write::CloneCheckedOutcome> {
-        let tenant_id = task.tenant_id;
-        let emitter =
-            crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.state.audit));
-        crate::control::server::shared::clone_write::intercept_and_authorize(
-            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
-                state: &self.state,
-                task,
-                identity,
-                tenant_id,
-                permissions: &self.state.permissions,
-                roles: &self.state.roles,
-                emitter: &emitter,
-            },
-        )
-        .await
-    }
-
     /// Dispatch a single physical task and wait for the response.
     ///
     /// In cluster mode, writes propose to Raft first and execute only after
@@ -286,6 +262,15 @@ impl NodeDbPgHandler {
                 TraceId::ZERO,
             )
             .await;
+        }
+
+        // Clone-read must run first: resolving derived Exchange plans below
+        // dispatches straight to the Data Plane, bypassing the clone check.
+        if let Some(resp) = self
+            .maybe_intercept_clone_read_early(&task, identity, perm)
+            .await?
+        {
+            return Ok(resp);
         }
 
         // Resolve derived Exchange plans before authorizing the dispatched task.

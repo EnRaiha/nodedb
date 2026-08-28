@@ -2,10 +2,10 @@
 
 //! Copy-on-write read resolution algorithm.
 //!
-//! For a `Shadowed` or `Materializing` clone, produces an augmented task
-//! list: one task for the target database (post-clone writes), one for the
-//! source (rows at `effective_source_lsn`), merged via
-//! `merge_clone_responses`. Other clones return the task list unchanged.
+//! For a `Shadowed` or `Materializing` clone, resolves one physical task into
+//! the target task plus its source-side chain-walk twins, which
+//! `shared::clone_read` dispatches and merges. A collection that is not a
+//! clone, or is fully `Materialized`, resolves to `None`.
 
 pub mod filter;
 pub mod refusal;

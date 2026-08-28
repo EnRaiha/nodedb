@@ -3,8 +3,6 @@
 //! Plan rewriting from a target-database read into the equivalent source-database
 //! read at the effective source LSN.
 
-use std::sync::Arc;
-
 use nodedb_types::DatabaseId;
 use nodedb_types::TenantId;
 
@@ -60,7 +58,7 @@ pub struct RewriteForSourceParams<'a> {
     /// filters out bindings allocated AFTER the clone's AS-OF
     /// (snapshot isolation for the lazy KV read path).
     pub kv_surrogate_ceiling: Option<u32>,
-    pub state: &'a Arc<SharedState>,
+    pub state: &'a SharedState,
 }
 
 /// Rewrite a `PhysicalPlan` to target the source database and collection at

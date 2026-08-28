@@ -23,6 +23,8 @@ mod clone_materialize_timeseries;
 mod clone_materializer_kill_resume;
 mod clone_preserves_quota;
 mod clone_read_at_or_before_as_of;
+mod clone_read_cursor_choke_point;
+mod clone_read_mv_refresh_choke_point;
 mod clone_read_post_clone_writes;
 mod clone_read_predates_clone;
 mod clone_recursive_correctness;

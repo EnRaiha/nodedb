@@ -106,7 +106,7 @@ pub(super) fn filter_kv_tombstoned_rows(
         return Some(payload.to_vec());
     }
 
-    // Callers (clone_dispatch read path) MUST pass a payload that has been
+    // Callers (clone_read dispatch) MUST pass a payload that has been
     // through `wrap_single_map_as_array`, so the input is guaranteed to be
     // a valid msgpack array. Non-array input here means the upstream
     // normalization or the Data Plane response shape changed — return None
@@ -171,4 +171,22 @@ pub(super) fn filter_kv_tombstoned_rows(
         buf.extend_from_slice(&payload[start..end]);
     }
     Some(buf)
+}
+
+/// Replace a msgpack array with its first element's raw bytes (or empty).
+/// `SingleDocument` plans dispatch a bare row; `apply_kv_wrap` misparses an
+/// array as one raw scalar, garbling every field, if left wrapped.
+pub(super) fn unwrap_single_row(payload: Vec<u8>) -> Vec<u8> {
+    use nodedb_query::msgpack_scan;
+
+    let Some((count, body_start)) = msgpack_scan::array_header(&payload, 0) else {
+        return payload;
+    };
+    if count == 0 {
+        return Vec::new();
+    }
+    match msgpack_scan::skip_value(&payload, body_start) {
+        Some(end) => payload[body_start..end].to_vec(),
+        None => payload,
+    }
 }

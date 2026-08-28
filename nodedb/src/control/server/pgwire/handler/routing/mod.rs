@@ -12,7 +12,6 @@ mod calvin_dispatch;
 mod calvin_response;
 mod catalog;
 mod check_enforcement;
-mod clone_dispatch;
 mod cluster_array;
 mod dispatch_loop;
 pub(in crate::control::server::pgwire::handler) mod execute;

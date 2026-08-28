@@ -1,6 +1,7 @@
 //! Protocol-neutral machinery shared by every server entrypoint (pgwire, native, http).
 pub mod authorization;
 pub mod check_constraint;
+pub mod clone_read;
 pub mod clone_write;
 pub mod ddl;
 pub mod metering;

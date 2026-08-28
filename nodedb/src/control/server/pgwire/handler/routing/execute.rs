@@ -136,27 +136,6 @@ impl NodeDbPgHandler {
         // statement.
         let effective_schema = shaping.projection.or(Some(&output_schema));
 
-        // Clone CoW read-path interception: for Shadowed/Materializing clones,
-        // augment tasks with source-database reads and merge results.
-        // Returns Some(responses) when clone dispatch is fully handled.
-        // Returns None when this is not a cloned collection (fast path).
-        if let Some(clone_responses) = self
-            .maybe_dispatch_clone_reads(
-                tasks.clone(),
-                identity,
-                tenant_id,
-                session_id,
-                ResultShaping {
-                    projection: effective_schema,
-                    formats: shaping.formats,
-                },
-                &auth_ctx,
-            )
-            .await?
-        {
-            return Ok(clone_responses);
-        }
-
         // Implicit-edge dependent predicates must be preempted onto the
         // OLLP/Calvin path before gateway forwarding or ordinary dispatch.
         if let Some(responses) = self

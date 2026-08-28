@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `resolve_read`: walk the clone chain and build augmented source tasks.
+//! `resolve_read`: walk the clone chain for ONE physical task and build its
+//! source-side twins.
 
-use std::sync::Arc;
+use nodedb_types::{CloneStatus, Lsn, TenantId};
 
-use nodedb_types::{CloneOrigin, CloneStatus, Lsn, TenantId};
-
-use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
@@ -25,23 +23,17 @@ pub struct CloneReadParams {
     pub query_ms: Option<i64>,
 }
 
-/// Outcome of attempting to resolve clone reads for a set of tasks.
+/// Outcome of attempting to resolve a clone read for one task.
 pub enum ResolveOutcome {
-    /// Tasks were not modified — either the collection is not a clone, or
-    /// it is fully `Materialized`.
-    Passthrough(Vec<PhysicalTask>),
     /// The query time predates the clone's creation — return empty + note.
     PreDatesClone(ClonePredicatesNote),
-    /// Augmented tasks: [target_tasks..., source_tasks...].
-    ///
-    /// The caller dispatches all tasks and then calls `merge_source_into_target`
-    /// to filter tombstoned rows before returning results to the client.
+    /// `target_task` plus every source-side task the chain walk produced.
     Augmented {
-        tasks: Vec<PhysicalTask>,
-        /// Index into `tasks` where source tasks begin.
-        source_start_idx: usize,
-        /// Clone metadata for result filtering.
-        origin: CloneOrigin,
+        /// Boxed: `PhysicalTask` embeds `PhysicalPlan`, the crate's largest
+        /// enum, which would otherwise blow this variant's size far past
+        /// `PreDatesClone`'s.
+        target_task: Box<PhysicalTask>,
+        source_tasks: Vec<PhysicalTask>,
         /// Collection key for tombstone lookups, e.g. `"1/users"`.
         target_collection_key: String,
         /// Clone predation note, `None` unless `T_lsn < clone_created_at`.
@@ -49,43 +41,23 @@ pub enum ResolveOutcome {
     },
 }
 
-/// Attempt to resolve `tasks` for a cloned collection.
+/// Attempt to resolve `task` against a cloned collection.
 ///
 /// Returns `None` when the collection has no clone origin (fast path: zero
 /// overhead). Returns `Some(ResolveOutcome)` when resolution is required.
 pub fn resolve_read(
-    state: &Arc<SharedState>,
-    tasks: Vec<PhysicalTask>,
+    state: &SharedState,
+    task: PhysicalTask,
     tenant_id: TenantId,
     params: &CloneReadParams,
 ) -> crate::Result<Option<ResolveOutcome>> {
-    // Quick-check: do any tasks target a database other than the default?
-    // All tasks in a statement share the same database_id (single-database
-    // statements); use the first task's database_id.
-    let Some(first_task) = tasks.first() else {
-        return Ok(None);
-    };
-
-    // Clone resolution is a READ protocol; a write must reach
-    // `dispatch_task_loop`'s copy-on-write hook instead, or the superseded
-    // source row survives the next read. Gate runs before collection
-    // extraction so the invariant holds for any plan shape.
-    if tasks
-        .iter()
-        .any(|t| required_permission(&t.plan) != Permission::Read)
-    {
-        return Ok(None);
-    }
-
-    let db_id = first_task.database_id;
-
-    // Retrieve catalog for lookup.
+    let db_id = task.database_id;
     let catalog = state.credentials.catalog();
 
     // The shared extractor sees through the `Exchange` / `PostProcess`
     // wrappers the converter puts over every sharded read; a clone-local
     // copy would drift out of sync and misread those as "not a clone".
-    let Some(raw_coll) = extract_collection(&first_task.plan) else {
+    let Some(raw_coll) = extract_collection(&task.plan) else {
         return Ok(None);
     };
     // Strip the database prefix that db_qualified() prepends, e.g. "1/users" → "users".
@@ -111,36 +83,13 @@ pub fn resolve_read(
         CloneStatus::Shadowed | CloneStatus::Materializing { .. } => {}
     }
 
-    // A set operation (UNION DISTINCT / INTERSECT / EXCEPT) is applied by the
-    // normal dispatch loop, which the clone read path bypasses — the branches
-    // are concatenated instead. EXCEPT would then return the very rows it must
-    // subtract, and UNION DISTINCT would return duplicates. Refuse.
-    if tasks
-        .iter()
-        .any(|t| !matches!(t.post_set_op, PostSetOp::None))
-    {
+    // UNION DISTINCT/INTERSECT/EXCEPT dedup/subtract this task's response
+    // against siblings' by exact row match — unsound without proven parity.
+    if !matches!(task.post_set_op, PostSetOp::None) {
         return Err(crate::Error::PlanError {
             detail: format!(
                 "a set operation over '{coll_name}' cannot be read through an unmaterialized \
                  clone; run ALTER DATABASE <clone> MATERIALIZE first"
-            ),
-        });
-    }
-
-    // Only `coll_name`'s clone origin is resolved, and every task is rewritten
-    // against it. A statement whose other branch reads a DIFFERENT collection
-    // (e.g. `UNION ALL`, which carries no `post_set_op`) would answer that
-    // branch from the target alone, silently dropping its source rows.
-    if let Some(other) = tasks
-        .iter()
-        .filter_map(|t| extract_collection(&t.plan))
-        .find(|c| *c != raw_coll)
-    {
-        let other = super::rewrite::strip_db_prefix(db_id, other).to_string();
-        return Err(crate::Error::PlanError {
-            detail: format!(
-                "a statement reading both '{coll_name}' and '{other}' cannot be read through an \
-                 unmaterialized clone; run ALTER DATABASE <clone> MATERIALIZE first"
             ),
         });
     }
@@ -165,8 +114,7 @@ pub fn resolve_read(
     // Walk source-side tasks up the clone chain until `cloned_from = None`
     // or `Materialized`. `MAX_CLONE_DEPTH` bounds the chain at create time;
     // the loop still caps at 8 as a guard against catalog corruption.
-    let mut augmented_tasks = tasks.clone();
-    let source_start_idx = augmented_tasks.len();
+    let mut source_tasks: Vec<PhysicalTask> = Vec::new();
 
     // Current "target" level for this iteration.
     let mut cur_db_id = db_id;
@@ -174,10 +122,10 @@ pub fn resolve_read(
     let mut cur_origin = origin.clone();
     let mut cur_effective_ms = effective_source_ms;
 
-    // Templates for the next rewrite; after each level, updated to the
-    // tasks just pushed so the next iteration rewrites the correct
-    // per-level qualified name rather than the original target tasks.
-    let mut prev_level_tasks: Vec<PhysicalTask> = tasks.clone();
+    // Template for the next rewrite; after each level, updated to the task
+    // just pushed so the next iteration rewrites the correct per-level
+    // qualified name rather than the original target task.
+    let mut prev_level_tasks: Vec<PhysicalTask> = vec![task.clone()];
 
     const MAX_WALK: u32 = 8;
     let mut depth = 0u32;
@@ -194,12 +142,12 @@ pub fn resolve_read(
 
         let mut this_level_tasks: Vec<PhysicalTask> = Vec::new();
 
-        for task in &prev_level_tasks {
+        for level_task in &prev_level_tasks {
             // An unsupported read shape over the cloned collection returns an
             // error here, not `NoSourceTask` — it propagates to the client
             // instead of quietly producing a target-only answer.
             let rewritten = rewrite_plan_for_source(super::rewrite::RewriteForSourceParams {
-                plan: &task.plan,
+                plan: &level_task.plan,
                 target_db_id: cur_db_id,
                 source_db_id: src_db_id,
                 tenant_id,
@@ -229,7 +177,7 @@ pub fn resolve_read(
             });
         }
 
-        augmented_tasks.extend(this_level_tasks.iter().cloned());
+        source_tasks.extend(this_level_tasks.iter().cloned());
         prev_level_tasks = this_level_tasks;
 
         // Check whether `src_db_id / src_coll_name` is itself a clone so we
@@ -270,9 +218,8 @@ pub fn resolve_read(
         crate::control::planner::sql_plan_convert::convert::db_qualified(db_id, coll_name);
 
     Ok(Some(ResolveOutcome::Augmented {
-        tasks: augmented_tasks,
-        source_start_idx,
-        origin: origin.clone(),
+        target_task: Box::new(task),
+        source_tasks,
         target_collection_key,
         note: None,
     }))
