@@ -217,6 +217,7 @@ mod sql_transactions_kv_overlay;
 mod sql_transactions_kv_transfer_overlay;
 mod sql_transactions_pk_scan_consistency;
 mod sql_transactions_point_get_overlay;
+mod sql_transactions_rollback_savepoint_ddl;
 mod sql_transactions_savepoint_overlay;
 mod sql_transactions_scan_overlay;
 mod sql_transactions_spatial_overlay;

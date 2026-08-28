@@ -37,7 +37,7 @@ fn savepoint_rollback_truncates_aligned_lease_holders() {
     let scope = Arc::new(QueryLeaseScope::empty());
     assert!(store.buffer_write(addr, task()));
     assert!(store.attach_tx_lease_scope_since(addr, 0, Arc::clone(&scope)));
-    store.create_savepoint(addr, "sp".into(), BTreeMap::new());
+    store.create_savepoint(addr, "sp".into(), BTreeMap::new(), 0);
     assert!(store.buffer_write(addr, task()));
     assert!(store.attach_tx_lease_scope_since(addr, 1, Arc::clone(&scope)));
 
@@ -67,7 +67,7 @@ fn rollback_to_savepoint_discards_deferred_offsets_after_the_mark() {
         offset: crate::event::cdc::CdcOffset::new(10, 1),
     };
     assert!(store.defer_offset_commit(addr, before));
-    store.create_savepoint(addr, "sp".into(), BTreeMap::new());
+    store.create_savepoint(addr, "sp".into(), BTreeMap::new(), 0);
     assert!(store.defer_offset_commit(
         addr,
         PendingOffsetCommit {

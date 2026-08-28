@@ -100,6 +100,16 @@ pub fn buffer_len() -> usize {
     with_slot(0, |b| b.borrow().as_ref().map(|v| v.len()).unwrap_or(0))
 }
 
+/// Truncate the active buffer to `len` entries, discarding everything
+/// buffered after that point. No-op if no buffer is active.
+pub fn truncate(len: usize) {
+    with_slot((), |b| {
+        if let Some(buf) = b.borrow_mut().as_mut() {
+            buf.truncate(len);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::conn_scope;

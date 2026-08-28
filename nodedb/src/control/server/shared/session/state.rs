@@ -39,6 +39,8 @@ pub struct SavepointEntry {
     pub pending_offset_len: usize,
     /// `pending_field_inference` length captured when the savepoint was established.
     pub pending_inference_len: usize,
+    /// Task-local DDL buffer length captured when the savepoint was established.
+    pub ddl_buffer_len: usize,
     /// Per-vShard `(value_marker, graph_marker)` overlay journal markers.
     pub markers: BTreeMap<VShardId, (usize, usize)>,
 }

@@ -116,7 +116,12 @@ pub async fn run_savepoint(
             markers.insert(vshard_id, decode_markers(payload));
         }
     }
-    sessions.create_savepoint(session_id, name.to_string(), markers);
+    sessions.create_savepoint(
+        session_id,
+        name.to_string(),
+        markers,
+        super::ddl_buffer::buffer_len(),
+    );
     Ok(())
 }
 
@@ -155,11 +160,13 @@ pub async fn run_rollback_to_savepoint(
     name: &str,
 ) -> Result<(), SavepointError> {
     require_active_txn(sessions, session_id)?;
-    let markers = sessions
+    let rewind = sessions
         .rollback_to_savepoint(session_id, name)
         .map_err(|e| SavepointError::NotFound {
             message: e.to_string(),
         })?;
+    super::ddl_buffer::truncate(rewind.ddl_buffer_len);
+    let markers = rewind.markers;
     let (txn_id, vshards) = sessions.txn_identity(session_id);
     if let Some(txn_id) = txn_id {
         for vshard_id in vshards {
