@@ -36,11 +36,12 @@ use crate::wal::WalManager;
 /// The SharedState owns the plan cache via `gateway`, and `gateway_invalidator`
 /// points to a weak-ref invalidator backed by the same cache. This mirrors
 /// the production wiring in `main.rs`.
-fn make_test_state() -> (Arc<SharedState>, Arc<PlanCache>) {
+///
+/// Returns state, plan cache, and the backing `TempDir` guard — the caller
+/// must keep the guard alive for as long as `shared` is in use.
+fn make_test_state() -> (Arc<SharedState>, Arc<PlanCache>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tmpdir");
     let wal_path = dir.path().join("test.wal");
-    // Leak the TempDir so it outlives the SharedState.
-    std::mem::forget(dir);
 
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
@@ -65,7 +66,7 @@ fn make_test_state() -> (Arc<SharedState>, Arc<PlanCache>) {
         let _ = (*state).gateway_invalidator.set(invalidator);
     }
 
-    (shared, plan_cache)
+    (shared, plan_cache, dir)
 }
 
 /// Insert a sentinel plan entry for collection `col` at version 1.
@@ -92,7 +93,7 @@ fn plant_sentinel(cache: &PlanCache, col: &str) -> PlanCacheKey {
 
 #[tokio::test]
 async fn put_collection_evicts_stale_plan_entries() {
-    let (shared, cache) = make_test_state();
+    let (shared, cache, _dir) = make_test_state();
     let key = plant_sentinel(&cache, "orders");
     assert_eq!(cache.len(), 1);
 
@@ -114,7 +115,7 @@ async fn put_collection_evicts_stale_plan_entries() {
 
 #[tokio::test]
 async fn deactivate_collection_evicts_plan_entries() {
-    let (shared, cache) = make_test_state();
+    let (shared, cache, _dir) = make_test_state();
     let key = plant_sentinel(&cache, "products");
     assert_eq!(cache.len(), 1);
 
@@ -165,7 +166,7 @@ fn assert_noop(
 async fn no_op_variants_do_not_evict_plan_cache() {
     use crate::control::security::catalog::sequence_types::StoredSequence;
 
-    let (shared, cache) = make_test_state();
+    let (shared, cache, _dir) = make_test_state();
 
     // DeleteSequence
     assert_noop(
@@ -360,9 +361,11 @@ async fn no_op_variants_do_not_evict_plan_cache() {
 #[tokio::test]
 async fn no_gateway_invalidator_is_safe_noop() {
     // Build SharedState WITHOUT wiring the gateway_invalidator.
+    // The WAL lives under the guard's directory rather than a fixed path, so
+    // it is removed with the guard and two concurrent runs cannot collide on
+    // the same file.
     let dir = tempfile::tempdir().expect("tmpdir");
-    std::mem::forget(dir); // leak to avoid drop-before-use
-    let wal_path = std::path::PathBuf::from("/tmp/matchstick_no_gw.wal");
+    let wal_path = dir.path().join("test.wal");
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();

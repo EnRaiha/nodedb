@@ -290,7 +290,9 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
-    fn temp_db() -> Arc<redb::Database> {
+    /// Returns the database plus the backing `TempDir` guard — the caller
+    /// must keep the guard alive for as long as `db` is in use.
+    fn temp_db() -> (Arc<redb::Database>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
         let db = redb::Database::create(&path).unwrap();
@@ -299,8 +301,7 @@ mod tests {
             let _ = txn.open_table(MigrationStateTable::TABLE).unwrap();
         }
         txn.commit().unwrap();
-        std::mem::forget(dir);
-        Arc::new(db)
+        (Arc::new(db), dir)
     }
 
     fn shared_table(db: Arc<redb::Database>) -> SharedMigrationStateTable {
@@ -349,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_migration_is_cleaned_up() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let table = shared_table(Arc::clone(&db));
         let id = Uuid::new_v4();
         let now_ms = SystemTime::now()
@@ -388,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_migration_is_aborted() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let table = shared_table(Arc::clone(&db));
         let id = Uuid::new_v4();
         // ts_ms = 0 means the migration is extremely old.
@@ -429,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_migration_is_resumed() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let table = shared_table(Arc::clone(&db));
         let id = Uuid::new_v4();
         let now_ms = SystemTime::now()

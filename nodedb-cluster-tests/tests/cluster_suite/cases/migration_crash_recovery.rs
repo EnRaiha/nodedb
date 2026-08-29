@@ -33,7 +33,9 @@ use nodedb_cluster::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn temp_db() -> Arc<redb::Database> {
+/// Returns the database plus the backing `TempDir` guard — the caller must
+/// keep the guard alive for as long as `db` is in use.
+fn temp_db() -> (Arc<redb::Database>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("migration_test.redb");
     let db = redb::Database::create(&path).unwrap();
@@ -46,8 +48,7 @@ fn temp_db() -> Arc<redb::Database> {
             .unwrap();
     }
     txn.commit().unwrap();
-    std::mem::forget(dir);
-    Arc::new(db)
+    (Arc::new(db), dir)
 }
 
 fn shared_table(db: Arc<redb::Database>) -> SharedMigrationStateTable {
@@ -119,7 +120,7 @@ fn empty_topology() -> Arc<std::sync::RwLock<ClusterTopology>> {
 
 #[tokio::test]
 async fn crash_after_add_learner_stale_aborts() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
 
@@ -162,7 +163,7 @@ async fn crash_after_add_learner_stale_aborts() {
 
 #[tokio::test]
 async fn completed_migration_is_cleaned_up() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
 
@@ -199,7 +200,7 @@ async fn completed_migration_is_cleaned_up() {
 
 #[tokio::test]
 async fn recent_migration_is_resumed() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
 
@@ -233,7 +234,7 @@ async fn recent_migration_is_resumed() {
 
 #[test]
 fn idempotent_checkpoint_upsert() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
     let payload = MigrationCheckpointPayload::CatchUp {
@@ -262,7 +263,7 @@ fn idempotent_checkpoint_upsert() {
 
 #[test]
 fn crc32c_mismatch_is_rejected() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
     let payload = MigrationCheckpointPayload::CatchUp {
@@ -294,7 +295,7 @@ fn crc32c_mismatch_is_rejected() {
 
 #[test]
 fn abort_applies_compensations_and_deletes_row() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
 
@@ -328,7 +329,7 @@ fn abort_applies_compensations_and_deletes_row() {
 
 #[test]
 fn abort_applies_all_compensations_in_order() {
-    let db = temp_db();
+    let (db, _dir) = temp_db();
     let table = shared_table(Arc::clone(&db));
     let id = Uuid::new_v4();
 
@@ -393,7 +394,7 @@ async fn state_machine_fuzz_fixed_seed() {
 
     for seed_offset in 0..32_u32 {
         rng = SEED.wrapping_add(seed_offset).max(1); // xorshift32 requires non-zero seed
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let table = shared_table(Arc::clone(&db));
         let id = Uuid::new_v4();
 

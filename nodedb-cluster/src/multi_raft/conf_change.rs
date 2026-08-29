@@ -219,20 +219,21 @@ mod tests {
 
     use super::super::core::MultiRaft;
 
-    fn new_mr(node_id: u64, group_ids: &[u64]) -> MultiRaft {
+    /// Returns the raft group plus the backing `TempDir` guard — the caller
+    /// must keep the guard alive for as long as `mr` is in use.
+    fn new_mr(node_id: u64, group_ids: &[u64]) -> (MultiRaft, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let rt = RoutingTable::uniform(group_ids.len() as u64, &[node_id], 1);
         let mut mr = MultiRaft::new(node_id, rt, dir.path().to_path_buf());
-        std::mem::forget(dir); // Keep temp dir alive for the duration of the test.
         for &gid in group_ids {
             mr.add_group(gid, vec![]).unwrap();
         }
-        mr
+        (mr, dir)
     }
 
     #[test]
     fn apply_add_learner_updates_routing_and_raftnode() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
         let change = ConfChange {
             change_type: ConfChangeType::AddLearner,
             node_id: 2,
@@ -254,7 +255,7 @@ mod tests {
 
     #[test]
     fn apply_promote_learner_moves_peer_to_voters() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
         mr.apply_conf_change(
             0,
             &ConfChange {
@@ -290,7 +291,7 @@ mod tests {
     /// here, on the leader's propose path.
     #[test]
     fn propose_promote_requires_learner_caught_up() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
         // Force election: single-voter group becomes leader on first tick,
         // and its no-op commits immediately.
         for node in mr.groups.values_mut() {
@@ -342,7 +343,7 @@ mod tests {
     /// same propose succeeds.
     #[test]
     fn propose_promote_allows_caught_up_learner() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
         for node in mr.groups.values_mut() {
             node.election_deadline_override(
                 std::time::Instant::now() - std::time::Duration::from_millis(1),
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn apply_remove_learner_drops_from_learners_only() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
         // Add learner first.
         mr.apply_conf_change(
             0,
@@ -446,7 +447,7 @@ mod tests {
 
     #[test]
     fn apply_remove_learner_noop_for_voter_and_absent() {
-        let mut mr = new_mr(1, &[0]);
+        let (mut mr, _dir) = new_mr(1, &[0]);
 
         // Removing a voter via RemoveLearner must be a no-op (does not
         // touch the voter list).

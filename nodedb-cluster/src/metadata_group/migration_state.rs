@@ -330,7 +330,9 @@ pub fn new_shared(db: Arc<redb::Database>) -> SharedMigrationStateTable {
 mod tests {
     use super::*;
 
-    fn temp_db() -> Arc<redb::Database> {
+    /// Returns the database plus the backing `TempDir` guard — the caller
+    /// must keep the guard alive for as long as `db` is in use.
+    fn temp_db() -> (Arc<redb::Database>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
         let db = redb::Database::create(&path).unwrap();
@@ -340,9 +342,7 @@ mod tests {
             let _ = txn.open_table(MigrationStateTable::TABLE).unwrap();
         }
         txn.commit().unwrap();
-        // Box keeps the TempDir alive — we leak it intentionally for tests.
-        std::mem::forget(dir);
-        Arc::new(db)
+        (Arc::new(db), dir)
     }
 
     fn make_row(
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn upsert_and_load_roundtrip() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let mut table = MigrationStateTable::new(Arc::clone(&db));
 
         let id = Uuid::new_v4();
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn idempotent_upsert_same_phase_attempt() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let mut table = MigrationStateTable::new(Arc::clone(&db));
 
         let id = Uuid::new_v4();
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_from_redb() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let mut table = MigrationStateTable::new(Arc::clone(&db));
 
         let id = Uuid::new_v4();

@@ -28,14 +28,15 @@ use nodedb::wal::WalManager;
 use nodedb_test_support::array_sync::build_schema_snapshot;
 use nodedb_types::DatabaseId;
 
-fn build_test_state() -> Arc<SharedState> {
+/// Returns the shared state plus the backing `TempDir` guard — the caller
+/// must keep the guard alive for as long as the state is in use.
+fn build_test_state() -> (Arc<SharedState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tmpdir");
     let wal_path = dir.path().join("test.wal");
-    std::mem::forget(dir); // outlive SharedState, mirrors other test harnesses in this crate
 
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    SharedState::new(dispatcher, wal).unwrap()
+    (SharedState::new(dispatcher, wal).unwrap(), dir)
 }
 
 fn superuser_identity() -> AuthenticatedIdentity {
@@ -57,7 +58,7 @@ fn row_names(results: &[DdlResult]) -> Vec<String> {
 
 #[tokio::test]
 async fn synced_array_schema_is_visible_in_system_catalog_single_node() {
-    let shared = build_test_state();
+    let (shared, _dir) = build_test_state();
     // No `raft_proposer` installed => `handle_schema` takes the single-node
     // direct-import branch (mirrors an embedded / single-node deployment).
     assert!(
