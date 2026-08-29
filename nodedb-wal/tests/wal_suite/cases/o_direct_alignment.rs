@@ -10,8 +10,6 @@
 //! unpadded record length, otherwise subsequent submissions land on an
 //! unaligned offset and the kernel returns `-EINVAL`.
 
-#![cfg(all(feature = "io-uring", target_os = "linux"))]
-
 use std::path::PathBuf;
 
 use nodedb_wal::align::{DEFAULT_ALIGNMENT, is_aligned};

@@ -12,8 +12,6 @@
 //! Requires `--features failpoints`; without it the injections compile away
 //! and there is nothing to drive.
 
-#![cfg(feature = "failpoints")]
-
 use std::path::Path;
 
 use nodedb_types::fail_point::FailGuard;

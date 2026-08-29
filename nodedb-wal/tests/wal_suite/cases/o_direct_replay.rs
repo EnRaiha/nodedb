@@ -12,8 +12,6 @@
 //! segment and assert every reader recovers *all* of them — not just the
 //! first. Each one fails if the padding stops being framed as a `Noop` record.
 
-#![cfg(target_os = "linux")]
-
 use std::path::{Path, PathBuf};
 
 use nodedb_wal::align::{DEFAULT_ALIGNMENT, is_aligned};

@@ -3,8 +3,6 @@
 //! Spec: mmap WAL readers must advise MADV_SEQUENTIAL, and replay
 //! helpers must filter segments by SegmentMeta.first_lsn before opening.
 //!
-
-#![cfg(not(target_arch = "wasm32"))]
 //! The Event-Plane WAL catchup path scans segments forward. The kernel
 //! default (MADV_NORMAL) underreads for sequential workloads and keeps
 //! already-consumed pages resident. MADV_SEQUENTIAL doubles readahead

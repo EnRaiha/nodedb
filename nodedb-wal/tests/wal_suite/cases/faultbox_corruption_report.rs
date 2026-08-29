@@ -8,8 +8,6 @@
 //! that hit it, and only until something repairs or rolls the log. The report
 //! has to hold a copy or the evidence is gone.
 
-#![cfg(feature = "diagnostics")]
-
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

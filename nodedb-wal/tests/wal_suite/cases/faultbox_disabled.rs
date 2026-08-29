@@ -8,8 +8,6 @@
 //! inert even when it is on. A recorder that changed an error, swallowed one, or
 //! panicked at a detection site would be worse than no recorder at all.
 
-#![cfg(not(feature = "diagnostics"))]
-
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
