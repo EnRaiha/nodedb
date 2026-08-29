@@ -208,6 +208,8 @@ fn apply_deactivate_preserves_record() {
             database_id: 0,
             tenant_id: 7,
             name: "archived".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         })
         .unwrap(),
     };

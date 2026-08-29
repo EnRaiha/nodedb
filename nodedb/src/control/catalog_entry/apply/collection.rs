@@ -205,11 +205,35 @@ fn purge_index_records(
     Ok(())
 }
 
-pub fn deactivate(database_id: u64, tenant_id: u64, name: &str, catalog: &SystemCatalog) {
+/// Ordering metadata a soft delete records on the collection row, frozen at
+/// propose time by `descriptor_stamp::stamp` and carried inside the entry so
+/// every replica writes identical values.
+pub struct DeactivateStamp {
+    pub descriptor_version: u64,
+    pub modification_hlc: nodedb_types::Hlc,
+}
+
+pub fn deactivate(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    stamp: DeactivateStamp,
+    catalog: &SystemCatalog,
+) {
     let database_id = DatabaseId::new(database_id);
     match catalog.get_collection(database_id, tenant_id, name) {
         Ok(Some(mut stored)) => {
             stored.is_active = false;
+            // The drop is itself a descriptor mutation: without its own
+            // version and HLC the row keeps the CREATE's metadata, and a
+            // replayed CREATE cannot be ordered against it. Version `0` is
+            // the pre-stamping sentinel — an unstamped entry carries no
+            // ordering information, so the row keeps what it already had
+            // rather than being reset behind the CREATE.
+            if stamp.descriptor_version != 0 {
+                stored.descriptor_version = stamp.descriptor_version;
+                stored.modification_hlc = stamp.modification_hlc;
+            }
             if let Err(e) = catalog.put_collection(database_id, &stored) {
                 warn!(
                     collection = %name,

@@ -17,7 +17,9 @@ fn kind_label_is_stable() {
         CatalogEntry::DeactivateCollection {
             database_id: 0,
             tenant_id: 1,
-            name: "a".into()
+            name: "a".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
         .kind(),
         "deactivate_collection"

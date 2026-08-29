@@ -90,6 +90,7 @@ fn target_of(entry: &CatalogEntry) -> Option<Target> {
             database_id,
             tenant_id,
             name,
+            ..
         }
         | CatalogEntry::PurgeCollection {
             database_id,

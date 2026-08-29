@@ -157,7 +157,8 @@ pub(super) fn emit_ddl_audit(
 
 /// Return `(descriptor_name, version_after, hlc_string)` for a
 /// stamped `CatalogEntry`. Delete* variants return `version_after = 0`
-/// since the object is being removed.
+/// since the object is being removed. A soft delete keeps its row, so it
+/// reports the version and HLC it stamped.
 pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, String) {
     use catalog_entry::CatalogEntry as E;
     match e {
@@ -171,7 +172,16 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             c.descriptor_version,
             format!("{:?}", c.modification_hlc),
         ),
-        E::DeactivateCollection { name, .. } => (name.clone(), 0, String::new()),
+        E::DeactivateCollection {
+            name,
+            descriptor_version,
+            modification_hlc,
+            ..
+        } => (
+            name.clone(),
+            *descriptor_version,
+            format!("{modification_hlc:?}"),
+        ),
         E::PurgeCollection { name, .. } => (name.clone(), 0, String::new()),
         E::RecordWalTombstone { collection, .. } => (collection.clone(), 0, String::new()),
         E::PutSequence(s) => (

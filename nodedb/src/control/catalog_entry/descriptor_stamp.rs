@@ -27,16 +27,35 @@
 //! Not every `CatalogEntry` variant carries descriptor version/HLC.
 //! `PutUser`, `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`,
 //! `PutApiKey`, `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
-//! `PutSequenceState`, and the `Delete*` / `Deactivate*` variants
-//! are returned unchanged. The helper is exhaustive on
+//! `PutSequenceState`, and the `Delete*` / `Purge*` variants
+//! are returned unchanged. `DeactivateCollection` does carry them:
+//! a soft delete rewrites the collection row, so it consumes a
+//! version like any other mutation. The helper is exhaustive on
 //! [`CatalogEntry`] so adding a new variant is a compile-time
 //! error here — the compiler forces you to make a conscious
 //! decision about whether it needs a version stamp.
 
-use nodedb_types::HlcClock;
+use nodedb_types::{Hlc, HlcClock};
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::{StoredCollection, SystemCatalog};
+
+/// Derive `(descriptor_version, modification_hlc)` for a collection mutation
+/// from its prior committed row. Shared by the `PutCollection` and
+/// `DeactivateCollection` arms below — a soft delete advances the same
+/// ordering metadata a `PutCollection` would, from the same prior row.
+fn next_collection_stamp(
+    prior: Option<&StoredCollection>,
+    clock: &HlcClock,
+    hlc: Hlc,
+) -> (u64, Hlc) {
+    let hlc = match prior.map(|c| c.modification_hlc) {
+        Some(prior_hlc) if prior_hlc >= hlc => clock.update(prior_hlc),
+        _ => hlc,
+    };
+    let prior_descriptor = prior.map(|c| c.descriptor_version).unwrap_or(0);
+    (prior_descriptor.saturating_add(1), hlc)
+}
 
 /// Read the prior persisted descriptor (if any), assign
 /// `descriptor_version = prior + 1` (or `1` on create), stamp
@@ -59,13 +78,10 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
-            if let Some(prior_hlc) = prior.as_ref().map(|c| c.modification_hlc)
-                && prior_hlc >= hlc
-            {
-                hlc = clock.update(prior_hlc);
-            }
-            let prior_descriptor = prior.as_ref().map(|c| c.descriptor_version).unwrap_or(0);
-            stored.descriptor_version = prior_descriptor.saturating_add(1);
+            let (descriptor_version, stamped_hlc) =
+                next_collection_stamp(prior.as_ref(), clock, hlc);
+            stored.descriptor_version = descriptor_version;
+            hlc = stamped_hlc;
             // Constraint version bumps ONLY when the derived constraint set
             // actually changes, so an unrelated ALTER never advances the
             // apply-time fence key and never transiently rejects in-flight
@@ -189,11 +205,37 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             stored.modification_hlc = hlc;
             CatalogEntry::PutContinuousAggregate(stored)
         }
+        CatalogEntry::DeactivateCollection {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => {
+            // A soft delete rewrites the row, so it advances the same
+            // ordering metadata a `PutCollection` would. Committed-only for
+            // the same reason as that arm.
+            let prior = catalog
+                .get_committed_collection(
+                    crate::types::DatabaseId::new(database_id),
+                    tenant_id,
+                    &name,
+                )
+                .ok()
+                .flatten();
+            let (descriptor_version, stamped_hlc) =
+                next_collection_stamp(prior.as_ref(), clock, hlc);
+            CatalogEntry::DeactivateCollection {
+                database_id,
+                tenant_id,
+                name,
+                descriptor_version,
+                modification_hlc: stamped_hlc,
+            }
+        }
         // Variants without descriptor versioning pass through
         // unchanged. Exhaustive match forces explicit handling of
         // any future variant added to `CatalogEntry`.
-        entry @ (CatalogEntry::DeactivateCollection { .. }
-        | CatalogEntry::PurgeCollection { .. }
+        entry @ (CatalogEntry::PurgeCollection { .. }
         | CatalogEntry::DeleteFunction { .. }
         | CatalogEntry::DeleteProcedure { .. }
         | CatalogEntry::DeleteTrigger { .. }
@@ -271,12 +313,33 @@ pub fn stamp_batch(
     stamped_entries
 }
 
+/// The `(database, tenant, name)` a versioned collection entry mutates.
+/// A soft delete shares this key with the puts: `CREATE t; DROP t;` in one
+/// transaction is two mutations of one descriptor, not two firsts.
+fn collection_key(entry: &CatalogEntry) -> Option<(u64, u64, &str)> {
+    match entry {
+        CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
+            Some((
+                stored.database_id.as_u64(),
+                stored.tenant_id,
+                stored.name.as_str(),
+            ))
+        }
+        CatalogEntry::DeactivateCollection {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => Some((*database_id, *tenant_id, name.as_str())),
+        _ => None,
+    }
+}
+
 fn same_descriptor(prior: &CatalogEntry, current: &CatalogEntry) -> bool {
+    if let (Some(prior_key), Some(current_key)) = (collection_key(prior), collection_key(current)) {
+        return prior_key == current_key;
+    }
     match (prior, current) {
-        (
-            CatalogEntry::PutCollection(a) | CatalogEntry::PutCollectionIfAbsent(a),
-            CatalogEntry::PutCollection(b) | CatalogEntry::PutCollectionIfAbsent(b),
-        ) => a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name,
         (CatalogEntry::PutMaterializedView(a), CatalogEntry::PutMaterializedView(b)) => {
             a.tenant_id == b.tenant_id && a.name == b.name
         }
@@ -345,7 +408,59 @@ fn advance_after(prior: &CatalogEntry, current: CatalogEntry) -> CatalogEntry {
             current.descriptor_version = prior.descriptor_version.saturating_add(1);
             CatalogEntry::PutContinuousAggregate(current)
         }
+        (
+            CatalogEntry::DeactivateCollection {
+                descriptor_version: prior_version,
+                ..
+            },
+            CatalogEntry::PutCollection(mut current),
+        ) => {
+            // A soft delete leaves the constraint set untouched, so only the
+            // descriptor version advances past it.
+            current.descriptor_version = prior_version.saturating_add(1);
+            CatalogEntry::PutCollection(current)
+        }
+        (
+            CatalogEntry::DeactivateCollection {
+                descriptor_version: prior_version,
+                ..
+            },
+            CatalogEntry::PutCollectionIfAbsent(mut current),
+        ) => {
+            current.descriptor_version = prior_version.saturating_add(1);
+            CatalogEntry::PutCollectionIfAbsent(current)
+        }
+        (
+            prior,
+            CatalogEntry::DeactivateCollection {
+                database_id,
+                tenant_id,
+                name,
+                modification_hlc,
+                ..
+            },
+        ) => CatalogEntry::DeactivateCollection {
+            database_id,
+            tenant_id,
+            name,
+            descriptor_version: collection_version(prior).saturating_add(1),
+            modification_hlc,
+        },
         (_, current) => current,
+    }
+}
+
+/// The version a preceding collection entry in the same batch stamped, or `0`
+/// when the entry is not a versioned collection mutation.
+fn collection_version(entry: &CatalogEntry) -> u64 {
+    match entry {
+        CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
+            stored.descriptor_version
+        }
+        CatalogEntry::DeactivateCollection {
+            descriptor_version, ..
+        } => *descriptor_version,
+        _ => 0,
     }
 }
 
@@ -601,17 +716,52 @@ mod tests {
         assert_eq!(second.descriptor_version, 2);
     }
 
+    /// A soft delete (`DeactivateCollection`) must advance the same
+    /// descriptor version and HLC a `PutCollection` would — it is a mutation
+    /// of the row, not a pass-through. `stamp_ignores_deletes` previously
+    /// asserted the opposite (pass-through unchanged), which encoded the
+    /// bug this test now guards against.
     #[test]
-    fn stamp_ignores_deletes() {
+    fn stamp_advances_deactivate_collection_version_and_hlc() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
         let catalog = store.catalog();
-        let entry = CatalogEntry::DeactivateCollection {
-            database_id: 0,
-            tenant_id: 1,
-            name: "orders".into(),
+
+        let stored = StoredCollection::new(1, "orders", "tester");
+        let create = stamp(
+            CatalogEntry::PutCollection(Box::new(stored)),
+            &clock,
+            catalog,
+        );
+        let CatalogEntry::PutCollection(created) = &create else {
+            panic!("expected PutCollection");
         };
-        let stamped = stamp(entry, &clock, catalog);
-        assert!(matches!(stamped, CatalogEntry::DeactivateCollection { .. }));
+        let create_version = created.descriptor_version;
+        let create_hlc = created.modification_hlc;
+        catalog
+            .put_collection(DatabaseId::DEFAULT, created)
+            .expect("put_collection");
+
+        let stamped = stamp(
+            CatalogEntry::DeactivateCollection {
+                database_id: 0,
+                tenant_id: 1,
+                name: "orders".into(),
+                descriptor_version: 0,
+                modification_hlc: nodedb_types::Hlc::ZERO,
+            },
+            &clock,
+            catalog,
+        );
+        let CatalogEntry::DeactivateCollection {
+            descriptor_version,
+            modification_hlc,
+            ..
+        } = stamped
+        else {
+            panic!("expected DeactivateCollection");
+        };
+        assert_eq!(descriptor_version, create_version + 1);
+        assert!(modification_hlc > create_hlc);
     }
 }

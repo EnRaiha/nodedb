@@ -123,6 +123,8 @@ async fn deactivate_collection_evicts_plan_entries() {
         database_id: 0,
         tenant_id: 1,
         name: "products".into(),
+        descriptor_version: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
     invalidate_gateway_cache_for_entry(&entry, &shared);

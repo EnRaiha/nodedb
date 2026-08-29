@@ -4,10 +4,11 @@
 
 use crate::control::catalog_entry::apply::apply_to;
 use crate::control::catalog_entry::codec::{decode, encode};
+use crate::control::catalog_entry::descriptor_stamp::stamp;
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::catalog_entry::tests::open_catalog;
 use crate::control::security::catalog::StoredCollection;
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, HlcClock};
 
 #[test]
 fn roundtrip_put_collection() {
@@ -31,6 +32,8 @@ fn roundtrip_deactivate_collection() {
         database_id: 0,
         tenant_id: 3,
         name: "legacy".into(),
+        descriptor_version: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
     let bytes = encode(&entry).unwrap();
     match decode(&bytes).unwrap() {
@@ -38,6 +41,7 @@ fn roundtrip_deactivate_collection() {
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             assert_eq!(database_id, 0);
             assert_eq!(tenant_id, 3);
@@ -81,6 +85,8 @@ fn apply_deactivate_collection_preserves_record() {
             database_id: 0,
             tenant_id: 1,
             name: "archived".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         },
         catalog,
     )
@@ -91,6 +97,60 @@ fn apply_deactivate_collection_preserves_record() {
         .unwrap()
         .expect("record preserved");
     assert!(!loaded.is_active);
+}
+
+/// DROP COLLECTION is a soft delete, so it must advance the same ordering
+/// metadata a CREATE or ALTER would — a replayed CREATE cannot be ordered
+/// against the current row otherwise, and retention (which reads
+/// `modification_hlc` as the drop time) would measure from the original
+/// CREATE instead. Drives the entry through the exact production path:
+/// `descriptor_stamp::stamp` then `apply_to`.
+#[test]
+fn apply_deactivate_collection_advances_descriptor_version_and_hlc() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let clock = HlcClock::new();
+
+    let stored = StoredCollection::new(1, "audit_log", "carol");
+    let create = stamp(
+        CatalogEntry::PutCollection(Box::new(stored)),
+        &clock,
+        catalog,
+    );
+    let CatalogEntry::PutCollection(created) = &create else {
+        panic!("expected PutCollection");
+    };
+    let create_version = created.descriptor_version;
+    let create_hlc = created.modification_hlc;
+    apply_to(&create, catalog).expect("apply put_collection");
+
+    let deactivate = stamp(
+        CatalogEntry::DeactivateCollection {
+            database_id: 0,
+            tenant_id: 1,
+            name: "audit_log".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        },
+        &clock,
+        catalog,
+    );
+    apply_to(&deactivate, catalog).expect("apply deactivate_collection");
+
+    let loaded = catalog
+        .get_collection(DatabaseId::DEFAULT, 1, "audit_log")
+        .unwrap()
+        .expect("record preserved");
+    assert!(!loaded.is_active);
+    assert_eq!(
+        loaded.descriptor_version,
+        create_version + 1,
+        "DROP must consume its own descriptor version, not leave the CREATE's version in place"
+    );
+    assert!(
+        loaded.modification_hlc > create_hlc,
+        "DROP must stamp a fresh modification_hlc, not leave the CREATE's HLC in place"
+    );
 }
 
 #[test]
@@ -144,6 +204,8 @@ fn apply_deactivate_missing_is_noop() {
             database_id: 0,
             tenant_id: 1,
             name: "ghost".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         },
         catalog,
     )

@@ -95,7 +95,18 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             database_id,
             tenant_id,
             name,
-        } => collection::deactivate(*database_id, *tenant_id, name, catalog),
+            descriptor_version,
+            modification_hlc,
+        } => collection::deactivate(
+            *database_id,
+            *tenant_id,
+            name,
+            collection::DeactivateStamp {
+                descriptor_version: *descriptor_version,
+                modification_hlc: *modification_hlc,
+            },
+            catalog,
+        ),
         CatalogEntry::PurgeCollection {
             database_id,
             tenant_id,

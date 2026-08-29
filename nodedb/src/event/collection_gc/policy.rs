@@ -106,4 +106,74 @@ mod tests {
             PurgeDecision::Purge
         );
     }
+
+    /// The retention clock must start at the DROP, not the original CREATE.
+    /// Seeds a collection with an ancient `modification_hlc` (its CREATE
+    /// stamp), then drops it through the exact production path
+    /// (`descriptor_stamp::stamp` then `apply_to`, the same as
+    /// `CatalogEntry::DeactivateCollection` dispatch) and checks the
+    /// retention decision immediately after. A collection created long ago
+    /// but dropped moments before the sweep must not be purgable under a
+    /// retention window that has not elapsed since the drop.
+    #[test]
+    fn retention_window_is_measured_from_deactivation_not_creation() {
+        use crate::control::catalog_entry::CatalogEntry;
+        use crate::control::catalog_entry::apply::apply_to;
+        use crate::control::catalog_entry::descriptor_stamp::stamp;
+        use crate::control::security::credential::store::CredentialStore;
+        use nodedb_types::{DatabaseId, HlcClock};
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let store =
+            CredentialStore::open(&tmp.path().join("system.redb")).expect("open credential store");
+        let catalog = store.catalog();
+        let clock = HlcClock::new();
+
+        // Created long ago: an ancient `modification_hlc`, far outside any
+        // retention window measured against the real clock.
+        let mut old = StoredCollection::new(1, "ancient", "tester");
+        old.modification_hlc = Hlc::new(1_000, 0);
+        old.descriptor_version = 1;
+        // Seeded through `apply_to` rather than `put_collection` so the
+        // StoredOwner row lands too — the integrity guard rejects a
+        // collection row with no owner.
+        apply_to(&CatalogEntry::PutCollection(Box::new(old)), catalog)
+            .expect("apply put_collection");
+
+        // Drop it "now", through the same path production DROP COLLECTION
+        // uses: stamp the entry, then apply it.
+        let deactivate = stamp(
+            CatalogEntry::DeactivateCollection {
+                database_id: 0,
+                tenant_id: 1,
+                name: "ancient".into(),
+                descriptor_version: 0,
+                modification_hlc: Hlc::ZERO,
+            },
+            &clock,
+            catalog,
+        );
+        apply_to(&deactivate, catalog).expect("apply deactivate_collection");
+
+        let dropped = catalog
+            .get_collection(DatabaseId::DEFAULT, 1, "ancient")
+            .unwrap()
+            .expect("row preserved after soft delete");
+
+        // The sweep runs immediately after the drop. A one-hour retention
+        // window has not elapsed since the drop, even though the collection
+        // was created long ago.
+        let sweep_now_ns = clock.now().wall_ns;
+        let decision = resolve_retention(&dropped, sweep_now_ns, Duration::from_secs(3600));
+        match decision {
+            PurgeDecision::Wait { remaining } => {
+                assert!(remaining <= Duration::from_secs(3600));
+            }
+            other => panic!(
+                "expected Wait: retention must be measured from the DROP, not the original \
+                 CREATE time — got {other:?} for a collection created long ago but dropped only \
+                 moments before the sweep"
+            ),
+        }
+    }
 }

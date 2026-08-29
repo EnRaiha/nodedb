@@ -253,6 +253,10 @@ pub fn drop_collection(
             database_id: database_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             name: name.to_string(),
+            // Sentinel: the proposer freezes the real version and HLC through
+            // `descriptor_stamp::stamp` before the entry is replicated.
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     };
     // Without metadata Raft, acquire the per-name lifecycle guard before the
@@ -309,10 +313,17 @@ pub fn drop_collection(
                 .permissions
                 .remove_grants_for_target(&format!("collection:{}:{name}", tenant_id.as_u64()));
         } else {
+            // Local apply is only reached without a metadata raft group, where
+            // the entry is never stamped. The sentinel version leaves the
+            // row's existing ordering metadata in place.
             crate::control::catalog_entry::apply::collection::deactivate(
                 database_id.as_u64(),
                 tenant_id.as_u64(),
                 name,
+                crate::control::catalog_entry::apply::collection::DeactivateStamp {
+                    descriptor_version: 0,
+                    modification_hlc: nodedb_types::Hlc::ZERO,
+                },
                 catalog,
             );
         }

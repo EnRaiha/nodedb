@@ -34,6 +34,7 @@ fn targets(entry: &CatalogEntry, database_id: DatabaseId, tenant_id: u64, name: 
             database_id: entry_db,
             tenant_id: entry_tenant,
             name: entry_name,
+            ..
         }
         | CatalogEntry::PurgeCollection {
             database_id: entry_db,
@@ -51,8 +52,20 @@ fn step(current: Option<StoredCollection>, entry: &CatalogEntry) -> Option<Store
         CatalogEntry::PutCollectionIfAbsent(stored) => {
             Some(current.unwrap_or_else(|| (**stored).clone()))
         }
-        CatalogEntry::DeactivateCollection { .. } => current.map(|mut stored| {
+        CatalogEntry::DeactivateCollection {
+            descriptor_version,
+            modification_hlc,
+            ..
+        } => current.map(|mut stored| {
             stored.is_active = false;
+            // Mirror the committed apply, or a transaction reads back ordering
+            // metadata its own COMMIT will not produce. Version `0` is the
+            // pre-stamping sentinel — buffered entries are stamped at flush,
+            // so in-transaction the row keeps what it already had.
+            if *descriptor_version != 0 {
+                stored.descriptor_version = *descriptor_version;
+                stored.modification_hlc = *modification_hlc;
+            }
             stored
         }),
         CatalogEntry::PurgeCollection { .. } => None,
@@ -157,6 +170,8 @@ mod tests {
             database_id: DatabaseId::DEFAULT.as_u64(),
             tenant_id: TENANT,
             name: name.to_owned(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

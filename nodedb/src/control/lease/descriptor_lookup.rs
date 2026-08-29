@@ -67,6 +67,20 @@ pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<Descript
             DescriptorKind::Sequence,
             stored.name.clone(),
         )),
+        // A soft delete drains like a `Put*`, so it must clear that drain the
+        // same way — otherwise the descriptor stays draining until an explicit
+        // `DescriptorDrainEnd` and a same-name CREATE wedges behind it.
+        CatalogEntry::DeactivateCollection {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => Some(DescriptorId::new(
+            *database_id,
+            *tenant_id,
+            DescriptorKind::Collection,
+            name.clone(),
+        )),
         _ => None,
     }
 }
@@ -203,6 +217,33 @@ pub fn descriptor_id_and_prior_version(
                     stored.tenant_id,
                     DescriptorKind::Sequence,
                     stored.name.clone(),
+                ),
+                prior,
+            ))
+        }
+        // A soft delete carries a descriptor version, so DROP drains behind
+        // in-flight queries exactly like any other versioned DDL. The entry
+        // is still unstamped here — this runs before `descriptor_stamp` — so
+        // the prior version comes from the committed row, as it does above.
+        CatalogEntry::DeactivateCollection {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => {
+            let database_id = DatabaseId::new(*database_id);
+            let prior = catalog
+                .get_collection(database_id, *tenant_id, name)
+                .ok()
+                .flatten()
+                .map(|c| c.descriptor_version)
+                .unwrap_or(0);
+            Some((
+                DescriptorId::new(
+                    database_id.as_u64(),
+                    *tenant_id,
+                    DescriptorKind::Collection,
+                    name.clone(),
                 ),
                 prior,
             ))

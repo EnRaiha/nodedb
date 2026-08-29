@@ -41,10 +41,22 @@ pub enum CatalogEntry {
     /// Mark a collection as `is_active = false`. Record is
     /// preserved for audit + undrop. The soft-delete step in the
     /// two-step DROP → retention-expiry → PURGE flow.
+    ///
+    /// A soft delete mutates the row, so it consumes a descriptor
+    /// version of its own: leaving the CREATE's ordering metadata in
+    /// place makes a replayed CREATE unorderable against the dropped
+    /// row. Both stamped values are carried inside the entry because
+    /// they are frozen once at propose time — an apply-time stamp
+    /// from each node's local clock diverges across replicas.
     DeactivateCollection {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Version the row carries after the drop: prior committed
+        /// version + 1. `0` is the pre-stamping compat sentinel.
+        descriptor_version: u64,
+        /// Drop time, and the instant retention measures from.
+        modification_hlc: nodedb_types::Hlc,
     },
     /// Hard-delete a collection: remove the `StoredCollection`
     /// row + owner row + cascade-dependent catalog entries, and
