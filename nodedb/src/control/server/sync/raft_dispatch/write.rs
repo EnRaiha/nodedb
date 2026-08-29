@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
 use crate::event::EventSource;
@@ -131,16 +132,10 @@ pub async fn dispatch_write_replicated(
         .await?
     };
 
-    if resp.status != Status::Ok {
-        // Preserve the typed error code so the CRDT delta path builds a precise
-        // compensation hint instead of substring-matching a message.
-        return Err(match resp.error_code {
-            Some(code) => crate::Error::DataPlane(*code),
-            None => crate::Error::Internal {
-                detail: String::from_utf8_lossy(&resp.payload).into_owned(),
-            },
-        });
-    }
+    // Rejection short-circuits here with its typed error code preserved, so the
+    // CRDT delta path builds a precise compensation hint instead of
+    // substring-matching a message.
+    let payload = payload_or_typed_error(resp)?;
 
     // System-task dispatch bypasses the write funnel's own durable-at-ack barrier —
     // without this fsync, `kill -9` erases an acked write.
@@ -150,7 +145,7 @@ pub async fn dispatch_write_replicated(
 
     // Mirrors `dispatch_system_with_source`'s success-path write-HLC advance.
     state.advance_tenant_write_hlc(tenant_id.as_u64());
-    Ok(resp.payload.to_vec())
+    Ok(payload)
 }
 
 #[cfg(test)]

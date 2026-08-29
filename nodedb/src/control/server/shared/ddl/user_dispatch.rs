@@ -14,10 +14,13 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
-use crate::control::server::shared::authorization::{AuthorizedTask, authorize_task_set};
+use crate::control::server::shared::clone_write::{
+    CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
+};
 use crate::control::server::shared::metering::{
     PlanMeteringInfo, meter_dispatch, operation_for_plan,
 };
+use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -99,17 +102,28 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
-    let authorized =
-        authorize_for_identity(state, identity, database_id, collection, plan, admission)?;
-    let result = dispatch_authorized(state, authorized, collection, timeout).await;
+    let result =
+        match authorize_for_identity(state, identity, database_id, collection, plan, admission)
+            .await?
+        {
+            // A clone hook served the request itself (copy-up/tombstone applied, or
+            // a shadowed-clone read merged from its source): its `Response` is the
+            // answer, flattened to bytes the same way the Data Plane's own is, so a
+            // caller cannot tell the two apart by error shape.
+            CloneCheckedOutcome::Handled(response) => payload_or_typed_error(response),
+            CloneCheckedOutcome::Proceed(checked) => {
+                dispatch_authorized(state, checked, collection, timeout).await
+            }
+        };
     if result.is_ok() {
-        // Metered only on the success path returned by `dispatch_authorized`
-        // above — a denied/errored/timed-out request performed no billable
-        // work. Rebuilt from `state`/`identity`/`database_id` rather than
-        // threaded out of `authorize_for_identity`, since that function's
-        // scope is local to its own synchronous authorization step; this is
-        // the same derivation `resolve_dispatch_scope` already gives every
-        // other caller in this file, so it cannot disagree with it.
+        // Metered only on the success path above — a denied/errored/timed-out
+        // request performed no billable work, while a clone hook that served
+        // the request did the work this dispatch was charged for and is metered
+        // like any other success. Rebuilt from `state`/`identity`/`database_id`
+        // rather than threaded out of `authorize_for_identity`, since that
+        // function's scope is local to its own clone-check-and-authorize step;
+        // this is the same derivation `resolve_dispatch_scope` already gives
+        // every other caller in this file, so it cannot disagree with it.
         //
         // `rows: None` — `dispatch_authorized` returns a raw MessagePack
         // payload, and decoding it here solely to count rows would add real
@@ -129,24 +143,32 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
 /// `database_id`, apply row-level security, and authorize the resulting
 /// `PhysicalTask`.
 ///
-/// Split out from [`dispatch_for_identity`] so this synchronous
-/// authorization step — the part that must never let the task's database and
-/// `$auth.database_id` diverge — is directly unit-testable without spinning
-/// up the Data Plane dispatch machinery.
+/// Split out from [`dispatch_for_identity`] so this pre-dispatch step — the
+/// part that must never let the task's database and `$auth.database_id`
+/// diverge — is directly unit-testable without spinning up the Data Plane
+/// dispatch machinery.
 ///
 /// `database_id` flows through [`RequestAuthScope::builder`] as the session
 /// database rather than being used directly for `PhysicalTask::database_id`
 /// while `$auth.database_id` is resolved separately from `identity` — that
 /// split was the defect this function exists to close. `scope.database_id()`
 /// is what actually lands on the task, so the two provably cannot disagree.
-fn authorize_for_identity(
+///
+/// The trailing step is [`intercept_and_authorize`], not a bare
+/// `authorize_task_set`: this door hands its task straight to
+/// [`dispatch_authorized`], which accepts only a clone-checked capability, so
+/// the ~200 handlers behind it inherit clone-write copy-up and clone-read merge
+/// without a call-site edit. Order is load-bearing and unchanged ahead of it —
+/// admission gate, RLS injection, redaction refusal — so a request is shed, or
+/// refused, before any clone work is spent on it.
+async fn authorize_for_identity(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
     admission: RequestAdmission<'_>,
-) -> crate::Result<AuthorizedTask> {
+) -> crate::Result<CloneCheckedOutcome> {
     let mut plan = plan;
 
     // Request-admission gate: internal-service exemption, blacklist, account
@@ -195,20 +217,16 @@ fn authorize_for_identity(
         txn_id: None,
     };
     let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
-    authorize_task_set(
+    intercept_and_authorize(InterceptAndAuthorizeParams {
+        state,
+        task,
         identity,
-        std::slice::from_ref(&task),
-        &state.permissions,
-        &state.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?
-    .into_tasks()
-    .into_iter()
-    .next()
-    .ok_or_else(|| crate::Error::Internal {
-        detail: "authorization returned an empty capability set".into(),
+        tenant_id: identity.tenant_id,
+        permissions: &state.permissions,
+        roles: &state.roles,
+        emitter: &emitter,
     })
+    .await
 }
 
 /// Resolve the request-scoped auth contract for a user-issued dispatch.
@@ -318,8 +336,13 @@ mod tests {
     /// End-to-end sanity check that the resolved scope's database is what
     /// actually lands on the authorized `PhysicalTask`, using the same
     /// mismatched-identity setup as the test above.
-    #[test]
-    fn authorized_task_database_matches_passed_in_database_not_identity_default() {
+    ///
+    /// Neither database here names a clone, so the gate must hand back the
+    /// capability rather than serving the request itself — asserted, because a
+    /// `Handled` outcome would carry no task for the database claim to be made
+    /// about at all.
+    #[tokio::test]
+    async fn authorized_task_database_matches_passed_in_database_not_identity_default() {
         let dir = tempfile::tempdir().expect("create test directory");
         let wal = Arc::new(
             WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
@@ -343,7 +366,7 @@ mod tests {
 
         let plan = trivial_kv_get_plan();
 
-        let authorized = authorize_for_identity(
+        let outcome = authorize_for_identity(
             &state,
             &identity,
             dispatch_target,
@@ -353,9 +376,13 @@ mod tests {
                 peer_addr: "127.0.0.1:9",
             },
         )
+        .await
         .expect("authorize task for identity");
 
-        assert_eq!(authorized.database_id(), dispatch_target);
+        let CloneCheckedOutcome::Proceed(checked) = outcome else {
+            panic!("a non-clone collection must not be served by a clone hook");
+        };
+        assert_eq!(checked.database_id(), dispatch_target);
     }
 
     /// The regression this module exists to prevent going forward: a caller
@@ -372,8 +399,8 @@ mod tests {
     /// check, so a blacklisted identity is still authorized when the caller
     /// asserts it already admitted the request — the exact bypass a re-added
     /// call would break.
-    #[test]
-    fn already_admitted_skips_the_gate_even_for_a_blacklisted_identity() {
+    #[tokio::test]
+    async fn already_admitted_skips_the_gate_even_for_a_blacklisted_identity() {
         let dir = tempfile::tempdir().expect("create test directory");
         let wal = Arc::new(
             WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
@@ -405,7 +432,8 @@ mod tests {
             RequestAdmission::NotYetAdmitted {
                 peer_addr: "127.0.0.1:9",
             },
-        );
+        )
+        .await;
         assert!(
             denied.is_err(),
             "NotYetAdmitted must still run the full gate and reject a blacklisted identity"
@@ -421,7 +449,8 @@ mod tests {
             "widgets",
             trivial_kv_get_plan(),
             RequestAdmission::AlreadyAdmitted,
-        );
+        )
+        .await;
         assert!(
             allowed.is_ok(),
             "AlreadyAdmitted must skip the gate so an already-admitted request is not \

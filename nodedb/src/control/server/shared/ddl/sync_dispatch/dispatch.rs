@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
-use crate::control::server::shared::authorization::AuthorizedTask;
+use crate::control::server::shared::clone_write::CloneCheckedTask;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 
@@ -84,18 +84,26 @@ pub(crate) async fn dispatch_system_response_with_source(
     .await
 }
 
-/// Send already-authorized work to the Data Plane and await its payload.
+/// Send clone-checked, already-authorized work to the Data Plane and await its
+/// payload.
 ///
 /// The capability is consumed here: the plan that reaches storage is the plan
 /// authorization approved, so a caller cannot authorize one shape and dispatch
 /// another. Client-reachable paths use this rather than the system door.
+///
+/// Taking a [`CloneCheckedTask`] rather than a bare `AuthorizedTask` is what
+/// makes the clone hooks unskippable on this door: only
+/// [`intercept_and_authorize`](crate::control::server::shared::clone_write::intercept_and_authorize)
+/// mints that type, so an entry point that authorizes without running clone-write
+/// and clone-read interception fails to compile instead of silently reading a
+/// `Shadowed` clone target-locally.
 pub(crate) async fn dispatch_authorized(
     state: &SharedState,
-    authorized: AuthorizedTask,
+    checked: CloneCheckedTask,
     collection: &str,
     timeout: Duration,
 ) -> crate::Result<Vec<u8>> {
-    let task = authorized.into_physical_task();
+    let task = checked.into_authorized().into_physical_task();
     let vshard_id = VShardId::from_collection_in_database(task.database_id, collection);
     let tenant_id = task.tenant_id;
     let resp = dispatch_plan(

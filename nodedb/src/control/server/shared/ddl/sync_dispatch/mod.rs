@@ -2,9 +2,10 @@
 
 //! Async Data-Plane dispatch for DDL, DSL, and system-initiated work.
 //!
-//! Two doors, and the type system says which one a caller took: an
-//! [`AuthorizedTask`](crate::control::server::shared::authorization::AuthorizedTask)
-//! for work a user asked for, or a [`SystemTask`] naming why no user exists.
+//! Two doors, and the type system says which one a caller took: a
+//! [`CloneCheckedTask`](crate::control::server::shared::clone_write::CloneCheckedTask)
+//! for work a user asked for — clone-checked and authorized in one step, so
+//! neither hook can be skipped — or a [`SystemTask`] naming why no user exists.
 
 mod dispatch;
 mod system_task;
