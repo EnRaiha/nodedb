@@ -98,7 +98,7 @@ pub use hlc::{Hlc, HlcClock};
 pub use hnsw::{HnswCheckpoint, HnswNodeSnapshot, HnswParams};
 pub use id::{
     CollectionId, DatabaseId, DocumentId, EdgeId, EdgeIdParseError, IdError, IdType, NodeId,
-    ShapeId, TenantId,
+    QualifiedCollection, ShapeId, TenantId,
 };
 pub use identity::KeyRepr;
 pub use json_msgpack::{

@@ -25,11 +25,9 @@ use crate::types::{DatabaseId, VShardId};
 /// the catalog has to be qualified the same way before it can be compared with a
 /// source that already is.
 pub fn db_qualified(database_id: DatabaseId, collection: &str) -> String {
-    if database_id == DatabaseId::DEFAULT {
-        collection.to_string()
-    } else {
-        format!("{}/{}", database_id.as_u64(), collection)
-    }
+    nodedb_types::QualifiedCollection::new(database_id, collection)
+        .as_str()
+        .to_owned()
 }
 
 /// The vShard a materialized-sum target collection homes to.

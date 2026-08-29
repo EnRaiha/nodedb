@@ -425,11 +425,9 @@ async fn resolve_bodies(
 
 /// Qualify a catalog collection name for the plan / surrogate namespace.
 fn db_qualified(database_id: DatabaseId, collection: &str) -> String {
-    if database_id == DatabaseId::DEFAULT {
-        collection.to_string()
-    } else {
-        format!("{}/{}", database_id.as_u64(), collection)
-    }
+    nodedb_types::QualifiedCollection::new(database_id, collection)
+        .as_str()
+        .to_owned()
 }
 
 /// Strip the `"<db_id>/"` prefix a planned collection name carries, yielding the

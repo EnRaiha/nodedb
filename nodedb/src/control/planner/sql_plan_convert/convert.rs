@@ -30,11 +30,9 @@ use nodedb_physical::physical_task::PhysicalTask;
 /// `(tenant_id, collection, document_id)` — by embedding the database ID
 /// into the collection token, isolation between databases is automatic.
 pub fn db_qualified(database_id: crate::types::DatabaseId, collection: &str) -> String {
-    if database_id == crate::types::DatabaseId::DEFAULT {
-        collection.to_string()
-    } else {
-        format!("{}/{}", database_id.as_u64(), collection)
-    }
+    nodedb_types::QualifiedCollection::new(database_id, collection)
+        .as_str()
+        .to_owned()
 }
 
 /// Whether conversion produces executable work or metadata used only for
