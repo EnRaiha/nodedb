@@ -80,7 +80,7 @@ fn hit_collection_name(plan: &PhysicalPlan) -> Option<String> {
         )
         | PhysicalPlan::Text(
             TextOp::HybridSearch { collection, .. } | TextOp::HybridSearchTriple { collection, .. },
-        ) => Some(collection.clone()),
+        ) => Some(collection.to_string()),
         other => other.collection().map(str::to_owned),
     }
 }

@@ -121,7 +121,10 @@ mod tests {
 
     fn ok_plan() -> Result<PhysicalPlan, Error> {
         Ok(PhysicalPlan::Kv(KvOp::Get {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: vec![],
             rls_filters: vec![],
             surrogate_ceiling: None,

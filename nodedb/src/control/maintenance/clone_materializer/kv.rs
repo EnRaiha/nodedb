@@ -98,7 +98,7 @@ pub(super) async fn materialize_kv_collection(
                     .surrogate_assigner
                     .assign(db_id, tenant_id, &target_qualified, &key)?;
             let plan = PhysicalPlan::Kv(KvOp::Put {
-                collection: target_qualified.clone(),
+                collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                 key: key.clone(),
                 value,
                 ttl_ms: 0,
@@ -197,7 +197,7 @@ async fn scan_source_page(
     cursor: &[u8],
 ) -> crate::Result<ScanPage> {
     let plan = PhysicalPlan::Kv(KvOp::MaterializeScan {
-        collection: source_qualified.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(source_qualified.to_string()),
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
     });
@@ -273,7 +273,7 @@ async fn probe_target_key(
     key: &[u8],
 ) -> crate::Result<bool> {
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: target_qualified.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(target_qualified.to_string()),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         // Materializer is the writer that COPIES rows from source into

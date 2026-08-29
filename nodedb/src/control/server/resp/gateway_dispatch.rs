@@ -256,6 +256,7 @@ fn authorize_resp_task(
     // closed here with a typed error rather than executing unfiltered.
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         session.tenant_id.as_u64(),
+        database_id,
         &mut plan,
         &state.rls,
         scope.auth(),
@@ -267,6 +268,7 @@ fn authorize_resp_task(
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         session.tenant_id,
+        database_id,
         scope.auth(),
         &state.redaction,
     )?;
@@ -467,7 +469,10 @@ mod tests {
         session.identity = Some(identity);
 
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: session.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                DatabaseId::DEFAULT,
+                &session.collection,
+            ),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -583,7 +588,7 @@ mod tests {
     fn kv_get_plan(collection: &str) -> PhysicalPlan {
         use nodedb_physical::physical_plan::KvOp;
         PhysicalPlan::Kv(KvOp::Get {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

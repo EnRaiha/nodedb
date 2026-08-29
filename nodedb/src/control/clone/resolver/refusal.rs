@@ -81,7 +81,7 @@ fn join_reads_collection(plan: &PhysicalPlan, qualified: &str) -> bool {
                 right_collection,
                 ..
             },
-        ) => left_collection == qualified || right_collection == qualified,
+        ) => left_collection.as_str() == qualified || right_collection.as_str() == qualified,
         _ => false,
     }
 }

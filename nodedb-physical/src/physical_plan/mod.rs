@@ -126,8 +126,12 @@ impl PhysicalPlan {
                 right_bitmap,
                 ..
             }) => {
-                hash_join_side_is_sharded(left_collection, left_input, left_bitmap)
-                    || hash_join_side_is_sharded(right_collection, right_input, right_bitmap)
+                hash_join_side_is_sharded(left_collection.as_str(), left_input, left_bitmap)
+                    || hash_join_side_is_sharded(
+                        right_collection.as_str(),
+                        right_input,
+                        right_bitmap,
+                    )
             }
             _ => self.is_sharded_source_leaf(),
         }

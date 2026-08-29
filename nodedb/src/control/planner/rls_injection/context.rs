@@ -20,17 +20,27 @@ pub(super) struct RlsCtx<'a> {
     pub(super) store: &'a RlsPolicyStore,
     pub(super) tenant_id: u64,
     pub(super) auth: &'a AuthContext,
+    /// Database bare op-carried collection names (e.g.
+    /// `AlgoParams.collection`) must be qualified against before a lookup.
+    pub(super) database_id: nodedb_types::DatabaseId,
 }
 
 impl RlsCtx<'_> {
     /// The concrete read filters for `collection`; empty when no policy
     /// restricts this identity.
-    pub(super) fn read_filters(&self, collection: &str) -> crate::Result<Vec<u8>> {
-        get_rls(self.store, self.tenant_id, collection, self.auth)
+    pub(super) fn read_filters(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+    ) -> crate::Result<Vec<u8>> {
+        get_rls(self.store, self.tenant_id, collection.as_str(), self.auth)
     }
 
     /// AND the collection's read policy into a scan-style pushdown slot.
-    pub(super) fn merge_into(&self, collection: &str, filters: &mut Vec<u8>) -> crate::Result<()> {
+    pub(super) fn merge_into(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        filters: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         let rls = self.read_filters(collection)?;
         if !rls.is_empty() {
             merge_filters(filters, &rls)?;
@@ -41,7 +51,7 @@ impl RlsCtx<'_> {
     /// Store the collection's read policy in a dedicated post-fetch slot.
     pub(super) fn set_post_filters(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         rls_filters: &mut Vec<u8>,
     ) -> crate::Result<()> {
         let rls = self.read_filters(collection)?;
@@ -53,8 +63,12 @@ impl RlsCtx<'_> {
 
     /// Refuse while a read policy restricts this identity on `collection`.
     /// `why` completes "…is not supported with this operation: {why}".
-    pub(super) fn refuse_if_policy(&self, collection: &str, why: &str) -> crate::Result<()> {
-        if collection.is_empty() || self.read_filters(collection)?.is_empty() {
+    pub(super) fn refuse_if_policy(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        why: &str,
+    ) -> crate::Result<()> {
+        if collection.as_str().is_empty() || self.read_filters(collection)?.is_empty() {
             return Ok(());
         }
         Err(crate::Error::PlanError {
@@ -82,13 +96,17 @@ impl RlsCtx<'_> {
     /// Admit a write whose post-image the plan already carries as
     /// MessagePack. A rejected row fails the whole statement — a silently
     /// dropped row would report a write that never happened.
-    pub(super) fn admit_write_image(&self, collection: &str, image: &[u8]) -> crate::Result<()> {
-        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+    pub(super) fn admit_write_image(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        image: &[u8],
+    ) -> crate::Result<()> {
+        let check = get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?;
         crate::control::security::rls::admit_compiled_write_image(
             &check,
             image,
             self.tenant_id,
-            collection,
+            collection.as_str(),
         )
     }
 
@@ -97,10 +115,10 @@ impl RlsCtx<'_> {
     /// deny rather than admit by omission.
     pub(super) fn admit_write_json_image(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         image: &[u8],
     ) -> crate::Result<()> {
-        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        let check = get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?;
         if check.is_empty() {
             return Ok(());
         }
@@ -118,7 +136,7 @@ impl RlsCtx<'_> {
             &check,
             &nodedb_types::json_to_msgpack_or_empty(&object),
             self.tenant_id,
-            collection,
+            collection.as_str(),
         )
     }
 
@@ -127,10 +145,10 @@ impl RlsCtx<'_> {
     /// MessagePack first, or comparing tags directly would deny every row.
     pub(super) fn admit_write_value_map_image(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         payload: &[u8],
     ) -> crate::Result<()> {
-        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        let check = get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?;
         if check.is_empty() {
             return Ok(());
         }
@@ -160,7 +178,7 @@ impl RlsCtx<'_> {
             &check,
             &bytes,
             self.tenant_id,
-            collection,
+            collection.as_str(),
         )
     }
 
@@ -169,11 +187,11 @@ impl RlsCtx<'_> {
     /// check slot — left at `PendingInjection` it reads as "never ran".
     pub(super) fn admit_write_batch(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         payload: &[u8],
         rls_write_check: &mut nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
-        let check = get_rls_write(self.store, self.tenant_id, collection, self.auth)?;
+        let check = get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?;
         if check.is_empty() {
             *rls_write_check = nodedb_types::RlsWriteCheck::NoPolicyApplies;
             return Ok(());
@@ -200,7 +218,7 @@ impl RlsCtx<'_> {
                 &check,
                 &image,
                 self.tenant_id,
-                collection,
+                collection.as_str(),
             )?;
         }
         // Decided here, with a live identity, against the exact images carried.
@@ -213,13 +231,13 @@ impl RlsCtx<'_> {
     /// delete's removed row) — evaluated there instead of refusing outright.
     pub(super) fn set_write_check(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         rls_write_check: &mut nodedb_types::RlsWriteCheck,
     ) -> crate::Result<()> {
         *rls_write_check = nodedb_types::RlsWriteCheck::from_injected(get_rls_write(
             self.store,
             self.tenant_id,
-            collection,
+            collection.as_str(),
             self.auth,
         )?);
         Ok(())
@@ -228,9 +246,13 @@ impl RlsCtx<'_> {
     /// Refuse the write while a write policy restricts this identity on
     /// `collection`. `why` completes "…cannot be enforced for this operation:
     /// {why}".
-    pub(super) fn refuse_if_write_policy(&self, collection: &str, why: &str) -> crate::Result<()> {
-        if collection.is_empty()
-            || get_rls_write(self.store, self.tenant_id, collection, self.auth)?.is_empty()
+    pub(super) fn refuse_if_write_policy(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        why: &str,
+    ) -> crate::Result<()> {
+        if collection.as_str().is_empty()
+            || get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?.is_empty()
         {
             return Ok(());
         }

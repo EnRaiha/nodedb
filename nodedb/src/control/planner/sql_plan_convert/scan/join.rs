@@ -58,7 +58,7 @@ fn bitmap_hint_to_plan(hint: &BitmapHint, database_id: DatabaseId) -> Option<Box
     if !hint.extra_values.is_empty() {
         return None;
     }
-    let collection = super::super::convert::db_qualified(database_id, &hint.collection);
+    let collection = nodedb_types::QualifiedCollection::new(database_id, &hint.collection);
     let value_str = sql_value_to_string(&hint.primary_value);
     Some(Box::new(PhysicalPlan::Document(DocumentOp::IndexedFetch {
         collection,
@@ -200,8 +200,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
     let shuffle_keys = on_keys.clone();
 
     let hash_join = PhysicalPlan::Query(QueryOp::HashJoin {
-        left_collection,
-        right_collection,
+        left_collection: nodedb_types::QualifiedCollection::from_stored(left_collection),
+        right_collection: nodedb_types::QualifiedCollection::from_stored(right_collection),
         left_alias,
         right_alias,
         on: on_keys,

@@ -102,12 +102,12 @@ fn authorize_traversal(
 
     // Column redaction is refused here for the same reason and on the same
     // seam: the traversal returns topology, so there are no stored columns in
-    // its result for the redaction hook to mask. Redaction policies are
-    // stored keyed by `db_qualified(database_id, collection)`, so the lookup
-    // must use the same key or it silently misses a policy on a non-default
-    // database (and collides with a same-named collection on another one).
+    // its result for the redaction hook to mask.
+    // `collection` is passed bare: the callee qualifies it against
+    // `database_id` itself, so qualifying it here too would double-qualify.
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_collection(
-        &crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, collection),
+        collection,
+        database_id,
         gate.tenant_id(),
         gate.auth(),
         &state.redaction,
@@ -208,7 +208,10 @@ pub async fn neighbors(
     let tenant_id = identity.tenant_id;
 
     let plan = PhysicalPlan::Graph(GraphOp::Neighbors {
-        collection: Some(collection),
+        collection: Some(nodedb_types::QualifiedCollection::new(
+            database_id,
+            &collection,
+        )),
         node_id: node,
         edge_label,
         direction: dir,

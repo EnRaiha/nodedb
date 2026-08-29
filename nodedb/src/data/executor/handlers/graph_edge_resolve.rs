@@ -42,7 +42,7 @@ impl CoreLoop {
             .get_edge(
                 task.request.database_id.as_u64(),
                 TenantId::new(tid),
-                collection,
+                collection.as_str(),
                 src_id,
                 label,
                 dst_id,
@@ -54,7 +54,7 @@ impl CoreLoop {
             rls_write_check,
             stored.as_deref(),
             tid,
-            collection,
+            collection.as_str(),
         ) {
             Ok(()) => self.response_ok(task),
             Err(error) => self.response_error(task, error),

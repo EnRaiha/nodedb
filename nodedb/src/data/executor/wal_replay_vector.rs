@@ -201,7 +201,9 @@ impl CoreLoop {
                         DatabaseId::new(database_id),
                         vshard,
                         PhysicalPlan::Vector(nodedb_physical::physical_plan::VectorOp::Insert {
-                            collection: collection.clone(),
+                            collection: nodedb_types::QualifiedCollection::from_stored(
+                                collection.clone(),
+                            ),
                             vector: vector.clone(),
                             dim,
                             field_name: field_name.clone(),
@@ -463,7 +465,9 @@ impl CoreLoop {
                         vshard,
                         PhysicalPlan::Vector(
                             nodedb_physical::physical_plan::VectorOp::DeleteBySurrogate {
-                                collection: collection.clone(),
+                                collection: nodedb_types::QualifiedCollection::from_stored(
+                                    collection.clone(),
+                                ),
                                 surrogate,
                                 field_name: field_name.clone(),
                                 provenance: provenance.clone(),

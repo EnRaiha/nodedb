@@ -2,12 +2,18 @@
 
 //! Text search plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::TextOp;
 
-pub(crate) fn build_search(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_search(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let query_text = fields
         .query_text
         .as_ref()
@@ -18,7 +24,7 @@ pub(crate) fn build_search(fields: &TextFields, collection: &str) -> crate::Resu
     let fuzzy = fields.fuzzy.unwrap_or(false);
 
     Ok(PhysicalPlan::Text(TextOp::Search {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         query: query_text.to_string(),
         top_k,
         fuzzy,
@@ -28,6 +34,7 @@ pub(crate) fn build_search(fields: &TextFields, collection: &str) -> crate::Resu
 }
 
 pub(crate) fn build_hybrid_search(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -49,7 +56,7 @@ pub(crate) fn build_hybrid_search(
     let fuzzy = fields.fuzzy.unwrap_or(false);
 
     Ok(PhysicalPlan::Text(TextOp::HybridSearch {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         query_vector: query_vector.clone(),
         query_text: query_text.clone(),
         top_k,

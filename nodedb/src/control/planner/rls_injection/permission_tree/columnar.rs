@@ -123,7 +123,10 @@ mod tests {
     fn timeseries_scan_is_narrowed_to_the_readable_subtree() {
         let cache = cache_with_tree("metrics");
         let mut plan = PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             time_range: (0, 1),
             projection: Vec::new(),
             limit: 0,

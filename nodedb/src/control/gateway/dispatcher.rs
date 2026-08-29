@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn gateway_rejects_unadmitted_crdt_apply_before_route_selection() {
         let plan = PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "doc".into(),
             delta: vec![1],
             peer_id: 1,

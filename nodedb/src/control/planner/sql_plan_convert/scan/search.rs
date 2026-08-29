@@ -18,6 +18,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
     p: VectorSearchParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(p.ctx.database_id, p.collection);
+    let qualified_collection =
+        nodedb_types::QualifiedCollection::new(p.ctx.database_id, p.collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(p.ctx.database_id, collection);
     let filter_bytes = serialize_filters(p.filters)?;
@@ -40,7 +42,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
         vshard_id: vshard,
         database_id: p.ctx.database_id,
         plan: PhysicalPlan::Vector(VectorOp::Search {
-            collection: collection.into(),
+            collection: qualified_collection,
             query_vector: p.query_vector.to_vec(),
             top_k: *p.top_k,
             ef_search: *p.ef_search,
@@ -62,6 +64,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
     p: SparseSearchParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(p.database_id, p.collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(p.database_id, p.collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(p.database_id, collection);
     Ok(vec![PhysicalTask {
@@ -69,7 +72,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
         vshard_id: vshard,
         database_id: p.database_id,
         plan: PhysicalPlan::Vector(VectorOp::SparseSearch {
-            collection: collection.into(),
+            collection: qualified_collection,
             field_name: p.field.to_string(),
             query_entries: p.query_entries.to_vec(),
             top_k: *p.top_k,
@@ -182,6 +185,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
     use nodedb_sql::fts_types::FtsQuery;
 
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(database_id, collection);
 
@@ -199,7 +203,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
                 vshard_id: vshard,
                 database_id,
                 plan: PhysicalPlan::Text(TextOp::Search {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     query: String::new(),
                     top_k: *top_k,
                     fuzzy: false,
@@ -215,7 +219,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
             vshard_id: vshard,
             database_id,
             plan: PhysicalPlan::Text(TextOp::PhraseSearch {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 terms: analyzed_terms,
                 top_k: *top_k,
                 prefilter: None,
@@ -240,14 +244,14 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
     // hit-only `Search` for the WHERE `text_match(...)` shape.
     let op = if let Some(alias) = score_alias {
         TextOp::BM25ScoreScan {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             query: query_str,
             score_alias: alias.to_string(),
             fuzzy,
         }
     } else {
         TextOp::Search {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             query: query_str,
             top_k: *top_k,
             fuzzy,
@@ -282,6 +286,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search(
         database_id,
     } = p;
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(database_id, collection);
     Ok(vec![PhysicalTask {
@@ -289,7 +294,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search(
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Text(TextOp::HybridSearch {
-            collection: collection.into(),
+            collection: qualified_collection,
             query_vector: query_vector.to_vec(),
             query_text: query_text.to_string(),
             top_k: *top_k,
@@ -324,6 +329,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search_tripl
         database_id,
     } = p;
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(database_id, collection);
     Ok(vec![PhysicalTask {
@@ -331,7 +337,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search_tripl
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Text(TextOp::HybridSearchTriple {
-            collection: collection.into(),
+            collection: qualified_collection,
             query_vector: query_vector.to_vec(),
             query_text: query_text.to_string(),
             graph_seed_id: graph_seed_id.to_string(),

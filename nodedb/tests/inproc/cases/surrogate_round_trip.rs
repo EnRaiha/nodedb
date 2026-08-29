@@ -222,7 +222,10 @@ fn surrogate_round_trip_all_engines() {
         .copied()
         .map(|s| {
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "vec_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "vec_col",
+                ),
                 vector: vec![1.0, s as f32 * 0.01, 0.0],
                 dim: 3,
                 field_name: String::new(),
@@ -243,7 +246,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "doc_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "doc_col",
+                ),
                 document_id: hex.clone(),
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
@@ -265,7 +271,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "graph_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "graph_col",
+                ),
                 src_id: src.clone(),
                 label: "LINKED".into(),
                 dst_id: dst.clone(),
@@ -285,7 +294,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "kv_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "kv_col",
+                ),
                 key: key.clone(),
                 value: vec![],
                 ttl_ms: 0,
@@ -310,7 +322,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: "col_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "col_col",
+                ),
                 payload: rows_mp,
                 format: "msgpack".into(),
                 intent: ColumnarInsertIntent::Insert,
@@ -383,7 +398,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "fts_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "fts_col",
+                ),
                 document_id: hex.clone(),
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
@@ -405,7 +423,10 @@ fn surrogate_round_trip_all_engines() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "spatial_col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "spatial_col",
+                ),
                 document_id: hex.clone(),
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
@@ -510,7 +531,10 @@ fn surrogate_round_trip_all_engines() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "vec_col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vec_col",
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 20,
             ef_search: 0,
@@ -535,7 +559,10 @@ fn surrogate_round_trip_all_engines() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "vec_col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vec_col",
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 20,
             ef_search: 0,
@@ -575,7 +602,10 @@ fn surrogate_round_trip_all_engines() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "graph_col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "graph_col",
+            ),
             src_id: "n10".into(),
             label: "REACH".into(),
             dst_id: "n11".into(),

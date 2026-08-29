@@ -34,6 +34,7 @@ pub fn inject_rls(
             store: rls_store,
             tenant_id: task.tenant_id.as_u64(),
             auth,
+            database_id: task.database_id,
         };
         walk(&ctx, &mut task.plan)?;
         refuse_undecided_write_check(&task.plan)?;
@@ -44,6 +45,7 @@ pub fn inject_rls(
 /// Inject RLS into a single physical plan (public for native protocol dispatch).
 pub fn inject_rls_for_single_plan(
     tenant_id: u64,
+    database_id: nodedb_types::DatabaseId,
     plan: &mut PhysicalPlan,
     rls_store: &RlsPolicyStore,
     auth: &AuthContext,
@@ -52,6 +54,7 @@ pub fn inject_rls_for_single_plan(
         store: rls_store,
         tenant_id,
         auth,
+        database_id,
     };
     walk(&ctx, plan)?;
     refuse_undecided_write_check(plan)
@@ -257,14 +260,26 @@ pub(super) mod test_support {
         plan: &mut crate::bridge::envelope::PhysicalPlan,
         store: &RlsPolicyStore,
     ) -> crate::Result<()> {
-        super::inject_rls_for_single_plan(TENANT, plan, store, &regular_auth())
+        super::inject_rls_for_single_plan(
+            TENANT,
+            nodedb_types::DatabaseId::DEFAULT,
+            plan,
+            store,
+            &regular_auth(),
+        )
     }
 
     /// Run the injector with an empty policy store: nothing must change.
     pub(in crate::control::planner::rls_injection) fn inject_without_policy(
         plan: &mut crate::bridge::envelope::PhysicalPlan,
     ) -> crate::Result<()> {
-        super::inject_rls_for_single_plan(TENANT, plan, &RlsPolicyStore::new(), &regular_auth())
+        super::inject_rls_for_single_plan(
+            TENANT,
+            nodedb_types::DatabaseId::DEFAULT,
+            plan,
+            &RlsPolicyStore::new(),
+            &regular_auth(),
+        )
     }
 
     /// Assert the injector refused with a typed plan error naming `collection`.
@@ -292,16 +307,17 @@ mod tests {
         assert_refused, inject, inject_without_policy, store_with_read_policy,
     };
     use crate::bridge::envelope::PhysicalPlan;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     fn last_values(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Meta(MetaOp::QueryLastValues {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         })
     }
 
     fn rag_fusion(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Graph(GraphOp::RagFusion {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             query_vector: vec![0.0],
             vector_top_k: 4,
             edge_label: None,
@@ -359,7 +375,7 @@ mod tests {
     fn query_last_value_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("metrics");
         let mut plan = PhysicalPlan::Meta(MetaOp::QueryLastValue {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             series_id: 7,
         });
         assert_refused(inject(&mut plan, &store), "metrics");
@@ -411,7 +427,7 @@ mod tests {
     fn a_write_op_is_untouched_by_the_read_pass() {
         let store = store_with_read_policy("docs");
         let mut plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: "docs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
         });

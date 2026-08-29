@@ -282,7 +282,7 @@ pub async fn insert_document(
             }
         };
         let vec_plan = crate::bridge::envelope::PhysicalPlan::Vector(VectorOp::Insert {
-            collection: parsed.coll_name.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &parsed.coll_name),
             vector,
             dim,
             field_name: field_name.clone(),

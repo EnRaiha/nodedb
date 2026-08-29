@@ -69,7 +69,7 @@ pub fn columnar_ingest(wire: ColumnarIngestWire<'_>) -> crate::Result<PhysicalPl
     let provenance = decode_provenance(wire.prov_bytes)?;
     let returning = decode_returning(wire.returning_bytes)?;
     Ok(PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: wire.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(wire.collection.to_owned()),
         payload: wire.payload.to_vec(),
         format: wire.format.to_owned(),
         intent: wire.intent,
@@ -103,7 +103,7 @@ pub fn timeseries_ingest(
     let provenance = decode_provenance(prov_bytes)?;
     let returning = decode_returning(returning_bytes)?;
     Ok(PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         payload: payload.to_vec(),
         format: format.to_owned(),
         wal_lsn: None,
@@ -125,7 +125,7 @@ pub fn fts_index(
 ) -> crate::Result<PhysicalPlan> {
     let provenance = decode_provenance(prov_bytes)?;
     Ok(PhysicalPlan::Text(TextOp::FtsIndexDoc {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         surrogate: Surrogate::new(surrogate),
         text: text.to_owned(),
         provenance,
@@ -139,7 +139,7 @@ pub fn fts_delete(
 ) -> crate::Result<PhysicalPlan> {
     let provenance = decode_provenance(prov_bytes)?;
     Ok(PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         surrogate: Surrogate::new(surrogate),
         provenance,
     }))
@@ -158,7 +158,7 @@ pub fn spatial_insert(
         })?;
     let provenance = decode_provenance(prov_bytes)?;
     Ok(PhysicalPlan::Spatial(SpatialOp::Insert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field: field.to_owned(),
         surrogate: Surrogate::new(surrogate),
         geometry,
@@ -174,7 +174,7 @@ pub fn spatial_delete(
 ) -> crate::Result<PhysicalPlan> {
     let provenance = decode_provenance(prov_bytes)?;
     Ok(PhysicalPlan::Spatial(SpatialOp::Delete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field: field.to_owned(),
         surrogate: Surrogate::new(surrogate),
         provenance,

@@ -23,6 +23,7 @@ use nodedb_cluster::calvin::types::{
     TxClass, VersionedReadSet,
 };
 use nodedb_types::id::VShardId;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 fn two_distinct_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
@@ -110,7 +111,7 @@ fn dependent_barrier_completes_after_passive_delivers() {
 
     // Simulate the passive vshard delivering its read result.
     let key_id = PassiveReadKeyId {
-        collection: "passive_col".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "passive_col"),
         surrogate: 42,
     };
     let values = vec![(key_id.clone(), Value::Integer(100))];
@@ -199,7 +200,7 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
         10u32,
         vec![(
             PassiveReadKeyId {
-                collection: "coll_10".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "coll_10"),
                 surrogate: 1,
             },
             Value::Integer(42),
@@ -214,7 +215,7 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
         20u32,
         vec![(
             PassiveReadKeyId {
-                collection: "coll_20".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "coll_20"),
                 surrogate: 2,
             },
             Value::Integer(99),
@@ -259,7 +260,7 @@ fn read_result_event_assembles_correctly() {
         tenant_id: TenantId::new(3),
         values: vec![(
             PassiveReadKeyId {
-                collection: "coll".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "coll"),
                 surrogate: 100,
             },
             Value::Float(std::f64::consts::PI),
@@ -269,5 +270,5 @@ fn read_result_event_assembles_correctly() {
     assert_eq!(event.epoch, 5);
     assert_eq!(event.passive_vshard, 17);
     assert_eq!(event.values.len(), 1);
-    assert_eq!(event.values[0].0.collection, "coll");
+    assert_eq!(event.values[0].0.collection.as_str(), "coll");
 }

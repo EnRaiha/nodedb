@@ -85,7 +85,10 @@ pub async fn cross_core_shortest_path(
             .saturating_sub(visited.len())
             .min(u32::MAX as usize) as u32;
         let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
-            collection: Some(collection.clone()),
+            collection: Some(nodedb_types::QualifiedCollection::new(
+                database_id,
+                &collection,
+            )),
             node_ids: frontier.clone(),
             edge_label: edge_label.clone(),
             direction,

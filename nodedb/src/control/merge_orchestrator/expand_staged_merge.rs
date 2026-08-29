@@ -76,27 +76,28 @@ pub(crate) async fn resolve_and_emit_merge_ops(
                 predicate,
                 body,
                 tenant_id.as_u64(),
-                &target_collection,
+                target_collection.as_str(),
             )?;
         }
     }
 
     let catalog = state.credentials.catalog();
-    let target_bare = bare_collection_name(task.database_id, &target_collection);
+    let target_bare = bare_collection_name(task.database_id, target_collection.as_str());
     let target = catalog
         .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
         .ok_or_else(|| crate::Error::CollectionNotFound {
             tenant_id,
-            collection: target_collection.clone(),
+            collection: target_collection.to_string(),
         })?;
     let target_pk = resolve_target_pk(&target, "MERGE")?;
 
-    let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
+    let vshard_id =
+        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
     let mut out: Vec<PhysicalTask> = Vec::new();
     emit_arms(
         state,
         task,
-        &target_collection,
+        target_collection.as_str(),
         &target_pk,
         vshard_id,
         arms,
@@ -138,7 +139,7 @@ async fn resolve_merge_arms(
         state,
         tenant_id,
         task.database_id,
-        source_collection,
+        source_collection.as_str(),
         task.txn_id,
     )
     .await?;
@@ -169,7 +170,7 @@ async fn resolve_merge_arms(
         state,
         tenant_id,
         task.database_id,
-        target_collection,
+        target_collection.as_str(),
         resolve_plan,
         task.txn_id,
     )
@@ -212,7 +213,9 @@ fn emit_arms(
             task,
             vshard_id,
             PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: target_collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target_collection.to_string(),
+                ),
                 document_id,
                 value: body,
                 if_absent: false,
@@ -235,7 +238,9 @@ fn emit_arms(
             task,
             vshard_id,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: target_collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target_collection.to_string(),
+                ),
                 document_id,
                 value: body,
                 surrogate,
@@ -256,7 +261,9 @@ fn emit_arms(
             task,
             vshard_id,
             PhysicalPlan::Document(DocumentOp::PointDelete {
-                collection: target_collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target_collection.to_string(),
+                ),
                 document_id,
                 surrogate,
                 pk_bytes,

@@ -104,7 +104,7 @@ pub(super) async fn resolve_gather(
             PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::HashJoin {
                 left_collection,
                 ..
-            }) => Some(left_collection.clone()),
+            }) => Some(left_collection.to_string()),
             other => other.collection().map(str::to_owned),
         }
     } else {

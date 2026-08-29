@@ -33,7 +33,10 @@ fn register_schemaless_bitemporal(ctx: &mut TestCtx, collection: &str) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Register {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             indexes: Vec::new(),
             crdt_enabled: false,
             storage_mode: StorageMode::Schemaless,
@@ -53,7 +56,10 @@ fn register_strict_bitemporal(ctx: &mut TestCtx, collection: &str) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Register {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             indexes: Vec::new(),
             crdt_enabled: false,
             storage_mode: StorageMode::Strict {
@@ -83,7 +89,10 @@ fn put(ctx: &mut TestCtx, collection: &str, doc_id: &str, value: Vec<u8>, surrog
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: doc_id.into(),
             value,
             surrogate: nodedb_types::Surrogate::new(surrogate),
@@ -102,7 +111,10 @@ fn delete(ctx: &mut TestCtx, collection: &str, doc_id: &str, surrogate: u32) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: doc_id.into(),
             surrogate: nodedb_types::Surrogate::new(surrogate),
             pk_bytes: doc_id.as_bytes().to_vec(),
@@ -128,7 +140,10 @@ fn range_scan_scores(
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::RangeScan {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             field: "score".into(),
             lower: lower.map(|b| b.to_vec()),
             upper: upper.map(|b| b.to_vec()),

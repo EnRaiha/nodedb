@@ -39,7 +39,7 @@ pub async fn create_checkpoint(
 
     // Dispatch to Data Plane to get current version vector.
     let plan = PhysicalPlan::Crdt(CrdtOp::GetVersionVector {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     let vv_bytes = dispatch_system(

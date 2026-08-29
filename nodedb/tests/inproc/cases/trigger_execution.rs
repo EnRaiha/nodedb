@@ -128,7 +128,10 @@ fn classify_point_put_as_insert() {
     use nodedb_physical::physical_plan::PhysicalPlan;
 
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "orders".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "orders",
+        ),
         document_id: "doc-1".into(),
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -149,7 +152,10 @@ fn classify_point_delete() {
     use nodedb_physical::physical_plan::PhysicalPlan;
 
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: "orders".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "orders",
+        ),
         document_id: "doc-1".into(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -170,7 +176,10 @@ fn classify_point_update() {
     use nodedb_physical::physical_plan::PhysicalPlan;
 
     let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
-        collection: "users".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "users",
+        ),
         document_id: "u-1".into(),
         updates: vec![],
         returning: None,
@@ -191,7 +200,10 @@ fn classify_bulk_delete() {
     use nodedb_physical::physical_plan::PhysicalPlan;
 
     let plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
-        collection: "logs".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "logs",
+        ),
         filters: vec![],
         returning: None,
         ollp_predicted_surrogates: None,
@@ -212,7 +224,10 @@ fn classify_scan_returns_none() {
     use nodedb_physical::physical_plan::PhysicalPlan;
 
     let plan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: "orders".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "orders",
+        ),
         limit: 100,
         offset: 0,
         sort_keys: vec![],
@@ -234,7 +249,10 @@ fn classify_vector_op_returns_none() {
     use nodedb_physical::physical_plan::VectorOp;
 
     let plan = PhysicalPlan::Vector(VectorOp::Insert {
-        collection: "embeddings".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "embeddings",
+        ),
         vector: vec![1.0, 2.0, 3.0],
         dim: 3,
         field_name: String::new(),
@@ -659,7 +677,10 @@ fn classify_point_put_deserializes_json_value() {
 
     let value = serde_json::to_vec(&serde_json::json!({"name": "Alice", "age": 30})).unwrap();
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "users".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "users",
+        ),
         document_id: "u-1".into(),
         value,
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -687,7 +708,10 @@ fn classify_point_put_deserializes_msgpack_value() {
 
     let value = nodedb_types::json_to_msgpack(&serde_json::json!({"key": "val"})).unwrap();
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "data".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "data",
+        ),
         document_id: "d-1".into(),
         value,
         surrogate: nodedb_types::Surrogate::ZERO,

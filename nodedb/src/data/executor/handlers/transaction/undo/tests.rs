@@ -10,7 +10,8 @@ use crate::engine::timeseries::columnar_memtable::{
     ColumnType, ColumnValue, ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
 };
 use crate::engine::timeseries::last_value_cache::LastValueCache;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
+use nodedb_types::QualifiedCollection;
 
 const DB: u64 = 0;
 const TID: u64 = 1;
@@ -167,7 +168,7 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
     let task = make_default_task();
     let plans = [
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: b"metrics value=1i 1000000000\n".to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -178,7 +179,7 @@ fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
             rls_filters: Vec::new(),
         }),
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: b"other_measurement value=2i 2000000000\n".to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -251,7 +252,7 @@ fn transactional_timeseries_flush_uses_the_enclosing_wal_lsn() {
         Some(Lsn::new(lsn)),
     );
     let plans = [PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"metrics value=1i 1000000000\n".to_vec(),
         format: "ilp".into(),
         // Buffered transaction plans normally have no per-op LSN. The
@@ -699,7 +700,7 @@ fn columnar_predicate_update_rolls_back_on_sibling_failure() {
         nodedb_types::value_to_msgpack(&Value::Integer(999)).unwrap(),
     )];
     let plan = PhysicalPlan::Columnar(ColumnarOp::Update {
-        collection: "m".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "m"),
         filters: Vec::new(),
         updates,
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -740,7 +741,7 @@ fn columnar_predicate_delete_rolls_back_on_sibling_failure() {
 
     // Durable COMMIT replay of `DELETE FROM m` (empty filter = all rows).
     let plan = PhysicalPlan::Columnar(ColumnarOp::Delete {
-        collection: "m".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "m"),
         filters: Vec::new(),
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
     });

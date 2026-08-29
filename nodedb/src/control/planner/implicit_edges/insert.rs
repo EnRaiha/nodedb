@@ -46,7 +46,7 @@ pub async fn append_implicit_edge_tasks(
             | PhysicalPlan::Document(DocumentOp::Upsert {
                 collection, value, ..
             }) => {
-                if let Some(edge) = extract_edge(collection, value) {
+                if let Some(edge) = extract_edge(collection.as_str(), value) {
                     edges.push(edge);
                 }
             }
@@ -56,7 +56,7 @@ pub async fn append_implicit_edge_tasks(
                 ..
             }) => {
                 for (_doc_id, value) in documents {
-                    if let Some(edge) = extract_edge(collection, value) {
+                    if let Some(edge) = extract_edge(collection.as_str(), value) {
                         edges.push(edge);
                     }
                 }
@@ -113,7 +113,7 @@ pub async fn append_implicit_edge_tasks(
             vshard_id: vsrc,
             database_id,
             plan: PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: edge.collection,
+                collection: nodedb_types::QualifiedCollection::from_stored(edge.collection),
                 src_id: edge.src,
                 label: edge.label,
                 dst_id: edge.dst,

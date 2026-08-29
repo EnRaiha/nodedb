@@ -184,7 +184,7 @@ impl CoreLoop {
             DatabaseId::new(database_id),
             vshard,
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field: field.clone(),
                 surrogate,
                 vector: vector.clone(),
@@ -267,7 +267,7 @@ impl CoreLoop {
             DatabaseId::new(database_id),
             vshard,
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-                collection: collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field_name: field_name.clone(),
                 document_surrogate,
                 vectors: vectors_flat.clone(),
@@ -339,7 +339,7 @@ impl CoreLoop {
             DatabaseId::new(database_id),
             vshard,
             PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-                collection: collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field_name: field_name.clone(),
                 document_surrogate,
             }),
@@ -388,7 +388,7 @@ impl CoreLoop {
             DatabaseId::new(database_id),
             vshard,
             PhysicalPlan::Vector(VectorOp::SparseInsert {
-                collection: collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field_name: field_name.clone(),
                 doc_id: doc_id.clone(),
                 entries: entries.clone(),
@@ -433,7 +433,7 @@ impl CoreLoop {
             DatabaseId::new(database_id),
             vshard,
             PhysicalPlan::Vector(VectorOp::SparseDelete {
-                collection: collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field_name: field_name.clone(),
                 doc_id: doc_id.clone(),
             }),
@@ -455,7 +455,7 @@ mod tests {
     use crate::engine::vector::hnsw::HnswParams;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     /// Holds the bridge endpoints + tempdir alive for the core's lifetime. The
     /// tests drive the replay methods directly and never tick the event loop.
@@ -519,7 +519,7 @@ mod tests {
 
     fn direct_upsert_plan(surrogate: u32, vector: Vec<f32>) -> PhysicalPlan {
         PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: "vp".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vp"),
             field: "emb".into(),
             surrogate: Surrogate::new(surrogate),
             vector,
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn sparse_insert_survives_wal_replay() {
         let plan = PhysicalPlan::Vector(VectorOp::SparseInsert {
-            collection: "sc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".into(),
             doc_id: "d1".into(),
             entries: vec![(10, 0.5), (20, 0.8)],
@@ -631,13 +631,13 @@ mod tests {
     #[test]
     fn sparse_delete_survives_wal_replay() {
         let insert = PhysicalPlan::Vector(VectorOp::SparseInsert {
-            collection: "sc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".into(),
             doc_id: "d1".into(),
             entries: vec![(10, 0.5)],
         });
         let delete = PhysicalPlan::Vector(VectorOp::SparseDelete {
-            collection: "sc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".into(),
             doc_id: "d1".into(),
         });
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn multi_vector_insert_survives_wal_replay() {
         let plan = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-            collection: "mc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".into(),
             document_surrogate: Surrogate::new(7),
             vectors: vec![1.0, 2.0, 3.0, 4.0], // 2 vectors of dim 2
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn multi_vector_delete_survives_wal_replay() {
         let insert = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-            collection: "mc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".into(),
             document_surrogate: Surrogate::new(7),
             vectors: vec![1.0, 2.0, 3.0, 4.0],
@@ -698,7 +698,7 @@ mod tests {
             dim: 2,
         });
         let delete = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-            collection: "mc".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".into(),
             document_surrogate: Surrogate::new(7),
         });

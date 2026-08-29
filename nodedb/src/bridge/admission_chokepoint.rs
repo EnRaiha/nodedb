@@ -95,12 +95,13 @@ mod tests {
     use crate::control::server::shared::write_admission::plan_is_write;
     use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
     use nodedb_physical::physical_plan::{DocumentOp, KvOp};
+    use nodedb_types::QualifiedCollection;
     use std::time::{Duration, Instant};
 
     /// A write-class plan: `plan_is_write` returns true for `KvOp::Put`.
     fn write_plan() -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
@@ -113,7 +114,7 @@ mod tests {
     /// A read-class plan: `plan_is_write` returns false for `DocumentOp::PointGet`.
     fn read_plan() -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -210,7 +211,7 @@ mod tests {
     /// A `KvOp::Delete` write plan carrying the given `RlsWriteCheck`.
     fn delete_plan_with_check(check: nodedb_types::RlsWriteCheck) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Delete {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             keys: vec![b"k".to_vec()],
             rls_write_check: check,
         })
@@ -223,8 +224,8 @@ mod tests {
         dest: nodedb_types::RlsWriteCheck,
     ) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: "src".into(),
-            dest_collection: "dst".into(),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "dst"),
             item_key: b"item".to_vec(),
             dest_key: b"item".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use nodedb::control::metrics::SystemMetrics;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
-use nodedb_types::{DatabaseId, TenantId};
+use nodedb_types::{DatabaseId, QualifiedCollection, TenantId};
 
 /// Baseline SPSC read depth, sourced from the `CoreLoop` public accessor so
 /// the test does not hard-code the value.
@@ -148,7 +148,7 @@ fn critical_check_engine_pressure_increments_metric() {
         vshard_id: VShardId::new(0),
         database_id: nodedb::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "test".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "test"),
             vector: vec![0.1],
             dim: 1,
             field_name: "emb".into(),
@@ -218,7 +218,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
         vshard_id: VShardId::new(0),
         database_id: nodedb::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "test".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "test"),
             vector: vec![0.1],
             dim: 1,
             field_name: "emb".into(),

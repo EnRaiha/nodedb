@@ -21,6 +21,7 @@ use nodedb::control::gateway::GatewayErrorMap;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::{RequestId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -66,7 +67,10 @@ async fn native_gateway_migration_single_node_select() {
 
     // INSERT — mirrors native SQL INSERT going through dispatch_task_via_gateway.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "native_gw_single".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "native_gw_single",
+        ),
         key: b"native-key".to_vec(),
         value: mp_string("native-value"),
         ttl_ms: 0,
@@ -82,7 +86,10 @@ async fn native_gateway_migration_single_node_select() {
 
     // SELECT (GET) — mirrors native SQL SELECT going through dispatch_task_via_gateway.
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "native_gw_single".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "native_gw_single",
+        ),
         key: b"native-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -130,7 +137,10 @@ async fn native_gateway_migration_cross_node_select() {
 
     // Seed a KV entry on the leader.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "native_gw_cross".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "native_gw_cross",
+        ),
         key: b"cross-native-key".to_vec(),
         value: mp_string("cross-native-value"),
         ttl_ms: 0,
@@ -150,7 +160,10 @@ async fn native_gateway_migration_cross_node_select() {
     let follower_gw = Gateway::new(Arc::clone(&cluster.nodes[1].shared));
 
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "native_gw_cross".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "native_gw_cross",
+        ),
         key: b"cross-native-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,

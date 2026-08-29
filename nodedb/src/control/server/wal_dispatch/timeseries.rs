@@ -32,10 +32,11 @@ pub(super) fn wal_append_timeseries_op(
         } => {
             // WAL bypass: skip WAL if collection has wal=false in timeseries_config.
             if let Some(creds) = credentials
-                && let Ok(Some(coll)) =
-                    creds
-                        .catalog()
-                        .get_collection(database_id, tenant_id.as_u64(), collection)
+                && let Ok(Some(coll)) = creds.catalog().get_collection(
+                    database_id,
+                    tenant_id.as_u64(),
+                    collection.as_str(),
+                )
                 && let Some(config) = coll.get_timeseries_config()
                 && config.get("wal").and_then(|v| v.as_str()) == Some("false")
             {
@@ -43,8 +44,11 @@ pub(super) fn wal_append_timeseries_op(
                 None
             } else {
                 // Provenance appended last; older 3-element decoders ignore it via arity fallback.
-                let wal_payload =
-                    encode_timeseries_batch_payload(collection, payload, provenance.as_ref())?;
+                let wal_payload = encode_timeseries_batch_payload(
+                    collection.as_str(),
+                    payload,
+                    provenance.as_ref(),
+                )?;
                 Some(wal.append_timeseries_batch(
                     tenant_id,
                     vshard_id,
@@ -277,7 +281,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: vec![1, 2, 3],
             format: "samples".to_string(),
             wal_lsn: None,
@@ -309,7 +313,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "metrics".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 10,

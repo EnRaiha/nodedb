@@ -322,7 +322,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::{KvOp, UpdateValue};
-    use nodedb_types::{RlsWriteCheck, Surrogate, Value};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate, Value};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -407,7 +407,7 @@ mod tests {
         let seed = obj_bytes(&[("hp", 10)]);
         let excluded = obj_bytes(&[("hp", 1)]);
         let put_p1 = PhysicalPlan::Kv(KvOp::Put {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p1".to_vec(),
             value: seed.clone(),
             ttl_ms: 0,
@@ -422,7 +422,7 @@ mod tests {
             ),
         )];
         let upsert = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p1".to_vec(),
             value: excluded.clone(),
             ttl_ms: 0,
@@ -466,7 +466,7 @@ mod tests {
             ),
         )];
         let upsert = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"fresh".to_vec(),
             value: excluded.clone(),
             ttl_ms: 0,
@@ -496,7 +496,7 @@ mod tests {
 
         let seed = obj_bytes(&[("hp", 10)]);
         let put_p1 = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"s1".to_vec(),
             value: seed.clone(),
             ttl_ms: 0,

@@ -161,10 +161,10 @@ fn build_dependent_tx_class_impl(
         ) = &task.plan
         {
             edge_pairs
-                .entry(edge_coll.clone())
+                .entry(edge_coll.to_string())
                 .or_default()
                 .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
-            let homes = edge_homes.entry(edge_coll.clone()).or_default();
+            let homes = edge_homes.entry(edge_coll.to_string()).or_default();
             homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
             homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
             continue;
@@ -266,7 +266,7 @@ mod tests {
             vshard_id: VShardId::new(0),
             database_id: DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: collection.to_owned(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
                 filters: vec![],
                 returning: None,
                 ollp_predicted_surrogates: None,

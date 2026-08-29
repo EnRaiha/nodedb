@@ -387,7 +387,10 @@ mod tests {
     use nodedb_types::id::{RequestId, TxnId, VShardId};
     use nodedb_types::timeseries::continuous_agg::{ContinuousAggregateDef, RefreshPolicy};
     use nodedb_types::vector_distance::DistanceMetric;
-    use nodedb_types::{DatabaseId, Lsn, Surrogate, SystemTimeScope, TenantId, VectorAnnOptions};
+    use nodedb_types::{
+        DatabaseId, Lsn, QualifiedCollection, Surrogate, SystemTimeScope, TenantId,
+        VectorAnnOptions,
+    };
     use std::collections::BTreeMap;
 
     fn tenant() -> TenantId {
@@ -405,7 +408,7 @@ mod tests {
     /// under test.
     fn trivial_read_plan() -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Get {
-            collection: String::new(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, ""),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -475,7 +478,7 @@ mod tests {
     fn document_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -484,7 +487,7 @@ mod tests {
                 valid_at_ms: None,
             }),
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 surrogate: Surrogate::ZERO,
@@ -494,7 +497,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 if_absent: false,
@@ -505,7 +508,7 @@ mod tests {
                 deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -515,7 +518,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -526,7 +529,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Scan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 limit: 0,
                 offset: 0,
                 sort_keys: Vec::new(),
@@ -540,7 +543,7 @@ mod tests {
                 prefilter: None,
             }),
             PhysicalPlan::Document(DocumentOp::RangeScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 lower: None,
                 upper: None,
@@ -548,7 +551,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Register {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 indexes: Vec::new(),
                 crdt_enabled: false,
                 storage_mode: StorageMode::default(),
@@ -559,12 +562,12 @@ mod tests {
                 vector_primary: None,
             }),
             PhysicalPlan::Document(DocumentOp::IndexLookup {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 path: "$.f".into(),
                 value: "v".into(),
             }),
             PhysicalPlan::Document(DocumentOp::IndexedFetch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 path: "$.f".into(),
                 value: "v".into(),
                 filters: Vec::new(),
@@ -573,11 +576,11 @@ mod tests {
                 offset: 0,
             }),
             PhysicalPlan::Document(DocumentOp::DropIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
             }),
             PhysicalPlan::Document(DocumentOp::BackfillIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 path: "$.f".into(),
                 is_array: false,
                 unique: false,
@@ -585,17 +588,17 @@ mod tests {
                 predicate: None,
             }),
             PhysicalPlan::Document(DocumentOp::EstimateCount {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
             }),
             PhysicalPlan::Document(DocumentOp::InsertSelect {
-                target_collection: "t".into(),
-                source_collection: "s".into(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_filters: Vec::new(),
                 source_limit: 0,
             }),
             PhysicalPlan::Document(DocumentOp::Upsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
@@ -607,7 +610,7 @@ mod tests {
             }),
             // BulkUpdate / BulkDelete: non-OLLP (both None) — the buffered case.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 updates: Vec::new(),
                 returning: None,
@@ -618,7 +621,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 returning: None,
                 ollp_predicted_surrogates: None,
@@ -630,7 +633,7 @@ mod tests {
             // BulkUpdate / BulkDelete: OLLP surrogate set present — the
             // Calvin-routed, not-buffered case.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 updates: Vec::new(),
                 returning: None,
@@ -641,7 +644,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 returning: None,
                 ollp_predicted_surrogates: Some(vec![1, 2]),
@@ -653,7 +656,7 @@ mod tests {
             // BulkUpdate / BulkDelete: OLLP edge set present, surrogates None —
             // the other half of the `Some` guard.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 updates: Vec::new(),
                 returning: None,
@@ -669,7 +672,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 returning: None,
                 ollp_predicted_surrogates: None,
@@ -684,14 +687,14 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::MaterializeScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cursor: Vec::new(),
                 count: 0,
                 system_as_of_ms: None,
             }),
             // Predicate `true` and encoder `Some` agree for `BatchInsert`.
             PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 documents: Vec::new(),
                 surrogates: Vec::new(),
                 returning: None,
@@ -709,7 +712,7 @@ mod tests {
     fn vector_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Vector(VectorOp::Search {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query_vector: Vec::new(),
                 top_k: 0,
                 ef_search: 0,
@@ -723,7 +726,7 @@ mod tests {
                 payload_filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 vector: Vec::new(),
                 dim: 0,
                 field_name: String::new(),
@@ -732,13 +735,13 @@ mod tests {
                 provenance: None,
             }),
             PhysicalPlan::Vector(VectorOp::BatchInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 vectors: Vec::new(),
                 dim: 0,
                 surrogates: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiSearch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query_vector: Vec::new(),
                 top_k: 0,
                 ef_search: 0,
@@ -746,11 +749,11 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::Delete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 vector_id: 0,
             }),
             PhysicalPlan::Vector(VectorOp::SetParams {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 dim: 0,
                 m: 0,
@@ -762,32 +765,32 @@ mod tests {
                 ivf_nprobe: 0,
             }),
             PhysicalPlan::Vector(VectorOp::QueryStats {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
             }),
             PhysicalPlan::Vector(VectorOp::Seal {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
             }),
             PhysicalPlan::Vector(VectorOp::CompactIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
             }),
             PhysicalPlan::Vector(VectorOp::Rebuild {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 m: 0,
                 m0: 0,
                 ef_construction: 0,
             }),
             PhysicalPlan::Vector(VectorOp::SparseSearch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 query_entries: Vec::new(),
                 top_k: 0,
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 query_vector: Vec::new(),
                 top_k: 0,
@@ -796,24 +799,24 @@ mod tests {
             }),
             // Encoder covers these six, so predicate and encoder agree — oracle-matching set.
             PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 surrogate: Surrogate::ZERO,
                 field_name: String::new(),
                 provenance: None,
             }),
             PhysicalPlan::Vector(VectorOp::SparseInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 doc_id: "d".into(),
                 entries: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::SparseDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 doc_id: "d".into(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 document_surrogate: Surrogate::ZERO,
                 vectors: Vec::new(),
@@ -821,12 +824,12 @@ mod tests {
                 dim: 0,
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
                 document_surrogate: Surrogate::ZERO,
             }),
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: String::new(),
                 surrogate: Surrogate::ZERO,
                 vector: Vec::new(),
@@ -846,7 +849,7 @@ mod tests {
     #[test]
     fn raw_crdt_apply_is_not_transaction_bufferable() {
         let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             delta: Vec::new(),
             peer_id: 0,
@@ -863,42 +866,42 @@ mod tests {
     fn crdt_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Crdt(CrdtOp::Read {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
             }),
             PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
                 tenant_id: 1,
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 bytes: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::ReadConstraints {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Crdt(CrdtOp::SetPolicy {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 policy_json: "{}".into(),
             }),
             PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Crdt(CrdtOp::ReadAtVersion {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 version_vector_json: "{}".into(),
             }),
             PhysicalPlan::Crdt(CrdtOp::GetVersionVector {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Crdt(CrdtOp::ExportDelta {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 from_version_json: "{}".into(),
             }),
             PhysicalPlan::Crdt(CrdtOp::CompactAtVersion {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 target_version_json: "{}".into(),
             }),
             PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 list_path: "$.l".into(),
                 index: 0,
@@ -906,14 +909,14 @@ mod tests {
                 surrogate: Surrogate::ZERO,
             }),
             PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 list_path: "$.l".into(),
                 index: 0,
                 surrogate: Surrogate::ZERO,
             }),
             PhysicalPlan::Crdt(CrdtOp::ListMove {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 list_path: "$.l".into(),
                 from_index: 0,
@@ -922,16 +925,16 @@ mod tests {
             }),
             // `to_replicated_entry` has encoder arms for these — predicate and encoder agree.
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 constraint_version: 0,
                 constraints: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 constraint_version: 0,
             }),
             PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 fields_json: "{}".into(),
                 surrogate: Surrogate::ZERO,
@@ -940,7 +943,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::DocDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
                 returning: None,
@@ -956,7 +959,7 @@ mod tests {
     fn graph_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 src_id: "a".into(),
                 label: "L".into(),
                 dst_id: "b".into(),
@@ -968,7 +971,7 @@ mod tests {
                 edges: Vec::<BatchEdge>::new(),
             }),
             PhysicalPlan::Graph(GraphOp::EdgeDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 src_id: "a".into(),
                 label: "L".into(),
                 dst_id: "b".into(),
@@ -1023,7 +1026,7 @@ mod tests {
                 collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::RagFusion {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query_vector: Vec::new(),
                 vector_top_k: 0,
                 edge_label: None,
@@ -1081,7 +1084,7 @@ mod tests {
                 labels: Vec::new(),
             }),
             PhysicalPlan::Graph(GraphOp::TemporalNeighbors {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 node_id: "n".into(),
                 edge_label: None,
                 direction: Direction::Out,
@@ -1108,13 +1111,13 @@ mod tests {
     fn kv_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Kv(KvOp::Get {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 rls_filters: Vec::new(),
                 surrogate_ceiling: None,
             }),
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -1123,7 +1126,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Insert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -1132,7 +1135,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -1141,7 +1144,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -1152,23 +1155,23 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Delete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 keys: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::PredicateUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 updates: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::PredicateDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::Scan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cursor: Vec::new(),
                 count: 0,
                 filters: Vec::new(),
@@ -1177,27 +1180,27 @@ mod tests {
                 surrogate_ceiling: None,
             }),
             PhysicalPlan::Kv(KvOp::Expire {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 ttl_ms: 0,
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::Persist {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::GetTtl {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::BatchGet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 keys: Vec::new(),
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::BatchPut {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
                 surrogates: Vec::new(),
@@ -1205,20 +1208,20 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::FieldGet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 fields: Vec::new(),
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::FieldSet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::Incr {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 delta: 0,
                 ttl_ms: 0,
@@ -1226,14 +1229,14 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::IncrFloat {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 delta: 0.0,
                 surrogate: Surrogate::ZERO,
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::Cas {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 expected: Vec::new(),
                 new_value: Vec::new(),
@@ -1241,7 +1244,7 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::GetSet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 new_value: Vec::new(),
                 surrogate: Surrogate::ZERO,
@@ -1249,7 +1252,7 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::Transfer {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 source_key: Vec::new(),
                 dest_key: Vec::new(),
                 field: "f".into(),
@@ -1259,8 +1262,8 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::TransferItem {
-                source_collection: "s".into(),
-                dest_collection: "d".into(),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "d"),
                 item_key: Vec::new(),
                 dest_key: Vec::new(),
                 surrogate: Surrogate::ZERO,
@@ -1268,7 +1271,7 @@ mod tests {
                 dest_rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 index_name: "i".into(),
                 sort_columns: Vec::new(),
                 key_column: "k".into(),
@@ -1301,7 +1304,7 @@ mod tests {
                 primary_key: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::MaterializeScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cursor: Vec::new(),
                 count: 0,
             }),
@@ -1315,7 +1318,7 @@ mod tests {
     fn columnar_timeseries_spatial_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Columnar(ColumnarOp::Scan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 projection: Vec::new(),
                 limit: 0,
                 filters: Vec::new(),
@@ -1327,7 +1330,7 @@ mod tests {
                 computed_columns: Vec::new(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 payload: Vec::new(),
                 format: "json".into(),
                 intent: ColumnarInsertIntent::Insert,
@@ -1341,34 +1344,34 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::Update {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 updates: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Columnar(ColumnarOp::Delete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 rows: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 pks: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
             }),
             PhysicalPlan::Columnar(ColumnarOp::MaterializeScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cursor: Vec::new(),
                 count: 0,
                 system_as_of_ms: None,
             }),
             PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 time_range: (0, i64::MAX),
                 projection: Vec::new(),
                 limit: 0,
@@ -1384,7 +1387,7 @@ mod tests {
                 valid_at_ms: None,
             }),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 payload: Vec::new(),
                 format: "ilp".into(),
                 wal_lsn: None,
@@ -1395,20 +1398,20 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Spatial(SpatialOp::Insert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 surrogate: Surrogate::ZERO,
                 geometry: Geometry::point(0.0, 0.0),
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Delete {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 surrogate: Surrogate::ZERO,
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Scan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 predicate: SpatialPredicate::Contains,
                 query_geometry: Geometry::point(0.0, 0.0),
@@ -1429,7 +1432,7 @@ mod tests {
     fn text_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Text(TextOp::Search {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query: "q".into(),
                 top_k: 0,
                 fuzzy: false,
@@ -1437,19 +1440,19 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Text(TextOp::BM25ScoreScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query: "q".into(),
                 score_alias: "s".into(),
                 fuzzy: false,
             }),
             PhysicalPlan::Text(TextOp::PhraseSearch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 terms: Vec::new(),
                 top_k: 0,
                 prefilter: None,
             }),
             PhysicalPlan::Text(TextOp::HybridSearch {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query_vector: Vec::new(),
                 query_text: "q".into(),
                 top_k: 0,
@@ -1461,18 +1464,18 @@ mod tests {
                 score_alias: None,
             }),
             PhysicalPlan::Text(TextOp::FtsIndexDoc {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 surrogate: Surrogate::ZERO,
                 text: "t".into(),
                 provenance: None,
             }),
             PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 surrogate: Surrogate::ZERO,
                 provenance: None,
             }),
             PhysicalPlan::Text(TextOp::HybridSearchTriple {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 query_vector: Vec::new(),
                 query_text: "q".into(),
                 graph_seed_id: "n".into(),
@@ -1487,7 +1490,7 @@ mod tests {
                 score_alias: None,
             }),
             PhysicalPlan::Text(TextOp::SetTextConfig {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 analyzer_name: Some("standard".into()),
                 fuzzy_default: None,
             }),
@@ -1515,7 +1518,7 @@ mod tests {
                 distinct: false,
             }),
             PhysicalPlan::Query(QueryOp::Aggregate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 input: None,
                 group_by: Vec::new(),
                 aggregates: Vec::new(),
@@ -1528,21 +1531,21 @@ mod tests {
                 sort_keys: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::PartialAggregate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 group_by: Vec::new(),
                 aggregates: Vec::new(),
                 filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::PartialAggregateState {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 input: None,
                 group_by: Vec::new(),
                 aggregates: Vec::new(),
                 filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::HashJoin {
-                left_collection: "l".into(),
-                right_collection: "r".into(),
+                left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "l"),
+                right_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "r"),
                 left_alias: None,
                 right_alias: None,
                 on: Vec::new(),
@@ -1579,8 +1582,8 @@ mod tests {
                 sort_keys: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::NestedLoopJoin {
-                left_collection: "l".into(),
-                right_collection: "r".into(),
+                left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "l"),
+                right_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "r"),
                 condition: Vec::new(),
                 join_type: "inner".into(),
                 limit: 0,
@@ -1588,8 +1591,8 @@ mod tests {
                 right_rls_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::SortMergeJoin {
-                left_collection: "l".into(),
-                right_collection: "r".into(),
+                left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "l"),
+                right_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "r"),
                 on: Vec::new(),
                 join_type: "inner".into(),
                 limit: 0,
@@ -1598,13 +1601,13 @@ mod tests {
                 right_rls_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::FacetCounts {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 filters: Vec::new(),
                 fields: Vec::new(),
                 limit_per_facet: 0,
             }),
             PhysicalPlan::Query(QueryOp::RecursiveScan {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 base_filters: Vec::new(),
                 recursive_filters: Vec::new(),
                 join_link: None,
@@ -1624,7 +1627,7 @@ mod tests {
             PhysicalPlan::Query(QueryOp::LateralTopK {
                 outer_plan: Box::new(trivial_read_plan()),
                 outer_alias: "o".into(),
-                inner_collection: "i".into(),
+                inner_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "i"),
                 inner_filters: Vec::new(),
                 inner_order_by: Vec::new(),
                 inner_limit: 0,
@@ -1636,7 +1639,7 @@ mod tests {
             PhysicalPlan::Query(QueryOp::LateralLoop {
                 outer_plan: Box::new(trivial_read_plan()),
                 outer_alias: "o".into(),
-                inner_collection: "i".into(),
+                inner_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "i"),
                 inner_filters: Vec::new(),
                 correlation_predicates: Vec::new(),
                 lateral_alias: "l".into(),
@@ -1683,7 +1686,7 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: "agg".into() }),
             PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
             PhysicalPlan::Meta(MetaOp::ConvertCollection {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 target_type: "kv".into(),
                 schema_json: "{}".into(),
             }),
@@ -1711,27 +1714,27 @@ mod tests {
                 name: "c".into(),
             }),
             PhysicalPlan::Meta(MetaOp::EnforceTimeseriesRetention {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 max_age_ms: 0,
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeEdgeStore {
                 tenant_id: 1,
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cutoff_system_ms: 0,
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeDocumentStrict {
                 tenant_id: 1,
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cutoff_system_ms: 0,
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeColumnar {
                 tenant_id: 1,
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cutoff_system_ms: 0,
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeCrdt {
                 tenant_id: 1,
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cutoff_system_ms: 0,
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeArray {
@@ -1749,10 +1752,10 @@ mod tests {
                 aggregate_name: "agg".into(),
             }),
             PhysicalPlan::Meta(MetaOp::QueryLastValues {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Meta(MetaOp::QueryLastValue {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 series_id: 0,
             }),
             PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
@@ -1764,7 +1767,7 @@ mod tests {
                 is_group_leader: false,
                 versioned_reads: vec![VersionedReadEntry {
                     engine: EngineTag::Kv,
-                    collection: "c".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c").to_string(),
                     key: ReadKeyIdent::Predicate,
                     read_lsn: Lsn::ZERO,
                 }],
@@ -1775,7 +1778,7 @@ mod tests {
                 tenant_id: tenant(),
                 keys_to_read: vec![PassiveReadKey {
                     engine_key: EngineKeySet::Kv {
-                        collection: "c".into(),
+                        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c").to_string(),
                         keys: SortedVec::new(Vec::new()),
                     },
                 }],
@@ -1790,7 +1793,7 @@ mod tests {
                 is_group_leader: false,
             }),
             PhysicalPlan::Meta(MetaOp::RebuildIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 index_name: None,
                 concurrent: false,
             }),
@@ -1806,8 +1809,8 @@ mod tests {
                 tenant_id: 1,
                 old_database_id: 0,
                 new_database_id: 1,
-                old_collection: "old".into(),
-                new_collection: "new".into(),
+                old_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "old"),
+                new_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "new"),
             }),
             PhysicalPlan::Meta(MetaOp::StageWrite {
                 plan: Box::new(trivial_read_plan()),
@@ -1955,8 +1958,8 @@ mod tests {
     fn flipped_variants_are_buffered_and_unencoded() {
         let plans = vec![
             PhysicalPlan::Document(DocumentOp::Merge {
-                target_collection: "t".into(),
-                source_collection: "s".into(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),
@@ -1969,8 +1972,8 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-                target_collection: "t".into(),
-                source_collection: "s".into(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),
@@ -1983,7 +1986,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 target_version_json: "{}".into(),
                 surrogate: Surrogate::ZERO,
@@ -2018,21 +2021,21 @@ mod tests {
     fn truncate_and_index_variants_are_encoded_but_not_buffered() {
         let plans = vec![
             PhysicalPlan::Document(DocumentOp::Truncate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 restart_identity: false,
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Truncate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 field_position: 0,
                 backfill: false,
             }),
             PhysicalPlan::Kv(KvOp::DropIndex {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
             }),
         ];

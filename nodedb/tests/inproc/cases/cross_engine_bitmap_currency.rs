@@ -167,7 +167,10 @@ fn fts_derived_bitmap_filters_vector_search() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "articles".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "articles",
+                ),
                 document_id: hex_id.clone(),
                 value: serde_json::to_vec(&doc_json).unwrap(),
                 surrogate: *surrogate,
@@ -190,7 +193,10 @@ fn fts_derived_bitmap_filters_vector_search() {
     for (surrogate, vec) in vectors {
         tx.try_push(BridgeRequest {
             inner: make_req(PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "articles".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "articles",
+                ),
                 vector: vec.to_vec(),
                 dim: 3,
                 field_name: String::new(),
@@ -213,7 +219,10 @@ fn fts_derived_bitmap_filters_vector_search() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 10,
             ef_search: 0,
@@ -248,7 +257,10 @@ fn fts_derived_bitmap_filters_vector_search() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 10,
             ef_search: 0,
@@ -321,7 +333,10 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "catalog".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "catalog",
+                ),
                 document_id: hex_id.clone(),
                 value: serde_json::to_vec(&doc_json).unwrap(),
                 surrogate: *surrogate,
@@ -355,7 +370,10 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             payload: rows_mp,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -395,7 +413,10 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             filters: Vec::new(),
             rls_filters: Vec::new(),
             sort_keys: Vec::new(),
@@ -442,7 +463,10 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
     // The executor runs the sub-plan, collects surrogates 1+2, and injects
     // the bitmap into the left side scan before probing.
     let bm_subplan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: "catalog".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "catalog",
+        ),
         limit: 100,
         offset: 0,
         sort_keys: Vec::new(),
@@ -461,8 +485,14 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "catalog".into(),
-            right_collection: "metrics".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "catalog",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "id".into())],

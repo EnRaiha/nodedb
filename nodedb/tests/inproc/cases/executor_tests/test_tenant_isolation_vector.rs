@@ -7,6 +7,7 @@
 use nodedb::bridge::envelope::Status;
 use nodedb_physical::physical_plan::{PhysicalPlan, VectorOp};
 use nodedb_types::vector_distance::DistanceMetric;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -22,7 +23,7 @@ fn vector_search_isolated() {
             &mut rx,
             TENANT_A,
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "embeddings".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
@@ -40,7 +41,7 @@ fn vector_search_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "embeddings".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
             query_vector: vec![5.0f32, 0.0, 0.0],
             top_k: 3,
             ef_search: 0,
@@ -64,7 +65,7 @@ fn vector_search_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "embeddings".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
             query_vector: vec![5.0f32, 0.0, 0.0],
             top_k: 3,
             ef_search: 0,

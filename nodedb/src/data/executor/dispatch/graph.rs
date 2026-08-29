@@ -55,7 +55,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::graph::EdgePutParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     src_id,
                     label,
                     dst_id,
@@ -78,7 +78,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::graph::EdgeDeleteParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     src_id,
                     label,
                     dst_id,
@@ -125,7 +125,7 @@ impl CoreLoop {
                 node_id,
                 edge_label,
                 *direction,
-                collection.as_deref(),
+                collection.as_ref().map(|c| c.as_str()),
             ),
 
             GraphOp::NeighborsMulti {
@@ -143,7 +143,7 @@ impl CoreLoop {
                     edge_label,
                     direction: *direction,
                     max_results: *max_results,
-                    collection: collection.as_deref(),
+                    collection: collection.as_ref().map(|c| c.as_str()),
                 },
             ),
 
@@ -203,7 +203,7 @@ impl CoreLoop {
                         task,
                         crate::data::executor::handlers::graph_rag_triple::GraphRagFusionTripleParams {
                             tenant_id: tid,
-                            collection,
+                            collection: collection.as_str(),
                             query_vector,
                             vector_top_k: *vector_top_k,
                             edge_label,
@@ -222,7 +222,7 @@ impl CoreLoop {
                         task,
                         crate::data::executor::handlers::graph_rag::GraphRagFusionParams {
                             tenant_id: tid,
-                            collection,
+                            collection: collection.as_str(),
                             query_vector,
                             vector_top_k: *vector_top_k,
                             edge_label,
@@ -317,7 +317,7 @@ impl CoreLoop {
                     task,
                     super::super::handlers::graph_temporal::TemporalNeighborsParams {
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         node_id,
                         edge_label,
                         direction: *direction,
@@ -360,7 +360,7 @@ impl CoreLoop {
             }
 
             GraphOp::Stats { collection, as_of } => {
-                self.execute_graph_stats(task, tid, collection.as_deref(), *as_of)
+                self.execute_graph_stats(task, tid, collection.as_ref().map(|c| c.as_str()), *as_of)
             }
         }
     }

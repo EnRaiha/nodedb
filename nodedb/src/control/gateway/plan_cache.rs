@@ -262,7 +262,10 @@ mod tests {
 
     fn kv_plan(collection: &str) -> Arc<PhysicalPlan> {
         Arc::new(PhysicalPlan::Kv(KvOp::Get {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             key: vec![],
             rls_filters: vec![],
             surrogate_ceiling: None,

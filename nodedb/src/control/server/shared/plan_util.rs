@@ -156,19 +156,19 @@ pub(crate) fn metered_collections(plan: &PhysicalPlan) -> Vec<String> {
         ..
     }) = plan
     {
-        push_distinct(&mut out, source_collection);
-        push_distinct(&mut out, dest_collection);
+        push_distinct(&mut out, source_collection.as_str());
+        push_distinct(&mut out, dest_collection.as_str());
         return out;
     }
     if let PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) = plan {
         for mutation in mutations {
-            push_distinct(&mut out, mutation.collection());
+            push_distinct(&mut out, mutation.collection().as_str());
         }
         return out;
     }
     if let PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) = plan {
         for mutation in mutations {
-            push_distinct(&mut out, mutation.collection());
+            push_distinct(&mut out, mutation.collection().as_str());
         }
         return out;
     }

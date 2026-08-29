@@ -9,7 +9,7 @@
 //! `precondition` is always raw stored bytes (Binary Tuple or MessagePack).
 //! Swapping the two forms fails silently or never matches — never mix them.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 use super::sum_target::ResolvedSumTarget;
 
@@ -32,7 +32,7 @@ use super::sum_target::ResolvedSumTarget;
 pub enum DocumentResolvedMutation {
     /// Store `value` for `document_id`, replacing whatever is there.
     Put {
-        collection: String,
+        collection: QualifiedCollection,
         /// User-facing primary key, as `RETURNING` and CDC name the row.
         document_id: String,
         /// Catalog-bound identity; the handler hex-encodes it for the row key.
@@ -49,7 +49,7 @@ pub enum DocumentResolvedMutation {
     },
     /// Remove `document_id`.
     Delete {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         surrogate: Surrogate,
         pk_bytes: Vec<u8>,
@@ -62,10 +62,10 @@ pub enum DocumentResolvedMutation {
 
 impl DocumentResolvedMutation {
     /// The collection this one mutation targets.
-    pub fn collection(&self) -> &str {
+    pub fn collection(&self) -> &QualifiedCollection {
         match self {
             DocumentResolvedMutation::Put { collection, .. }
-            | DocumentResolvedMutation::Delete { collection, .. } => collection.as_str(),
+            | DocumentResolvedMutation::Delete { collection, .. } => collection,
         }
     }
 

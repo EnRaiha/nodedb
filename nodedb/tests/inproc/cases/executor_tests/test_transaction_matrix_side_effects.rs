@@ -9,6 +9,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{DocumentOp, MetaOp, PhysicalPlan, TextOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 use super::test_transaction_matrix_helpers::*;
@@ -42,7 +43,7 @@ fn rollback_matrix_fts_side_effect_rolled_back() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "articles".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
                     document_id: "fts_rollback_doc".into(),
                     value: doc_value.as_bytes().to_vec(),
                     surrogate: nodedb_types::Surrogate::new(7001),
@@ -76,7 +77,7 @@ fn rollback_matrix_fts_side_effect_rolled_back() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
             query: "unique_rollback_sentinel".into(),
             top_k: 10,
             fuzzy: false,
@@ -129,7 +130,7 @@ fn rollback_matrix_spatial_not_written_in_tx_path() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "places".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
                     document_id: "geo_rollback_doc".into(),
                     value: geo_doc.as_bytes().to_vec(),
                     surrogate: nodedb_types::Surrogate::new(8001),
@@ -166,7 +167,7 @@ fn rollback_matrix_spatial_not_written_in_tx_path() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Spatial(SpatialOp::Scan {
-            collection: "places".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "location".into(),
             predicate: SpatialPredicate::DWithin,
             query_geometry,

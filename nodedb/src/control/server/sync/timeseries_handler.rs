@@ -107,7 +107,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
         let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             payload: payload_bytes,
             format: "ilp".to_string(),
             wal_lsn,

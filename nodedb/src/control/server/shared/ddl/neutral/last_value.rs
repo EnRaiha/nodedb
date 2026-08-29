@@ -32,7 +32,7 @@ pub async fn query_last_values(
     collection: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let plan = PhysicalPlan::Meta(MetaOp::QueryLastValues {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
     });
 
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
@@ -101,7 +101,7 @@ pub async fn query_last_value(
     series_id: u64,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let plan = PhysicalPlan::Meta(MetaOp::QueryLastValue {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         series_id,
     });
 

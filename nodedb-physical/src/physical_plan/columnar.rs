@@ -9,7 +9,9 @@
 //!
 //! All profiles share the same `ColumnarMemtable` → `SegmentWriter` infrastructure.
 
-use nodedb_types::{RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{
+    QualifiedCollection, RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope,
+};
 
 use crate::physical_plan::document::ReturningSpec;
 
@@ -58,7 +60,7 @@ pub enum ColumnarOp {
     /// Applies filters, projects columns, respects limit.
     /// No time-range semantics — that's `TimeseriesOp::Scan`.
     Scan {
-        collection: String,
+        collection: QualifiedCollection,
         projection: Vec<String>,
         limit: usize,
         filters: Vec<u8>,
@@ -101,7 +103,7 @@ pub enum ColumnarOp {
     /// `UPSERT` / `ON CONFLICT (pk) DO UPDATE` (`Put` — optionally with
     /// per-row merges in `on_conflict_updates`).
     Insert {
-        collection: String,
+        collection: QualifiedCollection,
         /// Row data. Format determined by `format` field.
         payload: Vec<u8>,
         /// "json" for JSON array of objects, "msgpack" for MessagePack,
@@ -168,7 +170,7 @@ pub enum ColumnarOp {
     /// Uses `MutationEngine` for plain/spatial profiles.
     /// `updates` is a list of (field_name, json_value_bytes) pairs.
     Update {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` (MessagePack).
         filters: Vec<u8>,
         /// Field assignments: `(column_name, json_value_bytes)`.
@@ -183,7 +185,7 @@ pub enum ColumnarOp {
     ///
     /// Uses `MutationEngine` for plain/spatial profiles.
     Delete {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` (MessagePack).
         filters: Vec<u8>,
         /// Compiled row-level-security WRITE predicate, evaluated against the
@@ -200,7 +202,7 @@ pub enum ColumnarOp {
     /// live, so this carries the verdict, not a predicate to re-evaluate.
     /// The Data Plane applies exactly these rows and evaluates nothing.
     ResolvedUpdate {
-        collection: String,
+        collection: QualifiedCollection,
         /// (primary key, full post-image) for each row the Control Plane
         /// resolved and the write policy admitted.
         rows: Vec<(nodedb_types::Value, Vec<nodedb_types::Value>)>,
@@ -215,7 +217,7 @@ pub enum ColumnarOp {
     /// so this carries the verdict, not a predicate to re-evaluate. The
     /// Data Plane removes exactly these rows and evaluates nothing.
     ResolvedDelete {
-        collection: String,
+        collection: QualifiedCollection,
         /// Primary key of each row the write policy admitted for removal.
         pks: Vec<nodedb_types::Value>,
         rls_write_check: RlsWriteCheck,
@@ -229,7 +231,7 @@ pub enum ColumnarOp {
     /// because a follower has no writing identity to evaluate a predicate
     /// against.
     ResolveDml {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` — the statement's WHERE clause.
         filters: Vec<u8>,
         /// Field assignments for an UPDATE. Empty for a DELETE.
@@ -245,7 +247,7 @@ pub enum ColumnarOp {
     /// payload. Honors `system_as_of_ms` so the materializer reads source
     /// as-of the clone's `as_of_lsn` for bitemporal collections.
     MaterializeScan {
-        collection: String,
+        collection: QualifiedCollection,
         cursor: Vec<u8>,
         count: usize,
         system_as_of_ms: Option<i64>,

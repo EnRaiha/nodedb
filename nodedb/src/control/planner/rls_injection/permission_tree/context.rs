@@ -53,6 +53,9 @@ pub(super) struct PermCtx<'a> {
     cache: &'a PermissionCache,
     tenant_id: u64,
     auth: &'a AuthContext,
+    /// Database bare op-carried collection names (e.g.
+    /// `AlgoParams.collection`) must be qualified against before a lookup.
+    pub(super) database_id: nodedb_types::DatabaseId,
 }
 
 impl<'a> PermCtx<'a> {
@@ -62,6 +65,7 @@ impl<'a> PermCtx<'a> {
         cache: &'a PermissionCache,
         tenant_id: u64,
         auth: &'a AuthContext,
+        database_id: nodedb_types::DatabaseId,
     ) -> Option<Self> {
         if auth.is_superuser() {
             return None;
@@ -70,6 +74,7 @@ impl<'a> PermCtx<'a> {
             cache,
             tenant_id,
             auth,
+            database_id,
         })
     }
 
@@ -86,11 +91,11 @@ impl<'a> PermCtx<'a> {
     /// as a row outside their subtree is invisible rather than reported.
     pub(super) fn filter_into(
         &self,
-        collection: &str,
+        collection: &nodedb_types::QualifiedCollection,
         level: PermTreeLevel,
         slot: &mut Vec<u8>,
     ) -> crate::Result<()> {
-        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection) else {
+        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection.as_str()) else {
             return Ok(());
         };
         let accessible = self.accessible(def, level);
@@ -121,8 +126,12 @@ impl<'a> PermCtx<'a> {
     /// Per-row restriction is impossible there, so the check is the blanket
     /// one, and a caller with no grant at all is rejected outright rather than
     /// silently writing.
-    pub(super) fn authorize(&self, collection: &str, level: PermTreeLevel) -> crate::Result<()> {
-        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection) else {
+    pub(super) fn authorize(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        level: PermTreeLevel,
+    ) -> crate::Result<()> {
+        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection.as_str()) else {
             return Ok(());
         };
         if self.accessible(def, level).is_empty() {
@@ -142,11 +151,15 @@ impl<'a> PermCtx<'a> {
     /// `why` completes the sentence "…is not supported with this operation:
     /// {why}", so it must state what the result carries instead of filterable
     /// rows and why the subtree filter cannot be evaluated against it.
-    pub(super) fn refuse_if_tree(&self, collection: &str, why: &str) -> crate::Result<()> {
-        if collection.is_empty()
+    pub(super) fn refuse_if_tree(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+        why: &str,
+    ) -> crate::Result<()> {
+        if collection.as_str().is_empty()
             || self
                 .cache
-                .get_tree_def(self.tenant_id, collection)
+                .get_tree_def(self.tenant_id, collection.as_str())
                 .is_none()
         {
             return Ok(());

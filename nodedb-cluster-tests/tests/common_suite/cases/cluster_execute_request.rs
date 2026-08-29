@@ -22,6 +22,7 @@ use nodedb_cluster::rpc_codec::{
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 /// Build an `ExecuteRequest` wrapping a trivial `KvOp::Put`.
 fn make_kv_put_request(
@@ -34,7 +35,7 @@ fn make_kv_put_request(
     let value_bytes = zerompk::to_msgpack_vec(&nodedb_types::Value::String("hello".into()))
         .expect("encode value");
     let plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: collection.into(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, collection),
         key: b"test-key".to_vec(),
         value: value_bytes,
         ttl_ms: 0,
@@ -142,7 +143,10 @@ async fn execute_request_read_carries_watermark_lsn() {
     // Empty descriptor_versions → no descriptor-version validation on the
     // receiver, so the scan reaches the local executor unconditionally.
     let scan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: "watermark_scan_test".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "watermark_scan_test",
+        ),
         limit: 100,
         offset: 0,
         sort_keys: vec![],
@@ -272,7 +276,10 @@ async fn execute_request_cross_node_dispatch() {
             let value_bytes = zerompk::to_msgpack_vec(&nodedb_types::Value::String("v1".into()))
                 .expect("encode value");
             let plan = PhysicalPlan::Kv(KvOp::Put {
-                collection: "cross_node_kv".into(),
+                collection: QualifiedCollection::new(
+                    nodedb_types::id::DatabaseId::DEFAULT,
+                    "cross_node_kv",
+                ),
                 key: b"k1".to_vec(),
                 value: value_bytes,
                 ttl_ms: 0,

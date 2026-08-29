@@ -66,7 +66,7 @@ impl CoreLoop {
                 crate::data::executor::handlers::kv::ttl::KvTtlTarget {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -83,7 +83,7 @@ impl CoreLoop {
                 crate::data::executor::handlers::kv::ttl::KvTtlTarget {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -105,7 +105,7 @@ impl CoreLoop {
                 super::sub_plan_kv_ttl_sorted::TxRegisterSortedIndexParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     index_name,
                     sort_columns,
                     key_column,

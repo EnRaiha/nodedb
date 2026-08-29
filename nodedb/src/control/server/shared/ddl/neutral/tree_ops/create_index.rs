@@ -125,7 +125,7 @@ pub async fn create_graph_index(
 
     // ── Broadcast scan: collect documents from every vshard ──────────
     let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         limit: usize::MAX,
         offset: 0,
         sort_keys: Vec::new(),
@@ -208,7 +208,7 @@ pub async fn create_graph_index(
                     .assign(database_id, tenant_id, &collection, child.as_bytes())
                     .map_err(|e| ddl_err("XX000", e.to_string()))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
-                    collection: collection.to_string(),
+                    collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
                     src_id: parent.to_string(),
                     label: index_name.clone(),
                     dst_id: child.to_string(),

@@ -45,7 +45,7 @@ pub(super) fn serialize_columnar_op(
             rls_filters: _,
         } => {
             let sub_payload = encode_columnar_batch_payload(
-                collection,
+                collection.as_str(),
                 payload,
                 provenance.as_ref(),
                 surrogates,
@@ -72,7 +72,8 @@ pub(super) fn serialize_columnar_op(
             updates,
             rls_write_check: _,
         } => {
-            let sub_payload = encode_columnar_dml_payload(collection, true, filters, updates)?;
+            let sub_payload =
+                encode_columnar_dml_payload(collection.as_str(), true, filters, updates)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,
@@ -84,7 +85,8 @@ pub(super) fn serialize_columnar_op(
             filters,
             rls_write_check: _,
         } => {
-            let sub_payload = encode_columnar_dml_payload(collection, false, filters, &[])?;
+            let sub_payload =
+                encode_columnar_dml_payload(collection.as_str(), false, filters, &[])?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,
@@ -99,7 +101,8 @@ pub(super) fn serialize_columnar_op(
             rows,
             rls_write_check: _,
         } => {
-            let sub_payload = encode_columnar_resolved_dml_payload(collection, true, rows, &[])?;
+            let sub_payload =
+                encode_columnar_resolved_dml_payload(collection.as_str(), true, rows, &[])?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,
@@ -111,7 +114,8 @@ pub(super) fn serialize_columnar_op(
             pks,
             rls_write_check: _,
         } => {
-            let sub_payload = encode_columnar_resolved_dml_payload(collection, false, &[], pks)?;
+            let sub_payload =
+                encode_columnar_resolved_dml_payload(collection.as_str(), false, &[], pks)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,
@@ -142,7 +146,7 @@ pub(super) fn serialize_timeseries_op(
             rls_filters: _,
         } => {
             let sub_payload = encode_timeseries_batch_payload_with_format(
-                collection,
+                collection.as_str(),
                 payload,
                 provenance.as_ref(),
                 format,

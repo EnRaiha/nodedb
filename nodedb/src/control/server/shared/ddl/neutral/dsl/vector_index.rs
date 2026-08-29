@@ -161,7 +161,7 @@ pub async fn create_vector_index(
 
     let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
     let set_params_plan = PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         field_name: field_name.clone(),
         dim: params.dim,
         m: params.m,

@@ -26,7 +26,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         } => kv::put(
-            collection,
+            collection.as_str(),
             key,
             value,
             *ttl_ms,
@@ -43,7 +43,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             keys,
             // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
             rls_write_check: _,
-        } => kv::delete(collection, keys),
+        } => kv::delete(collection.as_str(), keys),
         KvOp::Insert {
             collection,
             key,
@@ -53,7 +53,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         } => kv::insert(
-            collection,
+            collection.as_str(),
             key,
             value,
             *ttl_ms,
@@ -72,7 +72,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         } => kv::insert_if_absent(
-            collection,
+            collection.as_str(),
             key,
             value,
             *ttl_ms,
@@ -94,7 +94,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         } => kv::insert_on_conflict_update(
-            collection,
+            collection.as_str(),
             key,
             value,
             *ttl_ms,
@@ -113,7 +113,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         } => kv::batch_put(
-            collection,
+            collection.as_str(),
             entries,
             *ttl_ms,
             surrogates,
@@ -128,13 +128,13 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             key,
             ttl_ms,
             rls_write_check: _,
-        } => kv::expire(collection, key, *ttl_ms),
+        } => kv::expire(collection.as_str(), key, *ttl_ms),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::Persist {
             collection,
             key,
             rls_write_check: _,
-        } => kv::persist(collection, key),
+        } => kv::persist(collection.as_str(), key),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::Incr {
             collection,
@@ -143,7 +143,13 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             ttl_ms,
             surrogate,
             rls_write_check: _,
-        } => kv::incr(collection, key, *delta, *ttl_ms, surrogate.as_u32()),
+        } => kv::incr(
+            collection.as_str(),
+            key,
+            *delta,
+            *ttl_ms,
+            surrogate.as_u32(),
+        ),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::IncrFloat {
             collection,
@@ -151,7 +157,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             delta,
             surrogate,
             rls_write_check: _,
-        } => kv::incr_float(collection, key, *delta, surrogate.as_u32()),
+        } => kv::incr_float(collection.as_str(), key, *delta, surrogate.as_u32()),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::Cas {
             collection,
@@ -160,7 +166,13 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             new_value,
             surrogate,
             rls_write_check: _,
-        } => kv::cas(collection, key, expected, new_value, surrogate.as_u32()),
+        } => kv::cas(
+            collection.as_str(),
+            key,
+            expected,
+            new_value,
+            surrogate.as_u32(),
+        ),
         KvOp::GetSet {
             collection,
             key,
@@ -169,7 +181,13 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             rls_filters,
             // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
             rls_write_check: _,
-        } => kv::get_set(collection, key, new_value, surrogate.as_u32(), rls_filters),
+        } => kv::get_set(
+            collection.as_str(),
+            key,
+            new_value,
+            surrogate.as_u32(),
+            rls_filters,
+        ),
         KvOp::RegisterSortedIndex {
             collection,
             index_name,
@@ -180,7 +198,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             window_start_ms,
             window_end_ms,
         } => kv::register_sorted_index(kv::RegisterSortedIndexFields {
-            collection,
+            collection: collection.as_str(),
             index_name,
             sort_columns,
             key_column,
@@ -195,8 +213,8 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             field,
             field_position,
             backfill,
-        } => kv::register_index(collection, field, *field_position, *backfill),
-        KvOp::DropIndex { collection, field } => kv::drop_index(collection, field),
+        } => kv::register_index(collection.as_str(), field, *field_position, *backfill),
+        KvOp::DropIndex { collection, field } => kv::drop_index(collection.as_str(), field),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::FieldSet {
             collection,
@@ -204,7 +222,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             updates,
             surrogate,
             rls_write_check: _,
-        } => kv::field_set(collection, key, updates, surrogate.as_u32()),
+        } => kv::field_set(collection.as_str(), key, updates, surrogate.as_u32()),
         // A follower has no writing identity; decode stamps `already_decided_elsewhere()`.
         KvOp::Transfer {
             collection,
@@ -216,7 +234,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             credit_surrogate,
             rls_write_check: _,
         } => kv::transfer(
-            collection,
+            collection.as_str(),
             source_key,
             dest_key,
             field,
@@ -234,14 +252,14 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             source_rls_write_check: _,
             dest_rls_write_check: _,
         } => kv::transfer_item(
-            source_collection,
-            dest_collection,
+            source_collection.as_str(),
+            dest_collection.as_str(),
             item_key,
             dest_key,
             surrogate.as_u32(),
         ),
 
-        KvOp::Truncate { collection } => kv::truncate(collection),
+        KvOp::Truncate { collection } => kv::truncate(collection.as_str()),
 
         // Verdict is already on the plan (`RlsWriteCheck::DecidedEarlierInRequest`),
         // so no predicate to drop here.
@@ -260,16 +278,16 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             updates,
             rls_write_check,
         } => {
-            refuse_governed_predicate_dml(collection, rls_write_check)?;
-            kv::predicate_update(collection, filters, updates)
+            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
+            kv::predicate_update(collection.as_str(), filters, updates)
         }
         KvOp::PredicateDelete {
             collection,
             filters,
             rls_write_check,
         } => {
-            refuse_governed_predicate_dml(collection, rls_write_check)?;
-            kv::predicate_delete(collection, filters)
+            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
+            kv::predicate_delete(collection.as_str(), filters)
         }
 
         // Not a write — reads/scans/sorted-index queries. `ResolveWrite` mutates

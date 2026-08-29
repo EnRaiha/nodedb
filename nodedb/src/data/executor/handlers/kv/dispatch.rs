@@ -27,7 +27,7 @@ impl CoreLoop {
                 super::crud::KvGetParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_filters,
                     surrogate_ceiling: *surrogate_ceiling,
@@ -46,7 +46,7 @@ impl CoreLoop {
                 super::crud::KvWriteParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     value,
                     ttl_ms: *ttl_ms,
@@ -68,7 +68,7 @@ impl CoreLoop {
                 super::crud::KvWriteParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     value,
                     ttl_ms: *ttl_ms,
@@ -90,7 +90,7 @@ impl CoreLoop {
                 super::crud::KvWriteParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     value,
                     ttl_ms: *ttl_ms,
@@ -114,7 +114,7 @@ impl CoreLoop {
                 super::crud::KvInsertOnConflictUpdateParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     value,
                     ttl_ms: *ttl_ms,
@@ -129,7 +129,7 @@ impl CoreLoop {
                 collection,
                 keys,
                 rls_write_check,
-            } => self.execute_kv_delete(task, did, tid, collection, keys, rls_write_check),
+            } => self.execute_kv_delete(task, did, tid, collection.as_str(), keys, rls_write_check),
             KvOp::Scan {
                 collection,
                 cursor,
@@ -143,7 +143,7 @@ impl CoreLoop {
                 super::scan::KvScanHandlerParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     cursor,
                     count: *count,
                     match_pattern: match_pattern.as_deref(),
@@ -162,7 +162,7 @@ impl CoreLoop {
                 super::ttl::KvTtlTarget {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -177,7 +177,7 @@ impl CoreLoop {
                 super::ttl::KvTtlTarget {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -186,7 +186,7 @@ impl CoreLoop {
                 collection,
                 keys,
                 rls_filters,
-            } => self.execute_kv_batch_get(task, did, tid, collection, keys, rls_filters),
+            } => self.execute_kv_batch_get(task, did, tid, collection.as_str(), keys, rls_filters),
             KvOp::BatchPut {
                 collection,
                 entries,
@@ -199,7 +199,7 @@ impl CoreLoop {
                 super::batch::KvBatchPutArgs {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     entries,
                     ttl_ms: *ttl_ms,
                     surrogates,
@@ -217,14 +217,14 @@ impl CoreLoop {
                 super::index::KvRegisterIndexParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field,
                     field_position: *field_position,
                     backfill: *backfill,
                 },
             ),
             KvOp::DropIndex { collection, field } => {
-                self.execute_kv_drop_index(task, did, tid, collection, field)
+                self.execute_kv_drop_index(task, did, tid, collection.as_str(), field)
             }
             KvOp::FieldGet {
                 collection,
@@ -236,7 +236,7 @@ impl CoreLoop {
                 super::field::KvFieldGetArgs {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     fields,
                     rls_filters,
@@ -253,7 +253,7 @@ impl CoreLoop {
                     task,
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     surrogate: *surrogate,
                     rls_write_check,
@@ -261,9 +261,11 @@ impl CoreLoop {
                 updates,
             ),
             KvOp::GetTtl { collection, key } => {
-                self.execute_kv_get_ttl(task, did, tid, collection, key)
+                self.execute_kv_get_ttl(task, did, tid, collection.as_str(), key)
             }
-            KvOp::Truncate { collection } => self.execute_kv_truncate(task, did, tid, collection),
+            KvOp::Truncate { collection } => {
+                self.execute_kv_truncate(task, did, tid, collection.as_str())
+            }
             KvOp::Incr {
                 collection,
                 key,
@@ -276,7 +278,7 @@ impl CoreLoop {
                     task,
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     surrogate: *surrogate,
                     rls_write_check,
@@ -295,7 +297,7 @@ impl CoreLoop {
                     task,
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     surrogate: *surrogate,
                     rls_write_check,
@@ -314,7 +316,7 @@ impl CoreLoop {
                     task,
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     surrogate: *surrogate,
                     rls_write_check,
@@ -334,7 +336,7 @@ impl CoreLoop {
                     task,
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     surrogate: *surrogate,
                     rls_write_check,
@@ -356,7 +358,7 @@ impl CoreLoop {
                 super::sorted::KvRegisterSortedIndexParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     index_name,
                     sort_columns,
                     key_column,
@@ -411,7 +413,7 @@ impl CoreLoop {
                 super::transfer::TransferParams {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     source_key,
                     dest_key,
                     field,
@@ -434,8 +436,8 @@ impl CoreLoop {
                 super::transfer::TransferItemParams {
                     did,
                     tid,
-                    source_collection,
-                    dest_collection,
+                    source_collection: source_collection.as_str(),
+                    dest_collection: dest_collection.as_str(),
                     item_key,
                     dest_key,
                     surrogate: *surrogate,
@@ -447,7 +449,14 @@ impl CoreLoop {
                 collection,
                 cursor,
                 count,
-            } => self.execute_kv_materialize_scan(task, did, tid, collection, cursor, *count),
+            } => self.execute_kv_materialize_scan(
+                task,
+                did,
+                tid,
+                collection.as_str(),
+                cursor,
+                *count,
+            ),
             KvOp::PredicateUpdate {
                 collection,
                 filters,
@@ -458,7 +467,7 @@ impl CoreLoop {
                 super::predicate::KvPredicateCtx {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     filters,
                     rls_write_check,
                 },
@@ -473,7 +482,7 @@ impl CoreLoop {
                 super::predicate::KvPredicateCtx {
                     did,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     filters,
                     rls_write_check,
                 },

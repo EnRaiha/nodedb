@@ -121,7 +121,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Vector(VectorOp::Insert {
-            collection: params.collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &params.collection),
             vector: params.vector,
             dim: params.dim,
             field_name: params.field_name,
@@ -182,7 +182,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             surrogate,
             field_name,
             provenance: Some(prov),

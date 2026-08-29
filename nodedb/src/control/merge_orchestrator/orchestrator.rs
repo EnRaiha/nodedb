@@ -90,8 +90,8 @@ pub async fn run_authorized_merge(
         MergeArgs {
             tenant_id: task.tenant_id,
             database_id: task.database_id,
-            target_collection: &target_collection,
-            source_collection: &source_collection,
+            target_collection: target_collection.as_str(),
+            source_collection: source_collection.as_str(),
             source_alias: &source_alias,
             target_join_col: &target_join_col,
             source_join_col: &source_join_col,
@@ -249,8 +249,12 @@ fn merge_plan(
     resolved_sum_targets: Vec<nodedb_physical::physical_plan::ResolvedSumTarget>,
 ) -> PhysicalPlan {
     let merge = DocumentOp::Merge {
-        target_collection: args.target_collection.to_string(),
-        source_collection: args.source_collection.to_string(),
+        target_collection: nodedb_types::QualifiedCollection::from_stored(
+            args.target_collection.to_string(),
+        ),
+        source_collection: nodedb_types::QualifiedCollection::from_stored(
+            args.source_collection.to_string(),
+        ),
         source_alias: args.source_alias.to_string(),
         target_join_col: args.target_join_col.to_string(),
         source_join_col: args.source_join_col.to_string(),

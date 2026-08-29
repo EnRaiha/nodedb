@@ -298,6 +298,7 @@ fn primary_vshard(plan: &PhysicalPlan, database_id: DatabaseId) -> u32 {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
+    use nodedb_types::QualifiedCollection;
 
     fn single_node_table() -> RoutingTable {
         RoutingTable::uniform(1, &[1], 1)
@@ -313,7 +314,7 @@ mod tests {
     fn single_node_routes_locally() {
         let table = single_node_table();
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "users".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             key: vec![],
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -334,7 +335,7 @@ mod tests {
     #[test]
     fn no_routing_table_routes_locally() {
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "x".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             key: vec![],
             value: vec![],
             ttl_ms: 0,
@@ -366,7 +367,7 @@ mod tests {
         // Find one by brute force.
         let collection = find_collection_for_vshard(0);
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection,
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             key: vec![],
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -391,7 +392,7 @@ mod tests {
     fn single_homed_gather_routes_to_one_vshard() {
         let table = two_node_table();
         let scan = PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "events".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "events"),
             limit: 100,
             offset: 0,
             sort_keys: vec![],

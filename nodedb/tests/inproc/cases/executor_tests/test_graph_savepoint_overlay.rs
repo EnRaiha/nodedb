@@ -49,7 +49,10 @@ fn send_txn(
 fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             src_id: src.into(),
             label: label.into(),
             dst_id: dst.into(),
@@ -63,7 +66,10 @@ fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> Physic
 fn stage_edge_delete(collection: &str, src: &str, label: &str, dst: &str) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             src_id: src.into(),
             label: label.into(),
             dst_id: dst.into(),
@@ -185,7 +191,10 @@ fn rollback_to_savepoint_restores_cross_set_cleared_tombstone() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "g".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "g",
+            ),
             src_id: "x".into(),
             label: "knows".into(),
             dst_id: "y".into(),
@@ -269,7 +278,10 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
@@ -295,7 +307,10 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         txn_id,
         PhysicalPlan::Meta(MetaOp::StageWrite {
             plan: Box::new(PhysicalPlan::Kv(KvOp::Expire {
-                collection: "c".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "c",
+                ),
                 key: b"k".to_vec(),
                 ttl_ms: 60_000,
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -335,7 +350,10 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         txn_id,
         PhysicalPlan::Meta(MetaOp::StageWrite {
             plan: Box::new(PhysicalPlan::Kv(KvOp::Persist {
-                collection: "c".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "c",
+                ),
                 key: b"k".to_vec(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             })),
@@ -372,7 +390,10 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );

@@ -14,6 +14,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_recursive_scan(
     p: RecursiveScanParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(p.database_id, p.collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(p.database_id, p.collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(p.database_id, collection);
     Ok(vec![PhysicalTask {
@@ -21,7 +22,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_recursive_scan(
         vshard_id: vshard,
         database_id: p.database_id,
         plan: PhysicalPlan::Query(QueryOp::RecursiveScan {
-            collection: collection.into(),
+            collection: qualified_collection,
             base_filters: serialize_filters(p.base_filters)?,
             recursive_filters: serialize_filters(p.recursive_filters)?,
             join_link: p.join_link.clone(),

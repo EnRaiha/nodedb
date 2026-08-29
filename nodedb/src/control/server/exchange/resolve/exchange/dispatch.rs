@@ -120,8 +120,8 @@ pub(super) async fn resolve_exchange(
                 ctx,
                 captures,
                 HashJoinFields {
-                    left_collection,
-                    right_collection,
+                    left_collection: left_collection.to_string(),
+                    right_collection: right_collection.to_string(),
                     left_alias,
                     right_alias,
                     on,

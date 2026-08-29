@@ -160,7 +160,7 @@ mod tests {
     use crate::data::executor::task::ExecutionTask;
     use crate::types::*;
     use nodedb_physical::physical_plan::VectorOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     fn make_core() -> (
         CoreLoop,
@@ -214,7 +214,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "test".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "test"),
                 vector: vec![0.1],
                 dim: 1,
                 field_name: "emb".into(),
@@ -402,7 +402,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "t".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
                 vector: vec![0.5],
                 dim: 1,
                 field_name: "emb".into(),
@@ -448,7 +448,7 @@ mod tests {
                 database_id: DatabaseId::DEFAULT,
                 vshard_id: VShardId::new(0),
                 plan: PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "t".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
                     vector: vec![0.5],
                     dim: 1,
                     field_name: "emb".into(),

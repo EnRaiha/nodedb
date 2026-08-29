@@ -72,7 +72,7 @@ use crate::control::server::shared::session::read_set::{
     EngineTag, ReadKey, ReadOrigin, ReadSetEntry,
 };
 use crate::engine::document::store::surrogate_to_doc_id;
-use crate::query::{db_qualified, sum_target_is_co_resident, sum_target_vshard};
+use crate::query::{sum_target_is_co_resident, sum_target_vshard};
 use crate::types::{DatabaseId, KeyRepr, Lsn, TenantId};
 
 /// One source write's plan-time images, ready to settle.
@@ -227,7 +227,10 @@ pub(super) fn balance_task(spec: BalanceTaskSpec<'_>) -> PhysicalTask {
         vshard_id: sum_target_vshard(spec.database_id, &spec.binding.target_collection),
         database_id: spec.database_id,
         plan: PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
-            collection: db_qualified(spec.database_id, &spec.binding.target_collection),
+            collection: nodedb_types::QualifiedCollection::new(
+                spec.database_id,
+                &spec.binding.target_collection,
+            ),
             document_id: surrogate_to_doc_id(spec.surrogate),
             surrogate: spec.surrogate,
             column: spec.binding.target_column.clone(),

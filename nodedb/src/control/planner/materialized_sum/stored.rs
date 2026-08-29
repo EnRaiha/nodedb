@@ -315,6 +315,7 @@ fn decode_body(body: &[u8]) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_types::QualifiedCollection;
 
     const ROW: Surrogate = Surrogate(77);
 
@@ -331,7 +332,7 @@ mod tests {
 
     fn point_delete() -> DocumentOp {
         DocumentOp::PointDelete {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             surrogate: ROW,
             pk_bytes: b"e1".to_vec(),
@@ -344,7 +345,7 @@ mod tests {
 
     fn point_update() -> DocumentOp {
         DocumentOp::PointUpdate {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             surrogate: ROW,
             pk_bytes: b"e1".to_vec(),
@@ -358,7 +359,7 @@ mod tests {
 
     fn point_put() -> DocumentOp {
         DocumentOp::PointPut {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             value: Vec::new(),
             surrogate: ROW,
@@ -371,7 +372,7 @@ mod tests {
 
     fn upsert() -> DocumentOp {
         DocumentOp::Upsert {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             value: Vec::new(),
             on_conflict_updates: assignments(),
@@ -385,7 +386,7 @@ mod tests {
 
     fn point_insert() -> DocumentOp {
         DocumentOp::PointInsert {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             value: Vec::new(),
             if_absent: false,
@@ -458,7 +459,7 @@ mod tests {
 
     fn upsert_with(value: Vec<u8>, on_conflict_updates: Vec<(String, UpdateValue)>) -> DocumentOp {
         DocumentOp::Upsert {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             value,
             on_conflict_updates,
@@ -574,7 +575,7 @@ mod tests {
     #[test]
     fn a_put_onto_an_existing_row_folds_the_body_wholesale() {
         let op = DocumentOp::PointPut {
-            collection: "entries".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
             value: body("acc-1", 60),
             surrogate: ROW,

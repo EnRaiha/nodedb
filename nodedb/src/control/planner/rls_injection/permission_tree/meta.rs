@@ -26,9 +26,10 @@ pub(super) fn apply_meta(ctx: &PermCtx<'_>, op: &mut MetaOp) -> crate::Result<()
 
         // Refuse: a byte-size estimate is derived from every stored row of the
         // collection, including the ones outside the subtree, and carries no
-        // resource column to filter on.
+        // resource column to filter on. `name` is a bare collection name —
+        // qualify it against this task's database before the tree lookup.
         MetaOp::QueryCollectionSize { name, .. } => ctx.refuse_if_tree(
-            name,
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, name),
             "the size estimate is derived from every stored row, which the subtree filter cannot \
              be evaluated against",
         ),
@@ -117,7 +118,10 @@ mod tests {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Meta(MetaOp::TransactionBatch {
             plans: vec![PhysicalPlan::Document(DocumentOp::IndexLookup {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 path: "$.email".into(),
                 value: "a@b.c".into(),
             })],

@@ -211,12 +211,14 @@ impl NodeDbPgHandler {
             ) || info.needs_existence_probe)
         {
             let doc_id = info.document_id.as_deref().unwrap_or("");
+            // `info.collection` is already qualified (from `DocumentOp`) —
+            // rebuild rather than re-qualify.
             let row = crate::control::trigger::dml_hook::fetch_old_row(
                 &self.state,
                 identity,
                 database_id,
                 auth,
-                &info.collection,
+                &nodedb_types::QualifiedCollection::from_stored(info.collection.clone()),
                 doc_id,
             )
             .await
@@ -294,7 +296,7 @@ impl NodeDbPgHandler {
                 },
             ) = &task.plan
             {
-                Some(collection.clone())
+                Some(collection.to_string())
             } else {
                 None
             };

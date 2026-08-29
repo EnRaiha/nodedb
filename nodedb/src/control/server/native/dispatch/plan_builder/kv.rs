@@ -2,20 +2,25 @@
 
 //! KV engine plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::KvOp;
 
-pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_scan(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let cursor = fields.cursor.clone().unwrap_or_default();
     let count = fields.limit.unwrap_or(100) as usize;
     let filters = fields.filters.clone().unwrap_or_default();
     let match_pattern = fields.match_pattern.clone();
 
     Ok(PhysicalPlan::Kv(KvOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         cursor,
         count,
         filters,
@@ -25,7 +30,11 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
     }))
 }
 
-pub(crate) fn build_expire(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_expire(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let key = require_key_bytes(fields)?;
     let ttl_ms = fields.ttl_ms.ok_or_else(|| crate::Error::BadRequest {
         detail: "missing 'ttl_ms'".to_string(),
@@ -34,33 +43,42 @@ pub(crate) fn build_expire(fields: &TextFields, collection: &str) -> crate::Resu
     // Every RLS slot below is left empty here and filled by the injection pass
     // this dispatch path runs before the plan reaches the Data Plane.
     Ok(PhysicalPlan::Kv(KvOp::Expire {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key,
         ttl_ms,
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     }))
 }
 
-pub(crate) fn build_persist(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_persist(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let key = require_key_bytes(fields)?;
 
     Ok(PhysicalPlan::Kv(KvOp::Persist {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key,
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     }))
 }
 
-pub(crate) fn build_get_ttl(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_get_ttl(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let key = require_key_bytes(fields)?;
 
     Ok(PhysicalPlan::Kv(KvOp::GetTtl {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key,
     }))
 }
 
 pub(crate) fn build_batch_get(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -78,7 +96,7 @@ pub(crate) fn build_batch_get(
     }
 
     Ok(PhysicalPlan::Kv(KvOp::BatchGet {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         keys,
         rls_filters: Vec::new(),
     }))
@@ -114,7 +132,7 @@ pub(crate) fn build_batch_put(
         .collect::<crate::Result<Vec<_>>>()?;
 
     Ok(PhysicalPlan::Kv(KvOp::BatchPut {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         entries,
         ttl_ms,
         surrogates,
@@ -124,6 +142,7 @@ pub(crate) fn build_batch_put(
 }
 
 pub(crate) fn build_field_get(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -137,7 +156,7 @@ pub(crate) fn build_field_get(
         .clone();
 
     Ok(PhysicalPlan::Kv(KvOp::FieldGet {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key,
         fields: field_names,
         rls_filters: Vec::new(),
@@ -160,7 +179,7 @@ pub(crate) fn build_field_set(
     let surrogate = assign_kv_surrogate(ctx, collection, &key)?;
 
     Ok(PhysicalPlan::Kv(KvOp::FieldSet {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key,
         updates,
         surrogate,
@@ -182,6 +201,7 @@ fn require_key_bytes(fields: &TextFields) -> crate::Result<Vec<u8>> {
 }
 
 pub(crate) fn build_register_index(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -196,7 +216,7 @@ pub(crate) fn build_register_index(
     let backfill = fields.backfill.unwrap_or(true);
 
     Ok(PhysicalPlan::Kv(KvOp::RegisterIndex {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
         field_position,
         backfill,
@@ -204,6 +224,7 @@ pub(crate) fn build_register_index(
 }
 
 pub(crate) fn build_drop_index(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -216,14 +237,17 @@ pub(crate) fn build_drop_index(
         .clone();
 
     Ok(PhysicalPlan::Kv(KvOp::DropIndex {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
     }))
 }
 
-pub(crate) fn build_truncate(collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_truncate(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     Ok(PhysicalPlan::Kv(KvOp::Truncate {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
     }))
 }
 
@@ -256,7 +280,7 @@ pub(crate) fn build_incr(
     let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::Incr {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key: key.as_bytes().to_vec(),
         delta,
         ttl_ms,
@@ -280,7 +304,7 @@ pub(crate) fn build_incr_float(
     let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key: key.as_bytes().to_vec(),
         delta,
         surrogate,
@@ -309,7 +333,7 @@ pub(crate) fn build_cas(
     let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::Cas {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key: key.as_bytes().to_vec(),
         expected,
         new_value,
@@ -338,7 +362,7 @@ pub(crate) fn build_getset(
     let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::GetSet {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         key: key.as_bytes().to_vec(),
         new_value,
         surrogate,
@@ -348,6 +372,7 @@ pub(crate) fn build_getset(
 }
 
 pub(crate) fn build_register_sorted_index(
+    ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
 ) -> crate::Result<PhysicalPlan> {
@@ -365,7 +390,7 @@ pub(crate) fn build_register_sorted_index(
     let window_end_ms = fields.window_end_ms.unwrap_or(0);
 
     Ok(PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         index_name: index_name.to_string(),
         sort_columns,
         key_column,

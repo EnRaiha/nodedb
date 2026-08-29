@@ -31,7 +31,10 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate,
@@ -57,7 +60,10 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             input: None,
             group_by: vec![GroupKeySpec::column("department")],
             aggregates: vec![
@@ -105,7 +111,10 @@ fn grouped_count_plan(user_alias: &str) -> PhysicalPlan {
 
 fn computed_group_count_plan(function: &str) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::Aggregate {
-        collection: "cache_alias_users".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "cache_alias_users",
+        ),
         input: None,
         group_by: vec![GroupKeySpec {
             output_name: "group_0".into(),
@@ -138,7 +147,10 @@ fn grouped_count_shape_plan(
     sort_keys: Vec<nodedb_physical::physical_plan::SortKeySpec>,
 ) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::Aggregate {
-        collection: "cache_alias_users".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "cache_alias_users",
+        ),
         input: None,
         group_by: vec![GroupKeySpec::column("department")],
         aggregates: vec![AggregateSpec {
@@ -173,7 +185,10 @@ fn aggregate_cache_separates_user_facing_output_aliases() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "cache_alias_users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "cache_alias_users",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -225,7 +240,10 @@ fn aggregate_cache_separates_computed_group_expressions() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "cache_alias_users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "cache_alias_users",
+                ),
                 document_id: id,
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -273,7 +291,10 @@ fn aggregate_cache_separates_limit_and_sort_shape() {
                 &mut ctx.tx,
                 &mut ctx.rx,
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "cache_alias_users".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "cache_alias_users",
+                    ),
                     document_id: id,
                     value: doc,
                     surrogate: nodedb_types::Surrogate::new(surrogate),

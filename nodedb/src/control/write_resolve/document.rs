@@ -87,7 +87,7 @@ pub(super) fn resolver_for_document_op(op: &DocumentOp) -> Option<Box<dyn Engine
         | DocumentOp::ApplyBalanceDelta { .. } => return None,
     };
     Some(Box::new(DocumentWriteResolver {
-        collection: collection.clone(),
+        collection: collection.as_str().to_owned(),
         op: op.clone(),
     }))
 }

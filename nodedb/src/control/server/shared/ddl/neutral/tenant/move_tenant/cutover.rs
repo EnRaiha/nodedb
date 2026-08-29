@@ -124,8 +124,8 @@ async fn dispatch_rename_ops(
             tenant_id: coll.tenant_id,
             old_database_id: source_db_id.as_u64(),
             new_database_id: target_db_id.as_u64(),
-            old_collection: old_collection.clone(),
-            new_collection: new_collection.clone(),
+            old_collection: nodedb_types::QualifiedCollection::from_stored(old_collection.clone()),
+            new_collection: nodedb_types::QualifiedCollection::from_stored(new_collection.clone()),
         });
 
         // Route to the destination database: cutover materializes the

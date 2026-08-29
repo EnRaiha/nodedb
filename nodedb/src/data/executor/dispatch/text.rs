@@ -26,7 +26,7 @@ impl CoreLoop {
                 task,
                 TextSearchParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     query,
                     top_k: *top_k,
                     fuzzy: *fuzzy,
@@ -40,16 +40,28 @@ impl CoreLoop {
                 query,
                 score_alias,
                 fuzzy,
-            } => self.execute_bm25_score_scan(task, tid, collection, query, score_alias, *fuzzy),
+            } => self.execute_bm25_score_scan(
+                task,
+                tid,
+                collection.as_str(),
+                query,
+                score_alias,
+                *fuzzy,
+            ),
 
             TextOp::PhraseSearch {
                 collection,
                 terms,
                 top_k,
                 prefilter,
-            } => {
-                self.execute_phrase_search(task, tid, collection, terms, *top_k, prefilter.as_ref())
-            }
+            } => self.execute_phrase_search(
+                task,
+                tid,
+                collection.as_str(),
+                terms,
+                *top_k,
+                prefilter.as_ref(),
+            ),
 
             TextOp::HybridSearch {
                 collection,
@@ -66,7 +78,7 @@ impl CoreLoop {
                 task,
                 HybridSearchParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     query_vector,
                     query_text,
                     top_k: *top_k,
@@ -87,7 +99,7 @@ impl CoreLoop {
             } => self.execute_fts_index_doc(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 *surrogate,
                 text,
                 provenance.as_ref(),
@@ -97,9 +109,13 @@ impl CoreLoop {
                 collection,
                 surrogate,
                 provenance,
-            } => {
-                self.execute_fts_delete_doc(task, tid, collection, *surrogate, provenance.as_ref())
-            }
+            } => self.execute_fts_delete_doc(
+                task,
+                tid,
+                collection.as_str(),
+                *surrogate,
+                provenance.as_ref(),
+            ),
 
             TextOp::HybridSearchTriple {
                 collection,
@@ -119,7 +135,7 @@ impl CoreLoop {
                 task,
                 HybridSearchTripleParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     query_vector,
                     query_text,
                     graph_seed_id,
@@ -142,7 +158,7 @@ impl CoreLoop {
             } => self.execute_set_text_config(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 analyzer_name.as_deref(),
                 *fuzzy_default,
             ),

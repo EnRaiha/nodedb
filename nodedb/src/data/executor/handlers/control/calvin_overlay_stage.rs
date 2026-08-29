@@ -63,7 +63,14 @@ impl CoreLoop {
                 surrogate,
                 ..
             }) => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx = StageCtx::new(
+                    task,
+                    tid,
+                    txn_id,
+                    collection.as_str(),
+                    document_id,
+                    *surrogate,
+                );
                 let resp = self.stage_point_insert(&ctx, value, *if_absent);
                 Self::stage_result(&resp)
             }
@@ -74,7 +81,14 @@ impl CoreLoop {
                 surrogate,
                 ..
             }) => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx = StageCtx::new(
+                    task,
+                    tid,
+                    txn_id,
+                    collection.as_str(),
+                    document_id,
+                    *surrogate,
+                );
                 let resp = self.stage_point_put(&ctx, value);
                 Self::stage_result(&resp)
             }
@@ -85,7 +99,14 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             }) => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx = StageCtx::new(
+                    task,
+                    tid,
+                    txn_id,
+                    collection.as_str(),
+                    document_id,
+                    *surrogate,
+                );
                 let resp = self.stage_point_delete(&ctx, rls_write_check);
                 Self::stage_result(&resp)
             }
@@ -97,7 +118,14 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             }) => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx = StageCtx::new(
+                    task,
+                    tid,
+                    txn_id,
+                    collection.as_str(),
+                    document_id,
+                    *surrogate,
+                );
                 let resp = self.stage_point_update(&ctx, updates, rls_write_check);
                 Self::stage_result(&resp)
             }
@@ -110,7 +138,14 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             }) => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx = StageCtx::new(
+                    task,
+                    tid,
+                    txn_id,
+                    collection.as_str(),
+                    document_id,
+                    *surrogate,
+                );
                 let resp =
                     self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check);
                 Self::stage_result(&resp)
@@ -125,7 +160,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection.as_str(),
                     ollp_predicted_surrogates.as_deref(),
                     rls_write_check,
                 )
@@ -141,7 +176,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     updates,
                     ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
                     rls_write_check,
@@ -163,7 +198,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     payload,
                     format,
                     surrogates,

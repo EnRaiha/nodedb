@@ -141,7 +141,7 @@ pub async fn tree_sum(
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             let mut get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
-                    collection: coll_name.clone(),
+                    collection: nodedb_types::QualifiedCollection::new(database_id, coll_name),
                     document_id: node_id.clone(),
                     surrogate,
                     pk_bytes,

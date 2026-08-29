@@ -16,6 +16,7 @@ use nodedb::event::cross_shard::types::CrossShardWriteRequest;
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 use std::sync::Arc;
 
 /// Decide + encode in one call: `to_replicated_entry` takes a decided
@@ -40,7 +41,7 @@ fn async_trigger_not_in_raft_log() {
     // The Raft log entry contains only the original DML (PointPut, etc.).
     // Trigger side effects are separate Event Plane dispatches.
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "doc-1".into(),
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -92,7 +93,7 @@ fn cross_shard_request_carries_cascade_depth() {
         source_lsn: 100,
         source_sequence: 1,
         cascade_depth: 3,
-        source_collection: "orders".into(),
+        source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders").to_string(),
     };
     // Cascade depth is preserved across cross-shard delivery.
     assert_eq!(req.cascade_depth, 3);
@@ -136,7 +137,7 @@ fn trigger_definitions_stored_in_catalog() {
         tenant_id: 1,
         database_id: nodedb::types::DatabaseId::DEFAULT,
         name: "cluster_audit".into(),
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders").to_string(),
         timing: TriggerTiming::After,
         events: TriggerEvents {
             on_insert: true,
@@ -204,7 +205,7 @@ fn event_source_preserved_through_write_event() {
 #[test]
 fn replicated_entry_roundtrip_point_delete() {
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "doc-99".into(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -235,7 +236,7 @@ fn replicated_entry_roundtrip_point_delete() {
 fn read_ops_not_replicated() {
     // Reads (PointGet, Scan) should NOT produce replicated entries.
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "doc-1".into(),
         rls_filters: vec![],
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -263,7 +264,7 @@ fn procedure_dml_is_normal_write() {
     // Each DML statement is an independent write that goes through Raft.
     // The procedure itself is NOT replicated — only its data effects.
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "archive".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
         document_id: "a-1".into(),
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,

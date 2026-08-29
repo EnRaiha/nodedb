@@ -21,7 +21,10 @@ use super::helpers::*;
 
 fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: "kv_coll".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "kv_coll",
+        ),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
@@ -33,7 +36,10 @@ fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
 
 fn kv_get(key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Get {
-        collection: "kv_coll".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "kv_coll",
+        ),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -42,7 +48,7 @@ fn kv_get(key: &[u8]) -> PhysicalPlan {
 
 fn doc_put_conflict_seed(coll: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "conflict_doc".into(),
         value: b"seed".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -55,7 +61,7 @@ fn doc_put_conflict_seed(coll: &str) -> PhysicalPlan {
 
 fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "conflict_doc".into(),
         value: b"conflict".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -69,7 +75,7 @@ fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
 
 fn doc_get(coll: &str, doc_id: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: doc_id.into(),
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -178,7 +184,10 @@ fn rollback_matrix_kv_delete_then_doc_fail() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Kv(KvOp::Delete {
-                    collection: "kv_coll".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "kv_coll",
+                    ),
                     keys: vec![b"del_key".to_vec()],
                     rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 }),
@@ -214,7 +223,10 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Kv(KvOp::BatchPut {
-                    collection: "kv_coll".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "kv_coll",
+                    ),
                     entries: vec![
                         (b"k_a".to_vec(), b"a_new".to_vec()),
                         (b"k_b".to_vec(), b"b_new".to_vec()),
@@ -320,7 +332,10 @@ fn rollback_matrix_columnar_then_doc_fail() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
-                    collection: "metrics".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "metrics",
+                    ),
                     payload,
                     format: "msgpack".into(),
                     intent: ColumnarInsertIntent::Insert,
@@ -387,7 +402,10 @@ fn rollback_matrix_columnar_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "metrics2".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics2",
+            ),
             payload: baseline_payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -413,7 +431,10 @@ fn rollback_matrix_columnar_count_after_rollback() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
-                    collection: "metrics2".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "metrics2",
+                    ),
                     payload: extra_payload,
                     format: "msgpack".into(),
                     intent: ColumnarInsertIntent::Insert,
@@ -438,7 +459,10 @@ fn rollback_matrix_columnar_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "metrics2".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics2",
+            ),
             input: None,
             group_by: Vec::new(),
             aggregates: vec![AggregateSpec {
@@ -502,7 +526,10 @@ fn rollback_matrix_timeseries_then_doc_fail() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: "cpu".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "cpu",
+                    ),
                     payload: ilp.as_bytes().to_vec(),
                     format: "ilp".into(),
                     wal_lsn: None,
@@ -536,7 +563,10 @@ fn rollback_matrix_timeseries_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "cpu".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "cpu",
+            ),
             time_range: (0, i64::MAX),
             projection: Vec::new(),
             limit: 100,
@@ -592,7 +622,10 @@ fn rollback_matrix_timeseries_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "temp".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "temp",
+            ),
             payload: baseline_ilp.as_bytes().to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -616,7 +649,10 @@ fn rollback_matrix_timeseries_count_after_rollback() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: "temp".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "temp",
+                    ),
                     payload: extra_ilp.as_bytes().to_vec(),
                     format: "ilp".into(),
                     wal_lsn: None,
@@ -638,7 +674,10 @@ fn rollback_matrix_timeseries_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "temp".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "temp",
+            ),
             time_range: (0, i64::MAX),
             projection: Vec::new(),
             limit: 100,

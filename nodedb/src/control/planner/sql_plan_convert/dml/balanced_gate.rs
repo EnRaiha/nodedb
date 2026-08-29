@@ -96,7 +96,7 @@ pub(in crate::control::planner::sql_plan_convert::dml) fn balanced_batch_task(
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Document(DocumentOp::BatchInsert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, collection),
             documents,
             surrogates,
             // Filled by the passes that own them, exactly as the per-row

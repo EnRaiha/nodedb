@@ -61,7 +61,7 @@ pub(super) struct ResolvedPut<'a> {
 /// Build the `Put` mutation a resolved write applies.
 pub(super) fn put_mutation(put: ResolvedPut<'_>) -> KvResolvedMutation {
     KvResolvedMutation::Put {
-        collection: put.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(put.collection.to_owned()),
         key: put.key.to_vec(),
         value: put.value,
         ttl_ms: put.ttl_ms,
@@ -78,7 +78,7 @@ pub(super) fn delete_mutation(
     precondition: Option<Vec<u8>>,
 ) -> KvResolvedMutation {
     KvResolvedMutation::Delete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         precondition,
     }

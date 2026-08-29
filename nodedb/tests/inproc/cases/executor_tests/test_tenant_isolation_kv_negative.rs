@@ -23,7 +23,10 @@ fn kv_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "cache".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "cache",
+            ),
             key: b"shared_key".to_vec(),
             value: b"tenant_a_value".to_vec(),
             ttl_ms: 0,
@@ -41,7 +44,10 @@ fn kv_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "cache".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "cache",
+            ),
             key: b"shared_key".to_vec(),
             value: b"tenant_b_value".to_vec(),
             ttl_ms: 0,
@@ -59,7 +65,10 @@ fn kv_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "cache".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "cache",
+            ),
             key: b"shared_key".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -88,7 +97,10 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"sess_xyz".to_vec(),
             value: b"secret_token".to_vec(),
             ttl_ms: 0,
@@ -107,7 +119,10 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Kv(KvOp::Delete {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             keys: vec![b"sess_xyz".to_vec()],
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         }),
@@ -128,7 +143,10 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"sess_xyz".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

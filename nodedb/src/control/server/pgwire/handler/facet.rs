@@ -51,7 +51,7 @@ pub(super) async fn execute_facet_counts_sql(
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: parsed.collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &parsed.collection),
             filters: filter_bytes,
             fields: parsed.fields,
             limit_per_facet: parsed.limit_per_facet,
@@ -114,7 +114,7 @@ pub(super) async fn execute_search_with_facets_sql(
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             filters: filter_bytes,
             fields: parsed.facets,
             limit_per_facet: 0, // All values.

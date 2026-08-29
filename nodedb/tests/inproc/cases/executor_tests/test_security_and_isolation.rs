@@ -30,7 +30,10 @@ fn security_tenant_isolation() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "secrets".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "secrets",
+            ),
             document_id: "s1".into(),
             value: b"{\"data\":\"tenant1_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -47,7 +50,10 @@ fn security_tenant_isolation() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "secrets".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "secrets",
+            ),
             document_id: "s1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -170,7 +176,10 @@ fn linearizability_read_after_write() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "linear".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "linear",
+                ),
                 document_id: doc_id.clone(),
                 value: value.into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -186,7 +195,10 @@ fn linearizability_read_after_write() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "linear".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "linear",
+                ),
                 document_id: doc_id.clone(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -212,7 +224,10 @@ fn linearizability_delete_visibility() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "linear".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "linear",
+            ),
             document_id: "del1".into(),
             value: b"{\"x\":1}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -228,7 +243,10 @@ fn linearizability_delete_visibility() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "linear".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "linear",
+            ),
             document_id: "del1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -245,7 +263,10 @@ fn linearizability_delete_visibility() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "linear".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "linear",
+            ),
             document_id: "del1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -280,7 +301,10 @@ fn wal_replay_deterministic() {
                 &mut tx,
                 &mut rx,
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "replay".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "replay",
+                    ),
                     document_id: doc_id.to_string(),
                     value: value.clone(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -299,7 +323,10 @@ fn wal_replay_deterministic() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "replay".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "replay",
+            ),
             document_id: "d1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -321,7 +348,10 @@ fn wal_replay_deterministic() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "replay".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "replay",
+            ),
             document_id: "d2".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -337,7 +367,10 @@ fn wal_replay_deterministic() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "replay".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "replay",
+            ),
             document_id: "d3".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -364,7 +397,10 @@ fn mixed_engine_isolation_no_cross_eviction() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "mixed".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "mixed",
+                ),
                 document_id: format!("doc_{i}"),
                 value: format!("{{\"val\":{i}}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -383,7 +419,10 @@ fn mixed_engine_isolation_no_cross_eviction() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "mixed".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "mixed",
+                ),
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
@@ -401,7 +440,10 @@ fn mixed_engine_isolation_no_cross_eviction() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "col",
+                ),
                 src_id: format!("doc_{i}"),
                 label: "NEXT".into(),
                 dst_id: format!("doc_{}", i + 1),
@@ -419,7 +461,10 @@ fn mixed_engine_isolation_no_cross_eviction() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "mixed".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "mixed",
+            ),
             document_id: "doc_25".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -436,7 +481,10 @@ fn mixed_engine_isolation_no_cross_eviction() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "mixed".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "mixed",
+            ),
             query_vector: vec![25.0f32, 0.0, 0.0],
             top_k: 3,
             ef_search: 0,

@@ -3,6 +3,7 @@
 //! Query operations (joins, aggregates) dispatched to the Data Plane.
 
 pub use nodedb_query::expr::GroupKeySpec;
+use nodedb_types::QualifiedCollection;
 
 /// Aggregate specification for Data Plane aggregate execution.
 #[derive(
@@ -134,7 +135,7 @@ pub enum QueryOp {
 
     /// Aggregate: GROUP BY + aggregate functions.
     Aggregate {
-        collection: String,
+        collection: QualifiedCollection,
         /// Optional sub-plan whose decoded rows are aggregated instead of
         /// scanning `collection` per-shard. `Some` currently means EXACTLY a
         /// catalog source (a `ProviderScan` lowered by the converter): the
@@ -169,7 +170,7 @@ pub enum QueryOp {
 
     /// Partial aggregate: each core computes locally, Control Plane merges.
     PartialAggregate {
-        collection: String,
+        collection: QualifiedCollection,
         group_by: Vec<String>,
         aggregates: Vec<AggregateSpec>,
         filters: Vec<u8>,
@@ -194,7 +195,7 @@ pub enum QueryOp {
     /// (or its `input` sub-plan) — so it is wire-shippable: a coordinator embeds
     /// it in a producer plan and dispatches it to a remote node's Data Plane.
     PartialAggregateState {
-        collection: String,
+        collection: QualifiedCollection,
         /// Optional sub-plan whose decoded rows are aggregated instead of
         /// scanning `collection` per-shard. Mirrors [`QueryOp::Aggregate`]'s
         /// `input`: `Some` runs the producer over the sub-plan's rows (e.g. a
@@ -213,8 +214,8 @@ pub enum QueryOp {
     /// child during planning, or an embedded `ProviderScan` after coordinator
     /// resolution). When `None` the side is scanned locally by collection name.
     HashJoin {
-        left_collection: String,
-        right_collection: String,
+        left_collection: QualifiedCollection,
+        right_collection: QualifiedCollection,
         left_alias: Option<String>,
         right_alias: Option<String>,
         on: Vec<(String, String)>,
@@ -326,8 +327,8 @@ pub enum QueryOp {
 
     /// Nested loop join: fallback for non-equi joins.
     NestedLoopJoin {
-        left_collection: String,
-        right_collection: String,
+        left_collection: QualifiedCollection,
+        right_collection: QualifiedCollection,
         /// Join condition as serialized `Vec<ScanFilter>`.
         condition: Vec<u8>,
         join_type: String,
@@ -344,8 +345,8 @@ pub enum QueryOp {
     /// Optimal when both collections have index-ordered scans or
     /// when the planner sorts both sides before joining.
     SortMergeJoin {
-        left_collection: String,
-        right_collection: String,
+        left_collection: QualifiedCollection,
+        right_collection: QualifiedCollection,
         on: Vec<(String, String)>,
         join_type: String,
         limit: usize,
@@ -360,7 +361,7 @@ pub enum QueryOp {
     /// Multi-facet aggregation: compute facet counts for multiple fields
     /// in a single query, sharing the filter evaluation across all facets.
     FacetCounts {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` predicates (MessagePack).
         filters: Vec<u8>,
         /// Field names to facet on (each produces a `[{value, count}]` array).
@@ -376,7 +377,7 @@ pub enum QueryOp {
     /// until no new rows are produced (fixed point).
     RecursiveScan {
         /// Collection for the recursive scan.
-        collection: String,
+        collection: QualifiedCollection,
         /// Base query filters (seeded once).
         base_filters: Vec<u8>,
         /// Recursive step filters (applied to working table each iteration).
@@ -432,7 +433,7 @@ pub enum QueryOp {
         /// Alias qualifying the outer columns in output rows.
         outer_alias: String,
         /// Inner collection to scan per outer row.
-        inner_collection: String,
+        inner_collection: QualifiedCollection,
         /// Non-correlated filters applied to every inner scan (msgpack bytes).
         inner_filters: Vec<u8>,
         /// ORDER BY terms for the inner per-outer-row result.
@@ -462,7 +463,7 @@ pub enum QueryOp {
         /// Alias qualifying the outer columns in output rows.
         outer_alias: String,
         /// Inner collection to scan per outer row.
-        inner_collection: String,
+        inner_collection: QualifiedCollection,
         /// Base inner filters (non-correlated, msgpack bytes).
         inner_filters: Vec<u8>,
         /// Correlated predicates: `(inner_field, outer_field)`.

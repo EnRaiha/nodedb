@@ -103,7 +103,7 @@ impl NodeDbPgHandler {
                 identity,
                 database_id,
                 auth,
-                &coll_name,
+                &nodedb_types::QualifiedCollection::new(database_id, &coll_name),
                 &doc_id,
             )
             .await

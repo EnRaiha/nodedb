@@ -146,10 +146,10 @@ pub(super) fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
         }
         | KvOp::FieldSet {
             collection, key, ..
-        } => Some((collection.clone(), vec![key.clone()])),
+        } => Some((collection.to_string(), vec![key.clone()])),
         KvOp::Delete {
             collection, keys, ..
-        } => Some((collection.clone(), keys.clone())),
+        } => Some((collection.to_string(), keys.clone())),
         _ => None,
     }
 }
@@ -167,13 +167,13 @@ pub(super) fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>
             collection,
             surrogate,
             ..
-        } => Some((collection.clone(), vec![surrogate.as_u32()])),
+        } => Some((collection.to_string(), vec![surrogate.as_u32()])),
         VectorOp::BatchInsert {
             collection,
             surrogates,
             ..
         } => Some((
-            collection.clone(),
+            collection.to_string(),
             surrogates.iter().map(|s| s.as_u32()).collect(),
         )),
         _ => None,
@@ -208,17 +208,19 @@ pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
             // agree with.
             | KvOp::PredicateUpdate { collection, .. }
             | KvOp::PredicateDelete { collection, .. },
-        ) => collection.clone(),
+        ) => collection.to_string(),
         PhysicalPlan::Vector(
             VectorOp::Insert { collection, .. }
             | VectorOp::BatchInsert { collection, .. }
             | VectorOp::Delete { collection, .. }
             | VectorOp::DeleteBySurrogate { collection, .. },
-        ) => collection.clone(),
+        ) => collection.to_string(),
         PhysicalPlan::Graph(
             GraphOp::EdgePut { collection, .. } | GraphOp::EdgeDelete { collection, .. },
-        ) => collection.clone(),
-        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => collection.clone(),
+        ) => collection.to_string(),
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => {
+            collection.to_string()
+        }
         _ => String::new(),
     }
 }
@@ -236,10 +238,10 @@ fn document_write_collection(op: &DocumentOp) -> String {
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::Truncate { collection, .. }
         // Homes on the TARGET collection — same one the routing oracle uses.
-        | DocumentOp::ApplyBalanceDelta { collection, .. } => collection.clone(),
+        | DocumentOp::ApplyBalanceDelta { collection, .. } => collection.to_string(),
         DocumentOp::InsertSelect {
             target_collection, ..
-        } => target_collection.clone(),
+        } => target_collection.to_string(),
         // Cross-collection writes: Control-Plane orchestrators resolve them
         // into concrete point writes before dispatch, so no raw plan reaches
         // this builder; the routing oracle names them `Unroutable`.
@@ -374,7 +376,10 @@ mod lockstep_tests {
     #[test]
     fn kv_incr_gate_key_matches_scheduler_key() {
         assert_gate_matches_scheduler(PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "counters",
+            ),
             key: b"ctr".to_vec(),
             delta: 1,
             ttl_ms: 0,
@@ -386,7 +391,10 @@ mod lockstep_tests {
     #[test]
     fn kv_cas_gate_key_matches_scheduler_key() {
         assert_gate_matches_scheduler(PhysicalPlan::Kv(KvOp::Cas {
-            collection: "counters".to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "counters",
+            ),
             key: b"ctr".to_vec(),
             expected: vec![],
             new_value: vec![],
@@ -398,7 +406,10 @@ mod lockstep_tests {
     #[test]
     fn document_upsert_gate_key_matches_scheduler_key() {
         assert_gate_matches_scheduler(PhysicalPlan::Document(DocumentOp::Upsert {
-            collection: "docs".to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".to_owned(),
             value: vec![],
             on_conflict_updates: vec![],
@@ -462,7 +473,7 @@ mod routing_agreement_tests {
 
     fn source_write() -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: SOURCE.to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(DB, SOURCE),
             document_id: "e1".to_owned(),
             value: Vec::new(),
             if_absent: false,
@@ -476,7 +487,7 @@ mod routing_agreement_tests {
 
     fn balance_write() -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
-            collection: TARGET.to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(DB, TARGET),
             document_id: "0000010f".to_owned(),
             surrogate: Surrogate::new(271),
             column: "balance".to_owned(),

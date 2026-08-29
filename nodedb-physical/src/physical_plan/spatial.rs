@@ -2,7 +2,7 @@
 
 //! Spatial engine operations dispatched to the Data Plane.
 
-use nodedb_types::{Surrogate, SurrogateBitmap, geometry::Geometry};
+use nodedb_types::{QualifiedCollection, Surrogate, SurrogateBitmap, geometry::Geometry};
 
 /// Spatial predicate type for R-tree index scan.
 #[derive(
@@ -46,7 +46,7 @@ pub enum SpatialOp {
     /// `surrogate` (matching direct `INSERT INTO` semantics), so the
     /// cross-engine prefilter bitmap intersect works without translation.
     Insert {
-        collection: String,
+        collection: QualifiedCollection,
         field: String,
         /// Stable global surrogate for the row, assigned on the Control Plane.
         surrogate: Surrogate,
@@ -61,7 +61,7 @@ pub enum SpatialOp {
     /// Used by the sync inbound path. Keyed by the same hex-encoded surrogate
     /// used at insert time.
     Delete {
-        collection: String,
+        collection: QualifiedCollection,
         field: String,
         /// Stable global surrogate for the row.
         surrogate: Surrogate,
@@ -71,7 +71,7 @@ pub enum SpatialOp {
     },
     /// R-tree index scan with spatial predicate and exact refinement.
     Scan {
-        collection: String,
+        collection: QualifiedCollection,
         field: String,
         predicate: SpatialPredicate,
         /// Typed query geometry, parsed and validated on the Control Plane.

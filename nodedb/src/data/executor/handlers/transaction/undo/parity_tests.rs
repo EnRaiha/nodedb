@@ -226,7 +226,7 @@ fn dummy_task() -> ExecutionTask {
         database_id: DatabaseId::DEFAULT,
         vshard_id: VShardId::new(0),
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: COLL.into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
             document_id: PK.into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),

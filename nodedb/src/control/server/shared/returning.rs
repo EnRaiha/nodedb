@@ -340,6 +340,7 @@ fn is_valid_column_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     /// The document engines carry the clause, so it is stripped and parsed like
     /// any other verb's — the statement text alone cannot decide the engine, so
@@ -370,8 +371,8 @@ mod tests {
     #[test]
     fn an_insert_plan_with_no_returning_slot_is_refused() {
         let plan = PhysicalPlan::Document(DocumentOp::InsertSelect {
-            target_collection: "dst".into(),
-            source_collection: "src".into(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "dst"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
             source_filters: Vec::new(),
             source_limit: 0,
         });
@@ -392,7 +393,7 @@ mod tests {
     #[test]
     fn a_vector_primary_upsert_plan_is_admitted() {
         let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: "vectors".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vectors"),
             field: "emb".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             vector: Vec::new(),
@@ -413,7 +414,7 @@ mod tests {
     #[test]
     fn a_timeseries_ingest_plan_is_admitted() {
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: Vec::new(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -433,7 +434,7 @@ mod tests {
     #[test]
     fn a_columnar_insert_plan_is_admitted() {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: Vec::new(),
             format: "msgpack".into(),
             intent: nodedb_physical::physical_plan::ColumnarInsertIntent::Insert,
@@ -453,7 +454,7 @@ mod tests {
     #[test]
     fn a_document_insert_plan_is_admitted() {
         let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: "items".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             document_id: "a".into(),
             value: Vec::new(),
             if_absent: false,

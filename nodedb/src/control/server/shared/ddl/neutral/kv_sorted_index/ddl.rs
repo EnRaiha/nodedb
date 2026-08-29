@@ -96,7 +96,7 @@ pub async fn create_sorted_index(
 
     let fields: Vec<String> = sort_columns.iter().map(|(name, _)| name.clone()).collect();
     let plan = PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         index_name: index_name.clone(),
         sort_columns,
         key_column,

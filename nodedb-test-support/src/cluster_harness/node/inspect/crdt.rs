@@ -43,7 +43,7 @@ impl TestClusterNode {
             database_id: DatabaseId::DEFAULT,
             vshard_id,
             plan: PhysicalPlan::Crdt(CrdtOp::ReadConstraints {
-                collection: collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             priority: Priority::Normal,
@@ -116,7 +116,7 @@ impl TestClusterNode {
             database_id: DatabaseId::DEFAULT,
             vshard_id,
             plan: PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-                collection: collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
                 constraint_version,
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),

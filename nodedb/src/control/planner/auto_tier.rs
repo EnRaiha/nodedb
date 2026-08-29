@@ -232,7 +232,7 @@ fn build_scan_task(
         vshard_id: VShardId::from_collection_in_database(database_id, collection),
         database_id,
         plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, collection),
             time_range,
             projection: Vec::new(),
             limit: usize::MAX,

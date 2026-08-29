@@ -6,6 +6,7 @@
 
 use nodedb::bridge::envelope::Status;
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan, TextOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -35,7 +36,7 @@ fn fulltext_search_isolated() {
             &mut rx,
             TENANT_A,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "articles".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
                 document_id: id.to_string(),
                 value: val.as_bytes().to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -54,7 +55,7 @@ fn fulltext_search_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
             query: "quantum".into(),
             top_k: 5,
             fuzzy: false,
@@ -71,7 +72,7 @@ fn fulltext_search_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
             query: "quantum".into(),
             top_k: 5,
             fuzzy: false,

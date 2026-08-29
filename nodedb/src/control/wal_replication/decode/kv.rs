@@ -30,7 +30,7 @@ pub(super) fn put(
         None => carried,
     };
     Ok(PhysicalPlan::Kv(KvOp::Put {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms,
@@ -46,7 +46,7 @@ pub(super) fn put(
 /// recovery time would make it non-deterministic.
 pub(super) fn delete(collection: &str, keys: &[Vec<u8>]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Delete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         keys: keys.to_vec(),
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
@@ -61,7 +61,7 @@ pub(super) fn predicate_update(
     updates: &[(String, Vec<u8>)],
 ) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::PredicateUpdate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         filters: filters.to_vec(),
         updates: updates.to_vec(),
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
@@ -71,7 +71,7 @@ pub(super) fn predicate_update(
 /// Reconstruct a KV predicate `DELETE` plan — see [`predicate_update`].
 pub(super) fn predicate_delete(collection: &str, filters: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::PredicateDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         filters: filters.to_vec(),
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
@@ -92,7 +92,7 @@ pub(super) fn insert(
         None => carried,
     };
     Ok(PhysicalPlan::Kv(KvOp::Insert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms,
@@ -118,7 +118,7 @@ pub(super) fn insert_if_absent(
         None => carried,
     };
     Ok(PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms,
@@ -157,7 +157,7 @@ pub(super) fn insert_on_conflict_update(
         None => carried,
     };
     Ok(PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms,
@@ -191,7 +191,7 @@ pub(super) fn batch_put(
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(PhysicalPlan::Kv(KvOp::BatchPut {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         entries: entries.to_vec(),
         ttl_ms,
         surrogates: resolved,
@@ -203,7 +203,7 @@ pub(super) fn batch_put(
 
 pub(super) fn expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Expire {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         ttl_ms,
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
@@ -212,7 +212,7 @@ pub(super) fn expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan 
 
 pub(super) fn persist(collection: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Persist {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     })
@@ -229,7 +229,7 @@ pub(super) fn incr(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::Incr {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         delta,
         ttl_ms,
@@ -248,7 +248,7 @@ pub(super) fn incr_float(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         delta,
         surrogate,
@@ -267,7 +267,7 @@ pub(super) fn cas(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::Cas {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         expected: expected.to_vec(),
         new_value: new_value.to_vec(),
@@ -287,7 +287,7 @@ pub(super) fn get_set(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::GetSet {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         new_value: new_value.to_vec(),
         surrogate,
@@ -314,7 +314,7 @@ pub(super) struct RegisterSortedIndexFields<'a> {
 
 pub(super) fn register_sorted_index(f: RegisterSortedIndexFields) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         index_name: f.index_name.to_owned(),
         sort_columns: f.sort_columns.to_vec(),
         key_column: f.key_column.to_owned(),
@@ -340,7 +340,7 @@ pub(super) fn register_index(
     backfill: bool,
 ) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::RegisterIndex {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field: field.to_owned(),
         field_position,
         backfill,
@@ -351,7 +351,7 @@ pub(super) fn register_index(
 /// [`register_index`].
 pub(super) fn drop_index(collection: &str, field: &str) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::DropIndex {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field: field.to_owned(),
     })
 }
@@ -366,7 +366,7 @@ pub(super) fn field_set(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::FieldSet {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         key: key.to_vec(),
         updates: updates.to_vec(),
         surrogate,
@@ -392,7 +392,7 @@ pub(super) fn transfer(ctx: &DecodeCtx, f: TransferFields) -> crate::Result<Phys
     let carried_credit = nodedb_types::Surrogate::new(f.credit_surrogate);
     let credit_surrogate = bind_or_lookup(ctx, f.collection, f.dest_key, carried_credit)?;
     Ok(PhysicalPlan::Kv(KvOp::Transfer {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         source_key: f.source_key.to_vec(),
         dest_key: f.dest_key.to_vec(),
         field: f.field.to_owned(),
@@ -407,7 +407,7 @@ pub(super) fn transfer(ctx: &DecodeCtx, f: TransferFields) -> crate::Result<Phys
 /// `document::truncate` — no surrogate binding, whole-collection clear.
 pub(super) fn truncate(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Truncate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
     })
 }
 
@@ -436,7 +436,9 @@ pub(super) fn resolved_write(
                 } => {
                     let carried = nodedb_types::Surrogate::new(*surrogate);
                     M::Put {
-                        collection: collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.clone(),
+                        ),
                         key: key.clone(),
                         value: value.clone(),
                         ttl_ms: *ttl_ms,
@@ -450,7 +452,7 @@ pub(super) fn resolved_write(
                     key,
                     precondition,
                 } => M::Delete {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     key: key.clone(),
                     precondition: precondition.clone(),
                 },
@@ -461,7 +463,7 @@ pub(super) fn resolved_write(
                     resolved_now_ms,
                     precondition,
                 } => M::Expire {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     key: key.clone(),
                     ttl_ms: *ttl_ms,
                     // Stamped from the wire, mirroring the `KvExpire` arm.
@@ -473,7 +475,7 @@ pub(super) fn resolved_write(
                     key,
                     precondition,
                 } => M::Persist {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     key: key.clone(),
                     precondition: precondition.clone(),
                 },
@@ -500,8 +502,10 @@ pub(super) fn transfer_item(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, dest_collection, dest_key, carried)?;
     Ok(PhysicalPlan::Kv(KvOp::TransferItem {
-        source_collection: source_collection.to_owned(),
-        dest_collection: dest_collection.to_owned(),
+        source_collection: nodedb_types::QualifiedCollection::from_stored(
+            source_collection.to_owned(),
+        ),
+        dest_collection: nodedb_types::QualifiedCollection::from_stored(dest_collection.to_owned()),
         item_key: item_key.to_vec(),
         dest_key: dest_key.to_vec(),
         surrogate,

@@ -52,7 +52,7 @@ pub fn inject_permission_tree(
     for task in tasks.iter_mut() {
         // No context means a superuser, which is a property of the session
         // rather than of the task — so the whole batch is bypassed.
-        let Some(ctx) = PermCtx::new(cache, task.tenant_id.as_u64(), auth) else {
+        let Some(ctx) = PermCtx::new(cache, task.tenant_id.as_u64(), auth, task.database_id) else {
             return Ok(());
         };
         walk(&ctx, &mut task.plan)?;
@@ -190,7 +190,7 @@ pub(super) mod test_support {
         cache: &PermissionCache,
         auth: &AuthContext,
     ) -> crate::Result<()> {
-        match super::PermCtx::new(cache, TENANT, auth) {
+        match super::PermCtx::new(cache, TENANT, auth, nodedb_types::DatabaseId::DEFAULT) {
             Some(ctx) => super::walk(&ctx, plan),
             None => Ok(()),
         }
@@ -289,7 +289,10 @@ mod tests {
 
     fn columnar_scan(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             projection: Vec::new(),
             limit: 0,
             filters: Vec::new(),
@@ -317,7 +320,10 @@ mod tests {
     fn document_scan_still_receives_the_subtree_filter() {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             limit: 0,
             offset: 0,
             sort_keys: Vec::new(),

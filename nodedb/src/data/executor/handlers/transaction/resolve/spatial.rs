@@ -69,7 +69,7 @@ pub(super) fn serialize_spatial_op(
                     .to_string(),
             })?;
             let payload =
-                encode_spatial_put_payload(collection, field, *surrogate, geometry, prov)?;
+                encode_spatial_put_payload(collection.as_str(), field, *surrogate, geometry, prov)?;
             let bytes = payload.to_bytes().map_err(crate::Error::Wal)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::SpatialPut as u32,
@@ -88,7 +88,8 @@ pub(super) fn serialize_spatial_op(
                          and is not supported in transaction resolve"
                     .to_string(),
             })?;
-            let payload = encode_spatial_delete_payload(collection, field, *surrogate, prov);
+            let payload =
+                encode_spatial_delete_payload(collection.as_str(), field, *surrogate, prov);
             let bytes = payload.to_bytes().map_err(crate::Error::Wal)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::SpatialDelete as u32,
@@ -109,6 +110,7 @@ mod tests {
     use nodedb_types::Surrogate;
     use nodedb_types::geometry::Geometry;
     use nodedb_types::sync::wire::SyncProvenance;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     fn prov(seq: u64) -> SyncProvenance {
         SyncProvenance {
@@ -126,7 +128,7 @@ mod tests {
     #[test]
     fn insert_emits_spatial_put_sub_record() {
         let op = SpatialOp::Insert {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(7),
             geometry: point(10.0, 20.0),
@@ -149,7 +151,7 @@ mod tests {
     #[test]
     fn delete_emits_spatial_delete_sub_record() {
         let op = SpatialOp::Delete {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(7),
             provenance: Some(prov(2)),
@@ -168,7 +170,7 @@ mod tests {
     #[test]
     fn scan_emits_nothing() {
         let op = SpatialOp::Scan {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             predicate: nodedb_physical::physical_plan::SpatialPredicate::Intersects,
             query_geometry: point(0.0, 0.0),
@@ -187,7 +189,7 @@ mod tests {
     #[test]
     fn insert_without_provenance_errors_rather_than_dropping() {
         let op = SpatialOp::Insert {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(1),
             geometry: point(1.0, 1.0),
@@ -205,7 +207,7 @@ mod tests {
     #[test]
     fn delete_without_provenance_errors_rather_than_dropping() {
         let op = SpatialOp::Delete {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(1),
             provenance: None,

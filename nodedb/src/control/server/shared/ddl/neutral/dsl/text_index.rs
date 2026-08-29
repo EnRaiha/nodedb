@@ -179,7 +179,7 @@ async fn create_text_index(
 
     if analyzer_name.is_some() || fuzzy_default.is_some() {
         let set_config_plan = PhysicalPlan::Text(TextOp::SetTextConfig {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             analyzer_name: analyzer_name.clone(),
             fuzzy_default,
         });

@@ -130,7 +130,10 @@ mod tests {
 
     fn vector_insert(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             vector: vec![0.0],
             dim: 1,
             field_name: String::new(),
@@ -161,7 +164,10 @@ mod tests {
 
     fn search_with_prefilter(collection: &str, prefilter: Option<PhysicalPlan>) -> PhysicalPlan {
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             query_vector: vec![0.1, 0.2],
             top_k: 4,
             ef_search: 0,
@@ -184,7 +190,10 @@ mod tests {
         let mut plan = search_with_prefilter(
             "embeddings",
             Some(PhysicalPlan::Document(DocumentOp::IndexLookup {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 path: "$.email".into(),
                 value: "a@b.c".into(),
             })),
@@ -203,7 +212,10 @@ mod tests {
             zerompk::to_msgpack_vec(&map).expect("encode payload")
         };
         PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             field: "emb".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             vector: vec![0.1, 0.2],
@@ -268,7 +280,10 @@ mod tests {
     fn sparse_search_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("docs");
         let mut plan = PhysicalPlan::Vector(VectorOp::SparseSearch {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             field_name: "sparse".into(),
             query_entries: vec![(1, 1.0)],
             top_k: 5,

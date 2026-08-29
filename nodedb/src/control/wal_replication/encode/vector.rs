@@ -24,7 +24,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             pk_bytes,
             provenance,
         } => insert(
-            collection,
+            collection.as_str(),
             vector,
             *dim,
             field_name,
@@ -37,11 +37,11 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             vectors,
             dim,
             surrogates,
-        } => batch_insert(collection, vectors, *dim, surrogates),
+        } => batch_insert(collection.as_str(), vectors, *dim, surrogates),
         VectorOp::Delete {
             collection,
             vector_id,
-        } => delete(collection, *vector_id),
+        } => delete(collection.as_str(), *vector_id),
         VectorOp::SetParams {
             collection,
             field_name,
@@ -54,7 +54,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             ivf_cells,
             ivf_nprobe,
         } => set_params(SetParamsFields {
-            collection,
+            collection: collection.as_str(),
             field_name,
             dim: *dim,
             m: *m,
@@ -71,7 +71,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             doc_id,
             entries,
         } => ReplicatedWrite::SparseInsert {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field_name: field_name.to_owned(),
             doc_id: doc_id.to_owned(),
             entries: entries.clone(),
@@ -81,7 +81,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             field_name,
             doc_id,
         } => ReplicatedWrite::SparseDelete {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field_name: field_name.to_owned(),
             doc_id: doc_id.to_owned(),
         },
@@ -93,7 +93,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             count,
             dim,
         } => ReplicatedWrite::MultiVectorInsert {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field_name: field_name.to_owned(),
             // All `count` vectors are bound to this one leader-assigned
             // surrogate; carried verbatim so every replica shares the same
@@ -108,7 +108,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             field_name,
             document_surrogate,
         } => ReplicatedWrite::MultiVectorDelete {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field_name: field_name.to_owned(),
             document_surrogate: document_surrogate.as_u32(),
         },
@@ -118,7 +118,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             field_name,
             provenance,
         } => ReplicatedWrite::DeleteBySurrogate {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             surrogate: surrogate.as_u32(),
             field_name: field_name.to_owned(),
             provenance: super::entry::encode_provenance(provenance),
@@ -135,7 +135,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             returning,
             rls_filters,
         } => ReplicatedWrite::DirectUpsert {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field: field.to_owned(),
             surrogate: surrogate.as_u32(),
             vector: vector.clone(),
@@ -150,7 +150,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             collection,
             field_name,
         } => ReplicatedWrite::DropVectorIndex {
-            collection: collection.to_owned(),
+            collection: collection.as_str().to_owned(),
             field_name: field_name.to_owned(),
         },
         VectorOp::Search { .. }

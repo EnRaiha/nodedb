@@ -242,7 +242,7 @@ impl CoreLoop {
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
-                    &edge.collection,
+                    edge.collection.as_str(),
                     &edge.src_id,
                     &edge.label,
                     &edge.dst_id,
@@ -260,7 +260,7 @@ impl CoreLoop {
                         &edge.src_id,
                         &edge.label,
                         &edge.dst_id,
-                        &edge.collection,
+                        edge.collection.as_str(),
                     ) {
                         return self.response_error(
                             task,
@@ -290,7 +290,7 @@ impl CoreLoop {
             self.note_edge_write_lsn(
                 task,
                 tid,
-                &edge.collection,
+                edge.collection.as_str(),
                 &edge.src_id,
                 &edge.label,
                 &edge.dst_id,
@@ -301,7 +301,7 @@ impl CoreLoop {
             self.emit_graph_edge_event(
                 task,
                 crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
-                    collection: &edge.collection,
+                    collection: edge.collection.as_str(),
                     src_id: &edge.src_id,
                     label: &edge.label,
                     dst_id: &edge.dst_id,
@@ -335,7 +335,7 @@ impl CoreLoop {
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
-                    &edge.collection,
+                    edge.collection.as_str(),
                     &edge.src_id,
                     &edge.label,
                     &edge.dst_id,
@@ -348,7 +348,7 @@ impl CoreLoop {
                 &edge.src_id,
                 &edge.label,
                 &edge.dst_id,
-                &edge.collection,
+                edge.collection.as_str(),
             );
         }
         if !edges.is_empty() {
@@ -359,7 +359,7 @@ impl CoreLoop {
             self.note_edge_write_lsn(
                 task,
                 tid,
-                &edge.collection,
+                edge.collection.as_str(),
                 &edge.src_id,
                 &edge.label,
                 &edge.dst_id,
@@ -368,7 +368,7 @@ impl CoreLoop {
             self.emit_graph_edge_event(
                 task,
                 crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
-                    collection: &edge.collection,
+                    collection: edge.collection.as_str(),
                     src_id: &edge.src_id,
                     label: &edge.label,
                     dst_id: &edge.dst_id,

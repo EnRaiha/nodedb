@@ -10,7 +10,9 @@ use nodedb_physical::physical_plan::{
 };
 use nodedb_types::geometry::Geometry;
 use nodedb_types::sync::wire::SyncProvenance;
-use nodedb_types::{PayloadIndexKind, Surrogate, VectorQuantization, VectorStorageDtype};
+use nodedb_types::{
+    PayloadIndexKind, QualifiedCollection, Surrogate, VectorQuantization, VectorStorageDtype,
+};
 
 use super::test_support::to_replicated_entry;
 
@@ -301,7 +303,7 @@ fn to_replicated_entry_writes_only() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "c".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
         document_id: "d".into(),
         value: vec![],
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -317,7 +319,7 @@ fn to_replicated_entry_writes_only() {
     );
 
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: "c".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
         document_id: "d".into(),
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -341,7 +343,7 @@ fn materialized_sum_resolution_roundtrips() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: "entries".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
         document_id: "e1".into(),
         value: vec![1, 2, 3],
         if_absent: false,
@@ -390,7 +392,7 @@ fn materialized_sum_resolution_roundtrips() {
     }
 
     let bulk = PhysicalPlan::Document(DocumentOp::BulkDelete {
-        collection: "entries".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
         filters: vec![7, 7],
         returning: None,
         ollp_predicted_surrogates: None,
@@ -474,7 +476,7 @@ fn a_record_without_target_collections_decodes_as_untargeted() {
 #[test]
 fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: "entries".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
         document_id: "e1".into(),
         surrogate: Surrogate::new(900),
         pk_bytes: b"e1".to_vec(),
@@ -547,7 +549,7 @@ fn vector_insert_provenance_roundtrip() {
 
     // With provenance.
     let plan = PhysicalPlan::Vector(VectorOp::Insert {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         vector: vec![0.1, 0.2, 0.3],
         dim: 3,
         field_name: "emb".into(),
@@ -578,7 +580,7 @@ fn vector_insert_provenance_roundtrip() {
 
     // Without provenance.
     let plan_none = PhysicalPlan::Vector(VectorOp::Insert {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         vector: vec![0.1, 0.2, 0.3],
         dim: 3,
         field_name: "emb".into(),
@@ -617,7 +619,7 @@ fn crdt_apply_legacy_and_fenced_wire_compatibility() {
 
     // With provenance.
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "doc-1".into(),
         delta: vec![0xDE, 0xAD],
         peer_id: 7,
@@ -705,7 +707,7 @@ fn crdt_list_insert_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         index: 2,
@@ -728,7 +730,7 @@ fn crdt_list_insert_roundtrip() {
             fields_json,
             ..
         }) => {
-            assert_eq!(collection, "notes");
+            assert_eq!(collection.as_str(), "notes");
             assert_eq!(document_id, "doc-1");
             assert_eq!(list_path, "blocks");
             assert_eq!(index, 2, "index must round-trip");
@@ -751,7 +753,7 @@ fn doc_batch_insert_roundtrip() {
     let surrogates = vec![Surrogate::new(11), Surrogate::new(22), Surrogate::new(33)];
 
     let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         documents: documents.clone(),
         surrogates: surrogates.clone(),
         returning: None,
@@ -774,7 +776,7 @@ fn doc_batch_insert_roundtrip() {
             surrogates: decoded_surrogates,
             ..
         }) => {
-            assert_eq!(collection, "docs");
+            assert_eq!(collection.as_str(), "docs");
             assert_eq!(
                 decoded_docs, documents,
                 "every (doc_id, body) pair must round-trip"
@@ -794,7 +796,7 @@ fn doc_truncate_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         restart_identity: true,
         resolved_sum_targets: Vec::new(),
     });
@@ -811,7 +813,7 @@ fn doc_truncate_roundtrip() {
             restart_identity,
             ..
         }) => {
-            assert_eq!(collection, "docs");
+            assert_eq!(collection.as_str(), "docs");
             assert!(restart_identity, "restart_identity must round-trip");
         }
         other => panic!("expected Document(Truncate), got {other:?}"),
@@ -825,7 +827,7 @@ fn kv_truncate_roundtrip() {
 
     use nodedb_physical::physical_plan::KvOp;
     let plan = PhysicalPlan::Kv(KvOp::Truncate {
-        collection: "kv".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("encode must not error")
@@ -836,7 +838,7 @@ fn kv_truncate_roundtrip() {
         .expect("from_replicated_entry returned None");
     match decoded_plan {
         PhysicalPlan::Kv(KvOp::Truncate { collection }) => {
-            assert_eq!(collection, "kv");
+            assert_eq!(collection.as_str(), "kv");
         }
         other => panic!("expected Kv(Truncate), got {other:?}"),
     }
@@ -851,7 +853,7 @@ fn kv_register_index_roundtrip() {
 
     use nodedb_physical::physical_plan::KvOp;
     let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
-        collection: "players".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
         field: "name".into(),
         field_position: 2,
         backfill: true,
@@ -871,7 +873,7 @@ fn kv_register_index_roundtrip() {
             field_position,
             backfill,
         }) => {
-            assert_eq!(collection, "players");
+            assert_eq!(collection.as_str(), "players");
             assert_eq!(field, "name");
             assert_eq!(field_position, 2, "field_position must round-trip");
             assert!(
@@ -884,7 +886,7 @@ fn kv_register_index_roundtrip() {
 
     // backfill = false must survive distinctly, not default to true.
     let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
-        collection: "players".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
         field: "name".into(),
         field_position: 0,
         backfill: false,
@@ -913,7 +915,7 @@ fn kv_drop_index_roundtrip() {
 
     use nodedb_physical::physical_plan::KvOp;
     let plan = PhysicalPlan::Kv(KvOp::DropIndex {
-        collection: "players".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
         field: "name".into(),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
@@ -925,7 +927,7 @@ fn kv_drop_index_roundtrip() {
         .expect("from_replicated_entry returned None");
     match decoded_plan {
         PhysicalPlan::Kv(KvOp::DropIndex { collection, field }) => {
-            assert_eq!(collection, "players");
+            assert_eq!(collection.as_str(), "players");
             assert_eq!(field, "name");
         }
         other => panic!("expected Kv(DropIndex), got {other:?}"),
@@ -938,7 +940,7 @@ fn crdt_list_delete_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         index: 5,
@@ -959,7 +961,7 @@ fn crdt_list_delete_roundtrip() {
             index,
             ..
         }) => {
-            assert_eq!(collection, "notes");
+            assert_eq!(collection.as_str(), "notes");
             assert_eq!(document_id, "doc-1");
             assert_eq!(list_path, "blocks");
             assert_eq!(index, 5, "index must round-trip");
@@ -976,7 +978,7 @@ fn crdt_list_move_roundtrip_distinct_indices() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         from_index: 3,
@@ -999,7 +1001,7 @@ fn crdt_list_move_roundtrip_distinct_indices() {
             to_index,
             ..
         }) => {
-            assert_eq!(collection, "notes");
+            assert_eq!(collection.as_str(), "notes");
             assert_eq!(document_id, "doc-1");
             assert_eq!(list_path, "blocks");
             assert_eq!(from_index, 3, "from_index must survive the round trip");
@@ -1025,7 +1027,7 @@ fn columnar_ingest_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Insert,
@@ -1092,7 +1094,7 @@ fn timeseries_ingest_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "temps".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "temps"),
         payload: b"data".to_vec(),
         format: "ilp".into(),
         wal_lsn: None,
@@ -1129,7 +1131,7 @@ fn timeseries_ingest_provenance_roundtrip() {
 #[test]
 fn columnar_ingest_on_conflict_updates_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Put,
@@ -1174,7 +1176,7 @@ fn columnar_ingest_on_conflict_updates_roundtrip() {
 #[test]
 fn columnar_ingest_intent_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::InsertIfAbsent,
@@ -1216,7 +1218,7 @@ fn columnar_ingest_intent_roundtrip() {
 #[test]
 fn columnar_ingest_json_format_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "json".into(),
         intent: ColumnarInsertIntent::Insert,
@@ -1263,7 +1265,7 @@ fn columnar_ingest_returning_roundtrip() {
         }]),
     };
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Insert,
@@ -1305,7 +1307,7 @@ fn columnar_ingest_returning_roundtrip() {
 #[test]
 fn columnar_ingest_rls_filters_roundtrip() {
     let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: "metrics".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         payload: b"[{}]".to_vec(),
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Insert,
@@ -1350,7 +1352,7 @@ fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "temps".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "temps"),
         payload: b"data".to_vec(),
         format: "ilp".into(),
         wal_lsn: None,
@@ -1402,7 +1404,7 @@ fn document_point_put_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "users".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
         document_id: "u1".into(),
         value: b"alice".to_vec(),
         surrogate: Surrogate::new(1),
@@ -1455,7 +1457,7 @@ fn document_point_update_returning_and_rls_filters_roundtrip() {
         }]),
     };
     let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         document_id: "a1".into(),
         surrogate: Surrogate::new(2),
         pk_bytes: b"a1".to_vec(),
@@ -1506,7 +1508,7 @@ fn document_point_delete_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         document_id: "a1".into(),
         surrogate: Surrogate::new(3),
         pk_bytes: b"a1".to_vec(),
@@ -1556,7 +1558,7 @@ fn document_upsert_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Document(DocumentOp::Upsert {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         document_id: "a1".into(),
         value: b"{}".to_vec(),
         on_conflict_updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
@@ -1611,7 +1613,7 @@ fn fts_index_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
-        collection: "articles".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
         surrogate: nodedb_types::Surrogate::new(500),
         text: "hello world".into(),
         provenance: Some(prov.clone()),
@@ -1648,7 +1650,7 @@ fn fts_delete_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-        collection: "articles".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
         surrogate: nodedb_types::Surrogate::new(501),
         provenance: Some(prov.clone()),
     });
@@ -1687,7 +1689,7 @@ fn spatial_insert_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
-        collection: "places".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
         field: "location".into(),
         surrogate: nodedb_types::Surrogate::new(700),
         geometry: geometry.clone(),
@@ -1727,7 +1729,7 @@ fn spatial_delete_provenance_roundtrip() {
     };
 
     let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
-        collection: "places".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
         field: "location".into(),
         surrogate: nodedb_types::Surrogate::new(701),
         provenance: Some(prov.clone()),
@@ -1758,7 +1760,7 @@ fn edge_put_surrogates_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-        collection: "graph".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "graph"),
         src_id: "alice".into(),
         label: "knows".into(),
         dst_id: "bob".into(),
@@ -1947,7 +1949,7 @@ fn constraint_change_set_decodes_to_set_constraints() {
             constraint_version,
             constraints,
         }) => {
-            assert_eq!(collection, "users");
+            assert_eq!(collection.as_str(), "users");
             assert_eq!(constraint_version, 12);
             assert_eq!(constraints.len(), 1);
             assert_eq!(constraints[0], vec![1, 2, 3]);
@@ -1978,7 +1980,7 @@ fn constraint_change_drop_decodes_to_drop_constraints() {
             collection,
             constraint_version,
         }) => {
-            assert_eq!(collection, "users");
+            assert_eq!(collection.as_str(), "users");
             assert_eq!(constraint_version, 8);
         }
         other => panic!("expected Crdt(DropConstraints), got {other:?}"),
@@ -1992,7 +1994,7 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "c".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
         document_id: "d".into(),
         value: vec![1, 2, 3],
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -2020,7 +2022,7 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
         .expect("from_replicated_entry returned None");
     match decoded_plan {
         PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => {
-            assert_eq!(collection, "c");
+            assert_eq!(collection.as_str(), "c");
         }
         other => panic!("expected Document(PointPut), got {other:?}"),
     }
@@ -2036,24 +2038,24 @@ fn vector_extended_variants_all_encode_to_some() {
     let vshard = VShardId::new(0);
     let plans = vec![
         PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             surrogate: Surrogate::new(1),
             field_name: "emb".into(),
             provenance: None,
         }),
         PhysicalPlan::Vector(VectorOp::SparseInsert {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "sparse".into(),
             doc_id: "d1".into(),
             entries: vec![(1, 0.5)],
         }),
         PhysicalPlan::Vector(VectorOp::SparseDelete {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "sparse".into(),
             doc_id: "d1".into(),
         }),
         PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "colbert".into(),
             document_surrogate: Surrogate::new(2),
             vectors: vec![0.1, 0.2, 0.3, 0.4],
@@ -2061,12 +2063,12 @@ fn vector_extended_variants_all_encode_to_some() {
             dim: 2,
         }),
         PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "colbert".into(),
             document_surrogate: Surrogate::new(2),
         }),
         PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: "vecs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field: "emb".into(),
             surrogate: Surrogate::new(3),
             vector: vec![0.5, 0.6],
@@ -2095,7 +2097,7 @@ fn sparse_insert_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let plan = PhysicalPlan::Vector(VectorOp::SparseInsert {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field_name: "splade".into(),
         doc_id: "doc-42".into(),
         entries: vec![(10, 0.25), (20, 0.75)],
@@ -2115,7 +2117,7 @@ fn sparse_delete_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let plan = PhysicalPlan::Vector(VectorOp::SparseDelete {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field_name: "splade".into(),
         doc_id: "doc-42".into(),
     });
@@ -2136,7 +2138,7 @@ fn multi_vector_insert_roundtrip_shares_one_surrogate() {
     let shared_surrogate = Surrogate::new(777);
     // Three vectors, dim 2 each, all bound to the SAME document_surrogate.
     let plan = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field_name: "colbert".into(),
         document_surrogate: shared_surrogate,
         vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
@@ -2195,7 +2197,7 @@ fn multi_vector_delete_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let plan = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field_name: "colbert".into(),
         document_surrogate: Surrogate::new(888),
     });
@@ -2231,7 +2233,7 @@ fn delete_by_surrogate_roundtrip() {
         seq: 9,
     };
     let plan = PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         surrogate: Surrogate::new(555),
         field_name: "emb".into(),
         provenance: Some(prov.clone()),
@@ -2265,7 +2267,7 @@ fn direct_upsert_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-        collection: "primary_vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "primary_vecs"),
         field: "embedding".into(),
         surrogate: Surrogate::new(999),
         vector: vec![0.1, 0.2, 0.3, 0.4],
@@ -2345,7 +2347,7 @@ fn pre_database_id_entry_decodes_to_default_database() {
         .expect("from_replicated_entry returned None");
     match decoded_plan {
         PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => {
-            assert_eq!(collection, "c");
+            assert_eq!(collection.as_str(), "c");
         }
         other => panic!("expected Document(PointPut), got {other:?}"),
     }
@@ -2364,8 +2366,8 @@ fn known_write_gaps_are_not_replicated() {
         (
             "Document::Merge",
             PhysicalPlan::Document(DocumentOp::Merge {
-                target_collection: "docs".into(),
-                source_collection: "staging".into(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),
@@ -2381,8 +2383,8 @@ fn known_write_gaps_are_not_replicated() {
         (
             "Document::UpdateFromJoin",
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-                target_collection: "docs".into(),
-                source_collection: "staging".into(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),
@@ -2398,7 +2400,7 @@ fn known_write_gaps_are_not_replicated() {
         (
             "Crdt::RestoreToVersion",
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-                collection: "docs".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "id1".into(),
                 target_version_json: "{}".into(),
                 surrogate: Surrogate::new(1),
@@ -2423,7 +2425,7 @@ fn crdt_set_constraints_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         constraint_version: 7,
         constraints: vec![vec![1, 2, 3], vec![4, 5]],
     });
@@ -2440,7 +2442,7 @@ fn crdt_set_constraints_roundtrip() {
             constraint_version,
             constraints,
         }) => {
-            assert_eq!(collection, "accounts");
+            assert_eq!(collection.as_str(), "accounts");
             assert_eq!(constraint_version, 7, "version fence must round-trip");
             assert_eq!(constraints, vec![vec![1, 2, 3], vec![4, 5]]);
         }
@@ -2454,7 +2456,7 @@ fn crdt_drop_constraints_roundtrip() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         constraint_version: 9,
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
@@ -2469,7 +2471,7 @@ fn crdt_drop_constraints_roundtrip() {
             collection,
             constraint_version,
         }) => {
-            assert_eq!(collection, "accounts");
+            assert_eq!(collection.as_str(), "accounts");
             assert_eq!(constraint_version, 9, "version fence must round-trip");
         }
         other => panic!("expected CrdtOp::DropConstraints, got {other:?}"),
@@ -2485,7 +2487,7 @@ fn representative_handled_writes_still_replicate() {
 
     // Guard: a live document/KV write must still return `Some`.
     let point_put = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "d1".into(),
         value: vec![1, 2, 3],
         surrogate: Surrogate::ZERO,
@@ -2502,7 +2504,7 @@ fn representative_handled_writes_still_replicate() {
     );
 
     let kv_put = PhysicalPlan::Kv(KvOp::Put {
-        collection: "kv".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
         key: vec![1],
         value: vec![2],
         ttl_ms: 0,
@@ -2531,7 +2533,7 @@ fn kv_put_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "kv".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
         key: b"k1".to_vec(),
         value: b"v1".to_vec(),
         ttl_ms: 0,
@@ -2582,7 +2584,7 @@ fn kv_insert_on_conflict_update_returning_and_rls_filters_roundtrip() {
         }]),
     };
     let plan = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-        collection: "accounts".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         key: b"a1".to_vec(),
         value: b"v1".to_vec(),
         ttl_ms: 0,
@@ -2630,7 +2632,7 @@ fn vector_direct_upsert_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-        collection: "vecs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field: "emb".into(),
         surrogate: Surrogate::new(3),
         vector: vec![0.5, 0.6],
@@ -2679,7 +2681,7 @@ fn crdt_doc_upsert_returning_and_rls_filters_roundtrip() {
         columns: ReturningColumns::Star,
     };
     let plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "d1".into(),
         fields_json: "{}".into(),
         surrogate: Surrogate::new(4),
@@ -2761,7 +2763,7 @@ fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
 
     let leader_surrogate = Surrogate::new(9_001);
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "doc-1".into(),
         delta: vec![0xDE, 0xAD],
         peer_id: 1,
@@ -2874,7 +2876,7 @@ fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
         .expect("seed parent binding");
 
     let insert_plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         index: 0,
@@ -2898,7 +2900,7 @@ fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
     }
 
     let delete_plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         index: 0,
@@ -2921,7 +2923,7 @@ fn crdt_list_ops_bind_carried_surrogate_not_fresh_allocation() {
     }
 
     let move_plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
-        collection: "notes".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
         document_id: "doc-1".into(),
         list_path: "blocks".into(),
         from_index: 0,

@@ -196,7 +196,7 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
     let vshard = VShardId::new(0);
 
     let plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "sessions".into(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
         key: b"k1".to_vec(),
         value: b"v1".to_vec(),
         ttl_ms: 5_000,
@@ -218,7 +218,7 @@ fn kv_encoders_resolve_the_instant_once_at_proposal_time() {
     }
 
     let plan_no_ttl = PhysicalPlan::Kv(KvOp::Put {
-        collection: "sessions".into(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
         key: b"k2".to_vec(),
         value: b"v2".to_vec(),
         ttl_ms: 0,

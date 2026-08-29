@@ -253,7 +253,7 @@ mod tests {
 
         let put_plan = |surrogate: u32, doc_id: &str, body: &[u8]| {
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: COLL.to_string(),
+                collection: nodedb_types::QualifiedCollection::new(db, COLL),
                 document_id: doc_id.to_string(),
                 value: body.to_vec(),
                 surrogate: Surrogate::new(surrogate),

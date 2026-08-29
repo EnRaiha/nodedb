@@ -64,7 +64,7 @@ impl CoreLoop {
                 surrogate,
                 ..
             } => {
-                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
+                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection.as_str(), key, *surrogate);
                 self.stage_kv_put(&ctx, value, *ttl_ms)
             }
             KvOp::Insert {
@@ -75,7 +75,7 @@ impl CoreLoop {
                 surrogate,
                 ..
             } => {
-                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
+                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection.as_str(), key, *surrogate);
                 self.stage_kv_insert(&ctx, key, value, *ttl_ms)
             }
             KvOp::InsertIfAbsent {
@@ -86,7 +86,7 @@ impl CoreLoop {
                 surrogate,
                 ..
             } => {
-                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
+                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection.as_str(), key, *surrogate);
                 self.stage_kv_insert_if_absent(&ctx, key, value, *ttl_ms)
             }
             KvOp::InsertOnConflictUpdate {
@@ -99,7 +99,7 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             } => {
-                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
+                let ctx = self.kv_stage_ctx(task, tid, txn_id, collection.as_str(), key, *surrogate);
                 self.stage_kv_insert_on_conflict_update(
                     &ctx,
                     key,
@@ -113,7 +113,7 @@ impl CoreLoop {
                 collection,
                 keys,
                 rls_write_check,
-            } => self.stage_kv_delete(task, tid, txn_id, collection, keys, rls_write_check),
+            } => self.stage_kv_delete(task, tid, txn_id, collection.as_str(), keys, rls_write_check),
             KvOp::BatchPut { .. }
             | KvOp::Incr { .. }
             | KvOp::IncrFloat { .. }
@@ -132,7 +132,7 @@ impl CoreLoop {
                 super::stage_kv_ttl::StageKvTtlTarget {
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -147,7 +147,7 @@ impl CoreLoop {
                 super::stage_kv_ttl::StageKvTtlTarget {
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     key,
                     rls_write_check,
                 },
@@ -313,7 +313,7 @@ mod tests {
     /// the explicit `tid`/`txn_id`/`collection`/`key` args, not `task.plan`.
     fn make_task(txn_id: Option<TxnId>) -> ExecutionTask {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "x".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),

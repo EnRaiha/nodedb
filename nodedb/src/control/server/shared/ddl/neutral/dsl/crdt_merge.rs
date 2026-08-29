@@ -67,7 +67,7 @@ pub async fn crdt_merge(
     }
 
     let source_plan = PhysicalPlan::Crdt(CrdtOp::Read {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         document_id: source_id.to_string(),
     });
 
@@ -101,7 +101,7 @@ pub async fn crdt_merge(
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         document_id: target_id.to_string(),
         delta: source_bytes,
         peer_id: identity.user_id,

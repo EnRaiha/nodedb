@@ -24,7 +24,7 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
             src_surrogate,
             dst_surrogate,
         } => graph::edge_put(
-            collection,
+            collection.as_str(),
             src_id,
             label,
             dst_id,
@@ -43,7 +43,7 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
             dst_surrogate,
             rls_write_check: _,
         } => graph::edge_delete(
-            collection,
+            collection.as_str(),
             src_id,
             label,
             dst_id,

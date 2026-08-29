@@ -39,11 +39,11 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 ..
             }) => {
                 out.push(AuthorizationRequirement::collection(
-                    target_collection,
+                    target_collection.as_str(),
                     Permission::Write,
                 ));
                 out.push(AuthorizationRequirement::collection(
-                    source_collection,
+                    source_collection.as_str(),
                     Permission::Read,
                 ));
             }
@@ -53,11 +53,11 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 ..
             }) => {
                 out.push(AuthorizationRequirement::collection(
-                    source_collection,
+                    source_collection.as_str(),
                     Permission::Read,
                 ));
                 out.push(AuthorizationRequirement::collection(
-                    dest_collection,
+                    dest_collection.as_str(),
                     Permission::Write,
                 ));
             }
@@ -77,16 +77,16 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | CrdtOp::GetVersionVector { collection, .. }
                 | CrdtOp::ExportDelta { collection, .. }
                 | CrdtOp::CompactAtVersion { collection, .. },
-            ) => add_collection_requirement(collection, required_permission(plan), out),
+            ) => add_collection_requirement(collection.as_str(), required_permission(plan), out),
             PhysicalPlan::Graph(GraphOp::EdgePut { collection, .. })
             | PhysicalPlan::Graph(GraphOp::EdgeDelete { collection, .. }) => {
-                add_collection_requirement(collection, required_permission(plan), out);
+                add_collection_requirement(collection.as_str(), required_permission(plan), out);
             }
             PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges })
             | PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { edges }) => {
                 let permission = required_permission(plan);
                 for edge in edges {
-                    add_collection_requirement(&edge.collection, permission, out);
+                    add_collection_requirement(edge.collection.as_str(), permission, out);
                 }
             }
             PhysicalPlan::Meta(
@@ -99,7 +99,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | MetaOp::QueryLastValues { collection }
                 | MetaOp::QueryLastValue { collection, .. }
                 | MetaOp::RebuildIndex { collection, .. },
-            ) => add_collection_requirement(collection, required_permission(plan), out),
+            ) => add_collection_requirement(collection.as_str(), required_permission(plan), out),
             PhysicalPlan::Meta(
                 MetaOp::UnregisterCollection { name, .. }
                 | MetaOp::UnregisterMaterializedView { name, .. }
@@ -111,8 +111,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 ..
             }) => {
                 let permission = required_permission(plan);
-                add_collection_requirement(old_collection, permission, out);
-                add_collection_requirement(new_collection, permission, out);
+                add_collection_requirement(old_collection.as_str(), permission, out);
+                add_collection_requirement(new_collection.as_str(), permission, out);
             }
             PhysicalPlan::Meta(MetaOp::TransactionBatch { plans, .. })
             | PhysicalPlan::Meta(MetaOp::ResolveTxn { plans, .. })
@@ -128,7 +128,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             }
             PhysicalPlan::Kv(KvOp::Transfer { collection, .. }) => {
                 out.push(AuthorizationRequirement::collection(
-                    collection,
+                    collection.as_str(),
                     Permission::Write,
                 ));
             }
@@ -144,8 +144,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                     source_collection,
                     ..
                 } => {
-                    add_collection_requirement(target_collection, Permission::Read, out);
-                    add_collection_requirement(source_collection, Permission::Read, out);
+                    add_collection_requirement(target_collection.as_str(), Permission::Read, out);
+                    add_collection_requirement(source_collection.as_str(), Permission::Read, out);
                 }
                 // Point/bulk writes read exactly the collection they'd write.
                 DocumentOp::PointUpdate { collection, .. }
@@ -153,7 +153,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | DocumentOp::Upsert { collection, .. }
                 | DocumentOp::BulkUpdate { collection, .. }
                 | DocumentOp::BulkDelete { collection, .. } => {
-                    add_collection_requirement(collection, Permission::Read, out);
+                    add_collection_requirement(collection.as_str(), Permission::Read, out);
                 }
                 // No other op is ever wrapped; an empty set falls back to a tenant-wide
                 // check below — fail-closed, not a bypass. Enumerated so a new op is a compile error.
@@ -179,7 +179,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             // Per-mutation: `PhysicalPlan::collection` reports none of the rows touched.
             PhysicalPlan::Document(DocumentOp::ResolvedWrite { mutations, .. }) => {
                 for mutation in mutations {
-                    add_collection_requirement(mutation.collection(), Permission::Write, out);
+                    add_collection_requirement(mutation.collection().as_str(), Permission::Write, out);
                 }
             }
             // Read-only probe over exactly the rows the wrapped write reads.
@@ -192,7 +192,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             // neither reported by `KvOp::collection`.
             PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => {
                 for mutation in mutations {
-                    add_collection_requirement(mutation.collection(), Permission::Write, out);
+                    add_collection_requirement(mutation.collection().as_str(), Permission::Write, out);
                 }
             }
             PhysicalPlan::Kv(
@@ -290,7 +290,9 @@ fn kv_op_collections(op: &nodedb_physical::physical_plan::KvOp) -> Vec<&str> {
             dest_collection,
             ..
         } => vec![source_collection.as_str(), dest_collection.as_str()],
-        KvOp::ResolvedWrite { mutations, .. } => mutations.iter().map(|m| m.collection()).collect(),
+        KvOp::ResolvedWrite { mutations, .. } => {
+            mutations.iter().map(|m| m.collection().as_str()).collect()
+        }
         KvOp::ResolveWrite(inner) => kv_op_collections(inner),
         other @ (KvOp::Get { .. }
         | KvOp::Put { .. }

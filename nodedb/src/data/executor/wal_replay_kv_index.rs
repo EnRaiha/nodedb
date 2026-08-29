@@ -130,7 +130,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -195,7 +195,7 @@ mod tests {
 
     fn seed_put(collection: &str, key: &[u8], name: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             key: key.to_vec(),
             value: nodedb_types::json_to_msgpack(&serde_json::json!({ "name": name }))
                 .expect("encode seed doc"),
@@ -225,7 +225,7 @@ mod tests {
             seed_put("players", b"p1", "alice"),
             seed_put("players", b"p2", "bob"),
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "players".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
                 field: "name".into(),
                 field_position: 0,
                 backfill: true,
@@ -254,7 +254,7 @@ mod tests {
             seed_put("players", b"p1", "alice"),
             seed_put("players", b"p2", "bob"),
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "players".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
                 field: "name".into(),
                 field_position: 0,
                 backfill: false,
@@ -280,7 +280,7 @@ mod tests {
         let plans = &[
             seed_put("players", b"p1", "alice"),
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "players".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
                 field: "name".into(),
                 field_position: 0,
                 backfill: false,
@@ -309,13 +309,13 @@ mod tests {
         let plans = &[
             seed_put("players", b"p1", "alice"),
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "players".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
                 field: "name".into(),
                 field_position: 0,
                 backfill: true,
             }),
             PhysicalPlan::Kv(KvOp::DropIndex {
-                collection: "players".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
                 field: "name".into(),
             }),
         ];

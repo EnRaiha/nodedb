@@ -168,10 +168,10 @@ pub(super) fn classify_graph_op(
             dst_surrogate,
             ..
         } => {
-            collections.insert(collection.clone());
+            collections.insert(collection.to_string());
             edge_surrogates.insert(
                 (
-                    collection.clone(),
+                    collection.to_string(),
                     src_id.clone(),
                     label.clone(),
                     dst_id.clone(),
@@ -182,10 +182,10 @@ pub(super) fn classify_graph_op(
         }
         GraphOp::EdgePutBatch { edges } => {
             for edge in edges {
-                collections.insert(edge.collection.clone());
+                collections.insert(edge.collection.to_string());
                 edge_surrogates.insert(
                     (
-                        edge.collection.clone(),
+                        edge.collection.to_string(),
                         edge.src_id.clone(),
                         edge.label.clone(),
                         edge.dst_id.clone(),
@@ -199,12 +199,12 @@ pub(super) fn classify_graph_op(
         // Edge delete: the redo delete tuple carries no surrogate, so only
         // the collection is needed to walk the overlay's tombstone set.
         GraphOp::EdgeDelete { collection, .. } => {
-            collections.insert(collection.clone());
+            collections.insert(collection.to_string());
             Ok(())
         }
         GraphOp::EdgeDeleteBatch { edges } => {
             for edge in edges {
-                collections.insert(edge.collection.clone());
+                collections.insert(edge.collection.to_string());
             }
             Ok(())
         }

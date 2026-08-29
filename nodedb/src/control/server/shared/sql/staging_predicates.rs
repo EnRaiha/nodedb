@@ -239,6 +239,7 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     #[test]
     fn extract_affected_count_reads_msgpack_payload() {
@@ -275,7 +276,7 @@ mod tests {
 
         // RETURNING doesn't force the buffer path: these stage and render an affected-count tag.
         let point_update = PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -290,7 +291,7 @@ mod tests {
         assert_eq!(staged_tag_kind(&point_update, &[]), StagedTagKind::Update);
 
         let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -303,7 +304,7 @@ mod tests {
         assert_eq!(staged_tag_kind(&point_delete, &[]), StagedTagKind::Delete);
 
         let bulk_update = PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             filters: Vec::new(),
             updates: Vec::new(),
             returning: ret(),
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(staged_tag_kind(&bulk_update, &[]), StagedTagKind::Update);
 
         let bulk_delete = PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             filters: Vec::new(),
             returning: ret(),
             ollp_predicted_surrogates: None,
@@ -333,7 +334,7 @@ mod tests {
     #[test]
     fn is_stageable_write_accepts_the_kv_atomics_and_batch_put() {
         assert!(is_stageable_write(&kv_plan(KvOp::Incr {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             delta: 1,
             ttl_ms: 0,
@@ -341,14 +342,14 @@ mod tests {
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::IncrFloat {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             delta: 1.0,
             surrogate: nodedb_types::Surrogate::ZERO,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::Cas {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             expected: vec![],
             new_value: b"v".to_vec(),
@@ -356,7 +357,7 @@ mod tests {
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::GetSet {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             new_value: b"v".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -364,7 +365,7 @@ mod tests {
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::BatchPut {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
             surrogates: vec![nodedb_types::Surrogate::ZERO],
@@ -378,7 +379,7 @@ mod tests {
         let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "value": 5 })).unwrap();
         for op in [
             KvOp::Incr {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 delta: 1,
                 ttl_ms: 0,
@@ -386,14 +387,14 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             },
             KvOp::IncrFloat {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 delta: 1.0,
                 surrogate: nodedb_types::Surrogate::ZERO,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             },
             KvOp::Cas {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 expected: vec![],
                 new_value: b"v".to_vec(),
@@ -401,7 +402,7 @@ mod tests {
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             },
             KvOp::GetSet {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 new_value: b"v".to_vec(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -421,7 +422,7 @@ mod tests {
     fn staged_kv_tag_kind_batch_put_is_insert() {
         let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": 2 })).unwrap();
         let op = KvOp::BatchPut {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
             surrogates: vec![nodedb_types::Surrogate::ZERO],
@@ -434,13 +435,13 @@ mod tests {
     #[test]
     fn is_stageable_write_accepts_expire_and_persist() {
         assert!(is_stageable_write(&kv_plan(KvOp::Expire {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             ttl_ms: 1_000,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::Persist {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
@@ -450,13 +451,13 @@ mod tests {
     fn staged_kv_tag_kind_expire_and_persist_are_update() {
         let payload = nodedb_types::json_to_msgpack(&serde_json::json!({})).unwrap();
         let expire = KvOp::Expire {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             ttl_ms: 1_000,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         };
         let persist = KvOp::Persist {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         };

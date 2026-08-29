@@ -143,7 +143,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -211,7 +211,7 @@ mod tests {
 
     fn seed_put(collection: &str, key: &[u8], doc: serde_json::Value) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             key: key.to_vec(),
             value: nodedb_types::json_to_msgpack(&doc).expect("encode seed doc"),
             ttl_ms: 0,
@@ -234,7 +234,7 @@ mod tests {
 
     fn register_plan(args: RegisterPlanArgs<'_>) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-            collection: args.collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, args.collection),
             index_name: args.index_name.into(),
             sort_columns: args
                 .sort_columns

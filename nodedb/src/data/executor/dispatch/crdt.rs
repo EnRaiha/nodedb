@@ -14,13 +14,13 @@ impl CoreLoop {
             CrdtOp::Read {
                 collection,
                 document_id,
-            } => self.execute_crdt_read(task, collection, document_id),
+            } => self.execute_crdt_read(task, collection.as_str(), document_id),
 
             CrdtOp::PreviewApply {
                 collection,
                 document_id,
                 delta,
-            } => self.execute_crdt_preview_apply(task, collection, document_id, delta),
+            } => self.execute_crdt_preview_apply(task, collection.as_str(), document_id, delta),
 
             CrdtOp::Apply {
                 collection,
@@ -35,7 +35,7 @@ impl CoreLoop {
             } => self.execute_crdt_apply(
                 task,
                 crate::data::executor::handlers::control::crdt_apply::CrdtApplyParams {
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     delta,
                     surrogate: *surrogate,
@@ -69,7 +69,7 @@ impl CoreLoop {
             } => self.execute_crdt_apply(
                 task,
                 crate::data::executor::handlers::control::crdt_apply::CrdtApplyParams {
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     delta,
                     surrogate: *surrogate,
@@ -89,15 +89,15 @@ impl CoreLoop {
                 tenant_id,
                 collection,
                 bytes,
-            } => self.execute_crdt_import_snapshot(task, *tenant_id, collection, bytes),
+            } => self.execute_crdt_import_snapshot(task, *tenant_id, collection.as_str(), bytes),
 
             CrdtOp::SetPolicy {
                 collection,
                 policy_json,
-            } => self.execute_set_collection_policy(task, collection, policy_json),
+            } => self.execute_set_collection_policy(task, collection.as_str(), policy_json),
 
             CrdtOp::GetPolicy { collection } => {
-                self.execute_get_collection_policy(task, collection)
+                self.execute_get_collection_policy(task, collection.as_str())
             }
 
             CrdtOp::SetConstraints {
@@ -106,7 +106,7 @@ impl CoreLoop {
                 constraints,
             } => self.execute_crdt_set_constraints(
                 task,
-                collection,
+                collection.as_str(),
                 *constraint_version,
                 constraints,
             ),
@@ -114,10 +114,10 @@ impl CoreLoop {
             CrdtOp::DropConstraints {
                 collection,
                 constraint_version,
-            } => self.execute_crdt_drop_constraints(task, collection, *constraint_version),
+            } => self.execute_crdt_drop_constraints(task, collection.as_str(), *constraint_version),
 
             CrdtOp::ReadConstraints { collection } => {
-                self.execute_crdt_read_constraints(task, collection)
+                self.execute_crdt_read_constraints(task, collection.as_str())
             }
 
             CrdtOp::ReadAtVersion {
@@ -126,31 +126,36 @@ impl CoreLoop {
                 version_vector_json,
             } => self.execute_crdt_read_at_version(
                 task,
-                collection,
+                collection.as_str(),
                 document_id,
                 version_vector_json,
             ),
 
             CrdtOp::GetVersionVector { collection } => {
-                self.execute_crdt_get_version_vector(task, collection)
+                self.execute_crdt_get_version_vector(task, collection.as_str())
             }
 
             CrdtOp::ExportDelta {
                 collection,
                 from_version_json,
-            } => self.execute_crdt_export_delta(task, collection, from_version_json),
+            } => self.execute_crdt_export_delta(task, collection.as_str(), from_version_json),
 
             CrdtOp::RestoreToVersion {
                 collection,
                 document_id,
                 target_version_json,
                 surrogate: _,
-            } => self.execute_crdt_restore(task, collection, document_id, target_version_json),
+            } => self.execute_crdt_restore(
+                task,
+                collection.as_str(),
+                document_id,
+                target_version_json,
+            ),
 
             CrdtOp::CompactAtVersion {
                 collection,
                 target_version_json,
-            } => self.execute_crdt_compact(task, collection, target_version_json),
+            } => self.execute_crdt_compact(task, collection.as_str(), target_version_json),
 
             CrdtOp::ListInsert {
                 collection,
@@ -161,7 +166,7 @@ impl CoreLoop {
                 surrogate: _,
             } => self.execute_crdt_list_insert(
                 task,
-                collection,
+                collection.as_str(),
                 document_id,
                 list_path,
                 *index,
@@ -174,7 +179,13 @@ impl CoreLoop {
                 list_path,
                 index,
                 surrogate: _,
-            } => self.execute_crdt_list_delete(task, collection, document_id, list_path, *index),
+            } => self.execute_crdt_list_delete(
+                task,
+                collection.as_str(),
+                document_id,
+                list_path,
+                *index,
+            ),
 
             CrdtOp::ListMove {
                 collection,
@@ -185,7 +196,7 @@ impl CoreLoop {
                 surrogate: _,
             } => self.execute_crdt_list_move(
                 task,
-                collection,
+                collection.as_str(),
                 document_id,
                 list_path,
                 *from_index,
@@ -203,7 +214,7 @@ impl CoreLoop {
             } => self.execute_crdt_doc_upsert(
                 task,
                 crate::data::executor::handlers::control::crdt_doc::CrdtDocUpsert {
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     fields_json,
                     surrogate: *surrogate,
@@ -222,7 +233,7 @@ impl CoreLoop {
             } => self.execute_crdt_doc_delete(
                 task,
                 crate::data::executor::handlers::control::crdt_doc::CrdtDocDelete {
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     returning: returning.as_ref(),

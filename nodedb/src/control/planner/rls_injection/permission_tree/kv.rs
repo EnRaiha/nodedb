@@ -142,7 +142,10 @@ mod tests {
     fn get_receives_the_subtree_filter() {
         let cache = cache_with_tree("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -162,7 +165,10 @@ mod tests {
     fn get_ttl_is_refused_under_a_tree() {
         let cache = cache_with_tree("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
         });
         assert_refused(apply(&mut plan, &cache), "sessions");

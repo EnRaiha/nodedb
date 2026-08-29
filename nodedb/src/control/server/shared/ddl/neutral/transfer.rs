@@ -90,7 +90,7 @@ pub async fn transfer(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         source_key: source_bytes,
         dest_key: dest_bytes,
         field,
@@ -169,8 +169,14 @@ pub async fn transfer_item(
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).
     let plan = PhysicalPlan::Kv(KvOp::TransferItem {
-        source_collection: source_collection.clone(),
-        dest_collection: dest_collection.clone(),
+        source_collection: nodedb_types::QualifiedCollection::new(
+            DatabaseId::DEFAULT,
+            &source_collection,
+        ),
+        dest_collection: nodedb_types::QualifiedCollection::new(
+            DatabaseId::DEFAULT,
+            &dest_collection,
+        ),
         item_key: item_key.into_bytes(),
         dest_key: dest_bytes,
         surrogate,

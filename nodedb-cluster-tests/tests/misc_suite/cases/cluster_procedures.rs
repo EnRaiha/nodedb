@@ -38,7 +38,7 @@ fn procedure_dml_creates_replicated_entry() {
     // Each DML statement in a procedure body is dispatched through the
     // normal query planner, producing a replicated entry for Raft.
     let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "archive".into(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
         document_id: "a-1".into(),
         value: b"{}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -60,7 +60,7 @@ fn procedure_dml_creates_replicated_entry() {
 #[test]
 fn procedure_reads_not_replicated() {
     let plan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: "archive".into(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
         limit: 100,
         offset: 0,
         sort_keys: vec![],
@@ -97,7 +97,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
         vshard_id: VShardId::new(0),
         database_id: DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
             document_id: "o-1".into(),
             value: b"{}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -114,7 +114,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
         vshard_id: VShardId::new(0),
         database_id: DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "temp".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "temp"),
             document_id: "t-1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -155,7 +155,7 @@ fn procedure_can_target_multiple_vshards() {
         vshard_id: VShardId::new(0),
         database_id: DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "a".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "a"),
             document_id: "d1".into(),
             value: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -173,7 +173,7 @@ fn procedure_can_target_multiple_vshards() {
         vshard_id: VShardId::new(1),
         database_id: DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "b".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "b"),
             document_id: "d2".into(),
             value: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,

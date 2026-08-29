@@ -182,7 +182,7 @@ pub async fn resolve_shuffle_aggregate(
 
     // 4. Producer node set for the source collection (single-vShard-homed → one
     //    leader, but compute generally and dedup).
-    let producers = producer_nodes(&routing_snapshot, database_id, &collection)?;
+    let producers = producer_nodes(&routing_snapshot, database_id, collection.as_str())?;
     let producer_count = producers.len() as u32;
     if producer_count == 0 {
         return Err(crate::Error::Internal {

@@ -54,24 +54,25 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
                 predicate,
                 body,
                 tenant_id.as_u64(),
-                &target_collection,
+                target_collection.as_str(),
             )?;
         }
     }
 
     let catalog = state.credentials.catalog();
-    let target_bare = bare_collection_name(task.database_id, &target_collection);
+    let target_bare = bare_collection_name(task.database_id, target_collection.as_str());
     let target = catalog
         .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
         .ok_or_else(|| crate::Error::CollectionNotFound {
             tenant_id,
-            collection: target_collection.clone(),
+            collection: target_collection.to_string(),
         })?;
     let target_pk = resolve_target_pk(&target, "UPDATE ... FROM")?;
 
     // Recomputed rather than reusing the staged task's vShard, keeping dispatch
     // classification honest, like the MERGE / INSERT SELECT expanders.
-    let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
+    let vshard_id =
+        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
 
     // A join-column rewrite debits the target left and credits the one joined —
     // resolving post-images alone would leave the abandoned target overstated.
@@ -83,7 +84,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
         crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
             state,
             &sum_bodies,
-            &target_collection,
+            target_collection.as_str(),
             tenant_id,
             task.database_id,
             crate::types::TraceId::ZERO,
@@ -149,7 +150,7 @@ async fn resolve_update_rows(
         state,
         tenant_id,
         task.database_id,
-        source_collection,
+        source_collection.as_str(),
         task.txn_id,
     )
     .await?;
@@ -179,7 +180,7 @@ async fn resolve_update_rows(
         state,
         tenant_id,
         task.database_id,
-        target_collection,
+        target_collection.as_str(),
         resolve_plan,
         task.txn_id,
     )

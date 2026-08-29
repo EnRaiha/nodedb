@@ -18,6 +18,7 @@ use nodedb::control::gateway::GatewayErrorMap;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::{RequestId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -63,7 +64,10 @@ async fn resp_gateway_migration_single_node_set_get() {
 
     // SET — mirrors RESP SET command going through dispatch_kv_write → gateway.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "resp_gw_single".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "resp_gw_single",
+        ),
         key: b"mykey".to_vec(),
         value: mp_string("myvalue"),
         ttl_ms: 0,
@@ -81,7 +85,10 @@ async fn resp_gateway_migration_single_node_set_get() {
 
     // GET — mirrors RESP GET command going through dispatch_kv → gateway.
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "resp_gw_single".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "resp_gw_single",
+        ),
         key: b"mykey".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -129,7 +136,10 @@ async fn resp_gateway_migration_cross_node_get() {
     let ctx = test_ctx();
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "resp_gw_cross".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "resp_gw_cross",
+        ),
         key: b"cross-key".to_vec(),
         value: mp_string("cross-value"),
         ttl_ms: 0,
@@ -149,7 +159,10 @@ async fn resp_gateway_migration_cross_node_get() {
     let follower_gw = Gateway::new(Arc::clone(&cluster.nodes[1].shared));
 
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "resp_gw_cross".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "resp_gw_cross",
+        ),
         key: b"cross-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,

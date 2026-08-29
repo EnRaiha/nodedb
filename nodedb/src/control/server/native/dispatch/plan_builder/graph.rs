@@ -2,6 +2,7 @@
 
 //! Graph operation plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 use sonic_rs;
 
@@ -29,6 +30,7 @@ fn clamped_depth(value: Option<u32>, default: usize, field: &str) -> crate::Resu
 }
 
 pub(crate) fn build_rag_fusion(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -39,7 +41,7 @@ pub(crate) fn build_rag_fusion(
             detail: "missing 'query_vector'".to_string(),
         })?;
     Ok(PhysicalPlan::Graph(GraphOp::RagFusion {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         query_vector: query_vector.clone(),
         vector_top_k: fields.vector_top_k.unwrap_or(20) as usize,
         edge_label: fields.edge_label.clone(),
@@ -58,7 +60,7 @@ pub(crate) fn build_rag_fusion(
     }))
 }
 
-pub(crate) fn build_hop(fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_hop(ctx: &DispatchCtx<'_>, fields: &TextFields) -> crate::Result<PhysicalPlan> {
     let start = fields
         .start_node
         .as_ref()
@@ -66,7 +68,10 @@ pub(crate) fn build_hop(fields: &TextFields) -> crate::Result<PhysicalPlan> {
             detail: "missing 'start_node'".to_string(),
         })?;
     Ok(PhysicalPlan::Graph(GraphOp::Hop {
-        collection: fields.collection.as_deref().map(str::to_lowercase),
+        collection: fields
+            .collection
+            .as_deref()
+            .map(|c| QualifiedCollection::new(ctx.database_id(), &c.to_lowercase())),
         start_nodes: vec![start.clone()],
         depth: clamped_depth(fields.depth, 2, "depth")?,
         edge_label: fields.edge_label.clone(),
@@ -77,7 +82,10 @@ pub(crate) fn build_hop(fields: &TextFields) -> crate::Result<PhysicalPlan> {
     }))
 }
 
-pub(crate) fn build_neighbors(fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_neighbors(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let start = fields
         .start_node
         .as_ref()
@@ -85,7 +93,10 @@ pub(crate) fn build_neighbors(fields: &TextFields) -> crate::Result<PhysicalPlan
             detail: "missing 'start_node'".to_string(),
         })?;
     Ok(PhysicalPlan::Graph(GraphOp::Neighbors {
-        collection: fields.collection.as_deref().map(str::to_lowercase),
+        collection: fields
+            .collection
+            .as_deref()
+            .map(|c| QualifiedCollection::new(ctx.database_id(), &c.to_lowercase())),
         node_id: start.clone(),
         edge_label: fields.edge_label.clone(),
         direction: parse_direction(fields.direction.as_deref()),
@@ -93,7 +104,10 @@ pub(crate) fn build_neighbors(fields: &TextFields) -> crate::Result<PhysicalPlan
     }))
 }
 
-pub(crate) fn build_path(fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_path(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let from = fields
         .start_node
         .as_ref()
@@ -107,7 +121,10 @@ pub(crate) fn build_path(fields: &TextFields) -> crate::Result<PhysicalPlan> {
             detail: "missing 'end_node'".to_string(),
         })?;
     Ok(PhysicalPlan::Graph(GraphOp::Path {
-        collection: fields.collection.as_deref().map(str::to_lowercase),
+        collection: fields
+            .collection
+            .as_deref()
+            .map(|c| QualifiedCollection::new(ctx.database_id(), &c.to_lowercase())),
         src: from.clone(),
         dst: to.clone(),
         max_depth: clamped_depth(fields.depth, 10, "depth")?,
@@ -118,7 +135,10 @@ pub(crate) fn build_path(fields: &TextFields) -> crate::Result<PhysicalPlan> {
     }))
 }
 
-pub(crate) fn build_subgraph(fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_subgraph(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let start = fields
         .start_node
         .as_ref()
@@ -126,7 +146,10 @@ pub(crate) fn build_subgraph(fields: &TextFields) -> crate::Result<PhysicalPlan>
             detail: "missing 'start_node'".to_string(),
         })?;
     Ok(PhysicalPlan::Graph(GraphOp::Subgraph {
-        collection: fields.collection.as_deref().map(str::to_lowercase),
+        collection: fields
+            .collection
+            .as_deref()
+            .map(|c| QualifiedCollection::new(ctx.database_id(), &c.to_lowercase())),
         start_nodes: vec![start.clone()],
         depth: clamped_depth(fields.depth, 2, "depth")?,
         edge_label: fields.edge_label.clone(),
@@ -182,7 +205,7 @@ pub(crate) fn build_edge_put(
         dst.as_bytes(),
     )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgePut {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         src_id: src.clone(),
         label: label.clone(),
         dst_id: dst.clone(),
@@ -236,7 +259,7 @@ pub(crate) fn build_edge_delete(
         dst.as_bytes(),
     )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgeDelete {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         src_id: src.clone(),
         label: label.clone(),
         dst_id: dst.clone(),

@@ -10,14 +10,17 @@
 
 use super::*;
 use nodedb_physical::physical_plan::{BatchEdge, CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp};
-use nodedb_types::{PayloadIndexKind, Surrogate, VectorQuantization, VectorStorageDtype};
+use nodedb_types::{
+    DatabaseId, PayloadIndexKind, QualifiedCollection, Surrogate, VectorQuantization,
+    VectorStorageDtype,
+};
 
 // ── CrdtOp ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn is_write_plan_true_for_crdt_apply() {
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "id1".to_owned(),
         delta: Vec::new(),
         peer_id: 0,
@@ -33,7 +36,7 @@ fn is_write_plan_true_for_crdt_apply() {
 #[test]
 fn is_write_plan_true_for_crdt_set_constraints() {
     let plan = PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         constraint_version: 1,
         constraints: Vec::new(),
     });
@@ -46,7 +49,7 @@ fn is_write_plan_true_for_crdt_set_constraints() {
 #[test]
 fn is_write_plan_true_for_crdt_drop_constraints() {
     let plan = PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         constraint_version: 1,
     });
     assert!(
@@ -58,7 +61,7 @@ fn is_write_plan_true_for_crdt_drop_constraints() {
 #[test]
 fn is_write_plan_true_for_crdt_restore_to_version() {
     let plan = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "id1".to_owned(),
         target_version_json: "{}".to_owned(),
         surrogate: Surrogate::new(1),
@@ -73,7 +76,7 @@ fn is_write_plan_true_for_crdt_restore_to_version() {
 fn is_write_plan_true_for_crdt_import_snapshot() {
     let plan = PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
         tenant_id: 1,
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         bytes: Vec::new(),
     });
     assert!(
@@ -87,7 +90,7 @@ fn is_write_plan_true_for_crdt_import_snapshot() {
 #[test]
 fn is_write_plan_true_for_document_truncate() {
     let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-        collection: "docs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         restart_identity: false,
         resolved_sum_targets: Vec::new(),
     });
@@ -99,7 +102,7 @@ fn is_write_plan_true_for_document_truncate() {
 #[test]
 fn is_write_plan_true_for_kv_truncate() {
     let plan = PhysicalPlan::Kv(KvOp::Truncate {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
     });
     assert!(is_write_plan(&plan), "KvOp::Truncate must be a write");
 }
@@ -107,7 +110,7 @@ fn is_write_plan_true_for_kv_truncate() {
 #[test]
 fn is_write_plan_true_for_kv_expire() {
     let plan = PhysicalPlan::Kv(KvOp::Expire {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         ttl_ms: 1000,
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -118,7 +121,7 @@ fn is_write_plan_true_for_kv_expire() {
 #[test]
 fn is_write_plan_true_for_kv_persist() {
     let plan = PhysicalPlan::Kv(KvOp::Persist {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
@@ -128,7 +131,7 @@ fn is_write_plan_true_for_kv_persist() {
 #[test]
 fn is_write_plan_true_for_kv_field_set() {
     let plan = PhysicalPlan::Kv(KvOp::FieldSet {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         updates: vec![("field".to_owned(), b"v".to_vec())],
         surrogate: Surrogate::new(1),
@@ -140,7 +143,7 @@ fn is_write_plan_true_for_kv_field_set() {
 #[test]
 fn is_write_plan_true_for_kv_incr() {
     let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         delta: 1,
         ttl_ms: 0,
@@ -153,7 +156,7 @@ fn is_write_plan_true_for_kv_incr() {
 #[test]
 fn is_write_plan_true_for_kv_incr_float() {
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         delta: 1.5,
         surrogate: Surrogate::new(1),
@@ -165,7 +168,7 @@ fn is_write_plan_true_for_kv_incr_float() {
 #[test]
 fn is_write_plan_true_for_kv_cas() {
     let plan = PhysicalPlan::Kv(KvOp::Cas {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         expected: b"old".to_vec(),
         new_value: b"new".to_vec(),
@@ -178,7 +181,7 @@ fn is_write_plan_true_for_kv_cas() {
 #[test]
 fn is_write_plan_true_for_kv_get_set() {
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
-        collection: "cache".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         new_value: b"new".to_vec(),
         surrogate: Surrogate::new(1),
@@ -191,7 +194,7 @@ fn is_write_plan_true_for_kv_get_set() {
 #[test]
 fn is_write_plan_true_for_kv_transfer() {
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
-        collection: "accounts".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         source_key: b"a".to_vec(),
         dest_key: b"b".to_vec(),
         field: "balance".to_owned(),
@@ -208,7 +211,7 @@ fn is_write_plan_true_for_kv_transfer() {
 #[test]
 fn is_write_plan_true_for_vector_multi_vector_delete() {
     let plan = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-        collection: "vecs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field_name: "colbert".to_owned(),
         document_surrogate: Surrogate::new(2),
     });
@@ -221,7 +224,7 @@ fn is_write_plan_true_for_vector_multi_vector_delete() {
 #[test]
 fn is_write_plan_true_for_vector_direct_upsert() {
     let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-        collection: "vecs".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
         field: "emb".to_owned(),
         surrogate: Surrogate::new(3),
         vector: vec![0.5, 0.6],
@@ -243,7 +246,7 @@ fn is_write_plan_true_for_vector_direct_upsert() {
 #[test]
 fn is_write_plan_true_for_graph_edge_put_batch() {
     let edge = BatchEdge {
-        collection: "follows".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "follows"),
         src_id: "a".to_owned(),
         label: "knows".to_owned(),
         dst_id: "b".to_owned(),
@@ -260,7 +263,7 @@ fn is_write_plan_true_for_graph_edge_put_batch() {
 #[test]
 fn is_write_plan_true_for_graph_edge_delete_batch() {
     let edge = BatchEdge {
-        collection: "follows".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "follows"),
         src_id: "a".to_owned(),
         label: "knows".to_owned(),
         dst_id: "b".to_owned(),
@@ -302,7 +305,7 @@ fn is_write_plan_true_for_graph_remove_node_labels() {
 
 fn balance_delta_plan() -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
-        collection: "accounts".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
         document_id: "0000010f".to_owned(),
         surrogate: Surrogate::new(271),
         column: "balance".to_owned(),
@@ -314,7 +317,7 @@ fn balance_delta_plan() -> PhysicalPlan {
 
 fn point_insert_plan() -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: "entries".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
         document_id: "e1".to_owned(),
         value: Vec::new(),
         if_absent: false,

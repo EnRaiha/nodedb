@@ -156,7 +156,7 @@ pub async fn upsert_document(
             identity,
             database_id,
             scope.auth(),
-            &parsed.coll_name,
+            &nodedb_types::QualifiedCollection::new(database_id, &parsed.coll_name),
             pk,
         )
         .await

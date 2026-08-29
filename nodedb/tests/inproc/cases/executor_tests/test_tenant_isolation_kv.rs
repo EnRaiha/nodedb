@@ -6,6 +6,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -20,7 +21,7 @@ fn kv_get_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "cache".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
             key: b"session_abc".to_vec(),
             value: b"tenant_a_session_data".to_vec(),
             ttl_ms: 0,
@@ -37,7 +38,7 @@ fn kv_get_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "cache".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
             key: b"session_abc".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -56,7 +57,7 @@ fn kv_get_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "cache".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
             key: b"session_abc".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

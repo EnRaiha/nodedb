@@ -35,9 +35,13 @@ impl CoreLoop {
         let now_ms = self.kv_ttl_now_ms(task);
 
         for mutation in mutations {
-            let current =
-                self.kv_engine
-                    .get(did, tid, mutation.collection(), mutation.key(), now_ms);
+            let current = self.kv_engine.get(
+                did,
+                tid,
+                mutation.collection().as_str(),
+                mutation.key(),
+                now_ms,
+            );
             if current.as_deref() != mutation.precondition() {
                 return self.response_error(task, ErrorCode::OllpRetryRequired);
             }
@@ -58,7 +62,8 @@ impl CoreLoop {
                 value,
                 ..
             } = mutation
-                && let Err(error) = admit_kv_row(rls_write_check, value, key, tid, collection)
+                && let Err(error) =
+                    admit_kv_row(rls_write_check, value, key, tid, collection.as_str())
             {
                 return self.response_error(task, error);
             }
@@ -95,7 +100,7 @@ impl CoreLoop {
                     crate::engine::kv::KvPutParams {
                         database_id: did,
                         tenant_id: tid,
-                        collection,
+                        collection: collection.as_str(),
                         key,
                         value,
                         ttl_ms: *ttl_ms,
@@ -114,13 +119,13 @@ impl CoreLoop {
                 let key_str = String::from_utf8_lossy(key);
                 self.emit_write_event(
                     task,
-                    collection,
+                    collection.as_str(),
                     op,
                     &key_str,
                     Some(value),
                     precondition.as_deref(),
                 );
-                self.note_kv_write_lsn(task, did, tid, collection, key);
+                self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
             KvResolvedMutation::Delete {
                 collection,
@@ -128,20 +133,20 @@ impl CoreLoop {
                 precondition,
             } => {
                 self.kv_engine
-                    .delete(did, tid, collection, &[key.to_vec()], now_ms);
+                    .delete(did, tid, collection.as_str(), &[key.to_vec()], now_ms);
                 if let Some(ref m) = self.metrics {
                     m.record_kv_delete();
                 }
                 let key_str = String::from_utf8_lossy(key);
                 self.emit_write_event(
                     task,
-                    collection,
+                    collection.as_str(),
                     crate::event::WriteOp::Delete,
                     &key_str,
                     None,
                     precondition.as_deref(),
                 );
-                self.note_kv_write_lsn(task, did, tid, collection, key);
+                self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
             // No body change, so no event — matches the live handlers.
             KvResolvedMutation::Expire {
@@ -154,19 +159,19 @@ impl CoreLoop {
                 self.kv_engine.expire_with_absolute_expiry(
                     did,
                     tid,
-                    collection,
+                    collection.as_str(),
                     key,
                     resolved_now_ms.saturating_add(*ttl_ms),
                 );
-                self.note_kv_write_lsn(task, did, tid, collection, key);
+                self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
             KvResolvedMutation::Persist {
                 collection,
                 key,
                 precondition: _,
             } => {
-                self.kv_engine.persist(did, tid, collection, key);
-                self.note_kv_write_lsn(task, did, tid, collection, key);
+                self.kv_engine.persist(did, tid, collection.as_str(), key);
+                self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
         }
     }

@@ -573,7 +573,10 @@ mod tests {
 
     fn dummy_spatial_plan() -> PhysicalPlan {
         PhysicalPlan::Spatial(SpatialOp::Scan {
-            collection: "places".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "places",
+            ),
             field: "loc".into(),
             predicate: nodedb_physical::physical_plan::SpatialPredicate::DWithin,
             query_geometry: origin_point(),

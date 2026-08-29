@@ -35,9 +35,9 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             returning,
             rls_filters,
         } => {
-            refuse_governed_merge(collection, on_conflict_updates, rls_write_check)?;
+            refuse_governed_merge(collection.as_str(), on_conflict_updates, rls_write_check)?;
             columnar::columnar_ingest(ColumnarIngestFields {
-                collection,
+                collection: collection.as_str(),
                 payload,
                 format,
                 intent: *intent,
@@ -56,8 +56,8 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             filters,
             rls_write_check,
         } => {
-            refuse_governed_predicate_dml(collection, rls_write_check)?;
-            columnar::bulk_delete(collection, filters)
+            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
+            columnar::bulk_delete(collection.as_str(), filters)
         }
         ColumnarOp::Update {
             collection,
@@ -65,8 +65,8 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             updates,
             rls_write_check,
         } => {
-            refuse_governed_predicate_dml(collection, rls_write_check)?;
-            columnar::bulk_update(collection, filters, updates)
+            refuse_governed_predicate_dml(collection.as_str(), rls_write_check)?;
+            columnar::bulk_update(collection.as_str(), filters, updates)
         }
 
         // Already resolved: the wire shape carries the row set, never a
@@ -75,12 +75,12 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             collection,
             rows,
             rls_write_check: _,
-        } => columnar::bulk_resolved_update(collection, rows),
+        } => columnar::bulk_resolved_update(collection.as_str(), rows),
         ColumnarOp::ResolvedDelete {
             collection,
             pks,
             rls_write_check: _,
-        } => columnar::bulk_resolved_delete(collection, pks),
+        } => columnar::bulk_resolved_delete(collection.as_str(), pks),
 
         // Not a write — reads/scans. `ResolveDml` only reports the row set a DML would touch.
         ColumnarOp::Scan { .. }
@@ -147,7 +147,7 @@ pub(super) fn timeseries_write(op: &TimeseriesOp) -> Option<ReplicatedWrite> {
             returning,
             rls_filters,
         } => columnar::timeseries_ingest(
-            collection,
+            collection.as_str(),
             payload,
             format,
             surrogates,
@@ -171,7 +171,7 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
             text,
             provenance,
         } => columnar::fts_index(
-            collection,
+            collection.as_str(),
             surrogate.as_u32(),
             text,
             encode_provenance(provenance),
@@ -181,7 +181,7 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
             surrogate,
             provenance,
         } => columnar::fts_delete(
-            collection,
+            collection.as_str(),
             surrogate.as_u32(),
             encode_provenance(provenance),
         ),
@@ -207,7 +207,7 @@ pub(super) fn spatial_write(op: &SpatialOp) -> Option<ReplicatedWrite> {
             geometry,
             provenance,
         } => columnar::spatial_insert(
-            collection,
+            collection.as_str(),
             field,
             surrogate.as_u32(),
             geometry,
@@ -219,7 +219,7 @@ pub(super) fn spatial_write(op: &SpatialOp) -> Option<ReplicatedWrite> {
             surrogate,
             provenance,
         } => columnar::spatial_delete(
-            collection,
+            collection.as_str(),
             field,
             surrogate.as_u32(),
             encode_provenance(provenance),

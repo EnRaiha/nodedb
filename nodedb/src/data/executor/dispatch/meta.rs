@@ -84,7 +84,13 @@ impl CoreLoop {
                 collection,
                 target_type,
                 schema_json,
-            } => self.execute_convert_collection(task, tid, collection, target_type, schema_json),
+            } => self.execute_convert_collection(
+                task,
+                tid,
+                collection.as_str(),
+                target_type,
+                schema_json,
+            ),
 
             MetaOp::PurgeTenant { tenant_id } => self.execute_purge_tenant(task, *tenant_id),
 
@@ -115,16 +121,18 @@ impl CoreLoop {
             MetaOp::EnforceTimeseriesRetention {
                 collection,
                 max_age_ms,
-            } => self.meta_enforce_timeseries_retention(task, collection, *max_age_ms),
+            } => self.meta_enforce_timeseries_retention(task, collection.as_str(), *max_age_ms),
             MetaOp::ApplyContinuousAggRetention => self.meta_apply_continuous_agg_retention(task),
             MetaOp::QueryAggregateWatermark { aggregate_name } => {
                 self.meta_query_aggregate_watermark(task, aggregate_name)
             }
-            MetaOp::QueryLastValues { collection } => self.meta_query_last_values(task, collection),
+            MetaOp::QueryLastValues { collection } => {
+                self.meta_query_last_values(task, collection.as_str())
+            }
             MetaOp::QueryLastValue {
                 collection,
                 series_id,
-            } => self.meta_query_last_value(task, collection, *series_id),
+            } => self.meta_query_last_value(task, collection.as_str(), *series_id),
 
             MetaOp::AlterArray {
                 audit_retain_ms, ..
@@ -208,7 +216,7 @@ impl CoreLoop {
             } => self.execute_rebuild_index(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 index_name.as_deref(),
                 *concurrent,
             ),
@@ -234,8 +242,8 @@ impl CoreLoop {
                     tenant_id: *tenant_id,
                     old_database_id: *old_database_id,
                     new_database_id: *new_database_id,
-                    old_collection,
-                    new_collection,
+                    old_collection: old_collection.as_str(),
+                    new_collection: new_collection.as_str(),
                 },
             ),
 

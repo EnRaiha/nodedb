@@ -47,7 +47,7 @@ pub(super) fn resolver_for_timeseries_op(
         TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => return None,
     };
     Some(Box::new(TimeseriesWriteResolver {
-        collection: collection.clone(),
+        collection: collection.as_str().to_owned(),
         op: op.clone(),
     }))
 }

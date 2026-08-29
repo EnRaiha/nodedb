@@ -102,7 +102,7 @@ pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<Physi
             detail: "authenticated CRDT replay is missing sync provenance".into(),
         })?;
         Ok(PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             document_id: document_id.to_owned(),
             delta: delta.to_vec(),
             peer_id,
@@ -119,7 +119,7 @@ pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<Physi
         }))
     } else {
         Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             document_id: document_id.to_owned(),
             delta: delta.to_vec(),
             peer_id,
@@ -138,7 +138,7 @@ pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<Physi
 pub(super) fn import_collection(tenant_id: u64, collection: &str, bytes: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
         tenant_id,
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         bytes: bytes.to_vec(),
     })
 }
@@ -180,7 +180,7 @@ pub(super) fn list_insert(
         nodedb_types::Surrogate::new(surrogate),
     )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         index: list_index("index", index)?,
@@ -206,7 +206,7 @@ pub(super) fn list_delete(
         nodedb_types::Surrogate::new(surrogate),
     )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         index: list_index("index", index)?,
@@ -234,7 +234,7 @@ pub(super) fn list_move(
         nodedb_types::Surrogate::new(surrogate),
     )?;
     Ok(PhysicalPlan::Crdt(CrdtOp::ListMove {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         list_path: list_path.to_owned(),
         from_index: list_index("from_index", from_index)?,
@@ -257,7 +257,7 @@ pub(super) fn doc_upsert(
     rls_filters: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         fields_json: fields_json.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
@@ -279,7 +279,7 @@ pub(super) fn doc_delete(
     rls_filters: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::DocDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
         // Carried on the record — see `doc_upsert`.
@@ -296,12 +296,12 @@ pub(super) fn constraint_change(
 ) -> PhysicalPlan {
     match op {
         ConstraintChangeOp::Set => PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             constraint_version,
             constraints: constraints.to_vec(),
         }),
         ConstraintChangeOp::Drop => PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             constraint_version,
         }),
     }

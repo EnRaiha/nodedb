@@ -107,7 +107,7 @@ pub(super) struct ResolvedPut<'a> {
 /// One decided row write.
 pub(super) fn put_mutation(put: ResolvedPut<'_>) -> DocumentResolvedMutation {
     DocumentResolvedMutation::Put {
-        collection: put.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(put.collection.to_owned()),
         document_id: put.document_id.to_owned(),
         surrogate: put.surrogate,
         pk_bytes: put.document_id.as_bytes().to_vec(),
@@ -126,7 +126,7 @@ pub(super) fn delete_mutation(
     resolved_sum_targets: &[ResolvedSumTarget],
 ) -> DocumentResolvedMutation {
     DocumentResolvedMutation::Delete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         surrogate,
         pk_bytes: document_id.as_bytes().to_vec(),

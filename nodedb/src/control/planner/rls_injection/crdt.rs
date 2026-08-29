@@ -108,7 +108,10 @@ mod tests {
 
     fn crdt_read(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::Read {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: "d1".into(),
         })
     }
@@ -136,7 +139,10 @@ mod tests {
     fn doc_delete_receives_the_policy_filter() {
         let store = store_with_read_policy("notes");
         let mut plan = PhysicalPlan::Crdt(CrdtOp::DocDelete {
-            collection: "notes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "notes",
+            ),
             document_id: "d1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             returning: None,
@@ -160,7 +166,10 @@ mod tests {
 
         let store = store_with_write_policy("notes");
         let mut plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-            collection: "notes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "notes",
+            ),
             document_id: "d1".into(),
             fields_json: "{}".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -176,7 +185,10 @@ mod tests {
     fn get_policy_is_allowed_under_a_read_policy() {
         let store = store_with_read_policy("notes");
         let mut plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-            collection: "notes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "notes",
+            ),
         });
         assert!(inject(&mut plan, &store).is_ok());
     }

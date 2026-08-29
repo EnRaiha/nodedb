@@ -340,7 +340,10 @@ mod tests {
             VShardId::new(0),
             crate::bridge::envelope::PhysicalPlan::Columnar(
                 nodedb_physical::physical_plan::ColumnarOp::Scan {
-                    collection: COLLECTION.into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        DatabaseId::DEFAULT,
+                        COLLECTION,
+                    ),
                     projection: Vec::new(),
                     limit: 0,
                     filters: Vec::new(),

@@ -14,6 +14,8 @@ use nodedb_physical::physical_plan::{
 };
 
 use crate::types::{DatabaseId, VShardId};
+#[cfg(test)]
+use nodedb_types::QualifiedCollection;
 
 /// Where a `PhysicalPlan` routes for Calvin cross-shard scheduling purposes.
 ///
@@ -103,7 +105,10 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         // was derived from homes elsewhere, and the pair is dual-homed by the
         // two tasks' own vshards rather than by one plan claiming both.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         // Never scheduled: the write-resolve orchestrator proposes it through
         // Raft directly, on the vshard of the collection it resolved.
@@ -114,7 +119,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
             target_collection, ..
         } => PlanRouting::Vshards(vec![collection_vshard_in_database(
             database_id,
-            target_collection,
+            target_collection.as_str(),
         )]),
         // Both join the target with a DIFFERENT source collection; nothing on
         // the plan enforces the two live on the same vshard.
@@ -160,7 +165,10 @@ fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
         // that collection's vshard like every other single-collection write.
         | KvOp::PredicateUpdate { collection, .. }
         | KvOp::PredicateDelete { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         // Source and dest are DIFFERENT collections; no co-location guarantee.
         KvOp::TransferItem { .. } => PlanRouting::Unroutable(
@@ -203,7 +211,10 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         | VectorOp::MultiVectorInsert { collection, .. }
         | VectorOp::MultiVectorDelete { collection, .. }
         | VectorOp::DirectUpsert { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         VectorOp::Search { .. }
         | VectorOp::MultiSearch { .. }
@@ -280,7 +291,10 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
 fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         TimeseriesOp::Ingest { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         // Read-only: it reports the lines the wrapped ingest would store and
         // mutates nothing.
@@ -295,7 +309,10 @@ fn columnar_routing(op: &ColumnarOp, database_id: DatabaseId) -> PlanRouting {
         | ColumnarOp::Delete { collection, .. }
         | ColumnarOp::ResolvedUpdate { collection, .. }
         | ColumnarOp::ResolvedDelete { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         ColumnarOp::Scan { .. }
         | ColumnarOp::MaterializeScan { .. }
@@ -316,7 +333,10 @@ fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
         | CrdtOp::DropConstraints { collection, .. }
         | CrdtOp::RestoreToVersion { collection, .. }
         | CrdtOp::ImportSnapshot { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(
+                database_id,
+                collection.as_str(),
+            )])
         }
         CrdtOp::Read { .. }
         | CrdtOp::PreviewApply { .. }
@@ -395,7 +415,7 @@ mod tests {
         assert_ne!(src_v, dst_v);
 
         let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "follows".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "follows"),
             src_id: src_id.clone(),
             label: "knows".to_owned(),
             dst_id: dst_id.clone(),
@@ -417,7 +437,7 @@ mod tests {
         assert_ne!(src_v, dst_v);
 
         let edge = |src: &str, dst: &str| nodedb_physical::physical_plan::BatchEdge {
-            collection: "follows".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "follows"),
             src_id: src.to_owned(),
             label: "knows".to_owned(),
             dst_id: dst.to_owned(),
@@ -465,7 +485,7 @@ mod tests {
         let key = "self".to_owned();
         let v = VShardId::from_key(key.as_bytes()).as_u32();
         let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "follows".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "follows"),
             src_id: key.clone(),
             label: "knows".to_owned(),
             dst_id: key,
@@ -482,7 +502,7 @@ mod tests {
             (
                 "ListInsert",
                 PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                    collection: "docs".to_owned(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                     document_id: "id1".to_owned(),
                     list_path: "blocks".to_owned(),
                     index: 0,
@@ -493,7 +513,7 @@ mod tests {
             (
                 "ListDelete",
                 PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                    collection: "docs".to_owned(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                     document_id: "id1".to_owned(),
                     list_path: "blocks".to_owned(),
                     index: 0,
@@ -503,7 +523,7 @@ mod tests {
             (
                 "ListMove",
                 PhysicalPlan::Crdt(CrdtOp::ListMove {
-                    collection: "docs".to_owned(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                     document_id: "id1".to_owned(),
                     list_path: "blocks".to_owned(),
                     from_index: 0,
@@ -524,7 +544,7 @@ mod tests {
     #[test]
     fn document_truncate_routes_to_collection_vshard() {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: "docs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
         });
@@ -542,7 +562,7 @@ mod tests {
             })
             .expect("collection whose home differs by database");
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: collection.clone(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
         });
@@ -560,7 +580,7 @@ mod tests {
         let want = collection_vshard("metrics").as_u32();
 
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: "metrics".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             filters: Vec::new(),
             updates: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -568,7 +588,7 @@ mod tests {
         assert_eq!(vshards_of(&update), vec![want]);
 
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: "metrics".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
@@ -580,7 +600,7 @@ mod tests {
         let want = collection_vshard("vecs").as_u32();
 
         let direct_upsert = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: "vecs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field: "emb".to_owned(),
             surrogate: Surrogate::new(3),
             vector: vec![0.5, 0.6],
@@ -594,7 +614,7 @@ mod tests {
         assert_eq!(vshards_of(&direct_upsert), vec![want]);
 
         let multi_vector_delete = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-            collection: "vecs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "colbert".to_owned(),
             document_surrogate: Surrogate::new(2),
         });
@@ -606,20 +626,20 @@ mod tests {
         let want = collection_vshard("docs").as_u32();
 
         let set_constraints = PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-            collection: "docs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             constraint_version: 1,
             constraints: Vec::new(),
         });
         assert_eq!(vshards_of(&set_constraints), vec![want]);
 
         let drop_constraints = PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-            collection: "docs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             constraint_version: 1,
         });
         assert_eq!(vshards_of(&drop_constraints), vec![want]);
 
         let restore = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-            collection: "docs".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "id1".to_owned(),
             target_version_json: "{}".to_owned(),
             surrogate: Surrogate::new(1),
@@ -642,8 +662,8 @@ mod tests {
     #[test]
     fn document_merge_is_unroutable() {
         let plan = PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection: "docs".to_owned(),
-            source_collection: "staging".to_owned(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
             source_alias: "s".to_owned(),
             target_join_col: "id".to_owned(),
             source_join_col: "id".to_owned(),
@@ -672,8 +692,8 @@ mod tests {
     #[test]
     fn document_update_from_join_is_unroutable() {
         let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection: "docs".to_owned(),
-            source_collection: "staging".to_owned(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
             source_alias: "s".to_owned(),
             target_join_col: "id".to_owned(),
             source_join_col: "id".to_owned(),
@@ -691,8 +711,8 @@ mod tests {
     #[test]
     fn kv_transfer_item_is_unroutable() {
         let plan = PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: "inbox".to_owned(),
-            dest_collection: "archive".to_owned(),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "inbox"),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
             item_key: vec![1, 2, 3],
             dest_key: vec![4, 5, 6],
             surrogate: Surrogate::new(1),

@@ -5,6 +5,7 @@
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::super::codec::RespValue;
 use super::super::command::RespCommand;
@@ -28,7 +29,7 @@ pub(in crate::control::server::resp) async fn handle_get(
     let redaction = resp_redaction(state, session);
 
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -107,7 +108,7 @@ pub(in crate::control::server::resp) async fn handle_set(
     // NX/XX conditional write: check existence first.
     if nx || xx {
         let check = PhysicalPlan::Kv(KvOp::Get {
-            collection: session.collection.clone(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
             key: key.clone(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -131,7 +132,7 @@ pub(in crate::control::server::resp) async fn handle_set(
         Err(e) => return e,
     };
     let plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key,
         value,
         ttl_ms,
@@ -157,7 +158,7 @@ pub(in crate::control::server::resp) async fn handle_del(
 
     let keys: Vec<Vec<u8>> = cmd.args.clone();
     let plan = PhysicalPlan::Kv(KvOp::Delete {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         keys,
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -184,7 +185,7 @@ pub(in crate::control::server::resp) async fn handle_exists(
     let mut count = 0i64;
     for key in &cmd.args {
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: session.collection.clone(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
             key: key.clone(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -223,7 +224,7 @@ pub(in crate::control::server::resp) async fn handle_getset(
         Err(e) => return e,
     };
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key,
         new_value,
         surrogate,

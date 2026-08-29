@@ -113,7 +113,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             surrogate,
             text,
             provenance: Some(prov),
@@ -164,7 +164,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             surrogate,
             provenance: Some(prov),
         });

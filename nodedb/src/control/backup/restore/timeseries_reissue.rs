@@ -268,7 +268,7 @@ pub fn build_timeseries_ingest_plan(
         })?;
 
     Ok(PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         payload,
         format: "msgpack".into(),
         wal_lsn: None,

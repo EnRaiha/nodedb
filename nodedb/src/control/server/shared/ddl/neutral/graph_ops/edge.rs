@@ -98,7 +98,7 @@ pub async fn insert_edge(
         identity,
         database_id,
         GraphOp::EdgePut {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             src_id: src,
             label,
             dst_id: dst,
@@ -258,7 +258,7 @@ pub async fn delete_edge(
         identity,
         database_id,
         GraphOp::EdgeDelete {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             src_id: src,
             label,
             dst_id: dst,

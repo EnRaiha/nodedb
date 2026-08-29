@@ -2,7 +2,7 @@
 
 //! Full-text search operations dispatched to the Data Plane.
 
-use nodedb_types::SurrogateBitmap;
+use nodedb_types::{QualifiedCollection, SurrogateBitmap};
 
 /// Full-text search physical operations.
 #[derive(
@@ -17,7 +17,7 @@ use nodedb_types::SurrogateBitmap;
 pub enum TextOp {
     /// BM25 full-text search on the inverted index.
     Search {
-        collection: String,
+        collection: QualifiedCollection,
         query: String,
         top_k: usize,
         /// Enable fuzzy matching (Levenshtein) for typo tolerance.
@@ -41,7 +41,7 @@ pub enum TextOp {
     /// restricting WHERE clause — all rows must be present in the result set
     /// so the query planner cannot emit the hit-only `TextOp::Search` shape.
     BM25ScoreScan {
-        collection: String,
+        collection: QualifiedCollection,
         query: String,
         /// Column name under which the BM25 score is injected into each row.
         score_alias: String,
@@ -55,7 +55,7 @@ pub enum TextOp {
     /// where the query terms appear as an exact contiguous sequence. Scoring
     /// is positional: documents with the phrase closer to the start rank higher.
     PhraseSearch {
-        collection: String,
+        collection: QualifiedCollection,
         /// Ordered sequence of terms to match as a phrase.
         terms: Vec<String>,
         top_k: usize,
@@ -65,7 +65,7 @@ pub enum TextOp {
 
     /// Hybrid search: vector similarity + BM25 text, fused via RRF.
     HybridSearch {
-        collection: String,
+        collection: QualifiedCollection,
         query_vector: Vec<f32>,
         query_text: String,
         top_k: usize,
@@ -89,7 +89,7 @@ pub enum TextOp {
     /// Origin assigns a surrogate for `(collection, doc_id)` on the Control
     /// Plane before dispatch; `surrogate` is the pre-assigned value.
     FtsIndexDoc {
-        collection: String,
+        collection: QualifiedCollection,
         /// Pre-assigned global surrogate for `(collection, doc_id)`.
         surrogate: nodedb_types::Surrogate,
         /// Concatenated text to index.
@@ -103,7 +103,7 @@ pub enum TextOp {
     ///
     /// Used by the sync path when a Lite client sends an `FtsDelete` frame.
     FtsDeleteDoc {
-        collection: String,
+        collection: QualifiedCollection,
         /// Pre-assigned global surrogate for `(collection, doc_id)`.
         surrogate: nodedb_types::Surrogate,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
@@ -118,7 +118,7 @@ pub enum TextOp {
     /// edges by `graph_edge_label` when set. All three ranked lists are passed
     /// to `reciprocal_rank_fusion_weighted` with per-source k-constants.
     HybridSearchTriple {
-        collection: String,
+        collection: QualifiedCollection,
         query_vector: Vec<f32>,
         query_text: String,
         /// Node id used as the BFS seed for the graph leg.
@@ -148,7 +148,7 @@ pub enum TextOp {
     /// Config-only, single-node, non-WAL-durable — the same dispatch shape
     /// `VectorOp::SetParams` uses for `CREATE VECTOR INDEX`.
     SetTextConfig {
-        collection: String,
+        collection: QualifiedCollection,
         /// Analyzer name, already checked against
         /// `nodedb_fts::index::analyzer_config::analyzer_exists` by the DDL
         /// layer (e.g. "standard", "english", "japanese"). `None` leaves the

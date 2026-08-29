@@ -22,7 +22,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             value: b"value1".to_vec(),
             ttl_ms: 0,
@@ -38,7 +41,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -52,7 +58,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             value: b"value2".to_vec(),
             ttl_ms: 0,
@@ -68,7 +77,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -82,7 +94,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -96,7 +111,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Delete {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             keys: vec![b"key1".to_vec()],
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         }),
@@ -110,7 +128,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             key: b"key1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -124,7 +145,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::BatchPut {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             entries: vec![
                 (b"a".to_vec(), b"1".to_vec()),
                 (b"b".to_vec(), b"2".to_vec()),
@@ -143,7 +167,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::BatchGet {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             keys: vec![
                 b"a".to_vec(),
                 b"b".to_vec(),
@@ -160,7 +187,10 @@ fn kv_protocol_command_sequence() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Delete {
-            collection: "default".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "default",
+            ),
             keys: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         }),
@@ -187,7 +217,10 @@ fn kv_and_vector_coexist() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 key: format!("user:{i}").into_bytes(),
                 value: format!("data:{i}").into_bytes(),
                 ttl_ms: 0,
@@ -205,7 +238,10 @@ fn kv_and_vector_coexist() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "embeddings".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "embeddings",
+                ),
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
@@ -222,7 +258,10 @@ fn kv_and_vector_coexist() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: b"user:3".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -236,7 +275,10 @@ fn kv_and_vector_coexist() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "embeddings".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "embeddings",
+            ),
             query_vector: vec![3.0f32, 0.0, 0.0],
             top_k: 2,
             ef_search: 0,
@@ -266,7 +308,10 @@ fn ttl_expiry_produces_expired_key_info() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"s1".to_vec(),
             value: b"data".to_vec(),
             ttl_ms: 1000, // 1 second.
@@ -282,7 +327,10 @@ fn ttl_expiry_produces_expired_key_info() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"s1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -304,7 +352,10 @@ fn ttl_expiry_produces_expired_key_info() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"persistent".to_vec(),
             value: b"forever".to_vec(),
             ttl_ms: 0,
@@ -319,7 +370,10 @@ fn ttl_expiry_produces_expired_key_info() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"persistent".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -354,7 +408,10 @@ fn kv_field_get_and_set() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: b"u1".to_vec(),
             value: doc,
             ttl_ms: 0,
@@ -370,7 +427,10 @@ fn kv_field_get_and_set() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::FieldGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: b"u1".to_vec(),
             fields: vec!["name".into(), "age".into()],
             rls_filters: Vec::new(),
@@ -386,7 +446,10 @@ fn kv_field_get_and_set() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: b"u1".to_vec(),
             updates: vec![(
                 "region".into(),
@@ -404,7 +467,10 @@ fn kv_field_get_and_set() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::FieldGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             key: b"u1".to_vec(),
             fields: vec!["region".into()],
             rls_filters: Vec::new(),
@@ -428,7 +494,10 @@ fn kv_truncate_clears_all() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "ephemeral".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "ephemeral",
+                ),
                 key: format!("k{i}").into_bytes(),
                 value: b"v".to_vec(),
                 ttl_ms: 0,
@@ -445,7 +514,10 @@ fn kv_truncate_clears_all() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Truncate {
-            collection: "ephemeral".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "ephemeral",
+            ),
         }),
     );
     let json: serde_json::Value = payload_value(&payload);
@@ -457,7 +529,10 @@ fn kv_truncate_clears_all() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "ephemeral".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "ephemeral",
+            ),
             key: b"k0".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -481,7 +556,10 @@ fn kv_index_write_amp_ratio_matches() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "indexed".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "indexed",
+                ),
                 field: field.to_string(),
                 field_position: 0,
                 backfill: false,
@@ -503,7 +581,10 @@ fn kv_index_write_amp_ratio_matches() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "indexed".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "indexed",
+                ),
                 key: format!("k{i:03}").into_bytes(),
                 value: doc,
                 ttl_ms: 0,
@@ -520,7 +601,10 @@ fn kv_index_write_amp_ratio_matches() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Scan {
-            collection: "indexed".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "indexed",
+            ),
             cursor: Vec::new(),
             count: 200,
             filters: Vec::new(),
@@ -552,7 +636,10 @@ fn kv_mass_expiry_respects_reap_budget() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "mass_expire".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "mass_expire",
+                ),
                 key: format!("k{i:04}").into_bytes(),
                 value: b"v".to_vec(),
                 ttl_ms: 100, // All expire in 100ms.
@@ -569,7 +656,10 @@ fn kv_mass_expiry_respects_reap_budget() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "mass_expire".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "mass_expire",
+            ),
             key: b"survivor".to_vec(),
             value: b"alive".to_vec(),
             ttl_ms: 0,
@@ -585,7 +675,10 @@ fn kv_mass_expiry_respects_reap_budget() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "mass_expire".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "mass_expire",
+            ),
             key: b"survivor".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -603,7 +696,10 @@ fn kv_mass_expiry_respects_reap_budget() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "mass_expire".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "mass_expire",
+            ),
             key: b"survivor".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

@@ -11,7 +11,10 @@ use nodedb_physical::physical_plan::{DocumentOp, GraphOp, PhysicalPlan, VectorOp
 /// Return a `VectorOp::SetParams` plan for a named collection with dim=3.
 pub fn vector_set_params(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: collection.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         field_name: String::new(),
         dim: 3,
         m: 16,
@@ -27,7 +30,10 @@ pub fn vector_set_params(collection: &str) -> PhysicalPlan {
 /// Seed a dim=3 vector index with one vector so the index exists.
 pub fn vector_seed(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         vector: vec![1.0, 2.0, 3.0],
         dim: 3,
         field_name: String::new(),
@@ -40,7 +46,10 @@ pub fn vector_seed(collection: &str) -> PhysicalPlan {
 /// A vector insert that will fail with dimension mismatch (index expects dim=3).
 pub fn vector_fail(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         vector: vec![1.0, 2.0],
         dim: 3,
         field_name: String::new(),
@@ -53,7 +62,7 @@ pub fn vector_fail(collection: &str) -> PhysicalPlan {
 /// A document PointPut for "doc1" in collection `coll`.
 pub fn doc_put(coll: &str, val: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "doc1".into(),
         value: val.to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -67,7 +76,7 @@ pub fn doc_put(coll: &str, val: &[u8]) -> PhysicalPlan {
 /// A PointGet for "doc1" in collection `coll`.
 pub fn doc_get(coll: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "doc1".into(),
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -80,7 +89,7 @@ pub fn doc_get(coll: &str) -> PhysicalPlan {
 /// A PointInsert (IF NOT EXISTS = false) for "doc2" in collection `coll`.
 pub fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "doc1".into(),
         value: b"{\"conflict\":true}".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -95,7 +104,7 @@ pub fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
 /// An EdgePut plan.
 pub fn edge_put(coll: &str, src: &str, dst: &str) -> PhysicalPlan {
     PhysicalPlan::Graph(GraphOp::EdgePut {
-        collection: coll.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         src_id: src.into(),
         label: "REL".into(),
         dst_id: dst.into(),

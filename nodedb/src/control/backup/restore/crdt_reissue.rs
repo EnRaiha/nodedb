@@ -40,7 +40,7 @@ async fn reissue_crdt_collection(
     let vshard = VShardId::from_collection_in_database(database_id, collection);
     let plan = PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
         tenant_id: tenant_id.as_u64(),
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         bytes,
     });
 

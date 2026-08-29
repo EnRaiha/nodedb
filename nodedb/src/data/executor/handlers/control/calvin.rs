@@ -502,7 +502,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use nodedb_physical::physical_plan::{DocumentOp, TimeseriesOp};
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     use super::*;
     use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request};
@@ -517,7 +517,7 @@ mod tests {
     /// its explicit `CalvinExecCtx` / `tenant_id` / `plans` arguments.
     fn make_task() -> ExecutionTask {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "x".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -556,7 +556,7 @@ mod tests {
 
     fn point_insert_plan(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: document_id.to_string(),
             value: doc_value("a", "1"),
             if_absent: false,
@@ -570,7 +570,7 @@ mod tests {
 
     fn canonical_ilp_plan(collection: &str, lines: Vec<&str>, tokens: Vec<u32>) -> PhysicalPlan {
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             payload: zerompk::to_msgpack_vec(&lines).expect("canonical ILP payload"),
             format: "ilp-msgpack".to_owned(),
             wal_lsn: None,
@@ -584,7 +584,7 @@ mod tests {
 
     fn bulk_delete_plan(collection: &str, predicted: Option<Vec<u32>>) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             filters: Vec::new(),
             returning: None,
             ollp_predicted_surrogates: predicted,
@@ -816,7 +816,7 @@ mod tests {
         let synthetic = calvin_synthetic_txn_id(21, 1, vshard).expect("synthetic transaction id");
 
         let malformed = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "cpu".to_owned(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cpu"),
             payload: vec![0xc1],
             format: "ilp-msgpack".to_owned(),
             wal_lsn: None,

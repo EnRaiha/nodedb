@@ -262,7 +262,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::{RlsWriteCheck, Surrogate};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn kv_incr_survives_wal_replay_from_empty() {
         let put_p = PhysicalPlan::Kv(KvOp::Put {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"hits".to_vec(),
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 0,
@@ -346,7 +346,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"hits".to_vec(),
             delta: 3,
             ttl_ms: 0,
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn kv_incr_replayed_twice_does_not_double_count() {
         let put_p = PhysicalPlan::Kv(KvOp::Put {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"hits".to_vec(),
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 0,
@@ -378,7 +378,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let incr1 = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"hits".to_vec(),
             delta: 3,
             ttl_ms: 0,
@@ -386,7 +386,7 @@ mod tests {
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"hits".to_vec(),
             delta: 3,
             ttl_ms: 0,
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn kv_incr_with_zero_ttl_preserves_existing_expiry() {
         let put_p = PhysicalPlan::Kv(KvOp::Put {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"temp".to_vec(),
             value: zerompk::to_msgpack_vec(&5i64).expect("encode"),
             ttl_ms: 60_000,
@@ -418,7 +418,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"temp".to_vec(),
             delta: 3,
             ttl_ms: 0,
@@ -446,7 +446,7 @@ mod tests {
         // at replay time would install a value far larger than 6000, since
         // real wall-clock time is vastly greater than 1000.
         let put_seed = PhysicalPlan::Kv(KvOp::Put {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"daily".to_vec(),
             value: zerompk::to_msgpack_vec(&0i64).expect("encode"),
             ttl_ms: 0,
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn kv_incr_over_non_numeric_value_replays_as_noop() {
         let put_str = PhysicalPlan::Kv(KvOp::Put {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"str".to_vec(),
             value: zerompk::to_msgpack_vec(&"hello").expect("encode"),
             ttl_ms: 0,
@@ -500,7 +500,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"str".to_vec(),
             delta: 1,
             ttl_ms: 0,
@@ -534,7 +534,7 @@ mod tests {
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
 
         let plan = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
             key: b"daily".to_vec(),
             delta: 1,
             ttl_ms: 86_400_000,

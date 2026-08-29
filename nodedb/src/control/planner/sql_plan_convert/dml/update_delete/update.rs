@@ -48,6 +48,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         ctx.database_id,
         collection,
     );
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let filter_bytes = serialize_filters(filters)?;
@@ -79,7 +80,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 vshard_id: vshard,
                 database_id: ctx.database_id,
                 plan: PhysicalPlan::Kv(KvOp::PredicateUpdate {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     filters: filter_bytes,
                     updates: literal_updates,
                     rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -109,7 +110,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 vshard_id: vshard,
                 database_id: ctx.database_id,
                 plan: PhysicalPlan::Kv(KvOp::FieldSet {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     key: key_bytes,
                     updates: field_updates,
                     surrogate,
@@ -161,7 +162,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Columnar(ColumnarOp::Update {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 filters: effective_filter,
                 updates: columnar_updates,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -216,7 +217,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 filters: effective_filter,
                 updates,
                 returning: None,
@@ -242,7 +243,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 // a real identity and allocates one.
                 let surrogate = ctx.surrogate_for_pk(collection, &pk_bytes)?;
                 PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     document_id: pk_string,
                     fields_json: fields_json.clone(),
                     surrogate,
@@ -257,7 +258,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 // creates no row, so it must never mint a binding.
                 let surrogate = ctx.surrogate_for_existing_pk(collection, &pk_bytes)?;
                 PhysicalPlan::Document(DocumentOp::PointUpdate {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     document_id: pk_string,
                     surrogate,
                     pk_bytes,
@@ -299,7 +300,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: collection.into(),
+                collection: qualified_collection,
                 filters: filter_bytes,
                 updates,
                 returning: None,

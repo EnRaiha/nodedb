@@ -17,6 +17,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, MetaOp, PhysicalPlan, VectorOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 use super::test_transaction_matrix_helpers::*;
@@ -83,7 +84,7 @@ fn rollback_matrix_vector_then_doc_fail() {
 
     // TransactionBatch: valid vector insert + PointInsert that conflicts.
     let v_plan = PhysicalPlan::Vector(VectorOp::Insert {
-        collection: "vec".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vec"),
         vector: vec![0.5, 0.5, 0.5],
         dim: 3,
         field_name: String::new(),
@@ -268,7 +269,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Crdt(CrdtOp::Apply {
-                    collection: "crdt_coll".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt_coll"),
                     document_id: "crdt_doc1".into(),
                     delta: crdt_delta,
                     peer_id: 1,
@@ -317,7 +318,7 @@ fn rollback_matrix_doc_doc_second_fails() {
 
     // Batch: write "other_doc" (new insert) + PointInsert on existing "doc1" (fails).
     let other_put = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "docs".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "other_doc".into(),
         value: b"should_not_persist".to_vec(),
         surrogate: nodedb_types::Surrogate::new(99),
@@ -346,7 +347,7 @@ fn rollback_matrix_doc_doc_second_fails() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "other_doc".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,

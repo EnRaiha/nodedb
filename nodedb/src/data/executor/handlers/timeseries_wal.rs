@@ -129,7 +129,7 @@ impl CoreLoop {
             db_id,
             crate::types::VShardId::from_collection_in_database(db_id, collection),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 payload: payload.to_vec(),
                 format: format.to_string(),
                 wal_lsn: Some(record_lsn),
@@ -201,7 +201,7 @@ impl CoreLoop {
             db_id,
             crate::types::VShardId::from_collection_in_database(db_id, collection),
             PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 payload: payload.to_vec(),
                 format: "msgpack".into(),
                 intent: ColumnarInsertIntent::Insert,

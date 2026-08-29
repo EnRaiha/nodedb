@@ -2,12 +2,18 @@
 
 //! Timeseries plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::TimeseriesOp;
 
-pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_scan(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let start = fields.time_range_start.unwrap_or(0);
     let end = fields.time_range_end.unwrap_or(i64::MAX);
     let limit = fields.limit.unwrap_or(10_000) as usize;
@@ -22,7 +28,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         .unwrap_or(0);
 
     Ok(PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         time_range: (start, end),
         projection: Vec::new(),
         limit,
@@ -39,7 +45,11 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
     }))
 }
 
-pub(crate) fn build_ingest(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_ingest(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let payload = fields
         .payload
         .as_ref()
@@ -51,7 +61,7 @@ pub(crate) fn build_ingest(fields: &TextFields, collection: &str) -> crate::Resu
     let format = fields.format.as_deref().unwrap_or("ilp").to_string();
 
     Ok(PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         payload,
         format,
         wal_lsn: None,

@@ -29,6 +29,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         ctx.database_id,
         collection,
     );
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
 
@@ -42,7 +43,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 vshard_id: vshard,
                 database_id: ctx.database_id,
                 plan: PhysicalPlan::Kv(KvOp::PredicateDelete {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     filters: filter_bytes,
                     rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 }),
@@ -56,7 +57,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Kv(KvOp::Delete {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 keys,
                 // Filled by the RLS injection pass, which runs after plan
                 // conversion.
@@ -92,7 +93,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Columnar(ColumnarOp::Delete {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 filters: effective_filter,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
@@ -127,7 +128,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 filters: effective_filter,
                 returning: None,
                 ollp_predicted_surrogates: None,
@@ -155,7 +156,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             let surrogate = ctx.surrogate_for_existing_pk(collection, &pk_bytes)?;
             let plan = if is_crdt {
                 PhysicalPlan::Crdt(CrdtOp::DocDelete {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     document_id: pk_string,
                     surrogate,
                     returning: None,
@@ -163,7 +164,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 })
             } else {
                 PhysicalPlan::Document(DocumentOp::PointDelete {
-                    collection: collection.into(),
+                    collection: qualified_collection.clone(),
                     document_id: pk_string,
                     surrogate,
                     pk_bytes,
@@ -190,7 +191,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection: collection.into(),
+                collection: qualified_collection,
                 filters: filter_bytes,
                 returning: None,
                 ollp_predicted_surrogates: None,

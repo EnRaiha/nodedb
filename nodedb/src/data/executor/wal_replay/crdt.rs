@@ -313,7 +313,9 @@ impl CoreLoop {
                     nodedb_physical::physical_plan::PhysicalPlan::Crdt(
                         nodedb_physical::physical_plan::CrdtOp::ImportSnapshot {
                             tenant_id: tid.as_u64(),
-                            collection: collection.to_owned(),
+                            collection: nodedb_types::QualifiedCollection::from_stored(
+                                collection.to_owned(),
+                            ),
                             bytes: Vec::new(),
                         },
                     ),

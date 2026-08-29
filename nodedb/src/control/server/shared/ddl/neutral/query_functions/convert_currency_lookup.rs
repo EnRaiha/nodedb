@@ -73,7 +73,7 @@ pub async fn convert_currency_lookup(
     // Scan rate table to find latest rate where key_column == key_value AND time_column <= as_of.
     let vshard = VShardId::from_collection_in_database(database_id, &rate_table);
     let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: rate_table.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &rate_table),
         limit: usize::MAX,
         offset: 0,
         sort_keys: Vec::new(),

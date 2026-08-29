@@ -78,7 +78,10 @@ mod tests {
 
     fn crdt_read(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::Read {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: "d1".into(),
         })
     }
@@ -105,7 +108,10 @@ mod tests {
     fn get_policy_is_allowed_under_a_tree() {
         let cache = cache_with_tree("notes");
         let mut plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-            collection: "notes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "notes",
+            ),
         });
         assert!(apply(&mut plan, &cache).is_ok());
     }

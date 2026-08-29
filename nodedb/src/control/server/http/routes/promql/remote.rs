@@ -105,7 +105,7 @@ pub async fn remote_write(
 
         let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             payload: ilp_payload.into_bytes(),
             format: "ilp".into(),
             wal_lsn: None,

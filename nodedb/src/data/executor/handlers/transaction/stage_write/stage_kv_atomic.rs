@@ -86,7 +86,7 @@ impl CoreLoop {
                 surrogate: _,
                 rls_write_check,
             } => {
-                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_ttl_side_effect(&ctx, *ttl_ms);
                 self.stage_kv_incr(&ctx, key, *delta, rls_write_check)
             }
@@ -97,7 +97,7 @@ impl CoreLoop {
                 surrogate: _,
                 rls_write_check,
             } => {
-                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_incr_float(&ctx, key, *delta, rls_write_check)
             }
             KvOp::Cas {
@@ -108,7 +108,7 @@ impl CoreLoop {
                 surrogate: _,
                 rls_write_check,
             } => {
-                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_cas(&ctx, key, expected, new_value, rls_write_check)
             }
             KvOp::GetSet {
@@ -119,7 +119,7 @@ impl CoreLoop {
                 rls_filters,
                 rls_write_check,
             } => {
-                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_getset(&ctx, key, new_value, rls_filters, rls_write_check)
             }
             // Three slots are deliberately elided. The plan's per-entry
@@ -137,7 +137,7 @@ impl CoreLoop {
                 entries,
                 ttl_ms,
                 ..
-            } => self.stage_kv_batch_put(task, tid, txn_id, collection, entries, *ttl_ms),
+            } => self.stage_kv_batch_put(task, tid, txn_id, collection.as_str(), entries, *ttl_ms),
             other => unreachable!(
                 "execute_stage_kv_atomic called on a non-atomic KvOp; \
                  caller invariant broken: {other:?}"

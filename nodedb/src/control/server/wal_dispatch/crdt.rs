@@ -37,7 +37,7 @@ pub(super) fn wal_append_crdt_op(
             // crash replay; legacy records decode without a fence.
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 delta.clone(),
-                Some(collection.clone()),
+                Some(collection.to_string()),
                 provenance.clone(),
                 *expected_frontier_digest,
                 Some(document_id.clone()),
@@ -65,7 +65,7 @@ pub(super) fn wal_append_crdt_op(
         } => {
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 delta.clone(),
-                Some(collection.clone()),
+                Some(collection.to_string()),
                 Some(provenance.clone()),
                 *expected_frontier_digest,
                 Some(document_id.clone()),
@@ -93,7 +93,7 @@ pub(super) fn wal_append_crdt_op(
             // routed to the same collection. No provenance (not a per-doc sync op).
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 bytes.clone(),
-                Some(collection.clone()),
+                Some(collection.to_string()),
                 None,
                 None,
                 None,
@@ -118,7 +118,7 @@ pub(super) fn wal_append_crdt_op(
             // logged here and re-executed deterministically at replay
             // (see `CrdtListOpWalRecord`'s doc comment).
             let payload = crate::wal::CrdtListOpWalRecord::Insert {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: document_id.clone(),
                 list_path: list_path.clone(),
                 index: *index as u64,
@@ -135,7 +135,7 @@ pub(super) fn wal_append_crdt_op(
             surrogate: _,
         } => {
             let payload = crate::wal::CrdtListOpWalRecord::Delete {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: document_id.clone(),
                 list_path: list_path.clone(),
                 index: *index as u64,
@@ -152,7 +152,7 @@ pub(super) fn wal_append_crdt_op(
             surrogate: _,
         } => {
             let payload = crate::wal::CrdtListOpWalRecord::Move {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: document_id.clone(),
                 list_path: list_path.clone(),
                 from_index: *from_index as u64,
@@ -175,7 +175,7 @@ pub(super) fn wal_append_crdt_op(
             // record carries the fields + partial flag and replay re-executes
             // the live handler (see `CrdtDocOpWalRecord`'s doc comment).
             let payload = crate::wal::CrdtDocOpWalRecord::Upsert {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: document_id.clone(),
                 surrogate: surrogate.as_u32(),
                 fields_json: fields_json.clone(),
@@ -192,7 +192,7 @@ pub(super) fn wal_append_crdt_op(
             rls_filters: _,
         } => {
             let payload = crate::wal::CrdtDocOpWalRecord::Delete {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: document_id.clone(),
                 surrogate: surrogate.as_u32(),
             };
@@ -244,7 +244,7 @@ fn encode_crdt_doc_op_payload(payload: crate::wal::CrdtDocOpWalRecord) -> crate:
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::PhysicalPlan;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     fn open_wal(dir: &std::path::Path) -> WalManager {
         WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
@@ -262,7 +262,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             delta: vec![9, 9, 9],
             peer_id: 1,
@@ -293,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             list_path: "blocks".to_string(),
             index: 0,
@@ -324,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             fields_json: r#"{"a":1}"#.to_string(),
             surrogate: Surrogate::new(3),
@@ -356,7 +356,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Crdt(CrdtOp::Read {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
         });
 

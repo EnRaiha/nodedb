@@ -6,6 +6,7 @@
 
 use nodedb::bridge::envelope::Status;
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -23,7 +24,7 @@ fn timeseries_scan_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "cpu".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cpu"),
             payload: ilp_data.as_bytes().to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -42,7 +43,7 @@ fn timeseries_scan_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "cpu".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cpu"),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 100,
@@ -71,7 +72,7 @@ fn timeseries_scan_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "cpu".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cpu"),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 100,

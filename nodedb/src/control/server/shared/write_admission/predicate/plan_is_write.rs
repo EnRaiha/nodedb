@@ -50,7 +50,10 @@ mod tests {
     #[test]
     fn point_get_is_not_a_write() {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             document_id: "d".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -64,7 +67,10 @@ mod tests {
     #[test]
     fn kv_put_is_a_write() {
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,

@@ -72,8 +72,8 @@ pub async fn run_authorized_update_from_join(
         UpdateFromJoinArgs {
             tenant_id: task.tenant_id,
             database_id: task.database_id,
-            target_collection: &target_collection,
-            source_collection: &source_collection,
+            target_collection: target_collection.as_str(),
+            source_collection: source_collection.as_str(),
             source_alias: &source_alias,
             target_join_col: &target_join_col,
             source_join_col: &source_join_col,
@@ -131,8 +131,12 @@ pub(crate) async fn run_update_from_join(
         };
 
         let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection: args.target_collection.to_string(),
-            source_collection: args.source_collection.to_string(),
+            target_collection: nodedb_types::QualifiedCollection::from_stored(
+                args.target_collection.to_string(),
+            ),
+            source_collection: nodedb_types::QualifiedCollection::from_stored(
+                args.source_collection.to_string(),
+            ),
             source_alias: args.source_alias.to_string(),
             target_join_col: args.target_join_col.to_string(),
             source_join_col: args.source_join_col.to_string(),
@@ -194,8 +198,12 @@ async fn resolve_matched_sum_targets(
 ) -> crate::Result<Option<Vec<ResolvedSumTarget>>> {
     let resolve_plan = PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(
         DocumentOp::UpdateFromJoin {
-            target_collection: args.target_collection.to_string(),
-            source_collection: args.source_collection.to_string(),
+            target_collection: nodedb_types::QualifiedCollection::from_stored(
+                args.target_collection.to_string(),
+            ),
+            source_collection: nodedb_types::QualifiedCollection::from_stored(
+                args.source_collection.to_string(),
+            ),
             source_alias: args.source_alias.to_string(),
             target_join_col: args.target_join_col.to_string(),
             source_join_col: args.source_join_col.to_string(),

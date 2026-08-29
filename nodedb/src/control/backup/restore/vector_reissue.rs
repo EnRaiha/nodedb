@@ -44,7 +44,7 @@ pub fn build_vector_insert_plan(
 ) -> PhysicalPlan {
     let dim = vector.len();
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         vector,
         dim,
         field_name: field_name.to_string(),
@@ -95,7 +95,7 @@ pub fn build_vector_set_params_plan(
     config: &IndexConfig,
 ) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         field_name: field_name.to_string(),
         dim: config.declared_dim,
         m: config.hnsw.m,

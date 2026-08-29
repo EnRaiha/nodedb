@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn every_remote_execution_mode_rejects_unadmitted_crdt_apply() {
         let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "doc-1".into(),
             delta: Vec::new(),
             peer_id: 1,

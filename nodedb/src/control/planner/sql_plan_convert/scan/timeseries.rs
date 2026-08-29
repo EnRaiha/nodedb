@@ -38,6 +38,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         temporal,
     } = p;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let agg_pairs: Vec<(String, String)> = aggregates.iter().map(agg_expr_to_pair).collect();
@@ -70,7 +71,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: collection.into(),
+            collection: qualified_collection,
             time_range: *time_range,
             projection: proj_names,
             limit: *limit,
@@ -97,6 +98,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
     ctx: &super::super::convert::ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let mut payload = Vec::with_capacity(rows.len() * 128);
@@ -120,7 +122,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.into(),
+            collection: qualified_collection,
             payload,
             format: "msgpack".into(),
             wal_lsn: None,

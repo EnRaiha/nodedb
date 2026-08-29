@@ -21,7 +21,10 @@ fn sparse_point_get_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u1".into(),
             value: b"{\"name\":\"alice\",\"secret\":\"tenant_a_data\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -39,7 +42,10 @@ fn sparse_point_get_isolated() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -59,7 +65,10 @@ fn sparse_point_get_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -86,7 +95,10 @@ fn sparse_range_scan_isolated() {
             &mut rx,
             TENANT_A,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "items".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "items",
+                ),
                 document_id: format!("item_{i}"),
                 value: format!("{{\"val\":{i}}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -105,7 +117,10 @@ fn sparse_range_scan_isolated() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::RangeScan {
-            collection: "items".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "items",
+            ),
             field: String::new(),
             lower: None,
             upper: None,

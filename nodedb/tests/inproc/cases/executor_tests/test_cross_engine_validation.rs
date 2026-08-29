@@ -29,7 +29,10 @@ fn cross_model_query_vector_graph_relational() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "papers".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "papers",
+                ),
                 document_id: format!("p{i}"),
                 value: serde_json::to_vec(&serde_json::json!({
                     "title": format!("Paper {i}"),
@@ -52,7 +55,10 @@ fn cross_model_query_vector_graph_relational() {
             inner: make_request_with_id(
                 100 + i as u64,
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "papers".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "papers",
+                    ),
                     vector: vec![i as f32, (i as f32).sin(), (i as f32).cos()],
                     dim: 3,
                     field_name: String::new(),
@@ -76,7 +82,10 @@ fn cross_model_query_vector_graph_relational() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "col".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "col",
+                ),
                 src_id: format!("p{i}"),
                 label: "CITES".into(),
                 dst_id: format!("p{}", i + 1),
@@ -93,7 +102,10 @@ fn cross_model_query_vector_graph_relational() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "papers".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "papers",
+            ),
             query_vector: vec![5.0f32, 5.0f32.sin(), 5.0f32.cos()],
             top_k: 3,
             ef_search: 0,
@@ -149,7 +161,10 @@ fn cross_model_query_vector_graph_relational() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "papers".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "papers",
+            ),
             limit: 100,
             offset: 0,
             sort_keys: Vec::new(),
@@ -177,7 +192,10 @@ fn cross_model_query_vector_graph_relational() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Graph(GraphOp::RagFusion {
-            collection: "papers".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "papers",
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             vector_top_k: 3,
             edge_label: Some("CITES".into()),
@@ -219,7 +237,10 @@ fn rrf_fusion_mathematically_correct() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: format!("d{i}"),
                 value: serde_json::to_vec(&serde_json::json!({
                     "body": format!("document about database systems topic {i}"),
@@ -240,7 +261,10 @@ fn rrf_fusion_mathematically_correct() {
             inner: make_request_with_id(
                 200 + i as u64,
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "docs".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "docs",
+                    ),
                     vector: vec![i as f32, 0.0, 0.0],
                     dim: 3,
                     field_name: String::new(),
@@ -263,7 +287,10 @@ fn rrf_fusion_mathematically_correct() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::HybridSearch {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             query_vector: vec![10.0f32, 0.0, 0.0],
             query_text: "database systems".into(),
             top_k: 5,
@@ -285,7 +312,10 @@ fn rrf_fusion_mathematically_correct() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::HybridSearch {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             query_vector: vec![10.0f32, 0.0, 0.0],
             query_text: "database systems".into(),
             top_k: 5,
@@ -322,7 +352,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             document_id: "a1".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "title": "Distributed databases are scalable",
@@ -342,7 +375,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             document_id: "a2".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "title": "Vector search with HNSW graphs",
@@ -366,7 +402,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query: "database".into(),
             top_k: 10,
             fuzzy: true,
@@ -386,7 +425,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             document_id: "a1".into(),
             surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"a1".to_vec(),
@@ -403,7 +445,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query: "database".into(),
             top_k: 10,
             fuzzy: true,
@@ -423,7 +468,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query: "vector search".into(),
             top_k: 10,
             fuzzy: true,
@@ -443,7 +491,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             document_id: "a1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -459,7 +510,10 @@ fn document_indexes_consistent_after_simulated_crash() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             document_id: "a2".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,

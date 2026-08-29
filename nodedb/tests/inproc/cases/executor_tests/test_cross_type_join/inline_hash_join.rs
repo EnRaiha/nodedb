@@ -19,7 +19,10 @@ fn inline_hash_join_honors_qualified_left_keys() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -41,7 +44,10 @@ fn inline_hash_join_honors_qualified_left_keys() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -63,7 +69,10 @@ fn inline_hash_join_honors_qualified_left_keys() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "payments".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "payments",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -80,8 +89,14 @@ fn inline_hash_join_honors_qualified_left_keys() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "users".into(),
-            right_collection: "orders".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "user_id".into())],
@@ -107,7 +122,10 @@ fn inline_hash_join_honors_qualified_left_keys() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "payments".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "payments",
+            ),
             filters: Vec::new(),
             limit: 100,
             offset: 0,
@@ -127,8 +145,14 @@ fn inline_hash_join_honors_qualified_left_keys() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: String::new(),
-            right_collection: String::new(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("orders.id".into(), "order_id".into())],

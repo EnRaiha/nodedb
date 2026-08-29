@@ -458,7 +458,10 @@ mod tests {
     #[test]
     fn generic_pgwire_dispatch_rejects_unadmitted_apply() {
         let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "doc-1".into(),
             delta: Vec::new(),
             peer_id: 1,

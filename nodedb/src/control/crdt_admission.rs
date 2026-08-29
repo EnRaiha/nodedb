@@ -207,7 +207,7 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
                 expected_frontier_digest: None,
                 ..
             },
-        ) if plan_collection == collection => (document_id.clone(), delta.clone()),
+        ) if plan_collection.as_str() == collection => (document_id.clone(), delta.clone()),
         PhysicalPlan::Crdt(
             CrdtOp::Apply {
                 expected_frontier_digest: Some(_),
@@ -289,7 +289,9 @@ async fn preview(
                 workflow.database_id,
                 workflow.collection,
                 PhysicalPlan::Crdt(CrdtOp::PreviewApply {
-                    collection: workflow.collection.to_owned(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(
+                        workflow.collection.to_owned(),
+                    ),
                     document_id: document_id.to_owned(),
                     delta: delta.to_vec(),
                 }),
@@ -435,7 +437,9 @@ pub(crate) async fn dispatch_crdt_restore_admitted(
                     return Ok(None);
                 }
                 let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-                    collection: collection.to_owned(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(
+                        collection.to_owned(),
+                    ),
                     document_id: document_id.to_owned(),
                     delta: delta.clone(),
                     peer_id,
@@ -480,7 +484,9 @@ async fn generate_restore_delta(
                 workflow.database_id,
                 workflow.collection,
                 PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-                    collection: workflow.collection.to_owned(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(
+                        workflow.collection.to_owned(),
+                    ),
                     document_id: document_id.to_owned(),
                     target_version_json: target_version_json.to_owned(),
                     surrogate,
@@ -586,6 +592,7 @@ mod tests {
     use crate::control::state::SharedState;
     use crate::types::{Lsn, RequestId};
     use crate::wal::WalManager;
+    use nodedb_types::QualifiedCollection;
 
     fn collection() -> String {
         "docs".to_owned()
@@ -605,7 +612,7 @@ mod tests {
 
     fn apply_plan() -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "doc-1".into(),
             delta: vec![0x91, 0x01],
             peer_id: 7,
@@ -1163,7 +1170,7 @@ mod tests {
     fn frontier_classifier_covers_every_crdt_operation_category() {
         let surrogate = Surrogate::ZERO;
         assert_frontier_mutation(CrdtOp::Apply {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             delta: Vec::new(),
             peer_id: 1,
@@ -1175,17 +1182,17 @@ mod tests {
         });
         assert_frontier_mutation(CrdtOp::ImportSnapshot {
             tenant_id: 1,
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             bytes: Vec::new(),
         });
         assert_frontier_mutation(CrdtOp::RestoreToVersion {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             target_version_json: "{}".into(),
             surrogate,
         });
         assert_frontier_mutation(CrdtOp::ListInsert {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             list_path: "blocks".into(),
             index: 0,
@@ -1193,14 +1200,14 @@ mod tests {
             surrogate,
         });
         assert_frontier_mutation(CrdtOp::ListDelete {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             list_path: "blocks".into(),
             index: 0,
             surrogate,
         });
         assert_frontier_mutation(CrdtOp::ListMove {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             list_path: "blocks".into(),
             from_index: 0,
@@ -1208,7 +1215,7 @@ mod tests {
             surrogate,
         });
         assert_frontier_mutation(CrdtOp::DocUpsert {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             fields_json: "{}".into(),
             surrogate,
@@ -1217,7 +1224,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         assert_frontier_mutation(CrdtOp::DocDelete {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             surrogate,
             returning: None,
@@ -1225,46 +1232,46 @@ mod tests {
         });
 
         assert_frontier_read(CrdtOp::Read {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
         });
         assert_frontier_read(CrdtOp::PreviewApply {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             delta: Vec::new(),
         });
         assert_frontier_read(CrdtOp::GetVersionVector {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
         });
         assert_frontier_read(CrdtOp::ExportDelta {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             from_version_json: "{}".into(),
         });
         assert_frontier_read(CrdtOp::CompactAtVersion {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             target_version_json: "{}".into(),
         });
         assert_frontier_read(CrdtOp::SetConstraints {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             constraint_version: 1,
             constraints: Vec::new(),
         });
         assert_frontier_read(CrdtOp::DropConstraints {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             constraint_version: 1,
         });
         assert_frontier_read(CrdtOp::ReadConstraints {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
         });
         assert_frontier_read(CrdtOp::SetPolicy {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             policy_json: "{}".into(),
         });
         assert_frontier_read(CrdtOp::GetPolicy {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
         });
         assert_frontier_read(CrdtOp::ReadAtVersion {
-            collection: collection(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
             version_vector_json: "{}".into(),
         });

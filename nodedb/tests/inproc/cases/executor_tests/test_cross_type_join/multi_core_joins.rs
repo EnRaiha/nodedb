@@ -26,7 +26,10 @@ fn multi_core_broadcast_inner_join() {
             &mut core0.tx,
             &mut core0.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -46,7 +49,10 @@ fn multi_core_broadcast_inner_join() {
             &mut core1.tx,
             &mut core1.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
@@ -63,7 +69,10 @@ fn multi_core_broadcast_inner_join() {
         &mut core1.tx,
         &mut core1.rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             filters: Vec::new(),
             limit: 100,
             offset: 0,
@@ -96,8 +105,14 @@ fn multi_core_broadcast_inner_join() {
         &mut core0.tx,
         &mut core0.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "docs".into(),
-            right_collection: "prefs".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "key".into())],
@@ -169,7 +184,10 @@ fn multi_core_broadcast_left_join() {
             &mut core0.tx,
             &mut core0.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -188,7 +206,10 @@ fn multi_core_broadcast_left_join() {
             &mut core1.tx,
             &mut core1.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
@@ -205,7 +226,10 @@ fn multi_core_broadcast_left_join() {
         &mut core1.tx,
         &mut core1.rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             filters: Vec::new(),
             limit: 100,
             offset: 0,
@@ -226,8 +250,14 @@ fn multi_core_broadcast_left_join() {
         &mut core0.tx,
         &mut core0.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "docs".into(),
-            right_collection: "prefs".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "key".into())],
@@ -286,7 +316,10 @@ fn multi_core_broadcast_merge_simulation() {
             &mut core0.tx,
             &mut core0.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -304,7 +337,10 @@ fn multi_core_broadcast_merge_simulation() {
             &mut core1.tx,
             &mut core1.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: "d4".into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new(1),
@@ -324,7 +360,10 @@ fn multi_core_broadcast_merge_simulation() {
             &mut core0.tx,
             &mut core0.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: b"d1".to_vec(),
                 value,
                 ttl_ms: 0,
@@ -341,7 +380,10 @@ fn multi_core_broadcast_merge_simulation() {
             &mut core1.tx,
             &mut core1.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: b"d3".to_vec(),
                 value,
                 ttl_ms: 0,
@@ -354,7 +396,10 @@ fn multi_core_broadcast_merge_simulation() {
 
     // Phase 1: scan prefs from BOTH cores and concatenate raw payloads.
     let scan_plan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: "prefs".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "prefs",
+        ),
         filters: Vec::new(),
         limit: 100,
         offset: 0,
@@ -390,8 +435,14 @@ fn multi_core_broadcast_merge_simulation() {
     // ProviderScan, then merge results.
     let join_plan = |data: Vec<u8>| {
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "docs".into(),
-            right_collection: "prefs".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "key".into())],

@@ -36,7 +36,7 @@ impl CoreLoop {
                 crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     input: input.as_deref(),
                     group_by,
                     aggregates,
@@ -120,8 +120,8 @@ impl CoreLoop {
                     post_filter_bytes: post_filters,
                 },
                 tid,
-                left_collection,
-                right_collection,
+                left_collection: left_collection.as_str(),
+                right_collection: right_collection.as_str(),
                 left_alias: left_alias.as_deref(),
                 right_alias: right_alias.as_deref(),
                 left_input: left_input.as_deref(),
@@ -181,8 +181,8 @@ impl CoreLoop {
             } => self.execute_nested_loop_join(NestedLoopJoinParams {
                 task,
                 tid,
-                left_collection,
-                right_collection,
+                left_collection: left_collection.as_str(),
+                right_collection: right_collection.as_str(),
                 condition,
                 join_type,
                 limit: *limit,
@@ -202,8 +202,8 @@ impl CoreLoop {
             } => self.execute_sort_merge_join(SortMergeJoinParams {
                 task,
                 tid,
-                left_collection,
-                right_collection,
+                left_collection: left_collection.as_str(),
+                right_collection: right_collection.as_str(),
                 on,
                 join_type,
                 limit: *limit,
@@ -224,7 +224,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::recursive::RecursiveScanParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     base_filters,
                     recursive_filters,
                     join_link: join_link.as_ref(),
@@ -260,9 +260,14 @@ impl CoreLoop {
                 filters,
                 fields,
                 limit_per_facet,
-            } => {
-                self.execute_facet_counts(task, tid, collection, filters, fields, *limit_per_facet)
-            }
+            } => self.execute_facet_counts(
+                task,
+                tid,
+                collection.as_str(),
+                filters,
+                fields,
+                *limit_per_facet,
+            ),
 
             QueryOp::PartialAggregate {
                 collection,
@@ -280,7 +285,7 @@ impl CoreLoop {
                     crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
                         task,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         input: None,
                         group_by: &group_specs,
                         aggregates,
@@ -305,7 +310,7 @@ impl CoreLoop {
                 crate::data::executor::handlers::aggregate::state_emit::PartialAggregateStateParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     input: input.as_deref(),
                     group_by,
                     aggregates,
@@ -356,7 +361,7 @@ impl CoreLoop {
                 tid,
                 outer_plan,
                 outer_alias,
-                inner_collection,
+                inner_collection: inner_collection.as_str(),
                 inner_filters,
                 inner_order_by,
                 inner_limit: *inner_limit,
@@ -381,7 +386,7 @@ impl CoreLoop {
                 tid,
                 outer_plan,
                 outer_alias,
-                inner_collection,
+                inner_collection: inner_collection.as_str(),
                 inner_filters,
                 correlation_predicates,
                 lateral_alias,

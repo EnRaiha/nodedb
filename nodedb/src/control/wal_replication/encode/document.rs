@@ -281,7 +281,7 @@ pub(super) fn resolved_write(
                     precondition,
                     resolved_sum_targets,
                 } => W::Put {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     document_id: document_id.clone(),
                     surrogate: surrogate.as_u32(),
                     value: value.clone(),
@@ -297,7 +297,7 @@ pub(super) fn resolved_write(
                     precondition,
                     resolved_sum_targets,
                 } => W::Delete {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     document_id: document_id.clone(),
                     surrogate: surrogate.as_u32(),
                     precondition: precondition.clone(),

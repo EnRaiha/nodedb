@@ -41,13 +41,15 @@ impl CoreLoop {
                 rls_write_check,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let prior = self
+                    .kv_engine
+                    .get(did, tid, collection.as_str(), key, now_ms);
                 let resp = self.execute_kv_incr(
                     crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
                         task,
                         did,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         key,
                         surrogate: *surrogate,
                         rls_write_check,
@@ -61,7 +63,7 @@ impl CoreLoop {
                     }));
                 }
                 undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
+                    collection: collection.to_string(),
                     key: key.clone(),
                     prior_value: prior,
                 });
@@ -76,13 +78,15 @@ impl CoreLoop {
                 rls_write_check,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let prior = self
+                    .kv_engine
+                    .get(did, tid, collection.as_str(), key, now_ms);
                 let resp = self.execute_kv_incr_float(
                     crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
                         task,
                         did,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         key,
                         surrogate: *surrogate,
                         rls_write_check,
@@ -95,7 +99,7 @@ impl CoreLoop {
                     }));
                 }
                 undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
+                    collection: collection.to_string(),
                     key: key.clone(),
                     prior_value: prior,
                 });
@@ -111,13 +115,15 @@ impl CoreLoop {
                 rls_write_check,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let prior = self
+                    .kv_engine
+                    .get(did, tid, collection.as_str(), key, now_ms);
                 let resp = self.execute_kv_cas(
                     crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
                         task,
                         did,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         key,
                         surrogate: *surrogate,
                         rls_write_check,
@@ -132,7 +138,7 @@ impl CoreLoop {
                 }
                 // CAS only mutates on success (which we verified above).
                 undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
+                    collection: collection.to_string(),
                     key: key.clone(),
                     prior_value: prior,
                 });
@@ -148,13 +154,15 @@ impl CoreLoop {
                 rls_write_check,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let prior = self
+                    .kv_engine
+                    .get(did, tid, collection.as_str(), key, now_ms);
                 let resp = self.execute_kv_getset(
                     crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
                         task,
                         did,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         key,
                         surrogate: *surrogate,
                         rls_write_check,
@@ -168,7 +176,7 @@ impl CoreLoop {
                     }));
                 }
                 undo_log.push(UndoEntry::KvPut {
-                    collection: collection.clone(),
+                    collection: collection.to_string(),
                     key: key.clone(),
                     prior_value: prior,
                 });

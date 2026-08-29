@@ -64,7 +64,10 @@ mod tests {
 
     fn delete_with(check: RlsWriteCheck) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: "orders".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             filters: Vec::new(),
             rls_write_check: check,
         })

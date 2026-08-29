@@ -189,7 +189,10 @@ fn three_way_fts_vector_doc_bitmap() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: COLLECTION.into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    COLLECTION,
+                ),
                 document_id: hex.clone(),
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
@@ -213,7 +216,10 @@ fn three_way_fts_vector_doc_bitmap() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: COLLECTION.into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    COLLECTION,
+                ),
                 document_id: hex.clone(),
                 value: serde_json::to_vec(&doc).unwrap(),
                 surrogate: Surrogate::new(s),
@@ -229,7 +235,10 @@ fn three_way_fts_vector_doc_bitmap() {
     for &s in LEARNING_SURS.iter().chain(NON_LEARNING_SURS) {
         tx.try_push(BridgeRequest {
             inner: make_req(PhysicalPlan::Vector(VectorOp::Insert {
-                collection: COLLECTION.into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    COLLECTION,
+                ),
                 vector: if s <= 7 {
                     vec![1.0f32, s as f32 * 0.01, 0.0]
                 } else {
@@ -258,7 +267,10 @@ fn three_way_fts_vector_doc_bitmap() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Text(TextOp::Search {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             query: "learning".into(),
             top_k: 20,
             fuzzy: false,
@@ -307,7 +319,10 @@ fn three_way_fts_vector_doc_bitmap() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 20,
             ef_search: 0,
@@ -349,7 +364,10 @@ fn three_way_fts_vector_doc_bitmap() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             limit: 100,
             offset: 0,
             sort_keys: Vec::new(),

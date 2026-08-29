@@ -24,7 +24,7 @@ use nodedb::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_test_support::pgwire_harness::TestServer;
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, count: usize) {
     let tenant_id = TenantId::new(1);
@@ -36,7 +36,7 @@ async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, cou
         plan: PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: (0..count)
                 .map(|index| BatchEdge {
-                    collection: collection.to_string(),
+                    collection: QualifiedCollection::new(database_id, collection),
                     src_id: "root".to_string(),
                     label: "l".to_string(),
                     dst_id: format!("{leaf_prefix}{index}"),

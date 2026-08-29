@@ -70,7 +70,7 @@ pub async fn crdt_state(
     let document_id = &args[1];
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Read {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         document_id: document_id.clone(),
     });
 
@@ -171,7 +171,7 @@ pub async fn crdt_apply(
         .map_err(|e| DdlError::new("XX000", e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         document_id: document_id.clone(),
         delta,
         peer_id: identity.user_id,

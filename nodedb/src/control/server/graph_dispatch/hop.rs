@@ -287,7 +287,8 @@ async fn expand_local(
         max_results,
     } = scope;
     let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
-        collection: collection.map(str::to_string),
+        collection: collection
+            .map(|c| nodedb_types::QualifiedCollection::from_stored(c.to_string())),
         node_ids: node_ids.to_vec(),
         edge_label: edge_label.map(str::to_string),
         direction,
@@ -342,7 +343,8 @@ async fn expand_remote(
             node_ids,
         } = owner;
         let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
-            collection: collection.map(str::to_string),
+            collection: collection
+                .map(|c| nodedb_types::QualifiedCollection::from_stored(c.to_string())),
             node_ids,
             edge_label: edge_label_owned.clone(),
             direction,

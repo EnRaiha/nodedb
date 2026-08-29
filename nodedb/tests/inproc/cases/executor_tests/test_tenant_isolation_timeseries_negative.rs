@@ -8,6 +8,7 @@
 
 use nodedb::bridge::envelope::Status;
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -26,7 +27,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: ilp_a.as_bytes().to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -45,7 +46,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 100,
@@ -87,7 +88,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: ilp_b.into_bytes(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -106,7 +107,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "metrics".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 100,

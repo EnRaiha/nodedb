@@ -15,6 +15,7 @@ use crate::control::server::shared::session::read_set::{
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{ColumnarOp, CrdtOp, DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_types::QualifiedCollection;
 
 fn crdt_apply_task(vshard: u32) -> PhysicalTask {
     PhysicalTask {
@@ -22,7 +23,7 @@ fn crdt_apply_task(vshard: u32) -> PhysicalTask {
         vshard_id: VShardId::new(vshard),
         database_id: crate::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: format!("col_{vshard}"),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &format!("col_{vshard}")),
             document_id: "id1".to_owned(),
             delta: vec![],
             peer_id: 0,
@@ -43,7 +44,7 @@ fn doc_insert_task(vshard: u32) -> PhysicalTask {
         vshard_id: VShardId::new(vshard),
         database_id: crate::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: format!("col_{vshard}"),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &format!("col_{vshard}")),
             document_id: "id1".to_owned(),
             surrogate: nodedb_types::Surrogate::new(1),
             value: vec![],
@@ -64,7 +65,7 @@ fn scan_task(vshard: u32) -> PhysicalTask {
         vshard_id: VShardId::new(vshard),
         database_id: crate::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::Scan {
-            collection: format!("col_{vshard}"),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &format!("col_{vshard}")),
             filters: vec![],
             limit: 0,
             offset: 0,
@@ -88,7 +89,7 @@ fn bulk_update_task(vshard: u32) -> PhysicalTask {
         vshard_id: VShardId::new(vshard),
         database_id: crate::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: format!("col_{vshard}"),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, &format!("col_{vshard}")),
             filters: vec![],
             updates: vec![],
             returning: None,
@@ -117,7 +118,7 @@ fn is_write_plan_classifies_crdt_list_ops() {
         (
             "ListInsert",
             PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                collection: "docs".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "id1".to_owned(),
                 list_path: "blocks".to_owned(),
                 index: 0,
@@ -128,7 +129,7 @@ fn is_write_plan_classifies_crdt_list_ops() {
         (
             "ListDelete",
             PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                collection: "docs".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "id1".to_owned(),
                 list_path: "blocks".to_owned(),
                 index: 0,
@@ -138,7 +139,7 @@ fn is_write_plan_classifies_crdt_list_ops() {
         (
             "ListMove",
             PhysicalPlan::Crdt(CrdtOp::ListMove {
-                collection: "docs".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "id1".to_owned(),
                 list_path: "blocks".to_owned(),
                 from_index: 0,
@@ -155,13 +156,13 @@ fn is_write_plan_classifies_crdt_list_ops() {
 #[test]
 fn is_write_plan_classifies_columnar_update_and_delete() {
     let update = PhysicalPlan::Columnar(ColumnarOp::Update {
-        collection: "metrics".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         filters: vec![],
         updates: vec![],
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });
     let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-        collection: "metrics".to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
         filters: vec![],
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
     });

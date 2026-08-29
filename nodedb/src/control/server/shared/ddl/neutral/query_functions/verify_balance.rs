@@ -71,7 +71,7 @@ pub async fn verify_balance(
     let target_vshard = VShardId::from_collection_in_database(database_id, &collection);
     let mut target_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             limit: usize::MAX,
             offset: 0,
             sort_keys: Vec::new(),
@@ -108,7 +108,10 @@ pub async fn verify_balance(
         VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
     let mut source_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-            collection: mat_def.source_collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                database_id,
+                &mat_def.source_collection,
+            ),
             limit: usize::MAX,
             offset: 0,
             sort_keys: Vec::new(),

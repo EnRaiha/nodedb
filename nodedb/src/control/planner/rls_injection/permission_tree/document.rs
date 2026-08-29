@@ -190,7 +190,10 @@ mod tests {
     fn point_get_receives_the_subtree_filter() {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -213,7 +216,10 @@ mod tests {
     fn bulk_delete_narrows_to_the_delete_subtree() {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             filters: Vec::new(),
             returning: None,
             ollp_predicted_surrogates: None,
@@ -239,7 +245,10 @@ mod tests {
     fn index_lookup_is_refused_under_a_tree() {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Document(DocumentOp::IndexLookup {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             path: "$.email".into(),
             value: "a@b.c".into(),
         });

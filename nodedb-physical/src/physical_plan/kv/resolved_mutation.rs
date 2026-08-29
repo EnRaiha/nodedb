@@ -9,7 +9,7 @@
 //! the Data Plane holds, decides the policy there, and ships the mutations
 //! themselves.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 /// One storage mutation a resolved KV write applies.
 ///
@@ -31,7 +31,7 @@ use nodedb_types::Surrogate;
 pub enum KvResolvedMutation {
     /// Write `value` under `key`, replacing whatever is there.
     Put {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         value: Vec<u8>,
         /// TTL the originating op requested, carried for the durable record's
@@ -47,13 +47,13 @@ pub enum KvResolvedMutation {
     },
     /// Remove `key`.
     Delete {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         precondition: Option<Vec<u8>>,
     },
     /// Install a TTL on `key`, leaving its body untouched.
     Expire {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         ttl_ms: u64,
         /// The wall-clock instant the resolving node read. The apply installs
@@ -64,7 +64,7 @@ pub enum KvResolvedMutation {
     },
     /// Clear `key`'s TTL, leaving its body untouched.
     Persist {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         precondition: Option<Vec<u8>>,
     },
@@ -72,12 +72,12 @@ pub enum KvResolvedMutation {
 
 impl KvResolvedMutation {
     /// The collection this one mutation targets.
-    pub fn collection(&self) -> &str {
+    pub fn collection(&self) -> &QualifiedCollection {
         match self {
             KvResolvedMutation::Put { collection, .. }
             | KvResolvedMutation::Delete { collection, .. }
             | KvResolvedMutation::Expire { collection, .. }
-            | KvResolvedMutation::Persist { collection, .. } => collection.as_str(),
+            | KvResolvedMutation::Persist { collection, .. } => collection,
         }
     }
 

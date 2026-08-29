@@ -97,7 +97,7 @@ async fn secondary(
     };
     let plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::DropIndex {
-            collection: record.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
             field,
         },
     );
@@ -115,7 +115,7 @@ async fn vector(
     let field_name = record.primary_field().to_string();
     let plan = crate::bridge::envelope::PhysicalPlan::Vector(
         nodedb_physical::physical_plan::VectorOp::DropIndex {
-            collection: record.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
             field_name: field_name.clone(),
         },
     );
@@ -192,7 +192,7 @@ async fn fulltext(
 
     let plan = crate::bridge::envelope::PhysicalPlan::Text(
         nodedb_physical::physical_plan::TextOp::SetTextConfig {
-            collection: record.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
             analyzer_name: Some("standard".to_string()),
             fuzzy_default: Some(false),
         },

@@ -11,7 +11,7 @@
 //! assert the total actually moved, per path.
 
 use nodedb_physical::physical_plan::{MaterializedSumBinding, ResolvedSumTarget, UpdateValue};
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 use crate::bridge::envelope::{ErrorCode, Status};
 use crate::data::executor::core_loop::CoreLoop;
@@ -839,7 +839,7 @@ fn the_transaction_batch_path_honours_a_deferred_binding() {
 
     let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::PointInsert {
-            collection: SOURCE.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, SOURCE),
             document_id: "e1".to_string(),
             value: doc_format::encode_to_msgpack(
                 &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),
@@ -899,7 +899,7 @@ fn the_transaction_batch_path_still_folds_an_undeferred_binding() {
 
     let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::PointInsert {
-            collection: SOURCE.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, SOURCE),
             document_id: "e1".to_string(),
             value: doc_format::encode_to_msgpack(
                 &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),
@@ -951,7 +951,7 @@ fn the_transaction_batch_path_reports_its_affected_count() {
 
     let plans = vec![nodedb_physical::physical_plan::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::PointInsert {
-            collection: SOURCE.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, SOURCE),
             document_id: "e1".to_string(),
             value: doc_format::encode_to_msgpack(
                 &serde_json::json!({"account_id": ACCOUNT_A, "amount": 25}),

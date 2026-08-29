@@ -9,6 +9,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -27,7 +28,7 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::BatchPut {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             entries,
             ttl_ms: 0,
             surrogates,
@@ -40,7 +41,7 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
 /// A no-LIMIT KV scan models `count == usize::MAX`.
 fn kv_scan(collection: &str, count: usize) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Scan {
-        collection: collection.into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         cursor: Vec::new(),
         count,
         filters: Vec::new(),

@@ -199,7 +199,7 @@ pub async fn create_index(
     let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
     let backfill_plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::BackfillIndex {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, collection),
             path: extraction_path.clone(),
             is_array,
             unique: is_unique,

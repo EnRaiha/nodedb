@@ -112,7 +112,9 @@ pub async fn show_graph_stats(
     // from different source vShards, and mixed legacy/current collections may
     // have no summary row at all. Identity union below is the correctness path.
     let plan = PhysicalPlan::Graph(GraphOp::Stats {
-        collection: collection.clone(),
+        collection: collection
+            .as_deref()
+            .map(|name| nodedb_types::QualifiedCollection::new(database_id, name)),
         as_of: as_of.or(Some(i64::MAX)),
     });
 

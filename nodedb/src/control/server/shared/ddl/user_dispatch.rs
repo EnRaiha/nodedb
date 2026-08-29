@@ -173,6 +173,7 @@ fn authorize_for_identity(
 
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         identity.tenant_id.as_u64(),
+        scope.database_id(),
         &mut plan,
         &state.rls,
         scope.auth(),
@@ -180,6 +181,7 @@ fn authorize_for_identity(
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         identity.tenant_id,
+        scope.database_id(),
         scope.auth(),
         &state.redaction,
     )?;
@@ -256,7 +258,7 @@ mod tests {
 
     fn trivial_kv_get_plan() -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

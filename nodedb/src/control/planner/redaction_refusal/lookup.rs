@@ -15,6 +15,10 @@ pub(super) struct RefusalCtx<'a> {
     pub(super) store: &'a RedactionStore,
     pub(super) tenant_id: u64,
     pub(super) roles: &'a [String],
+    /// The database bare op-carried collection names (a parsed
+    /// `MatchQuery.collection`) are qualified against before a rule lookup —
+    /// unqualified, the lookup silently misses outside the default database.
+    pub(super) database_id: nodedb_types::DatabaseId,
 }
 
 impl RefusalCtx<'_> {

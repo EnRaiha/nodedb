@@ -348,7 +348,7 @@ async fn dispatch_register_from_stored_inner(
 
     let plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::Register {
-            collection: config.name.clone(),
+            collection: nodedb_types::QualifiedCollection::from_stored(config.name.clone()),
             indexes,
             crdt_enabled: config.crdt_enabled,
             storage_mode: config.storage_mode,

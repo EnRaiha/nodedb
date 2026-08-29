@@ -14,6 +14,7 @@ use nodedb_physical::physical_plan::{
     AggregateSpec, ColumnarInsertIntent, ColumnarOp, GroupKeySpec, PhysicalPlan, QueryOp,
 };
 use nodedb_types::config::tuning::QueryTuning;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 /// Insert `rows` into a columnar collection in a single batch.
 /// Each row carries `{ "id": "rN", "g": "gM", "v": N }` where `M = N % groups`.
@@ -38,7 +39,7 @@ fn insert_grouped_columnar(
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -84,7 +85,7 @@ fn limit_honoured_when_groups_span_multiple_aggregate_chunks() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "chunk_limit_col".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "chunk_limit_col"),
             input: None,
             group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![AggregateSpec {
@@ -146,7 +147,7 @@ fn no_limit_returns_all_groups_with_small_chunk_size() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "chunk_nolimit_col".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "chunk_nolimit_col"),
             input: None,
             group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![AggregateSpec {

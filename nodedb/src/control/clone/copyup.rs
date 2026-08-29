@@ -62,7 +62,7 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         })?;
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: target_coll_qualified.clone(),
+        collection: nodedb_types::QualifiedCollection::new(target_db_id, target_collection),
         key: kv_key,
         value: source_value_bytes,
         ttl_ms: 0,
@@ -214,7 +214,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
 
     // Write the source row into target storage using PointPut.
     let put_plan = PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: target_coll_qualified.clone(),
+        collection: nodedb_types::QualifiedCollection::new(target_db_id, target_collection),
         document_id: source_doc_id.clone(),
         value: source_row_bytes.clone(),
         surrogate: target_surrogate,

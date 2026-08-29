@@ -150,7 +150,7 @@ pub(super) async fn materialize_columnar_collection(
                 // Format "msgpack" = msgpack array-of-maps (same layout as
                 // SQL VALUES ingest produced by the planner).
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: target_qualified.clone(),
+                    collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                     payload,
                     format: "msgpack".into(),
                     wal_lsn: None,
@@ -166,7 +166,7 @@ pub(super) async fn materialize_columnar_collection(
                 })
             } else {
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
-                    collection: target_qualified.clone(),
+                    collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                     payload,
                     format: "msgpack".into(),
                     intent: ColumnarInsertIntent::InsertIfAbsent,
@@ -279,7 +279,7 @@ async fn scan_source_page(
     system_as_of_ms: Option<i64>,
 ) -> crate::Result<ScanPage> {
     let plan = PhysicalPlan::Columnar(ColumnarOp::MaterializeScan {
-        collection: source_qualified.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(source_qualified.to_string()),
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
         system_as_of_ms,

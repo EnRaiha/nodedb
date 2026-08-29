@@ -184,12 +184,12 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
                 ..
             } => {
                 let left = left_alias.as_deref().unwrap_or(left_collection.as_str());
-                push_source(out, left, left_collection);
+                push_source(out, left, left_collection.as_str());
                 if let Some(child) = left_input {
                     collect_sources(child, left, out);
                 }
                 let right = right_alias.as_deref().unwrap_or(right_collection.as_str());
-                push_source(out, right, right_collection);
+                push_source(out, right, right_collection.as_str());
                 if let Some(child) = right_input {
                     collect_sources(child, right, out);
                 }
@@ -208,8 +208,8 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
                 right_collection,
                 ..
             } => {
-                push_source(out, left_collection, left_collection);
-                push_source(out, right_collection, right_collection);
+                push_source(out, left_collection.as_str(), left_collection.as_str());
+                push_source(out, right_collection.as_str(), right_collection.as_str());
                 return;
             }
             QueryOp::LateralTopK {
@@ -227,7 +227,7 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
                 ..
             } => {
                 collect_sources(outer_plan, outer_alias, out);
-                push_source(out, lateral_alias, inner_collection);
+                push_source(out, lateral_alias, inner_collection.as_str());
                 return;
             }
             QueryOp::Exchange(exchange) => {
@@ -244,7 +244,7 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
             | QueryOp::PartialAggregateState {
                 collection, input, ..
             } => {
-                push_source(out, qualifier, collection);
+                push_source(out, qualifier, collection.as_str());
                 if let Some(child) = input {
                     collect_sources(child, qualifier, out);
                 }
@@ -278,6 +278,7 @@ mod tests {
     use crate::control::security::redaction::{RedactionMode, RedactionPolicy, RedactionRule};
 
     use super::*;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     fn store_with_mask(collection: &str, role: &str, field: &str) -> RedactionStore {
         let store = RedactionStore::new();
@@ -331,7 +332,7 @@ mod tests {
     /// A minimal single-collection leaf plan.
     fn scan(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::EstimateCount {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             field: "id".to_string(),
         })
     }
@@ -342,8 +343,8 @@ mod tests {
         left_input: Option<PhysicalPlan>,
     ) -> PhysicalPlan {
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "workspaces".into(),
-            right_collection: "boards".into(),
+            left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "workspaces"),
+            right_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "boards"),
             left_alias: left_alias.map(str::to_string),
             right_alias: right_alias.map(str::to_string),
             on: Vec::new(),

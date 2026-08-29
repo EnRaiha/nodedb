@@ -19,6 +19,7 @@
 use nodedb::bridge::envelope::Status;
 use nodedb_crdt::policy::{CollectionPolicy, ConflictPolicy};
 use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, EnforcementOptions, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::{TestCtx, make_ctx};
 
@@ -40,7 +41,7 @@ fn register(ctx: &mut TestCtx, collection: &str, conflict_policy: Option<String>
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Register {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             indexes: Vec::new(),
             crdt_enabled: false,
             storage_mode: Default::default(),
@@ -60,7 +61,7 @@ fn get_policy(ctx: &mut TestCtx, collection: &str) -> CollectionPolicy {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-            collection: collection.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         }),
     );
     sonic_rs::from_slice(&payload).expect("decode CollectionPolicy JSON")

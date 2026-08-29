@@ -44,8 +44,8 @@ pub async fn run_authorized_insert_select(
         state,
         task.tenant_id,
         task.database_id,
-        &target_collection,
-        &source_collection,
+        target_collection.as_str(),
+        source_collection.as_str(),
         &source_filters,
         source_limit,
     )
@@ -135,7 +135,9 @@ pub(crate) async fn run_insert_select(
                 .await?;
 
             let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: target_collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target_collection.to_string(),
+                ),
                 documents,
                 surrogates,
                 // `INSERT ... SELECT` is paged across many of these writes, so

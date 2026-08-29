@@ -20,6 +20,7 @@ use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::*;
 use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, MetaOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 use nodedb_types::Surrogate;
 use nodedb_types::calvin::{EngineTag, ReadKeyIdent, VersionedReadEntry};
 
@@ -86,7 +87,7 @@ fn send(
 
 fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
@@ -98,7 +99,7 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
 
 fn kv_get(coll: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Get {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -116,7 +117,7 @@ fn doc_value() -> Vec<u8> {
 /// specific surrogate (the document engine's per-key identity).
 fn doc_insert(coll: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         document_id: document_id.to_string(),
         value: doc_value(),
         if_absent: false,
@@ -528,7 +529,7 @@ fn absent_kv_key_phantom_insert_causes_abort() {
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
             txn_id: None,
             plans: vec![PhysicalPlan::Kv(KvOp::Insert {
-                collection: "phantomkv".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "phantomkv"),
                 key: b"newkey".to_vec(),
                 value: b"v".to_vec(),
                 ttl_ms: 0,

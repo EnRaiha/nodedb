@@ -224,11 +224,12 @@ fn invalid_plan_shape(message: String) -> PgWireError {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::KvOp;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     #[test]
     fn calvin_tag_rejects_non_foldable_plan() {
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "items".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -254,7 +255,7 @@ mod tests {
         // An upsert applies one row unconditionally, so its tag needs no
         // round-trip.
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "items".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
@@ -272,7 +273,7 @@ mod tests {
     #[test]
     fn no_op_capable_writes_are_never_folded() {
         let delete = PhysicalPlan::Kv(KvOp::Delete {
-            collection: "items".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             keys: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
@@ -280,7 +281,7 @@ mod tests {
         assert!(calvin_tag_for_plan(&delete).is_err());
 
         let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "items".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             document_id: "a".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),

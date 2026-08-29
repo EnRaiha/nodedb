@@ -6,6 +6,7 @@
 
 use nodedb::bridge::envelope::Status;
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -21,7 +22,7 @@ fn graph_neighbors_isolated() {
             &mut rx,
             TENANT_A,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "col".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "col"),
                 src_id: format!("node_{i}"),
                 label: "FOLLOWS".into(),
                 dst_id: format!("node_{}", i + 1),

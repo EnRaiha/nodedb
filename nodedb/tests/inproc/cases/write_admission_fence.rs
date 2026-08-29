@@ -32,7 +32,7 @@ use nodedb::control::state::SharedState;
 use nodedb::types::{DatabaseId, TenantId, VShardId};
 use nodedb::wal::WalManager;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 /// Build a single-node `SharedState` over a throwaway WAL. The returned
 /// `TempDir` must be kept alive for the WAL's lifetime.
@@ -80,7 +80,7 @@ fn register_promotion_channel(
 /// A single-key KV point write to `collection` / `key`.
 fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: collection.to_owned(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         key: key.to_vec(),
         value: b"v".to_vec(),
         ttl_ms: 0,

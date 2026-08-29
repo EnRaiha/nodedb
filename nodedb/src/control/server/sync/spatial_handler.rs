@@ -121,7 +121,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             field,
             surrogate,
             geometry,
@@ -174,7 +174,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         )?;
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             field,
             surrogate,
             provenance: Some(prov),

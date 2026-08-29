@@ -45,7 +45,7 @@ pub async fn handle_show_vector_index(
         crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
 
     let plan = PhysicalPlan::Vector(VectorOp::QueryStats {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         field_name: field_name.clone(),
     });
 
@@ -134,7 +134,7 @@ pub async fn handle_alter_vector_index_seal(
         crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
 
     let plan = PhysicalPlan::Vector(VectorOp::Seal {
-        collection,
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         field_name,
     });
 
@@ -167,7 +167,7 @@ pub async fn handle_alter_vector_index_compact(
         crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
 
     let plan = PhysicalPlan::Vector(VectorOp::CompactIndex {
-        collection,
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         field_name,
     });
 
@@ -324,7 +324,7 @@ pub async fn handle_alter_vector_index_set(
         // Zero / empty = preserve existing stored value. The handler reads the
         // current IndexConfig and only overrides fields that were explicitly set.
         let set_plan = PhysicalPlan::Vector(VectorOp::SetParams {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             field_name: field_name.clone(),
             // ALTER never redeclares the dimension: `0` preserves whatever
             // CREATE declared rather than clearing the enforced width.
@@ -362,7 +362,7 @@ pub async fn handle_alter_vector_index_set(
 
     if has_rebuild {
         let plan = PhysicalPlan::Vector(VectorOp::Rebuild {
-            collection,
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
             field_name,
             m,
             m0,

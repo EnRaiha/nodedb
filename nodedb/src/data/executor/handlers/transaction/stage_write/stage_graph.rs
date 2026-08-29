@@ -46,7 +46,7 @@ impl CoreLoop {
                 if let Err(e) = self.stage_graph_capped(properties.len()) {
                     return self.response_error(task, e);
                 }
-                let coll_key = graph_coll_key(task, tid, collection);
+                let coll_key = graph_coll_key(task, tid, collection.as_str());
                 self.graph_txn_overlay_mut(txn_id).stage_edge_put(
                     coll_key,
                     src_id,
@@ -64,7 +64,7 @@ impl CoreLoop {
                 dst_id,
                 ..
             } => {
-                let coll_key = graph_coll_key(task, tid, collection);
+                let coll_key = graph_coll_key(task, tid, collection.as_str());
                 self.graph_txn_overlay_mut(txn_id)
                     .stage_edge_delete(coll_key, src_id, label, dst_id);
                 self.stage_count_response(task, 1)
@@ -124,7 +124,7 @@ impl CoreLoop {
         }
         let overlay: &mut GraphTxnOverlay = self.graph_txn_overlay_mut(txn_id);
         for edge in edges {
-            let coll_key = graph_coll_key(task, tid, &edge.collection);
+            let coll_key = graph_coll_key(task, tid, edge.collection.as_str());
             overlay.stage_edge_put(
                 coll_key,
                 &edge.src_id,
@@ -145,7 +145,7 @@ impl CoreLoop {
     ) -> Response {
         let overlay: &mut GraphTxnOverlay = self.graph_txn_overlay_mut(txn_id);
         for edge in edges {
-            let coll_key = graph_coll_key(task, tid, &edge.collection);
+            let coll_key = graph_coll_key(task, tid, edge.collection.as_str());
             overlay.stage_edge_delete(coll_key, &edge.src_id, &edge.label, &edge.dst_id);
         }
         self.stage_count_response(task, edges.len())

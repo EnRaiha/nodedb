@@ -400,7 +400,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Kv(KvOp::Get {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
                 key: Vec::new(),
                 rls_filters: Vec::new(),
                 surrogate_ceiling: None,

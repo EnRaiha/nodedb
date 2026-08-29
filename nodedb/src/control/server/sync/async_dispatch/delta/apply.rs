@@ -295,7 +295,7 @@ pub(crate) async fn apply_delta_and_finalize(
     };
 
     let plan = PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
-        collection: delta_msg.collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &delta_msg.collection),
         document_id: delta_msg.document_id.clone(),
         delta: delta_msg.delta.clone(),
         peer_id: delta_msg.peer_id,

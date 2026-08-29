@@ -38,7 +38,8 @@ pub(crate) fn wal_append_text_op(
         } => {
             let doc_id = crate::engine::document::store::surrogate_to_doc_id(*surrogate);
             let prov = provenance.clone().unwrap_or_default();
-            let payload = nodedb_wal::record::FtsIndexPayload::new(prov, collection, &doc_id, text);
+            let payload =
+                nodedb_wal::record::FtsIndexPayload::new(prov, collection.as_str(), &doc_id, text);
             Some(wal_dispatch_fts_spatial::wal_append_fts_index(
                 wal,
                 tenant_id,
@@ -54,7 +55,8 @@ pub(crate) fn wal_append_text_op(
         } => {
             let doc_id = crate::engine::document::store::surrogate_to_doc_id(*surrogate);
             let prov = provenance.clone().unwrap_or_default();
-            let payload = nodedb_wal::record::FtsDeletePayload::new(prov, collection, &doc_id);
+            let payload =
+                nodedb_wal::record::FtsDeletePayload::new(prov, collection.as_str(), &doc_id);
             Some(wal_dispatch_fts_spatial::wal_append_fts_delete(
                 wal,
                 tenant_id,

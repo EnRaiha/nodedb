@@ -21,7 +21,10 @@ fn transaction_edge_put_committed() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "alice".into(),
             value: b"{\"name\":\"alice\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -36,7 +39,10 @@ fn transaction_edge_put_committed() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "bob".into(),
             value: b"{\"name\":\"bob\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -56,7 +62,10 @@ fn transaction_edge_put_committed() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "nodes".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "nodes",
+                    ),
                     document_id: "carol".into(),
                     value: b"{\"name\":\"carol\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -66,7 +75,10 @@ fn transaction_edge_put_committed() {
                     resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
-                    collection: "col".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "col",
+                    ),
                     src_id: "alice".into(),
                     label: "KNOWS".into(),
                     dst_id: "bob".into(),
@@ -106,7 +118,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "alice".into(),
             value: b"{\"name\":\"alice\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -121,7 +136,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "bob".into(),
             value: b"{\"name\":\"bob\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -138,7 +156,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::SetParams {
-            collection: "emb".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "emb",
+            ),
             field_name: String::new(),
             dim: 3,
             m: 16,
@@ -155,7 +176,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "emb".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "emb",
+            ),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -174,7 +198,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Graph(GraphOp::EdgePut {
-                    collection: "col".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "col",
+                    ),
                     src_id: "alice".into(),
                     label: "KNOWS".into(),
                     dst_id: "bob".into(),
@@ -184,7 +211,10 @@ fn transaction_edge_put_rolled_back_on_failure() {
                 }),
                 // Dimension mismatch: index is dim=3 but vector has 2 elements.
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "emb".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "emb",
+                    ),
                     vector: vec![1.0, 2.0],
                     dim: 3,
                     field_name: String::new(),
@@ -232,7 +262,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "n1".into(),
             value: b"original_n1".to_vec(),
             surrogate: nodedb_types::Surrogate::new(1),
@@ -247,7 +280,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "n2".into(),
             value: b"original_n2".to_vec(),
             surrogate: nodedb_types::Surrogate::new(2),
@@ -264,7 +300,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::SetParams {
-            collection: "vec".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vec",
+            ),
             field_name: String::new(),
             dim: 3,
             m: 16,
@@ -281,7 +320,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "vec".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vec",
+            ),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -300,7 +342,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "nodes".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "nodes",
+                    ),
                     document_id: "n1".into(),
                     value: b"modified_n1".to_vec(),
                     surrogate: nodedb_types::Surrogate::new(1),
@@ -310,7 +355,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
                     resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Graph(GraphOp::EdgePut {
-                    collection: "col".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "col",
+                    ),
                     src_id: "n1".into(),
                     label: "LINKED".into(),
                     dst_id: "n2".into(),
@@ -320,7 +368,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
                 }),
                 // Fail: dim mismatch.
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "vec".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "vec",
+                    ),
                     vector: vec![1.0],
                     dim: 3,
                     field_name: String::new(),
@@ -339,7 +390,10 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "nodes".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nodes",
+            ),
             document_id: "n1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,

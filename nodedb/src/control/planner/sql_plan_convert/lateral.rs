@@ -65,7 +65,8 @@ pub(super) fn convert_lateral_top_k(
     let inner_filter_bytes = serialize_filters(inner_filters)?;
     let order_by_spec = sort_keys_to_spec(inner_order_by);
     let join_projection = projection_to_join_projections(projection);
-    let inner_coll_qualified = super::convert::db_qualified(ctx.database_id, inner_collection);
+    let inner_coll_qualified =
+        nodedb_types::QualifiedCollection::new(ctx.database_id, inner_collection);
 
     Ok(vec![PhysicalTask {
         tenant_id,
@@ -130,6 +131,8 @@ pub(super) fn convert_lateral_loop(
     let outer_alias_str = outer_alias.unwrap_or(&outer_collection_name).to_string();
 
     let inner_collection = collection_name_from_plan(inner).unwrap_or_default();
+    let inner_qualified_collection =
+        nodedb_types::QualifiedCollection::new(ctx.database_id, &inner_collection);
     let inner_filter_bytes = inner_filters_from_plan(inner)?;
     let join_projection = projection_to_join_projections(projection);
 
@@ -140,7 +143,7 @@ pub(super) fn convert_lateral_loop(
         plan: PhysicalPlan::Query(QueryOp::LateralLoop {
             outer_plan: Box::new(outer_task.plan),
             outer_alias: outer_alias_str,
-            inner_collection,
+            inner_collection: inner_qualified_collection,
             inner_filters: inner_filter_bytes,
             correlation_predicates: correlation_predicates.to_vec(),
             lateral_alias: lateral_alias.to_string(),

@@ -526,7 +526,7 @@ mod tests {
             vshard_id: VShardId::new(0),
             database_id: DB,
             plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: collection.to_string(),
+                collection: nodedb_types::QualifiedCollection::new(DB, collection),
                 document_id: "e1".to_string(),
                 value,
                 if_absent: false,
@@ -703,7 +703,7 @@ mod tests {
             vshard_id: VShardId::new(0),
             database_id: DB,
             plan: PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "entries".to_string(),
+                collection: nodedb_types::QualifiedCollection::new(DB, "entries"),
                 documents: vec![
                     ("e1".to_string(), body("acc-1")),
                     ("e2".to_string(), body("acc-1")),

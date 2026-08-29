@@ -239,7 +239,7 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
         | KvOp::GetSet { collection, .. }
         | KvOp::FieldSet { collection, .. }
         | KvOp::Transfer { collection, .. } => {
-            collections.insert(collection.clone());
+            collections.insert(collection.to_string());
             Ok(())
         }
         // `TransferItem` moves a row across collections: the source holds a
@@ -249,8 +249,8 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
             dest_collection,
             ..
         } => {
-            collections.insert(source_collection.clone());
-            collections.insert(dest_collection.clone());
+            collections.insert(source_collection.to_string());
+            collections.insert(dest_collection.to_string());
             Ok(())
         }
 
@@ -321,14 +321,14 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
         // A balance write stages like any other point write: one target row,
         // one absolute post-image, keyed by the row's own surrogate.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {
-            collections.insert(collection.clone());
+            collections.insert(collection.to_string());
             Ok(())
         }
         // `INSERT ... SELECT` stages the copied rows into the target collection.
         DocumentOp::InsertSelect {
             target_collection, ..
         } => {
-            collections.insert(target_collection.clone());
+            collections.insert(target_collection.to_string());
             Ok(())
         }
 
@@ -381,6 +381,7 @@ mod tests {
         ArrayOp, ColumnarInsertIntent, ColumnarOp, DocumentOp, GraphOp, KvOp, MetaOp,
         ReturningColumns, ReturningSpec, StorageMode, TimeseriesOp, UpdateValue, VectorOp,
     };
+    use nodedb_types::QualifiedCollection;
     use nodedb_types::Surrogate;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
     use nodedb_types::sync::wire::SyncProvenance;
@@ -458,7 +459,7 @@ mod tests {
     /// picks up that collection's overlay entries.
     fn kv_write_plan(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
@@ -494,7 +495,7 @@ mod tests {
                 TID,
                 txn,
                 &KvOp::Incr {
-                    collection: "counters".to_string(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                     key: b"c".to_vec(),
                     delta,
                     ttl_ms: 0,
@@ -615,7 +616,7 @@ mod tests {
             TID,
             txn,
             &[PhysicalPlan::Kv(KvOp::Delete {
-                collection: "kvc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kvc"),
                 keys: vec![b"gone".to_vec()],
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             })],
@@ -685,7 +686,7 @@ mod tests {
             .insert_tombstone(coll_key("notes"), surrogate, "gone");
 
         let doc_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "gone".to_string(),
             surrogate: Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
@@ -754,7 +755,7 @@ mod tests {
             .expect("seed base row");
 
         let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: row_key.as_str().to_string(),
             surrogate: Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
@@ -810,7 +811,7 @@ mod tests {
         // Empty filters match every row; a RETURNING clause does not change
         // which rows are staged.
         let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             filters: Vec::new(),
             updates: vec![("name".to_string(), literal_str("new"))],
             returning: Some(ReturningSpec {
@@ -866,7 +867,7 @@ mod tests {
         }
 
         let plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             filters: Vec::new(),
             returning: Some(ReturningSpec {
                 columns: ReturningColumns::Star,
@@ -915,7 +916,7 @@ mod tests {
 
         // Serializes the staged post-images from the overlay.
         let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             filters: Vec::new(),
             updates: Vec::new(),
             returning: Some(ReturningSpec {
@@ -970,8 +971,8 @@ mod tests {
         // raises a typed error rather than silently dropping their rows.
         let plans = [
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-                target_collection: "t".to_string(),
-                source_collection: "s".to_string(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_alias: "s".to_string(),
                 target_join_col: "id".to_string(),
                 source_join_col: "id".to_string(),
@@ -984,8 +985,8 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
-                target_collection: "t".to_string(),
-                source_collection: "s".to_string(),
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_alias: "s".to_string(),
                 target_join_col: "id".to_string(),
                 source_join_col: "id".to_string(),
@@ -998,7 +999,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "notes".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
                 documents: vec![("d1".to_string(), Vec::new())],
                 surrogates: vec![Surrogate::ZERO],
                 returning: None,
@@ -1030,7 +1031,7 @@ mod tests {
 
         let plans = [
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: "vp".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vp"),
                 field: "emb".to_string(),
                 surrogate: Surrogate::new(1),
                 vector: vec![1.0, 2.0, 3.0],
@@ -1042,7 +1043,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-                collection: "mc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
                 field_name: "mv".to_string(),
                 document_surrogate: Surrogate::new(2),
                 vectors: vec![1.0, 2.0, 3.0, 4.0],
@@ -1050,18 +1051,18 @@ mod tests {
                 dim: 2,
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-                collection: "mc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
                 field_name: "mv".to_string(),
                 document_surrogate: Surrogate::new(2),
             }),
             PhysicalPlan::Vector(VectorOp::SparseInsert {
-                collection: "sc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
                 field_name: "sv".to_string(),
                 doc_id: "d1".to_string(),
                 entries: vec![(10, 0.5)],
             }),
             PhysicalPlan::Vector(VectorOp::SparseDelete {
-                collection: "sc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
                 field_name: "sv".to_string(),
                 doc_id: "d1".to_string(),
             }),
@@ -1107,7 +1108,7 @@ mod tests {
         let (mut src, _src_dir) = make_core();
         let task = make_task();
         let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
-            collection: "vp".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vp"),
             field: "emb".to_string(),
             surrogate: Surrogate::new(42),
             vector: vec![1.0, 2.0, 3.0],
@@ -1146,7 +1147,7 @@ mod tests {
         let (mut src, _src_dir) = make_core();
         let task = make_task();
         let plan = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-            collection: "mc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".to_string(),
             document_surrogate: Surrogate::new(7),
             vectors: vec![1.0, 2.0, 3.0, 4.0],
@@ -1183,7 +1184,7 @@ mod tests {
         let task = make_task();
         let txn = TxnId::new(53);
         let insert = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-            collection: "mc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".to_string(),
             document_surrogate: Surrogate::new(7),
             vectors: vec![1.0, 2.0, 3.0, 4.0],
@@ -1191,7 +1192,7 @@ mod tests {
             dim: 2,
         });
         let delete = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-            collection: "mc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".to_string(),
             document_surrogate: Surrogate::new(7),
         });
@@ -1223,7 +1224,7 @@ mod tests {
         let (mut src, _src_dir) = make_core();
         let task = make_task();
         let plan = PhysicalPlan::Vector(VectorOp::SparseInsert {
-            collection: "sc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".to_string(),
             doc_id: "d1".to_string(),
             entries: vec![(10, 0.5), (20, 0.8)],
@@ -1254,13 +1255,13 @@ mod tests {
         let task = make_task();
         let txn = TxnId::new(55);
         let insert = PhysicalPlan::Vector(VectorOp::SparseInsert {
-            collection: "sc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".to_string(),
             doc_id: "d1".to_string(),
             entries: vec![(10, 0.5)],
         });
         let delete = PhysicalPlan::Vector(VectorOp::SparseDelete {
-            collection: "sc".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sc"),
             field_name: "sv".to_string(),
             doc_id: "d1".to_string(),
         });
@@ -1338,7 +1339,7 @@ mod tests {
     /// A resolve plan naming `collection` as a schemaless document write.
     fn doc_put_plan(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: String::new(),
             value: Vec::new(),
             surrogate: Surrogate::ZERO,
@@ -1462,7 +1463,7 @@ mod tests {
             .insert_tombstone(coll_key("notes"), surrogate, "gone");
 
         let delete_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "notes".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "gone".to_string(),
             surrogate: Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
@@ -1745,7 +1746,7 @@ mod tests {
             TID,
             txn,
             &[PhysicalPlan::Kv(KvOp::Get {
-                collection: "kvc".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kvc"),
                 key: b"k".to_vec(),
                 rls_filters: Vec::new(),
                 surrogate_ceiling: None,
@@ -1788,7 +1789,7 @@ mod tests {
         dst_surrogate: u32,
     ) -> PhysicalPlan {
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             src_id: src.to_string(),
             label: label.to_string(),
             dst_id: dst.to_string(),
@@ -1896,7 +1897,7 @@ mod tests {
             .stage_edge_delete(coll_key("g"), "a", "knows", "b");
 
         let plan = PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: "g".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "g"),
             src_id: "a".to_string(),
             label: "knows".to_string(),
             dst_id: "b".to_string(),
@@ -2345,7 +2346,7 @@ mod tests {
         let txn = TxnId::new(40);
 
         let plan = PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "emb".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "emb"),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -2410,7 +2411,7 @@ mod tests {
         core.vector_collections.insert(key.clone(), coll);
 
         let plan = PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "emb".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "emb"),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -2445,7 +2446,7 @@ mod tests {
         .expect("encode columnar payload");
 
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "cevents".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cevents"),
             payload,
             format: "msgpack".to_string(),
             intent: ColumnarInsertIntent::Insert,
@@ -2512,7 +2513,7 @@ mod tests {
         let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload,
             format: "samples".to_string(),
             wal_lsn: None,
@@ -2571,7 +2572,7 @@ mod tests {
         let payload =
             zerompk::to_msgpack_vec(&vec![line.to_string()]).expect("encode canonical ILP lines");
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "cpu,load".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cpu,load"),
             payload: payload.clone(),
             format: "ilp-msgpack".to_string(),
             wal_lsn: None,
@@ -2634,7 +2635,7 @@ mod tests {
         let task = make_task();
 
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: "cevents".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cevents"),
             filters: Vec::new(),
             updates: vec![("a".to_string(), vec![1, 2, 3])],
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -2652,7 +2653,7 @@ mod tests {
         assert_eq!(rec.updates, vec![("a".to_string(), vec![1, 2, 3])]);
 
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: "cevents".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cevents"),
             filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
@@ -2781,7 +2782,7 @@ mod tests {
         let plans = [
             kv_write_plan("kvc"),
             PhysicalPlan::Vector(VectorOp::Insert {
-                collection: "emb".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "emb"),
                 vector: vec![1.0, 2.0, 3.0],
                 dim: 3,
                 field_name: String::new(),
@@ -2790,7 +2791,7 @@ mod tests {
                 provenance: None,
             }),
             PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: "cevents".to_string(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cevents"),
                 payload: col_payload,
                 format: "msgpack".to_string(),
                 intent: ColumnarInsertIntent::Insert,
@@ -2877,7 +2878,7 @@ mod tests {
         seq: u64,
     ) -> PhysicalPlan {
         PhysicalPlan::Spatial(SpatialOp::Insert {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             field: field.to_string(),
             surrogate: Surrogate::new(surrogate),
             geometry,
@@ -2892,7 +2893,7 @@ mod tests {
         seq: u64,
     ) -> PhysicalPlan {
         PhysicalPlan::Spatial(SpatialOp::Delete {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             field: field.to_string(),
             surrogate: Surrogate::new(surrogate),
             provenance: Some(spatial_prov(seq)),
@@ -3169,7 +3170,7 @@ mod tests {
         let txn = TxnId::new(45);
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Scan {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             predicate: nodedb_physical::physical_plan::SpatialPredicate::Intersects,
             query_geometry: spatial_point(0.0, 0.0),
@@ -3195,7 +3196,7 @@ mod tests {
         let txn = TxnId::new(46);
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(1),
             geometry: spatial_point(0.0, 0.0),

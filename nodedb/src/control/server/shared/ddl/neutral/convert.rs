@@ -88,7 +88,7 @@ pub async fn convert_collection(
 
     // Dispatch to Data Plane: re-encode if needed (strict = Binary Tuple).
     let plan = PhysicalPlan::Meta(MetaOp::ConvertCollection {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         target_type: target_type.clone(),
         schema_json: schema_json_for_dp,
     });

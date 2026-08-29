@@ -26,7 +26,7 @@ impl CoreLoop {
             } => self.execute_spatial_insert(SpatialInsertExec {
                 task,
                 tid,
-                collection,
+                collection: collection.as_str(),
                 field,
                 surrogate: *surrogate,
                 geometry,
@@ -41,7 +41,7 @@ impl CoreLoop {
             } => self.execute_spatial_delete(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 field,
                 *surrogate,
                 provenance.as_ref(),
@@ -61,7 +61,7 @@ impl CoreLoop {
             } => self.execute_spatial_scan(super::super::handlers::spatial::SpatialScanParams {
                 task,
                 tid,
-                collection,
+                collection: collection.as_str(),
                 field,
                 predicate,
                 query_geometry,

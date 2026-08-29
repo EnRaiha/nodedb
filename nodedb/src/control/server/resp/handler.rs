@@ -7,6 +7,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::credential::store::{AuthRejection, PasswordVerification};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::codec::RespValue;
 use super::command::RespCommand;
@@ -205,7 +206,7 @@ async fn handle_expire(
     };
 
     let plan = PhysicalPlan::Kv(KvOp::Expire {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key,
         ttl_ms,
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
@@ -233,7 +234,7 @@ async fn handle_ttl(
     };
 
     let plan = PhysicalPlan::Kv(KvOp::GetTtl {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key: key.to_vec(),
     });
 
@@ -265,7 +266,7 @@ async fn handle_persist(
     };
 
     let plan = PhysicalPlan::Kv(KvOp::Persist {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key: key.to_vec(),
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -334,7 +335,7 @@ async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     }
 
     let plan = PhysicalPlan::Kv(KvOp::Scan {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         cursor,
         count,
         filters: filter_bytes,
@@ -368,7 +369,7 @@ async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     let pattern = cmd.arg_str(0).unwrap_or("*");
 
     let plan = PhysicalPlan::Kv(KvOp::Scan {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         cursor: Vec::new(),
         count: 100_000,
         filters: Vec::new(),
@@ -398,7 +399,7 @@ async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedSta
 
 async fn handle_dbsize(session: &RespSession, state: &SharedState) -> RespValue {
     let plan = PhysicalPlan::Kv(KvOp::Scan {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         cursor: Vec::new(),
         count: 0,
         filters: Vec::new(),

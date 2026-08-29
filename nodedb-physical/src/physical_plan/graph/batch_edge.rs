@@ -2,7 +2,7 @@
 
 //! `BatchEdge`: one edge in an `EdgePutBatch` / `EdgeDeleteBatch`.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 /// One edge in an `EdgePutBatch` / `EdgeDeleteBatch`.
 ///
@@ -20,7 +20,7 @@ use nodedb_types::Surrogate;
     zerompk::FromMessagePack,
 )]
 pub struct BatchEdge {
-    pub collection: String,
+    pub collection: QualifiedCollection,
     pub src_id: String,
     pub label: String,
     pub dst_id: String,

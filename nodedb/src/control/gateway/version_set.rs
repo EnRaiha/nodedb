@@ -161,7 +161,7 @@ fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut V
         | RegisterSortedIndex { collection, .. }
         | PredicateUpdate { collection, .. }
         | PredicateDelete { collection, .. }
-        | MaterializeScan { collection, .. } => out.push(collection.clone()),
+        | MaterializeScan { collection, .. } => out.push(collection.as_str().to_owned()),
 
         // TransferItem touches two collections.
         TransferItem {
@@ -169,8 +169,8 @@ fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut V
             dest_collection,
             ..
         } => {
-            out.push(source_collection.clone());
-            out.push(dest_collection.clone());
+            out.push(source_collection.as_str().to_owned());
+            out.push(dest_collection.as_str().to_owned());
         }
 
         // The wrapped op is the intercepted write verbatim, so it reads
@@ -180,7 +180,7 @@ fn kv_touched_collections(op: &nodedb_physical::physical_plan::KvOp, out: &mut V
         // Per-mutation: a resolved `TransferItem` writes into a different
         // collection than it deletes from.
         ResolvedWrite { mutations, .. } => {
-            out.extend(mutations.iter().map(|m| m.collection().to_owned()));
+            out.extend(mutations.iter().map(|m| m.collection().as_str().to_owned()));
         }
 
         // Sorted index ops — not per-collection.
@@ -224,7 +224,7 @@ fn document_touched_collections(
         | MaterializeScan { collection, .. }
         // The only collection ApplyBalanceDelta touches — the causing
         // source row rides a separate task on its own vShard.
-        | ApplyBalanceDelta { collection, .. } => out.push(collection.clone()),
+        | ApplyBalanceDelta { collection, .. } => out.push(collection.as_str().to_owned()),
 
         InsertSelect {
             target_collection,
@@ -241,8 +241,8 @@ fn document_touched_collections(
             source_collection,
             ..
         } => {
-            out.push(target_collection.clone());
-            out.push(source_collection.clone());
+            out.push(target_collection.as_str().to_owned());
+            out.push(source_collection.as_str().to_owned());
         }
 
         // The wrapped op is the intercepted write verbatim, so it reads
@@ -251,7 +251,7 @@ fn document_touched_collections(
 
         // Per-mutation: a resolved bulk write spans every row it matched.
         ResolvedWrite { mutations, .. } => {
-            out.extend(mutations.iter().map(|m| m.collection().to_owned()));
+            out.extend(mutations.iter().map(|m| m.collection().as_str().to_owned()));
         }
     }
 }
@@ -294,7 +294,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | MultiVectorDelete { collection, .. }
                 | MultiVectorScoreSearch { collection, .. }
                 | DirectUpsert { collection, .. }
-                | DeleteBySurrogate { collection, .. } => out.push(collection.clone()),
+                | DeleteBySurrogate { collection, .. } => out.push(collection.as_str().to_owned()),
             }
         }
 
@@ -309,7 +309,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | PhraseSearch { collection, .. }
                 | FtsIndexDoc { collection, .. }
                 | FtsDeleteDoc { collection, .. }
-                | SetTextConfig { collection, .. } => out.push(collection.clone()),
+                | SetTextConfig { collection, .. } => out.push(collection.as_str().to_owned()),
             }
         }
 
@@ -318,12 +318,12 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             use GraphOp::*;
             match op {
                 // These ops target a named graph collection.
-                RagFusion { collection, .. } => out.push(collection.clone()),
-                TemporalNeighbors { collection, .. } => out.push(collection.clone()),
+                RagFusion { collection, .. } => out.push(collection.as_str().to_owned()),
+                TemporalNeighbors { collection, .. } => out.push(collection.as_str().to_owned()),
                 Stats {
                     collection: Some(c),
                     ..
-                } => out.push(c.clone()),
+                } => out.push(c.as_str().to_owned()),
 
                 // Structural ops use node IDs, not a collection name.
                 EdgePut { .. }
@@ -363,7 +363,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | ResolvedUpdate { collection, .. }
                 | ResolvedDelete { collection, .. }
                 | ResolveDml { collection, .. }
-                | MaterializeScan { collection, .. } => out.push(collection.clone()),
+                | MaterializeScan { collection, .. } => out.push(collection.as_str().to_owned()),
             }
         }
 
@@ -371,12 +371,14 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Timeseries(op) => {
             use TimeseriesOp::*;
             match op {
-                Scan { collection, .. } | Ingest { collection, .. } => out.push(collection.clone()),
+                Scan { collection, .. } | Ingest { collection, .. } => {
+                    out.push(collection.as_str().to_owned())
+                }
 
                 // The wrapped ingest is the intercepted write verbatim.
                 ResolveIngest(inner) => {
                     if let Ingest { collection, .. } = inner.as_ref() {
-                        out.push(collection.clone());
+                        out.push(collection.as_str().to_owned());
                     }
                 }
             }
@@ -386,7 +388,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Spatial(op) => {
             use SpatialOp::*;
             match op {
-                Scan { collection, .. } => out.push(collection.clone()),
+                Scan { collection, .. } => out.push(collection.as_str().to_owned()),
                 // Sync ingest ops target a collection but do not produce
                 // versioned read output — no version-set entry needed.
                 Insert { .. } | Delete { .. } => {}
@@ -409,7 +411,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | ListDelete { collection, .. }
                 | ListMove { collection, .. }
                 | DocUpsert { collection, .. }
-                | DocDelete { collection, .. } => out.push(collection.clone()),
+                | DocDelete { collection, .. } => out.push(collection.as_str().to_owned()),
 
                 // `ImportSnapshot` is a whole-tenant Loro import and
                 // `SetConstraints` / `DropConstraints` install validator rules —
@@ -432,7 +434,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | PartialAggregate { collection, .. }
                 | PartialAggregateState { collection, .. }
                 | FacetCounts { collection, .. }
-                | RecursiveScan { collection, .. } => out.push(collection.clone()),
+                | RecursiveScan { collection, .. } => out.push(collection.as_str().to_owned()),
 
                 HashJoin {
                     left_collection,
@@ -449,20 +451,20 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     right_collection,
                     ..
                 } => {
-                    out.push(left_collection.clone());
-                    out.push(right_collection.clone());
+                    out.push(left_collection.as_str().to_owned());
+                    out.push(right_collection.as_str().to_owned());
                 }
 
                 LateralTopK {
                     inner_collection, ..
                 } => {
-                    out.push(inner_collection.clone());
+                    out.push(inner_collection.as_str().to_owned());
                 }
 
                 LateralLoop {
                     inner_collection, ..
                 } => {
-                    out.push(inner_collection.clone());
+                    out.push(inner_collection.as_str().to_owned());
                 }
 
                 // Exchange: recurse into the child plan for collection extraction.
@@ -520,6 +522,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     #[test]
     fn with_extra_folds_in_a_pseudo_entry_and_stays_deterministic() {
@@ -557,7 +560,7 @@ mod tests {
     #[test]
     fn from_plan_kv_get() {
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "users".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             key: b"key".to_vec(),
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -570,7 +573,7 @@ mod tests {
     #[test]
     fn from_plan_deterministic_order() {
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "alpha".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "alpha"),
             key: vec![],
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -601,8 +604,8 @@ mod tests {
     #[test]
     fn kv_transfer_item_extracts_both_collections() {
         let plan = PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: "from_col".into(),
-            dest_collection: "to_col".into(),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "from_col"),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "to_col"),
             item_key: vec![],
             dest_key: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,

@@ -480,7 +480,10 @@ mod tests {
                 database_id: DatabaseId::DEFAULT,
                 vshard_id: VShardId::new(0),
                 plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: "metrics".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        DatabaseId::DEFAULT,
+                        "metrics",
+                    ),
                     payload: Vec::new(),
                     format: "ilp-msgpack".into(),
                     wal_lsn: None,

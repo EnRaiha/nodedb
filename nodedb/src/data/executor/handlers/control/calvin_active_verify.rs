@@ -112,14 +112,15 @@ impl CoreLoop {
                 })?
             };
             let matching_ids =
-                self.scan_matching_documents(database_id, tid, collection, &filters)?;
+                self.scan_matching_documents(database_id, tid, collection.as_str(), &filters)?;
 
             if !ollp_surrogates_match(&matching_ids, predicted) {
                 return Ok(false);
             }
             if let Some(predicted_edges) = predicted_edges.as_deref() {
                 let apply_ids = ollp_predicted_doc_ids(predicted);
-                let actual = self.ollp_actual_edges(database_id, tid, collection, &apply_ids);
+                let actual =
+                    self.ollp_actual_edges(database_id, tid, collection.as_str(), &apply_ids);
                 if !ollp_edges_match(actual, predicted_edges) {
                     return Ok(false);
                 }

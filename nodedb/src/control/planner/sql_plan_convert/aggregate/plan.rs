@@ -92,8 +92,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Query(QueryOp::HashJoin {
-                left_collection,
-                right_collection,
+                left_collection: nodedb_types::QualifiedCollection::from_stored(left_collection),
+                right_collection: nodedb_types::QualifiedCollection::from_stored(right_collection),
                 left_alias,
                 right_alias,
                 on: on_keys,
@@ -176,7 +176,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
             vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
             database_id: ctx.database_id,
             plan: PhysicalPlan::Query(QueryOp::Aggregate {
-                collection: raw_collection,
+                collection: nodedb_types::QualifiedCollection::from_stored(raw_collection),
                 input: Some(Box::new(provider_scan)),
                 group_by: group_specs,
                 aggregates: agg_specs,
@@ -197,6 +197,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     }
 
     let collection = db_qualified(ctx.database_id, &raw_collection);
+    let qualified_collection =
+        nodedb_types::QualifiedCollection::new(ctx.database_id, &raw_collection);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, &collection);
 
     let group_strs = group_by_to_strings(group_by);
@@ -210,7 +212,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection,
+                collection: qualified_collection,
                 // Derived in the Data Plane against the declared TIME_KEY.
                 time_range: UNBOUNDED_TIME_RANGE,
                 sort_keys: bridge_sort_keys.clone(),
@@ -280,7 +282,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     // keys and the cost model above still key on the plain column-name strings.
     let group_specs = group_by_to_specs(group_by);
     let aggregate = PhysicalPlan::Query(QueryOp::Aggregate {
-        collection,
+        collection: qualified_collection,
         input: None,
         group_by: group_specs,
         aggregates: agg_specs,

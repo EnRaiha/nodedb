@@ -31,7 +31,7 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
         | GraphOp::Path { collection, .. }
-        | GraphOp::Subgraph { collection, .. } => match collection.as_deref() {
+        | GraphOp::Subgraph { collection, .. } => match collection.as_ref() {
             Some(collection) => ctx.refuse_if_tree(collection, TRAVERSAL_REASON),
             None => Ok(()),
         },
@@ -49,19 +49,25 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
 
         // Refuse: runs over the whole CSR, returns scalars derived from
-        // every row (including ones outside the subtree), no column to filter.
-        GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => {
-            ctx.refuse_if_tree(&params.collection, ALGORITHM_REASON)
-        }
+        // every row (including ones outside the subtree), no column to
+        // filter. `AlgoParams` comes from `nodedb-graph` and carries a bare
+        // name — qualify it against this task's database before the lookup.
+        GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => ctx
+            .refuse_if_tree(
+                &nodedb_types::QualifiedCollection::new(ctx.database_id, &params.collection),
+                ALGORITHM_REASON,
+            ),
 
         // Refuse: the distributed supersteps are the same algorithms one round
         // at a time, carrying the target collection in their params.
-        GraphOp::BspSuperstep(plan) => {
-            ctx.refuse_if_tree(&plan.params.collection, ALGORITHM_REASON)
-        }
-        GraphOp::WccSuperstep(plan) => {
-            ctx.refuse_if_tree(&plan.params.collection, ALGORITHM_REASON)
-        }
+        GraphOp::BspSuperstep(plan) => ctx.refuse_if_tree(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &plan.params.collection),
+            ALGORITHM_REASON,
+        ),
+        GraphOp::WccSuperstep(plan) => ctx.refuse_if_tree(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &plan.params.collection),
+            ALGORITHM_REASON,
+        ),
 
         // Refuse: fusion envelope has no filter slot and no sub-plan to
         // recurse into.
@@ -73,7 +79,7 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
 
         // Refuse: counters over the collection's edges, no column to filter.
         // `None` spans every collection, so no narrow question can be asked.
-        GraphOp::Stats { collection, .. } => match collection.as_deref() {
+        GraphOp::Stats { collection, .. } => match collection.as_ref() {
             Some(collection) => ctx.refuse_if_tree(
                 collection,
                 "graph statistics are counters over the collection's edges, which the subtree \
@@ -120,7 +126,10 @@ fn refuse_match(ctx: &PermCtx<'_>, query: &[u8]) -> crate::Result<()> {
     let decoded: Result<crate::engine::graph::pattern::ast::MatchQuery, _> =
         zerompk::from_msgpack(query);
     match decoded.ok().and_then(|query| query.collection) {
-        Some(collection) => ctx.refuse_if_tree(&collection, MATCH_REASON),
+        Some(collection) => ctx.refuse_if_tree(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &collection),
+            MATCH_REASON,
+        ),
         None => ctx.refuse_if_any_tree(MATCH_REASON),
     }
 }
@@ -137,7 +146,9 @@ mod tests {
 
     fn neighbors(collection: Option<&str>) -> PhysicalPlan {
         PhysicalPlan::Graph(GraphOp::Neighbors {
-            collection: collection.map(str::to_string),
+            collection: collection.map(|c| {
+                nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, c)
+            }),
             node_id: "n1".into(),
             edge_label: None,
             direction: nodedb_types::graph::Direction::Out,

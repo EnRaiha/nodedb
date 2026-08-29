@@ -30,7 +30,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // resolve the target row's identity itself — see `document`'s module doc.
             resolved_sum_targets,
         } => document::point_put(
-            collection,
+            collection.as_str(),
             document_id,
             value,
             surrogate.as_u32(),
@@ -50,7 +50,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             resolved_sum_targets,
             deferred_sum_targets,
         } => document::point_insert(
-            collection,
+            collection.as_str(),
             document_id,
             value,
             *if_absent,
@@ -77,7 +77,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `PointPut`.
             resolved_sum_targets,
         } => document::point_delete(
-            collection,
+            collection.as_str(),
             document_id,
             surrogate.as_u32(),
             resolved_sum_targets,
@@ -98,7 +98,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `PointPut`.
             resolved_sum_targets,
         } => document::point_update(
-            collection,
+            collection.as_str(),
             document_id,
             updates,
             surrogate.as_u32(),
@@ -121,7 +121,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `PointPut`.
             resolved_sum_targets,
         } => document::upsert(
-            collection,
+            collection.as_str(),
             document_id,
             value,
             on_conflict_updates,
@@ -144,7 +144,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `PointPut`. Matches are re-derived by every replica; target identity is not.
             resolved_sum_targets,
         } => document::bulk_delete(
-            collection,
+            collection.as_str(),
             filters,
             resolved_sum_targets,
             encode_returning(returning),
@@ -163,7 +163,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             // See `BulkDelete`.
             resolved_sum_targets,
         } => document::bulk_update(
-            collection,
+            collection.as_str(),
             filters,
             updates,
             resolved_sum_targets,
@@ -176,8 +176,8 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             source_filters,
             source_limit,
         } => document::insert_select(
-            target_collection,
-            source_collection,
+            target_collection.as_str(),
+            source_collection.as_str(),
             source_filters,
             *source_limit,
         ),
@@ -192,7 +192,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             resolved_sum_targets,
             deferred_sum_targets,
         } => document::batch_insert(
-            collection,
+            collection.as_str(),
             documents,
             surrogates,
             resolved_sum_targets,
@@ -209,7 +209,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             restart_identity,
             // See `PointPut`.
             resolved_sum_targets,
-        } => document::truncate(collection, *restart_identity, resolved_sum_targets),
+        } => document::truncate(collection.as_str(), *restart_identity, resolved_sum_targets),
         // OLLP-prepared bulk plans route via the cross-shard Calvin path, not
         // single-shard Raft proposal.
         DocumentOp::BulkDelete { .. } | DocumentOp::BulkUpdate { .. } => return None,
@@ -232,7 +232,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             join_column,
             join_value,
         } => document::apply_balance_delta(
-            collection,
+            collection.as_str(),
             document_id,
             surrogate.as_u32(),
             column,

@@ -207,7 +207,7 @@ pub(super) fn insert(ctx: &DecodeCtx, f: InsertFields) -> crate::Result<Physical
     };
     let provenance = decode_sync_engines::decode_provenance(f.provenance)?;
     Ok(PhysicalPlan::Vector(VectorOp::Insert {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         vector: f.vector.to_vec(),
         dim: f.dim,
         field_name: f.field_name.to_owned(),
@@ -247,7 +247,7 @@ pub(super) fn batch_insert(
         .map(|&raw| bind_self_keyed(ctx, collection, Surrogate::new(raw)))
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(PhysicalPlan::Vector(VectorOp::BatchInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         vectors: vectors.to_vec(),
         dim,
         surrogates,
@@ -256,7 +256,7 @@ pub(super) fn batch_insert(
 
 pub(super) fn delete(collection: &str, vector_id: u32) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Delete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         vector_id,
     })
 }
@@ -278,7 +278,7 @@ pub(super) struct SetParamsFields<'a> {
 
 pub(super) fn set_params(f: SetParamsFields) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         field_name: f.field_name.to_owned(),
         dim: f.dim,
         m: f.m,
@@ -293,7 +293,7 @@ pub(super) fn set_params(f: SetParamsFields) -> PhysicalPlan {
 
 pub(super) fn drop_index(collection: &str, field_name: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::DropIndex {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field_name: field_name.to_owned(),
     })
 }
@@ -305,7 +305,7 @@ pub(super) fn sparse_insert(
     entries: &[(u32, f32)],
 ) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SparseInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field_name: field_name.to_owned(),
         doc_id: doc_id.to_owned(),
         entries: entries.to_vec(),
@@ -314,7 +314,7 @@ pub(super) fn sparse_insert(
 
 pub(super) fn sparse_delete(collection: &str, field_name: &str, doc_id: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SparseDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field_name: field_name.to_owned(),
         doc_id: doc_id.to_owned(),
     })
@@ -335,7 +335,7 @@ pub(super) fn multi_vector_insert(
     // replica without a separate PK.
     let surrogate = bind_self_keyed(ctx, collection, Surrogate::new(document_surrogate))?;
     Ok(PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field_name: field_name.to_owned(),
         document_surrogate: surrogate,
         vectors: vectors.to_vec(),
@@ -350,7 +350,7 @@ pub(super) fn multi_vector_delete(
     document_surrogate: u32,
 ) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         field_name: field_name.to_owned(),
         // Deletes an already-bound identity; no re-binding needed (mirrors
         // `VectorDelete`, which carries no ctx interaction).
@@ -366,7 +366,7 @@ pub(super) fn delete_by_surrogate(
 ) -> crate::Result<PhysicalPlan> {
     let provenance = decode_sync_engines::decode_provenance(provenance)?;
     Ok(PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         // Deletes an already-bound identity; no re-binding needed.
         surrogate: Surrogate::new(surrogate),
         field_name: field_name.to_owned(),
@@ -395,7 +395,7 @@ pub(super) fn direct_upsert(ctx: &DecodeCtx, f: DirectUpsertFields) -> crate::Re
     // binds by its own bytes, same as headless vector inserts.
     let surrogate = bind_self_keyed(ctx, f.collection, Surrogate::new(f.surrogate))?;
     Ok(PhysicalPlan::Vector(VectorOp::DirectUpsert {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         field: f.field.to_owned(),
         surrogate,
         vector: f.vector.to_vec(),

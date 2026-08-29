@@ -23,6 +23,7 @@ use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
 use nodedb_types::{ArrayCell, Value};
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::{Surrogate, SurrogateBitmap};
 
 use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
@@ -787,7 +788,7 @@ fn vector_search_with_array_surrogate_prefilter() {
     // Insert 10 vectors with matching surrogates 1..=10.
     for i in 0u32..10 {
         let r = h.send_plan(PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "embeddings".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
             vector: vec![(i + 1) as f32, 0.0, 0.0],
             dim: 3,
             field_name: String::new(),
@@ -807,7 +808,7 @@ fn vector_search_with_array_surrogate_prefilter() {
 
     // Vector search with inline prefilter sub-plan.
     let r = h.send_plan(PhysicalPlan::Vector(VectorOp::Search {
-        collection: "embeddings".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
         query_vector: vec![5.5f32, 0.0, 0.0],
         top_k: 10,
         ef_search: 0,

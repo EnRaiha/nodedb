@@ -329,7 +329,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::{RlsWriteCheck, Surrogate};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn kv_transfer_survives_wal_replay_from_empty() {
         let put_alice = PhysicalPlan::Kv(KvOp::Put {
-            collection: "accounts".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
             key: b"alice".to_vec(),
             value: kv_doc("balance", 100.0),
             ttl_ms: 0,
@@ -411,7 +411,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let put_bob = PhysicalPlan::Kv(KvOp::Put {
-            collection: "accounts".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
             key: b"bob".to_vec(),
             value: kv_doc("balance", 10.0),
             ttl_ms: 0,
@@ -420,7 +420,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let transfer = PhysicalPlan::Kv(KvOp::Transfer {
-            collection: "accounts".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
             source_key: b"alice".to_vec(),
             dest_key: b"bob".to_vec(),
             field: "balance".into(),
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn kv_transfer_item_survives_wal_replay_from_empty() {
         let put_item = PhysicalPlan::Kv(KvOp::Put {
-            collection: "inventory".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "inventory"),
             key: b"sword_1".to_vec(),
             value: kv_doc("power", 5.0),
             ttl_ms: 0,
@@ -487,8 +487,8 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let transfer_item = PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: "inventory".into(),
-            dest_collection: "trades".into(),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "inventory"),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "trades"),
             item_key: b"sword_1".to_vec(),
             dest_key: b"sword_1_moved".to_vec(),
             surrogate: Surrogate::new(7),

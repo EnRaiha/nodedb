@@ -56,7 +56,7 @@ pub(crate) fn prefiltered_scan_plan(
         return None;
     }
     Some(PhysicalPlan::Document(DocumentOp::Scan {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         limit,
         offset: 0,
         sort_keys: Vec::new(),

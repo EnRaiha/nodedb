@@ -46,12 +46,13 @@ impl AuthorizationRequirement {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, KvOp, MetaOp, QueryOp};
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     #[test]
     fn insert_select_requires_source_read_and_target_write() {
         let plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::InsertSelect {
-            target_collection: "target".into(),
-            source_collection: "source".into(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "target"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
             source_filters: Vec::new(),
             source_limit: 0,
         });
@@ -108,7 +109,7 @@ mod tests {
     #[test]
     fn crdt_constraint_reads_remain_collection_scoped() {
         let plan = crate::bridge::envelope::PhysicalPlan::Crdt(CrdtOp::ReadConstraints {
-            collection: "documents".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "documents"),
         });
         assert_eq!(
             plan_requirements(&plan),
@@ -123,7 +124,7 @@ mod tests {
     fn nested_collection_plan_does_not_require_tenant_permission() {
         let plan = crate::bridge::envelope::PhysicalPlan::Meta(MetaOp::TransactionBatch {
             plans: vec![crate::bridge::envelope::PhysicalPlan::Kv(KvOp::Get {
-                collection: "orders".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
                 key: Vec::new(),
                 rls_filters: Vec::new(),
                 surrogate_ceiling: None,

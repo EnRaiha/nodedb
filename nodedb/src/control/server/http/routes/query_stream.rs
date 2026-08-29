@@ -376,7 +376,10 @@ mod tests {
         // Collection/engine only matter for attribution, not for this test's
         // assertion — any plan with an extractable collection works.
         let plan = crate::bridge::envelope::PhysicalPlan::Kv(KvOp::Get {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                crate::types::DatabaseId::DEFAULT,
+                "widgets",
+            ),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

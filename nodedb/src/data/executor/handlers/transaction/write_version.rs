@@ -62,7 +62,7 @@ impl CoreLoop {
                 }
             }
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => {
-                self.note_write_lsn(db, tenant, collection, None, lsn);
+                self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
             }
             PhysicalPlan::Spatial(op) => {
                 let coll = match op {
@@ -88,7 +88,7 @@ impl CoreLoop {
             PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::DocUpsert { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::DocDelete { collection, .. }) => {
-                self.note_write_lsn(db, tenant, collection, None, lsn);
+                self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
             }
             // No per-key/collection version recorded for reads, control ops, or
             // engines not (yet) part of the funnel (array is keyed by tile).
@@ -167,7 +167,7 @@ impl CoreLoop {
                 self.note_write_lsn(
                     db,
                     tenant,
-                    collection,
+                    collection.as_str(),
                     Some(KeyRepr::Surrogate(surrogate.as_u32())),
                     lsn,
                 );
@@ -185,7 +185,7 @@ impl CoreLoop {
                 self.note_write_lsn(
                     db,
                     tenant,
-                    collection,
+                    collection.as_str(),
                     Some(KeyRepr::Surrogate(document_surrogate.as_u32())),
                     lsn,
                 );
@@ -201,7 +201,7 @@ impl CoreLoop {
                         self.note_write_lsn(
                             db,
                             tenant,
-                            collection,
+                            collection.as_str(),
                             Some(KeyRepr::Surrogate(s.as_u32())),
                             lsn,
                         );
@@ -209,7 +209,7 @@ impl CoreLoop {
                     }
                 }
                 if !any_surrogate_recorded {
-                    self.note_write_lsn(db, tenant, collection, None, lsn);
+                    self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
                 }
             }
             // Sparse (doc_id-keyed) and `Delete` (vector_id isn't the
@@ -217,7 +217,7 @@ impl CoreLoop {
             VectorOp::SparseInsert { collection, .. }
             | VectorOp::SparseDelete { collection, .. }
             | VectorOp::Delete { collection, .. } => {
-                self.note_write_lsn(db, tenant, collection, None, lsn);
+                self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
             }
             // Read / config / query ops: nothing written, no version to record.
             VectorOp::Search { .. }
@@ -258,7 +258,7 @@ impl CoreLoop {
                 self.note_write_lsn(
                     db,
                     tenant,
-                    collection,
+                    collection.as_str(),
                     Some(KeyRepr::Edge {
                         src: Box::from(src_id.as_str()),
                         label: Box::from(label.as_str()),
@@ -272,7 +272,7 @@ impl CoreLoop {
                     self.note_write_lsn(
                         db,
                         tenant,
-                        &edge.collection,
+                        edge.collection.as_str(),
                         Some(KeyRepr::Edge {
                             src: Box::from(edge.src_id.as_str()),
                             label: Box::from(edge.label.as_str()),
@@ -330,7 +330,7 @@ impl CoreLoop {
                 self.note_write_lsn(
                     db,
                     tenant,
-                    collection,
+                    collection.as_str(),
                     Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
                     lsn,
                 );
@@ -342,7 +342,7 @@ impl CoreLoop {
                     self.note_write_lsn(
                         db,
                         tenant,
-                        collection,
+                        collection.as_str(),
                         Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
                         lsn,
                     );
@@ -357,7 +357,7 @@ impl CoreLoop {
                     self.note_write_lsn(
                         db,
                         tenant,
-                        collection,
+                        collection.as_str(),
                         Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
                         lsn,
                     );
@@ -368,7 +368,7 @@ impl CoreLoop {
             KvOp::Truncate { collection }
             | KvOp::PredicateUpdate { collection, .. }
             | KvOp::PredicateDelete { collection, .. } => {
-                self.note_write_lsn(db, tenant, collection, None, lsn);
+                self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
             }
             _ => {}
         }

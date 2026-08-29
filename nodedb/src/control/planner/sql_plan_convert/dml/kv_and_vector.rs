@@ -24,6 +24,7 @@ pub(in super::super) fn convert_kv_insert(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let update_values = if on_conflict_updates.is_empty() {
         Vec::new()
@@ -49,7 +50,7 @@ pub(in super::super) fn convert_kv_insert(
         let surrogate = assign_for_pk(ctx, collection, &key)?;
         let op = match intent {
             KvInsertIntent::Insert => KvOp::Insert {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 key,
                 value,
                 ttl_ms,
@@ -61,7 +62,7 @@ pub(in super::super) fn convert_kv_insert(
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::InsertIfAbsent => KvOp::InsertIfAbsent {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 key,
                 value,
                 ttl_ms,
@@ -73,7 +74,7 @@ pub(in super::super) fn convert_kv_insert(
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::Put if !update_values.is_empty() => KvOp::InsertOnConflictUpdate {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 key,
                 value,
                 ttl_ms,
@@ -89,7 +90,7 @@ pub(in super::super) fn convert_kv_insert(
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::Put => KvOp::Put {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 key,
                 value,
                 ttl_ms,
@@ -128,6 +129,7 @@ pub(in super::super) fn convert_vector_primary_insert(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let mut tasks = Vec::with_capacity(rows.len());
@@ -167,7 +169,7 @@ pub(in super::super) fn convert_vector_primary_insert(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: collection.to_string(),
+                collection: qualified_collection.clone(),
                 field: cfg.field.to_string(),
                 surrogate,
                 vector: row.vector.clone(),

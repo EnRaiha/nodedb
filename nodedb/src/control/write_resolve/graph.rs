@@ -69,7 +69,7 @@ pub(super) fn resolver_for_graph_op(op: &GraphOp) -> Option<Box<dyn EngineWriteR
         | GraphOp::WccSuperstep(_) => return None,
     };
     Some(Box::new(GraphWriteResolver {
-        collection: collection.clone(),
+        collection: collection.as_str().to_owned(),
         src_id: src_id.clone(),
         op: op.clone(),
     }))

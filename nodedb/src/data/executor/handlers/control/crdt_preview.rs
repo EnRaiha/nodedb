@@ -113,7 +113,7 @@ impl CoreLoop {
 mod tests {
     use loro::LoroValue;
     use nodedb_types::sync::wire::SyncProvenance;
-    use nodedb_types::{DatabaseId, Surrogate, TenantId, Value};
+    use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate, TenantId, Value};
 
     use super::*;
     use crate::bridge::envelope::{ErrorCode, Status};
@@ -203,7 +203,7 @@ mod tests {
         task.request.plan = nodedb_physical::physical_plan::PhysicalPlan::Crdt(
             nodedb_physical::physical_plan::CrdtOp::ImportSnapshot {
                 tenant_id: 1,
-                collection: "docs".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 bytes: snapshot.clone(),
             },
         );
@@ -415,7 +415,7 @@ mod tests {
         let surrogate = Surrogate::new(77);
         task.request.plan = nodedb_physical::physical_plan::PhysicalPlan::Crdt(
             nodedb_physical::physical_plan::CrdtOp::Apply {
-                collection: "docs".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "one".into(),
                 delta: delta.clone(),
                 peer_id: 42,

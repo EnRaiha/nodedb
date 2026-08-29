@@ -131,7 +131,10 @@ impl TestStack {
         let resp = self
             .dispatch(
                 PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                    collection: collection.to_string(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        collection,
+                    ),
                     time_range: (0, i64::MAX),
                     projection: Vec::new(),
                     limit: usize::MAX,
@@ -200,7 +203,7 @@ async fn wal_redispatch_makes_data_queryable() {
         let resp = stack
             .dispatch(
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: coll,
+                    collection: nodedb_types::QualifiedCollection::from_stored(coll),
                     payload,
                     format: "ilp".to_string(),
                     wal_lsn: Some(record.header.lsn),
@@ -294,7 +297,7 @@ async fn catchup_fills_gaps_from_spsc_drops() {
         stack
             .dispatch(
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: coll,
+                    collection: nodedb_types::QualifiedCollection::from_stored(coll),
                     payload,
                     format: "ilp".to_string(),
                     wal_lsn: Some(record.header.lsn),
@@ -448,7 +451,7 @@ async fn production_scenario_catchup_drains_wal_after_ingest() {
             stack
                 .dispatch(
                     PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                        collection: coll_str,
+                        collection: nodedb_types::QualifiedCollection::from_stored(coll_str),
                         payload: raw_payload,
                         format: "ilp".to_string(),
                         wal_lsn: None,
@@ -544,7 +547,10 @@ fn startup_replay_recovers_all_wal_data() {
 
     // Query via direct scan: COUNT(*) must see ALL rows.
     let scan_plan = PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         time_range: (0, i64::MAX),
         projection: Vec::new(),
         limit: usize::MAX,

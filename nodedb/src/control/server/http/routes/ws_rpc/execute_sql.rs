@@ -479,7 +479,7 @@ mod tests {
 
     fn kv_get_plan() -> crate::bridge::envelope::PhysicalPlan {
         crate::bridge::envelope::PhysicalPlan::Kv(nodedb_physical::physical_plan::KvOp::Get {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

@@ -101,6 +101,7 @@ mod tests {
 
     use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
     use nodedb_physical::physical_plan::TimeseriesOp;
+    use nodedb_types::QualifiedCollection;
 
     use super::*;
     use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
@@ -178,7 +179,7 @@ mod tests {
             let line = format!("{COLL},host={host} value={value} {}\n", ts_ms * 1_000_000);
             let r = self.send(
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
                     payload: line.into_bytes(),
                     format: "ilp".to_string(),
                     wal_lsn: Some(wal_lsn),
@@ -201,7 +202,7 @@ mod tests {
         fn scan_hosts(&mut self) -> Vec<String> {
             let r = self.send(
                 PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
                     time_range: (0, i64::MAX),
                     projection: Vec::new(),
                     limit: usize::MAX,

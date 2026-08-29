@@ -62,7 +62,7 @@ pub(super) fn decode_plan(
         && let Ok(Some(resolved)) = catalog_ref.get_surrogate_for_pk(
             database_id,
             crate::types::TenantId::new(tenant_id),
-            collection,
+            collection.as_str(),
             pk_bytes,
         )
     {

@@ -49,13 +49,17 @@ impl CoreLoop {
 
         let tid = task.request.tenant_id;
         let time_key = self
-            .declared_ts_time_key(task.request.database_id, tid, collection)
+            .declared_ts_time_key(task.request.database_id, tid, collection.as_str())
             .map(str::to_string);
-        let batch =
-            match Self::normalized_ilp_batch(collection, payload, format, time_key.as_deref()) {
-                Ok(batch) => batch,
-                Err(error) => return self.response_error(task, error),
-            };
+        let batch = match Self::normalized_ilp_batch(
+            collection.as_str(),
+            payload,
+            format,
+            time_key.as_deref(),
+        ) {
+            Ok(batch) => batch,
+            Err(error) => return self.response_error(task, error),
+        };
 
         let now_ms = self.ingest_now_ms();
         let lines = match normalize::stamp_timestamps(&batch, now_ms) {
@@ -98,7 +102,7 @@ impl CoreLoop {
             time_key.as_deref(),
             now_ms,
             tid.as_u64(),
-            collection,
+            collection.as_str(),
         ) {
             return self.response_error(task, error);
         }

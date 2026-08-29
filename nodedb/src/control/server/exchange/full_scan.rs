@@ -100,7 +100,7 @@ pub fn full_scan_plan_for_collection(
         CollectionType::Document(DocumentMode::Schemaless)
         | CollectionType::Document(DocumentMode::Strict(_)) => {
             PhysicalPlan::Document(DocumentOp::Scan {
-                collection: collection.into(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 limit: COMPLETE_SCAN,
                 offset: 0,
                 filters: rls_filters.to_vec(),
@@ -115,7 +115,7 @@ pub fn full_scan_plan_for_collection(
             })
         }
         CollectionType::KeyValue(_) => PhysicalPlan::Kv(KvOp::Scan {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
             cursor: Vec::new(),
             count: COMPLETE_SCAN,
             filters: rls_filters.to_vec(),
@@ -126,7 +126,7 @@ pub fn full_scan_plan_for_collection(
         CollectionType::Columnar(ColumnarProfile::Plain)
         | CollectionType::Columnar(ColumnarProfile::Spatial { .. }) => {
             PhysicalPlan::Columnar(ColumnarOp::Scan {
-                collection: collection.into(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 projection: Vec::new(),
                 limit: COMPLETE_SCAN,
                 filters: Vec::new(),
@@ -140,7 +140,7 @@ pub fn full_scan_plan_for_collection(
         }
         CollectionType::Columnar(ColumnarProfile::Timeseries { .. }) => {
             PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: collection.into(),
+                collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 // (0, i64::MAX) = no time filter — scan all rows.
                 time_range: (0, i64::MAX),
                 projection: Vec::new(),

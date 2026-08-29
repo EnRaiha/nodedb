@@ -197,7 +197,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
             updates,
             ..
         } => Some(PredicateScope {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             filters: filters.clone(),
             updates: updates.clone(),
             effect: PredicateEffect::Assign,
@@ -207,7 +207,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
             filters,
             ..
         } => Some(PredicateScope {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             filters: filters.clone(),
             updates: Vec::new(),
             effect: PredicateEffect::Remove,
@@ -215,7 +215,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
         // TRUNCATE removes every row, so it carries no filter — the empty
         // filter set is exactly "every row" to the recon scan.
         DocumentOp::Truncate { collection, .. } => Some(PredicateScope {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             filters: Vec::new(),
             updates: Vec::new(),
             effect: PredicateEffect::Remove,

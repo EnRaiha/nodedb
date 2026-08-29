@@ -165,7 +165,7 @@ impl CoreLoop {
                 TxPointPut {
                     task: dummy_task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -198,7 +198,7 @@ impl CoreLoop {
                 TxPointPut {
                     task: dummy_task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -220,7 +220,7 @@ impl CoreLoop {
                 TxPointDelete {
                     task: dummy_task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     user_roles,
@@ -256,7 +256,7 @@ impl CoreLoop {
                 dummy_task,
                 tid,
                 TxVectorInsertParams {
-                    collection,
+                    collection: collection.as_str(),
                     vector,
                     dim: *dim,
                     field_name,
@@ -268,7 +268,13 @@ impl CoreLoop {
             VectorOp::Delete {
                 collection,
                 vector_id,
-            } => Ok(self.exec_tx_vector_delete(dummy_task, tid, collection, *vector_id, undo_log)),
+            } => Ok(self.exec_tx_vector_delete(
+                dummy_task,
+                tid,
+                collection.as_str(),
+                *vector_id,
+                undo_log,
+            )),
 
             _ => self.exec_tx_passthrough(tid, plan),
         }
@@ -297,7 +303,7 @@ impl CoreLoop {
                 dummy_task,
                 tid,
                 TxEdgePutParams {
-                    collection,
+                    collection: collection.as_str(),
                     src_id,
                     label,
                     dst_id,
@@ -319,7 +325,7 @@ impl CoreLoop {
                 dummy_task,
                 tid,
                 TxEdgeDeleteParams {
-                    collection,
+                    collection: collection.as_str(),
                     src_id,
                     label,
                     dst_id,
@@ -335,7 +341,7 @@ impl CoreLoop {
                         dummy_task,
                         tid,
                         TxEdgePutParams {
-                            collection: &edge.collection,
+                            collection: edge.collection.as_str(),
                             src_id: &edge.src_id,
                             label: &edge.label,
                             dst_id: &edge.dst_id,
@@ -356,7 +362,7 @@ impl CoreLoop {
                         dummy_task,
                         tid,
                         TxEdgeDeleteParams {
-                            collection: &edge.collection,
+                            collection: edge.collection.as_str(),
                             src_id: &edge.src_id,
                             label: &edge.label,
                             dst_id: &edge.dst_id,
@@ -419,7 +425,7 @@ impl CoreLoop {
                 dummy_task,
                 super::sub_plan_kv::TxTimeseriesIngestParams {
                     tid: TenantId::new(tid),
-                    collection,
+                    collection: collection.as_str(),
                     payload,
                     format,
                     rls_write_check,

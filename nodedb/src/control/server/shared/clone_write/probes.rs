@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Response, Status};
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -29,7 +29,7 @@ pub(super) async fn probe_row_in_target(
     surrogate: Surrogate,
 ) -> crate::Result<bool> {
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: collection_qualified.to_string(),
+        collection: QualifiedCollection::from_stored(collection_qualified.to_string()),
         document_id: document_id.to_string(),
         surrogate,
         pk_bytes: document_id.as_bytes().to_vec(),
@@ -56,7 +56,7 @@ pub(super) async fn fetch_source_row(
     surrogate: Surrogate,
 ) -> crate::Result<Option<Vec<u8>>> {
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: source_coll_qualified.to_string(),
+        collection: QualifiedCollection::from_stored(source_coll_qualified.to_string()),
         document_id: document_id.to_string(),
         surrogate,
         pk_bytes: document_id.as_bytes().to_vec(),
@@ -86,7 +86,7 @@ pub(super) async fn probe_kv_key_in_target(
     kv_key: &[u8],
 ) -> crate::Result<bool> {
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: collection_qualified.to_string(),
+        collection: QualifiedCollection::from_stored(collection_qualified.to_string()),
         key: kv_key.to_vec(),
         rls_filters: Vec::new(),
         // Internal probe of the clone's own target collection — never
@@ -111,7 +111,7 @@ pub(super) async fn fetch_kv_source_value(
     kv_key: &[u8],
 ) -> crate::Result<Option<Vec<u8>>> {
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: source_coll_qualified.to_string(),
+        collection: QualifiedCollection::from_stored(source_coll_qualified.to_string()),
         key: kv_key.to_vec(),
         rls_filters: Vec::new(),
         // Copy-up reads must see every binding in the source — the
@@ -155,6 +155,7 @@ fn with_caller_rls(
     );
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
+        database_id,
         &mut plan,
         &state.rls,
         scope.auth(),
@@ -162,6 +163,7 @@ fn with_caller_rls(
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         tenant_id,
+        database_id,
         scope.auth(),
         &state.redaction,
     )?;

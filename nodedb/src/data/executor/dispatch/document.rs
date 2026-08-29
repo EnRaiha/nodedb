@@ -55,7 +55,7 @@ impl CoreLoop {
                     task,
                     super::super::handlers::point::get::PointGetParams {
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         document_id,
                         surrogate: *surrogate,
                         rls_filters,
@@ -78,7 +78,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::point::put::PointPutExec {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -102,7 +102,7 @@ impl CoreLoop {
                 crate::data::executor::handlers::point::insert::PointInsertParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -127,7 +127,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::point::delete::PointDeleteExec {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     returning: returning.as_ref(),
@@ -151,7 +151,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::point::update::PointUpdateParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     updates,
@@ -181,7 +181,7 @@ impl CoreLoop {
                     task,
                     crate::data::executor::handlers::document::read::scan::DocumentScanParams {
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         limit: *limit,
                         offset: *offset,
                         sort_keys,
@@ -208,7 +208,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::document::write::DocumentBatchInsertParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     documents,
                     surrogates,
                     returning: returning.as_ref(),
@@ -256,7 +256,7 @@ impl CoreLoop {
                 task,
                 tid,
                 super::super::handlers::bulk_dml::BulkUpdateParams {
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     updates,
                     returning: returning.as_ref(),
@@ -281,7 +281,7 @@ impl CoreLoop {
                 task,
                 tid,
                 super::super::handlers::bulk_dml::BulkDeleteParams {
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     returning: returning.as_ref(),
                     rls_filters,
@@ -308,7 +308,7 @@ impl CoreLoop {
                 task,
                 crate::data::executor::handlers::upsert::UpsertParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -324,10 +324,10 @@ impl CoreLoop {
                 collection,
                 resolved_sum_targets,
                 ..
-            } => self.execute_truncate(task, tid, collection, resolved_sum_targets),
+            } => self.execute_truncate(task, tid, collection.as_str(), resolved_sum_targets),
 
             DocumentOp::EstimateCount { collection, field } => {
-                self.execute_estimate_count(task, tid, collection, field)
+                self.execute_estimate_count(task, tid, collection.as_str(), field)
             }
 
             DocumentOp::InsertSelect { .. } => {
@@ -359,7 +359,7 @@ impl CoreLoop {
                 task,
                 super::super::handlers::document::write::RegisterDocumentCollectionParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     indexes,
                     crdt_enabled: *crdt_enabled,
                     storage_mode,
@@ -375,7 +375,7 @@ impl CoreLoop {
                 collection,
                 path,
                 value,
-            } => self.execute_document_index_lookup(task, tid, collection, path, value),
+            } => self.execute_document_index_lookup(task, tid, collection.as_str(), path, value),
 
             DocumentOp::IndexedFetch {
                 collection,
@@ -389,7 +389,7 @@ impl CoreLoop {
                 task,
                 super::super::handlers::document::index_fetch::IndexedFetchParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     path,
                     value,
                     filters,
@@ -400,7 +400,7 @@ impl CoreLoop {
             ),
 
             DocumentOp::DropIndex { collection, field } => {
-                self.execute_drop_document_index(task, tid, collection, field)
+                self.execute_drop_document_index(task, tid, collection.as_str(), field)
             }
 
             DocumentOp::Merge { .. } => self.dispatch_merge(task, tid, op, false),
@@ -432,7 +432,7 @@ impl CoreLoop {
                 task,
                 super::super::handlers::document::index_maintenance::BackfillIndexParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     path,
                     is_array: *is_array,
                     unique: *unique,
@@ -449,7 +449,7 @@ impl CoreLoop {
             } => self.execute_document_materialize_scan(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 cursor,
                 *count,
                 *system_as_of_ms,
@@ -467,7 +467,7 @@ impl CoreLoop {
                 task,
                 super::super::handlers::document::apply_balance_delta::ApplyBalanceDeltaParams {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     column,

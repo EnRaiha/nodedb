@@ -48,6 +48,8 @@ use nodedb::fail_point::{FailAction, FailGuard};
 use nodedb_physical::physical_plan::{KvOp, MetaOp, PhysicalPlan};
 #[cfg(feature = "failpoints")]
 use nodedb_types::TenantId as NodedbTenantId;
+#[cfg(feature = "failpoints")]
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -107,7 +109,7 @@ fn stage_then_flush(
 #[cfg(feature = "failpoints")]
 fn kv_put_in(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
@@ -121,7 +123,7 @@ fn kv_put_in(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
 #[cfg(feature = "failpoints")]
 fn kv_get_in(coll: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Get {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,

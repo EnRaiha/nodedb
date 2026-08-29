@@ -192,7 +192,9 @@ impl CoreLoop {
                     database_id,
                     vshard,
                     PhysicalPlan::Spatial(SpatialOp::Insert {
-                        collection: payload.collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            payload.collection.clone(),
+                        ),
                         field: payload.field.clone(),
                         surrogate,
                         geometry: geometry.clone(),
@@ -271,7 +273,9 @@ impl CoreLoop {
                     database_id,
                     vshard,
                     PhysicalPlan::Spatial(SpatialOp::Delete {
-                        collection: payload.collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            payload.collection.clone(),
+                        ),
                         field: payload.field.clone(),
                         surrogate,
                         provenance: Some(prov.clone()),

@@ -25,14 +25,14 @@ pub(super) fn bulk_dml(
 ) -> PhysicalPlan {
     if is_update {
         PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             filters: filters.to_vec(),
             updates: updates.to_vec(),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         })
     } else {
         PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             filters: filters.to_vec(),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         })
@@ -77,7 +77,7 @@ pub(super) fn bulk_dml_resolved(
             decoded.push((pk, new_row));
         }
         Ok(PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             rows: decoded,
             rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
         }))
@@ -87,7 +87,7 @@ pub(super) fn bulk_dml_resolved(
             .map(|row| decode_value(&row.pk_msgpack))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             pks,
             rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
         }))

@@ -207,7 +207,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
 
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             payload,
             format: "msgpack".to_string(),
             intent: ColumnarInsertIntent::Insert,

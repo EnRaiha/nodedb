@@ -497,7 +497,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(vshard),
             plan: PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
                 document_id: "u1".into(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -528,7 +528,7 @@ mod tests {
             database_id: DatabaseId::new(db),
             vshard_id: VShardId::new(vshard),
             plan: PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "c".into(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::new(db), "c"),
                 document_id: "d".into(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),

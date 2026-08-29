@@ -182,6 +182,7 @@ pub(in super::super) fn convert_insert(
         ctx,
     } = args;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let mut tasks = Vec::new();
@@ -291,7 +292,7 @@ pub(in super::super) fn convert_insert(
                 }
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-                        collection: collection.into(),
+                        collection: qualified_collection.clone(),
                         document_id: doc_id,
                         fields_json: super::crdt_gate::row_to_fields_json(row)?,
                         surrogate,
@@ -301,7 +302,7 @@ pub(in super::super) fn convert_insert(
                     })
                 } else {
                     PhysicalPlan::Document(DocumentOp::PointInsert {
-                        collection: collection.into(),
+                        collection: qualified_collection.clone(),
                         document_id: doc_id,
                         value: value_bytes,
                         if_absent,
@@ -364,7 +365,7 @@ pub(in super::super) fn convert_insert(
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 payload,
                 format: "msgpack".into(),
                 intent,

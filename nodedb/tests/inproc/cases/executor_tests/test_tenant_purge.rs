@@ -26,7 +26,10 @@ fn purge_removes_all_tenant_data() {
             &mut rx,
             TENANT_A,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 document_id: format!("u{i}"),
                 value: format!("{{\"name\":\"user_{i}\"}}").into_bytes(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -45,7 +48,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "col",
+            ),
             src_id: "u0".into(),
             label: "KNOWS".into(),
             dst_id: "u1".into(),
@@ -62,7 +68,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"sess_1".to_vec(),
             value: b"session_data".to_vec(),
             ttl_ms: 0,
@@ -79,7 +88,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             payload: b"metrics,host=a value=1.0 1000000000\n".to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
@@ -99,7 +111,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u0".into(),
             value: b"{\"name\":\"tenant_b_user\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -147,7 +162,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u0".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -186,7 +204,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"sess_1".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -204,7 +225,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             time_range: (0, i64::MAX),
             projection: vec![],
             limit: 100,
@@ -239,7 +263,10 @@ fn purge_removes_all_tenant_data() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u0".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -271,7 +298,10 @@ fn purge_is_idempotent() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "test".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "test",
+            ),
             document_id: "d1".into(),
             value: b"{\"x\":1}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,

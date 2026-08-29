@@ -62,7 +62,7 @@ pub async fn kv_incr(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
         delta,
         ttl_ms,
@@ -122,7 +122,7 @@ pub async fn kv_incr_float(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
         delta,
         surrogate,
@@ -176,7 +176,7 @@ pub async fn kv_cas(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Cas {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
         expected: expected.into_bytes(),
         new_value: new_value.into_bytes(),
@@ -230,7 +230,7 @@ pub async fn kv_getset(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
         new_value: new_value.into_bytes(),
         surrogate,

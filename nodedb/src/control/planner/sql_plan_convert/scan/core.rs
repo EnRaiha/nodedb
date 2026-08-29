@@ -69,6 +69,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
     }
 
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let proj_names = extract_projection_names(projection, window_functions);
@@ -83,7 +84,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             // bounds on the collection's declared TIME_KEY column. Only the
             // core holding the collection knows which column that is.
             PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 time_range: UNBOUNDED_TIME_RANGE,
                 sort_keys: sort.clone(),
                 projection: proj_names,
@@ -100,7 +101,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             })
         }
         EngineType::Columnar => PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             projection: proj_names,
             limit: limit.unwrap_or(usize::MAX),
             filters: filter_bytes,
@@ -112,7 +113,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             computed_columns: computed_bytes.clone(),
         }),
         EngineType::Spatial => PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             projection: proj_names,
             limit: limit.unwrap_or(10000),
             filters: filter_bytes,
@@ -124,7 +125,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             computed_columns: computed_bytes.clone(),
         }),
         EngineType::KeyValue => PhysicalPlan::Kv(KvOp::Scan {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             cursor: Vec::new(),
             count: limit.unwrap_or(usize::MAX),
             filters: filter_bytes,
@@ -136,7 +137,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         }),
         EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
             PhysicalPlan::Document(DocumentOp::Scan {
-                collection: collection.into(),
+                collection: qualified_collection,
                 // A no-LIMIT document scan is unbounded by row count; the Data
                 // Plane bounds it by a memory budget (`max_scan_result_bytes`)
                 // and surfaces a deterministic error rather than silently
@@ -208,12 +209,13 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         database_id,
     } = args;
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;
     let proj_names = extract_projection_names(projection, &[]);
     let vshard = VShardId::from_collection_in_database(database_id, collection);
     let physical = PhysicalPlan::Document(DocumentOp::IndexedFetch {
-        collection: collection.into(),
+        collection: qualified_collection,
         path: field.into(),
         value: sql_value_to_string(value),
         filters: filter_bytes,
@@ -240,11 +242,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
     ctx: &super::super::convert::ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let physical = match engine {
         EngineType::KeyValue => PhysicalPlan::Kv(KvOp::Get {
-            collection: collection.into(),
+            collection: qualified_collection.clone(),
             key: sql_value_to_bytes(key_value),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -268,7 +271,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
                 None => nodedb_types::Surrogate::ZERO,
             };
             PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 document_id: pk_string,
                 surrogate,
                 pk_bytes,
@@ -297,7 +300,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
                 }
             })?;
             PhysicalPlan::Columnar(ColumnarOp::Scan {
-                collection: collection.into(),
+                collection: qualified_collection.clone(),
                 projection: Vec::new(),
                 limit: 1,
                 filters: filter_bytes,

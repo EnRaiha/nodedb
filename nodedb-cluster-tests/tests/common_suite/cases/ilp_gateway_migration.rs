@@ -20,6 +20,7 @@ use nodedb::control::gateway::GatewayErrorMap;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::{RequestId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -70,7 +71,10 @@ async fn ilp_gateway_migration_single_node_ingest() {
     // Ingest via gateway — mirrors the migrated flush_ilp_batch_inner path.
     let batch = ilp_batch("ilp_gw_single", 10);
     let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "ilp_gw_single".to_string(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "ilp_gw_single",
+        ),
         payload: batch,
         format: "ilp".to_string(),
         wal_lsn: None,
@@ -119,7 +123,7 @@ async fn ilp_gateway_migration_cross_node_ingest() {
     // Ingest via node 1 (leader / bootstrap).
     let leader_gw = Gateway::new(Arc::clone(&cluster.nodes[0].shared));
     let plan1 = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "ilp_gw_cross".to_string(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, "ilp_gw_cross"),
         payload: ilp_batch("ilp_gw_cross", 5),
         format: "ilp".to_string(),
         wal_lsn: None,
@@ -144,7 +148,7 @@ async fn ilp_gateway_migration_cross_node_ingest() {
     // Ingest via node 2 (potential follower) — gateway routes to the shard owner.
     let follower_gw = Gateway::new(Arc::clone(&cluster.nodes[1].shared));
     let plan2 = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: "ilp_gw_cross".to_string(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, "ilp_gw_cross"),
         payload: ilp_batch("ilp_gw_cross", 5),
         format: "ilp".to_string(),
         wal_lsn: None,
@@ -161,7 +165,10 @@ async fn ilp_gateway_migration_cross_node_ingest() {
         Err(nodedb::Error::RetryableSchemaChanged { .. }) => {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let plan2b = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "ilp_gw_cross".to_string(),
+                collection: QualifiedCollection::new(
+                    nodedb_types::id::DatabaseId::DEFAULT,
+                    "ilp_gw_cross",
+                ),
                 payload: ilp_batch("ilp_gw_cross", 5),
                 format: "ilp".to_string(),
                 wal_lsn: None,

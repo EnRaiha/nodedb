@@ -68,7 +68,10 @@ mod tests {
     fn bm25_score_scan_is_refused_under_a_tree() {
         let cache = cache_with_tree("articles");
         let mut plan = PhysicalPlan::Text(TextOp::BM25ScoreScan {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query: "rust".into(),
             score_alias: "score".into(),
             fuzzy: false,
@@ -81,7 +84,10 @@ mod tests {
     fn search_receives_the_subtree_filter() {
         let cache = cache_with_tree("articles");
         let mut plan = PhysicalPlan::Text(TextOp::Search {
-            collection: "articles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "articles",
+            ),
             query: "rust".into(),
             top_k: 10,
             fuzzy: false,

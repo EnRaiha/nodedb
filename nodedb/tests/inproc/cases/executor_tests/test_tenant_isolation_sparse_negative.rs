@@ -22,7 +22,10 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "profiles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "profiles",
+            ),
             document_id: "user_1".into(),
             value: b"{\"name\":\"alice\",\"secret\":\"tenant_a_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -40,7 +43,10 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "profiles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "profiles",
+            ),
             document_id: "user_1".into(),
             value: b"{\"name\":\"bob\",\"secret\":\"tenant_b_secret\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -58,7 +64,10 @@ fn sparse_cross_tenant_put_does_not_overwrite() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "profiles".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "profiles",
+            ),
             document_id: "user_1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -91,7 +100,10 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "records".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "records",
+            ),
             document_id: "rec_42".into(),
             value: b"{\"data\":\"confidential\"}".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -111,7 +123,10 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "records".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "records",
+            ),
             document_id: "rec_42".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -136,7 +151,10 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "records".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "records",
+            ),
             document_id: "rec_42".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,

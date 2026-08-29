@@ -71,7 +71,10 @@ fn insert_active(ctx: &mut TestCtx, id: &str) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             document_id: id.into(),
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
@@ -100,7 +103,10 @@ fn insert_active_edge(ctx: &mut TestCtx, id: &str, from: &str, to: &str, etype: 
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             document_id: id.into(),
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
@@ -130,7 +136,10 @@ fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         UpdateValue::Literal(nodedb_types::json_to_msgpack(&serde_json::json!("updated")).unwrap()),
     )];
     PhysicalPlan::Document(DocumentOp::BulkUpdate {
-        collection: COLLECTION.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            COLLECTION,
+        ),
         filters: filter_active(),
         updates,
         returning: None,
@@ -145,7 +154,10 @@ fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
 /// Build a BulkDelete plan that deletes all `active = true` docs.
 fn bulk_delete_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::BulkDelete {
-        collection: COLLECTION.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            COLLECTION,
+        ),
         filters: filter_active(),
         returning: None,
         ollp_predicted_surrogates: predicted,
@@ -163,7 +175,10 @@ fn bulk_delete_plan_with_edges(
     edges: Option<Vec<OllpPredictedEdge>>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::BulkDelete {
-        collection: COLLECTION.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            COLLECTION,
+        ),
         filters: filter_active(),
         returning: None,
         ollp_predicted_surrogates: predicted,
@@ -298,7 +313,10 @@ fn bulk_update_stale_prediction_returns_ollp_retry_required() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             document_id: "z1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -415,7 +433,10 @@ fn bulk_delete_changed_edge_endpoint_returns_ollp_retry_required() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             document_id: "e1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -556,7 +577,10 @@ fn bulk_update_retry_with_corrected_prediction_succeeds() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: COLLECTION.into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    COLLECTION,
+                ),
                 document_id: id.into(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -589,7 +613,10 @@ fn bulk_update_superset_prediction_returns_ollp_retry_required() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: COLLECTION.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                COLLECTION,
+            ),
             document_id: "s2".into(),
             surrogate: surrogate_for("s2"),
             pk_bytes: "s2".as_bytes().to_vec(),

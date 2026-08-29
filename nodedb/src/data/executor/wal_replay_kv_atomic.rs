@@ -273,7 +273,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::{RlsWriteCheck, Surrogate};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn kv_cas_survives_wal_replay_from_empty() {
         let put_p1 = PhysicalPlan::Kv(KvOp::Put {
-            collection: "state".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
             key: b"p1".to_vec(),
             value: b"idle".to_vec(),
             ttl_ms: 0,
@@ -357,7 +357,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let cas = PhysicalPlan::Kv(KvOp::Cas {
-            collection: "state".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
             key: b"p1".to_vec(),
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn kv_cas_mismatch_replays_as_noop() {
         let put_p1 = PhysicalPlan::Kv(KvOp::Put {
-            collection: "state".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
             key: b"p1".to_vec(),
             value: b"fighting".to_vec(),
             ttl_ms: 0,
@@ -392,7 +392,7 @@ mod tests {
         // the seeded value is "fighting"); the WAL record still exists
         // because `wal_append_if_write` appends before dispatch.
         let cas = PhysicalPlan::Kv(KvOp::Cas {
-            collection: "state".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
             key: b"p1".to_vec(),
             expected: b"idle".to_vec(),
             new_value: b"in_match".to_vec(),
@@ -416,7 +416,7 @@ mod tests {
     fn kv_cas_empty_expected_against_absent_key_replays_as_create() {
         // No prior put: the key is absent when this record replays.
         let cas = PhysicalPlan::Kv(KvOp::Cas {
-            collection: "state".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "state"),
             key: b"player1".to_vec(),
             expected: Vec::new(),
             new_value: b"idle".to_vec(),
@@ -439,14 +439,14 @@ mod tests {
     #[test]
     fn kv_incr_float_survives_wal_replay_from_empty() {
         let incr1 = PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection: "scores".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"dmg".to_vec(),
             delta: 3.0,
             surrogate: Surrogate::new(1),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
         let incr2 = PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection: "scores".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"dmg".to_vec(),
             delta: 1.5,
             surrogate: Surrogate::new(1),
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn kv_incr_float_non_numeric_replays_as_noop() {
         let put_str = PhysicalPlan::Kv(KvOp::Put {
-            collection: "scores".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"str".to_vec(),
             value: zerompk::to_msgpack_vec(&"hello").expect("encode"),
             ttl_ms: 0,
@@ -478,7 +478,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let incr = PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection: "scores".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "scores"),
             key: b"str".to_vec(),
             delta: 1.0,
             surrogate: Surrogate::new(1),
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn kv_getset_survives_wal_replay_from_empty() {
         let put_tok = PhysicalPlan::Kv(KvOp::Put {
-            collection: "session".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "session"),
             key: b"tok".to_vec(),
             value: b"old-token".to_vec(),
             ttl_ms: 0,
@@ -510,7 +510,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let getset = PhysicalPlan::Kv(KvOp::GetSet {
-            collection: "session".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "session"),
             key: b"tok".to_vec(),
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn kv_getset_against_absent_key_replays_as_create() {
         let getset = PhysicalPlan::Kv(KvOp::GetSet {
-            collection: "session".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "session"),
             key: b"fresh".to_vec(),
             new_value: b"new-token".to_vec(),
             surrogate: Surrogate::new(1),

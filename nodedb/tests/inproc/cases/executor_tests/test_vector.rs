@@ -6,6 +6,7 @@ use nodedb::bridge::dispatch::BridgeRequest;
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{PhysicalPlan, VectorOp};
 use nodedb_types::vector_distance::DistanceMetric;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -18,7 +19,7 @@ fn vector_insert_and_search() {
             inner: make_request_with_id(
                 100 + i as u64,
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "embeddings".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
                     vector: vec![i as f32, 0.0, 0.0],
                     dim: 3,
                     field_name: String::new(),
@@ -43,7 +44,7 @@ fn vector_insert_and_search() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "embeddings".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "embeddings"),
             query_vector: vec![5.0f32, 0.0, 0.0],
             top_k: 3,
             ef_search: 0,
@@ -71,7 +72,7 @@ fn vector_search_no_index_returns_not_found() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Search {
-            collection: "nonexistent".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "nonexistent"),
             query_vector: vec![1.0f32, 0.0, 0.0],
             top_k: 5,
             ef_search: 0,

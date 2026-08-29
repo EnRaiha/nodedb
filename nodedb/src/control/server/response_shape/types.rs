@@ -343,6 +343,7 @@ impl ShapedRows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_types::{DatabaseId, QualifiedCollection};
 
     fn shaped(columns: &[&str], rows: &[&[(&str, &str)]]) -> ShapedRows {
         ShapedRows {
@@ -428,7 +429,7 @@ mod tests {
     #[test]
     fn crdt_preview_is_an_opaque_execution_plan() {
         let plan = PhysicalPlan::Crdt(CrdtOp::PreviewApply {
-            collection: "tasks".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "tasks"),
             document_id: "task-1".to_string(),
             delta: vec![0x92, 0x01],
         });
@@ -440,8 +441,8 @@ mod tests {
         returning: Option<nodedb_physical::physical_plan::ReturningSpec>,
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection: "target".to_string(),
-            source_collection: "source".to_string(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "target"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
             source_alias: "s".to_string(),
             target_join_col: "id".to_string(),
             source_join_col: "id".to_string(),
@@ -481,7 +482,7 @@ mod tests {
         };
         let plans = [
             PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 if_absent: false,
@@ -492,7 +493,7 @@ mod tests {
                 deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -502,7 +503,7 @@ mod tests {
                 resolved_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 documents: Vec::new(),
                 surrogates: Vec::new(),
                 returning: spec(),
@@ -511,7 +512,7 @@ mod tests {
                 deferred_sum_targets: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Upsert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
@@ -543,7 +544,7 @@ mod tests {
         };
         let plans = [
             PhysicalPlan::Kv(KvOp::Insert {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -552,7 +553,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -561,7 +562,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -572,7 +573,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
@@ -581,7 +582,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::BatchPut {
-                collection: "c".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
                 surrogates: Vec::new(),

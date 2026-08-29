@@ -68,7 +68,10 @@ async fn pgwire_gateway_smoke_cache_hit() {
 
     // Pre-populate a KV entry.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_smoke_pgwire".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_pgwire",
+        ),
         key: b"pgwire-smoke-key".to_vec(),
         value: mp_string("pgwire-smoke-val"),
         ttl_ms: 0,
@@ -81,7 +84,10 @@ async fn pgwire_gateway_smoke_cache_hit() {
 
     // Manually populate the plan cache to test hit counting.
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_smoke_pgwire".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_pgwire",
+        ),
         key: b"pgwire-smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -132,7 +138,10 @@ async fn http_gateway_smoke_cache_hit() {
 
     // Put then Get to verify round-trip.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_smoke_http".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_http",
+        ),
         key: b"http-smoke-key".to_vec(),
         value: mp_string("http-smoke-val"),
         ttl_ms: 0,
@@ -144,7 +153,10 @@ async fn http_gateway_smoke_cache_hit() {
     gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_smoke_http".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_http",
+        ),
         key: b"http-smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -190,7 +202,10 @@ async fn resp_gateway_smoke_cache_hit() {
     let ctx = test_ctx(0xC0DE_6003);
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_smoke_resp".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_resp",
+        ),
         key: b"resp-smoke-key".to_vec(),
         value: mp_string("resp-smoke-val"),
         ttl_ms: 0,
@@ -202,7 +217,10 @@ async fn resp_gateway_smoke_cache_hit() {
     gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_smoke_resp".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_resp",
+        ),
         key: b"resp-smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -251,7 +269,10 @@ async fn ilp_gateway_smoke_cache_hit() {
     let ctx = test_ctx(0xC0DE_6004);
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_smoke_ilp".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_ilp",
+        ),
         key: b"ilp-smoke-key".to_vec(),
         value: mp_string("ilp-smoke-val"),
         ttl_ms: 0,
@@ -263,7 +284,10 @@ async fn ilp_gateway_smoke_cache_hit() {
     gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_smoke_ilp".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_ilp",
+        ),
         key: b"ilp-smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -309,7 +333,10 @@ async fn native_gateway_smoke_cache_hit() {
     let ctx = test_ctx(0xC0DE_6005);
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_smoke_native".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_native",
+        ),
         key: b"native-smoke-key".to_vec(),
         value: mp_string("native-smoke-val"),
         ttl_ms: 0,
@@ -321,7 +348,10 @@ async fn native_gateway_smoke_cache_hit() {
     gateway.execute(&ctx, checked).await.expect("gateway Put");
 
     let get_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_smoke_native".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "gw_smoke_native",
+        ),
         key: b"native-smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,

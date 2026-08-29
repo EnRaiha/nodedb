@@ -87,7 +87,7 @@ impl CoreLoop {
                 partial,
             } => {
                 let plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone(),
                     fields_json: fields_json.clone(),
                     surrogate: Surrogate::new(*surrogate),
@@ -117,7 +117,7 @@ impl CoreLoop {
                 surrogate,
             } => {
                 let plan = PhysicalPlan::Crdt(CrdtOp::DocDelete {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone(),
                     surrogate: Surrogate::new(*surrogate),
                     returning: None,
@@ -192,7 +192,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::CrdtOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     const TID: u64 = 1;
     const COLLECTION: &str = "users";
@@ -232,7 +232,7 @@ mod tests {
 
     fn upsert_plan(fields_json: &str, partial: bool) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::DocUpsert {
-            collection: COLLECTION.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
             fields_json: fields_json.to_string(),
             surrogate: Surrogate::new(SURROGATE),
@@ -244,7 +244,7 @@ mod tests {
 
     fn delete_plan() -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::DocDelete {
-            collection: COLLECTION.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
             surrogate: Surrogate::new(SURROGATE),
             returning: None,
@@ -317,7 +317,7 @@ mod tests {
             db,
             &PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
                 tenant_id: TID,
-                collection: COLLECTION.into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
                 bytes: snapshot,
             }),
         )

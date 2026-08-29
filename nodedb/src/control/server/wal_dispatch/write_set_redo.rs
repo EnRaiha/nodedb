@@ -22,32 +22,32 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// a materialized-sum binding writes an unjournaled target row.
 pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     if let PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::PointInsert { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::PointDelete { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::Upsert { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::Truncate { collection, .. }) = plan {
-        Some(collection.clone())
+        Some(collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection, ..
     }) = plan
     {
-        Some(target_collection.clone())
+        Some(target_collection.to_string())
     } else if let PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { collection, .. }) = plan {
         // Journals nothing on the pre-dispatch path; without this redo, a WAL-only
         // restart replays source rows and leaves the total as it stood before.
-        Some(collection.clone())
+        Some(collection.to_string())
     } else {
         None
     }
@@ -119,6 +119,7 @@ pub fn mint_dispatch_local_redo(
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::ReturningSpec;
+    use nodedb_types::QualifiedCollection;
     use nodedb_types::sync::wire::SyncProvenance;
 
     fn open_wal(dir: &std::path::Path) -> WalManager {
@@ -143,7 +144,7 @@ mod tests {
     #[test]
     fn point_update_is_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             surrogate: Surrogate::new(1),
             pk_bytes: Vec::new(),
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn bulk_update_is_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             filters: Vec::new(),
             updates: Vec::new(),
             returning: None::<ReturningSpec>,
@@ -175,8 +176,8 @@ mod tests {
     #[test]
     fn update_from_join_is_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection: "docs".to_string(),
-            source_collection: "src".to_string(),
+            target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
             source_alias: "s".to_string(),
             target_join_col: "sku".to_string(),
             source_join_col: "sku".to_string(),
@@ -194,7 +195,7 @@ mod tests {
     #[test]
     fn bulk_delete_is_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             filters: Vec::new(),
             returning: None::<ReturningSpec>,
             ollp_predicted_surrogates: None,
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn batch_insert_is_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             documents: Vec::new(),
             surrogates: Vec::new(),
             returning: None,
@@ -223,7 +224,7 @@ mod tests {
     #[test]
     fn point_get_is_not_post_apply_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),

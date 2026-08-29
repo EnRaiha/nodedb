@@ -107,14 +107,18 @@ impl CoreLoop {
         // `WriteAborted` marker before the refusal is acknowledged.
         let plan = if record.is_update {
             PhysicalPlan::Columnar(ColumnarOp::Update {
-                collection: record.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    record.collection.clone(),
+                ),
                 filters: record.filters.clone(),
                 updates: record.updates.clone(),
                 rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             })
         } else {
             PhysicalPlan::Columnar(ColumnarOp::Delete {
-                collection: record.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    record.collection.clone(),
+                ),
                 filters: record.filters.clone(),
                 rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             })
@@ -267,7 +271,9 @@ impl CoreLoop {
                 rows.push((pk, new_row));
             }
             let plan = PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate {
-                collection: record.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    record.collection.clone(),
+                ),
                 rows: rows.clone(),
                 rls_write_check: replay_check.clone(),
             });
@@ -304,7 +310,9 @@ impl CoreLoop {
                 pks.push(pk);
             }
             let plan = PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete {
-                collection: record.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    record.collection.clone(),
+                ),
                 pks: pks.clone(),
                 rls_write_check: replay_check.clone(),
             });
@@ -349,7 +357,7 @@ mod tests {
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
     use nodedb_query::scan_filter::{FilterOp, ScanFilter};
-    use nodedb_types::{RlsWriteCheck, Value};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Value};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -395,7 +403,7 @@ mod tests {
         let payload = nodedb_types::value_to_msgpack(&Value::Array(rows))
             .expect("encode columnar insert payload");
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -494,7 +502,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             filters: eq_filter_bytes("id", Value::Integer(2)),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
@@ -518,7 +526,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             filters: eq_filter_bytes("id", Value::Integer(1)),
             updates: vec![(
                 "v".to_string(),
@@ -549,7 +557,7 @@ mod tests {
     fn deleted_rows_do_not_reappear_after_replay_from_empty() {
         let insert = insert_plan(vec![row(1, 10), row(2, 20), row(3, 30)]);
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             filters: eq_filter_bytes("id", Value::Integer(2)),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
@@ -575,7 +583,7 @@ mod tests {
     fn updated_row_present_exactly_once_after_replay_from_empty() {
         let insert = insert_plan(vec![row(1, 10), row(2, 20)]);
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             filters: eq_filter_bytes("id", Value::Integer(1)),
             // The planner emits raw msgpack primitives here
             // (`sql_value_to_msgpack`), not the tagged `Value` enum encoding.

@@ -140,7 +140,9 @@ pub(super) async fn intercept_kv_clone_write(
             if !keys_to_dispatch.is_empty() {
                 // Dispatch a real Delete for keys that exist in target.
                 let delete_plan = PhysicalPlan::Kv(KvOp::Delete {
-                    collection: collection_qualified.to_string(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(
+                        collection_qualified.to_string(),
+                    ),
                     keys: keys_to_dispatch,
                     // The narrowed delete is the same statement's write, so
                     // it carries the same compiled predicate: dropping it

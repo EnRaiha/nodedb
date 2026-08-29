@@ -109,7 +109,7 @@ impl CoreLoop {
                     PointPutParams {
                         database_id: db_id,
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         document_id: &row_key,
                         surrogate: *surrogate,
                         value,
@@ -175,7 +175,14 @@ impl CoreLoop {
                             Ok(p) => p.prior_value.as_deref(),
                             Err(_) => None,
                         };
-                        self.emit_put_event(task, tid, collection, document_id, value, prior);
+                        self.emit_put_event(
+                            task,
+                            tid,
+                            collection.as_str(),
+                            document_id,
+                            value,
+                            prior,
+                        );
                     }
                     self.response_ok(task)
                 }

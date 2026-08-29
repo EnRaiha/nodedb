@@ -2,6 +2,7 @@
 
 //! Columnar engine plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::Surrogate;
 use nodedb_types::protocol::TextFields;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
@@ -10,12 +11,16 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
 
-pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_scan(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let limit = fields.limit.unwrap_or(10_000) as usize;
     let filters = fields.filters.clone().unwrap_or_default();
 
     Ok(PhysicalPlan::Columnar(ColumnarOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         projection: Vec::new(),
         limit,
         filters,
@@ -50,7 +55,7 @@ pub(crate) fn build_insert(
     let surrogates = derive_surrogates(ctx, collection, &payload, &format)?;
 
     Ok(PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         payload,
         format,
         intent: ColumnarInsertIntent::Insert,

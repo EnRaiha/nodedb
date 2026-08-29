@@ -135,7 +135,7 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
         | KvOp::ResolvedWrite { .. } => return None,
     };
     Some(Box::new(KvWriteResolver {
-        collection: collection.clone(),
+        collection: collection.as_str().to_owned(),
         op: op.clone(),
     }))
 }

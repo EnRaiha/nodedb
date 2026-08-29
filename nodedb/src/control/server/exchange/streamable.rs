@@ -60,7 +60,10 @@ mod tests {
 
     fn unordered_scan() -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             filters: Vec::new(),
             limit: 1234,
             offset: 0,

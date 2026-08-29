@@ -61,7 +61,7 @@ fn to_replicated_batch_edges(edges: &[BatchEdge]) -> Vec<ReplicatedBatchEdge> {
     edges
         .iter()
         .map(|e| ReplicatedBatchEdge {
-            collection: e.collection.clone(),
+            collection: e.collection.as_str().to_owned(),
             src_id: e.src_id.clone(),
             label: e.label.clone(),
             dst_id: e.dst_id.clone(),

@@ -33,9 +33,10 @@ impl JoinSide<'_> {
 /// Refuse when any spec in `specs` aggregates a redacted column of `collection`.
 pub(super) fn refuse_aggregates(
     ctx: &RefusalCtx<'_>,
-    collection: &str,
+    collection: &nodedb_types::QualifiedCollection,
     specs: &[AggregateSpec],
 ) -> crate::Result<()> {
+    let collection = collection.as_str();
     if collection.is_empty() {
         return Ok(());
     }
@@ -90,9 +91,10 @@ pub(super) fn refuse_join_aggregates(
 /// themselves, in a nested array the row-level masking hook does not reach.
 pub(super) fn refuse_facet_fields(
     ctx: &RefusalCtx<'_>,
-    collection: &str,
+    collection: &nodedb_types::QualifiedCollection,
     fields: &[String],
 ) -> crate::Result<()> {
+    let collection = collection.as_str();
     if collection.is_empty() {
         return Ok(());
     }

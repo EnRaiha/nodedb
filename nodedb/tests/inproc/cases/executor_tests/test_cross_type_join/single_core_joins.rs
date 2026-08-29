@@ -25,7 +25,10 @@ fn single_core_cross_type_hash_join() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -45,7 +48,10 @@ fn single_core_cross_type_hash_join() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
@@ -68,8 +74,14 @@ fn single_core_cross_type_hash_join() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "docs".into(),
-            right_collection: "prefs".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "key".into())],
@@ -131,7 +143,10 @@ fn single_core_left_join_with_nulls() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -150,7 +165,10 @@ fn single_core_left_join_with_nulls() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "prefs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "prefs",
+                ),
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
@@ -166,8 +184,14 @@ fn single_core_left_join_with_nulls() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "docs".into(),
-            right_collection: "prefs".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "key".into())],
@@ -220,7 +244,10 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "employees".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "employees",
+                ),
                 document_id: (*id).into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -246,8 +273,14 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "employees".into(),
-            right_collection: "employees".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "employees",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "employees",
+            ),
             left_alias: Some("a".into()),
             right_alias: Some("b".into()),
             on: vec![("dept".into(), "dept".into())],
@@ -309,7 +342,10 @@ fn single_core_self_join_star_keeps_both_sides() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "employees".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "employees",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -326,8 +362,14 @@ fn single_core_self_join_star_keeps_both_sides() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "employees".into(),
-            right_collection: "employees".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "employees",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "employees",
+            ),
             left_alias: Some("a".into()),
             right_alias: Some("b".into()),
             on: vec![("dept".into(), "dept".into())],
@@ -398,7 +440,10 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 document_id: (*id).into(),
                 value: tagged,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -424,8 +469,14 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "orders".into(),
-            right_collection: "orders".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             left_alias: Some("a".into()),
             right_alias: Some("b".into()),
             on: vec![("user_id".into(), "user_id".into())],

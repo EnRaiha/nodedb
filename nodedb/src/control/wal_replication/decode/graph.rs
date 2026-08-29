@@ -43,7 +43,7 @@ pub(super) fn edge_put(ctx: &DecodeCtx, f: EdgePutFields) -> crate::Result<Physi
         None => carried_dst,
     };
     Ok(PhysicalPlan::Graph(GraphOp::EdgePut {
-        collection: f.collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
         src_id: f.src_id.to_owned(),
         label: f.label.to_owned(),
         dst_id: f.dst_id.to_owned(),
@@ -85,7 +85,7 @@ pub(super) fn edge_delete(
         None => carried_dst,
     };
     Ok(PhysicalPlan::Graph(GraphOp::EdgeDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         src_id: src_id.to_owned(),
         label: label.to_owned(),
         dst_id: dst_id.to_owned(),
@@ -144,7 +144,7 @@ fn bind_batch_edges(
             None => carried_dst,
         };
         bound.push(BatchEdge {
-            collection: e.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::from_stored(e.collection.clone()),
             src_id: e.src_id.clone(),
             label: e.label.clone(),
             dst_id: e.dst_id.clone(),

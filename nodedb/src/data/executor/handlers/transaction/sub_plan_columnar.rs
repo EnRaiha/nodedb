@@ -50,7 +50,7 @@ impl CoreLoop {
             } => self.execute_tx_columnar_insert(
                 dummy_task,
                 super::sub_plan_kv::TxColumnarInsertParams {
-                    collection,
+                    collection: collection.as_str(),
                     payload,
                     format,
                     intent: *intent,
@@ -69,7 +69,7 @@ impl CoreLoop {
                 rls_write_check,
             } => self.exec_tx_columnar_update(
                 dummy_task,
-                collection,
+                collection.as_str(),
                 filters,
                 updates,
                 rls_write_check,
@@ -82,7 +82,7 @@ impl CoreLoop {
                 rls_write_check,
             } => self.exec_tx_columnar_delete(
                 dummy_task,
-                collection,
+                collection.as_str(),
                 filters,
                 rls_write_check,
                 undo_log,
@@ -99,7 +99,7 @@ impl CoreLoop {
                 rls_write_check,
             } => self.exec_tx_columnar_resolved_update(
                 dummy_task,
-                collection,
+                collection.as_str(),
                 rows,
                 rls_write_check,
                 undo_log,
@@ -111,7 +111,7 @@ impl CoreLoop {
                 rls_write_check,
             } => self.exec_tx_columnar_resolved_delete(
                 dummy_task,
-                collection,
+                collection.as_str(),
                 pks,
                 rls_write_check,
                 undo_log,

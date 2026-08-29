@@ -23,7 +23,10 @@ fn transaction_batch_commits_atomically() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "docs".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "docs",
+                    ),
                     document_id: "d1".into(),
                     value: b"{\"name\":\"alice\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -33,7 +36,10 @@ fn transaction_batch_commits_atomically() {
                     resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "docs".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "docs",
+                    ),
                     document_id: "d2".into(),
                     value: b"{\"name\":\"bob\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -53,7 +59,10 @@ fn transaction_batch_commits_atomically() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -69,7 +78,10 @@ fn transaction_batch_commits_atomically() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d2".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -91,7 +103,10 @@ fn transaction_batch_response_uses_outer_request_id() {
             PhysicalPlan::Meta(MetaOp::TransactionBatch {
                 txn_id: None,
                 plans: vec![PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "docs".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "docs",
+                    ),
                     document_id: "d1".into(),
                     value: b"{\"name\":\"alice\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -121,7 +136,10 @@ fn transaction_batch_rollback_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             value: b"original".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -138,7 +156,10 @@ fn transaction_batch_rollback_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::SetParams {
-            collection: "emb".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "emb",
+            ),
             field_name: String::new(),
             dim: 3,
             m: 16,
@@ -156,7 +177,10 @@ fn transaction_batch_rollback_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "emb".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "emb",
+            ),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -175,7 +199,10 @@ fn transaction_batch_rollback_on_failure() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "docs".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "docs",
+                    ),
                     document_id: "d1".into(),
                     value: b"{\"name\":\"modified\"}".to_vec(),
                     surrogate: nodedb_types::Surrogate::ZERO,
@@ -186,7 +213,10 @@ fn transaction_batch_rollback_on_failure() {
                 }),
                 // Dimension mismatch: index is dim=3 but vector has 2 elements.
                 PhysicalPlan::Vector(VectorOp::Insert {
-                    collection: "emb".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "emb",
+                    ),
                     vector: vec![1.0, 2.0],
                     dim: 3,
                     field_name: String::new(),
@@ -205,7 +235,10 @@ fn transaction_batch_rollback_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,

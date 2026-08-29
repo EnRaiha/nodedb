@@ -376,7 +376,7 @@ mod tests {
 
     fn kv_get_plan() -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn timeseries_ingest_plan_extracts_collection_and_engine() {
         let plan = PhysicalPlan::Timeseries(nodedb_physical::physical_plan::TimeseriesOp::Ingest {
-            collection: "cpu".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "cpu"),
             payload: Vec::new(),
             format: "ilp-msgpack".into(),
             wal_lsn: None,

@@ -71,8 +71,6 @@ pub struct RewriteForSourceParams<'a> {
 /// A read that names the cloned collection but has no rewrite is refused with a
 /// typed error; see [`SourceRewrite`].
 pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Result<SourceRewrite> {
-    use crate::control::planner::sql_plan_convert::convert::db_qualified;
-
     let RewriteForSourceParams {
         plan,
         target_db_id,
@@ -84,8 +82,8 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
         kv_surrogate_ceiling,
         state,
     } = params;
-    let target_qualified = db_qualified(target_db_id, target_coll);
-    let source_qualified = db_qualified(source_db_id, source_coll);
+    let target_qualified = nodedb_types::QualifiedCollection::new(target_db_id, target_coll);
+    let source_qualified = nodedb_types::QualifiedCollection::new(source_db_id, source_coll);
 
     match plan {
         // Structural wrappers, matched before the engine arms: the converter
@@ -201,7 +199,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
             let Some(source_surrogate) = state
                 .surrogate_assigner
-                .lookup(source_db_id, tenant_id, &source_qualified, pk_bytes)
+                .lookup(source_db_id, tenant_id, source_qualified.as_str(), pk_bytes)
                 .ok()
                 .flatten()
             else {
@@ -378,7 +376,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_)
         | PhysicalPlan::ClusterEvent(_) => {
-            if plan_reads_cloned_collection(plan, &target_qualified) {
+            if plan_reads_cloned_collection(plan, target_qualified.as_str()) {
                 return Err(refuse_clone_read_shape(plan, target_coll));
             }
             Ok(SourceRewrite::NoSourceTask)
@@ -409,6 +407,7 @@ mod tests {
         ColumnarOp, DocumentOp, ExchangeMode, ExchangeOp, GraphOp, PhysicalPlan, QueryOp, TextOp,
         VectorOp,
     };
+    use nodedb_types::QualifiedCollection;
     use nodedb_types::SystemTimeScope;
     use nodedb_types::vector_distance::DistanceMetric;
 
@@ -434,7 +433,7 @@ mod tests {
             (
                 "document_scan",
                 PhysicalPlan::Document(DocumentOp::Scan {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     limit: 10,
                     offset: 0,
                     sort_keys: Vec::new(),
@@ -451,7 +450,7 @@ mod tests {
             (
                 "columnar_scan",
                 PhysicalPlan::Columnar(ColumnarOp::Scan {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     projection: Vec::new(),
                     limit: 10,
                     filters: Vec::new(),
@@ -466,7 +465,7 @@ mod tests {
             (
                 "partial_aggregate",
                 PhysicalPlan::Query(QueryOp::PartialAggregate {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     group_by: Vec::new(),
                     aggregates: Vec::new(),
                     filters: Vec::new(),
@@ -475,7 +474,7 @@ mod tests {
             (
                 "partial_aggregate_state",
                 PhysicalPlan::Query(QueryOp::PartialAggregateState {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     input: None,
                     group_by: Vec::new(),
                     aggregates: Vec::new(),
@@ -485,7 +484,7 @@ mod tests {
             (
                 "vector_search",
                 PhysicalPlan::Vector(VectorOp::Search {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query_vector: vec![0.0, 1.0],
                     top_k: 4,
                     ef_search: 16,
@@ -502,7 +501,7 @@ mod tests {
             (
                 "text_search",
                 PhysicalPlan::Text(TextOp::Search {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query: "hello".to_string(),
                     top_k: 4,
                     fuzzy: false,
@@ -513,7 +512,7 @@ mod tests {
             (
                 "text_bm25_score_scan",
                 PhysicalPlan::Text(TextOp::BM25ScoreScan {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query: "hello".to_string(),
                     score_alias: "score".to_string(),
                     fuzzy: false,
@@ -522,7 +521,7 @@ mod tests {
             (
                 "text_hybrid_search",
                 PhysicalPlan::Text(TextOp::HybridSearch {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query_vector: vec![0.0, 1.0],
                     query_text: "hello".to_string(),
                     top_k: 4,
@@ -537,7 +536,7 @@ mod tests {
             (
                 "text_hybrid_search_triple",
                 PhysicalPlan::Text(TextOp::HybridSearchTriple {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query_vector: vec![0.0, 1.0],
                     query_text: "hello".to_string(),
                     graph_seed_id: "n1".to_string(),
@@ -555,7 +554,7 @@ mod tests {
             (
                 "graph_rag_fusion",
                 PhysicalPlan::Graph(GraphOp::RagFusion {
-                    collection: COLL.to_string(),
+                    collection: QualifiedCollection::from_stored(COLL.to_string()),
                     query_vector: vec![0.0, 1.0],
                     vector_top_k: 4,
                     edge_label: None,

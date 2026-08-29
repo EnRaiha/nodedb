@@ -194,7 +194,7 @@ mod tests {
             vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
             database_id: DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: collection.to_owned(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
                 document_id: format!("d{surrogate}"),
                 surrogate: Surrogate::new(surrogate),
                 value: Vec::new(),
@@ -250,7 +250,7 @@ mod tests {
             vshard_id: VShardId::from_key(src_id.as_bytes()),
             database_id: DatabaseId::DEFAULT,
             plan: PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "edges".to_owned(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "edges"),
                 src_id,
                 label: "links".to_owned(),
                 dst_id,

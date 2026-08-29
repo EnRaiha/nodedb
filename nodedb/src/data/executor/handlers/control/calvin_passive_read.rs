@@ -11,6 +11,11 @@
 //! The KV/edge surrogate hashes MUST be deterministic across replicas: the
 //! same byte key or `(src, dst)` edge must produce the same `u32` on every
 //! node, so `DefaultHasher` (RandomState) is explicitly NOT used.
+//!
+//! `EngineKeySet.collection` arrives already database-qualified —
+//! `collection_name_from_plan` reads it off the physical plan's own
+//! qualified collection field — so every `PassiveReadKeyId` below rebuilds
+//! it via `from_stored` rather than re-qualifying.
 
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::Value;
@@ -48,7 +53,9 @@ impl CoreLoop {
                         .unwrap_or(Value::Null);
                     (
                         PassiveReadKeyId {
-                            collection: collection.clone(),
+                            collection: nodedb_types::QualifiedCollection::from_stored(
+                                collection.clone(),
+                            ),
                             surrogate,
                         },
                         value,
@@ -68,7 +75,9 @@ impl CoreLoop {
                     let key_hash = stable_kv_hash(k);
                     (
                         PassiveReadKeyId {
-                            collection: collection.clone(),
+                            collection: nodedb_types::QualifiedCollection::from_stored(
+                                collection.clone(),
+                            ),
                             surrogate: key_hash,
                         },
                         value,
@@ -85,7 +94,9 @@ impl CoreLoop {
                     let edge_hash = stable_edge_hash(src, dst);
                     (
                         PassiveReadKeyId {
-                            collection: collection.clone(),
+                            collection: nodedb_types::QualifiedCollection::from_stored(
+                                collection.clone(),
+                            ),
                             surrogate: edge_hash,
                         },
                         Value::Null, // Edge existence read: Null = absent, non-Null = present.

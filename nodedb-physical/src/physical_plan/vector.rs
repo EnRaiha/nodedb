@@ -2,7 +2,9 @@
 
 //! Vector engine operations dispatched to the Data Plane.
 
-use nodedb_types::{Surrogate, SurrogateBitmap, vector_distance::DistanceMetric};
+use nodedb_types::{
+    QualifiedCollection, Surrogate, SurrogateBitmap, vector_distance::DistanceMetric,
+};
 
 use crate::physical_plan::PhysicalPlan;
 use crate::physical_plan::document::ReturningSpec;
@@ -20,7 +22,7 @@ use crate::physical_plan::document::ReturningSpec;
 pub enum VectorOp {
     /// Vector similarity search.
     Search {
-        collection: String,
+        collection: QualifiedCollection,
         query_vector: Vec<f32>,
         top_k: usize,
         /// Optional search beam width override. If 0, uses default `4 * top_k`.
@@ -64,7 +66,7 @@ pub enum VectorOp {
 
     /// Insert a vector into the HNSW index (write path).
     Insert {
-        collection: String,
+        collection: QualifiedCollection,
         vector: Vec<f32>,
         dim: usize,
         /// Named vector field. Empty string = default (unnamed) field.
@@ -87,7 +89,7 @@ pub enum VectorOp {
 
     /// Batch insert vectors into the HNSW index.
     BatchInsert {
-        collection: String,
+        collection: QualifiedCollection,
         vectors: Vec<Vec<f32>>,
         dim: usize,
         /// One surrogate per inserted vector, parallel to `vectors`.
@@ -97,7 +99,7 @@ pub enum VectorOp {
 
     /// Multi-vector search: query across all named vector fields, fuse via RRF.
     MultiSearch {
-        collection: String,
+        collection: QualifiedCollection,
         query_vector: Vec<f32>,
         top_k: usize,
         ef_search: usize,
@@ -107,7 +109,10 @@ pub enum VectorOp {
     },
 
     /// Soft-delete a vector by internal node ID.
-    Delete { collection: String, vector_id: u32 },
+    Delete {
+        collection: QualifiedCollection,
+        vector_id: u32,
+    },
 
     /// Soft-delete a vector by surrogate (sync inbound path).
     ///
@@ -115,7 +120,7 @@ pub enum VectorOp {
     /// `surrogate_to_local` map and tombstones the node.  If the surrogate
     /// is not found the op is a no-op (idempotent).
     DeleteBySurrogate {
-        collection: String,
+        collection: QualifiedCollection,
         surrogate: nodedb_types::Surrogate,
         /// Named vector field; empty = default field.
         field_name: String,
@@ -126,7 +131,7 @@ pub enum VectorOp {
 
     /// Set vector index parameters for a collection.
     SetParams {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field this config applies to. Empty string = the
         /// default (unnamed) vector field. Lets one collection carry
         /// multiple vector indexes, one per `VECTOR` / embedding column.
@@ -157,7 +162,7 @@ pub enum VectorOp {
     /// keeps its `(collection, field)` slot occupied so no replacement index
     /// can be created.
     DropIndex {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field the index covers. Empty string = the default
         /// (unnamed) vector field.
         field_name: String,
@@ -165,21 +170,21 @@ pub enum VectorOp {
 
     /// Query live vector index statistics. Returns `VectorIndexStats` as payload.
     QueryStats {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty string = default (unnamed) field.
         field_name: String,
     },
 
     /// Force-seal the growing segment, triggering background HNSW build.
     Seal {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty string = default field.
         field_name: String,
     },
 
     /// Force tombstone compaction on sealed segments.
     CompactIndex {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty string = default field.
         field_name: String,
     },
@@ -187,7 +192,7 @@ pub enum VectorOp {
     /// Rebuild sealed segments with new HNSW parameters.
     /// Old index serves queries until rebuild completes, then swaps atomically.
     Rebuild {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty string = default field.
         field_name: String,
         /// New M parameter. 0 = keep current.
@@ -200,7 +205,7 @@ pub enum VectorOp {
 
     /// Insert a sparse vector into the inverted index.
     SparseInsert {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named sparse vector field.
         field_name: String,
         /// Document ID to associate with this sparse vector.
@@ -211,7 +216,7 @@ pub enum VectorOp {
 
     /// Search the sparse inverted index via dot-product scoring.
     SparseSearch {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named sparse vector field.
         field_name: String,
         /// Query sparse vector entries.
@@ -222,7 +227,7 @@ pub enum VectorOp {
 
     /// Delete a document from the sparse inverted index.
     SparseDelete {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named sparse vector field.
         field_name: String,
         /// Document ID to remove.
@@ -233,7 +238,7 @@ pub enum VectorOp {
     /// All vectors are inserted as separate HNSW nodes sharing the
     /// same `document_surrogate`.
     MultiVectorInsert {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty = default.
         field_name: String,
         /// Surrogate shared by all vectors of the document.
@@ -248,7 +253,7 @@ pub enum VectorOp {
 
     /// Delete all vectors for a document from the multi-vector index.
     MultiVectorDelete {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty = default.
         field_name: String,
         /// Document surrogate whose vectors should be tombstoned.
@@ -258,7 +263,7 @@ pub enum VectorOp {
     /// Search with multi-vector aggregated scoring (MaxSim, AvgSim, SumSim).
     /// Over-fetches from HNSW, groups by doc_id, aggregates, deduplicates.
     MultiVectorScoreSearch {
-        collection: String,
+        collection: QualifiedCollection,
         /// Named vector field. Empty = default.
         field_name: String,
         /// Query vector.
@@ -287,7 +292,7 @@ pub enum VectorOp {
     /// If step 4 fails (should not happen — pure in-memory), the handler
     /// attempts to delete the just-inserted HNSW node and returns an error.
     DirectUpsert {
-        collection: String,
+        collection: QualifiedCollection,
         /// Vector column name. Used to compute the vector index key so the
         /// SELECT path (which keys by `(tid, collection, field)`) finds the
         /// same index this insert wrote into.

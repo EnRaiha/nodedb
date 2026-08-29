@@ -180,7 +180,9 @@ impl CoreLoop {
                     database_id,
                     vshard,
                     PhysicalPlan::Text(TextOp::FtsIndexDoc {
-                        collection: payload.collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            payload.collection.clone(),
+                        ),
                         surrogate,
                         text: payload.text.clone(),
                         provenance: Some(prov.clone()),
@@ -257,7 +259,9 @@ impl CoreLoop {
                     database_id,
                     vshard,
                     PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-                        collection: payload.collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            payload.collection.clone(),
+                        ),
                         surrogate,
                         provenance: Some(prov.clone()),
                     }),

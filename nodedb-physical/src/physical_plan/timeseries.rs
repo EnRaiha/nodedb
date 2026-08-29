@@ -2,7 +2,7 @@
 
 //! Timeseries engine operations dispatched to the Data Plane.
 
-use nodedb_types::{RlsWriteCheck, Surrogate, SystemTimeScope};
+use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate, SystemTimeScope};
 
 use crate::physical_plan::document::ReturningSpec;
 
@@ -28,7 +28,7 @@ pub enum TimeseriesOp {
     /// aggregation, and generic GROUP BY. Reads from both the active
     /// memtable and sealed disk partitions.
     Scan {
-        collection: String,
+        collection: QualifiedCollection,
         /// `(min_ts_ms, max_ts_ms)` pruning envelope. The Data Plane narrows
         /// it further using the query's bounds on the declared `TIME_KEY`;
         /// see [`UNBOUNDED_TIME_RANGE`].
@@ -66,7 +66,7 @@ pub enum TimeseriesOp {
 
     /// Write a batch of samples to the columnar memtable.
     Ingest {
-        collection: String,
+        collection: QualifiedCollection,
         payload: Vec<u8>,
         /// "ilp" for InfluxDB Line Protocol, "samples" for structured.
         format: String,

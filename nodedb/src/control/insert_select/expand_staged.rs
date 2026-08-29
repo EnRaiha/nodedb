@@ -57,8 +57,8 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         MaterializeCopy {
             tenant_id,
             database_id: task.database_id,
-            target_collection,
-            source_collection,
+            target_collection: target_collection.as_str(),
+            source_collection: source_collection.as_str(),
             source_filters,
             source_limit: *source_limit,
             txn_id: task.txn_id,
@@ -68,7 +68,8 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
 
     // Recompute the target vShard (rather than reusing the staged task's)
     // to keep dispatch classification honest, as the MERGE expander does.
-    let vshard_id = VShardId::from_collection_in_database(task.database_id, target_collection);
+    let vshard_id =
+        VShardId::from_collection_in_database(task.database_id, target_collection.as_str());
 
     // Resolve materialized-sum targets: these ops stage directly, bypassing
     // statement-level resolution, so without this a bound target collection
@@ -78,7 +79,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
             state,
             &sum_bodies,
-            target_collection,
+            target_collection.as_str(),
             tenant_id,
             task.database_id,
             crate::types::TraceId::ZERO,

@@ -2,6 +2,7 @@
 
 //! CRDT plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 use sonic_rs;
 
@@ -11,10 +12,14 @@ use nodedb_physical::physical_plan::CrdtOp;
 use super::DispatchCtx;
 use super::require_doc_id;
 
-pub(crate) fn build_read(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_read(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let document_id = require_doc_id(fields)?;
     Ok(PhysicalPlan::Crdt(CrdtOp::Read {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id,
     }))
 }
@@ -44,7 +49,7 @@ pub(crate) fn build_apply(
     )?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id,
         delta,
         peer_id,
@@ -77,6 +82,7 @@ fn bounded_delta(fields: &TextFields) -> crate::Result<Vec<u8>> {
 }
 
 pub(crate) fn build_alter_policy(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -90,7 +96,7 @@ pub(crate) fn build_alter_policy(
         detail: format!("invalid policy: {e}"),
     })?;
     Ok(PhysicalPlan::Crdt(CrdtOp::SetPolicy {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         policy_json,
     }))
 }
@@ -145,7 +151,7 @@ pub(crate) fn build_list_insert(
     )?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListInsert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id,
         list_path,
         index,
@@ -171,7 +177,7 @@ pub(crate) fn build_list_delete(
     )?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListDelete {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id,
         list_path,
         index,
@@ -197,7 +203,7 @@ pub(crate) fn build_list_move(
     )?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListMove {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id,
         list_path,
         from_index,
@@ -209,7 +215,7 @@ pub(crate) fn build_list_move(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{DatabaseId, Surrogate};
 
     fn list_insert_fields() -> TextFields {
         TextFields {
@@ -262,7 +268,7 @@ mod tests {
 
         let surrogate = Surrogate::new(42);
         let plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: document_id.clone(),
             list_path: list_path.clone(),
             index,
@@ -281,7 +287,7 @@ mod tests {
         else {
             panic!("expected CrdtOp::ListInsert");
         };
-        assert_eq!(collection, "docs");
+        assert_eq!(collection.as_str(), "docs");
         assert_eq!(got_document_id, document_id);
         assert_eq!(got_list_path, list_path);
         assert_eq!(got_index, index);
@@ -332,7 +338,7 @@ mod tests {
         let surrogate = Surrogate::new(9);
 
         let plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: document_id.clone(),
             list_path: list_path.clone(),
             index,
@@ -349,7 +355,7 @@ mod tests {
         else {
             panic!("expected CrdtOp::ListDelete");
         };
-        assert_eq!(collection, "docs");
+        assert_eq!(collection.as_str(), "docs");
         assert_eq!(got_document_id, document_id);
         assert_eq!(got_list_path, list_path);
         assert_eq!(got_index, index);
@@ -367,7 +373,7 @@ mod tests {
 
         let surrogate = Surrogate::new(11);
         let plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id,
             list_path,
             from_index,

@@ -8,6 +8,7 @@
 use nodedb::bridge::envelope::ErrorCode;
 use nodedb::engine::graph::edge_store::Direction;
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -22,7 +23,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "col".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "col"),
                 src_id: "hub".into(),
                 label: "LINKS".into(),
                 dst_id: format!("n{i}"),
@@ -40,7 +41,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "col".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "col"),
                 src_id: format!("c{i}"),
                 label: "NEXT".into(),
                 dst_id: format!("c{}", i + 1),

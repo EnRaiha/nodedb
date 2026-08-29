@@ -39,7 +39,11 @@ pub(crate) fn wal_append_spatial_op(
         } => {
             let prov = provenance.clone().unwrap_or_default();
             let payload = wal_dispatch_fts_spatial::encode_spatial_put_payload(
-                collection, field, *surrogate, geometry, &prov,
+                collection.as_str(),
+                field,
+                *surrogate,
+                geometry,
+                &prov,
             )?;
             Some(wal_dispatch_fts_spatial::wal_append_spatial_put(
                 wal,
@@ -57,7 +61,10 @@ pub(crate) fn wal_append_spatial_op(
         } => {
             let prov = provenance.clone().unwrap_or_default();
             let payload = wal_dispatch_fts_spatial::encode_spatial_delete_payload(
-                collection, field, *surrogate, &prov,
+                collection.as_str(),
+                field,
+                *surrogate,
+                &prov,
             );
             Some(wal_dispatch_fts_spatial::wal_append_spatial_delete(
                 wal,

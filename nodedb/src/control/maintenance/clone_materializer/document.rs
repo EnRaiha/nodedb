@@ -140,7 +140,7 @@ pub(super) async fn materialize_document_collection(
                 })?;
 
             let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: target_qualified.clone(),
+                collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                 document_id: document_id.clone(),
                 value: value_bytes,
                 if_absent: true,
@@ -250,7 +250,7 @@ pub(crate) async fn scan_source_page(
     txn_id: Option<TxnId>,
 ) -> crate::Result<ScanPage> {
     let plan = PhysicalPlan::Document(DocumentOp::MaterializeScan {
-        collection: source_qualified.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(source_qualified.to_string()),
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
         system_as_of_ms,

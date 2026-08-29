@@ -147,7 +147,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::{RlsWriteCheck, Surrogate};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -222,7 +222,7 @@ mod tests {
         // at replay time would install a value far larger than 6000, since
         // real wall-clock time is vastly greater than 1000.
         let put_seed = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok1".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 0,
@@ -273,7 +273,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let put_seed = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok2".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 0,
@@ -291,7 +291,7 @@ mod tests {
         .expect("wal append seed put");
 
         let plan = PhysicalPlan::Kv(KvOp::Expire {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok2".to_vec(),
             ttl_ms: 5_000,
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
@@ -344,7 +344,7 @@ mod tests {
         // silently: the key would still carry its TTL after replay. This
         // assertion is what bites on that code path.
         let put_p = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok3".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 60_000,
@@ -353,7 +353,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let persist_p = PhysicalPlan::Kv(KvOp::Persist {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok3".to_vec(),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });

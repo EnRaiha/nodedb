@@ -28,7 +28,7 @@ mod tests {
     use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     const TID: u64 = 1;
@@ -162,7 +162,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok2".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 5_000,
@@ -213,7 +213,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok3".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 0,
@@ -277,7 +277,7 @@ mod tests {
     fn execute_kv_put_installs_task_resolved_now_ms_verbatim() {
         let mut h = make_core();
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok4".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 5_000,
@@ -322,7 +322,7 @@ mod tests {
         // `CoreLoop::kv_ttl_now_ms`, which this test pins for `execute_kv_insert`.
         let mut h = make_core();
         let plan = PhysicalPlan::Kv(KvOp::Insert {
-            collection: "sessions".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "sessions"),
             key: b"tok5".to_vec(),
             value: b"payload".to_vec(),
             ttl_ms: 5_000,

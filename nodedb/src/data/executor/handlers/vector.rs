@@ -478,7 +478,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Vector(VectorOp::Search {
-                collection: "docs".to_string(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 query_vector: Vec::new(),
                 top_k: 0,
                 ef_search: 0,

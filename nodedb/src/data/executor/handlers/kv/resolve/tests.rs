@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use nodedb_physical::physical_plan::{KvOp, KvResolveOutcome, KvResolvedMutation};
-use nodedb_types::{RlsWriteCheck, Surrogate};
+use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Status};
 use crate::data::executor::core_loop::CoreLoop;
@@ -56,7 +56,7 @@ fn task() -> ExecutionTask {
         DatabaseId::DEFAULT,
         VShardId::new(0),
         PhysicalPlan::Kv(KvOp::Get {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             key: b"seed".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -115,7 +115,7 @@ fn apply(h: &mut CoreHarness, outcome: &KvResolveOutcome) -> crate::bridge::enve
 
 fn incr_op(key: &[u8], delta: i64) -> KvOp {
     KvOp::Incr {
-        collection: COLLECTION.into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
         key: key.to_vec(),
         delta,
         ttl_ms: 0,
@@ -139,7 +139,7 @@ fn incr_resolves_to_the_computed_post_image_and_applies_it() {
             precondition,
             ..
         } => {
-            assert_eq!(collection, COLLECTION);
+            assert_eq!(collection.as_str(), COLLECTION);
             assert_eq!(key.as_slice(), b"counter");
             assert_eq!(value, &i64_bytes(8), "post-image must be 5 + 3");
             assert_eq!(
@@ -195,7 +195,7 @@ fn drift_scan_refuses_before_the_first_mutation_applies() {
     let outcome = KvResolveOutcome {
         mutations: vec![
             KvResolvedMutation::Put {
-                collection: COLLECTION.into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
                 key: b"a".to_vec(),
                 value: i64_bytes(10),
                 ttl_ms: 0,
@@ -204,7 +204,7 @@ fn drift_scan_refuses_before_the_first_mutation_applies() {
                 precondition: Some(i64_bytes(1)),
             },
             KvResolvedMutation::Put {
-                collection: COLLECTION.into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
                 key: b"b".to_vec(),
                 value: i64_bytes(20),
                 ttl_ms: 0,
@@ -231,7 +231,7 @@ fn absent_key_precondition_requires_the_key_to_stay_absent() {
 
     let outcome = KvResolveOutcome {
         mutations: vec![KvResolvedMutation::Put {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             key: b"fresh".to_vec(),
             value: i64_bytes(1),
             ttl_ms: 0,
@@ -259,7 +259,7 @@ fn cas_mismatch_resolves_to_zero_mutations_and_still_replies() {
     seed(&mut h.core, COLLECTION, b"slot", &stored_value);
 
     let op = KvOp::Cas {
-        collection: COLLECTION.into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
         key: b"slot".to_vec(),
         expected: b"not-the-stored-value".to_vec(),
         new_value: b"next".to_vec(),
@@ -291,7 +291,7 @@ fn cas_match_resolves_to_one_put() {
     seed(&mut h.core, COLLECTION, b"slot", b"actual");
 
     let op = KvOp::Cas {
-        collection: COLLECTION.into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
         key: b"slot".to_vec(),
         expected: b"actual".to_vec(),
         new_value: b"next".to_vec(),
@@ -313,8 +313,8 @@ fn transfer_item_resolves_a_delete_and_a_put_across_two_collections() {
     seed(&mut h.core, COLLECTION, b"item", &body);
 
     let op = KvOp::TransferItem {
-        source_collection: COLLECTION.into(),
-        dest_collection: DEST_COLLECTION.into(),
+        source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+        dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, DEST_COLLECTION),
         item_key: b"item".to_vec(),
         dest_key: b"owned".to_vec(),
         surrogate: Surrogate::new(7),
@@ -329,7 +329,7 @@ fn transfer_item_resolves_a_delete_and_a_put_across_two_collections() {
             key,
             precondition,
         } => {
-            assert_eq!(collection, COLLECTION);
+            assert_eq!(collection.as_str(), COLLECTION);
             assert_eq!(key.as_slice(), b"item");
             assert_eq!(precondition.as_deref(), Some(body.as_slice()));
         }
@@ -343,7 +343,7 @@ fn transfer_item_resolves_a_delete_and_a_put_across_two_collections() {
             precondition,
             ..
         } => {
-            assert_eq!(collection, DEST_COLLECTION);
+            assert_eq!(collection.as_str(), DEST_COLLECTION);
             assert_eq!(key.as_slice(), b"owned");
             assert_eq!(value, &body);
             assert_eq!(
@@ -365,8 +365,8 @@ fn transfer_item_resolves_a_delete_and_a_put_across_two_collections() {
 fn transfer_item_on_a_missing_row_is_not_found() {
     let h = make_core();
     let op = KvOp::TransferItem {
-        source_collection: COLLECTION.into(),
-        dest_collection: DEST_COLLECTION.into(),
+        source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+        dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, DEST_COLLECTION),
         item_key: b"nope".to_vec(),
         dest_key: b"owned".to_vec(),
         surrogate: Surrogate::new(7),
@@ -383,7 +383,7 @@ fn persist_on_an_absent_key_reports_not_found_at_apply() {
     let mut h = make_core();
     let outcome = KvResolveOutcome {
         mutations: vec![KvResolvedMutation::Persist {
-            collection: COLLECTION.into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             key: b"gone".to_vec(),
             precondition: None,
         }],
@@ -397,7 +397,7 @@ fn persist_on_an_absent_key_reports_not_found_at_apply() {
 fn resolve_refuses_an_op_with_no_state_dependent_image() {
     let h = make_core();
     let op = KvOp::Get {
-        collection: COLLECTION.into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
         key: b"k".to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,

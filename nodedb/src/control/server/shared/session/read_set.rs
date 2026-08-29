@@ -337,6 +337,7 @@ fn lock_key_to_wire(key: &LockKey) -> LockKeyWire {
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{DocumentOp, KvOp};
+    use nodedb_types::QualifiedCollection;
 
     fn session_id() -> SessionId {
         SessionId::from(
@@ -348,7 +349,7 @@ mod tests {
 
     fn kv_get(collection: &str, key: &[u8]) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Get {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             key: key.to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -357,7 +358,7 @@ mod tests {
 
     fn kv_batch_get(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::BatchGet {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             keys: vec![b"a".to_vec(), b"b".to_vec()],
             rls_filters: Vec::new(),
         })
@@ -508,7 +509,7 @@ mod tests {
 
     fn doc_point_get(collection: &str, surrogate: u32) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: "d".to_string(),
             surrogate: nodedb_types::Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
@@ -618,7 +619,7 @@ mod tests {
     #[test]
     fn point_get_document_uses_surrogate_identity() {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
             surrogate: nodedb_types::Surrogate::new(42),
             pk_bytes: Vec::new(),
@@ -637,7 +638,7 @@ mod tests {
 
     fn indexed_fetch(collection: &str, path: &str, value: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::IndexedFetch {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             path: path.to_string(),
             value: value.to_string(),
             filters: Vec::new(),
@@ -654,7 +655,7 @@ mod tests {
         upper: Option<&[u8]>,
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::RangeScan {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             field: field.to_string(),
             lower: lower.map(|b| b.to_vec()),
             upper: upper.map(|b| b.to_vec()),

@@ -66,7 +66,10 @@ mod tests {
     #[test]
     fn task_route_holds_plan() {
         let plan = PhysicalPlan::Kv(KvOp::Get {
-            collection: "test".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "test",
+            ),
             key: b"k".to_vec(),
             rls_filters: vec![],
             surrogate_ceiling: None,

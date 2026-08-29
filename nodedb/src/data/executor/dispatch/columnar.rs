@@ -26,7 +26,7 @@ impl CoreLoop {
             } => self.execute_columnar_scan(
                 task,
                 ColumnarScanParams {
-                    collection,
+                    collection: collection.as_str(),
                     projection,
                     limit: *limit,
                     filters,
@@ -60,7 +60,7 @@ impl CoreLoop {
                 self.execute_columnar_insert(
                     task,
                     crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
-                        collection,
+                        collection: collection.as_str(),
                         payload,
                         format,
                         intent: *intent,
@@ -86,7 +86,7 @@ impl CoreLoop {
                 }
                 self.execute_columnar_update(
                     task,
-                    collection,
+                    collection.as_str(),
                     filters,
                     updates,
                     rls_write_check,
@@ -102,7 +102,13 @@ impl CoreLoop {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_delete(task, collection, filters, rls_write_check, None)
+                self.execute_columnar_delete(
+                    task,
+                    collection.as_str(),
+                    filters,
+                    rls_write_check,
+                    None,
+                )
             }
 
             ColumnarOp::MaterializeScan {
@@ -112,7 +118,7 @@ impl CoreLoop {
                 system_as_of_ms,
             } => self.execute_columnar_materialize_scan(
                 task,
-                collection,
+                collection.as_str(),
                 cursor,
                 *count,
                 *system_as_of_ms,
@@ -126,7 +132,13 @@ impl CoreLoop {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_resolved_update(task, collection, rows, rls_write_check, None)
+                self.execute_columnar_resolved_update(
+                    task,
+                    collection.as_str(),
+                    rows,
+                    rls_write_check,
+                    None,
+                )
             }
 
             ColumnarOp::ResolvedDelete {
@@ -137,7 +149,13 @@ impl CoreLoop {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_resolved_delete(task, collection, pks, rls_write_check, None)
+                self.execute_columnar_resolved_delete(
+                    task,
+                    collection.as_str(),
+                    pks,
+                    rls_write_check,
+                    None,
+                )
             }
 
             ColumnarOp::ResolveDml {
@@ -148,7 +166,7 @@ impl CoreLoop {
                 rls_write_check,
             } => self.execute_columnar_resolve_dml(
                 task,
-                collection,
+                collection.as_str(),
                 filters,
                 updates,
                 *is_update,

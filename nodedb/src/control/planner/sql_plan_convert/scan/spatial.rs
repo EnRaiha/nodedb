@@ -27,6 +27,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_spatial_scan(
         database_id,
     } = p;
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(database_id, collection);
     let attr_bytes = serialize_filters(attribute_filters)?;
@@ -42,7 +43,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_spatial_scan(
         vshard_id: vshard,
         database_id,
         plan: PhysicalPlan::Spatial(SpatialOp::Scan {
-            collection: collection.into(),
+            collection: qualified_collection,
             field: field.to_string(),
             predicate: sp,
             query_geometry: query_geometry.clone(),

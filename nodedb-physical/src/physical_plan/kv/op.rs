@@ -2,7 +2,7 @@
 
 //! The KV operation enum — the wire shape and nothing else.
 
-use nodedb_types::{RlsWriteCheck, Surrogate};
+use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
 
 use super::resolved_mutation::KvResolvedMutation;
 use crate::physical_plan::document::ReturningSpec;
@@ -23,7 +23,7 @@ use crate::physical_plan::document::ReturningSpec;
 pub enum KvOp {
     /// Point lookup by primary key. Returns Binary Tuple value or nil.
     Get {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// RLS post-fetch filters. Evaluated after fetching the value.
         /// Returns nil on denial (no info leak).
@@ -41,7 +41,7 @@ pub enum KvOp {
     /// If the collection has secondary indexes, they are maintained synchronously.
     /// If no secondary indexes, takes the zero-index fast path.
     Put {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// Binary Tuple encoded value (all value columns).
         value: Vec<u8>,
@@ -65,7 +65,7 @@ pub enum KvOp {
     /// Returns `unique_violation` (SQLSTATE 23505) on duplicate key. RESP
     /// `SET` and `UPSERT` continue to use `Put`.
     Insert {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
@@ -82,7 +82,7 @@ pub enum KvOp {
     /// SQL `INSERT ... ON CONFLICT DO NOTHING` semantics: write if the key
     /// does not exist, silently no-op on duplicate. No error on conflict.
     InsertIfAbsent {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
@@ -103,7 +103,7 @@ pub enum KvOp {
     /// would-be-inserted row, used both as the write target when absent
     /// and as `EXCLUDED` when the handler evaluates expressions.
     InsertOnConflictUpdate {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
@@ -125,7 +125,7 @@ pub enum KvOp {
 
     /// Delete by primary key(s). Returns count of keys actually deleted.
     Delete {
-        collection: String,
+        collection: QualifiedCollection,
         keys: Vec<Vec<u8>>,
         /// Compiled row-level-security WRITE predicate, evaluated in the Data
         /// Plane against the stored row being removed, or the reason no
@@ -136,7 +136,7 @@ pub enum KvOp {
 
     /// Cursor-based scan with optional filter predicate.
     Scan {
-        collection: String,
+        collection: QualifiedCollection,
         /// Opaque cursor from a previous scan. Empty = start from beginning.
         cursor: Vec<u8>,
         /// Maximum entries to return in this batch.
@@ -156,7 +156,7 @@ pub enum KvOp {
 
     /// Set or update TTL on an existing key.
     Expire {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// TTL in milliseconds from now.
         ttl_ms: u64,
@@ -169,7 +169,7 @@ pub enum KvOp {
 
     /// Remove TTL from an existing key (make it persistent).
     Persist {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// Compiled row-level-security WRITE predicate — see `Expire`, which
         /// this mirrors: the row body does not change, so the stored row is
@@ -183,11 +183,14 @@ pub enum KvOp {
     /// - `-2` — key does not exist
     /// - `-1` — key exists but has no TTL (persistent)
     /// - `>= 0` — remaining milliseconds until expiry
-    GetTtl { collection: String, key: Vec<u8> },
+    GetTtl {
+        collection: QualifiedCollection,
+        key: Vec<u8>,
+    },
 
     /// Batch get: fetch multiple keys in a single bridge round-trip.
     BatchGet {
-        collection: String,
+        collection: QualifiedCollection,
         keys: Vec<Vec<u8>>,
         /// RLS filters applied post-fetch (no pushdown slot in storage) —
         /// same shape `KvOp::Get` and `DocumentOp::PointGet` use.
@@ -197,7 +200,7 @@ pub enum KvOp {
 
     /// Batch put: insert/update multiple key-value pairs atomically.
     BatchPut {
-        collection: String,
+        collection: QualifiedCollection,
         /// `(key, value)` pairs.
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         /// Per-key TTL override in milliseconds. 0 = use collection default.
@@ -223,7 +226,7 @@ pub enum KvOp {
     /// Dispatched when `CREATE INDEX idx ON kv_collection (field)` is executed.
     /// If `backfill` is true, scans all existing entries to populate the index.
     RegisterIndex {
-        collection: String,
+        collection: QualifiedCollection,
         /// Field name to index (must match a column in the KV schema).
         field: String,
         /// Position of the field in the schema column list.
@@ -233,14 +236,17 @@ pub enum KvOp {
     },
 
     /// Remove a secondary index from a value field (DDL).
-    DropIndex { collection: String, field: String },
+    DropIndex {
+        collection: QualifiedCollection,
+        field: String,
+    },
 
     /// Extract one or more fields from a key's value (HGET/HMGET).
     ///
     /// Deserializes the stored value, extracts the named fields, and returns
     /// them as a JSON object. O(1) key lookup + field extraction.
     FieldGet {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// Field names to extract.
         fields: Vec<String>,
@@ -252,7 +258,7 @@ pub enum KvOp {
     /// Update specific fields in a key's value (HSET): read-modify-write,
     /// merges field updates, maintains secondary indexes.
     FieldSet {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         /// Field name → new value (JSON-encoded bytes).
         updates: Vec<(String, Vec<u8>)>,
@@ -265,12 +271,12 @@ pub enum KvOp {
     },
 
     /// Truncate: delete ALL entries in a KV collection.
-    Truncate { collection: String },
+    Truncate { collection: QualifiedCollection },
 
     /// Atomic increment: init 0 if absent, `TypeMismatch` if not i64,
     /// `OverflowError` on wrap. `ttl_ms > 0` sets/resets TTL; `0` preserves it.
     Incr {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         delta: i64,
         /// TTL in milliseconds. 0 = preserve existing TTL.
@@ -287,7 +293,7 @@ pub enum KvOp {
     /// Same semantics as `Incr` but for f64 values.
     /// If value is not f64, returns `TypeMismatch`.
     IncrFloat {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         delta: f64,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
@@ -302,7 +308,7 @@ pub enum KvOp {
     /// Returns JSON `{"success": bool, "current_value": "<base64>"}`.
     /// If key doesn't exist and `expected` is empty, creates the key (create-if-not-exists).
     Cas {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         expected: Vec<u8>,
         new_value: Vec<u8>,
@@ -318,7 +324,7 @@ pub enum KvOp {
     ///
     /// Returns the previous value (or null if key didn't exist).
     GetSet {
-        collection: String,
+        collection: QualifiedCollection,
         key: Vec<u8>,
         new_value: Vec<u8>,
         /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
@@ -342,7 +348,7 @@ pub enum KvOp {
     /// Reads source and dest values, validates source.field >= amount,
     /// then atomically writes both updated values. No TOCTOU race.
     Transfer {
-        collection: String,
+        collection: QualifiedCollection,
         source_key: Vec<u8>,
         dest_key: Vec<u8>,
         field: String,
@@ -365,8 +371,8 @@ pub enum KvOp {
     /// then atomically deletes from source and inserts at dest. `NotFound`
     /// if source doesn't own it.
     TransferItem {
-        source_collection: String,
-        dest_collection: String,
+        source_collection: QualifiedCollection,
+        dest_collection: QualifiedCollection,
         item_key: Vec<u8>,
         dest_key: Vec<u8>,
         /// Moved row's identity at its destination, content-addressed on
@@ -383,7 +389,7 @@ pub enum KvOp {
     // ── Sorted Index (Leaderboard) Operations ──────────────────────────
     /// Register a sorted index on a KV collection (DDL).
     RegisterSortedIndex {
-        collection: String,
+        collection: QualifiedCollection,
         index_name: String,
         /// Sort columns: (column_name, direction "ASC"/"DESC").
         sort_columns: Vec<(String, String)>,
@@ -436,7 +442,7 @@ pub enum KvOp {
     ///   `[ next_cursor: bytes, entries: [[key: bytes, value: bytes], ...] ]`
     /// `next_cursor` is empty when the scan is complete.
     MaterializeScan {
-        collection: String,
+        collection: QualifiedCollection,
         cursor: Vec<u8>,
         count: usize,
     },
@@ -475,7 +481,7 @@ pub enum KvOp {
     /// predicate, not a key list, since `WHERE` selects rows only once the
     /// Data Plane scans current state. Uses the same merge as `FieldSet`.
     PredicateUpdate {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` (MessagePack). Empty matches every row.
         filters: Vec<u8>,
         /// Field assignments: `(field_name, msgpack_value_bytes)`.
@@ -491,7 +497,7 @@ pub enum KvOp {
     /// The predicate form of [`KvOp::Delete`], which it delegates to once the
     /// scan has resolved the matching keys.
     PredicateDelete {
-        collection: String,
+        collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` (MessagePack). Empty matches every row.
         filters: Vec<u8>,
         /// Compiled row-level-security WRITE predicate, evaluated against the

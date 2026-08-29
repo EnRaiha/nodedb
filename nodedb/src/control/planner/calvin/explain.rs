@@ -84,7 +84,10 @@ mod tests {
             vshard_id: VShardId::new(vshard),
             database_id: crate::types::DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: format!("col_{vshard}"),
+                collection: nodedb_types::QualifiedCollection::new(
+                    crate::types::DatabaseId::DEFAULT,
+                    &format!("col_{vshard}"),
+                ),
                 document_id: "id1".to_owned(),
                 surrogate: nodedb_types::Surrogate::new(1),
                 value: vec![],
@@ -105,7 +108,10 @@ mod tests {
             vshard_id: VShardId::new(vshard),
             database_id: crate::types::DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::Scan {
-                collection: format!("col_{vshard}"),
+                collection: nodedb_types::QualifiedCollection::new(
+                    crate::types::DatabaseId::DEFAULT,
+                    &format!("col_{vshard}"),
+                ),
                 filters: vec![],
                 limit: 0,
                 offset: 0,

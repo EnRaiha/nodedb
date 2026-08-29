@@ -64,7 +64,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         } => {
             let new_fields = deserialize_value_to_fields(value);
             Some(DmlWriteInfo {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: Some(document_id.clone()),
                 event: DmlEvent::Insert,
                 new_fields: Some(new_fields),
@@ -81,7 +81,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             // as a harmless default, the probe result overrides it.
             let new_fields = deserialize_value_to_fields(value);
             Some(DmlWriteInfo {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 document_id: Some(document_id.clone()),
                 event: DmlEvent::Insert,
                 new_fields: Some(new_fields),
@@ -93,7 +93,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             document_id,
             ..
         } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: Some(document_id.clone()),
             event: DmlEvent::Delete,
             new_fields: None,
@@ -104,35 +104,35 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             document_id,
             ..
         } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: Some(document_id.clone()),
             event: DmlEvent::Update,
             new_fields: None, // NEW fields computed after applying updates to OLD
             needs_existence_probe: false,
         }),
         DocumentOp::BatchInsert { collection, .. } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: None,
             event: DmlEvent::Insert,
             new_fields: None, // Batch — individual rows not available here
             needs_existence_probe: false,
         }),
         DocumentOp::BulkUpdate { collection, .. } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: None,
             event: DmlEvent::Update,
             new_fields: None,
             needs_existence_probe: false,
         }),
         DocumentOp::BulkDelete { collection, .. } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: None,
             event: DmlEvent::Delete,
             new_fields: None,
             needs_existence_probe: false,
         }),
         DocumentOp::Truncate { collection, .. } => Some(DmlWriteInfo {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: None,
             event: DmlEvent::Delete,
             new_fields: None,
@@ -141,7 +141,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         DocumentOp::InsertSelect {
             target_collection, ..
         } => Some(DmlWriteInfo {
-            collection: target_collection.clone(),
+            collection: target_collection.to_string(),
             document_id: None,
             event: DmlEvent::Insert,
             new_fields: None,
@@ -150,7 +150,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         DocumentOp::UpdateFromJoin {
             target_collection, ..
         } => Some(DmlWriteInfo {
-            collection: target_collection.clone(),
+            collection: target_collection.to_string(),
             document_id: None,
             event: DmlEvent::Update,
             new_fields: None,
@@ -159,7 +159,7 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
         DocumentOp::Merge {
             target_collection, ..
         } => Some(DmlWriteInfo {
-            collection: target_collection.clone(),
+            collection: target_collection.to_string(),
             document_id: None,
             event: DmlEvent::Update,
             new_fields: None,
@@ -250,12 +250,16 @@ pub fn patch_task_with_mutated_fields(
 /// Fetch the current document as a field map (for OLD row bindings).
 /// Authorizes `READ` before touching catalog state, injects RLS. An empty map
 /// means the row is absent; other failures propagate.
+///
+/// `collection` is typed [`nodedb_types::QualifiedCollection`] so each caller
+/// states, and the compiler checks, whether it holds a bare or a qualified
+/// name — a bare `&str` let a caller pass either silently.
 pub async fn fetch_old_row(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     auth: &AuthContext,
-    collection: &str,
+    collection: &nodedb_types::QualifiedCollection,
     document_id: &str,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
     let tenant_id = identity.tenant_id;
@@ -267,11 +271,28 @@ pub async fn fetch_old_row(
         });
     }
 
+    // Catalog/permission/surrogate lookups key on the bare name plus a
+    // separate `database_id`, never the qualified string — recover it by
+    // stripping the same prefix `collection` was qualified with.
+    let bare_collection = if database_id == DatabaseId::DEFAULT {
+        collection.as_str()
+    } else {
+        collection
+            .as_str()
+            .strip_prefix(&format!("{}/", database_id.as_u64()))
+            .ok_or_else(|| crate::Error::RejectedAuthz {
+                tenant_id,
+                resource: format!(
+                    "OLD-row fetch: '{collection}' is not qualified for database {database_id}"
+                ),
+            })?
+    };
+
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
     authorize_collection(
         identity,
         database_id,
-        collection,
+        bare_collection,
         Permission::Read,
         &state.permissions,
         &state.roles,
@@ -282,12 +303,12 @@ pub async fn fetch_old_row(
     let Some(surrogate) =
         state
             .surrogate_assigner
-            .lookup(database_id, tenant_id, collection, &pk_bytes)?
+            .lookup(database_id, tenant_id, bare_collection, &pk_bytes)?
     else {
         return Ok(HashMap::new());
     };
     let mut plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: collection.to_string(),
+        collection: collection.clone(),
         document_id: document_id.to_string(),
         surrogate,
         pk_bytes,
@@ -297,6 +318,7 @@ pub async fn fetch_old_row(
     });
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
+        database_id,
         &mut plan,
         &state.rls,
         auth,
@@ -304,6 +326,7 @@ pub async fn fetch_old_row(
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         tenant_id,
+        database_id,
         auth,
         &state.redaction,
     )?;
@@ -431,7 +454,7 @@ mod tests {
             &identity,
             database_id,
             &auth,
-            collection,
+            &nodedb_types::QualifiedCollection::new(database_id, collection),
             document_id,
         )
         .await
@@ -490,9 +513,16 @@ mod tests {
             .expect("read surrogate registry")
             .current_hwm();
 
-        let error = fetch_old_row(&state, &identity, database_id, &auth, "orders", "order-42")
-            .await
-            .expect_err("misaligned auth context must be rejected before authorization");
+        let error = fetch_old_row(
+            &state,
+            &identity,
+            database_id,
+            &auth,
+            &nodedb_types::QualifiedCollection::new(database_id, "orders"),
+            "order-42",
+        )
+        .await
+        .expect_err("misaligned auth context must be rejected before authorization");
 
         assert!(matches!(
             error,

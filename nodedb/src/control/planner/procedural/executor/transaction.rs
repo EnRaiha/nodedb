@@ -151,7 +151,10 @@ mod tests {
             vshard_id: VShardId::new(0),
             database_id: crate::types::DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "test".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    crate::types::DatabaseId::DEFAULT,
+                    "test",
+                ),
                 document_id: id.into(),
                 value: vec![],
                 surrogate: nodedb_types::Surrogate::ZERO,

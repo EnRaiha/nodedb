@@ -3,6 +3,7 @@
 //! Document engine plan builders.
 
 use nodedb_types::CollectionType;
+use nodedb_types::QualifiedCollection;
 use nodedb_types::columnar::ColumnarProfile;
 use nodedb_types::protocol::TextFields;
 use sonic_rs;
@@ -20,7 +21,7 @@ pub(crate) fn build_point_get(
     let doc_id = require_doc_id(fields)?;
     match collection_type(ctx, collection) {
         Some(CollectionType::KeyValue(_)) => Ok(PhysicalPlan::Kv(KvOp::Get {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(ctx.database_id(), collection),
             key: doc_id.into_bytes(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -45,7 +46,7 @@ pub(crate) fn build_point_get(
                 .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             Ok(PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: collection.to_string(),
+                collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
                 surrogate,
                 pk_bytes,
@@ -74,7 +75,7 @@ pub(crate) fn build_point_put(
                 &key,
             )?;
             Ok(PhysicalPlan::Kv(KvOp::Put {
-                collection: collection.to_string(),
+                collection: QualifiedCollection::new(ctx.database_id(), collection),
                 key,
                 value,
                 ttl_ms: 0,
@@ -87,7 +88,7 @@ pub(crate) fn build_point_put(
             let json_str = String::from_utf8_lossy(&value);
             let ilp_line = format!("{collection} value={json_str}\n");
             Ok(PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: collection.to_string(),
+                collection: QualifiedCollection::new(ctx.database_id(), collection),
                 payload: ilp_line.into_bytes(),
                 format: "ilp".to_string(),
                 wal_lsn: None,
@@ -112,7 +113,7 @@ pub(crate) fn build_point_put(
                 &pk_bytes,
             )?;
             Ok(PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: collection.to_string(),
+                collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
                 value,
                 surrogate,
@@ -135,7 +136,7 @@ pub(crate) fn build_point_delete(
     let doc_id = require_doc_id(fields)?;
     match collection_type(ctx, collection) {
         Some(CollectionType::KeyValue(_)) => Ok(PhysicalPlan::Kv(KvOp::Delete {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(ctx.database_id(), collection),
             keys: vec![doc_id.into_bytes()],
             // Filled by the RLS injection pass this dispatch path runs.
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -160,7 +161,7 @@ pub(crate) fn build_point_delete(
                 .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             Ok(PhysicalPlan::Document(DocumentOp::PointDelete {
-                collection: collection.to_string(),
+                collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
                 surrogate,
                 pk_bytes,
@@ -174,6 +175,7 @@ pub(crate) fn build_point_delete(
 }
 
 pub(crate) fn build_range_scan(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -186,7 +188,7 @@ pub(crate) fn build_range_scan(
         .clone();
     let limit = fields.limit.unwrap_or(100) as usize;
     Ok(PhysicalPlan::Document(DocumentOp::RangeScan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
         lower: fields.lower_bound.clone(),
         upper: fields.upper_bound.clone(),
@@ -228,7 +230,7 @@ pub(crate) fn build_batch_insert(
         surrogates.push(surrogate);
     }
     Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         documents,
         surrogates,
         // See `build_point_put`.
@@ -266,7 +268,7 @@ pub(crate) fn build_update(
         .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     Ok(PhysicalPlan::Document(DocumentOp::PointUpdate {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id: doc_id,
         surrogate,
         pk_bytes,
@@ -278,11 +280,15 @@ pub(crate) fn build_update(
     }))
 }
 
-pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_scan(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let limit = fields.limit.unwrap_or(1000) as usize;
     let filters = fields.filters.clone().unwrap_or_default();
     Ok(PhysicalPlan::Document(DocumentOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         limit,
         offset: 0,
         sort_keys: Vec::new(),
@@ -311,7 +317,7 @@ pub(crate) fn build_upsert(
         doc_id.as_bytes(),
     )?;
     Ok(PhysicalPlan::Document(DocumentOp::Upsert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id: doc_id,
         value,
         // The native text protocol carries no ON CONFLICT clause; plain
@@ -327,6 +333,7 @@ pub(crate) fn build_upsert(
 }
 
 pub(crate) fn build_bulk_update(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -352,7 +359,7 @@ pub(crate) fn build_bulk_update(
         })
         .collect();
     Ok(PhysicalPlan::Document(DocumentOp::BulkUpdate {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         filters,
         updates,
         returning: None,
@@ -366,6 +373,7 @@ pub(crate) fn build_bulk_update(
 }
 
 pub(crate) fn build_bulk_delete(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -377,7 +385,7 @@ pub(crate) fn build_bulk_delete(
         })?
         .clone();
     Ok(PhysicalPlan::Document(DocumentOp::BulkDelete {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         filters,
         returning: None,
         ollp_predicted_surrogates: None,
@@ -389,9 +397,12 @@ pub(crate) fn build_bulk_delete(
     }))
 }
 
-pub(crate) fn build_truncate(collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_truncate(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     Ok(PhysicalPlan::Document(DocumentOp::Truncate {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         restart_identity: false,
         // Filled in by the materialized-sum resolution pass.
         resolved_sum_targets: Vec::new(),
@@ -399,18 +410,20 @@ pub(crate) fn build_truncate(collection: &str) -> crate::Result<PhysicalPlan> {
 }
 
 pub(crate) fn build_estimate_count(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
     let field = fields.field.as_deref().unwrap_or("id").to_string();
 
     Ok(PhysicalPlan::Document(DocumentOp::EstimateCount {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
     }))
 }
 
 pub(crate) fn build_insert_select(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -425,14 +438,18 @@ pub(crate) fn build_insert_select(
     let limit = fields.limit.unwrap_or(10_000) as usize;
 
     Ok(PhysicalPlan::Document(DocumentOp::InsertSelect {
-        target_collection: collection.to_string(),
-        source_collection: source,
+        target_collection: QualifiedCollection::new(ctx.database_id(), collection),
+        source_collection: QualifiedCollection::new(ctx.database_id(), &source),
         source_filters: filters,
         source_limit: limit,
     }))
 }
 
-pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_register(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     // Native protocol exposes only a legacy `index_paths` text list — promote
     // each entry to a `Ready`, non-unique `RegisteredIndex` named after the
     // path. UNIQUE / COLLATE / build-state come from SQL DDL only.
@@ -452,7 +469,7 @@ pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Re
         .collect();
 
     Ok(PhysicalPlan::Document(DocumentOp::Register {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         indexes,
         crdt_enabled: false,
         storage_mode: nodedb_physical::physical_plan::StorageMode::Schemaless,
@@ -468,6 +485,7 @@ pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Re
 }
 
 pub(crate) fn build_drop_index(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -480,7 +498,7 @@ pub(crate) fn build_drop_index(
         .clone();
 
     Ok(PhysicalPlan::Document(DocumentOp::DropIndex {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
     }))
 }

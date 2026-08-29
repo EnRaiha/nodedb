@@ -7,6 +7,7 @@ use sonic_rs;
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::QualifiedCollection;
 
 use super::codec::RespValue;
 use super::command::RespCommand;
@@ -32,7 +33,10 @@ pub(super) async fn handle_hget(
     let redaction = resp_redaction(state, session);
 
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
         key,
         fields: vec![field.clone()],
         rls_filters: Vec::new(),
@@ -74,7 +78,10 @@ pub(super) async fn handle_hmget(
     let redaction = resp_redaction(state, session);
 
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
         key,
         fields: fields.clone(),
         rls_filters: Vec::new(),
@@ -133,7 +140,10 @@ pub(super) async fn handle_hset(
     };
 
     let plan = PhysicalPlan::Kv(KvOp::FieldSet {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
         key,
         updates,
         surrogate,
@@ -153,7 +163,10 @@ pub(super) async fn handle_hset(
 
 pub(super) async fn handle_flushdb(session: &RespSession, state: &SharedState) -> RespValue {
     let plan = PhysicalPlan::Kv(KvOp::Truncate {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
     });
 
     match dispatch_kv_write(state, session, plan).await {

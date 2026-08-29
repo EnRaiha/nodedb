@@ -126,7 +126,7 @@ impl CoreLoop {
                     return Some(0);
                 };
                 let plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone(),
                     list_path: list_path.clone(),
                     index,
@@ -155,7 +155,7 @@ impl CoreLoop {
                     return Some(0);
                 };
                 let plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone(),
                     list_path: list_path.clone(),
                     index,
@@ -184,7 +184,7 @@ impl CoreLoop {
                     return Some(0);
                 };
                 let plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
-                    collection: collection.clone(),
+                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone(),
                     list_path: list_path.clone(),
                     from_index,
@@ -261,7 +261,7 @@ mod tests {
     use crate::control::server::wal_dispatch::wal_append_if_write;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     const TID: u64 = 1;
     const COLLECTION: &str = "pages";
@@ -319,7 +319,7 @@ mod tests {
 
     fn list_insert_plan(index: usize, fields_json: &str) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::ListInsert {
-            collection: COLLECTION.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
             list_path: "blocks".to_string(),
             index,
@@ -330,7 +330,7 @@ mod tests {
 
     fn list_move_plan(from_index: usize, to_index: usize) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::ListMove {
-            collection: COLLECTION.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
             list_path: "blocks".to_string(),
             from_index,
@@ -341,7 +341,7 @@ mod tests {
 
     fn list_delete_plan(index: usize) -> PhysicalPlan {
         PhysicalPlan::Crdt(CrdtOp::ListDelete {
-            collection: COLLECTION.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
             list_path: "blocks".to_string(),
             index,

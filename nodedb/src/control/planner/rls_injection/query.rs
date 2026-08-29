@@ -175,7 +175,10 @@ mod tests {
     fn recursive_scan_filters_every_round() {
         let store = store_with_read_policy("tree");
         let mut plan = PhysicalPlan::Query(QueryOp::RecursiveScan {
-            collection: "tree".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "tree",
+            ),
             base_filters: Vec::new(),
             recursive_filters: Vec::new(),
             join_link: None,
@@ -206,7 +209,10 @@ mod tests {
     fn facet_counts_receive_the_policy_filter() {
         let store = store_with_read_policy("items");
         let mut plan = PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "items".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "items",
+            ),
             filters: Vec::new(),
             fields: vec!["colour".into()],
             limit_per_facet: 0,
@@ -225,8 +231,14 @@ mod tests {
     fn hash_join_bitmap_child_is_walked() {
         let store = store_with_read_policy("users");
         let mut plan = PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "orders".into(),
-            right_collection: "items".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "items",
+            ),
             left_alias: None,
             right_alias: None,
             on: Vec::new(),
@@ -241,7 +253,10 @@ mod tests {
             left_input: None,
             right_input: None,
             left_bitmap: Some(Box::new(PhysicalPlan::Document(DocumentOp::IndexLookup {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 path: "$.email".into(),
                 value: "a@b.c".into(),
             }))),

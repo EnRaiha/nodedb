@@ -170,7 +170,7 @@ pub(super) fn build_scan_plan(
     limit: usize,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Scan {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         limit: limit.min(100_000),
         offset: 0,
         sort_keys: order_by.to_vec(),

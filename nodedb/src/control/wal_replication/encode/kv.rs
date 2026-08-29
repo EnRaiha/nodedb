@@ -354,7 +354,7 @@ pub(super) fn resolved_write(
                     surrogate,
                     precondition,
                 } => W::Put {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     key: key.clone(),
                     value: value.clone(),
                     ttl_ms: *ttl_ms,
@@ -367,7 +367,7 @@ pub(super) fn resolved_write(
                     key,
                     precondition,
                 } => W::Delete {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     key: key.clone(),
                     precondition: precondition.clone(),
                 },
@@ -378,7 +378,7 @@ pub(super) fn resolved_write(
                     resolved_now_ms,
                     precondition,
                 } => W::Expire {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     key: key.clone(),
                     ttl_ms: *ttl_ms,
                     resolved_now_ms: *resolved_now_ms,
@@ -389,7 +389,7 @@ pub(super) fn resolved_write(
                     key,
                     precondition,
                 } => W::Persist {
-                    collection: collection.clone(),
+                    collection: collection.as_str().to_owned(),
                     key: key.clone(),
                     precondition: precondition.clone(),
                 },

@@ -10,6 +10,7 @@
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::QualifiedCollection;
 
 use super::codec::RespValue;
 use super::command::RespCommand;
@@ -73,7 +74,7 @@ pub(super) async fn handle_zadd(
             Err(e) => return RespValue::from_error(&e),
         };
         let plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: index_name.clone(),
+            collection: QualifiedCollection::new(crate::types::DatabaseId::DEFAULT, &index_name),
             key: member,
             value,
             ttl_ms: 0,
@@ -105,7 +106,10 @@ pub(super) async fn handle_zrem(
 
     let keys: Vec<Vec<u8>> = cmd.args.clone();
     let plan = PhysicalPlan::Kv(KvOp::Delete {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(
+            crate::types::DatabaseId::DEFAULT,
+            &session.collection,
+        ),
         keys,
         // Filled by the RLS injection pass `dispatch_kv_write` runs.
         rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),

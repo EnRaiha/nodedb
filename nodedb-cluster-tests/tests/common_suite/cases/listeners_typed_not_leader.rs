@@ -65,6 +65,7 @@ use nodedb::control::gateway::GatewayErrorMap;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::TestClusterNode;
 
@@ -137,7 +138,10 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
         version_set: GatewayVersionSet::from_pairs(vec![("nl_pgwire_shared_gw".into(), 1)]),
     };
     let sentinel_plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: "nl_pgwire_shared_gw".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "nl_pgwire_shared_gw",
+        ),
         key: vec![],
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -165,7 +169,10 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
 
     // Direct gateway execute via shared.gateway (not Gateway::new).
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "nl_pgwire_shared_gw".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "nl_pgwire_shared_gw",
+        ),
         key: b"pgwire-key".to_vec(),
         value: mp_string("val"),
         ttl_ms: 0,
@@ -227,7 +234,10 @@ async fn http_not_leader_gateway_error_mapping() {
         .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "nl_http_shared_gw".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "nl_http_shared_gw",
+        ),
         key: b"http-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,
@@ -295,7 +305,10 @@ async fn resp_not_leader_gateway_error_mapping() {
         .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "nl_resp_shared_gw".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "nl_resp_shared_gw",
+        ),
         key: b"resp-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,
@@ -426,7 +439,10 @@ async fn native_not_leader_gateway_error_mapping() {
         .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "nl_native_shared_gw".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "nl_native_shared_gw",
+        ),
         key: b"native-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,

@@ -76,7 +76,7 @@ pub(super) fn authorized_write(state: &SharedState) -> AuthorizedTask {
         database_id: DatabaseId::DEFAULT,
         vshard_id: vshard(),
         plan: PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-            collection: COLLECTION.to_owned(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             surrogate: nodedb_types::Surrogate::ZERO,
             provenance: None,
         }),

@@ -81,7 +81,7 @@ pub fn wal_append_kv_op(
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_put(
-                collection,
+                collection.as_str(),
                 key,
                 value,
                 *ttl_ms,
@@ -106,7 +106,7 @@ pub fn wal_append_kv_op(
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_insert_on_conflict_update(
-                collection,
+                collection.as_str(),
                 key,
                 value,
                 *ttl_ms,
@@ -118,7 +118,7 @@ pub fn wal_append_kv_op(
         KvOp::Delete {
             collection, keys, ..
         } => {
-            let entry = encode_kv_delete(collection, keys)?;
+            let entry = encode_kv_delete(collection.as_str(), keys)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::BatchPut {
@@ -131,7 +131,8 @@ pub fn wal_append_kv_op(
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let raw: Vec<u32> = surrogates.iter().map(|s| s.as_u32()).collect();
-            let entry = encode_kv_batch_put(collection, entries, *ttl_ms, expire_at_ms, &raw)?;
+            let entry =
+                encode_kv_batch_put(collection.as_str(), entries, *ttl_ms, expire_at_ms, &raw)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Expire {
@@ -145,13 +146,13 @@ pub fn wal_append_kv_op(
             let now_ms = now_override.unwrap_or_else(crate::engine::kv::current_ms);
             let expire_at_ms = now_ms + *ttl_ms;
             resolved_now_ms = Some(now_ms);
-            let entry = encode_kv_expire(collection, key, *ttl_ms, expire_at_ms)?;
+            let entry = encode_kv_expire(collection.as_str(), key, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Persist {
             collection, key, ..
         } => {
-            let entry = encode_kv_persist(collection, key)?;
+            let entry = encode_kv_persist(collection.as_str(), key)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::RegisterIndex {
@@ -160,11 +161,12 @@ pub fn wal_append_kv_op(
             field_position,
             backfill,
         } => {
-            let entry = encode_kv_register_index(collection, field, *field_position, *backfill)?;
+            let entry =
+                encode_kv_register_index(collection.as_str(), field, *field_position, *backfill)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::DropIndex { collection, field } => {
-            let entry = encode_kv_drop_index(collection, field)?;
+            let entry = encode_kv_drop_index(collection.as_str(), field)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::FieldSet {
@@ -174,7 +176,7 @@ pub fn wal_append_kv_op(
             surrogate,
             ..
         } => {
-            let entry = encode_kv_field_set(collection, key, updates, surrogate.as_u32())?;
+            let entry = encode_kv_field_set(collection.as_str(), key, updates, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Incr {
@@ -188,7 +190,7 @@ pub fn wal_append_kv_op(
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_incr(
-                collection,
+                collection.as_str(),
                 key,
                 *delta,
                 *ttl_ms,
@@ -204,7 +206,7 @@ pub fn wal_append_kv_op(
             surrogate,
             ..
         } => {
-            let entry = encode_kv_incr_float(collection, key, *delta, surrogate.as_u32())?;
+            let entry = encode_kv_incr_float(collection.as_str(), key, *delta, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Cas {
@@ -215,7 +217,13 @@ pub fn wal_append_kv_op(
             surrogate,
             ..
         } => {
-            let entry = encode_kv_cas(collection, key, expected, new_value, surrogate.as_u32())?;
+            let entry = encode_kv_cas(
+                collection.as_str(),
+                key,
+                expected,
+                new_value,
+                surrogate.as_u32(),
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::GetSet {
@@ -225,7 +233,7 @@ pub fn wal_append_kv_op(
             surrogate,
             ..
         } => {
-            let entry = encode_kv_getset(collection, key, new_value, surrogate.as_u32())?;
+            let entry = encode_kv_getset(collection.as_str(), key, new_value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::RegisterSortedIndex {
@@ -239,7 +247,7 @@ pub fn wal_append_kv_op(
             window_end_ms,
         } => {
             let entry = encode_kv_register_sorted_index(KvRegisterSortedIndexFields {
-                collection,
+                collection: collection.as_str(),
                 index_name,
                 sort_columns,
                 key_column,
@@ -255,7 +263,7 @@ pub fn wal_append_kv_op(
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Truncate { collection } => {
-            let entry = encode_kv_truncate(collection)?;
+            let entry = encode_kv_truncate(collection.as_str())?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // The predicate is the durable record; replay re-executes it via the live handler.
@@ -266,7 +274,7 @@ pub fn wal_append_kv_op(
             // Per-request authorization input, not part of the durable image.
             rls_write_check: _,
         } => {
-            let entry = encode_kv_predicate_update(collection, filters, updates)?;
+            let entry = encode_kv_predicate_update(collection.as_str(), filters, updates)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::PredicateDelete {
@@ -274,7 +282,7 @@ pub fn wal_append_kv_op(
             filters,
             rls_write_check: _,
         } => {
-            let entry = encode_kv_predicate_delete(collection, filters)?;
+            let entry = encode_kv_predicate_delete(collection.as_str(), filters)?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Transfer {
@@ -288,7 +296,7 @@ pub fn wal_append_kv_op(
             ..
         } => {
             let entry = encode_kv_transfer(KvTransferFields {
-                collection,
+                collection: collection.as_str(),
                 source_key,
                 dest_key,
                 field,
@@ -307,8 +315,8 @@ pub fn wal_append_kv_op(
             ..
         } => {
             let entry = encode_kv_transfer_item(
-                source_collection,
-                dest_collection,
+                source_collection.as_str(),
+                dest_collection.as_str(),
                 item_key,
                 dest_key,
                 surrogate.as_u32(),
@@ -377,7 +385,7 @@ fn append_kv_resolved_mutation(
             precondition: _,
         } => {
             let entry = encode_kv_put(
-                collection,
+                collection.as_str(),
                 key,
                 value,
                 *ttl_ms,
@@ -393,7 +401,7 @@ fn append_kv_resolved_mutation(
             key,
             precondition: _,
         } => {
-            let entry = encode_kv_delete(collection, std::slice::from_ref(key))?;
+            let entry = encode_kv_delete(collection.as_str(), std::slice::from_ref(key))?;
             wal.append_delete(tenant_id, vshard_id, database_id, &entry)
         }
         M::Expire {
@@ -404,7 +412,7 @@ fn append_kv_resolved_mutation(
             precondition: _,
         } => {
             let entry = encode_kv_expire(
-                collection,
+                collection.as_str(),
                 key,
                 *ttl_ms,
                 resolved_now_ms.saturating_add(*ttl_ms),
@@ -416,7 +424,7 @@ fn append_kv_resolved_mutation(
             key,
             precondition: _,
         } => {
-            let entry = encode_kv_persist(collection, key)?;
+            let entry = encode_kv_persist(collection.as_str(), key)?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)
         }
     }

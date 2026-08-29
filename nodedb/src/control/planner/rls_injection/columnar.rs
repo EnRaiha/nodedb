@@ -140,7 +140,10 @@ mod tests {
 
     fn columnar_insert(collection: &str, owner_ids: &[&str]) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             payload: rows(owner_ids),
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -157,7 +160,10 @@ mod tests {
 
     fn columnar_update(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::Update {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             filters: Vec::new(),
             updates: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -166,7 +172,10 @@ mod tests {
 
     fn ingest(collection: &str, format: &str) -> PhysicalPlan {
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             payload: Vec::new(),
             format: format.into(),
             wal_lsn: None,
@@ -255,7 +264,10 @@ mod tests {
     fn an_undecodable_insert_payload_is_rejected_under_a_write_policy() {
         let store = store_with_write_policy("events");
         let mut plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "events".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "events",
+            ),
             payload: vec![0xC1],
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -281,7 +293,10 @@ mod tests {
     fn on_conflict_update_carries_the_write_predicate() {
         let store = store_with_write_policy("events");
         let mut plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "events".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "events",
+            ),
             payload: rows(&["42"]),
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Put,
@@ -312,7 +327,10 @@ mod tests {
         assert!(write_check(&update).has_predicate());
 
         let mut delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
-            collection: "events".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "events",
+            ),
             filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
@@ -327,7 +345,10 @@ mod tests {
     fn timeseries_msgpack_ingest_carries_the_write_predicate_rather_than_deciding_here() {
         let store = store_with_write_policy("metrics");
         let mut plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             payload: rows(&["99"]),
             format: "msgpack".into(),
             wal_lsn: None,
@@ -402,7 +423,10 @@ mod tests {
     fn spatial_delete_is_refused_under_a_write_policy() {
         let store = store_with_write_policy("places");
         let mut plan = PhysicalPlan::Spatial(SpatialOp::Delete {
-            collection: "places".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "places",
+            ),
             field: "geom".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             provenance: None,

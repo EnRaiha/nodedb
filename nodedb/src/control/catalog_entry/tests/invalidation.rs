@@ -77,7 +77,7 @@ fn plant_sentinel(cache: &PlanCache, col: &str) -> PlanCacheKey {
         version_set: GatewayVersionSet::from_pairs(vec![(col.into(), 1)]),
     };
     let plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-        collection: col.into(),
+        collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, col),
         key: vec![],
         rls_filters: vec![],
         surrogate_ceiling: None,

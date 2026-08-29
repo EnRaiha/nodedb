@@ -165,8 +165,8 @@ pub async fn resolve_shuffle_join(
 
     // 5. Producer node sets per side (collections are single-vShard-homed → one
     //    leader each, but compute generally and dedup).
-    let build_nodes = producer_nodes(&routing_snapshot, database_id, &right_collection)?;
-    let probe_nodes = producer_nodes(&routing_snapshot, database_id, &left_collection)?;
+    let build_nodes = producer_nodes(&routing_snapshot, database_id, right_collection.as_str())?;
+    let probe_nodes = producer_nodes(&routing_snapshot, database_id, left_collection.as_str())?;
     let build_producer_count = build_nodes.len() as u32;
     let probe_producer_count = probe_nodes.len() as u32;
     if build_producer_count == 0 || probe_producer_count == 0 {
@@ -201,13 +201,13 @@ pub async fn resolve_shuffle_join(
         state,
         database_id,
         tenant_id,
-        ScanSide::join_side(&right_collection, &right_rls_filters),
+        ScanSide::join_side(right_collection.as_str(), &right_rls_filters),
     )?;
     let probe_scan = require_scan_plan(
         state,
         database_id,
         tenant_id,
-        ScanSide::join_side(&left_collection, &left_rls_filters),
+        ScanSide::join_side(left_collection.as_str(), &left_rls_filters),
     )?;
     let build_plan_bytes = plan_wire::encode(&build_scan).map_err(|e| crate::Error::Internal {
         detail: format!("shuffle join: encode build scan: {e}"),

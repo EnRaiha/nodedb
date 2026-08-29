@@ -46,7 +46,10 @@ fn batch_kv(ctx: &mut TestCtx, collection: &str, count: usize) -> String {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::BatchPut {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             entries,
             ttl_ms: 0,
             surrogates,
@@ -79,7 +82,10 @@ fn hash_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "right_small".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "right_small",
+            ),
             key: match_key.as_bytes().to_vec(),
             value: b"match".to_vec(),
             ttl_ms: 0,
@@ -95,8 +101,14 @@ fn hash_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "left_large".into(),
-            right_collection: "right_small".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "left_large",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "right_small",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -141,7 +153,10 @@ fn sort_merge_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "smj_right".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smj_right",
+            ),
             key: match_key.as_bytes().to_vec(),
             value: b"smatch".to_vec(),
             ttl_ms: 0,
@@ -156,8 +171,14 @@ fn sort_merge_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::SortMergeJoin {
-            left_collection: "smj_left".into(),
-            right_collection: "smj_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smj_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smj_right",
+            ),
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
@@ -190,7 +211,10 @@ fn nested_loop_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "nlj_right".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nlj_right",
+            ),
             key: match_key.as_bytes().to_vec(),
             value: b"nlmatch".to_vec(),
             ttl_ms: 0,
@@ -207,8 +231,14 @@ fn nested_loop_join_completeness_past_50k_cap() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::NestedLoopJoin {
-            left_collection: "nlj_left".into(),
-            right_collection: "nlj_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nlj_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nlj_right",
+            ),
             // Serialize a ScanFilter on the key column to restrict to the match.
             condition: zerompk::to_msgpack_vec(&vec![ScanFilter {
                 field: "nlj_left.key".into(),
@@ -272,8 +302,14 @@ fn hash_join_left_side_over_budget_streams_and_completes() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "bgt_left".into(),
-            right_collection: "bgt_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "bgt_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "bgt_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -336,8 +372,14 @@ fn hash_join_right_side_over_budget_spills_and_completes() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "bgtr_left".into(),
-            right_collection: "bgtr_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "bgtr_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "bgtr_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -399,8 +441,14 @@ fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "spill_left".into(),
-            right_collection: "spill_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "spill_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "spill_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -472,8 +520,14 @@ fn hash_join_probe_side_spill_returns_all_matches() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "pspill_left".into(),
-            right_collection: "pspill_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "pspill_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "pspill_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -526,8 +580,14 @@ fn sort_merge_join_left_over_budget_surfaces_error() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::SortMergeJoin {
-            left_collection: "smjb_left".into(),
-            right_collection: "smjb_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smjb_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smjb_right",
+            ),
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
@@ -564,8 +624,14 @@ fn sort_merge_join_right_over_budget_surfaces_error() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::SortMergeJoin {
-            left_collection: "smjbr_left".into(),
-            right_collection: "smjbr_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smjbr_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "smjbr_right",
+            ),
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
@@ -602,8 +668,14 @@ fn nested_loop_join_left_over_budget_surfaces_error() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::NestedLoopJoin {
-            left_collection: "nljb_left".into(),
-            right_collection: "nljb_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nljb_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nljb_right",
+            ),
             condition: Vec::new(),
             join_type: "inner".into(),
             limit: 1_000_000,
@@ -639,8 +711,14 @@ fn nested_loop_join_right_over_budget_surfaces_error() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::NestedLoopJoin {
-            left_collection: "nljbr_left".into(),
-            right_collection: "nljbr_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nljbr_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nljbr_right",
+            ),
             condition: Vec::new(),
             join_type: "inner".into(),
             limit: 1_000_000,
@@ -686,8 +764,14 @@ fn no_limit_join_output_over_budget_surfaces_error() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::NestedLoopJoin {
-            left_collection: "nolim_left".into(),
-            right_collection: "nolim_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nolim_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "nolim_right",
+            ),
             // Cross join (no condition) → 40 × 40 = 1600 output rows.
             condition: Vec::new(),
             join_type: "inner".into(),
@@ -738,8 +822,14 @@ fn no_limit_join_within_budget_returns_all_rows_past_10k() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "allrows_left".into(),
-            right_collection: "allrows_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "allrows_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "allrows_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -796,8 +886,14 @@ fn explicit_limit_join_caps_at_k_regardless_of_budget() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "explim_left".into(),
-            right_collection: "explim_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "explim_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "explim_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],
@@ -851,8 +947,14 @@ fn join_budget_zero_is_unlimited() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "unlim_left".into(),
-            right_collection: "unlim_right".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "unlim_left",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "unlim_right",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("key".into(), "key".into())],

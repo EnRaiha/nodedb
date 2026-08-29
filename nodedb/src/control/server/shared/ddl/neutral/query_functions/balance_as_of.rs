@@ -59,7 +59,7 @@ pub async fn balance_as_of(
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let mut get_plan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             document_id: key.clone(),
             surrogate,
             pk_bytes,
@@ -116,7 +116,10 @@ pub async fn balance_as_of(
         VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
     let mut source_scan =
         PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-            collection: mat_def.source_collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                database_id,
+                &mat_def.source_collection,
+            ),
             limit: usize::MAX,
             offset: 0,
             sort_keys: Vec::new(),

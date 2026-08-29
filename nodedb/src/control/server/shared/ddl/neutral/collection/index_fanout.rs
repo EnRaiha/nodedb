@@ -99,7 +99,7 @@ pub(super) async fn backfill_on_peers(
     }
 
     let plan = PhysicalPlan::Document(DocumentOp::BackfillIndex {
-        collection: args.collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(args.database_id, args.collection),
         path: args.path.to_string(),
         is_array: args.is_array,
         unique: args.unique,

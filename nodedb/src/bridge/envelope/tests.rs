@@ -14,7 +14,7 @@ fn sample_request() -> Request {
         database_id: DatabaseId::DEFAULT,
         vshard_id: VShardId::new(0),
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             document_id: "doc-1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),

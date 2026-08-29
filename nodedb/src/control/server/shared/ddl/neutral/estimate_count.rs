@@ -51,7 +51,7 @@ pub async fn estimate_count(
 
             let vshard = crate::types::VShardId::from_collection_in_database(database_id, &coll);
             let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
-                collection: coll,
+                collection: nodedb_types::QualifiedCollection::new(database_id, &coll),
                 field,
             });
             match crate::control::server::dispatch_utils::dispatch_to_data_plane(

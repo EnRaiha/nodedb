@@ -153,7 +153,7 @@ mod tests {
 
     fn edge(collection: &str, src: &str, label: &str, dst: &str) -> BatchEdge {
         BatchEdge {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             src_id: src.to_string(),
             label: label.to_string(),
             dst_id: dst.to_string(),
@@ -304,7 +304,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "knows".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "knows"),
             src_id: "a".to_string(),
             label: "KNOWS".to_string(),
             dst_id: "b".to_string(),

@@ -90,7 +90,7 @@ impl CoreLoop {
                 surrogate: _,
                 rls_write_check,
             } => {
-                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection.as_str(), key);
                 self.stage_kv_field_set(&ctx, key, updates, rls_write_check)
             }
             KvOp::Transfer {
@@ -105,7 +105,7 @@ impl CoreLoop {
             } => self.stage_kv_transfer(
                 &cx,
                 StageTransfer {
-                    collection,
+                    collection: collection.as_str(),
                     source_key,
                     dest_key,
                     field,
@@ -124,8 +124,8 @@ impl CoreLoop {
             } => self.stage_kv_transfer_item(
                 &cx,
                 StageTransferItem {
-                    source_collection,
-                    dest_collection,
+                    source_collection: source_collection.as_str(),
+                    dest_collection: dest_collection.as_str(),
                     item_key,
                     dest_key,
                     source_rls_write_check,

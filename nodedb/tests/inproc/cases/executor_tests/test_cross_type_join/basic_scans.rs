@@ -28,7 +28,10 @@ fn kv_put_scan_roundtrip() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             key: b"d1".to_vec(),
             value: value1,
             ttl_ms: 0,
@@ -44,7 +47,10 @@ fn kv_put_scan_roundtrip() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             key: b"d3".to_vec(),
             value: value2,
             ttl_ms: 0,
@@ -85,7 +91,10 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Register {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             indexes: Vec::new(),
             crdt_enabled: false,
             storage_mode: StorageMode::Strict {
@@ -114,7 +123,10 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             key: b"d1".to_vec(),
             value,
             ttl_ms: 0,
@@ -129,7 +141,10 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "prefs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "prefs",
+            ),
             filters: Vec::new(),
             limit: 100,
             offset: 0,
@@ -167,7 +182,10 @@ fn schemaless_put_scan_roundtrip() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             value: doc1,
             surrogate: nodedb_types::Surrogate::new(1),
@@ -184,7 +202,10 @@ fn schemaless_put_scan_roundtrip() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d3".into(),
             value: doc2,
             surrogate: nodedb_types::Surrogate::new(2),

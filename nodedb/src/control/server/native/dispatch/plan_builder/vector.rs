@@ -2,6 +2,7 @@
 
 //! Vector engine plan builders.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 use nodedb_types::vector_distance::DistanceMetric;
 
@@ -9,7 +10,11 @@ use super::super::DispatchCtx;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::VectorOp;
 
-pub(crate) fn build_search(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_search(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let query_vector = fields
         .query_vector
         .as_ref()
@@ -21,7 +26,7 @@ pub(crate) fn build_search(fields: &TextFields, collection: &str) -> crate::Resu
     let field_name = fields.field_name.clone().unwrap_or_default();
 
     Ok(PhysicalPlan::Vector(VectorOp::Search {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         query_vector: query_vector.clone(),
         top_k,
         ef_search,
@@ -77,7 +82,7 @@ pub(crate) fn build_batch_insert(
     }
 
     Ok(PhysicalPlan::Vector(VectorOp::BatchInsert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         vectors,
         dim,
         surrogates,
@@ -118,7 +123,7 @@ pub(crate) fn build_insert(
     };
 
     Ok(PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         vector,
         dim,
         field_name,
@@ -129,6 +134,7 @@ pub(crate) fn build_insert(
 }
 
 pub(crate) fn build_multi_search(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -142,7 +148,7 @@ pub(crate) fn build_multi_search(
     let ef_search = fields.ef_search.unwrap_or(0) as usize;
 
     Ok(PhysicalPlan::Vector(VectorOp::MultiSearch {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         query_vector: query_vector.clone(),
         top_k,
         ef_search,
@@ -151,7 +157,11 @@ pub(crate) fn build_multi_search(
     }))
 }
 
-pub(crate) fn build_delete(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_delete(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let vector_id_wire = fields.vector_id.ok_or_else(|| crate::Error::BadRequest {
         detail: "missing 'vector_id'".to_string(),
     })?;
@@ -162,12 +172,13 @@ pub(crate) fn build_delete(fields: &TextFields, collection: &str) -> crate::Resu
         })?;
 
     Ok(PhysicalPlan::Vector(VectorOp::Delete {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         vector_id,
     }))
 }
 
 pub(crate) fn build_set_params(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -183,7 +194,7 @@ pub(crate) fn build_set_params(
         .unwrap_or_else(|| "hnsw".to_string());
 
     Ok(PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field_name: fields.field_name.clone().unwrap_or_default(),
         dim: fields.vector_dim.unwrap_or(0) as usize,
         m,

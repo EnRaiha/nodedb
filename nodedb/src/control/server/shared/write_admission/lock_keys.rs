@@ -223,7 +223,7 @@ fn graph_point_key(op: &GraphOp) -> Option<LockKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
 
     fn kv_key(op: KvOp) -> LockKey {
         kv_point_key(&op).expect("expected a lock key for this KV op")
@@ -233,7 +233,7 @@ mod tests {
     fn kv_incr_yields_kv_lock_key() {
         assert_eq!(
             kv_key(KvOp::Incr {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 key: b"k1".to_vec(),
                 delta: 1,
                 ttl_ms: 0,
@@ -251,7 +251,7 @@ mod tests {
     fn kv_incr_float_yields_kv_lock_key() {
         assert_eq!(
             kv_key(KvOp::IncrFloat {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 key: b"k1".to_vec(),
                 delta: 1.5,
                 surrogate: Surrogate::new(1),
@@ -268,7 +268,7 @@ mod tests {
     fn kv_cas_yields_kv_lock_key() {
         assert_eq!(
             kv_key(KvOp::Cas {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 key: b"k1".to_vec(),
                 expected: vec![],
                 new_value: vec![],
@@ -286,7 +286,7 @@ mod tests {
     fn kv_get_set_yields_kv_lock_key() {
         assert_eq!(
             kv_key(KvOp::GetSet {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 key: b"k1".to_vec(),
                 new_value: vec![],
                 surrogate: Surrogate::new(1),
@@ -304,7 +304,7 @@ mod tests {
     fn kv_field_set_yields_kv_lock_key() {
         assert_eq!(
             kv_key(KvOp::FieldSet {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 key: b"k1".to_vec(),
                 updates: vec![],
                 surrogate: Surrogate::new(1),
@@ -321,7 +321,7 @@ mod tests {
     fn kv_batch_put_stays_unfenced() {
         assert_eq!(
             kv_point_key(&KvOp::BatchPut {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 entries: vec![(b"k1".to_vec(), vec![]), (b"k2".to_vec(), vec![])],
                 ttl_ms: 0,
                 surrogates: vec![],
@@ -336,7 +336,7 @@ mod tests {
     fn kv_multi_key_delete_stays_unfenced() {
         assert_eq!(
             kv_point_key(&KvOp::Delete {
-                collection: "counters".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 keys: vec![b"k1".to_vec(), b"k2".to_vec()],
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
@@ -348,7 +348,7 @@ mod tests {
     fn document_upsert_yields_surrogate_lock_key() {
         assert_eq!(
             document_point_key(&DocumentOp::Upsert {
-                collection: "docs".to_owned(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
                 document_id: "d1".to_owned(),
                 value: vec![],
                 on_conflict_updates: vec![],

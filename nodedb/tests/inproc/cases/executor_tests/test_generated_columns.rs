@@ -32,7 +32,10 @@ fn register_with_generated(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::Register {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             indexes: Vec::new(),
             crdt_enabled: false,
             storage_mode: Default::default(),
@@ -63,7 +66,10 @@ fn get_doc(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: id.into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -99,7 +105,10 @@ fn insert_materializes_generated_column() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "price": 99.99,
@@ -142,7 +151,10 @@ fn insert_materializes_concat() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "name": "Running Shoe",
@@ -187,7 +199,10 @@ fn update_recomputes_generated_column() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "price": 100.0,
@@ -208,7 +223,10 @@ fn update_recomputes_generated_column() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             updates: vec![(
                 "price".to_string(),
@@ -253,7 +271,10 @@ fn update_generated_column_directly_rejected() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             value: serde_json::to_vec(&serde_json::json!({"price": 100.0})).unwrap(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -270,7 +291,10 @@ fn update_generated_column_directly_rejected() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "p1".into(),
             updates: vec![(
                 "price_with_tax".to_string(),
@@ -321,7 +345,10 @@ fn chained_generated_columns() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             document_id: "o1".into(),
             value: serde_json::to_vec(&serde_json::json!({
                 "qty": 3,

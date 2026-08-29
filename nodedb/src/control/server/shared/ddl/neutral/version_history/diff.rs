@@ -73,7 +73,7 @@ pub async fn select_diff(
     // this is user SQL, so the plan that reaches storage is the one
     // authorization approved.
     let plan = PhysicalPlan::Crdt(CrdtOp::ExportDelta {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         from_version_json: from_vv,
     });
     let delta_bytes =

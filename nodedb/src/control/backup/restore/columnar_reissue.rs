@@ -141,7 +141,7 @@ pub fn build_columnar_insert_plan(
     })?;
 
     Ok(PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
         payload,
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Insert,

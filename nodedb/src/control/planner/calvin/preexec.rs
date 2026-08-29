@@ -87,7 +87,7 @@ pub async fn run_preexec_scan(
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
 
     let scan_plan = PhysicalPlan::Document(DocumentOp::Scan {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         filters: filter_bytes,
         limit: usize::MAX,
         offset: 0,

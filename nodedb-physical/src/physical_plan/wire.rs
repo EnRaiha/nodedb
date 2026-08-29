@@ -102,14 +102,16 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<PhysicalPlan>, WireError> {
 
 #[cfg(test)]
 mod tests {
+    use nodedb_types::{DatabaseId, QualifiedCollection};
+
     use super::*;
     use crate::physical_plan::JoinProjection;
 
     #[test]
     fn hash_join_tail_semantics_roundtrip() {
         let plan = PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "left".into(),
-            right_collection: "right".into(),
+            left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "left"),
+            right_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "right"),
             left_alias: Some("l".into()),
             right_alias: Some("r".into()),
             on: vec![("id".into(), "id".into())],

@@ -41,7 +41,7 @@ impl CoreLoop {
                 task,
                 ResolvePointUpdate {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     updates,
@@ -64,7 +64,7 @@ impl CoreLoop {
                 task,
                 ResolvePointDelete {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     returning: returning.as_ref(),
@@ -87,7 +87,7 @@ impl CoreLoop {
                 task,
                 ResolveUpsert {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     document_id,
                     surrogate: *surrogate,
                     value,
@@ -114,7 +114,7 @@ impl CoreLoop {
                 task,
                 ResolveBulkUpdate {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     updates,
                     returning: returning.as_ref(),
@@ -136,7 +136,7 @@ impl CoreLoop {
                 task,
                 ResolveBulkDelete {
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     returning: returning.as_ref(),
                     rls_filters,

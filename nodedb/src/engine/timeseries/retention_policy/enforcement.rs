@@ -82,7 +82,10 @@ async fn enforcement_loop(
 
                 if safe_to_drop {
                     let plan = PhysicalPlan::Meta(MetaOp::EnforceTimeseriesRetention {
-                        collection: policy.collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::new(
+                            DatabaseId::new(policy.database_id),
+                            &policy.collection,
+                        ),
                         max_age_ms: raw_tier.retain_ms as i64,
                     });
 

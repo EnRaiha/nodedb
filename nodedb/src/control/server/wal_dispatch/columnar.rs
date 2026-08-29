@@ -50,7 +50,7 @@ pub(super) fn wal_append_columnar_op(
             // 4-tuple array, so old on-disk records still decode via the
             // replay fallback path.
             let wal_payload = super::timeseries::encode_columnar_batch_payload(
-                collection,
+                collection.as_str(),
                 payload,
                 provenance.as_ref(),
                 surrogates,
@@ -69,8 +69,12 @@ pub(super) fn wal_append_columnar_op(
             // replay re-executes it through the same live handler. See
             // `encode_columnar_dml_payload` for the record shape and the
             // idempotence constraint on replay ordering.
-            let wal_payload =
-                super::timeseries::encode_columnar_dml_payload(collection, true, filters, updates)?;
+            let wal_payload = super::timeseries::encode_columnar_dml_payload(
+                collection.as_str(),
+                true,
+                filters,
+                updates,
+            )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
         ColumnarOp::Delete {
@@ -82,8 +86,12 @@ pub(super) fn wal_append_columnar_op(
             // remove from PK index), so unlike update it tolerates a
             // hypothetical double-apply, but replay still runs it exactly
             // once by construction.
-            let wal_payload =
-                super::timeseries::encode_columnar_dml_payload(collection, false, filters, &[])?;
+            let wal_payload = super::timeseries::encode_columnar_dml_payload(
+                collection.as_str(),
+                false,
+                filters,
+                &[],
+            )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
         ColumnarOp::ResolvedUpdate {
@@ -96,7 +104,7 @@ pub(super) fn wal_append_columnar_op(
             // never a predicate: replay has no writing identity to decide one
             // against.
             let wal_payload = super::timeseries::encode_columnar_resolved_dml_payload(
-                collection,
+                collection.as_str(),
                 true,
                 rows,
                 &[],
@@ -109,7 +117,7 @@ pub(super) fn wal_append_columnar_op(
             rls_write_check: _,
         } => {
             let wal_payload = super::timeseries::encode_columnar_resolved_dml_payload(
-                collection,
+                collection.as_str(),
                 false,
                 &[],
                 pks,
@@ -147,7 +155,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "metrics".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             payload: vec![1, 2, 3],
             format: "msgpack".to_string(),
             intent: ColumnarInsertIntent::Insert,
@@ -181,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: "metrics".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
             projection: vec![],
             limit: 10,
             filters: vec![],

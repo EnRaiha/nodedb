@@ -150,6 +150,7 @@ pub async fn match_query(
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_match_scoped(
         query.collection.as_deref(),
         tenant_id,
+        database_id,
         gate.auth(),
         &state.redaction,
     )

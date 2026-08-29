@@ -55,7 +55,10 @@ fn insert_product(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: id.into(),
             value: value.into_bytes(),
             surrogate: surrogate_for(id),
@@ -79,7 +82,10 @@ fn get_stock(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: id.into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -113,7 +119,10 @@ fn bulk_update_returns_affected_count() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates,
             returning: None,
@@ -159,7 +168,10 @@ fn conditional_decrement_stops_at_zero() {
             &mut tx,
             &mut rx,
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection: "products".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "products",
+                ),
                 filters: filter_bytes,
                 updates,
                 returning: None,
@@ -207,7 +219,10 @@ fn bulk_update_zero_match_returns_zero_affected() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates,
             returning: None,
@@ -242,7 +257,10 @@ fn bulk_update_returning_returns_updated_documents() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates,
             returning: None,
@@ -276,7 +294,10 @@ fn bulk_update_returning_zero_match_returns_affected_zero() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates,
             returning: None,
@@ -308,7 +329,10 @@ fn point_update_returns_affected_count() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "pu1".into(),
             updates,
             returning: None,
@@ -341,7 +365,10 @@ fn point_update_returning_returns_updated_document() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: "pu2".into(),
             updates,
             returning: None,
@@ -388,7 +415,10 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
             txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                    collection: "products".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "products",
+                    ),
                     filters: filters_match,
                     updates: vec![(
                         "stock".to_string(),
@@ -404,7 +434,10 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
                     resolved_sum_targets: Vec::new(),
                 }),
                 PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                    collection: "products".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "products",
+                    ),
                     filters: filters_nomatch,
                     updates: vec![(
                         "stock".to_string(),

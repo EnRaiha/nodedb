@@ -107,7 +107,7 @@ mod tests {
     /// skipped here or COMMIT would double-bill it.
     fn stageable_task() -> PhysicalTask {
         buffered_task(PhysicalPlan::Kv(KvOp::Put {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
@@ -122,7 +122,7 @@ mod tests {
     /// `meter_committed_buffered_writes` must bill.
     fn non_stageable_task() -> PhysicalTask {
         buffered_task(PhysicalPlan::Kv(KvOp::Get {
-            collection: "widgets".into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,

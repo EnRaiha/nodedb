@@ -207,7 +207,10 @@ mod tests {
 
     fn point_insert(collection: &str, owner_id: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: "d1".into(),
             value: body(owner_id),
             if_absent: false,
@@ -221,7 +224,10 @@ mod tests {
 
     fn point_update(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointUpdate {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             document_id: "d1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -274,7 +280,10 @@ mod tests {
     fn batch_insert_is_rejected_when_any_row_violates_the_policy() {
         let store = store_with_write_policy("orders");
         let mut plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             documents: vec![("d1".into(), body("42")), ("d2".into(), body("99"))],
             surrogates: Vec::new(),
             returning: None,
@@ -327,7 +336,10 @@ mod tests {
     fn bulk_delete_carries_the_write_predicate() {
         let store = store_with_write_policy("orders");
         let mut plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             filters: Vec::new(),
             returning: None,
             ollp_predicted_surrogates: None,
@@ -346,8 +358,14 @@ mod tests {
     fn merge_carries_the_target_write_predicate() {
         let store = store_with_write_policy("target");
         let mut plan = PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection: "target".into(),
-            source_collection: "source".into(),
+            target_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "target",
+            ),
+            source_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "source",
+            ),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),
@@ -369,7 +387,10 @@ mod tests {
     fn upsert_carries_the_write_predicate() {
         let store = store_with_write_policy("orders");
         let mut plan = PhysicalPlan::Document(DocumentOp::Upsert {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             document_id: "d1".into(),
             value: body("42"),
             on_conflict_updates: Vec::new(),
@@ -426,7 +447,10 @@ mod tests {
     fn truncate_is_refused_under_a_write_policy() {
         let store = store_with_write_policy("orders");
         let mut plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: "orders".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
         });
@@ -511,7 +535,10 @@ mod tests {
 
     fn indexed_fetch(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::IndexedFetch {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             path: "$.email".into(),
             value: "a@b.c".into(),
             filters: Vec::new(),
@@ -551,7 +578,10 @@ mod tests {
     fn bulk_update_receives_the_policy_filter() {
         let store = store_with_read_policy("users");
         let mut plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             filters: Vec::new(),
             updates: Vec::new(),
             returning: None,
@@ -587,8 +617,14 @@ mod tests {
     fn merge_receives_the_target_collection_policy() {
         let store = store_with_read_policy("target");
         let mut plan = PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection: "target".into(),
-            source_collection: "source".into(),
+            target_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "target",
+            ),
+            source_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "source",
+            ),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),
@@ -614,7 +650,10 @@ mod tests {
     fn estimate_count_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("users");
         let mut plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             field: "id".into(),
         });
         assert_refused(inject(&mut plan, &store), "users");

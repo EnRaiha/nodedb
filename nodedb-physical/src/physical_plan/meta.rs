@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use nodedb_types::calvin::{PassiveReadKey, VersionedReadEntry};
 use nodedb_types::timeseries::continuous_agg::ContinuousAggregateDef;
-use nodedb_types::{TenantId, Value};
+use nodedb_types::{QualifiedCollection, TenantId, Value};
 
 pub use super::meta_calvin::PassiveReadKeyId;
 
@@ -72,7 +72,7 @@ pub enum MetaOp {
     /// `target_type`: "document_schemaless", "document_strict", "kv".
     /// `schema_json`: for "document_strict"/"kv", JSON-serialized column definitions.
     ConvertCollection {
-        collection: String,
+        collection: QualifiedCollection,
         target_type: String,
         schema_json: String,
     },
@@ -166,7 +166,10 @@ pub enum MetaOp {
 
     /// Enforce retention on a timeseries collection: drop segments older than
     /// the cutoff. Called by the retention policy enforcement loop.
-    EnforceTimeseriesRetention { collection: String, max_age_ms: i64 },
+    EnforceTimeseriesRetention {
+        collection: QualifiedCollection,
+        max_age_ms: i64,
+    },
 
     /// Bitemporal audit-retention purge for the graph edge store.
     ///
@@ -178,7 +181,7 @@ pub enum MetaOp {
     /// Emits one `RecordType::TemporalPurge` WAL record per purged batch.
     TemporalPurgeEdgeStore {
         tenant_id: u64,
-        collection: String,
+        collection: QualifiedCollection,
         cutoff_system_ms: i64,
     },
 
@@ -190,7 +193,7 @@ pub enum MetaOp {
     /// keyed to the purged document versions in the same transaction.
     TemporalPurgeDocumentStrict {
         tenant_id: u64,
-        collection: String,
+        collection: QualifiedCollection,
         cutoff_system_ms: i64,
     },
 
@@ -202,7 +205,7 @@ pub enum MetaOp {
     /// expected to be flagged bitemporal by the caller).
     TemporalPurgeColumnar {
         tenant_id: u64,
-        collection: String,
+        collection: QualifiedCollection,
         cutoff_system_ms: i64,
     },
 
@@ -212,7 +215,7 @@ pub enum MetaOp {
     /// the live row, so `AS OF now()` reads remain correct post-purge.
     TemporalPurgeCrdt {
         tenant_id: u64,
-        collection: String,
+        collection: QualifiedCollection,
         cutoff_system_ms: i64,
     },
 
@@ -262,11 +265,14 @@ pub enum MetaOp {
 
     /// Query all entries from a collection's last-value cache.
     /// Returns JSON-serialized `Vec<(u64, i64, f64)>` — (series_id, ts, value).
-    QueryLastValues { collection: String },
+    QueryLastValues { collection: QualifiedCollection },
 
     /// Query a single series from a collection's last-value cache.
     /// Returns JSON-serialized `Option<(i64, f64)>` — (ts, value).
-    QueryLastValue { collection: String, series_id: u64 },
+    QueryLastValue {
+        collection: QualifiedCollection,
+        series_id: u64,
+    },
 
     /// Calvin deterministic executor: static-set multi-shard transaction.
     ///
@@ -383,7 +389,7 @@ pub enum MetaOp {
     ///   (`ErrorCode::Conflict`), or
     /// - the shadow build fails (`ErrorCode::Internal`).
     RebuildIndex {
-        collection: String,
+        collection: QualifiedCollection,
         index_name: Option<String>,
         concurrent: bool,
     },
@@ -417,8 +423,8 @@ pub enum MetaOp {
         tenant_id: u64,
         old_database_id: u64,
         new_database_id: u64,
-        old_collection: String,
-        new_collection: String,
+        old_collection: QualifiedCollection,
+        new_collection: QualifiedCollection,
     },
 
     /// Execute a point write at STATEMENT time by STAGING it into the

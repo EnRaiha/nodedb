@@ -141,7 +141,7 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
     };
 
     let plan = PhysicalPlan::Document(DocumentOp::RangeScan {
-        collection: req.collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(req.database_id, req.collection),
         field: String::new(),
         lower: None,
         upper: None,

@@ -40,7 +40,10 @@ fn insert_product(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: id.into(),
             value: value_bytes,
             surrogate,
@@ -150,7 +153,10 @@ fn unfiltered_facet_counts_multiple_fields() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: Vec::new(),
             fields: vec!["brand".into(), "color".into()],
             limit_per_facet: 0,
@@ -197,7 +203,10 @@ fn filtered_facet_counts() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             fields: vec!["color".into(), "size".into()],
             limit_per_facet: 0,
@@ -237,7 +246,10 @@ fn zero_match_filter_returns_empty_facets() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             fields: vec!["color".into()],
             limit_per_facet: 0,
@@ -260,7 +272,10 @@ fn limit_per_facet_truncates() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: Vec::new(),
             fields: vec!["brand".into()],
             limit_per_facet: 2,
@@ -286,7 +301,10 @@ fn facet_on_field_without_index_falls_back_to_scan() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: Vec::new(),
             fields: vec!["price".into()],
             limit_per_facet: 0,
@@ -364,7 +382,10 @@ fn facet_single_field() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::FacetCounts {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: Vec::new(),
             fields: vec!["size".into()],
             limit_per_facet: 0,

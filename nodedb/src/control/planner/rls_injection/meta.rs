@@ -25,9 +25,10 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
 
         // Refuse: a byte-size estimate is derived from every stored row of the
         // collection, including the ones the policy hides, and carries no row
-        // to filter.
+        // to filter. `name` is a bare collection name — qualify it against
+        // this task's database before the policy lookup.
         MetaOp::QueryCollectionSize { name, .. } => ctx.refuse_if_policy(
-            name,
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, name),
             "the size estimate is derived from every stored row, which the row filter cannot be \
              evaluated against",
         ),
@@ -117,7 +118,10 @@ mod tests {
         let store = store_with_read_policy("users");
         let mut plan = PhysicalPlan::Meta(MetaOp::TransactionBatch {
             plans: vec![PhysicalPlan::Document(DocumentOp::IndexLookup {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 path: "$.email".into(),
                 value: "a@b.c".into(),
             })],

@@ -5,6 +5,7 @@
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::super::codec::RespValue;
 use super::super::command::RespCommand;
@@ -28,7 +29,7 @@ pub(in crate::control::server::resp) async fn handle_mget(
     let redaction = resp_redaction(state, session);
 
     let plan = PhysicalPlan::Kv(KvOp::BatchGet {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         keys: cmd.args.clone(),
         rls_filters: Vec::new(),
     });
@@ -105,7 +106,7 @@ pub(in crate::control::server::resp) async fn handle_mset(
     };
 
     let plan = PhysicalPlan::Kv(KvOp::BatchPut {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         entries,
         ttl_ms: 0,
         surrogates,

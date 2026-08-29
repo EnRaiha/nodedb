@@ -9,6 +9,7 @@
 use nodedb::bridge::envelope::Status;
 use nodedb::engine::graph::edge_store::Direction;
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -25,7 +26,7 @@ fn graph_cross_tenant_insert_does_not_contaminate_neighbors() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "social".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "social"),
             src_id: "node_1".into(),
             label: "FOLLOWS".into(),
             dst_id: "node_2".into(),
@@ -69,7 +70,7 @@ fn graph_cross_tenant_insert_does_not_contaminate_neighbors() {
             &mut rx,
             TENANT_B,
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "social".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "social"),
                 src_id: "node_1".into(),
                 label: "FOLLOWS".into(),
                 dst_id: format!("b_node_{i}"),
@@ -127,7 +128,7 @@ fn graph_cross_tenant_edge_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_A,
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "social".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "social"),
             src_id: "alpha".into(),
             label: "CONNECTED".into(),
             dst_id: "beta".into(),
@@ -144,7 +145,7 @@ fn graph_cross_tenant_edge_delete_does_not_affect_owner() {
         &mut rx,
         TENANT_B,
         PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: "social".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "social"),
             src_id: "alpha".into(),
             label: "CONNECTED".into(),
             dst_id: "beta".into(),

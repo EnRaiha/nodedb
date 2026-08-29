@@ -38,6 +38,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::tests::make_core_with_dir;
 use crate::engine::kv::current_ms;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 const DB: u64 = 0;
 const TID: u64 = 1;
@@ -75,7 +76,7 @@ fn kv_expire_in_tx_commit_replay_sets_ttl() {
     );
 
     let plan = PhysicalPlan::Kv(KvOp::Expire {
-        collection: "cache".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         ttl_ms: 5_000,
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -111,7 +112,7 @@ fn kv_expire_in_tx_rollback_reverts_ttl() {
     put_kv(&mut core, "cache", b"k", b"v", 0);
 
     let plan = PhysicalPlan::Kv(KvOp::Expire {
-        collection: "cache".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         ttl_ms: 5_000,
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -147,7 +148,7 @@ fn kv_persist_in_tx_commit_replay_clears_ttl() {
     );
 
     let plan = PhysicalPlan::Kv(KvOp::Persist {
-        collection: "cache".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
     });
@@ -183,7 +184,7 @@ fn kv_persist_in_tx_rollback_restores_ttl() {
     let before = ttl_ms(&core, "cache", b"k").unwrap();
 
     let plan = PhysicalPlan::Kv(KvOp::Persist {
-        collection: "cache".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "cache"),
         key: b"k".to_vec(),
         rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
     });
@@ -219,7 +220,7 @@ fn seed_players(core: &mut CoreLoop) {
 
 fn register_plan() -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-        collection: "players".to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
         index_name: "lb".to_string(),
         sort_columns: vec![("score".to_string(), "DESC".to_string())],
         key_column: "player_id".to_string(),

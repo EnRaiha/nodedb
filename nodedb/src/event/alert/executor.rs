@@ -160,7 +160,10 @@ async fn execute_aggregate_scan(
     };
 
     let plan = PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-        collection: alert.collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(
+            crate::types::DatabaseId::new(alert.database_id),
+            &alert.collection,
+        ),
         time_range: (window_start, window_end),
         projection: Vec::new(),
         limit: 10_000, // Safety cap on group cardinality.

@@ -64,8 +64,12 @@ pub(super) fn wal_append_document_op(
             // Plan-time materialized-sum resolution is not part of the applied record.
             resolved_sum_targets: _,
         } => {
-            let entry =
-                encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
+            let entry = encode_document_put_record(
+                collection.as_str(),
+                document_id,
+                value,
+                surrogate.as_u32(),
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         DocumentOp::PointInsert {
@@ -80,8 +84,12 @@ pub(super) fn wal_append_document_op(
             resolved_sum_targets: _,
             deferred_sum_targets: _,
         } => {
-            let entry =
-                encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
+            let entry = encode_document_put_record(
+                collection.as_str(),
+                document_id,
+                value,
+                surrogate.as_u32(),
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         DocumentOp::PointDelete {
@@ -92,7 +100,8 @@ pub(super) fn wal_append_document_op(
         } => {
             // 4-tuple keys secondary vector-index removal by surrogate on restart —
             // a 3-tuple would leave the deleted embedding to resurrect.
-            let entry = encode_document_delete_record(collection, document_id, surrogate.as_u32())?;
+            let entry =
+                encode_document_delete_record(collection.as_str(), document_id, surrogate.as_u32())?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // NotAWrite — reads / query ops / DDL that produces no engine mutation here
@@ -133,7 +142,7 @@ pub(super) fn wal_append_document_op(
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::PhysicalPlan;
-    use nodedb_types::Surrogate;
+    use nodedb_types::{QualifiedCollection, Surrogate};
 
     fn open_wal(dir: &std::path::Path) -> WalManager {
         WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
@@ -159,7 +168,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "users".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             document_id: "u1".to_string(),
             value: vec![1, 2, 3],
             surrogate: Surrogate::new(5),
@@ -198,7 +207,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "users".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             document_id: "u1".to_string(),
             surrogate: Surrogate::new(5),
             pk_bytes: vec![],
@@ -228,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
-            collection: "users".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             field: "id".to_string(),
         });
 

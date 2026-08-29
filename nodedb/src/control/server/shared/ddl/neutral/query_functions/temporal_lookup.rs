@@ -47,7 +47,7 @@ pub async fn temporal_lookup(
     // Scan the table.
     let vshard = VShardId::from_collection_in_database(database_id, &table);
     let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: table.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &table),
         limit: usize::MAX,
         offset: 0,
         sort_keys: Vec::new(),

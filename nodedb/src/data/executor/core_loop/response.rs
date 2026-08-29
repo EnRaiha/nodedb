@@ -115,7 +115,7 @@ impl CoreLoop {
         {
             return mutations
                 .iter()
-                .map(|m| self.collection_read_version(task, m.collection()))
+                .map(|m| self.collection_read_version(task, m.collection().as_str()))
                 .max()
                 .unwrap_or(crate::types::Lsn::ZERO);
         }

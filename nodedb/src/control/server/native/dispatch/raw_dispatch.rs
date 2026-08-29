@@ -98,7 +98,7 @@ async fn dispatch_external_crdt_apply(
     crate::control::server::shared::authorization::authorize_collection(
         ctx.identity,
         ctx.database_id(),
-        &collection,
+        collection.as_str(),
         crate::control::security::identity::Permission::Write,
         &ctx.state.permissions,
         &ctx.state.roles,
@@ -107,7 +107,7 @@ async fn dispatch_external_crdt_apply(
     .map_err(crate::Error::from)?;
     let task = nodedb_physical::physical_task::PhysicalTask {
         tenant_id,
-        vshard_id: VShardId::from_collection_in_database(ctx.database_id(), &collection),
+        vshard_id: VShardId::from_collection_in_database(ctx.database_id(), collection.as_str()),
         database_id: ctx.database_id(),
         plan,
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
@@ -127,19 +127,17 @@ async fn dispatch_external_crdt_apply(
     .ok_or_else(|| crate::Error::Internal {
         detail: "authorization returned no capability".into(),
     })?;
-    // RLS write policies are stored keyed by `db_qualified(database_id,
-    // collection)`, so the policy is handed that same key or it silently
-    // misses a policy on a non-default database. `collection` itself stays
-    // bare here: it also feeds the admission request's catalog lookup and its
-    // equality check against this same (unqualified) plan, and vShard routing.
-    let qualified_collection = crate::control::planner::sql_plan_convert::convert::db_qualified(
-        ctx.database_id(),
-        &collection,
-    );
+    // RLS write policies are stored keyed by the database-qualified
+    // collection, so the policy is handed that same key or it silently
+    // misses a policy on a non-default database. `collection` is already
+    // qualified here (the plan builder qualifies it against `ctx.database_id()`
+    // before this dispatch runs), so no re-qualification happens — doing so
+    // would double-prefix the name.
+    let qualified_collection = collection.as_str();
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         ctx.database_id(),
-        &qualified_collection,
+        qualified_collection,
         ctx.identity,
         "native".into(),
         &ctx.state.rls,
@@ -149,7 +147,7 @@ async fn dispatch_external_crdt_apply(
         ctx.state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
             authorized,
-            collection: &collection,
+            collection: collection.as_str(),
             timeout: std::time::Duration::from_secs(ctx.state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,

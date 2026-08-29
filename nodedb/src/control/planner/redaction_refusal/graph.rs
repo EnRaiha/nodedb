@@ -19,7 +19,7 @@ pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Resu
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
         | GraphOp::Path { collection, .. }
-        | GraphOp::Subgraph { collection, .. } => match collection.as_deref() {
+        | GraphOp::Subgraph { collection, .. } => match collection.as_ref() {
             Some(collection) => refuse_traversal(ctx, collection),
             None => Ok(()),
         },
@@ -53,8 +53,11 @@ pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Resu
     }
 }
 
-pub(super) fn refuse_traversal(ctx: &RefusalCtx<'_>, collection: &str) -> crate::Result<()> {
-    if collection.is_empty() || !ctx.collection_is_redacted(collection) {
+pub(super) fn refuse_traversal(
+    ctx: &RefusalCtx<'_>,
+    collection: &nodedb_types::QualifiedCollection,
+) -> crate::Result<()> {
+    if collection.as_str().is_empty() || !ctx.collection_is_redacted(collection.as_str()) {
         return Ok(());
     }
     Err(crate::Error::PlanError {
@@ -89,7 +92,10 @@ pub(super) fn refuse_match_scoped(
     collection: Option<&str>,
 ) -> crate::Result<()> {
     match collection {
-        Some(collection) => refuse_traversal(ctx, collection),
+        Some(collection) => refuse_traversal(
+            ctx,
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, collection),
+        ),
         None => refuse_unscoped_match(ctx),
     }
 }

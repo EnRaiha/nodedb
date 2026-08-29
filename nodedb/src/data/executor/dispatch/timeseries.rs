@@ -33,7 +33,7 @@ impl CoreLoop {
             } => self.execute_timeseries_scan(TimeseriesScanParams {
                 task,
                 tid: task.request.tenant_id,
-                collection,
+                collection: collection.as_str(),
                 time_range: *time_range,
                 limit: *limit,
                 filters,
@@ -60,7 +60,7 @@ impl CoreLoop {
             } => self.execute_timeseries_ingest(TimeseriesIngestExec {
                 task,
                 tid: task.request.tenant_id,
-                collection,
+                collection: collection.as_str(),
                 payload,
                 format,
                 // The envelope LSN wins: SQL/ILP planners leave the plan's copy
@@ -130,7 +130,7 @@ mod tests {
     /// the plan carries NO LSN, the request envelope carries the minted one.
     fn autocommit_ingest_task(envelope_lsn: Option<u64>) -> ExecutionTask {
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: COLLECTION.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             payload: format!("{COLLECTION},host=h0 value=1i\n").into_bytes(),
             format: "ilp".to_string(),
             wal_lsn: None,

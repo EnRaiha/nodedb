@@ -2,7 +2,7 @@
 
 //! CRDT engine operations dispatched to the Data Plane.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{QualifiedCollection, Surrogate};
 
 use super::ReturningSpec;
 
@@ -19,7 +19,7 @@ use super::ReturningSpec;
 pub enum CrdtOp {
     /// CRDT state read for a document.
     Read {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
     },
 
@@ -30,7 +30,7 @@ pub enum CrdtOp {
     /// the assigner returns the existing one. `Surrogate::ZERO` only
     /// appears in test fixtures.
     Apply {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         delta: Vec<u8>,
         peer_id: u64,
@@ -59,7 +59,7 @@ pub enum CrdtOp {
     /// signing enforcement. Kept distinct from trusted/internal `Apply` so a
     /// transport cannot accidentally omit the signing admission fields.
     ApplyAuthenticated {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         delta: Vec<u8>,
         peer_id: u64,
@@ -84,7 +84,7 @@ pub enum CrdtOp {
     /// provenance: it is a collection-doc import, not a per-document op.
     ImportSnapshot {
         tenant_id: u64,
-        collection: String,
+        collection: QualifiedCollection,
         bytes: Vec<u8>,
     },
 
@@ -98,7 +98,7 @@ pub enum CrdtOp {
     /// is `>=` the version last installed for the collection, so a stale set
     /// cannot clobber a newer one regardless of data-log apply order.
     SetConstraints {
-        collection: String,
+        collection: QualifiedCollection,
         constraint_version: u64,
         constraints: Vec<Vec<u8>>,
     },
@@ -106,7 +106,7 @@ pub enum CrdtOp {
     /// Remove every constraint scoped to `collection` from the CRDT validator.
     /// `constraint_version` fences the drop identically to `SetConstraints`.
     DropConstraints {
-        collection: String,
+        collection: QualifiedCollection,
         constraint_version: u64,
     },
 
@@ -115,11 +115,11 @@ pub enum CrdtOp {
     /// installed `Vec<Constraint>` zerompk-encoded in the response payload. It
     /// is never replicated or logged — it is constructed directly against a
     /// single node's data core to inspect that replica's validator state.
-    ReadConstraints { collection: String },
+    ReadConstraints { collection: QualifiedCollection },
 
     /// Set conflict resolution policy for a CRDT collection (DDL).
     SetPolicy {
-        collection: String,
+        collection: QualifiedCollection,
         /// JSON-serialized `CollectionPolicy` from nodedb-crdt.
         policy_json: String,
     },
@@ -127,12 +127,12 @@ pub enum CrdtOp {
     /// Read the current conflict resolution policy for a CRDT collection.
     /// Returns the JSON-serialized `CollectionPolicy`, falling back to the
     /// ephemeral default when no explicit policy has been registered.
-    GetPolicy { collection: String },
+    GetPolicy { collection: QualifiedCollection },
 
     /// Read a document at a specific historical version.
     /// Returns the document state as JSON bytes.
     ReadAtVersion {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         /// JSON-serialized `HashMap<String, i64>` of {peer_id_hex: counter}.
         version_vector_json: String,
@@ -140,12 +140,12 @@ pub enum CrdtOp {
 
     /// Get the current oplog version vector for a tenant's CRDT state.
     /// Returns version vector as JSON string.
-    GetVersionVector { collection: String },
+    GetVersionVector { collection: QualifiedCollection },
 
     /// Export oplog delta from a version to current.
     /// Returns raw Loro delta bytes.
     ExportDelta {
-        collection: String,
+        collection: QualifiedCollection,
         /// JSON-serialized version vector to start from.
         from_version_json: String,
     },
@@ -153,7 +153,7 @@ pub enum CrdtOp {
     /// Restore a document to a historical version (forward mutation).
     /// Returns the delta bytes for the restore operation.
     RestoreToVersion {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         /// JSON-serialized version vector of the target version.
         target_version_json: String,
@@ -163,7 +163,7 @@ pub enum CrdtOp {
 
     /// Compact history at a specific version.
     CompactAtVersion {
-        collection: String,
+        collection: QualifiedCollection,
         /// JSON-serialized version vector. Oplog before this is discarded.
         target_version_json: String,
     },
@@ -176,7 +176,7 @@ pub enum CrdtOp {
     /// document — it does not allocate a new top-level surrogate. The
     /// `surrogate` field carries the parent document's surrogate.
     ListInsert {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         list_path: String,
         index: usize,
@@ -187,7 +187,7 @@ pub enum CrdtOp {
 
     /// Delete a block from a document's block list.
     ListDelete {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         list_path: String,
         index: usize,
@@ -197,7 +197,7 @@ pub enum CrdtOp {
 
     /// Move a block within a document's block list (reorder).
     ListMove {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         list_path: String,
         from_index: usize,
@@ -219,7 +219,7 @@ pub enum CrdtOp {
     ///
     /// `surrogate` is this row's OWN stable top-level cross-engine identity.
     DocUpsert {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         fields_json: String,
         surrogate: Surrogate,
@@ -241,7 +241,7 @@ pub enum CrdtOp {
     /// Delete a document row: tombstone in the collection's Loro doc + remove
     /// from the sparse document store.
     DocDelete {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         surrogate: Surrogate,
         /// When `Some`, return the STORED pre-image of the deleted row —
@@ -260,7 +260,7 @@ pub enum CrdtOp {
     /// Appended to preserve every existing enum discriminator in durable WAL
     /// and replication records.
     PreviewApply {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         delta: Vec<u8>,
     },

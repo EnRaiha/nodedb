@@ -153,7 +153,10 @@ fn dummy_task(id: &str) -> nodedb_physical::physical_task::PhysicalTask {
         vshard_id: nodedb::types::VShardId::new(0),
         database_id: nodedb::types::DatabaseId::DEFAULT,
         plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "test".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb::types::DatabaseId::DEFAULT,
+                "test",
+            ),
             document_id: id.into(),
             value: vec![],
             surrogate: nodedb_types::Surrogate::ZERO,

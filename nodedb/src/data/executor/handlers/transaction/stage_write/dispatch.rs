@@ -53,7 +53,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     payload,
                     surrogates,
                     schema_bytes,
@@ -72,7 +72,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     rls_write_check,
                 });
@@ -87,7 +87,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     filter_bytes: filters,
                     updates,
                     rls_write_check,
@@ -109,7 +109,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     rows,
                     rls_write_check,
                 });
@@ -123,7 +123,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     pks,
                 });
             }
@@ -138,7 +138,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     field,
                     surrogate: *surrogate,
                     geometry,
@@ -149,7 +149,7 @@ impl CoreLoop {
                 surrogate,
                 field: _,
                 provenance: _,
-            }) => return self.stage_spatial_delete(task, tid, txn_id, collection, *surrogate),
+            }) => return self.stage_spatial_delete(task, tid, txn_id, collection.as_str(), *surrogate),
             PhysicalPlan::Spatial(SpatialOp::Scan { .. }) => {
                 return self.stage_not_point_write(task);
             }
@@ -193,7 +193,7 @@ impl CoreLoop {
                     task,
                     tid,
                     txn_id,
-                    collection,
+                    collection: collection.as_str(),
                     payload,
                     format,
                     surrogates,
@@ -223,7 +223,8 @@ impl CoreLoop {
                 surrogate,
                 ..
             } => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx =
+                    StageCtx::new(task, tid, txn_id, collection.as_str(), document_id, *surrogate);
                 self.stage_point_insert(&ctx, value, *if_absent)
             }
             DocumentOp::PointPut {
@@ -233,7 +234,8 @@ impl CoreLoop {
                 surrogate,
                 ..
             } => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx =
+                    StageCtx::new(task, tid, txn_id, collection.as_str(), document_id, *surrogate);
                 self.stage_point_put(&ctx, value)
             }
             DocumentOp::PointDelete {
@@ -243,7 +245,8 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             } => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx =
+                    StageCtx::new(task, tid, txn_id, collection.as_str(), document_id, *surrogate);
                 self.stage_point_delete(&ctx, rls_write_check)
             }
             DocumentOp::PointUpdate {
@@ -254,7 +257,8 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             } => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx =
+                    StageCtx::new(task, tid, txn_id, collection.as_str(), document_id, *surrogate);
                 self.stage_point_update(&ctx, updates, rls_write_check)
             }
             // Predicate UPDATE staged like a point update, resolved against
@@ -274,7 +278,7 @@ impl CoreLoop {
                 task,
                 tid,
                 txn_id,
-                collection,
+                collection: collection.as_str(),
                 filter_bytes: filters,
                 updates,
                 rls_write_check,
@@ -296,7 +300,7 @@ impl CoreLoop {
                 task,
                 tid,
                 txn_id,
-                collection,
+                collection: collection.as_str(),
                 filter_bytes: filters,
                 rls_write_check,
             }),
@@ -313,7 +317,8 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             } => {
-                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                let ctx =
+                    StageCtx::new(task, tid, txn_id, collection.as_str(), document_id, *surrogate);
                 self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check)
             }
 

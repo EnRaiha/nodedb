@@ -168,7 +168,10 @@ pub async fn weighted_pick(
         ) {
             Ok(audit_surrogate) => {
                 let audit_plan = PhysicalPlan::Kv(KvOp::Put {
-                    collection: "_system_random_audit".to_string(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        DatabaseId::DEFAULT,
+                        "_system_random_audit",
+                    ),
                     key: audit_key_bytes,
                     value: audit_value,
                     ttl_ms: 0,
@@ -234,7 +237,7 @@ async fn scan_all_entries(
     collection: &str,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DdlError> {
     let mut plan = PhysicalPlan::Kv(KvOp::Scan {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         cursor: Vec::new(),
         count: 100_000,
         filters: Vec::new(),

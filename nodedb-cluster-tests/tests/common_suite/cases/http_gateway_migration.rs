@@ -22,6 +22,7 @@ use nodedb::control::gateway::GatewayErrorMap;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::types::TenantId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -66,7 +67,10 @@ async fn http_gateway_migration_single_node_query() {
 
     // PUT — write path (mirrors HTTP POST /query with INSERT SQL).
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "http_gw_single_node".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "http_gw_single_node",
+        ),
         key: b"row-1".to_vec(),
         value: mp_string("hello-http"),
         ttl_ms: 0,
@@ -84,7 +88,10 @@ async fn http_gateway_migration_single_node_query() {
 
     // GET — read path (mirrors HTTP POST /query with SELECT SQL).
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "http_gw_single_node".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "http_gw_single_node",
+        ),
         key: b"row-1".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -139,7 +146,10 @@ async fn http_gateway_migration_cross_node_query() {
 
     // First PUT to ensure the collection has data.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "http_gw_cross_node".into(),
+        collection: QualifiedCollection::new(
+            nodedb_types::id::DatabaseId::DEFAULT,
+            "http_gw_cross_node",
+        ),
         key: b"cross-key".to_vec(),
         value: mp_string("cross-value"),
         ttl_ms: 0,
@@ -175,7 +185,10 @@ async fn http_gateway_migration_cross_node_query() {
                 &[],
                 || {
                     Ok(PhysicalPlan::Kv(KvOp::Get {
-                        collection: "http_gw_cross_node".into(),
+                        collection: QualifiedCollection::new(
+                            nodedb_types::id::DatabaseId::DEFAULT,
+                            "http_gw_cross_node",
+                        ),
                         key: b"cross-key".to_vec(),
                         rls_filters: vec![],
                         surrogate_ceiling: None,

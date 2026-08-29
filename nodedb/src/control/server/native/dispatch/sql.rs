@@ -466,7 +466,10 @@ mod tests {
     #[test]
     fn columnar_scan_is_sharded_source() {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: "metrics".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
             projection: Vec::new(),
             limit: 10,
             filters: Vec::new(),
@@ -483,7 +486,10 @@ mod tests {
     #[test]
     fn document_scan_is_still_sharded_source() {
         let plan = PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             filters: Vec::new(),
             limit: 10,
             offset: 0,

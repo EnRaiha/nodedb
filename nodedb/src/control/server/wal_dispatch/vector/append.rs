@@ -99,7 +99,7 @@ pub(crate) fn wal_append_vector_op(
             // can rebind without consulting the catalog. See
             // `encode_vector_put_payload` for the compatibility slot.
             let entry = encode_vector_put_payload(
-                collection,
+                collection.as_str(),
                 vector,
                 *dim,
                 field_name,
@@ -114,14 +114,14 @@ pub(crate) fn wal_append_vector_op(
             dim,
             surrogates: _,
         } => {
-            let entry = encode_vector_batch_put_payload(collection, vectors, *dim)?;
+            let entry = encode_vector_batch_put_payload(collection.as_str(), vectors, *dim)?;
             Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::Delete {
             collection,
             vector_id,
         } => {
-            let entry = encode_vector_delete_payload(collection, *vector_id)?;
+            let entry = encode_vector_delete_payload(collection.as_str(), *vector_id)?;
             Some(wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::DeleteBySurrogate {
@@ -135,7 +135,7 @@ pub(crate) fn wal_append_vector_op(
             // logging it here too keeps every path that reaches this function
             // durable without double-logging (the sync path bypasses it).
             let entry = encode_vector_delete_by_surrogate_payload(
-                collection,
+                collection.as_str(),
                 *surrogate,
                 field_name,
                 provenance.as_ref(),
@@ -182,7 +182,7 @@ pub(crate) fn wal_append_vector_op(
             // Durable, and required to be: the `VectorParams` record that
             // created this index is still in the log, so a replay that does
             // not see the drop rebuilds an index the user dropped.
-            let entry = encode_vector_index_drop_payload(collection, field_name)?;
+            let entry = encode_vector_index_drop_payload(collection.as_str(), field_name)?;
             Some(wal.append_vector_index_drop(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::DirectUpsert {
@@ -201,7 +201,7 @@ pub(crate) fn wal_append_vector_op(
             rls_filters: _,
         } => {
             let entry = encode_vector_direct_upsert_payload(VectorDirectUpsertPayload {
-                collection,
+                collection: collection.as_str(),
                 field,
                 surrogate: *surrogate,
                 vector,
@@ -218,7 +218,8 @@ pub(crate) fn wal_append_vector_op(
             doc_id,
             entries,
         } => {
-            let entry = encode_sparse_vector_put_payload(collection, field_name, doc_id, entries)?;
+            let entry =
+                encode_sparse_vector_put_payload(collection.as_str(), field_name, doc_id, entries)?;
             Some(wal.append_sparse_vector_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::SparseDelete {
@@ -226,7 +227,8 @@ pub(crate) fn wal_append_vector_op(
             field_name,
             doc_id,
         } => {
-            let entry = encode_sparse_vector_delete_payload(collection, field_name, doc_id)?;
+            let entry =
+                encode_sparse_vector_delete_payload(collection.as_str(), field_name, doc_id)?;
             Some(wal.append_sparse_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::MultiVectorInsert {
@@ -238,7 +240,7 @@ pub(crate) fn wal_append_vector_op(
             dim,
         } => {
             let entry = encode_multi_vector_put_payload(
-                collection,
+                collection.as_str(),
                 field_name,
                 *document_surrogate,
                 vectors,
@@ -252,8 +254,11 @@ pub(crate) fn wal_append_vector_op(
             field_name,
             document_surrogate,
         } => {
-            let entry =
-                encode_multi_vector_delete_payload(collection, field_name, *document_surrogate)?;
+            let entry = encode_multi_vector_delete_payload(
+                collection.as_str(),
+                field_name,
+                *document_surrogate,
+            )?;
             Some(wal.append_multi_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // Reads: no durable effect.

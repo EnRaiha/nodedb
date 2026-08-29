@@ -94,7 +94,7 @@ mod tests {
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
     use nodedb_physical::physical_plan::KvOp;
-    use nodedb_types::{RlsWriteCheck, Surrogate};
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
     use super::CoreLoop;
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn kv_field_set_merges_onto_existing_document_and_survives_replay() {
         let put_p1 = PhysicalPlan::Kv(KvOp::Put {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p1".to_vec(),
             value: nodedb_types::json_to_msgpack(&serde_json::json!({ "hp": 10 }))
                 .expect("encode seed doc"),
@@ -182,7 +182,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p1".to_vec(),
             updates: vec![("mana".to_string(), json_field_bytes(serde_json::json!(5)))],
             surrogate: Surrogate::new(1),
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn kv_field_set_onto_absent_key_creates_from_empty_object() {
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"fresh".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(100)))],
             surrogate: Surrogate::new(3),
@@ -247,7 +247,7 @@ mod tests {
         // treats this as an empty object rather than erroring, and replay
         // must pin that exact behavior, not "improve" on it.
         let put_scalar = PhysicalPlan::Kv(KvOp::Put {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p2".to_vec(),
             value: json_field_bytes(serde_json::json!(42)),
             ttl_ms: 0,
@@ -256,7 +256,7 @@ mod tests {
             rls_filters: Vec::new(),
         });
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p2".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(1)))],
             surrogate: Surrogate::new(2),
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn kv_field_set_surrogate_survives_replay() {
         let field_set = PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "players".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
             key: b"p3".to_vec(),
             updates: vec![("hp".to_string(), json_field_bytes(serde_json::json!(7)))],
             surrogate: Surrogate::new(99),

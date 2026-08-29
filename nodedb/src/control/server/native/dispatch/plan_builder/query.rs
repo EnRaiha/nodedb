@@ -2,12 +2,15 @@
 
 //! Query engine plan builders (recursive CTE).
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::QueryOp;
 
 pub(crate) fn build_recursive_scan(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -15,7 +18,7 @@ pub(crate) fn build_recursive_scan(
     let limit = fields.limit.unwrap_or(10_000) as usize;
 
     Ok(PhysicalPlan::Query(QueryOp::RecursiveScan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         base_filters,
         recursive_filters: Vec::new(),
         join_link: None,

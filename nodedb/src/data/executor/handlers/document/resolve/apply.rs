@@ -53,7 +53,7 @@ impl CoreLoop {
                     document_id,
                     None,
                     tid,
-                    collection,
+                    collection.as_str(),
                 )
             {
                 return self.response_error(task, e);
@@ -75,7 +75,7 @@ impl CoreLoop {
                     task,
                     ApplyResolvedPut {
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         surrogate: *surrogate,
                         value,
                         precondition: precondition.as_deref(),
@@ -93,7 +93,7 @@ impl CoreLoop {
                     task,
                     ApplyResolvedDelete {
                         tid,
-                        collection,
+                        collection: collection.as_str(),
                         document_id,
                         surrogate: *surrogate,
                         resolved_sum_targets,
@@ -123,8 +123,12 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         for mutation in mutations {
             let row_key = surrogate_to_doc_id(mutation.surrogate());
-            let current =
-                self.doc_current_bytes(database_id, tid, mutation.collection(), row_key.as_str())?;
+            let current = self.doc_current_bytes(
+                database_id,
+                tid,
+                mutation.collection().as_str(),
+                row_key.as_str(),
+            )?;
             if current.as_deref() != mutation.precondition() {
                 return Err(ErrorCode::OllpRetryRequired);
             }

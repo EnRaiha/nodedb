@@ -186,7 +186,7 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         let vshard_id = VShardId::new(record.header.vshard_id);
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection,
+            collection: nodedb_types::QualifiedCollection::from_stored(collection),
             payload,
             format: "ilp".to_string(),
             wal_lsn: Some(record.header.lsn),

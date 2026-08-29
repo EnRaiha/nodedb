@@ -299,7 +299,10 @@ fn build_ilp_calvin_tasks(
                 database_id,
                 vshard_id: VShardId::from_collection_in_database(database_id, &group.measurement),
                 plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: group.measurement.clone(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        database_id,
+                        &group.measurement,
+                    ),
                     payload,
                     format: "ilp-msgpack".into(),
                     wal_lsn: None,
@@ -431,7 +434,9 @@ mod tests {
             .rls
             .create_policy(RlsPolicy {
                 name: "cpu_owner".into(),
-                collection: "cpu".into(),
+                // Seeded straight into the store, so it must carry the key the
+                // DDL would have written: qualified for a non-default database.
+                collection: nodedb_types::QualifiedCollection::new(database_id, "cpu").to_string(),
                 display_collection: "cpu".into(),
                 tenant_id: 9,
                 policy_type: PolicyType::Write,
@@ -615,7 +620,7 @@ mod tests {
         else {
             panic!("timeseries task")
         };
-        assert_eq!(collection, "cpu");
+        assert_eq!(collection.as_str(), "7/cpu");
         assert_eq!(format, "ilp-msgpack");
         assert_eq!(*wal_lsn, None);
         assert!(

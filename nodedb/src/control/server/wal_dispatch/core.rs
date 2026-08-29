@@ -187,6 +187,7 @@ pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> 
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{SpatialOp, TextOp};
+    use nodedb_types::QualifiedCollection;
     use nodedb_types::Surrogate;
     use nodedb_types::geometry::Geometry;
 
@@ -214,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             surrogate: Surrogate::new(7),
             text: "hello world".to_string(),
             provenance: None,
@@ -249,7 +250,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             surrogate: Surrogate::new(7),
             provenance: None,
         });
@@ -282,7 +283,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(9),
             geometry: Geometry::point(10.0, 20.0),
@@ -317,7 +318,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
-            collection: "places".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(9),
             provenance: None,
@@ -364,7 +365,7 @@ mod tests {
         // Stand in for the writes the drop cancels: appended, then fsynced by
         // their own acknowledgement, so the segment already holds records.
         let created = PhysicalPlan::Spatial(SpatialOp::Insert {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(1),
             geometry: Geometry::point(1.0, 2.0),
@@ -381,7 +382,7 @@ mod tests {
         wal.sync().expect("sync wal");
 
         let plan = PhysicalPlan::Vector(nodedb_physical::physical_plan::VectorOp::DropIndex {
-            collection: "docs".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             field_name: "emb".to_string(),
         });
 

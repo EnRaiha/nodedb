@@ -154,6 +154,7 @@ impl<'a> CollectionReadGate<'a> {
     pub fn inject_rls(&self, plan: &mut PhysicalPlan) -> Result<(), DdlError> {
         inject_rls_for_single_plan(
             self.tenant_id().as_u64(),
+            self.scope.database_id(),
             plan,
             &self.state.rls,
             self.scope.auth(),

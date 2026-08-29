@@ -471,7 +471,7 @@ mod tests {
 
     fn kv_get(col: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Get {
-            collection: col.into(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, col),
             key: b"k".to_vec(),
             rls_filters: vec![],
             surrogate_ceiling: None,

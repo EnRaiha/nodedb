@@ -346,8 +346,9 @@ mod tests {
 
     use crate::bridge::envelope::{PhysicalPlan, Status};
     use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
-    use crate::types::TenantId;
+    use crate::types::{DatabaseId, TenantId};
     use nodedb_physical::physical_plan::{CrdtOp, TimeseriesOp};
+    use nodedb_types::QualifiedCollection;
 
     fn row_delta(peer: u64, row_id: &str) -> Vec<u8> {
         let state = CrdtState::new(peer).expect("CRDT state");
@@ -369,7 +370,7 @@ mod tests {
         let task = make_default_task();
         let plans = [
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "metrics".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
                 payload: b"metrics value=1i 1000000000\n".to_vec(),
                 format: "ilp".into(),
                 wal_lsn: None,
@@ -380,7 +381,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "row".into(),
                 delta: Vec::new(),
                 peer_id: 1,
@@ -419,7 +420,7 @@ mod tests {
         let key = (task.request.database_id, tenant_id, "metrics".to_string());
         let plans = [
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "metrics".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
                 payload: b"metrics value=1i 1000000000\\n".to_vec(),
                 format: "ilp".into(),
                 wal_lsn: None,
@@ -430,7 +431,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "after-timeseries".into(),
                 delta: Vec::new(),
                 peer_id: 1,
@@ -497,7 +498,7 @@ mod tests {
         let task = make_default_task();
         let plans = [
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "during".into(),
                 delta: row_delta(2, "during"),
                 peer_id: 2,
@@ -508,7 +509,7 @@ mod tests {
                 expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "bad".into(),
                 delta: b"not a valid Loro delta".to_vec(),
                 peer_id: 3,
@@ -544,7 +545,7 @@ mod tests {
             .expect("seed CRDT state");
         let plans = [
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "metrics".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
                 payload: b"metrics value=1i 1000000000\n".to_vec(),
                 format: "ilp".into(),
                 wal_lsn: None,
@@ -555,7 +556,7 @@ mod tests {
                 rls_filters: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "during".into(),
                 delta: row_delta(2, "during"),
                 peer_id: 2,
@@ -566,7 +567,7 @@ mod tests {
                 expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "crdt"),
                 document_id: "bad".into(),
                 delta: b"not a valid Loro delta".to_vec(),
                 peer_id: 3,

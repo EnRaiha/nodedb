@@ -45,7 +45,10 @@ fn ingest_ilp(
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             payload: payload.as_bytes().to_vec(),
             format: "ilp".to_string(),
             wal_lsn: None,
@@ -72,7 +75,10 @@ fn ts_scan(
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             time_range: (0, i64::MAX),
             projection: Vec::new(),
             limit: usize::MAX,
@@ -111,7 +117,10 @@ fn ts_scan_filtered(
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             time_range: (0, i64::MAX),
             projection: Vec::new(),
             limit: usize::MAX,
@@ -414,7 +423,10 @@ fn dedup_only_skips_flushed_partitions() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "dns_dedup".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "dns_dedup",
+            ),
             payload: payload.to_vec(),
             format: "ilp".to_string(),
             wal_lsn: Some(100),
@@ -439,7 +451,10 @@ fn dedup_only_skips_flushed_partitions() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "dns_dedup".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "dns_dedup",
+            ),
             payload: payload.to_vec(),
             format: "ilp".to_string(),
             wal_lsn: Some(100),
@@ -465,7 +480,10 @@ fn dedup_only_skips_flushed_partitions() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: "dns_dedup".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "dns_dedup",
+            ),
             payload: payload.to_vec(),
             format: "ilp".to_string(),
             wal_lsn: None,
@@ -511,7 +529,10 @@ fn catchup_replays_gaps_in_lsn_coverage() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "dns_gap".to_string(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "dns_gap",
+                ),
                 payload: mk_payload(lsn),
                 format: "ilp".to_string(),
                 wal_lsn: Some(lsn as u64),
@@ -545,7 +566,10 @@ fn catchup_replays_gaps_in_lsn_coverage() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "dns_gap".to_string(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "dns_gap",
+                ),
                 payload: mk_payload(lsn),
                 format: "ilp".to_string(),
                 wal_lsn: Some(lsn as u64),
@@ -721,7 +745,10 @@ fn large_group_by_returns_single_valid_json() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: "dns_large".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "dns_large",
+            ),
             time_range: (0, i64::MAX),
             projection: Vec::new(),
             limit: usize::MAX,

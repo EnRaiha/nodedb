@@ -149,7 +149,7 @@ async fn persist_restore_delta(
         delta,
     } = params;
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         document_id: document_id.to_string(),
         delta,
         peer_id,

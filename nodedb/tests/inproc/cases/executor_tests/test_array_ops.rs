@@ -30,7 +30,10 @@ fn insert_product(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             document_id: id.into(),
             value: serde_json::to_vec(&doc).unwrap(),
             surrogate: surrogate_for(id),
@@ -113,7 +116,10 @@ fn array_contains_filter() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates: vec![],
             returning: None,
@@ -151,7 +157,10 @@ fn array_contains_all_filter() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates: vec![],
             returning: None,
@@ -189,7 +198,10 @@ fn array_overlap_filter() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates: vec![],
             returning: None,
@@ -217,7 +229,10 @@ fn array_agg_aggregate() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             input: None,
             group_by: vec![GroupKeySpec::column("brand")],
             aggregates: vec![AggregateSpec {
@@ -314,7 +329,10 @@ fn no_match_returns_zero() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: "products".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "products",
+            ),
             filters: filter_bytes,
             updates: vec![],
             returning: None,

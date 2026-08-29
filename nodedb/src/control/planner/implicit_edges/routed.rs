@@ -80,7 +80,7 @@ pub(super) async fn push_edge_delete(
         vshard_id: vsrc,
         database_id,
         plan: PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
             src_id: src.to_string(),
             label,
             dst_id: dst.to_string(),
@@ -157,7 +157,7 @@ pub(super) async fn push_edge_put(
         vshard_id: vsrc,
         database_id,
         plan: PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: collection.to_string(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
             src_id: src.to_string(),
             label,
             dst_id: dst.to_string(),

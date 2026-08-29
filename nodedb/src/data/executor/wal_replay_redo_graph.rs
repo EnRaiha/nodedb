@@ -106,7 +106,9 @@ impl CoreLoop {
                     crate::types::VShardId::new(record.header.vshard_id),
                     record_lsn,
                     PhysicalPlan::Graph(GraphOp::EdgePut {
-                        collection: collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.clone(),
+                        ),
                         src_id: src_id.clone(),
                         label: label.clone(),
                         dst_id: dst_id.clone(),
@@ -168,7 +170,9 @@ impl CoreLoop {
                     crate::types::VShardId::new(record.header.vshard_id),
                     record_lsn,
                     PhysicalPlan::Graph(GraphOp::EdgeDelete {
-                        collection: collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.clone(),
+                        ),
                         src_id: src_id.clone(),
                         label: label.clone(),
                         dst_id: dst_id.clone(),

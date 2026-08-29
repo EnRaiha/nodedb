@@ -5,6 +5,7 @@
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::super::codec::RespValue;
 use super::super::command::RespCommand;
@@ -97,7 +98,7 @@ async fn dispatch_incr(
         Err(e) => return e,
     };
     let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key,
         delta,
         ttl_ms: 0,
@@ -147,7 +148,7 @@ pub(in crate::control::server::resp) async fn handle_incrbyfloat(
         Err(e) => return e,
     };
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: session.collection.clone(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         key,
         delta,
         surrogate,

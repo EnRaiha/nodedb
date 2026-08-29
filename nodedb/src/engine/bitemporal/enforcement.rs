@@ -99,24 +99,36 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
     let plan = match entry.engine {
         BitemporalEngineKind::EdgeStore => PhysicalPlan::Meta(MetaOp::TemporalPurgeEdgeStore {
             tenant_id: tenant_id.as_u64(),
-            collection: entry.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                entry.database_id,
+                &entry.collection,
+            ),
             cutoff_system_ms,
         }),
         BitemporalEngineKind::DocumentStrict => {
             PhysicalPlan::Meta(MetaOp::TemporalPurgeDocumentStrict {
                 tenant_id: tenant_id.as_u64(),
-                collection: entry.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    entry.database_id,
+                    &entry.collection,
+                ),
                 cutoff_system_ms,
             })
         }
         BitemporalEngineKind::Columnar => PhysicalPlan::Meta(MetaOp::TemporalPurgeColumnar {
             tenant_id: tenant_id.as_u64(),
-            collection: entry.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                entry.database_id,
+                &entry.collection,
+            ),
             cutoff_system_ms,
         }),
         BitemporalEngineKind::Crdt => PhysicalPlan::Meta(MetaOp::TemporalPurgeCrdt {
             tenant_id: tenant_id.as_u64(),
-            collection: entry.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(
+                entry.database_id,
+                &entry.collection,
+            ),
             cutoff_system_ms,
         }),
         // For Array entries `entry.collection` carries the array_id (see

@@ -35,7 +35,7 @@ use nodedb_cluster::rpc_codec::{RaftRpc, ShuffleAggregateConsumeResponse, Shuffl
 use nodedb_cluster::{PartNodeEntry, ShuffleAggregateConsumeRequest, ShuffleProduceRequest};
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec, PhysicalPlan, QueryOp};
-use nodedb_types::Value;
+use nodedb_types::{QualifiedCollection, Value};
 
 const NUM_PARTS: u32 = 2;
 const SIDE_PRODUCER: u8 = 0;
@@ -113,7 +113,7 @@ fn producer_plan(rows: &[&Row]) -> Vec<u8> {
         distinct: false,
     });
     let plan = PhysicalPlan::Query(QueryOp::PartialAggregateState {
-        collection: String::new(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, ""),
         input: Some(Box::new(scan)),
         group_by: vec![GroupKeySpec::column("k")],
         aggregates: agg_specs(),

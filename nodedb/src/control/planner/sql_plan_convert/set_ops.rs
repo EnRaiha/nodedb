@@ -58,6 +58,7 @@ pub(super) fn convert_truncate(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let coll_qualified = super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     Ok(vec![PhysicalTask {
@@ -65,7 +66,7 @@ pub(super) fn convert_truncate(
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: collection.into(),
+            collection: qualified_collection,
             restart_identity,
             // Filled in by the materialized-sum resolution pass, which recon-
             // scans the rows this TRUNCATE will remove.
@@ -149,6 +150,7 @@ pub(super) fn convert_insert_select(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let target_qualified = super::convert::db_qualified(ctx.database_id, target);
+    let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
     let target = target_qualified.as_str();
     let SqlPlan::Scan {
         collection,
@@ -187,15 +189,15 @@ pub(super) fn convert_insert_select(
 
     let filter_bytes = super::filter::serialize_filters(filters)?;
     let vshard = VShardId::from_collection_in_database(ctx.database_id, target);
-    let source_coll_qualified = super::convert::db_qualified(ctx.database_id, collection);
+    let qualified_source = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
 
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Document(DocumentOp::InsertSelect {
-            target_collection: target.into(),
-            source_collection: source_coll_qualified,
+            target_collection: qualified_target,
+            source_collection: qualified_source,
             source_filters: filter_bytes,
             source_limit: limit.unwrap_or(10_000),
         }),
@@ -413,8 +415,8 @@ mod tests {
                 source_limit,
                 ..
             }) => {
-                assert_eq!(target_collection, "batch_copy");
-                assert_eq!(source_collection, "batch_test");
+                assert_eq!(target_collection.as_str(), "batch_copy");
+                assert_eq!(source_collection.as_str(), "batch_test");
                 assert_eq!(*source_limit, 50);
             }
             other => panic!("expected DocumentOp::InsertSelect, got {other:?}"),

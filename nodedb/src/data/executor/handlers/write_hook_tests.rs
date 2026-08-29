@@ -405,7 +405,7 @@ fn a_transactional_delete_takes_the_row_back_off_the_total() {
     assert_eq!(balance(&core, T1), "90");
 
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: SOURCE.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, SOURCE),
         document_id: "e81".to_string(),
         surrogate: Surrogate(81),
         pk_bytes: b"e81".to_vec(),

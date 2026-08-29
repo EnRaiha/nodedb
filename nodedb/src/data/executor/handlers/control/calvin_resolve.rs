@@ -90,6 +90,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan, UpdateValue};
+    use nodedb_types::QualifiedCollection;
     use nodedb_types::Surrogate;
     use nodedb_types::Value;
 
@@ -107,7 +108,7 @@ mod tests {
     /// `CalvinFlush` / `CalvinDrop`; `CalvinResolve` must match).
     fn make_task() -> ExecutionTask {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "x".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -146,7 +147,7 @@ mod tests {
 
     fn point_insert_plan(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::PointInsert {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: document_id.to_string(),
             value: doc_value("a", "1"),
             if_absent: false,
@@ -163,7 +164,7 @@ mod tests {
         ollp_predicted_surrogates: Option<Vec<u32>>,
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             filters: Vec::new(),
             returning: None,
             ollp_predicted_surrogates,
@@ -180,7 +181,7 @@ mod tests {
         ollp_predicted_surrogates: Option<Vec<u32>>,
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             filters: Vec::new(),
             updates,
             returning: None,

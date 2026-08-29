@@ -23,6 +23,7 @@ use nodedb::control::gateway::version_set::GatewayVersionSet;
 use nodedb::control::gateway::{Gateway, PlanCache};
 use nodedb::types::TenantId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::TestClusterNode;
 
@@ -68,7 +69,7 @@ async fn gateway_execute_kv_put_get_single_node() {
 
     // Put.
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
-        collection: "gw_kv_smoke".into(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, "gw_kv_smoke"),
         key: b"smoke-key".to_vec(),
         value: mp_string("smoke-value"),
         ttl_ms: 0,
@@ -86,7 +87,7 @@ async fn gateway_execute_kv_put_get_single_node() {
 
     // Get.
     let get_plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_kv_smoke".into(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, "gw_kv_smoke"),
         key: b"smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,
@@ -135,7 +136,10 @@ async fn gateway_execute_sql_plan_cache_populated() {
     let sql = "GET gw_cache_smoke smoke-key";
     let make_plan = || {
         Ok(PhysicalPlan::Kv(KvOp::Get {
-            collection: "gw_cache_smoke".into(),
+            collection: QualifiedCollection::new(
+                nodedb_types::id::DatabaseId::DEFAULT,
+                "gw_cache_smoke",
+            ),
             key: b"smoke-key".to_vec(),
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -198,7 +202,7 @@ fn plan_cache_key_construction_and_lookup() {
     );
 
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: "gw_kv_smoke".into(),
+        collection: QualifiedCollection::new(nodedb_types::id::DatabaseId::DEFAULT, "gw_kv_smoke"),
         key: b"smoke-key".to_vec(),
         rls_filters: vec![],
         surrogate_ceiling: None,

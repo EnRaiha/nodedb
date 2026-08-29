@@ -32,7 +32,7 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
         | GraphOp::Neighbors { collection, .. }
         | GraphOp::NeighborsMulti { collection, .. }
         | GraphOp::Path { collection, .. }
-        | GraphOp::Subgraph { collection, .. } => match collection.as_deref() {
+        | GraphOp::Subgraph { collection, .. } => match collection.as_ref() {
             Some(collection) => ctx.refuse_if_policy(collection, TRAVERSAL_REASON),
             None => Ok(()),
         },
@@ -49,18 +49,23 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
 
         // Refuse: runs over the whole CSR, returns scalars derived from
-        // every row (including hidden ones), no row to filter.
-        GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => {
-            ctx.refuse_if_policy(&params.collection, ALGORITHM_REASON)
-        }
+        // every row (including hidden ones), no row to filter. `params.collection`
+        // is bare (from `nodedb-graph`) — qualify before the lookup.
+        GraphOp::Algo { params, .. } | GraphOp::TemporalAlgorithm { params, .. } => ctx
+            .refuse_if_policy(
+                &nodedb_types::QualifiedCollection::new(ctx.database_id, &params.collection),
+                ALGORITHM_REASON,
+            ),
 
         // Refuse: same algorithm, one round at a time.
-        GraphOp::BspSuperstep(plan) => {
-            ctx.refuse_if_policy(&plan.params.collection, ALGORITHM_REASON)
-        }
-        GraphOp::WccSuperstep(plan) => {
-            ctx.refuse_if_policy(&plan.params.collection, ALGORITHM_REASON)
-        }
+        GraphOp::BspSuperstep(plan) => ctx.refuse_if_policy(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &plan.params.collection),
+            ALGORITHM_REASON,
+        ),
+        GraphOp::WccSuperstep(plan) => ctx.refuse_if_policy(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &plan.params.collection),
+            ALGORITHM_REASON,
+        ),
 
         // Refuse: the fusion envelope has no filter slot and no sub-plan
         // to recurse into — hidden rows would be ranked and returned.
@@ -72,7 +77,7 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
 
         // Refuse: counters over the collection's edges, no row to filter.
         // `None` spans every collection, so no narrow question can be asked.
-        GraphOp::Stats { collection, .. } => match collection.as_deref() {
+        GraphOp::Stats { collection, .. } => match collection.as_ref() {
             Some(collection) => ctx.refuse_if_policy(
                 collection,
                 "graph statistics are counters over the collection's edges, which the row filter \
@@ -127,7 +132,7 @@ fn refuse_match(ctx: &RlsCtx<'_>, query: &[u8]) -> crate::Result<()> {
         zerompk::from_msgpack(query);
     match decoded.ok().and_then(|query| query.collection) {
         Some(collection) => ctx.refuse_if_policy(
-            &collection,
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, &collection),
             "a pattern match returns bindings over graph topology, which the row filter cannot be \
              evaluated against",
         ),
@@ -228,7 +233,10 @@ mod tests {
 
     fn edge_put(collection: &str, properties: &str) -> PhysicalPlan {
         PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             src_id: "a".into(),
             label: "knows".into(),
             dst_id: "b".into(),
@@ -240,7 +248,10 @@ mod tests {
 
     fn edge_delete(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             src_id: "a".into(),
             label: "knows".into(),
             dst_id: "b".into(),
@@ -352,7 +363,10 @@ mod tests {
     fn scoped_stats_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("users");
         let mut plan = PhysicalPlan::Graph(GraphOp::Stats {
-            collection: Some("users".into()),
+            collection: Some(nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            )),
             as_of: None,
         });
         assert_refused(inject(&mut plan, &store), "users");

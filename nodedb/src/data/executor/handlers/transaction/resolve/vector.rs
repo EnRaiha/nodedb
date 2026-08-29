@@ -89,7 +89,7 @@ pub(super) fn serialize_vector_op(
             provenance,
         } => {
             let payload = encode_vector_put_payload(
-                collection,
+                collection.as_str(),
                 vector,
                 *dim,
                 field_name,
@@ -108,7 +108,7 @@ pub(super) fn serialize_vector_op(
             dim,
             surrogates: _,
         } => {
-            let payload = encode_vector_batch_put_payload(collection, vectors, *dim)?;
+            let payload = encode_vector_batch_put_payload(collection.as_str(), vectors, *dim)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::VectorPut as u32,
                 payload,
@@ -119,7 +119,7 @@ pub(super) fn serialize_vector_op(
             collection,
             vector_id,
         } => {
-            let payload = encode_vector_delete_payload(collection, *vector_id)?;
+            let payload = encode_vector_delete_payload(collection.as_str(), *vector_id)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::VectorDelete as u32,
                 payload,
@@ -133,7 +133,7 @@ pub(super) fn serialize_vector_op(
             provenance,
         } => {
             let payload = encode_vector_delete_by_surrogate_payload(
-                collection,
+                collection.as_str(),
                 *surrogate,
                 field_name,
                 provenance.as_ref(),
@@ -190,7 +190,7 @@ pub(super) fn serialize_vector_op(
             rls_filters: _,
         } => {
             let payload = encode_vector_direct_upsert_payload(VectorDirectUpsertPayload {
-                collection,
+                collection: collection.as_str(),
                 field,
                 surrogate: *surrogate,
                 vector,
@@ -216,7 +216,7 @@ pub(super) fn serialize_vector_op(
             dim,
         } => {
             let payload = encode_multi_vector_put_payload(
-                collection,
+                collection.as_str(),
                 field_name,
                 *document_surrogate,
                 vectors,
@@ -235,8 +235,11 @@ pub(super) fn serialize_vector_op(
             field_name,
             document_surrogate,
         } => {
-            let payload =
-                encode_multi_vector_delete_payload(collection, field_name, *document_surrogate)?;
+            let payload = encode_multi_vector_delete_payload(
+                collection.as_str(),
+                field_name,
+                *document_surrogate,
+            )?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::MultiVectorDelete as u32,
                 payload,
@@ -251,7 +254,7 @@ pub(super) fn serialize_vector_op(
             entries,
         } => {
             let payload =
-                encode_sparse_vector_put_payload(collection, field_name, doc_id, entries)?;
+                encode_sparse_vector_put_payload(collection.as_str(), field_name, doc_id, entries)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::SparseVectorPut as u32,
                 payload,
@@ -264,7 +267,8 @@ pub(super) fn serialize_vector_op(
             field_name,
             doc_id,
         } => {
-            let payload = encode_sparse_vector_delete_payload(collection, field_name, doc_id)?;
+            let payload =
+                encode_sparse_vector_delete_payload(collection.as_str(), field_name, doc_id)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::SparseVectorDelete as u32,
                 payload,

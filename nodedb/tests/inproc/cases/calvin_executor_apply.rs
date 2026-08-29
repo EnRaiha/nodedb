@@ -15,7 +15,7 @@ use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::*;
 use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
 use nodedb_physical::physical_plan::{KvOp, MetaOp, PhysicalPlan, VectorOp};
-use nodedb_types::OrdinalClock;
+use nodedb_types::{OrdinalClock, QualifiedCollection};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ fn send_ok(
 
 fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
@@ -106,7 +106,7 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
 
 fn kv_get(coll: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Get {
-        collection: coll.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, coll),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -159,7 +159,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::SetParams {
-            collection: "vec_coll".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vec_coll"),
             field_name: String::new(),
             dim: 3,
             m: 16,
@@ -177,7 +177,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "vec_coll".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vec_coll"),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: String::new(),
@@ -192,7 +192,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
         kv_put("rollback_coll", b"should_be_gone", b"present"),
         // Second sub-plan fails: dim mismatch (index expects 3, we provide 2).
         PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "vec_coll".to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vec_coll"),
             vector: vec![1.0, 2.0],
             dim: 3,
             field_name: String::new(),

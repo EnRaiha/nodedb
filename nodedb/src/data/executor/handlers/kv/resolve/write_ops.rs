@@ -142,7 +142,9 @@ impl CoreLoop {
         let precondition = self.resolve_kv_ttl_precondition(&target, now_ms)?;
         Ok(one(
             KvResolvedMutation::Expire {
-                collection: target.collection.to_owned(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target.collection.to_owned(),
+                ),
                 key: target.key.to_vec(),
                 ttl_ms,
                 resolved_now_ms: now_ms,
@@ -158,7 +160,9 @@ impl CoreLoop {
         let precondition = self.resolve_kv_ttl_precondition(&target, current_ms())?;
         Ok(one(
             KvResolvedMutation::Persist {
-                collection: target.collection.to_owned(),
+                collection: nodedb_types::QualifiedCollection::from_stored(
+                    target.collection.to_owned(),
+                ),
                 key: target.key.to_vec(),
                 precondition,
             },

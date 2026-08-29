@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -85,7 +86,7 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) -> serde_json:
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             payload: payload.as_bytes().to_vec(),
             format: "ilp".to_string(),
             wal_lsn: None,

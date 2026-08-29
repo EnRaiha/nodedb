@@ -3,7 +3,9 @@
 //! `GraphOp`: graph engine physical operations dispatched to the Data Plane.
 
 use nodedb_graph::{AlgoParams, Direction, GraphAlgorithm, GraphTraversalOptions};
-use nodedb_types::{RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{
+    QualifiedCollection, RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope,
+};
 
 use super::batch_edge::BatchEdge;
 use super::bsp::BspSuperstepPlan;
@@ -26,7 +28,7 @@ pub enum GraphOp {
     /// / `dst_id` stay user-visible (CSR label interning, edge-store keying).
     /// Surrogates are the cross-engine join currency.
     EdgePut {
-        collection: String,
+        collection: QualifiedCollection,
         src_id: String,
         label: String,
         dst_id: String,
@@ -47,7 +49,7 @@ pub enum GraphOp {
     /// class its participant shards and the lock identity that serializes
     /// against a concurrent `EdgePut` of the same edge.
     EdgeDelete {
-        collection: String,
+        collection: QualifiedCollection,
         src_id: String,
         label: String,
         dst_id: String,
@@ -76,7 +78,7 @@ pub enum GraphOp {
         /// `(database, tenant)`-keyed with per-edge collection ids). `None`
         /// scopes by edge label alone — a tree-index BFS with no catalog
         /// mapping back to a collection, authorized via the index DDL instead.
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
         direction: Direction,
@@ -92,7 +94,7 @@ pub enum GraphOp {
     /// Immediate 1-hop neighbors lookup.
     Neighbors {
         /// See `Hop::collection`.
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         node_id: String,
         edge_label: Option<String>,
         direction: Direction,
@@ -111,7 +113,7 @@ pub enum GraphOp {
     /// unbounded (use with care).
     NeighborsMulti {
         /// See `Hop::collection`.
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         node_ids: Vec<String>,
         edge_label: Option<String>,
         direction: Direction,
@@ -123,7 +125,7 @@ pub enum GraphOp {
     /// Shortest path between two nodes.
     Path {
         /// See `Hop::collection`.
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         src: String,
         dst: String,
         edge_label: Option<String>,
@@ -139,7 +141,7 @@ pub enum GraphOp {
     /// Materialize a subgraph as edge tuples.
     Subgraph {
         /// See `Hop::collection`.
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
         depth: usize,
@@ -153,7 +155,7 @@ pub enum GraphOp {
     /// Two-source form: vector + graph (backwards-compatible; `bm25_query` is `None`).
     /// Three-source form: vector + BM25 text + graph; activated when `bm25_query` is set.
     RagFusion {
-        collection: String,
+        collection: QualifiedCollection,
         query_vector: Vec<f32>,
         vector_top_k: usize,
         edge_label: Option<String>,
@@ -262,7 +264,7 @@ pub enum GraphOp {
         /// the tenant-wide CSR, but the versioned key layout is
         /// `{collection}\x00...`, so the bitemporal path must name the
         /// collection explicitly.
-        collection: String,
+        collection: QualifiedCollection,
         node_id: String,
         edge_label: Option<String>,
         direction: Direction,
@@ -298,7 +300,7 @@ pub enum GraphOp {
     /// `as_of = None` is the O(1) live-snapshot path (reads the cached
     /// summary row). `as_of = Some(ms)` falls back to a historical scan.
     Stats {
-        collection: Option<String>,
+        collection: Option<QualifiedCollection>,
         as_of: Option<i64>,
     },
 }

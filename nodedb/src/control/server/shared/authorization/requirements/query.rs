@@ -20,8 +20,8 @@ pub(super) fn collect_query_requirements<'a>(
             right_bitmap,
             ..
         }) => {
-            add_read(left_collection, out);
-            add_read(right_collection, out);
+            add_read(left_collection.as_str(), out);
+            add_read(right_collection.as_str(), out);
             for nested in [left_input, right_input, left_bitmap, right_bitmap]
                 .into_iter()
                 .flatten()
@@ -40,8 +40,8 @@ pub(super) fn collect_query_requirements<'a>(
             right_collection,
             ..
         }) => {
-            add_read(left_collection, out);
-            add_read(right_collection, out);
+            add_read(left_collection.as_str(), out);
+            add_read(right_collection.as_str(), out);
             true
         }
         PhysicalPlan::Query(QueryOp::Aggregate { input, .. })
@@ -62,7 +62,7 @@ pub(super) fn collect_query_requirements<'a>(
             inner_collection,
             ..
         }) => {
-            add_read(inner_collection, out);
+            add_read(inner_collection.as_str(), out);
             pending.push(outer_plan);
             true
         }

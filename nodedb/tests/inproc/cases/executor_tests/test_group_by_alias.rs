@@ -9,6 +9,7 @@
 use nodedb::control::planner::sql_plan_convert::{ConvertContext, convert};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_sql::types::{CollectionInfo, EngineType, SqlCatalog, SqlPlan};
+use nodedb_types::QualifiedCollection;
 
 use super::helpers::*;
 
@@ -99,7 +100,7 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, collection),
             payload: payload.as_bytes().to_vec(),
             format: "ilp".to_string(),
             wal_lsn: None,

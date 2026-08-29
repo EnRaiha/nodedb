@@ -103,9 +103,15 @@ pub fn payload_json(payload: &[u8]) -> String {
 
 // ── Plan builders ────────────────────────────────────────────────────────────
 
+/// Qualify a plain collection name for the default database, matching the
+/// helpers below: every caller here operates on the default database.
+fn qualify(collection: &str) -> nodedb_types::QualifiedCollection {
+    nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, collection)
+}
+
 pub fn vector_set_params(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: collection.into(),
+        collection: qualify(collection),
         field_name: String::new(),
         dim: 0,
         m: 16,
@@ -120,7 +126,7 @@ pub fn vector_set_params(collection: &str) -> PhysicalPlan {
 
 pub fn vector_seed(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.into(),
+        collection: qualify(collection),
         vector: vec![1.0, 2.0, 3.0],
         dim: 3,
         field_name: String::new(),
@@ -132,7 +138,7 @@ pub fn vector_seed(collection: &str) -> PhysicalPlan {
 
 pub fn vector_insert_ok(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.into(),
+        collection: qualify(collection),
         vector: vec![0.5, 0.5, 0.5],
         dim: 3,
         field_name: String::new(),
@@ -145,7 +151,7 @@ pub fn vector_insert_ok(collection: &str) -> PhysicalPlan {
 /// Always fails: dim mismatch (index expects dim=3).
 pub fn vector_fail(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::Insert {
-        collection: collection.into(),
+        collection: qualify(collection),
         vector: vec![1.0, 2.0],
         dim: 3,
         field_name: String::new(),
@@ -157,7 +163,7 @@ pub fn vector_fail(collection: &str) -> PhysicalPlan {
 
 pub fn doc_put(collection: &str, doc_id: &str, val: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: collection.into(),
+        collection: qualify(collection),
         document_id: doc_id.into(),
         value: val.to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -170,7 +176,7 @@ pub fn doc_put(collection: &str, doc_id: &str, val: &[u8]) -> PhysicalPlan {
 
 pub fn doc_get(collection: &str, doc_id: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: collection.into(),
+        collection: qualify(collection),
         document_id: doc_id.into(),
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -183,7 +189,7 @@ pub fn doc_get(collection: &str, doc_id: &str) -> PhysicalPlan {
 /// Fails if doc_id already exists (if_absent=false but key present causes conflict).
 pub fn doc_conflict(collection: &str, doc_id: &str) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: collection.into(),
+        collection: qualify(collection),
         document_id: doc_id.into(),
         value: b"conflict".to_vec(),
         surrogate: nodedb_types::Surrogate::ZERO,
@@ -197,7 +203,7 @@ pub fn doc_conflict(collection: &str, doc_id: &str) -> PhysicalPlan {
 
 pub fn edge_put(collection: &str, src: &str, dst: &str) -> PhysicalPlan {
     PhysicalPlan::Graph(GraphOp::EdgePut {
-        collection: collection.into(),
+        collection: qualify(collection),
         src_id: src.into(),
         label: "REL".into(),
         dst_id: dst.into(),
@@ -219,7 +225,7 @@ pub fn neighbors(_collection: &str, src: &str) -> PhysicalPlan {
 
 pub fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
-        collection: "kv_coll".into(),
+        collection: qualify("kv_coll"),
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
@@ -231,7 +237,7 @@ pub fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
 
 pub fn kv_get(key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Get {
-        collection: "kv_coll".into(),
+        collection: qualify("kv_coll"),
         key: key.to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -242,7 +248,7 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
     let rows = serde_json::json!([{"id": id, "val": val}]);
     let payload = nodedb_types::json_to_msgpack(&rows).unwrap();
     PhysicalPlan::Columnar(ColumnarOp::Insert {
-        collection: collection.into(),
+        collection: qualify(collection),
         payload,
         format: "msgpack".into(),
         intent: ColumnarInsertIntent::Insert,
@@ -261,7 +267,7 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
 
 pub fn columnar_count(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::Aggregate {
-        collection: collection.into(),
+        collection: qualify(collection),
         input: None,
         group_by: Vec::new(),
         aggregates: vec![AggregateSpec {
@@ -283,7 +289,7 @@ pub fn columnar_count(collection: &str) -> PhysicalPlan {
 
 pub fn timeseries_ingest(collection: &str, ilp: &str) -> PhysicalPlan {
     PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: collection.into(),
+        collection: qualify(collection),
         payload: ilp.as_bytes().to_vec(),
         format: "ilp".into(),
         wal_lsn: None,
@@ -298,7 +304,7 @@ pub fn timeseries_ingest(collection: &str, ilp: &str) -> PhysicalPlan {
 
 pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-        collection: collection.into(),
+        collection: qualify(collection),
         time_range: (0, i64::MAX),
         projection: Vec::new(),
         limit: 100,
@@ -317,7 +323,7 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
 
 pub fn crdt_apply(collection: &str, doc_id: &str) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.into(),
+        collection: qualify(collection),
         document_id: doc_id.into(),
         delta: vec![0u8; 8],
         peer_id: 1,

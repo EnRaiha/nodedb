@@ -31,7 +31,7 @@ pub(super) fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u
             collection,
             filters,
             ..
-        }) => (collection.clone(), filters.clone()),
+        }) => (collection.to_string(), filters.clone()),
         // Not a bulk predicate. The two bulk arms above take precedence; these
         // inner wildcards catch every other op (including non-bulk document
         // ops). Exhaustive so a new PhysicalPlan variant forces a decision.

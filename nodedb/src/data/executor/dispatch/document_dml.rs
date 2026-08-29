@@ -50,8 +50,8 @@ impl CoreLoop {
             task,
             tid,
             super::super::handlers::update_from_join::UpdateFromJoinParams {
-                target_collection,
-                source_collection,
+                target_collection: target_collection.as_str(),
+                source_collection: source_collection.as_str(),
                 source_alias,
                 target_join_col,
                 source_join_col,
@@ -101,8 +101,8 @@ impl CoreLoop {
             task,
             tid,
             super::super::handlers::merge::MergeParams {
-                target_collection,
-                source_collection,
+                target_collection: target_collection.as_str(),
+                source_collection: source_collection.as_str(),
                 source_alias,
                 target_join_col,
                 source_join_col,

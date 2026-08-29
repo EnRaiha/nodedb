@@ -36,9 +36,12 @@ impl CoreLoop {
                 tenant_id,
                 collection,
                 cutoff_system_ms,
-            } => {
-                self.meta_temporal_purge_edge_store(task, *tenant_id, collection, *cutoff_system_ms)
-            }
+            } => self.meta_temporal_purge_edge_store(
+                task,
+                *tenant_id,
+                collection.as_str(),
+                *cutoff_system_ms,
+            ),
             MetaOp::TemporalPurgeDocumentStrict {
                 tenant_id,
                 collection,
@@ -46,19 +49,29 @@ impl CoreLoop {
             } => self.meta_temporal_purge_document_strict(
                 task,
                 *tenant_id,
-                collection,
+                collection.as_str(),
                 *cutoff_system_ms,
             ),
             MetaOp::TemporalPurgeColumnar {
                 tenant_id,
                 collection,
                 cutoff_system_ms,
-            } => self.meta_temporal_purge_columnar(task, *tenant_id, collection, *cutoff_system_ms),
+            } => self.meta_temporal_purge_columnar(
+                task,
+                *tenant_id,
+                collection.as_str(),
+                *cutoff_system_ms,
+            ),
             MetaOp::TemporalPurgeCrdt {
                 tenant_id,
                 collection,
                 cutoff_system_ms,
-            } => self.meta_temporal_purge_crdt(task, *tenant_id, collection, *cutoff_system_ms),
+            } => self.meta_temporal_purge_crdt(
+                task,
+                *tenant_id,
+                collection.as_str(),
+                *cutoff_system_ms,
+            ),
             MetaOp::TemporalPurgeArray {
                 tenant_id,
                 array_id,

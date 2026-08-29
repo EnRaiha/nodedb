@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nodedb_types::{RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope};
+use nodedb_types::{
+    QualifiedCollection, RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope,
+};
 
 use super::merge_types::MergeClauseOp;
 use super::ollp_edge::OllpPredictedEdge;
@@ -21,7 +23,7 @@ use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMo
 pub enum DocumentOp {
     /// Point lookup by document ID.
     PointGet {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. Hex-encoded
         /// by the handler for the substrate row key — user-PK strings are
@@ -47,7 +49,7 @@ pub enum DocumentOp {
     /// [`DocumentOp::PointInsert`] for SQL `INSERT` where duplicate PKs must
     /// raise `unique_violation`.
     PointPut {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         value: Vec<u8>,
         /// Catalog-bound identity for `(collection, document_id)`.
@@ -79,7 +81,7 @@ pub enum DocumentOp {
     /// Separate from [`DocumentOp::PointPut`]: the insert must probe
     /// `document_id` existence inside the same write txn.
     PointInsert {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         value: Vec<u8>,
         if_absent: bool,
@@ -111,7 +113,7 @@ pub enum DocumentOp {
 
     /// Point delete: remove a document.
     PointDelete {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. The
         /// handler hex-encodes this for the substrate row key.
@@ -137,7 +139,7 @@ pub enum DocumentOp {
 
     /// Point update: read-modify-write with field-level changes.
     PointUpdate {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. The
         /// handler hex-encodes this for the substrate row key.
@@ -162,7 +164,7 @@ pub enum DocumentOp {
 
     /// Full collection scan with filtering, sorting, and pagination.
     Scan {
-        collection: String,
+        collection: QualifiedCollection,
         limit: usize,
         offset: usize,
         sort_keys: Vec<crate::physical_plan::SortKeySpec>,
@@ -189,7 +191,7 @@ pub enum DocumentOp {
 
     /// Batch insert documents in a single redb transaction.
     BatchInsert {
-        collection: String,
+        collection: QualifiedCollection,
         /// (document_id, value_bytes) pairs.
         documents: Vec<(String, Vec<u8>)>,
         /// Per-row surrogates (parallel to `documents`). When non-empty and
@@ -216,7 +218,7 @@ pub enum DocumentOp {
 
     /// Range scan on a sparse/metadata index.
     RangeScan {
-        collection: String,
+        collection: QualifiedCollection,
         field: String,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
@@ -229,7 +231,7 @@ pub enum DocumentOp {
 
     /// Register collection with secondary indexes and storage mode (DDL).
     Register {
-        collection: String,
+        collection: QualifiedCollection,
         /// Full secondary-index specs (name, path, unique, case_insensitive,
         /// state). Replaces the old `Vec<String>` path-only payload so the
         /// write handler can enforce UNIQUE and skip Building indexes.
@@ -260,7 +262,7 @@ pub enum DocumentOp {
 
     /// Lookup documents by secondary index value.
     IndexLookup {
-        collection: String,
+        collection: QualifiedCollection,
         path: String,
         value: String,
     },
@@ -272,7 +274,7 @@ pub enum DocumentOp {
     /// applied to every fetched body. Sort / distinct / window functions
     /// fall back to a full scan upstream — never reach this variant.
     IndexedFetch {
-        collection: String,
+        collection: QualifiedCollection,
         /// Indexed field path (e.g. `$.email`).
         path: String,
         /// Equality lookup value. COLLATE NOCASE rewrites normalize to
@@ -287,13 +289,16 @@ pub enum DocumentOp {
     },
 
     /// Drop all secondary index entries for a field.
-    DropIndex { collection: String, field: String },
+    DropIndex {
+        collection: QualifiedCollection,
+        field: String,
+    },
 
     /// Backfill a secondary index from existing rows (CREATE INDEX on a
     /// non-empty collection). Runs as one write transaction so the index is
     /// consistent when the Ready flip commits.
     BackfillIndex {
-        collection: String,
+        collection: QualifiedCollection,
         /// JSON-path-like field (e.g. `$.email`).
         path: String,
         is_array: bool,
@@ -310,7 +315,7 @@ pub enum DocumentOp {
     /// If `restart_identity` is true, sequences attached to this collection's
     /// fields are reset to their start value after truncation.
     Truncate {
-        collection: String,
+        collection: QualifiedCollection,
         restart_identity: bool,
         /// Sum-binding targets from a Control-Plane recon scan of the rows
         /// this statement removes. The Data-Plane leader re-derives the
@@ -321,12 +326,15 @@ pub enum DocumentOp {
     },
 
     /// Estimate count via HLL cardinality stats.
-    EstimateCount { collection: String, field: String },
+    EstimateCount {
+        collection: QualifiedCollection,
+        field: String,
+    },
 
     /// INSERT ... SELECT: copy documents from source to target.
     InsertSelect {
-        target_collection: String,
-        source_collection: String,
+        target_collection: QualifiedCollection,
+        source_collection: QualifiedCollection,
         source_filters: Vec<u8>,
         source_limit: usize,
     },
@@ -336,7 +344,7 @@ pub enum DocumentOp {
     /// *existing* document instead of merging the inserted value —
     /// the `INSERT ... ON CONFLICT DO UPDATE SET ...` path.
     Upsert {
-        collection: String,
+        collection: QualifiedCollection,
         document_id: String,
         value: Vec<u8>,
         on_conflict_updates: Vec<(String, UpdateValue)>,
@@ -363,8 +371,8 @@ pub enum DocumentOp {
     /// source, build a merged doc per matching target row (source fields
     /// qualified `<alias>.<field>`), evaluate `updates`, write back.
     UpdateFromJoin {
-        target_collection: String,
-        source_collection: String,
+        target_collection: QualifiedCollection,
+        source_collection: QualifiedCollection,
         /// Qualifier used for source columns in assignment expressions.
         source_alias: String,
         /// Field in the target used for the equi-join.
@@ -398,7 +406,7 @@ pub enum DocumentOp {
 
     /// Bulk update: scan + apply field updates to all matches.
     BulkUpdate {
-        collection: String,
+        collection: QualifiedCollection,
         filters: Vec<u8>,
         updates: Vec<(String, UpdateValue)>,
         /// When `Some`, return updated documents projected per spec.
@@ -427,7 +435,7 @@ pub enum DocumentOp {
 
     /// Bulk delete: scan + delete all matches.
     BulkDelete {
-        collection: String,
+        collection: QualifiedCollection,
         filters: Vec<u8>,
         /// When `Some`, return pre-deletion documents projected per spec.
         #[serde(default)]
@@ -458,8 +466,8 @@ pub enum DocumentOp {
     /// match applying `NotMatched` (INSERT), then optionally target rows
     /// with no source match applying `NotMatchedBySource`.
     Merge {
-        target_collection: String,
-        source_collection: String,
+        target_collection: QualifiedCollection,
+        source_collection: QualifiedCollection,
         /// Qualifier used for source columns in assignment expressions.
         source_alias: String,
         target_join_col: String,
@@ -501,7 +509,7 @@ pub enum DocumentOp {
     /// Honors `system_as_of_ms` (the clone's `as_of_lsn`) on bitemporal
     /// collections; ignored otherwise.
     MaterializeScan {
-        collection: String,
+        collection: QualifiedCollection,
         cursor: Vec<u8>,
         count: usize,
         system_as_of_ms: Option<i64>,
@@ -516,7 +524,7 @@ pub enum DocumentOp {
     /// Calvin. Applied as a normal read-modify-write on the Data Plane.
     ApplyBalanceDelta {
         /// TARGET collection this op's task homes on.
-        collection: String,
+        collection: QualifiedCollection,
         /// Target row's storage key (hex-encoded surrogate).
         document_id: String,
         /// Target row's cross-engine identity, resolved from the join value.

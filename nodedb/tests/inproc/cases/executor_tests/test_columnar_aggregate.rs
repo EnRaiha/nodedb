@@ -23,7 +23,10 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "weather".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "weather",
+            ),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -50,7 +53,10 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "weather".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "weather",
+            ),
             input: None,
             group_by: Vec::new(),
             aggregates: vec![AggregateSpec {
@@ -94,7 +100,10 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "weather".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "weather",
+            ),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -123,7 +132,10 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "weather".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "weather",
+            ),
             input: None,
             group_by: vec![GroupKeySpec::column("city")],
             aggregates: vec![AggregateSpec {
@@ -179,7 +191,10 @@ fn columnar_insert_triggers_memtable_flush() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "large_col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "large_col",
+            ),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -231,7 +246,10 @@ fn aggregate_group_by_does_not_require_full_materialization() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: "grouped".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "grouped",
+            ),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -251,7 +269,10 @@ fn aggregate_group_by_does_not_require_full_materialization() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: "grouped".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "grouped",
+            ),
             input: None,
             group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![
@@ -314,7 +335,10 @@ fn insert_columnar_rows(ctx: &mut super::helpers::TestCtx, collection: &str, cou
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             payload,
             format: "msgpack".into(),
             intent: ColumnarInsertIntent::Insert,
@@ -333,7 +357,10 @@ fn insert_columnar_rows(ctx: &mut super::helpers::TestCtx, collection: &str, cou
 /// A no-LIMIT columnar scan models `limit == usize::MAX`.
 fn columnar_scan_unbounded(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Columnar(ColumnarOp::Scan {
-        collection: collection.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         projection: Vec::new(),
         limit: usize::MAX,
         filters: Vec::new(),
@@ -420,7 +447,10 @@ fn columnar_explicit_limit_returns_exactly_n() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: "limited_col".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "limited_col",
+            ),
             projection: Vec::new(),
             limit: 250,
             filters: Vec::new(),

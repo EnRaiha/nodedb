@@ -37,7 +37,7 @@ impl CoreLoop {
             } => self.execute_vector_insert(super::super::handlers::vector::VectorInsertParams {
                 task,
                 tid,
-                collection,
+                collection: collection.as_str(),
                 vector,
                 dim: *dim,
                 field_name,
@@ -50,7 +50,14 @@ impl CoreLoop {
                 vectors,
                 dim,
                 surrogates,
-            } => self.execute_vector_batch_insert(task, tid, collection, vectors, *dim, surrogates),
+            } => self.execute_vector_batch_insert(
+                task,
+                tid,
+                collection.as_str(),
+                vectors,
+                *dim,
+                surrogates,
+            ),
 
             VectorOp::MultiSearch {
                 collection,
@@ -63,7 +70,7 @@ impl CoreLoop {
                 super::super::handlers::vector_search::VectorMultiSearchParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     query_vector,
                     top_k: *top_k,
                     ef_search: *ef_search,
@@ -75,7 +82,7 @@ impl CoreLoop {
             VectorOp::Delete {
                 collection,
                 vector_id,
-            } => self.execute_vector_delete(task, tid, collection, *vector_id),
+            } => self.execute_vector_delete(task, tid, collection.as_str(), *vector_id),
 
             VectorOp::Search {
                 collection,
@@ -94,7 +101,7 @@ impl CoreLoop {
                 super::super::handlers::vector_search::VectorSearchParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     query_vector,
                     top_k: *top_k,
                     ef_search: *ef_search,
@@ -124,7 +131,7 @@ impl CoreLoop {
                 super::super::handlers::vector::SetVectorParamsInput {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field_name,
                     dim: *dim,
                     m: *m,
@@ -140,22 +147,22 @@ impl CoreLoop {
             VectorOp::DropIndex {
                 collection,
                 field_name,
-            } => self.execute_drop_vector_index(task, tid, collection, field_name),
+            } => self.execute_drop_vector_index(task, tid, collection.as_str(), field_name),
 
             VectorOp::QueryStats {
                 collection,
                 field_name,
-            } => self.execute_vector_query_stats(task, tid, collection, field_name),
+            } => self.execute_vector_query_stats(task, tid, collection.as_str(), field_name),
 
             VectorOp::Seal {
                 collection,
                 field_name,
-            } => self.execute_vector_seal(task, tid, collection, field_name),
+            } => self.execute_vector_seal(task, tid, collection.as_str(), field_name),
 
             VectorOp::CompactIndex {
                 collection,
                 field_name,
-            } => self.execute_vector_compact_index(task, tid, collection, field_name),
+            } => self.execute_vector_compact_index(task, tid, collection.as_str(), field_name),
 
             VectorOp::Rebuild {
                 collection,
@@ -167,7 +174,7 @@ impl CoreLoop {
                 super::super::handlers::vector_lifecycle::VectorRebuildParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field_name,
                     m: *m,
                     m0: *m0,
@@ -180,22 +187,34 @@ impl CoreLoop {
                 field_name,
                 doc_id,
                 entries,
-            } => self.execute_sparse_insert(task, tid, collection, field_name, doc_id, entries),
+            } => self.execute_sparse_insert(
+                task,
+                tid,
+                collection.as_str(),
+                field_name,
+                doc_id,
+                entries,
+            ),
 
             VectorOp::SparseSearch {
                 collection,
                 field_name,
                 query_entries,
                 top_k,
-            } => {
-                self.execute_sparse_search(task, tid, collection, field_name, query_entries, *top_k)
-            }
+            } => self.execute_sparse_search(
+                task,
+                tid,
+                collection.as_str(),
+                field_name,
+                query_entries,
+                *top_k,
+            ),
 
             VectorOp::SparseDelete {
                 collection,
                 field_name,
                 doc_id,
-            } => self.execute_sparse_delete(task, tid, collection, field_name, doc_id),
+            } => self.execute_sparse_delete(task, tid, collection.as_str(), field_name, doc_id),
 
             VectorOp::MultiVectorInsert {
                 collection,
@@ -208,7 +227,7 @@ impl CoreLoop {
                 super::super::handlers::vector_multi::MultiVectorInsertParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field_name,
                     document_surrogate: *document_surrogate,
                     vectors_flat: vectors,
@@ -224,7 +243,7 @@ impl CoreLoop {
             } => self.execute_multi_vector_delete(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 field_name,
                 *document_surrogate,
             ),
@@ -240,7 +259,7 @@ impl CoreLoop {
                 super::super::handlers::vector_multi::MultiVectorScoreSearchParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field_name,
                     query_vector,
                     top_k: *top_k,
@@ -264,7 +283,7 @@ impl CoreLoop {
                 super::super::handlers::vector_upsert::VectorDirectUpsertParams {
                     task,
                     tid,
-                    collection,
+                    collection: collection.as_str(),
                     field,
                     surrogate: *surrogate,
                     vector,
@@ -285,7 +304,7 @@ impl CoreLoop {
             } => self.execute_vector_delete_by_surrogate(
                 task,
                 tid,
-                collection,
+                collection.as_str(),
                 *surrogate,
                 field_name,
                 provenance.as_ref(),

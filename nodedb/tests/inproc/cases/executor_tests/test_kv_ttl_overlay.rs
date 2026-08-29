@@ -46,7 +46,10 @@ fn send_txn(
 fn stage_expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Kv(KvOp::Expire {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             key: key.to_vec(),
             ttl_ms,
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -57,7 +60,10 @@ fn stage_expire(collection: &str, key: &[u8], ttl_ms: u64) -> PhysicalPlan {
 fn stage_persist(collection: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Kv(KvOp::Persist {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             key: key.to_vec(),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         })),
@@ -80,7 +86,10 @@ fn staged_expire_is_observed_by_in_tx_get_ttl_then_reverts_on_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
@@ -108,7 +117,10 @@ fn staged_expire_is_observed_by_in_tx_get_ttl_then_reverts_on_rollback() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -135,7 +147,10 @@ fn staged_expire_is_observed_by_in_tx_get_ttl_then_reverts_on_rollback() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -156,7 +171,10 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 60_000,
@@ -172,7 +190,10 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -195,7 +216,10 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -220,7 +244,10 @@ fn staged_persist_hides_base_ttl_then_reverts_on_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -240,7 +267,10 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
@@ -267,7 +297,10 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -286,7 +319,10 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
         }),
     );
@@ -306,7 +342,10 @@ fn staged_expire_with_zero_ttl_makes_key_appear_absent_to_in_tx_get() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Kv(KvOp::Get {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"k".to_vec(),
             rls_filters: Vec::new(),
             surrogate_ceiling: None,
@@ -326,7 +365,10 @@ fn staged_incr_with_ttl_is_observed_by_in_tx_get_ttl() {
     // Stage an INCR that also carries a TTL, on a fresh key.
     let stage_incr = PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Kv(KvOp::Incr {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"ctr".to_vec(),
             delta: 5,
             ttl_ms: 30_000,
@@ -344,7 +386,10 @@ fn staged_incr_with_ttl_is_observed_by_in_tx_get_ttl() {
         &mut rx,
         txn_id,
         PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "c".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "c",
+            ),
             key: b"ctr".to_vec(),
         }),
     );

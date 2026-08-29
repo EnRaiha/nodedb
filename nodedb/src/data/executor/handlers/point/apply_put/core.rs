@@ -369,7 +369,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: COLL.into(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
                 document_id: row_key.into(),
                 value: BODY.to_vec(),
                 surrogate: SURROGATE,

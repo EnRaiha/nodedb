@@ -54,7 +54,7 @@ pub async fn handle_reindex(
     if concurrent {
         // Concurrent path: broadcast to all cores and await per-core ACK.
         let plan = crate::bridge::envelope::PhysicalPlan::Meta(MetaOp::RebuildIndex {
-            collection: collection.clone(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             index_name,
             concurrent: true,
         });

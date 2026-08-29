@@ -32,7 +32,10 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -58,8 +61,14 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "users".into(),
-            right_collection: "users".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             left_alias: None,
             right_alias: None,
             on: Vec::new(),
@@ -76,7 +85,10 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
             post_filters,
             left_input: None,
             right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 input: None,
                 group_by: Vec::new(),
                 aggregates: vec![AggregateSpec {
@@ -137,7 +149,10 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -163,8 +178,14 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "orders".into(),
-            right_collection: "orders".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             left_alias: None,
             right_alias: None,
             on: Vec::new(),
@@ -181,7 +202,10 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
             post_filters,
             left_input: None,
             right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 input: None,
                 group_by: Vec::new(),
                 aggregates: vec![AggregateSpec {
@@ -235,7 +259,10 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "users".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "users",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -268,7 +295,10 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
             &mut ctx.tx,
             &mut ctx.rx,
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "orders".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 document_id: id.into(),
                 value: doc,
                 surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
@@ -294,8 +324,14 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "users".into(),
-            right_collection: "orders".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             left_alias: None,
             right_alias: None,
             on: vec![("id".into(), "user_id".into())],
@@ -309,8 +345,14 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
             post_filters: Vec::new(),
             left_input: None,
             right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::HashJoin {
-                left_collection: "orders".into(),
-                right_collection: "orders".into(),
+                left_collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
+                right_collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "orders",
+                ),
                 left_alias: None,
                 right_alias: None,
                 on: Vec::new(),
@@ -327,7 +369,10 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 post_filters: inner_post_filters,
                 left_input: None,
                 right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
-                    collection: "orders".into(),
+                    collection: nodedb_types::QualifiedCollection::new(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        "orders",
+                    ),
                     input: None,
                     group_by: Vec::new(),
                     aggregates: vec![AggregateSpec {

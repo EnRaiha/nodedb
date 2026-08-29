@@ -45,7 +45,7 @@ pub async fn verify_hash_chain(
     // Scan all documents.
     let vshard = VShardId::from_collection_in_database(database_id, &collection);
     let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         limit: usize::MAX,
         offset: 0,
         sort_keys: Vec::new(),

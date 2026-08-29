@@ -15,7 +15,10 @@ use super::helpers::*;
 /// `limit == usize::MAX` models a no-LIMIT `SELECT * FROM collection`.
 fn doc_scan_plan(collection: &str, limit: usize) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Scan {
-        collection: collection.into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            collection,
+        ),
         limit,
         offset: 0,
         sort_keys: Vec::new(),
@@ -78,7 +81,10 @@ fn point_get_not_found() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "nonexistent".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -101,7 +107,10 @@ fn point_put_and_get() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             value: b"hello world".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -117,7 +126,10 @@ fn point_put_and_get() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -140,7 +152,10 @@ fn point_delete_removes() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             value: b"data".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -156,7 +171,10 @@ fn point_delete_removes() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -172,7 +190,10 @@ fn point_delete_removes() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "docs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
             document_id: "d1".into(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -194,7 +215,10 @@ fn crdt_read_not_found() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Crdt(CrdtOp::Read {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             document_id: "s1".into(),
         }),
     );
@@ -212,7 +236,10 @@ fn range_scan_returns_results() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u1".into(),
             value: b"{\"name\":\"alice\",\"age\":25}".to_vec(),
             surrogate: nodedb_types::Surrogate::new(1),
@@ -227,7 +254,10 @@ fn range_scan_returns_results() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             document_id: "u2".into(),
             value: b"{\"name\":\"bob\",\"age\":30}".to_vec(),
             surrogate: nodedb_types::Surrogate::new(2),
@@ -244,7 +274,10 @@ fn range_scan_returns_results() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Document(DocumentOp::Scan {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             limit: 10,
             offset: 0,
             sort_keys: Vec::new(),
@@ -287,7 +320,10 @@ fn batch_insert_docs(
         tx,
         rx,
         PhysicalPlan::Document(DocumentOp::BatchInsert {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             documents,
             surrogates,
             returning: None,

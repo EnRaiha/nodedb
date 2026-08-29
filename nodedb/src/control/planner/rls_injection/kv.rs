@@ -250,7 +250,10 @@ mod tests {
 
     fn kv_put_row(collection: &str, owner_id: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             key: b"k1".to_vec(),
             value: body(owner_id),
             ttl_ms: 0,
@@ -262,7 +265,10 @@ mod tests {
 
     fn kv_delete(collection: &str) -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Delete {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             keys: vec![b"k1".to_vec()],
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })
@@ -314,7 +320,10 @@ mod tests {
     fn an_opaque_scalar_value_is_rejected_under_a_write_policy() {
         let store = store_with_write_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             ttl_ms: 0,
@@ -350,7 +359,10 @@ mod tests {
     fn batch_put_is_rejected_when_any_row_violates_the_policy() {
         let store = store_with_write_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::BatchPut {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             entries: vec![(b"k1".to_vec(), body("42")), (b"k2".to_vec(), body("99"))],
             ttl_ms: 0,
             surrogates: Vec::new(),
@@ -382,7 +394,10 @@ mod tests {
     fn expire_carries_the_write_predicate() {
         let store = store_with_write_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::Expire {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
             ttl_ms: 1_000,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -396,7 +411,10 @@ mod tests {
     fn field_set_carries_the_write_predicate() {
         let store = store_with_write_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
             updates: Vec::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -412,7 +430,10 @@ mod tests {
     fn incr_carries_the_write_predicate() {
         let store = store_with_write_policy("counters");
         let mut plan = PhysicalPlan::Kv(KvOp::Incr {
-            collection: "counters".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "counters",
+            ),
             key: b"k1".to_vec(),
             delta: 1,
             ttl_ms: 0,
@@ -438,7 +459,10 @@ mod tests {
             },
         );
         let mut plan = PhysicalPlan::Kv(KvOp::GetSet {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
             new_value: body("42"),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -471,8 +495,14 @@ mod tests {
     fn transfer_item_carries_a_predicate_for_each_side() {
         let store = store_with_write_policy("vault");
         let mut plan = PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: "vault".into(),
-            dest_collection: "inbox".into(),
+            source_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vault",
+            ),
+            dest_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "inbox",
+            ),
             item_key: b"i1".to_vec(),
             dest_key: b"d1".to_vec(),
             surrogate: nodedb_types::Surrogate::ZERO,
@@ -505,7 +535,10 @@ mod tests {
     fn truncate_is_refused_under_a_write_policy() {
         let store = store_with_write_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::Truncate {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
         });
         assert_write_refused(inject(&mut plan, &store), "sessions");
     }
@@ -545,7 +578,10 @@ mod tests {
     fn get_ttl_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("sessions");
         let mut plan = PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: "sessions".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "sessions",
+            ),
             key: b"k1".to_vec(),
         });
         assert_refused(inject(&mut plan, &store), "sessions");

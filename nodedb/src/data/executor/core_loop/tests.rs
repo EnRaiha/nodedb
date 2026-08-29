@@ -7,7 +7,7 @@ use crate::data::executor::handlers::point::put::PointPutExec;
 use crate::types::*;
 use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
 use nodedb_physical::physical_plan::{DocumentOp, MetaOp};
-use nodedb_types::{Surrogate, SurrogateBitmap};
+use nodedb_types::{QualifiedCollection, Surrogate, SurrogateBitmap};
 use std::time::{Duration, Instant};
 
 fn make_core() -> (
@@ -52,7 +52,7 @@ pub fn make_core_with_dir(
 pub fn make_default_task() -> crate::data::executor::task::ExecutionTask {
     crate::data::executor::task::ExecutionTask::new(make_request(PhysicalPlan::Document(
         DocumentOp::PointGet {
-            collection: "x".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -107,7 +107,7 @@ fn doc_value(k: &str, v: &str) -> Vec<u8> {
 /// An `ExecutionTask` carrying a known WAL LSN, tenant 1 / database DEFAULT.
 fn wal_task(lsn: u64) -> ExecutionTask {
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: "x".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
         document_id: "y".into(),
         surrogate: Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -309,7 +309,7 @@ fn transaction_batch_records_sub_plan_versions() {
     let (mut core, _, _, _dir) = make_core();
     let task = wal_task(60);
     let plans = vec![PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "batch".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "batch"),
         document_id: "d1".into(),
         value: doc_value("a", "1"),
         surrogate: Surrogate::new(11),
@@ -337,7 +337,7 @@ fn no_wal_lsn_records_nothing() {
     let (mut core, _, _, _dir) = make_core();
     // Task without a WAL LSN — the version index is skipped, not advanced.
     let task = ExecutionTask::new(make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-        collection: "x".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
         document_id: "y".into(),
         surrogate: Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -405,7 +405,7 @@ fn expired_task_returns_deadline_exceeded() {
             inner: Request {
                 deadline: Instant::now() - Duration::from_secs(1),
                 ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-                    collection: "x".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
@@ -433,7 +433,7 @@ fn watermark_in_response() {
     req_tx
         .try_push(BridgeRequest {
             inner: make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "x".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                 document_id: "y".into(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -457,7 +457,7 @@ fn cancel_removes_pending_task() {
                 request_id: RequestId::new(10),
                 deadline: Instant::now() + Duration::from_secs(60),
                 ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-                    collection: "x".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
@@ -508,7 +508,7 @@ fn point_put_stores_schemaless_docs_as_canonical_msgpack_maps() {
     req_tx
         .try_push(BridgeRequest {
             inner: make_request(PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "orders".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
                 document_id: "o1".into(),
                 value: tagged,
                 surrogate: nodedb_types::Surrogate::ZERO,
@@ -552,7 +552,7 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
         req_tx
             .try_push(BridgeRequest {
                 inner: make_request(PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: "things".into(),
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "things"),
                     document_id: format!("doc_{sur_val}"),
                     value: bytes,
                     surrogate: Surrogate::new(*sur_val),
@@ -574,7 +574,7 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
     req_tx
         .try_push(BridgeRequest {
             inner: make_request(PhysicalPlan::Document(DocumentOp::Scan {
-                collection: "things".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "things"),
                 limit: 100,
                 offset: 0,
                 sort_keys: Vec::new(),
@@ -637,7 +637,7 @@ fn task_with_vshard(vshard_id: VShardId) -> ExecutionTask {
     ExecutionTask::new(Request {
         vshard_id,
         ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-            collection: "x".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
@@ -654,7 +654,7 @@ fn wal_task_with_vshard(lsn: u64, vshard_id: VShardId) -> ExecutionTask {
         Request {
             vshard_id,
             ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "x".into(),
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                 document_id: "y".into(),
                 surrogate: Surrogate::ZERO,
                 pk_bytes: Vec::new(),
@@ -796,7 +796,7 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
     // LSN 10 (this is the same chokepoint a Calvin apply funnels through).
     let write_task = wal_task_with_vshard(10, vshard);
     let write_plans = vec![PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "o7".into(),
         value: doc_value("a", "1"),
         surrogate: Surrogate::new(7),
@@ -821,7 +821,7 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
     // apply (non-enforcing).
     let second_task = wal_task_with_vshard(20, vshard);
     let second_plans = vec![PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: "orders".into(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "o8".into(),
         value: doc_value("a", "2"),
         surrogate: Surrogate::new(8),

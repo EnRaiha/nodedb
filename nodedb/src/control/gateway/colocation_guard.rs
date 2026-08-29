@@ -128,8 +128,8 @@ pub(crate) fn guard_cross_collection_write(
             state,
             database_id,
             "TRANSFER",
-            source_collection,
-            dest_collection,
+            source_collection.as_str(),
+            dest_collection.as_str(),
         ),
         _ => Ok(()),
     }

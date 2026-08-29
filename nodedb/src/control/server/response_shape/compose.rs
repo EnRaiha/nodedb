@@ -387,7 +387,7 @@ mod tests {
 
     fn preview_plan() -> PhysicalPlan {
         PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::PreviewApply {
-            collection: "tasks".to_string(),
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "tasks"),
             document_id: "task-1".to_string(),
             delta: vec![0x92, 0x01],
         })

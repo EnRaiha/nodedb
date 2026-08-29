@@ -41,7 +41,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             constraint_version_required,
             expected_frontier_digest,
         } => apply(ApplyFields {
-            collection,
+            collection: collection.as_str(),
             document_id,
             delta,
             peer_id: *peer_id,
@@ -67,7 +67,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             delta_signature,
             signing_required,
         } => ReplicatedWrite::CrdtApplyAuthenticated {
-            collection: collection.clone(),
+            collection: collection.to_string(),
             document_id: document_id.clone(),
             delta: delta.clone(),
             peer_id: *peer_id,
@@ -85,7 +85,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             tenant_id,
             collection,
             bytes,
-        } => import_snapshot(*tenant_id, collection, bytes),
+        } => import_snapshot(*tenant_id, collection.as_str(), bytes),
         CrdtOp::ListInsert {
             collection,
             document_id,
@@ -94,7 +94,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             fields_json,
             surrogate,
         } => list_insert(
-            collection,
+            collection.as_str(),
             document_id,
             list_path,
             *index,
@@ -108,7 +108,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             index,
             surrogate,
         } => list_delete(
-            collection,
+            collection.as_str(),
             document_id,
             list_path,
             *index,
@@ -122,7 +122,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             to_index,
             surrogate,
         } => list_move(
-            collection,
+            collection.as_str(),
             document_id,
             list_path,
             *from_index,
@@ -138,7 +138,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             returning,
             rls_filters,
         } => doc_upsert(
-            collection,
+            collection.as_str(),
             document_id,
             surrogate.as_u32(),
             fields_json,
@@ -153,7 +153,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             returning,
             rls_filters,
         } => doc_delete(
-            collection,
+            collection.as_str(),
             document_id,
             surrogate.as_u32(),
             super::entry::encode_returning(returning),
@@ -163,11 +163,11 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             collection,
             constraint_version,
             constraints,
-        } => set_constraints(collection, *constraint_version, constraints),
+        } => set_constraints(collection.as_str(), *constraint_version, constraints),
         CrdtOp::DropConstraints {
             collection,
             constraint_version,
-        } => drop_constraints(collection, *constraint_version),
+        } => drop_constraints(collection.as_str(), *constraint_version),
         CrdtOp::Read { .. }
         | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }

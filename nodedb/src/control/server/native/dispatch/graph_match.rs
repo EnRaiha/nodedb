@@ -49,6 +49,7 @@ pub(crate) async fn handle_graph_match(
         };
     if let Err(error) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
+        ctx.database_id(),
         &mut plan,
         &ctx.state.rls,
         ctx.auth_context(),
@@ -60,6 +61,7 @@ pub(crate) async fn handle_graph_match(
     if let Err(error) = crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         tenant_id,
+        ctx.database_id(),
         ctx.auth_context(),
         &ctx.state.redaction,
     ) {

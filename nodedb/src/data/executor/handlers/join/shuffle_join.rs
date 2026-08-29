@@ -194,7 +194,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT,
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Document(DocumentOp::PointGet {
-                collection: "t".into(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
                 document_id: "d".into(),
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),

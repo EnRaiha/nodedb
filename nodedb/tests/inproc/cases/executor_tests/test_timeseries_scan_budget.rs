@@ -11,6 +11,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_types::{DatabaseId, QualifiedCollection};
 
 use super::helpers::*;
 
@@ -36,7 +37,7 @@ fn ingest(ctx: &mut TestCtx, collection: &str, payload: &str) {
         &mut ctx.tx,
         &mut ctx.rx,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.to_string(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             payload: payload.as_bytes().to_vec(),
             format: "ilp".to_string(),
             wal_lsn: None,
@@ -52,7 +53,7 @@ fn ingest(ctx: &mut TestCtx, collection: &str, payload: &str) {
 /// A raw timeseries scan (no aggregation) with the given row `limit`.
 fn ts_raw_scan(collection: &str, limit: usize) -> PhysicalPlan {
     PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
         time_range: (0, i64::MAX),
         projection: Vec::new(),
         limit,

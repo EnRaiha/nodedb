@@ -57,7 +57,7 @@ pub async fn select_at_version(
     // Dispatch to the Data Plane through the authorized door — this is user
     // SQL, so the plan that reaches storage is the one authorization approved.
     let plan = PhysicalPlan::Crdt(CrdtOp::ReadAtVersion {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         document_id: doc_id.clone(),
         version_vector_json: vv_json,
     });

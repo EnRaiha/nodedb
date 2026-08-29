@@ -25,6 +25,7 @@ use nodedb::control::gateway::core::QueryContext;
 use nodedb::control::gateway::version_set::GatewayVersionSet;
 use nodedb::types::TenantId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::QualifiedCollection;
 
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
@@ -142,7 +143,10 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
             version_set: GatewayVersionSet::from_pairs(vec![("pgwire_gw_cache".into(), 1)]),
         };
         let plan = Arc::new(PhysicalPlan::Kv(KvOp::Get {
-            collection: "pgwire_gw_cache".into(),
+            collection: QualifiedCollection::new(
+                nodedb_types::id::DatabaseId::DEFAULT,
+                "pgwire_gw_cache",
+            ),
             key: b"k".to_vec(),
             rls_filters: vec![],
             surrogate_ceiling: None,
@@ -177,7 +181,10 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
     {
         // Pre-populate a key.
         let put_plan = PhysicalPlan::Kv(KvOp::Put {
-            collection: "pgwire_gw_cache".into(),
+            collection: QualifiedCollection::new(
+                nodedb_types::id::DatabaseId::DEFAULT,
+                "pgwire_gw_cache",
+            ),
             key: b"cache-key".to_vec(),
             value: mp_string("cache-val"),
             ttl_ms: 0,
@@ -194,7 +201,10 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
         let sql = "GET pgwire_gw_cache cache-key";
         let make_plan = || {
             Ok(PhysicalPlan::Kv(KvOp::Get {
-                collection: "pgwire_gw_cache".into(),
+                collection: QualifiedCollection::new(
+                    nodedb_types::id::DatabaseId::DEFAULT,
+                    "pgwire_gw_cache",
+                ),
                 key: b"cache-key".to_vec(),
                 rls_filters: vec![],
                 surrogate_ceiling: None,

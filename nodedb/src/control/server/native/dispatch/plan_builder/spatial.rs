@@ -2,12 +2,18 @@
 
 //! Spatial scan plan builder.
 
+use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::{SpatialOp, SpatialPredicate};
 
-pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_scan(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let raw_bytes = fields
         .query_geometry
         .as_ref()
@@ -45,7 +51,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
     let limit = fields.limit.unwrap_or(1000) as usize;
 
     Ok(PhysicalPlan::Spatial(SpatialOp::Scan {
-        collection: collection.to_string(),
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
         predicate,
         query_geometry: geometry,

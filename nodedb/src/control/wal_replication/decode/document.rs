@@ -74,7 +74,7 @@ pub(super) fn point_put(
         None => carried,
     };
     Ok(PhysicalPlan::Document(DocumentOp::PointPut {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         value: value.to_vec(),
         surrogate,
@@ -134,7 +134,7 @@ pub(super) fn point_insert(
         None => carried,
     };
     Ok(PhysicalPlan::Document(DocumentOp::PointInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         value: value.to_vec(),
         if_absent,
@@ -160,7 +160,7 @@ pub(super) fn point_delete(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, &pk_bytes, carried)?;
     Ok(PhysicalPlan::Document(DocumentOp::PointDelete {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         surrogate,
         pk_bytes,
@@ -188,7 +188,7 @@ pub(super) fn point_update(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, &pk_bytes, carried)?;
     Ok(PhysicalPlan::Document(DocumentOp::PointUpdate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         surrogate,
         pk_bytes,
@@ -228,7 +228,7 @@ pub(super) fn doc_upsert(
     let carried = nodedb_types::Surrogate::new(surrogate);
     let surrogate = bind_or_lookup(ctx, collection, &pk_bytes, carried)?;
     Ok(PhysicalPlan::Document(DocumentOp::Upsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         value: value.to_vec(),
         on_conflict_updates: on_conflict_updates.to_vec(),
@@ -286,7 +286,7 @@ pub(super) fn batch_insert(
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         documents: documents.to_vec(),
         surrogates: resolved,
         // Carried on the record — see `point_put`.
@@ -313,7 +313,7 @@ pub(super) fn bulk_dml(
     let resolved_sum_targets = plan_targets(resolved_sum_targets);
     if is_update {
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             filters: filters.to_vec(),
             updates: updates.to_vec(),
             // Carried on the record — see `point_put`.
@@ -327,7 +327,7 @@ pub(super) fn bulk_dml(
         })
     } else {
         PhysicalPlan::Document(DocumentOp::BulkDelete {
-            collection: collection.to_owned(),
+            collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
             filters: filters.to_vec(),
             // Carried on the record — see `point_put`.
             returning: returning.returning,
@@ -349,7 +349,7 @@ pub(super) fn truncate(
     resolved_sum_targets: &WireSumResolution<'_>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Truncate {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         restart_identity,
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
@@ -363,8 +363,12 @@ pub(super) fn insert_select(
     source_limit: usize,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::InsertSelect {
-        target_collection: target_collection.to_owned(),
-        source_collection: source_collection.to_owned(),
+        target_collection: nodedb_types::QualifiedCollection::from_stored(
+            target_collection.to_owned(),
+        ),
+        source_collection: nodedb_types::QualifiedCollection::from_stored(
+            source_collection.to_owned(),
+        ),
         source_filters: source_filters.to_vec(),
         source_limit,
     })
@@ -382,7 +386,7 @@ pub(super) fn apply_balance_delta(
     join_value: &str,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
-        collection: collection.to_owned(),
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
         column: column.to_owned(),
@@ -419,7 +423,9 @@ pub(super) fn resolved_write(
                     let carried = nodedb_types::Surrogate::new(*surrogate);
                     M::Put {
                         surrogate: bind_or_lookup(ctx, collection, &pk_bytes, carried)?,
-                        collection: collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.clone(),
+                        ),
                         document_id: document_id.clone(),
                         pk_bytes,
                         value: value.clone(),
@@ -441,7 +447,9 @@ pub(super) fn resolved_write(
                     let carried = nodedb_types::Surrogate::new(*surrogate);
                     M::Delete {
                         surrogate: bind_or_lookup(ctx, collection, &pk_bytes, carried)?,
-                        collection: collection.clone(),
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.clone(),
+                        ),
                         document_id: document_id.clone(),
                         pk_bytes,
                         precondition: precondition.clone(),

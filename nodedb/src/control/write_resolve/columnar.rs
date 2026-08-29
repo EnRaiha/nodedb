@@ -54,7 +54,7 @@ pub(super) fn resolver_for_columnar_op(op: &ColumnarOp) -> Option<Box<dyn Engine
         return None;
     }
     Some(Box::new(ColumnarWriteResolver {
-        collection: collection.clone(),
+        collection: collection.as_str().to_owned(),
         filters: filters.clone(),
         updates: updates.cloned().unwrap_or_default(),
         is_update,
@@ -70,7 +70,7 @@ impl EngineWriteResolver for ColumnarWriteResolver {
 
     fn build_resolve_op(&self) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::ResolveDml {
-            collection: self.collection.clone(),
+            collection: nodedb_types::QualifiedCollection::from_stored(self.collection.clone()),
             filters: self.filters.clone(),
             updates: self.updates.clone(),
             is_update: self.is_update,
@@ -126,12 +126,12 @@ impl EngineWriteResolver for ColumnarWriteResolver {
     fn apply(&self, resolved: ResolvedRows) -> crate::Result<PhysicalPlan> {
         Ok(PhysicalPlan::Columnar(match resolved {
             ResolvedRows::Update(rows) => ColumnarOp::ResolvedUpdate {
-                collection: self.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(self.collection.clone()),
                 rows,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             },
             ResolvedRows::Delete(pks) => ColumnarOp::ResolvedDelete {
-                collection: self.collection.clone(),
+                collection: nodedb_types::QualifiedCollection::from_stored(self.collection.clone()),
                 pks,
                 rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             },

@@ -46,14 +46,15 @@ pub(in super::super) fn convert_merge(
         ctx,
     } = args;
     let target_qualified = super::super::convert::db_qualified(ctx.database_id, target);
+    let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
     let target = target_qualified.as_str();
     // Extract source collection name from the source scan plan.
     let source_collection = match source {
         SqlPlan::Scan { collection, .. } => {
-            super::super::convert::db_qualified(ctx.database_id, collection)
+            nodedb_types::QualifiedCollection::new(ctx.database_id, collection)
         }
         SqlPlan::DocumentIndexLookup { collection, .. } => {
-            super::super::convert::db_qualified(ctx.database_id, collection)
+            nodedb_types::QualifiedCollection::new(ctx.database_id, collection)
         }
         other => {
             return Err(crate::Error::PlanError {
@@ -74,7 +75,7 @@ pub(in super::super) fn convert_merge(
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection: target.into(),
+            target_collection: qualified_target,
             source_collection,
             source_alias: source_alias.into(),
             target_join_col: target_join_col.into(),

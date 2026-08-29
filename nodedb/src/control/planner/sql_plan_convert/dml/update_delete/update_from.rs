@@ -51,26 +51,21 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
         ctx.database_id,
         collection,
     );
+    let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     // Extract source collection name and alias from the source scan plan.
     let (source_collection, source_alias) = match source {
         SqlPlan::Scan {
             collection, alias, ..
         } => {
-            let qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
-                ctx.database_id,
-                collection,
-            );
+            let qualified = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
             let alias_str = alias.as_deref().unwrap_or(collection.as_str()).to_string();
             (qualified, alias_str)
         }
         SqlPlan::DocumentIndexLookup {
             collection, alias, ..
         } => {
-            let qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
-                ctx.database_id,
-                collection,
-            );
+            let qualified = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
             let alias_str = alias.as_deref().unwrap_or(collection.as_str()).to_string();
             (qualified, alias_str)
         }
@@ -90,7 +85,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update_from(
         vshard_id: vshard,
         database_id: ctx.database_id,
         plan: PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection: collection.into(),
+            target_collection: qualified_collection,
             source_collection,
             source_alias,
             target_join_col: target_join_col.into(),

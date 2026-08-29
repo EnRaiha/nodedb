@@ -37,6 +37,7 @@ use super::lookup::RefusalCtx;
 pub fn refuse_unredactable_plan(
     plan: &PhysicalPlan,
     tenant_id: TenantId,
+    database_id: nodedb_types::DatabaseId,
     auth: &AuthContext,
     store: &RedactionStore,
 ) -> crate::Result<()> {
@@ -49,6 +50,7 @@ pub fn refuse_unredactable_plan(
         store,
         tenant_id: tenant_id.as_u64(),
         roles: &auth.roles,
+        database_id,
     };
     walk(plan, &ctx)
 }
@@ -61,6 +63,7 @@ pub fn refuse_unredactable_plan(
 /// collection directly — exactly as it does for the RLS refusal beside it.
 pub fn refuse_unredactable_graph_collection(
     collection: &str,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: TenantId,
     auth: &AuthContext,
     store: &RedactionStore,
@@ -73,8 +76,9 @@ pub fn refuse_unredactable_graph_collection(
             store,
             tenant_id: tenant_id.as_u64(),
             roles: &auth.roles,
+            database_id,
         },
-        collection,
+        &nodedb_types::QualifiedCollection::new(database_id, collection),
     )
 }
 
@@ -88,6 +92,7 @@ pub fn refuse_unredactable_graph_collection(
 pub fn refuse_unredactable_graph_match(
     query: &[u8],
     tenant_id: TenantId,
+    database_id: nodedb_types::DatabaseId,
     auth: &AuthContext,
     store: &RedactionStore,
 ) -> crate::Result<()> {
@@ -99,6 +104,7 @@ pub fn refuse_unredactable_graph_match(
             store,
             tenant_id: tenant_id.as_u64(),
             roles: &auth.roles,
+            database_id,
         },
         query,
     )
@@ -113,6 +119,7 @@ pub fn refuse_unredactable_graph_match(
 pub fn refuse_unredactable_graph_match_scoped(
     collection: Option<&str>,
     tenant_id: TenantId,
+    database_id: nodedb_types::DatabaseId,
     auth: &AuthContext,
     store: &RedactionStore,
 ) -> crate::Result<()> {
@@ -124,6 +131,7 @@ pub fn refuse_unredactable_graph_match_scoped(
             store,
             tenant_id: tenant_id.as_u64(),
             roles: &auth.roles,
+            database_id,
         },
         collection,
     )
@@ -139,7 +147,7 @@ pub fn refuse_unredactable_tasks(
     store: &RedactionStore,
 ) -> crate::Result<()> {
     for task in tasks {
-        refuse_unredactable_plan(&task.plan, task.tenant_id, auth, store)?;
+        refuse_unredactable_plan(&task.plan, task.tenant_id, task.database_id, auth, store)?;
     }
     Ok(())
 }
@@ -241,11 +249,11 @@ fn walk_query(op: &QueryOp, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
         } => {
             let left = JoinSide {
                 alias: left_alias.as_deref(),
-                collection: left_collection,
+                collection: left_collection.as_str(),
             };
             let right = JoinSide {
                 alias: right_alias.as_deref(),
-                collection: right_collection,
+                collection: right_collection.as_str(),
             };
             refuse_join_aggregates(ctx, &left, &right, post_aggregates)?;
             for child in [left_input, right_input, left_bitmap, right_bitmap]
@@ -352,7 +360,10 @@ mod tests {
 
     fn aggregate_plan(collection: &str, specs: Vec<AggregateSpec>) -> PhysicalPlan {
         PhysicalPlan::Query(QueryOp::Aggregate {
-            collection: collection.into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                collection,
+            ),
             input: None,
             group_by: Vec::<GroupKeySpec>::new(),
             aggregates: specs,
@@ -367,7 +378,13 @@ mod tests {
     }
 
     fn check(plan: &PhysicalPlan, store: &RedactionStore, role: &str) -> crate::Result<()> {
-        refuse_unredactable_plan(plan, TenantId::new(TENANT), &auth_with_role(role), store)
+        refuse_unredactable_plan(
+            plan,
+            TenantId::new(TENANT),
+            nodedb_types::id::DatabaseId::DEFAULT,
+            &auth_with_role(role),
+            store,
+        )
     }
 
     fn assert_refused(result: crate::Result<()>) {
@@ -457,8 +474,14 @@ mod tests {
         left_input: Option<PhysicalPlan>,
     ) -> PhysicalPlan {
         PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection: "users".into(),
-            right_collection: "orders".into(),
+            left_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
+            right_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "orders",
+            ),
             left_alias: Some("u".into()),
             right_alias: Some("o".into()),
             on: Vec::new(),
@@ -513,7 +536,10 @@ mod tests {
     fn graph_traversal_over_redacted_collection_is_refused() {
         let store = store_with_rule("users", "support", "ssn");
         let plan = PhysicalPlan::Graph(GraphOp::Neighbors {
-            collection: Some("users".into()),
+            collection: Some(nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            )),
             node_id: "n1".into(),
             edge_label: None,
             direction: nodedb_types::graph::Direction::Out,
@@ -587,7 +613,10 @@ mod tests {
     fn a_plain_scan_is_never_refused() {
         let store = store_with_rule("users", "support", "ssn");
         let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
-            collection: "users".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "users",
+            ),
             field: "id".into(),
         });
         assert!(check(&plan, &store, "support").is_ok());

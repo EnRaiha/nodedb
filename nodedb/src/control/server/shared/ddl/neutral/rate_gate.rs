@@ -63,7 +63,10 @@ pub async fn rate_check(
     // if it does, or ttl_ms=window if it doesn't.
     let key_exists = {
         let check = PhysicalPlan::Kv(KvOp::GetTtl {
-            collection: RATE_COLLECTION.to_string(),
+            collection: nodedb_types::QualifiedCollection::new(
+                DatabaseId::DEFAULT,
+                RATE_COLLECTION,
+            ),
             key: rate_key.as_bytes().to_vec(),
         });
         match crate::control::server::dispatch_utils::dispatch_to_data_plane(
@@ -98,7 +101,7 @@ pub async fn rate_check(
         )
         .map_err(|e| super::kv_atomic::ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection: RATE_COLLECTION.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         key: rate_key.as_bytes().to_vec(),
         delta: 1,
         ttl_ms: actual_ttl,
@@ -181,7 +184,7 @@ pub async fn rate_remaining(
 
     // Read current counter value (non-destructive).
     let plan = PhysicalPlan::Kv(KvOp::Get {
-        collection: RATE_COLLECTION.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         key: rate_key.as_bytes().to_vec(),
         rls_filters: Vec::new(),
         surrogate_ceiling: None,
@@ -242,7 +245,7 @@ pub async fn rate_reset(
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, RATE_COLLECTION);
 
     let plan = PhysicalPlan::Kv(KvOp::Delete {
-        collection: RATE_COLLECTION.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         keys: vec![rate_key.as_bytes().to_vec()],
         // Internal bookkeeping collection — see `rate_gate`'s INCR above.
         rls_write_check: nodedb_types::RlsWriteCheck::system_internal_collection(),
@@ -280,7 +283,7 @@ async fn read_ttl_ms(
     key: &str,
 ) -> u64 {
     let plan = PhysicalPlan::Kv(KvOp::GetTtl {
-        collection: RATE_COLLECTION.to_string(),
+        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         key: key.as_bytes().to_vec(),
     });
 

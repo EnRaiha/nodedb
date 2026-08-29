@@ -117,11 +117,11 @@ pub(super) fn assert_durable_before_ack(missing_redo_engine: Option<&'static str
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{DocumentOp, KvOp, MetaOp};
-    use nodedb_types::Surrogate;
+    use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
 
     fn kv_put() -> PhysicalPlan {
         PhysicalPlan::Kv(KvOp::Put {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn read_requires_no_redo() {
         let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             field: "f".into(),
         });
         assert_eq!(funnel_minted_redo_engine(&plan), None);
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn document_write_is_not_held_to_the_barrier() {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
-            collection: "c".into(),
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             restart_identity: false,
             resolved_sum_targets: Vec::new(),
         });

@@ -105,7 +105,7 @@ pub async fn rag_fusion(
     };
 
     let plan = PhysicalPlan::Graph(GraphOp::RagFusion {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         query_vector,
         vector_top_k,
         edge_label: params.edge_label,

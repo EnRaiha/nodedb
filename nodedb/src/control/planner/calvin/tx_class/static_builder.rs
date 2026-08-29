@@ -123,10 +123,10 @@ fn build_static_tx_class_impl(
         ) = &task.plan
         {
             edge_pairs
-                .entry(collection.clone())
+                .entry(collection.to_string())
                 .or_default()
                 .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
-            let homes = edge_homes.entry(collection.clone()).or_default();
+            let homes = edge_homes.entry(collection.to_string()).or_default();
             homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
             homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
             continue;
@@ -310,7 +310,7 @@ mod tests {
             vshard_id: VShardId::new(0),
             database_id: DatabaseId::DEFAULT,
             plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: collection.to_owned(),
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
                 document_id: "d1".to_owned(),
                 surrogate: Surrogate::new(surrogate),
                 value: vec![],

@@ -108,7 +108,10 @@ pub async fn crdt_apply(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.clone(),
+        collection: nodedb_types::QualifiedCollection::new(
+            crate::types::DatabaseId::DEFAULT,
+            &collection,
+        ),
         document_id: body.doc_id.clone(),
         delta,
         peer_id: identity.user_id,

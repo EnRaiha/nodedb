@@ -141,7 +141,10 @@ fn document_schemaless_non_bitemporal_byte_identical() {
         .map(|i| {
             let doc = format!(r#"{{"id":{i},"val":"hello"}}"#);
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "docs",
+                ),
                 document_id: format!("doc-{i}"),
                 value: doc.into_bytes(),
                 surrogate: nodedb_types::Surrogate::new(i),
@@ -165,7 +168,10 @@ fn kv_no_ttl_byte_identical() {
     let ops: Vec<PhysicalPlan> = (0..100)
         .map(|i| {
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "kv_coll".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "kv_coll",
+                ),
                 key: format!("key-{i}").into_bytes(),
                 value: format!("val-{i}").into_bytes(),
                 ttl_ms: 0,
@@ -186,7 +192,10 @@ fn kv_no_ttl_byte_identical() {
 #[test]
 fn vector_insert_byte_identical() {
     let mut ops = vec![PhysicalPlan::Vector(VectorOp::SetParams {
-        collection: "vecs".into(),
+        collection: nodedb_types::QualifiedCollection::new(
+            nodedb_types::DatabaseId::DEFAULT,
+            "vecs",
+        ),
         field_name: String::new(),
         dim: 3,
         m: 16,
@@ -199,7 +208,10 @@ fn vector_insert_byte_identical() {
     })];
     for i in 0u32..100 {
         ops.push(PhysicalPlan::Vector(VectorOp::Insert {
-            collection: "vecs".into(),
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "vecs",
+            ),
             vector: vec![i as f32 * 0.1, 0.5, 0.3],
             dim: 3,
             field_name: String::new(),
@@ -222,7 +234,10 @@ fn columnar_insert_byte_identical() {
             let rows = serde_json::json!([{"id": format!("r{i}"), "val": i}]);
             let payload = nodedb_types::json_to_msgpack(&rows).unwrap();
             PhysicalPlan::Columnar(ColumnarOp::Insert {
-                collection: "metrics".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "metrics",
+                ),
                 payload,
                 format: "msgpack".into(),
                 intent: ColumnarInsertIntent::Insert,
@@ -254,7 +269,10 @@ fn crdt_apply_byte_identical() {
     let ops: Vec<PhysicalPlan> = (0..100)
         .map(|i| {
             PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "crdt_coll".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "crdt_coll",
+                ),
                 document_id: format!("doc-{i}"),
                 delta: delta.clone(),
                 peer_id: 1,
@@ -298,7 +316,10 @@ fn document_bitemporal_byte_identical() {
         .map(|i| {
             let doc = format!(r#"{{"id":{i},"val":"bt"}}"#);
             PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: "bt_docs".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "bt_docs",
+                ),
                 document_id: format!("bt-doc-{i}"),
                 value: doc.into_bytes(),
                 surrogate: nodedb_types::Surrogate::new(i),
@@ -331,7 +352,10 @@ fn kv_with_ttl_byte_identical() {
     let ops: Vec<PhysicalPlan> = (0..100)
         .map(|i| {
             PhysicalPlan::Kv(KvOp::Put {
-                collection: "kv_coll".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "kv_coll",
+                ),
                 key: format!("ttl-key-{i}").into_bytes(),
                 value: format!("ttl-val-{i}").into_bytes(),
                 ttl_ms: 60_000,
@@ -363,7 +387,10 @@ fn graph_edge_put_byte_identical() {
     let ops: Vec<PhysicalPlan> = (0..100)
         .map(|i| {
             PhysicalPlan::Graph(GraphOp::EdgePut {
-                collection: "graph_coll".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "graph_coll",
+                ),
                 src_id: format!("node-{i}"),
                 label: "REL".into(),
                 dst_id: format!("node-{}", i + 1),
@@ -389,7 +416,10 @@ fn timeseries_bitemporal_byte_identical() {
     let ops: Vec<PhysicalPlan> = (0..100)
         .map(|_| {
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                collection: "ts_bt".into(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    "ts_bt",
+                ),
                 payload: ilp.as_bytes().to_vec(),
                 format: "ilp".into(),
                 wal_lsn: None,
