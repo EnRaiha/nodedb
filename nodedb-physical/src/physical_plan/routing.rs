@@ -2,11 +2,16 @@
 
 //! Cross-node routing predicates for physical plans.
 //!
-//! Decides whether a plan tree contains a cluster-partitioned leaf (graph /
-//! array, needing scatter-gather) versus a single-vShard-homed source
-//! (document / kv / columnar / ts / spatial / vector / text, routed directly).
+//! Two questions, kept together because they recurse through the same wrapper
+//! ops and must agree about what counts as a leaf:
+//!
+//! - whether a plan tree contains a cluster-partitioned leaf (graph / array,
+//!   needing scatter-gather) versus a single-vShard-homed source (document /
+//!   kv / columnar / ts / spatial / vector / text, routed directly)
+//! - whether a plan is a sharded source the converter must wrap in
+//!   `Exchange{Gather}`, so per-core results are merged on the coordinator
 
-use super::{ExchangeOp, GraphOp, PhysicalPlan, QueryOp};
+use super::{ColumnarOp, DocumentOp, ExchangeOp, GraphOp, PhysicalPlan, QueryOp, TextOp, VectorOp};
 
 /// `true` if the plan tree contains a leaf whose rows are distributed across
 /// vShards by node-id or tile-id (graph traversal, Array/ClusterArray),
@@ -120,4 +125,94 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Query(QueryOp::RecursiveScan { .. })
         | PhysicalPlan::Query(QueryOp::RecursiveValue { .. }) => false,
     }
+}
+
+impl PhysicalPlan {
+    /// Whether this plan is a sharded-source operation that the converter must
+    /// wrap in `Exchange{Gather}`. Identifies reads and joins that are
+    /// distributed across all Data Plane cores and whose results must be
+    /// gathered and merged on the coordinator.
+    pub fn is_sharded_source(&self) -> bool {
+        // Sharded only if a leaf reads a real per-shard collection — a
+        // pure-catalog plan must run exactly once (broadcasting overcounts).
+        match self {
+            // Catalog sub-plan: inherit child's sharded-ness. No sub-plan:
+            // legacy per-shard scan → always sharded.
+            PhysicalPlan::Query(QueryOp::Aggregate { input, .. }) => match input {
+                Some(child) => child.is_sharded_source(),
+                None => true,
+            },
+            // Sharded iff at least one side reads a real per-shard collection.
+            PhysicalPlan::Query(QueryOp::HashJoin {
+                left_collection,
+                right_collection,
+                left_input,
+                right_input,
+                left_bitmap,
+                right_bitmap,
+                ..
+            }) => {
+                hash_join_side_is_sharded(left_collection.as_str(), left_input, left_bitmap)
+                    || hash_join_side_is_sharded(
+                        right_collection.as_str(),
+                        right_input,
+                        right_bitmap,
+                    )
+            }
+            _ => self.is_sharded_source_leaf(),
+        }
+    }
+
+    /// Leaf / non-recursive sharded-source check for all plan variants other
+    /// than `Aggregate` and `HashJoin` (handled structurally in
+    /// `is_sharded_source`).
+    fn is_sharded_source_leaf(&self) -> bool {
+        matches!(
+            self,
+            PhysicalPlan::Document(DocumentOp::Scan { .. })
+                | PhysicalPlan::Columnar(ColumnarOp::Scan { .. })
+                | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+                | PhysicalPlan::Query(QueryOp::PartialAggregateState { .. })
+                | PhysicalPlan::Graph(GraphOp::Hop { .. })
+                | PhysicalPlan::Graph(GraphOp::Neighbors { .. })
+                | PhysicalPlan::Graph(GraphOp::NeighborsMulti { .. })
+                | PhysicalPlan::Graph(GraphOp::Path { .. })
+                | PhysicalPlan::Graph(GraphOp::Subgraph { .. })
+                | PhysicalPlan::Graph(GraphOp::RagFusion { .. })
+                | PhysicalPlan::Graph(GraphOp::Match { .. })
+                | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+                | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
+                | PhysicalPlan::Graph(GraphOp::TemporalNeighbors { .. })
+                | PhysicalPlan::Graph(GraphOp::TemporalAlgorithm { .. })
+                | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
+                | PhysicalPlan::Graph(GraphOp::WccSuperstep(_))
+                | PhysicalPlan::Graph(GraphOp::Stats { .. })
+                | PhysicalPlan::Vector(VectorOp::Search { .. })
+                | PhysicalPlan::Text(TextOp::Search { .. })
+                | PhysicalPlan::Text(TextOp::HybridSearch { .. })
+                | PhysicalPlan::Text(TextOp::HybridSearchTriple { .. })
+                | PhysicalPlan::Text(TextOp::BM25ScoreScan { .. })
+        )
+    }
+}
+
+/// Whether one side of a `HashJoin` reads a real per-shard collection (and so
+/// makes the join a sharded source fanned to all cores). `input: Some` child
+/// recurses; `input: None` + non-empty `collection` is sharded; `bitmap:
+/// Some` (`IndexedFetch`) is sharded.
+fn hash_join_side_is_sharded(
+    collection: &str,
+    input: &Option<Box<PhysicalPlan>>,
+    bitmap: &Option<Box<PhysicalPlan>>,
+) -> bool {
+    if let Some(child) = input {
+        // An Exchange wrapper always carries a sharded child; otherwise defer
+        // to the child's own structural classification.
+        return matches!(**child, PhysicalPlan::Query(QueryOp::Exchange(_)))
+            || child.is_sharded_source();
+    }
+    if bitmap.is_some() {
+        return true;
+    }
+    !collection.is_empty()
 }

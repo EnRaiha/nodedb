@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Which user collection a physical plan targets.
+//!
+//! Kept beside the plan enum rather than inside it so `plan.rs` stays the
+//! single declaration of the wire shape and nothing else.
+
+use super::{
+    ColumnarOp, DocumentOp, GraphOp, MetaOp, PhysicalPlan, QueryOp, SpatialOp, TextOp,
+    TimeseriesOp, VectorOp,
+};
+
+impl PhysicalPlan {
+    /// Primary read/target collection this plan touches, if it maps to
+    /// exactly one user collection.
+    ///
+    /// Plane-neutral twin of the Control-Plane
+    /// `crate::control::server::shared::plan_util::extract_collection` — the
+    /// two MUST stay in sync (logic replicated, not called, since the core
+    /// crate depends on `nodedb-physical`, not the reverse).
+    pub fn collection(&self) -> Option<&str> {
+        match self {
+            PhysicalPlan::Document(DocumentOp::PointGet { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::Search { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
+            // A vector-primary row lives here only; `None` left it with no
+            // collection to key a redaction policy on.
+            | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::Delete { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::PointPut { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::PointInsert { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::PointDelete { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::Scan { collection, .. })
+            | PhysicalPlan::Query(QueryOp::Aggregate { collection, .. })
+            | PhysicalPlan::Query(QueryOp::HashJoin {
+                left_collection: collection,
+                ..
+            })
+            | PhysicalPlan::Query(QueryOp::NestedLoopJoin {
+                left_collection: collection,
+                ..
+            })
+            | PhysicalPlan::Graph(GraphOp::RagFusion { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::SetParams { collection, .. })
+            | PhysicalPlan::Text(TextOp::Search { collection, .. })
+            | PhysicalPlan::Text(TextOp::PhraseSearch { collection, .. })
+            | PhysicalPlan::Text(TextOp::HybridSearch { collection, .. })
+            | PhysicalPlan::Text(TextOp::HybridSearchTriple { collection, .. })
+            | PhysicalPlan::Text(TextOp::BM25ScoreScan { collection, .. })
+            | PhysicalPlan::Text(TextOp::FtsIndexDoc { collection, .. })
+            | PhysicalPlan::Text(TextOp::FtsDeleteDoc { collection, .. })
+            | PhysicalPlan::Text(TextOp::SetTextConfig { collection, .. })
+            | PhysicalPlan::Query(QueryOp::PartialAggregate { collection, .. })
+            | PhysicalPlan::Query(QueryOp::FacetCounts { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::Upsert { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::InsertSelect {
+                target_collection: collection,
+                ..
+            })
+            | PhysicalPlan::Document(DocumentOp::Truncate { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::EstimateCount { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::Scan { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::Insert { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::Update { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::Delete { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::ResolvedUpdate { collection, .. })
+            | PhysicalPlan::Columnar(ColumnarOp::ResolvedDelete { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
+            | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::Register { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::IndexedFetch { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::DropIndex { collection, .. }) => {
+                Some(collection.as_str())
+            }
+            // Read-only resolve wrapper: it reports the wrapped ingest's
+            // collection, which is what the propose step routes on.
+            PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
+                TimeseriesOp::Scan { collection, .. }
+                | TimeseriesOp::Ingest { collection, .. } => Some(collection.as_str()),
+                TimeseriesOp::ResolveIngest(_) => None,
+            },
+            // Same shape on the graph side, and `EdgeDelete` itself reports
+            // `None` here: an edge plan is key-homed on its endpoints.
+            PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(_)) => None,
+            PhysicalPlan::Graph(GraphOp::EdgePut { .. })
+            | PhysicalPlan::Graph(GraphOp::EdgeDelete { .. })
+            | PhysicalPlan::Graph(GraphOp::Hop { .. })
+            | PhysicalPlan::Graph(GraphOp::Neighbors { .. })
+            | PhysicalPlan::Graph(GraphOp::Path { .. })
+            | PhysicalPlan::Graph(GraphOp::Subgraph { .. })
+            | PhysicalPlan::Meta(MetaOp::WalAppend { .. })
+            | PhysicalPlan::Meta(MetaOp::Cancel { .. })
+            | PhysicalPlan::Meta(MetaOp::TransactionBatch { .. })
+            | PhysicalPlan::Meta(MetaOp::CreateSnapshot)
+            | PhysicalPlan::Meta(MetaOp::Compact)
+            | PhysicalPlan::Meta(MetaOp::Checkpoint)
+            | PhysicalPlan::Graph(GraphOp::Algo { .. })
+            | PhysicalPlan::Graph(GraphOp::Match { .. })
+            | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+            | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
+            | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
+            | PhysicalPlan::Graph(GraphOp::WccSuperstep(_)) => None,
+            // Exchange: recurse into the child plan to extract the collection.
+            PhysicalPlan::Query(QueryOp::Exchange(op)) => op.child.collection(),
+            // PostProcess: recurse into the materialized input plan.
+            PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => input.collection(),
+            // ProviderScan is a catalog/constant source — no user collection.
+            PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
+            // KV ops carry their own collection (sorted-index-only ops → None).
+            PhysicalPlan::Kv(op) => op.collection(),
+            // Every CRDT op is scoped to one collection's Loro document, so the
+            // accessor is total over all 20 variants. Listing a subset here let
+            // a history read or a constraint install report `None` and lose the
+            // collection its policy, clone and metering scoping keys on.
+            PhysicalPlan::Crdt(op) => Some(op.collection().as_str()),
+            // Remaining ops carry no extractable collection. Exhaustive so a
+            // new variant forces a decision rather than silently returning None.
+            PhysicalPlan::Document(_)
+            | PhysicalPlan::Vector(_)
+            | PhysicalPlan::Graph(_)
+            | PhysicalPlan::Columnar(_)
+            | PhysicalPlan::Spatial(_)
+            | PhysicalPlan::Query(_)
+            | PhysicalPlan::Meta(_)
+            | PhysicalPlan::Array(_)
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => None,
+        }
+    }
+}
