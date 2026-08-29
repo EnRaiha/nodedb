@@ -116,12 +116,18 @@ fn is_internal_collection(name: &str) -> bool {
 ///
 /// On success, updates `session.tenant_id` from the authenticated identity.
 fn handle_auth(cmd: &RespCommand, session: &mut RespSession, state: &SharedState) -> RespValue {
+    // A missing or non-UTF-8 argument is a malformed command, not an empty
+    // credential: falling back to "" would send a blank password down the
+    // verification path and charge the caller a lockout strike for it.
     let (username, password) = match cmd.argc() {
-        1 => ("nodedb", cmd.arg_str(0).unwrap_or("")),
-        2 => (
-            cmd.arg_str(0).unwrap_or("nodedb"),
-            cmd.arg_str(1).unwrap_or(""),
-        ),
+        1 => match cmd.arg_str(0) {
+            Some(password) => ("nodedb", password),
+            None => return RespValue::err("ERR invalid password for 'auth' command"),
+        },
+        2 => match (cmd.arg_str(0), cmd.arg_str(1)) {
+            (Some(username), Some(password)) => (username, password),
+            _ => return RespValue::err("ERR invalid arguments for 'auth' command"),
+        },
         _ => return RespValue::err("ERR wrong number of arguments for 'auth' command"),
     };
 

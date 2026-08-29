@@ -61,6 +61,19 @@ impl CoreLoop {
             let (database_id, tenant_id, collection) =
                 super::restore::parse_timeseries_snapshot_key(&coll_blob.collection_key);
 
+            // The collection name is parsed out of a snapshot-supplied key and
+            // becomes the last component of the segment directory.
+            if !nodedb_types::is_plain_path_component(&collection) {
+                return Err(crate::Error::Storage {
+                    engine: "timeseries".into(),
+                    detail: format!(
+                        "restore: snapshot key '{}' yields collection name '{collection}', \
+                         which is not a plain path component",
+                        coll_blob.collection_key,
+                    ),
+                });
+            }
+
             let segment_dir = super::super::timeseries::paths::ts_collection_dir(
                 &self.data_dir,
                 database_id,
@@ -86,6 +99,36 @@ impl CoreLoop {
                             ),
                         }
                     })?;
+
+                // `dir_name` and the file names below arrive inside the
+                // snapshot blob — a Raft InstallSnapshot payload or a user
+                // RESTORE. They are joined onto `segment_dir` and one of them
+                // is handed to `remove_dir_all`, so a name that is not a single
+                // plain component would read, write, and delete outside the
+                // data directory.
+                if !nodedb_types::is_plain_path_component(&part_blob.dir_name) {
+                    return Err(crate::Error::Storage {
+                        engine: "timeseries".into(),
+                        detail: format!(
+                            "restore: snapshot for collection '{collection}' carries partition \
+                             directory name '{}', which is not a plain path component",
+                            part_blob.dir_name,
+                        ),
+                    });
+                }
+                for (filename, _) in &part_blob.files {
+                    if !nodedb_types::is_plain_path_component(filename) {
+                        return Err(crate::Error::Storage {
+                            engine: "timeseries".into(),
+                            detail: format!(
+                                "restore: snapshot partition '{}' of collection \
+                                 '{collection}' carries file name '{filename}', which is not a \
+                                 plain path component",
+                                part_blob.dir_name,
+                            ),
+                        });
+                    }
+                }
 
                 let partition_dir = segment_dir.join(&part_blob.dir_name);
 

@@ -63,9 +63,12 @@ impl AuthConfig {
         eprintln!("  ║         AUTO-GENERATED SUPERUSER PASSWORD (FIRST RUN)        ║");
         eprintln!("  ╠══════════════════════════════════════════════════════════════╣");
         eprintln!("  ║  user:     {:<50}║", self.superuser_name);
-        eprintln!("  ║  password: {generated:<50}║");
         eprintln!("  ║  saved to: {:<50}║", pw_path.display().to_string());
         eprintln!("  ║                                                              ║");
+        eprintln!("  ║  The password is written to that file with mode 0600 and is  ║");
+        eprintln!("  ║  never printed: process output reaches container logs, shell ║");
+        eprintln!("  ║  scrollback, and log shippers that no longer protect it.     ║");
+        eprintln!("  ║  Read it once, store it in your secret manager, delete it.   ║");
         eprintln!("  ║  Override via NODEDB_SUPERUSER_PASSWORD or auth config.      ║");
         eprintln!("  ╚══════════════════════════════════════════════════════════════╝");
         eprintln!();

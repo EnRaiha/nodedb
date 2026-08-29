@@ -20,7 +20,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::error::{Result, WalError};
 
@@ -43,6 +43,59 @@ pub fn fsync_directory(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn invalid_input(detail: String) -> WalError {
+    WalError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        detail,
+    ))
+}
+
+/// Reject a path that cannot be renamed within a single fsynced directory.
+///
+/// A `..` component makes the final name resolve outside the directory this
+/// module fsyncs, so the durability ordering no longer covers the entry that
+/// was created, and a name assembled from catalog or wire input can address a
+/// directory the caller never intended to write. Both are rejected here rather
+/// than left to the callers, which is why every caller passes paths it built
+/// by joining a fixed base with a single name.
+fn checked_parent<'a>(op: &str, label: &str, path: &'a Path) -> Result<&'a Path> {
+    if path.components().any(|c| c == Component::ParentDir) {
+        return Err(invalid_input(format!(
+            "{op}: {label} path contains a '..' component: {}",
+            path.display()
+        )));
+    }
+    if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
+        return Err(invalid_input(format!(
+            "{op}: {label} path does not end in a plain name: {}",
+            path.display()
+        )));
+    }
+    path.parent().ok_or_else(|| {
+        invalid_input(format!(
+            "{op}: {label} path has no parent directory: {}",
+            path.display()
+        ))
+    })
+}
+
+/// Check that `other` resolves in the same directory as `parent`.
+///
+/// `rename` is atomic only within one filesystem directory, and this module
+/// fsyncs exactly one parent, so a cross-directory pair would leave the new
+/// entry undurable even though every call returned `Ok`.
+fn same_parent(op: &str, label: &str, parent: &Path, other: &Path) -> Result<()> {
+    let other_parent = checked_parent(op, label, other)?;
+    if other_parent != parent {
+        return Err(invalid_input(format!(
+            "{op}: {label} ({}) is not in the fsynced directory {}",
+            other.display(),
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Atomically write `bytes` to `dst` via a `tmp` file with full durability.
 ///
 /// Order of operations (must not change):
@@ -53,14 +106,12 @@ pub fn fsync_directory(dir: &Path) -> Result<()> {
 ///    new name survives power loss.
 ///
 /// `tmp` and `dst` MUST be in the same directory; otherwise rename is not
-/// atomic and the parent fsync won't cover both entries.
+/// atomic and the parent fsync won't cover both entries. This is checked, not
+/// assumed: a mismatched pair, or either path containing a `..` component,
+/// returns `InvalidInput` before anything is written.
 pub fn atomic_write_fsync(tmp: &Path, dst: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = dst.parent().ok_or_else(|| {
-        WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "atomic_write_fsync: dst has no parent directory",
-        ))
-    })?;
+    let parent = checked_parent("atomic_write_fsync", "dst", dst)?;
+    same_parent("atomic_write_fsync", "tmp", parent, tmp)?;
 
     {
         let mut f = fs::File::create(tmp).map_err(WalError::Io)?;
@@ -76,16 +127,15 @@ pub fn atomic_write_fsync(tmp: &Path, dst: &Path, bytes: &[u8]) -> Result<()> {
 /// Atomically swap a directory: `rename(live, backup); rename(staged, live)`,
 /// fsyncing the parent directory once both renames have completed.
 ///
-/// `live`, `backup`, and `staged` MUST share the same parent directory. The
-/// caller is responsible for removing the backup directory once the new
-/// state is proven good — this helper does not delete anything.
+/// `live`, `backup`, and `staged` MUST share the same parent directory; this
+/// is checked, and a path outside it or containing a `..` component returns
+/// `InvalidInput` before either rename runs. The caller is responsible for
+/// removing the backup directory once the new state is proven good — this
+/// helper does not delete anything.
 pub fn atomic_swap_dirs_fsync(live: &Path, backup: &Path, staged: &Path) -> Result<()> {
-    let parent = live.parent().ok_or_else(|| {
-        WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "atomic_swap_dirs_fsync: live has no parent directory",
-        ))
-    })?;
+    let parent = checked_parent("atomic_swap_dirs_fsync", "live", live)?;
+    same_parent("atomic_swap_dirs_fsync", "backup", parent, backup)?;
+    same_parent("atomic_swap_dirs_fsync", "staged", parent, staged)?;
 
     fs::rename(live, backup).map_err(WalError::Io)?;
     fs::rename(staged, live).map_err(WalError::Io)?;
@@ -179,6 +229,63 @@ mod tests {
         assert_eq!(fs::read(live.join("marker")).unwrap(), b"new");
         assert_eq!(fs::read(backup.join("marker")).unwrap(), b"old");
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn atomic_write_fsync_rejects_cross_directory_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let dst = dir.path().join("payload.ckpt");
+        let tmp = other.join("payload.ckpt.tmp");
+
+        let err = atomic_write_fsync(&tmp, &dst, b"x").unwrap_err();
+        assert!(
+            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "cross-directory tmp must be InvalidInput, got {err:?}"
+        );
+        assert!(!dst.exists(), "nothing may be written before the check");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn atomic_write_fsync_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("sub").join("..").join("escaped.ckpt");
+        let tmp = dir.path().join("sub").join("..").join("escaped.ckpt.tmp");
+
+        let err = atomic_write_fsync(&tmp, &dst, b"x").unwrap_err();
+        assert!(
+            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "a `..` component must be InvalidInput, got {err:?}"
+        );
+        assert!(!dir.path().join("escaped.ckpt").exists());
+    }
+
+    #[test]
+    fn atomic_swap_dirs_fsync_rejects_cross_directory_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let live = dir.path().join("live");
+        let staged = dir.path().join("staged");
+        fs::create_dir(&live).unwrap();
+        fs::write(live.join("marker"), b"old").unwrap();
+        fs::create_dir(&staged).unwrap();
+
+        // `backup` outside the fsynced directory: the rename would not be
+        // covered by the single parent fsync this helper performs.
+        let backup = other.join("backup");
+        let err = atomic_swap_dirs_fsync(&live, &backup, &staged).unwrap_err();
+        assert!(
+            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "cross-directory backup must be InvalidInput, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(live.join("marker")).unwrap(),
+            b"old",
+            "live must be untouched when the check fails"
+        );
     }
 
     #[test]

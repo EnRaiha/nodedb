@@ -47,6 +47,7 @@ pub mod lsn;
 pub mod mirror;
 pub mod multi_vector;
 pub mod namespace;
+pub mod path_component;
 pub mod pg_compat;
 pub mod protocol;
 pub mod result;
@@ -110,6 +111,7 @@ pub use lsn::Lsn;
 pub use mirror::{MirrorLagRecord, MirrorMode, MirrorOrigin, MirrorStatus};
 pub use multi_vector::{MultiVector, MultiVectorError, MultiVectorScoreMode};
 pub use namespace::Namespace;
+pub use path_component::is_plain_path_component;
 pub use quota::{
     PriorityClass, PriorityClassParseError, QuotaRecord, QuotaSpec, QuotaValidationError,
 };

@@ -91,6 +91,19 @@ pub fn rewrite_partitions(
         tokio::task::spawn_blocking(move || {
             let mut rewritten = 0usize;
             for dir_name in &partitions_to_rewrite {
+                // Registry entries are generated from partition timestamps, but
+                // they are also reloaded from `partition.meta` on disk, and the
+                // name is joined onto `ts_base` and handed to `remove_dir_all`
+                // below. Reject anything that is not one plain component rather
+                // than trust the round trip.
+                if !nodedb_types::is_plain_path_component(dir_name) {
+                    tracing::warn!(
+                        collection = %collection_name,
+                        partition = %dir_name,
+                        "skipping partition rewrite: directory name is not a plain path component"
+                    );
+                    continue;
+                }
                 let partition_dir = ts_base.join(dir_name);
                 if !partition_dir.exists() {
                     continue;
