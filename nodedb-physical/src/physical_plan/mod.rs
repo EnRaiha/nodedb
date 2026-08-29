@@ -221,10 +221,6 @@ impl PhysicalPlan {
             PhysicalPlan::Document(DocumentOp::PointGet { collection, .. })
             | PhysicalPlan::Vector(VectorOp::Search { collection, .. })
             | PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::Read { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::PreviewApply { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { collection, .. })
             | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
@@ -248,8 +244,6 @@ impl PhysicalPlan {
                 ..
             })
             | PhysicalPlan::Graph(GraphOp::RagFusion { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::SetPolicy { collection, .. })
-            | PhysicalPlan::Crdt(CrdtOp::GetPolicy { collection, .. })
             | PhysicalPlan::Vector(VectorOp::SetParams { collection, .. })
             | PhysicalPlan::Text(TextOp::Search { collection, .. })
             | PhysicalPlan::Text(TextOp::PhraseSearch { collection, .. })
@@ -321,6 +315,11 @@ impl PhysicalPlan {
             PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
             // KV ops carry their own collection (sorted-index-only ops → None).
             PhysicalPlan::Kv(op) => op.collection(),
+            // Every CRDT op is scoped to one collection's Loro document, so the
+            // accessor is total over all 20 variants. Listing a subset here let
+            // a history read or a constraint install report `None` and lose the
+            // collection its policy, clone and metering scoping keys on.
+            PhysicalPlan::Crdt(op) => Some(op.collection().as_str()),
             // Remaining ops carry no extractable collection. Exhaustive so a
             // new variant forces a decision rather than silently returning None.
             PhysicalPlan::Document(_)
@@ -328,7 +327,6 @@ impl PhysicalPlan {
             | PhysicalPlan::Graph(_)
             | PhysicalPlan::Columnar(_)
             | PhysicalPlan::Spatial(_)
-            | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)

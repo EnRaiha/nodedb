@@ -7,8 +7,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::session::read_set::{EngineTag, ReadKey};
 use crate::types::KeyRepr;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp, SpatialOp, TextOp,
-    TimeseriesOp, VectorOp,
+    ColumnarOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
+    VectorOp,
 };
 
 /// Extract the collection name from a physical plan (if applicable).
@@ -17,11 +17,6 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Document(DocumentOp::PointGet { collection, .. })
         | PhysicalPlan::Vector(VectorOp::Search { collection, .. })
         | PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::Read { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::PreviewApply { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::DocUpsert { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::DocDelete { collection, .. })
         | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })
@@ -45,8 +40,6 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
             ..
         })
         | PhysicalPlan::Graph(GraphOp::RagFusion { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::SetPolicy { collection, .. })
-        | PhysicalPlan::Crdt(CrdtOp::GetPolicy { collection, .. })
         | PhysicalPlan::Vector(VectorOp::SetParams { collection, .. })
         | PhysicalPlan::Text(TextOp::Search { collection, .. })
         | PhysicalPlan::Text(TextOp::PhraseSearch { collection, .. })
@@ -122,6 +115,12 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
         // KV ops carry their own collection (sorted-index-only ops return None).
         PhysicalPlan::Kv(op) => op.collection(),
+        // Every CRDT op is scoped to exactly one collection's Loro document,
+        // so all 20 variants carry a `collection` and the accessor is total.
+        // Reporting `None` for any of them would silently drop RLS injection,
+        // redaction refusal, clone read/write interception, read-set tracking
+        // and metering for that op.
+        PhysicalPlan::Crdt(op) => Some(op.collection().as_str()),
         // Read-only resolve wrapper: it reports the wrapped ingest's collection.
         PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
             TimeseriesOp::Scan { collection, .. } | TimeseriesOp::Ingest { collection, .. } => {
@@ -136,7 +135,6 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Columnar(_)
         | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)

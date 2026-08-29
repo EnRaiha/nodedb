@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! CRDT engine operations dispatched to the Data Plane.
+//! The CRDT operation enum — the wire shape and nothing else.
 
 use nodedb_types::{QualifiedCollection, Surrogate};
 
-use super::ReturningSpec;
+use crate::physical_plan::document::ReturningSpec;
 
 /// CRDT engine physical operations.
 #[derive(
