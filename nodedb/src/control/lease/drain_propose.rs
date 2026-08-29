@@ -2,36 +2,21 @@
 
 //! Descriptor lease drain proposer flow.
 //!
-//! Wraps the replicated `DescriptorDrainStart` / `DescriptorDrainEnd`
-//! raft path with a synchronous wait loop:
+//! 1. Propose `DescriptorDrainStart`. Every node's applier installs it into
+//!    `shared.lease_drain`, so `force_refresh_lease` then rejects new acquires
+//!    at the drained version.
+//! 2. Poll `metadata_cache.leases` for entries on the same descriptor at
+//!    `version <= up_to_version`. Return once none remain.
+//! 3. On deadline, propose `DescriptorDrainEnd` so the cluster can progress,
+//!    then return the timeout error.
 //!
-//! 1. Propose `DescriptorDrainStart(id, up_to_version, expires_at)`
-//!    through the metadata raft group. Every node's applier installs
-//!    the drain entry into `shared.lease_drain`, so a subsequent
-//!    `force_refresh_lease` on any node rejects new acquires at the
-//!    drained version.
-//! 2. Poll `metadata_cache.leases` every 50ms, filtering for
-//!    entries on the same descriptor at `version <= up_to_version`.
-//!    Return `Ok(())` once the filtered set is empty.
-//! 3. On deadline, propose `DescriptorDrainEnd(id)` explicitly so
-//!    the cluster can make progress, then return
-//!    `Err::Config { "drain timed out" }`.
+//! The happy path emits no `DescriptorDrainEnd`: the following `Put*` carries
+//! the new version and the applier's post-apply hook calls `install_end` on
+//! every node. That saves a raft round-trip per DDL.
 //!
-//! On the happy path, the `DescriptorDrainEnd` raft entry is NOT
-//! emitted: the subsequent `Put*` raft entry carries the new
-//! descriptor version, and the metadata applier's post-apply hook
-//! calls `shared.lease_drain.install_end` implicitly on every node.
-//! This saves one raft round-trip per DDL on the common path.
-//!
-//! ## Rolling upgrade
-//!
-//! The `MetadataEntry::DescriptorDrainStart` / `End` variants are
-//! wire-format v4. Mixed clusters running v3 binaries can't decode
-//! them, so the proposer gates on
-//! `cluster_version_view().can_activate_feature(DESCRIPTOR_DRAIN_VERSION)`
-//! and returns `Ok(())` immediately in compat mode — the same
-//! "degrade to no drain" fallback catalog DDL uses. Mixed clusters
-//! behave without drain safety until all nodes are upgraded.
+//! The drain variants are wire-format v4, so mixed clusters gate on
+//! `DESCRIPTOR_DRAIN_VERSION` and run without drain safety until every node is
+//! upgraded.
 
 use std::time::{Duration, Instant};
 use tokio::runtime::RuntimeFlavor;
@@ -43,35 +28,22 @@ use crate::control::rolling_upgrade::DESCRIPTOR_DRAIN_VERSION;
 use crate::control::state::SharedState;
 use crate::error::Error;
 
-/// How often the drain wait loop re-polls `metadata_cache.leases`
-/// to check whether the in-flight leases have drained.
+/// Re-poll interval for the drain wait loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Grace period added on top of the configured lease duration
-/// when computing the `expires_at` stamped onto a drain entry.
-/// `is_draining` does not read this value (see `lease::drain`) —
-/// it is retained on the entry for observability only, so this
-/// grace period has no effect on when a drain actually clears.
+/// Grace added to the lease duration for the `expires_at` stamped on a drain
+/// entry. `is_draining` never reads it, so it affects observability only.
 const DRAIN_TTL_GRACE: Duration = Duration::from_secs(30);
 
-/// Orchestrate a full drain for a `Put*` DDL on the descriptor
-/// identified by `id`, targeting prior version `up_to_version`.
+/// Drain every lease on `id` at `version <= up_to_version` for a `Put*` DDL.
 ///
-/// Returns `Ok(())` when every lease at `version <= up_to_version`
-/// has drained from `shared.metadata_cache.leases`, or when the
-/// rolling-upgrade gate is closed (compat mode). Returns an error
-/// on timeout, on propose failures, or if `prior_version == 0`
-/// does not apply (callers should skip the call entirely for
-/// creates).
+/// Returns `Ok(())` once they have drained, or immediately when the
+/// rolling-upgrade gate is closed. Errors on timeout or propose failure.
 ///
-/// `own_holds` is the count of `(id, version <= up_to_version)` refcount
-/// units the REQUESTING transaction itself holds — pass `0` for a caller
-/// with no transactional lease scope of its own (e.g. a bare, unbuffered
-/// DDL statement). A transaction that both alters a descriptor and holds a
-/// statement-time lease on that same descriptor (a buffered write to the
-/// collection it is altering) cannot wait on its own hold; `own_holds` lets
-/// the wait exclude exactly that many units rather than wedging until the
-/// caller's own transaction releases a lease it cannot release until this
+/// `own_holds` is how many of those refcount units the requesting transaction
+/// holds itself — `0` for a caller with no lease scope of its own. A
+/// transaction altering a descriptor it also holds a statement-time lease on
+/// cannot wait for its own hold: it cannot release that lease until this
 /// call returns.
 pub fn drain_for_ddl(
     shared: &SharedState,
@@ -93,17 +65,12 @@ pub fn drain_for_ddl(
         }
     }
 
-    // Nothing to drain: no prior version means no lease could
-    // have been acquired against this descriptor. Callers SHOULD
-    // skip the call in that case but the guard is cheap.
+    // No prior version means no lease can exist. Callers skip this case
+    // already; the guard is cheap.
     if up_to_version == 0 {
         return Ok(());
     }
 
-    // Propose DrainStart. Every node's applier sees it and
-    // installs into `shared.lease_drain`, so a subsequent
-    // `force_refresh_lease` on any node rejects new acquires at
-    // the drained version.
     let now_hlc = shared.hlc_clock.now();
     let ttl_ns: u64 = (max_wait + DRAIN_TTL_GRACE)
         .as_nanos()
@@ -121,17 +88,12 @@ pub fn drain_for_ddl(
         "drain_start",
     )?;
 
-    // Wait for matching leases to drain.
     match poll_leases_drained(shared, &id, up_to_version, max_wait, own_holds) {
         Ok(()) => Ok(()),
         Err(e) => {
-            // Timeout or other failure: emit DrainEnd explicitly
-            // so the cluster isn't stuck rejecting acquires at
-            // this version. `is_draining` has no wall-clock
-            // expiry backstop (see `lease::drain`), so this
-            // explicit propose is the only way the drain clears
-            // if the wait above timed out — log and ignore
-            // errors from the cleanup propose itself.
+            // `is_draining` has no expiry backstop, so this explicit propose
+            // is the only thing that clears the drain after a timeout. Its own
+            // errors are logged and dropped.
             if let Err(cleanup_err) = propose_drain(
                 shared,
                 MetadataEntry::DescriptorDrainEnd {
@@ -149,22 +111,17 @@ pub fn drain_for_ddl(
     }
 }
 
-/// Wait until `metadata_cache.leases` and in-flight admission reservations
-/// have no entries on `id` at `version <= up_to_version`. Polls every
-/// [`POLL_INTERVAL`] until the deadline.
+/// Wait until no lease or admission reservation remains on `id` at
+/// `version <= up_to_version`, polling every [`POLL_INTERVAL`].
 ///
-/// Stays sync on purpose. The replicated-DDL layer this sits under
-/// (`metadata_proposer`) is deliberately synchronous because pgwire DDL
-/// handlers are sync, so an `async fn` here would have to ripple through
-/// every catalog-DDL call site and would strand the genuinely sync callers
-/// (GC sweeper, clone materializer, backup restore).
+/// Sync on purpose: `metadata_proposer` beneath it is sync because pgwire DDL
+/// handlers are, so an `async fn` here would ripple through every catalog-DDL
+/// call site and strand the sync callers (GC sweeper, clone materializer,
+/// backup restore).
 ///
-/// It is nonetheless reached from async tasks — e.g. the ILP batch flush
-/// path runs `persist_collection_replicated` -> `propose_catalog_entry` ->
-/// here from a tokio worker. Parking that worker for the whole drain can
-/// delay the very lease-release and raft-apply work the drain is waiting
-/// on, so the wait is handed back to tokio for its duration, exactly as
-/// the sibling apply wait in `propose_drain` does.
+/// Async tasks still reach it, so on a multi-thread runtime the wait goes back
+/// to tokio — parking a worker for the whole drain can delay the very
+/// lease-release and raft-apply work it is waiting on.
 pub(crate) fn poll_leases_drained(
     shared: &SharedState,
     id: &DescriptorId,
@@ -172,11 +129,8 @@ pub(crate) fn poll_leases_drained(
     max_wait: Duration,
     own_holds: u32,
 ) -> Result<(), Error> {
-    // `block_in_place` panics on the current-thread runtime and buys
-    // nothing without a worker pool to hand the parked work to, so it is
-    // used only where it is both legal and meaningful. Off a multi-thread
-    // runtime the loop blocks the calling thread, which is what a sync
-    // caller already expects.
+    // `block_in_place` panics on the current-thread runtime and has no worker
+    // pool to hand the parked work to, so it is used only where it is legal.
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| {
@@ -187,9 +141,8 @@ pub(crate) fn poll_leases_drained(
     }
 }
 
-/// The drain wait loop itself. Split out so the convergence condition and
-/// deadline handling are identical on both the `block_in_place` and the
-/// plain-sync path above.
+/// The wait loop itself, split out so the convergence condition and deadline
+/// handling are identical on both paths above.
 fn wait_for_lease_drain(
     shared: &SharedState,
     id: &DescriptorId,
@@ -216,37 +169,32 @@ fn wait_for_lease_drain(
     }
 }
 
-/// Count metadata leases and admission reservations on `id` at
-/// `version <= up_to_version`. `0` means the drain target has cleared. The
-/// exact nonzero diagnostic count is not significant, so saturate rather than
-/// risking arithmetic overflow.
+/// Count leases and admission reservations on `id` at `version <=
+/// up_to_version`. `0` means the drain has cleared; a nonzero value is
+/// diagnostic only, so it saturates rather than overflowing.
 ///
-/// Leases held by nodes that are no longer cluster members are ignored, as are
-/// leases past their `expires_at`: a crashed node can never release its leases
-/// (no SIGTERM path runs), so without this filter every DDL on those
-/// descriptors would wedge on the drain wait forever. The membership filter is
-/// fail-safe — a missing topology treats every holder as a member.
+/// Leases from non-member nodes and leases past `expires_at` are both ignored.
+/// A crashed node never releases its leases (no SIGTERM path runs), so without
+/// these filters every DDL on those descriptors wedges forever. Missing
+/// topology treats every holder as a member — the filter only drops holds it
+/// is certain about.
 ///
 /// Dropping an expired lease is safe because a live holder never has one: the
-/// renewal loop re-acquires any lease approaching expiry, so an expired record
-/// means that node's renewal stopped. A live hold on THIS node is counted
-/// separately through `lease_refcount`, below, and is unaffected by expiry.
+/// renewal loop re-acquires before expiry, so an expired record means that
+/// node's renewal stopped. A live hold on THIS node is counted through
+/// `lease_refcount` and is unaffected by expiry.
 ///
-/// Expiry is compared against wall time, not [`HlcClock::peek`], for the same
-/// reason the renewal loop is (see `lease::renewal::tick`): `peek` returns the
-/// last HLC the clock observed, which on a quiet cluster stays frozen where the
-/// lease was stamped. Comparing against a frozen clock would find every lease
-/// unexpired and reinstate exactly the wedge this filter removes — and an
-/// idle cluster is precisely the case where a crashed node's leases are the
-/// only ones left. `expires_at.wall_ns` was computed from real wall time when
-/// the lease was stamped, so both sides of the comparison stay in one frame.
+/// Expiry compares against wall time, not [`HlcClock::peek`]: `peek` stays
+/// frozen on a quiet cluster, which would find every lease unexpired and
+/// reinstate the wedge — and an idle cluster is exactly when a crashed node's
+/// leases are the only ones left. `expires_at.wall_ns` is stamped from
+/// `HlcClock::now()`, local wall time held monotonic; a peer's HLC is never
+/// merged in, so for a lease granted elsewhere the comparison carries that
+/// node's clock offset, unbounded.
 ///
-/// `own_holds` excludes that many local refcount units — the requesting
-/// transaction's own — from both the local-refcount safety net AND this
-/// node's own replicated cache entry, but ONLY once no other local holder
-/// remains: a different session on this same node still blocks normally.
-/// `own_holds == 0` (every caller except the requester's own DDL) reduces to
-/// the exact original comparison.
+/// `own_holds` excludes that many local refcount units — the requester's own —
+/// from both the refcount safety net and this node's replicated cache entry,
+/// but only once no other local holder remains.
 fn count_matching_leases(
     shared: &SharedState,
     id: &DescriptorId,
@@ -286,9 +234,8 @@ fn count_matching_leases(
     }
 }
 
-/// Whether `node_id` is a current cluster member. Missing topology
-/// (single-node / not yet wired) treats every holder as member —
-/// fail-safe: this filter only ever drops holds it is certain about.
+/// Whether `node_id` is a current cluster member. Missing topology treats
+/// every holder as a member.
 fn lease_holder_is_member(shared: &SharedState, node_id: u64) -> bool {
     match &shared.cluster_topology {
         Some(topo) => topo
@@ -299,22 +246,17 @@ fn lease_holder_is_member(shared: &SharedState, node_id: u64) -> bool {
     }
 }
 
-/// Encode + propose a drain variant through the shared
-/// `metadata_proposer` helper, blocking until the local
-/// applied-index watcher confirms the entry has been applied on
-/// this node. Mirrors `lease::propose_and_wait` — extracted here
-/// because drain variants are not `CatalogDdl` and go through a
-/// different encode path.
+/// Encode and propose a drain variant, blocking until the applied-index
+/// watcher confirms it applied locally. Separate from `lease::propose_and_wait`
+/// because drain variants are not `CatalogDdl` and encode differently.
 fn propose_drain(
     shared: &SharedState,
     entry: MetadataEntry,
     operation: &'static str,
 ) -> Result<(), Error> {
     let Some(handle) = shared.metadata_raft.get() else {
-        // Single-node fallback: apply drain directly to the local
-        // tracker by wrapping the entry in the same code path the
-        // applier uses. This keeps single-node DDL tests honest:
-        // they exercise drain state even without a real raft loop.
+        // Single-node fallback: apply through the same path the applier uses,
+        // so drain state is exercised without a raft loop.
         apply_drain_locally(shared, &entry);
         return Ok(());
     };
@@ -338,10 +280,8 @@ fn propose_drain(
     Ok(())
 }
 
-/// Single-node fallback: apply a drain variant directly to the
-/// local tracker without going through raft. Single-node clusters
-/// still install drains so DDL handlers that call `drain_for_ddl`
-/// observe consistent semantics regardless of deployment mode.
+/// Apply a drain variant to the local tracker without raft, so `drain_for_ddl`
+/// has the same semantics in every deployment mode.
 fn apply_drain_locally(shared: &SharedState, entry: &MetadataEntry) {
     match entry {
         MetadataEntry::DescriptorDrainStart {
@@ -349,9 +289,8 @@ fn apply_drain_locally(shared: &SharedState, entry: &MetadataEntry) {
             up_to_version,
             expires_at,
         } => {
-            // Shares plan admission's gate: either an admission completes with
-            // a refcount/lease before this start installs, or this drain wins
-            // and subsequent admission fails closed.
+            // Shares plan admission's gate: an admission completes before this
+            // start installs, or this drain wins and admission fails closed.
             let _admission_gate = shared
                 .lease_admission_gate
                 .lock()
@@ -366,9 +305,6 @@ fn apply_drain_locally(shared: &SharedState, entry: &MetadataEntry) {
         _ => {}
     }
 }
-
-// `descriptor_id_for_implicit_clear` and `descriptor_id_and_prior_version`
-// moved to `descriptor_lookup.rs`; re-exported from `lease::mod`.
 
 #[cfg(test)]
 mod tests {
@@ -451,10 +387,10 @@ mod tests {
             );
     }
 
-    /// A lease expiry a minute into the future, in REAL wall time — the same
-    /// frame the grant path stamps in. Deriving these from `hlc_clock.peek()`
-    /// would put both the fixture and the code under test in one frozen frame
-    /// and the assertions would hold whatever the comparison did.
+    /// A minute into the future in REAL wall time — the frame the grant path
+    /// stamps in. Deriving it from `hlc_clock.peek()` would put fixture and
+    /// code under test in one frozen frame, and the assertion would prove
+    /// nothing.
     fn unexpired() -> nodedb_types::Hlc {
         nodedb_types::Hlc::new(
             super::super::wall_now_ns().saturating_add(60_000_000_000),
@@ -509,15 +445,10 @@ mod tests {
         assert_eq!(count_matching_leases(&state, &descriptor, 1, 0), 0);
     }
 
-    /// A lease whose expiry has passed in REAL time must stop blocking the
-    /// drain even when this node's HLC has not advanced.
-    ///
-    /// `HlcClock::peek` returns the last HLC the clock observed and never
-    /// advances on its own, so on a quiet node it sits far behind wall time —
-    /// at `Hlc::ZERO` if nothing has stamped it at all. Comparing expiry
-    /// against it finds every lease unexpired and reinstates the wedge. An idle
-    /// cluster is exactly the case that matters: a crashed node's leases are
-    /// then the only ones left, and nothing is generating HLC events.
+    /// An expired lease must stop blocking the drain even when this node's HLC
+    /// has not advanced. `peek` never advances on its own, so on a quiet node
+    /// it sits at `Hlc::ZERO` — and a quiet cluster is exactly when a crashed
+    /// node's leases are the only ones left.
     #[tokio::test]
     async fn expired_lease_stops_blocking_even_with_an_unadvanced_hlc() {
         let directory = tempfile::tempdir().expect("create drain count test directory");
@@ -532,8 +463,7 @@ mod tests {
             .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // The HLC is untouched, so `peek()` is still at zero while wall time is
-        // decades ahead of it.
+        // Untouched HLC: `peek()` is at zero while wall time is decades ahead.
         assert_eq!(
             state.hlc_clock.peek().wall_ns,
             0,
@@ -548,10 +478,9 @@ mod tests {
         );
     }
 
-    /// The other direction: an HLC dragged ahead of wall time by a peer with a
-    /// skewed clock must not make a LIVE lease look expired. Dropping a live
-    /// hold would let the DDL proceed underneath a holder still using the
-    /// descriptor — trading a wedge for a correctness bug.
+    /// The other direction: an HLC dragged past wall time must not make a live
+    /// lease look expired. Dropping a live hold lets the DDL proceed under a
+    /// holder still using the descriptor.
     #[tokio::test]
     async fn a_live_lease_still_blocks_when_the_hlc_runs_ahead_of_wall_time() {
         let directory = tempfile::tempdir().expect("create drain count test directory");
@@ -566,8 +495,7 @@ mod tests {
             .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // A peer stamps an HLC an hour ahead of real time; the local clock
-        // folds it in and now reads far past every live lease's expiry.
+        // An HLC an hour ahead of real time, folded into the local clock.
         let skewed = nodedb_types::Hlc::new(
             super::super::wall_now_ns().saturating_add(3_600_000_000_000),
             0,
@@ -597,17 +525,14 @@ mod tests {
             .cluster_topology = Some(Arc::new(std::sync::RwLock::new(topo_with(&[1]))));
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // A live member's unexpired lease still blocks the drain — the
-        // membership/expiry filters must never mask real holds.
+        // The membership and expiry filters must never mask a real hold.
         insert_lease(&state, &descriptor, 1, 1, unexpired());
         assert_eq!(count_matching_leases(&state, &descriptor, 1, 0), 1);
     }
 
-    /// Pins the self-drain fix: a transaction altering its own descriptor
-    /// while it still holds a statement-time lease on that same descriptor
-    /// (a buffered write to the collection it is altering) must not wait on
-    /// its own hold — both the local refcount AND this node's own
-    /// replicated cache entry are excluded once `own_holds` accounts for
+    /// A transaction altering a descriptor it still holds a statement-time
+    /// lease on must not wait on its own hold. Both the refcount and this
+    /// node's replicated cache entry are excluded once `own_holds` covers
     /// everything left locally.
     #[tokio::test]
     async fn own_holds_excludes_the_requesters_own_sole_local_hold() {
@@ -620,8 +545,7 @@ mod tests {
         let state = SharedState::new(dispatcher, wal).expect("construct drain count state");
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // The requesting transaction's own statement-time hold: refcount AND
-        // this node's own replicated cache entry.
+        // The requester's own statement-time hold: refcount and cache entry.
         state.lease_refcount.increment(&descriptor, 1);
         insert_lease(&state, &descriptor, state.node_id, 1, unexpired());
 
@@ -637,9 +561,8 @@ mod tests {
         );
     }
 
-    /// The exclusion is precise: a DIFFERENT session's hold on the same
-    /// node still blocks even after the requester's own contribution is
-    /// excluded.
+    /// A different session's hold on the same node still blocks after the
+    /// requester's own contribution is excluded.
     #[tokio::test]
     async fn own_holds_does_not_mask_a_different_local_holder() {
         let directory = tempfile::tempdir().expect("create drain count test directory");
@@ -651,9 +574,8 @@ mod tests {
         let state = SharedState::new(dispatcher, wal).expect("construct drain count state");
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
 
-        // Two local holds: one is the requester's own (excluded), one
-        // belongs to a different session on the same node (must still
-        // block).
+        // Two local holds: the requester's own (excluded) and a different
+        // session's on the same node (must still block).
         state.lease_refcount.increment(&descriptor, 1);
         state.lease_refcount.increment(&descriptor, 1);
         insert_lease(&state, &descriptor, state.node_id, 1, unexpired());
