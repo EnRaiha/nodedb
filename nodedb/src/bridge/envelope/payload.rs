@@ -8,8 +8,6 @@ use std::sync::Arc;
 /// Response payload: heap-allocated bytes behind an `Arc<[u8]>`.
 ///
 /// The `Deref<Target=[u8]>` impl provides transparent byte access.
-/// Slab-backed zero-copy transport is defined in `super::slab` and will be
-/// wired in once the Data Plane slab pool is integrated.
 #[derive(Debug, Clone)]
 pub enum Payload {
     /// Heap-allocated payload.

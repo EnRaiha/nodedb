@@ -4,7 +4,6 @@ pub mod admission_chokepoint;
 pub mod dispatch;
 pub mod envelope;
 pub mod quiesce;
-pub mod slab;
 
 // Re-export shared query engine from nodedb-query crate.
 // Origin's internal code continues to use `crate::bridge::expr_eval`,
