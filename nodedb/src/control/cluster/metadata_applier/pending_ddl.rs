@@ -10,7 +10,7 @@
 //! with no pending record, is a no-op. Raft replay relies on exactly that
 //! shape.
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use nodedb_cluster::{MetadataEntry, PendingDdlObject};
 use nodedb_types::Hlc;
@@ -32,6 +32,22 @@ impl MetadataCommitApplier {
         let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
             return Ok(());
         };
+        // `proposed_at` is the only remote HLC observation the metadata group
+        // carries — every other `Hlc` on a `MetadataEntry` is a future
+        // deadline, and folding one would jump this node's clock forward.
+        //
+        // The entry is already committed, so a refused fold must not stop the
+        // apply: refusing to move the clock IS the protection. Applying still
+        // has to happen or the state machine wedges.
+        if let Err(skew) = shared.hlc_clock.update_checked(proposed_at) {
+            error!(
+                token,
+                skew_ms = skew.skew_ns / 1_000_000,
+                remote_wall_ns = skew.remote_wall_ns,
+                local_wall_ns = skew.local_wall_ns,
+                "refusing to fold a proposer's HLC: {skew}"
+            );
+        }
         shared
             .pending_ddl
             .insert(token, objects.to_vec(), proposed_at);

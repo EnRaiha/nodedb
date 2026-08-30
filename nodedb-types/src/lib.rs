@@ -95,7 +95,7 @@ pub use dropped_collection::DroppedCollection;
 pub use error::NodeDbError;
 pub use filter::{EdgeFilter, MetadataFilter};
 pub use graph::{Direction, GraphStats};
-pub use hlc::{Hlc, HlcClock};
+pub use hlc::{ClockSkew, Hlc, HlcClock, MAX_CLOCK_SKEW_NS};
 pub use hnsw::{HnswCheckpoint, HnswNodeSnapshot, HnswParams};
 pub use id::{
     CollectionId, DatabaseId, DocumentId, EdgeId, EdgeIdParseError, IdError, IdType, NodeId,

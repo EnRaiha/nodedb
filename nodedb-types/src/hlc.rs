@@ -16,6 +16,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// How far ahead of local wall time a remote HLC may be before it is refused.
+///
+/// A node whose clock is further ahead than this is misconfigured, and folding
+/// its timestamp in would move this node's clock permanently. Five seconds
+/// absorbs ordinary NTP disagreement while staying far below the descriptor
+/// drain timeout, which must outlast any skew this admits.
+pub const MAX_CLOCK_SKEW_NS: u64 = 5_000_000_000;
+
+/// A remote HLC refused for running too far ahead of local wall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockSkew {
+    /// The remote observation's wall clock, in nanoseconds since the epoch.
+    pub remote_wall_ns: u64,
+    /// This node's wall clock when the observation arrived.
+    pub local_wall_ns: u64,
+    /// How far ahead the remote clock ran.
+    pub skew_ns: u64,
+}
+
+impl std::fmt::Display for ClockSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "remote HLC wall clock is {}ms ahead of local (remote {}ns, local {}ns); \
+             the maximum accepted skew is {}ms",
+            self.skew_ns / 1_000_000,
+            self.remote_wall_ns,
+            self.local_wall_ns,
+            MAX_CLOCK_SKEW_NS / 1_000_000
+        )
+    }
+}
+
+impl std::error::Error for ClockSkew {}
+
 /// Hybrid Logical Clock timestamp.
 ///
 /// `#[non_exhaustive]` — a `epoch_id` discriminant for multi-cluster
@@ -124,6 +159,29 @@ impl HlcClock {
         next
     }
 
+    /// Fold a remote HLC into the local clock, refusing one whose wall clock
+    /// runs further ahead than [`MAX_CLOCK_SKEW_NS`].
+    ///
+    /// [`Self::update`] takes an unconditional `max`, so a single far-future
+    /// observation drags this node's clock forward permanently and every
+    /// later local timestamp inherits the error. Every remote HLC crossing a
+    /// node boundary goes through this, never `update`.
+    ///
+    /// Returns the skew in nanoseconds on refusal, so the caller can name the
+    /// offending peer.
+    pub fn update_checked(&self, remote: Hlc) -> Result<Hlc, ClockSkew> {
+        let wall = wall_now_ns();
+        let skew = remote.wall_ns.saturating_sub(wall);
+        if skew > MAX_CLOCK_SKEW_NS {
+            return Err(ClockSkew {
+                remote_wall_ns: remote.wall_ns,
+                local_wall_ns: wall,
+                skew_ns: skew,
+            });
+        }
+        Ok(self.update(remote))
+    }
+
     /// Read the last observed HLC without advancing.
     pub fn peek(&self) -> Hlc {
         *self.state.lock().unwrap_or_else(|p| p.into_inner())
@@ -150,6 +208,45 @@ fn wall_now_ns() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A remote HLC within the bound is folded exactly as `update` would.
+    #[test]
+    fn a_remote_hlc_inside_the_bound_is_accepted() {
+        let clock = HlcClock::new();
+        let local = clock.now();
+        let remote = Hlc::new(local.wall_ns + 1_000_000, 0);
+        let folded = clock
+            .update_checked(remote)
+            .expect("a remote clock 1ms ahead is ordinary skew");
+        assert!(folded > remote, "the fold must exceed the observation");
+        assert!(clock.peek() >= folded);
+    }
+
+    /// A remote HLC past the bound is refused, and the clock does not move.
+    #[test]
+    fn a_remote_hlc_past_the_bound_is_refused_without_moving_the_clock() {
+        let clock = HlcClock::new();
+        let before = clock.peek();
+        let far_future = Hlc::new(wall_now_ns() + MAX_CLOCK_SKEW_NS * 4, 0);
+        let err = clock
+            .update_checked(far_future)
+            .expect_err("a clock four times the bound ahead must be refused");
+        assert!(err.skew_ns > MAX_CLOCK_SKEW_NS);
+        assert!(
+            clock.peek() < far_future,
+            "a refused observation must never advance the clock"
+        );
+        assert!(clock.peek() >= before);
+    }
+
+    /// A remote HLC behind local wall time is always in bounds — skew only
+    /// bounds the future direction.
+    #[test]
+    fn a_remote_hlc_in_the_past_is_never_refused() {
+        let clock = HlcClock::new();
+        let past = Hlc::new(wall_now_ns().saturating_sub(MAX_CLOCK_SKEW_NS * 10), 0);
+        assert!(clock.update_checked(past).is_ok());
+    }
     use super::*;
 
     #[test]

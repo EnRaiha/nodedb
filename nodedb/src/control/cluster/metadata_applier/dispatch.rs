@@ -722,4 +722,54 @@ mod tests {
             "a no-op applies no catalog entry"
         );
     }
+
+    /// Wall clock in nanoseconds since the epoch, matching what `HlcClock`
+    /// compares a remote observation against.
+    fn now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
+    /// A proposer's `proposed_at` must advance this node's clock, so a later
+    /// local stamp is causally after the remote DDL that preceded it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proposers_hlc_advances_the_local_clock() {
+        let (applier, state, _tmp) = make_applier_with_shared();
+        let ahead = Hlc::new(now_ns() + 500_000_000, 0);
+        let propose = MetadataEntry::DdlPendingPropose {
+            token: 9,
+            objects: vec![pending_create_object("hlc_fold")],
+            proposed_at: ahead,
+        };
+        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert!(
+            state.hlc_clock.peek() >= ahead,
+            "the local clock must absorb a proposer's observation"
+        );
+    }
+
+    /// A proposer whose clock runs far ahead must not drag this node forward.
+    /// The entry still applies — it is already committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_far_future_proposer_hlc_is_refused_but_the_entry_still_applies() {
+        let (applier, state, _tmp) = make_applier_with_shared();
+        let far = Hlc::new(now_ns() + nodedb_types::MAX_CLOCK_SKEW_NS * 10, 0);
+        let propose = MetadataEntry::DdlPendingPropose {
+            token: 11,
+            objects: vec![pending_create_object("hlc_skew")],
+            proposed_at: far,
+        };
+        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert!(
+            state.hlc_clock.peek() < far,
+            "a skewed proposer must never move this node's clock"
+        );
+        assert!(
+            state.pending_ddl.contains(11),
+            "the committed entry must still apply — refusing the fold is the \
+             protection, wedging the state machine is not"
+        );
+    }
 }
