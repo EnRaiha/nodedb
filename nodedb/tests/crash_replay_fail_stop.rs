@@ -90,13 +90,13 @@ async fn replay_readiness_gate_failure_fails_the_boot() {
     );
     // The dead core is reported by the schema-register barrier, not by the
     // replay-done signal: `rehydrate_schema_registry` dispatches to the Data
-    // Plane before `await_cluster_ready` reaches its replay wait, so the
-    // barrier's deadline is what observes the core is gone. Pinning the
-    // barrier message keeps this test honest about which gate actually fires.
+    // Plane before `await_cluster_ready` reaches its replay wait. The barrier
+    // fails fast — the dispatcher's dead-core sweep synthesises an error for
+    // every outstanding request rather than letting the deadline expire.
     assert!(
-        log.contains("schema register barrier timeout on core 0"),
+        log.contains("core-0 is gone; the request can never be executed"),
         "the server fail-stopped, but not through the dead-core path this test targets — \
-         the schema-register barrier timeout naming the unreachable core is missing.\n\
+         the schema-register barrier's dead-core error is missing.\n\
          Server output:\n{log}"
     );
 }

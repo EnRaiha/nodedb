@@ -147,8 +147,12 @@ async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
     for collection in ["replay_kv", "replay_doc", "replay_ts"] {
         let live = count_rows(&h, collection).await;
         assert_eq!(
-            live, ROWS as u64,
-            "{collection} must hold {ROWS} rows before the crash (test-setup sanity), got {live}"
+            live,
+            ROWS as u64,
+            "{collection} must hold {ROWS} rows before the crash (test-setup sanity), got \
+             {live}. An over-count means one acknowledged INSERT applied twice — only the \
+             PK-less timeseries can gain a row that way.\nServer log:\n{}",
+            diagnostics::log_tail_section(&h.server_log())
         );
     }
 
