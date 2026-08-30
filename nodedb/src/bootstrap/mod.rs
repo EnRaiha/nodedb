@@ -4,6 +4,7 @@ pub mod background_loops;
 pub mod catalog_open;
 pub mod cluster_ready;
 pub mod constraint_reconcile;
+pub mod core_stall_monitor;
 pub mod credentials;
 pub mod data_group_recovery;
 pub mod data_plane;

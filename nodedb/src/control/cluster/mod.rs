@@ -8,6 +8,8 @@
 //! - [`init`] — cluster startup (transport, catalog, bootstrap/join/restart).
 //! - [`start_raft`] — Raft event loop + RPC server + applier wiring.
 //! - [`handle`] — the `ClusterHandle` passed between init and start_raft.
+//! - [`core_stall`] — samples every Data Plane core's event-loop
+//!   liveness counter and marks the cores that stopped advancing.
 //! - [`decommission_bridge`] — drives `nodedb-cluster`'s per-node
 //!   decommission signal into this process's `ShutdownWatch`.
 //! - [`spsc_applier`] — committed data-group entries → SPSC bridge.
@@ -24,6 +26,7 @@ pub mod array_executor;
 pub mod boot_restore;
 pub mod bootstrap_listener;
 pub mod calvin;
+pub mod core_stall;
 pub mod data_plane_error_wire;
 pub mod decommission_bridge;
 pub mod handle;
@@ -44,6 +47,7 @@ pub mod warm_peers;
 
 pub use array_cluster_exec::ClusterArrayExecutor;
 pub use array_executor::DataPlaneArrayExecutor;
+pub use core_stall::CoreStallMarker;
 pub use decommission_bridge::spawn_decommission_shutdown_bridge;
 pub use handle::ClusterHandle;
 pub use init::{init_cluster, init_cluster_with_transport, init_single_node_calvin};

@@ -40,6 +40,14 @@ impl CoreLoop {
         self.metrics = Some(metrics);
     }
 
+    /// The shared system metrics this core was wired with, if any.
+    ///
+    /// The event loop clones the `Arc` once before entering the loop so it can
+    /// hold its heartbeat slot without borrowing the core across every tick.
+    pub fn metrics(&self) -> Option<&Arc<crate::control::metrics::SystemMetrics>> {
+        self.metrics.as_ref()
+    }
+
     /// Set memory governor for per-engine budget enforcement.
     pub fn set_governor(&mut self, governor: Arc<nodedb_mem::MemoryGovernor>) {
         self.governor = Some(governor);

@@ -62,7 +62,11 @@ pub(crate) async fn bootstrap_data_plane(
 
     // Start Data Plane cores on dedicated OS threads (thread-per-core).
     // Each core gets: jemalloc arena pinning + eventfd-driven wake + WAL replay + event producer.
-    let system_metrics = Arc::new(nodedb::control::metrics::SystemMetrics::new());
+    // Sized for the configured core count so every core's `core_id` indexes a
+    // heartbeat slot the stall monitor can sample.
+    let system_metrics = Arc::new(nodedb::control::metrics::SystemMetrics::with_cores(
+        num_cores,
+    ));
 
     // Create the shared scan-quiesce registry up front so every Data
     // Plane core and (below) `SharedState::open` reference the same

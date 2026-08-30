@@ -109,6 +109,18 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
     }
 
+    // A core that stops completing event-loop iterations panics nothing, so
+    // the per-core panic watchdog stays quiet and every other check above
+    // still passes. Fail readiness and name the cores: work routed to a
+    // stalled core only ever ends in a deadline expiry that says nothing
+    // about which core stopped.
+    if let Some(stalled_cores) = state.shared.core_stall.report() {
+        let (status, mut body) =
+            crate::control::cluster::core_stall::to_http_response(&stalled_cores);
+        body["node_id"] = json!(state.shared.node_id);
+        return (status, axum::Json(body));
+    }
+
     let health = crate::control::startup::health::observe(&state.shared.startup);
     let (status, body) = crate::control::startup::health::to_http_response(&health);
     // Checked only once the startup gate is otherwise green, so a node still

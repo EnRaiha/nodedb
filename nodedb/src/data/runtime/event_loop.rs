@@ -41,7 +41,26 @@ pub(super) fn run_event_loop(
     let mut last_event_emit = Instant::now();
     let mut heartbeat_interval = heartbeat_interval_with_jitter();
 
+    // Resolved once: the Control Plane stall monitor reads this counter to
+    // tell a core that is idle from one that has stopped completing
+    // iterations. Cloning the `Arc` here keeps the slot borrow independent of
+    // the `&mut CoreLoop` the loop body needs. `None` only when this core was
+    // spawned without system metrics (test harnesses).
+    let metrics = core.metrics().map(std::sync::Arc::clone);
+    let liveness = metrics
+        .as_ref()
+        .and_then(|m| m.core_heartbeats.slot(core_id));
+
     loop {
+        // First statement in the iteration, before the poll and before any
+        // work, so a loop wedged anywhere below — including inside a single
+        // long `tick()` — stops advancing this counter. Relaxed: the reader
+        // compares the value against its own earlier sample and orders
+        // nothing else against it.
+        if let Some(beat) = liveness {
+            beat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Block until signaled or timeout.
         efd.poll_wait(IDLE_POLL_TIMEOUT_MS);
 

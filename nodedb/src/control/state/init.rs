@@ -246,6 +246,7 @@ impl SharedState {
             pending_ddl: crate::control::pending_ddl::PendingDdlTable::new(),
             metadata_apply_wedge: std::sync::Arc::default(),
             sequencer_halt: std::sync::Arc::default(),
+            core_stall: std::sync::Arc::default(),
             metadata_raft: std::sync::OnceLock::new(),
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),

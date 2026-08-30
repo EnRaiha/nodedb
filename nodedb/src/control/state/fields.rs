@@ -136,6 +136,11 @@ pub struct SharedState {
     /// the health surfaces read this to make the lost capability visible rather
     /// than letting it look like an ordinary node.
     pub sequencer_halt: Arc<crate::control::cluster::SequencerHaltMarker>,
+    /// Which Data Plane cores have stopped completing event-loop iterations,
+    /// as of the last sampling window. Replaced every window rather than
+    /// latched, because a stall can recover. The health surfaces read it so a
+    /// core that wedges without panicking stops being invisible.
+    pub core_stall: Arc<crate::control::cluster::CoreStallMarker>,
     /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
     /// Propose tracker for distributed writes; absent in single-node mode.

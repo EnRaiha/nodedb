@@ -199,6 +199,14 @@ pub fn spawn_background_loops(
         },
     );
 
+    // Data Plane core stall monitor (5-second sampling).
+    // Samples each core's event-loop liveness counter and publishes the set of
+    // cores that stopped completing iterations. Nothing else observes a core
+    // that wedges without panicking: the per-core panic watchdog is loop-local
+    // and counts panics only.
+    crate::bootstrap::core_stall_monitor::spawn_core_stall_monitor(shared);
+    info!("data plane core stall monitor running");
+
     // Idle session sweep (5-second timer).
     // Closes sessions whose idle timeout or OIDC token expiry has elapsed.
     crate::control::security::sessions::spawn_idle_sweep_loop(shared);

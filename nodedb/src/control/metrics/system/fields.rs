@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use super::super::histogram::{AtomicHistogram, WAL_FSYNC_BUCKETS_US};
 use super::super::purge::PurgeMetrics;
+use super::heartbeat::CoreHeartbeats;
 use crate::data::io::IoMetrics;
 
 /// Core metrics collected across the system.
@@ -200,13 +201,34 @@ pub struct SystemMetrics {
     /// Plane can update counters without crossing the plane boundary.
     /// The Prometheus handler reads from here.
     pub io_metrics: Arc<IoMetrics>,
+
+    // ── Data Plane core liveness ──
+    /// One counter per Data Plane core, bumped at the top of every event-loop
+    /// iteration. The Control Plane stall monitor samples these; a counter
+    /// that stops advancing is the only evidence a core has stopped
+    /// completing iterations.
+    pub core_heartbeats: CoreHeartbeats,
 }
 
 impl SystemMetrics {
+    /// Metrics for a process with no Data Plane cores of its own.
+    ///
+    /// The per-core heartbeat array is empty, so `core_heartbeats.slot(_)`
+    /// yields `None` and the stall monitor has nothing to sample. Boot uses
+    /// [`with_cores`](Self::with_cores) instead.
     pub fn new() -> Self {
+        Self::with_cores(0)
+    }
+
+    /// Metrics sized for `num_cores` Data Plane cores.
+    ///
+    /// Cores are dense `0..num_cores`, so every spawned core's `core_id`
+    /// indexes a heartbeat slot that exists.
+    pub fn with_cores(num_cores: usize) -> Self {
         // WAL fsync latency uses sub-millisecond buckets (100µs–1s range).
         Self {
             wal_fsync_seconds: AtomicHistogram::with_buckets(WAL_FSYNC_BUCKETS_US),
+            core_heartbeats: CoreHeartbeats::new(num_cores),
             ..Self::default()
         }
     }
