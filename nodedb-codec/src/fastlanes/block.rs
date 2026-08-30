@@ -2,8 +2,8 @@
 
 //! Block-level encode and decode for the FastLanes FOR + bit-packing codec.
 
-use super::BLOCK_SIZE;
 use super::bits::{low_mask_u8, pack_bits, unpack_bits};
+use super::header::BLOCK_SIZE;
 use crate::bounds::{checked_add, checked_mul, checked_range, encode_u32_len};
 use crate::error::CodecError;
 
