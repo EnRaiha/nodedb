@@ -143,6 +143,7 @@ mod session_plan_cache_rls_revoke;
 mod sorted_index_authorization;
 mod spatial_cp_dp_query;
 mod sql_aggregate_functions;
+mod sql_alter_after_drop;
 mod sql_arithmetic_overflow;
 mod sql_backup_restore_columnar;
 mod sql_backup_restore_columnar_restart;

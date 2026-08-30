@@ -16,7 +16,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::support::{err, status};
+use super::support::{err, load_active_collection, status};
 
 /// ALTER COLLECTION <name> SET RETENTION = '<value>'
 pub(super) fn alter_collection_set_retention(
@@ -26,11 +26,7 @@ pub(super) fn alter_collection_set_retention(
     value: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state.credentials.catalog();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
+    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
 
     crate::data::executor::enforcement::retention::parse_retention_period(value)
         .map_err(|e| err("22023", e.to_string()))?;
@@ -48,11 +44,7 @@ pub(super) fn alter_collection_set_legal_hold(
     tag: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state.credentials.catalog();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
+    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
 
     if enabled {
         if coll.legal_holds.iter().any(|h| h.tag == tag) {
@@ -92,11 +84,7 @@ pub(super) fn alter_collection_set_append_only(
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state.credentials.catalog();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
+    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
 
     if coll.append_only {
         return Err(err(
@@ -116,11 +104,7 @@ pub(super) fn alter_collection_set_last_value_cache(
     enabled: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state.credentials.catalog();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
+    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
 
     if !coll.collection_type.is_timeseries() {
         return Err(err(

@@ -22,7 +22,7 @@ use crate::control::security::catalog::StoredCollection;
 use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::state::SharedState;
 
-use super::support::err;
+use super::support::{err, load_active_collection};
 
 /// Look up the active strict collection `name` for `tenant_id` and
 /// return it together with its deserialized `StrictSchema`. Returns
@@ -35,13 +35,7 @@ pub(super) fn load_strict_collection(
     name: &str,
     operation: &str,
 ) -> Result<(StoredCollection, nodedb_types::columnar::StrictSchema), DdlError> {
-    let catalog = state.credentials.catalog();
-
-    let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .filter(|c| c.is_active)
-        .ok_or_else(|| err("42P01", format!("collection '{name}' does not exist")))?;
+    let coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
 
     if !coll.collection_type.is_strict() {
         return Err(err(

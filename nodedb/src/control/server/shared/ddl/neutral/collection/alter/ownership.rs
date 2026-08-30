@@ -23,7 +23,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::support::{err, status};
+use super::support::{err, load_active_collection, status};
 
 /// ALTER COLLECTION <name> OWNER TO <user>
 pub(super) fn alter_collection_owner(
@@ -72,16 +72,7 @@ pub(super) fn alter_collection_owner(
     // overwritten the next time anyone re-proposed the collection.
     let catalog = state.credentials.catalog();
     let mut stored =
-        match catalog.get_collection(database_id, identity.tenant_id.as_u64(), collection) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                return Err(err(
-                    "42P01",
-                    format!("collection '{collection}' does not exist"),
-                ));
-            }
-            Err(e) => return Err(err("XX000", format!("catalog read: {e}"))),
-        };
+        load_active_collection(state, database_id, identity.tenant_id.as_u64(), collection)?;
     stored.owner = new_owner.to_string();
     let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
     let outcome = propose_catalog_entry(state, &entry)

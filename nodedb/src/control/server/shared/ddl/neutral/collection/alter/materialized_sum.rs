@@ -29,7 +29,7 @@ use crate::control::server::shared::ddl::neutral::collection::helpers::parse_ori
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::support::{err, status};
+use super::support::{err, load_active_collection, status};
 
 /// The fully parsed `ADD COLUMN ... MATERIALIZED_SUM ...` statement.
 pub(super) struct MaterializedSumRequest<'a> {
@@ -74,15 +74,8 @@ pub(super) async fn add_materialized_sum(
 
     let catalog = state.credentials.catalog();
 
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, target_collection)
-        .map_err(|e| err("XX000", e.to_string()))?
-        .ok_or_else(|| {
-            err(
-                "42P01",
-                format!("collection '{target_collection}' not found"),
-            )
-        })?;
+    let mut coll =
+        load_active_collection(state, DatabaseId::DEFAULT, tenant_id, target_collection)?;
 
     if coll
         .materialized_sums
