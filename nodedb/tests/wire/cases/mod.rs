@@ -183,6 +183,7 @@ mod sql_lateral;
 mod sql_maintenance;
 mod sql_materialized_view_refresh;
 mod sql_merge;
+mod sql_multi_statement_batch;
 mod sql_object_literal_insert;
 mod sql_order_by;
 mod sql_order_by_indexed;
