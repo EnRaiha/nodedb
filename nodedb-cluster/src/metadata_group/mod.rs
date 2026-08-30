@@ -13,6 +13,7 @@ pub mod codec;
 pub mod compensation;
 pub mod descriptors;
 pub mod entry;
+mod ids;
 pub mod migration_recovery;
 pub mod migration_state;
 pub mod state;
@@ -23,6 +24,7 @@ pub use codec::{decode_entry, encode_entry};
 pub use compensation::Compensation;
 pub use descriptors::{DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease};
 pub use entry::{MetadataEntry, PendingDdlObject, RoutingChange, TopologyChange};
+pub use ids::METADATA_GROUP_ID;
 pub use migration_recovery::{
     DEFAULT_ABORT_TIMEOUT, RecoveryDecision, compensations_for_phase, recover_in_flight_migrations,
 };
@@ -31,7 +33,3 @@ pub use migration_state::{
     SharedMigrationStateTable, new_shared,
 };
 pub use state::DescriptorState;
-
-/// Well-known Raft group ID for the metadata group.
-/// Distinct from data vShard groups (which start at group 1).
-pub const METADATA_GROUP_ID: u64 = 0;

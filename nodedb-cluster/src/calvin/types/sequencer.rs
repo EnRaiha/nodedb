@@ -103,3 +103,120 @@ pub struct EpochBatch {
     /// threading it through every intermediate layer.
     pub epoch_system_ms: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::TenantId;
+    use nodedb_types::id::{DatabaseId, VShardId};
+
+    use super::super::primitives::{EngineKeySet, SortedVec, VersionedReadSet};
+    use super::super::transaction::ReadWriteSet;
+    use super::*;
+
+    fn doc_set(collection: &str, surrogates: Vec<u32>) -> EngineKeySet {
+        EngineKeySet::Document {
+            collection: collection.to_owned(),
+            surrogates: SortedVec::new(surrogates),
+        }
+    }
+
+    fn multi_vshard_write_set() -> ReadWriteSet {
+        // Use two different collections that hash to different vShards.
+        // We can't pick known-distinct names without running the hash, so we
+        // scan at test time.
+        let (a, b) = find_two_distinct_collections();
+        ReadWriteSet::new(vec![doc_set(&a, vec![1, 2]), doc_set(&b, vec![3])])
+    }
+
+    /// Find two collection names whose vShards differ.
+    fn find_two_distinct_collections() -> (String, String) {
+        let mut first: Option<(String, u32)> = None;
+        for i in 0u32..512 {
+            let name = format!("col_{i}");
+            let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            if let Some((ref fname, fv)) = first {
+                if fv != vshard {
+                    return (fname.clone(), name);
+                }
+            } else {
+                first = Some((name, vshard));
+            }
+        }
+        panic!("could not find two distinct-vshard collections in 512 tries");
+    }
+
+    fn make_tx_class(write_set: ReadWriteSet) -> TxClass {
+        TxClass::new(
+            ReadWriteSet::new(vec![]),
+            write_set,
+            vec![0x01, 0x02],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass")
+    }
+
+    #[test]
+    fn sequenced_txn_msgpack_roundtrip() {
+        let tx_class = make_tx_class(multi_vshard_write_set());
+        let st = SequencedTxn {
+            epoch: 42,
+            position: 7,
+            tx_class,
+            epoch_system_ms: 1_700_000_000_000,
+            epoch_vshard_txn_count: 3,
+            lock_owner: None,
+        };
+        let bytes = zerompk::to_msgpack_vec(&st).unwrap();
+        let mut decoded: SequencedTxn = zerompk::from_msgpack(&bytes).unwrap();
+        decoded.tx_class.restore_derived();
+        assert_eq!(st.epoch, decoded.epoch);
+        assert_eq!(st.position, decoded.position);
+        assert_eq!(st.epoch_system_ms, decoded.epoch_system_ms);
+        assert_eq!(st.tx_class.write_set, decoded.tx_class.write_set);
+    }
+
+    #[test]
+    fn epoch_batch_msgpack_roundtrip() {
+        let tc = make_tx_class(multi_vshard_write_set());
+        let batch = EpochBatch {
+            epoch: 1,
+            txns: vec![
+                SequencedTxn {
+                    epoch: 1,
+                    position: 0,
+                    tx_class: tc.clone(),
+                    epoch_system_ms: 1_700_000_000_000,
+                    epoch_vshard_txn_count: 2,
+                    lock_owner: None,
+                },
+                SequencedTxn {
+                    epoch: 1,
+                    position: 1,
+                    tx_class: tc,
+                    epoch_system_ms: 1_700_000_000_000,
+                    epoch_vshard_txn_count: 2,
+                    lock_owner: None,
+                },
+            ],
+            epoch_system_ms: 1_700_000_000_000,
+        };
+        let bytes = zerompk::to_msgpack_vec(&batch).unwrap();
+        let mut decoded: EpochBatch = zerompk::from_msgpack(&bytes).unwrap();
+        for txn in &mut decoded.txns {
+            txn.tx_class.restore_derived();
+        }
+        assert_eq!(batch.epoch, decoded.epoch);
+        assert_eq!(batch.epoch_system_ms, decoded.epoch_system_ms);
+        assert_eq!(batch.txns.len(), decoded.txns.len());
+        assert_eq!(
+            batch.txns[0].epoch_system_ms,
+            decoded.txns[0].epoch_system_ms
+        );
+        assert_eq!(
+            batch.txns[0].tx_class.write_set,
+            decoded.txns[0].tx_class.write_set
+        );
+    }
+}

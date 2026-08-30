@@ -329,3 +329,319 @@ where
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use crate::circuit_breaker::CircuitBreakerConfig;
+    use crate::wire::{VShardEnvelope, VShardMessageType};
+
+    use super::*;
+
+    /// Mock dispatch that returns a pre-serialised `ArrayShardSliceResp`.
+    struct SliceEchoDispatch {
+        /// Rows to return from each shard.
+        rows: Vec<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ShardRpcDispatch for SliceEchoDispatch {
+        async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+            let resp = ArrayShardSliceResp {
+                shard_id: req.vshard_id,
+                rows_msgpack: self.rows.clone(),
+                truncated: false,
+                truncated_before_horizon: false,
+            };
+            let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+            Ok(VShardEnvelope::new(
+                VShardMessageType::ArrayShardSliceResp,
+                req.target_node,
+                req.source_node,
+                req.vshard_id,
+                payload,
+            ))
+        }
+    }
+
+    /// Mock dispatch that returns a pre-canned `ArrayShardAggResp`.
+    struct AggEchoDispatch {
+        partials: Vec<ArrayAggPartial>,
+    }
+
+    #[async_trait]
+    impl ShardRpcDispatch for AggEchoDispatch {
+        async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+            let resp = ArrayShardAggResp {
+                shard_id: req.vshard_id,
+                partials: self.partials.clone(),
+                truncated_before_horizon: false,
+            };
+            let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+            Ok(VShardEnvelope::new(
+                VShardMessageType::ArrayShardSliceResp,
+                req.target_node,
+                req.source_node,
+                req.vshard_id,
+                payload,
+            ))
+        }
+    }
+
+    fn make_coordinator(
+        shard_ids: Vec<u32>,
+        dispatch: Arc<dyn ShardRpcDispatch>,
+    ) -> ArrayCoordinator {
+        ArrayCoordinator::new(
+            ArrayCoordParams {
+                source_node: 1,
+                shard_ids,
+                timeout_ms: 1000,
+                // Tests use prefix_bits=0 so shard-side routing validation
+                // is skipped — mock executors don't need to match Hilbert
+                // ownership.
+                prefix_bits: 0,
+                slice_hilbert_ranges: vec![],
+            },
+            dispatch,
+            Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+        )
+    }
+
+    #[tokio::test]
+    async fn coord_slice_merges_rows_from_all_shards() {
+        let row_a = zerompk::to_msgpack_vec(&"row-a").unwrap();
+        let row_b = zerompk::to_msgpack_vec(&"row-b").unwrap();
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(SliceEchoDispatch {
+            rows: vec![row_a.clone(), row_b.clone()],
+        });
+        let coord = make_coordinator(vec![0, 1, 2], dispatch);
+        let req = ArrayShardSliceReq {
+            array_id_msgpack: vec![],
+            slice_msgpack: vec![],
+            attr_projection: vec![],
+            limit: 100,
+            cell_filter_msgpack: vec![],
+            prefix_bits: 0,
+            slice_hilbert_ranges: vec![],
+            shard_hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        };
+
+        // 3 shards × 2 rows each = 6 merged rows.
+        let result = coord
+            .coord_slice(req, 0, nodedb_types::SystemTimeScope::Current)
+            .await
+            .expect("coord_slice should succeed");
+        assert_eq!(result.rows.len(), 6);
+        assert!(!result.truncated_before_horizon);
+    }
+
+    #[tokio::test]
+    async fn coord_slice_applies_coordinator_limit() {
+        let row = zerompk::to_msgpack_vec(&"row").unwrap();
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(SliceEchoDispatch {
+            rows: vec![row.clone(), row.clone(), row.clone()],
+        });
+        // 2 shards × 3 rows = 6 total, but limit = 4.
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let req = ArrayShardSliceReq {
+            array_id_msgpack: vec![],
+            slice_msgpack: vec![],
+            attr_projection: vec![],
+            limit: 3,
+            cell_filter_msgpack: vec![],
+            prefix_bits: 0,
+            slice_hilbert_ranges: vec![],
+            shard_hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        };
+
+        let result = coord
+            .coord_slice(req, 4, nodedb_types::SystemTimeScope::Current)
+            .await
+            .expect("coord_slice with limit should succeed");
+        assert_eq!(result.rows.len(), 4);
+    }
+
+    fn make_agg_req() -> ArrayShardAggReq {
+        // Sum reducer c_enum = 0.
+        ArrayShardAggReq {
+            array_id_msgpack: vec![],
+            attr_idx: 0,
+            reducer_msgpack: vec![0x00],
+            group_by_dim: -1,
+            cell_filter_msgpack: vec![],
+            shard_hilbert_range: None,
+            system_as_of: None,
+            valid_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn coord_agg_merges_scalar_partials_from_shards() {
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(AggEchoDispatch {
+            partials: vec![ArrayAggPartial::from_single(0, 10.0)],
+        });
+        // 3 shards each returning a partial with sum=10 → merged sum=30.
+        let coord = make_coordinator(vec![0, 1, 2], dispatch);
+        let merged = coord
+            .coord_agg(make_agg_req())
+            .await
+            .expect("coord_agg should succeed");
+
+        assert_eq!(merged.partials.len(), 1);
+        assert_eq!(merged.partials[0].count, 3);
+        assert!((merged.partials[0].sum - 30.0).abs() < f64::EPSILON);
+        assert!(!merged.truncated_before_horizon);
+    }
+
+    #[tokio::test]
+    async fn coord_agg_with_empty_shards_returns_empty() {
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(AggEchoDispatch { partials: vec![] });
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let merged = coord
+            .coord_agg(make_agg_req())
+            .await
+            .expect("coord_agg with empty shards should succeed");
+        assert!(merged.partials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coord_agg_merges_grouped_partials_across_shards() {
+        // Shard 0 returns group_key=0 partial, shard 1 also group_key=0 + group_key=1.
+        struct GroupedDispatch {
+            shard0_partials: Vec<ArrayAggPartial>,
+            shard1_partials: Vec<ArrayAggPartial>,
+        }
+
+        #[async_trait]
+        impl ShardRpcDispatch for GroupedDispatch {
+            async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+                let partials = if req.vshard_id == 0 {
+                    self.shard0_partials.clone()
+                } else {
+                    self.shard1_partials.clone()
+                };
+                let resp = ArrayShardAggResp {
+                    shard_id: req.vshard_id,
+                    partials,
+                    truncated_before_horizon: false,
+                };
+                let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+                Ok(VShardEnvelope::new(
+                    VShardMessageType::ArrayShardSliceResp,
+                    req.target_node,
+                    req.source_node,
+                    req.vshard_id,
+                    payload,
+                ))
+            }
+        }
+
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(GroupedDispatch {
+            shard0_partials: vec![ArrayAggPartial::from_single(0, 5.0)],
+            shard1_partials: vec![
+                ArrayAggPartial::from_single(0, 15.0),
+                ArrayAggPartial::from_single(1, 20.0),
+            ],
+        });
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let merged = coord
+            .coord_agg(make_agg_req())
+            .await
+            .expect("grouped coord_agg should succeed");
+
+        // group_key=0: sum=5+15=20, count=2; group_key=1: sum=20, count=1.
+        assert_eq!(merged.partials.len(), 2);
+        let g0 = merged
+            .partials
+            .iter()
+            .find(|p| p.group_key == 0)
+            .expect("group 0");
+        let g1 = merged
+            .partials
+            .iter()
+            .find(|p| p.group_key == 1)
+            .expect("group 1");
+        assert!((g0.sum - 20.0).abs() < f64::EPSILON);
+        assert_eq!(g0.count, 2);
+        assert!((g1.sum - 20.0).abs() < f64::EPSILON);
+        assert_eq!(g1.count, 1);
+    }
+
+    #[tokio::test]
+    async fn coord_agg_or_reduces_truncated_before_horizon() {
+        // One shard reports below-horizon; the coordinator must OR-reduce the
+        // flag so the upstream caller can surface an incomplete-result signal.
+        // Dropping it here was a silent-partial-success bug.
+        struct HorizonDispatch;
+
+        #[async_trait]
+        impl ShardRpcDispatch for HorizonDispatch {
+            async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+                // Shard 1 is below horizon (zero partials); shard 0 has data.
+                let (partials, below) = if req.vshard_id == 0 {
+                    (vec![ArrayAggPartial::from_single(0, 10.0)], false)
+                } else {
+                    (vec![], true)
+                };
+                let resp = ArrayShardAggResp {
+                    shard_id: req.vshard_id,
+                    partials,
+                    truncated_before_horizon: below,
+                };
+                let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+                Ok(VShardEnvelope::new(
+                    VShardMessageType::ArrayShardSliceResp,
+                    req.target_node,
+                    req.source_node,
+                    req.vshard_id,
+                    payload,
+                ))
+            }
+        }
+
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(HorizonDispatch);
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let merged = coord
+            .coord_agg(make_agg_req())
+            .await
+            .expect("coord_agg should succeed");
+        assert!(
+            merged.truncated_before_horizon,
+            "coordinator must OR-reduce the below-horizon flag across shards"
+        );
+    }
+
+    #[tokio::test]
+    async fn coord_slice_zero_limit_returns_all() {
+        let row = zerompk::to_msgpack_vec(&"r").unwrap();
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(SliceEchoDispatch {
+            rows: vec![row.clone(); 10],
+        });
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let req = ArrayShardSliceReq {
+            array_id_msgpack: vec![],
+            slice_msgpack: vec![],
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter_msgpack: vec![],
+            prefix_bits: 0,
+            slice_hilbert_ranges: vec![],
+            shard_hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        };
+
+        // coordinator_limit = 0 → no cutoff → 20 rows.
+        let result = coord
+            .coord_slice(req, 0, nodedb_types::SystemTimeScope::Current)
+            .await
+            .expect("coord_slice unlimited should succeed");
+        assert_eq!(result.rows.len(), 20);
+    }
+}
