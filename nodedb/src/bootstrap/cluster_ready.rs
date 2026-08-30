@@ -3,7 +3,7 @@
 //! Cluster readiness gate: raft election wait, catalog sanity check, peer warm-up.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::info;
 
@@ -51,27 +51,14 @@ pub async fn await_cluster_ready(
     // `metadata propose: not leader` because election had not yet
     // completed.
     if let Some(mut ready_rx) = raft_ready_rx {
-        const RAFT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-        match tokio::time::timeout(RAFT_READY_TIMEOUT, ready_rx.wait_for(|v| *v)).await {
-            Ok(Ok(_)) => {
-                info!("metadata raft group ready — opening client listeners");
-            }
-            Ok(Err(_)) => {
-                raft_gate.fail("raft readiness watch dropped before signalling ready");
-                return Err(anyhow::anyhow!(
-                    "raft readiness watch dropped before signalling ready"
-                ));
-            }
-            Err(_) => {
-                raft_gate.fail(format!(
-                    "raft readiness timeout after {RAFT_READY_TIMEOUT:?}"
-                ));
-                return Err(anyhow::anyhow!(
-                    "raft readiness timeout after {RAFT_READY_TIMEOUT:?} — \
-                     metadata group failed to apply first entry"
-                ));
-            }
-        }
+        wait_for_raft_ready(
+            shared,
+            &mut ready_rx,
+            &raft_gate,
+            RAFT_READY_STALL_TIMEOUT,
+            RAFT_READY_POLL_INTERVAL,
+        )
+        .await?;
     }
     // Metadata raft group has applied its first entry (or we're
     // in single-node mode with no raft).
@@ -208,4 +195,148 @@ pub async fn await_cluster_ready(
     gateway_enable_gate.fire();
 
     Ok(())
+}
+
+/// How long the metadata group may make NO replay progress before the boot
+/// fails. Reset on every applied-index advance, so a large replay never trips
+/// it — only a genuinely stuck group does.
+const RAFT_READY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the stall check samples the applied index while waiting.
+const RAFT_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Wait until the metadata raft group applies its first entry.
+///
+/// Bounds the wait on lack of PROGRESS, not on total elapsed time. A node
+/// replaying a large log keeps advancing `applied_index` and must be allowed
+/// to finish; a group that is genuinely stuck advances nothing and fails
+/// after [`RAFT_READY_STALL_TIMEOUT`].
+async fn wait_for_raft_ready(
+    shared: &Arc<SharedState>,
+    ready_rx: &mut tokio::sync::watch::Receiver<bool>,
+    raft_gate: &ReadyGate,
+    stall_timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let applied_index = || {
+        shared
+            .metadata_cache
+            .read()
+            .map(|c| c.applied_index)
+            .unwrap_or_else(|p| p.into_inner().applied_index)
+    };
+    let mut last_progress = Instant::now();
+    let mut last_index = applied_index();
+
+    loop {
+        match tokio::time::timeout(poll_interval, ready_rx.wait_for(|v| *v)).await {
+            Ok(Ok(_)) => {
+                info!("metadata raft group ready — opening client listeners");
+                return Ok(());
+            }
+            Ok(Err(_)) => {
+                raft_gate.fail("raft readiness watch dropped before signalling ready");
+                return Err(anyhow::anyhow!(
+                    "raft readiness watch dropped before signalling ready"
+                ));
+            }
+            // Not ready yet. Replay that is still advancing is healthy.
+            Err(_) => {
+                let current = applied_index();
+                if current != last_index {
+                    last_index = current;
+                    last_progress = Instant::now();
+                    continue;
+                }
+                if last_progress.elapsed() >= stall_timeout {
+                    let detail = format!(
+                        "metadata group applied no entry for {stall_timeout:?} \
+                         (applied_index stuck at {current}) — it failed to apply its first entry"
+                    );
+                    raft_gate.fail(detail.clone());
+                    return Err(anyhow::anyhow!(detail));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::startup::{StartupPhase, StartupSequencer};
+    use std::time::Duration;
+
+    /// A `SharedState` with no live Data Plane — this test only reads the
+    /// metadata cache's applied index.
+    fn test_shared_state() -> Arc<SharedState> {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wal = Arc::new(
+            crate::wal::WalManager::open_for_testing(&dir.path().join("raft-ready.wal"))
+                .expect("open wal"),
+        );
+        let (dispatcher, _data_sides) = crate::bridge::Dispatcher::new(1, 64);
+        SharedState::new(dispatcher, wal).expect("build shared state")
+    }
+
+    /// A replay that keeps applying entries must not be failed, however long
+    /// it runs. The stall bound measures lack of progress, not elapsed time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replay_that_keeps_making_progress_is_never_failed() {
+        let shared = test_shared_state();
+        let (sequencer, _gate) = StartupSequencer::new();
+        let raft_gate = sequencer.register_gate(StartupPhase::RaftMetadataReplay, "raft");
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+
+        // Advance the applied index for well past the stall bound, then
+        // signal ready. A wall-clock bound would have failed this boot.
+        let cache = Arc::clone(&shared.metadata_cache);
+        let ticker = tokio::spawn(async move {
+            for index in 1..=20u64 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                cache
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .advance_applied_index(index);
+            }
+            let _ = ready_tx.send(true);
+        });
+
+        let result = wait_for_raft_ready(
+            &shared,
+            &mut ready_rx,
+            &raft_gate,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .await;
+        ticker.await.expect("progress ticker");
+        assert!(
+            result.is_ok(),
+            "a progressing replay must be allowed to finish: {result:?}"
+        );
+    }
+
+    /// A group applying nothing fails once the stall bound elapses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_that_applies_nothing_fails_after_the_stall_bound() {
+        let shared = test_shared_state();
+        let (sequencer, _gate) = StartupSequencer::new();
+        let raft_gate = sequencer.register_gate(StartupPhase::RaftMetadataReplay, "raft");
+        let (_ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+
+        let err = wait_for_raft_ready(
+            &shared,
+            &mut ready_rx,
+            &raft_gate,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a stuck group must fail the boot");
+        assert!(
+            err.to_string().contains("applied no entry"),
+            "the failure must name the stall, not a generic timeout: {err}"
+        );
+    }
 }
