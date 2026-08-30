@@ -336,6 +336,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opcode_repr() {
+        assert_eq!(OpCode::Auth as u8, 0x01);
+        assert_eq!(OpCode::Sql as u8, 0x20);
+        assert_eq!(OpCode::Begin as u8, 0x40);
+        assert_eq!(OpCode::GraphHop as u8, 0x50);
+        assert_eq!(OpCode::TextSearch as u8, 0x60);
+        assert_eq!(OpCode::VectorBatchInsert as u8, 0x70);
+    }
+
+    #[test]
+    fn opcode_is_write() {
+        assert!(OpCode::PointPut.is_write());
+        assert!(OpCode::PointDelete.is_write());
+        assert!(OpCode::CrdtApply.is_write());
+        assert!(OpCode::EdgePut.is_write());
+        assert!(!OpCode::PointGet.is_write());
+        assert!(!OpCode::Sql.is_write());
+        assert!(!OpCode::VectorSearch.is_write());
+        assert!(!OpCode::Ping.is_write());
+    }
+
+    #[test]
+    fn response_status_repr() {
+        assert_eq!(ResponseStatus::Ok as u8, 0);
+        assert_eq!(ResponseStatus::Partial as u8, 1);
+        assert_eq!(ResponseStatus::Error as u8, 2);
+    }
+
+    #[test]
     fn crdt_list_opcodes_try_from_u8_roundtrip() {
         assert_eq!(OpCode::try_from(0x99), Ok(OpCode::CrdtListInsert));
         assert_eq!(OpCode::try_from(0x9A), Ok(OpCode::CrdtListDelete));

@@ -139,3 +139,55 @@ impl SymbolDictionary {
         remap
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_dictionary_basic() {
+        let mut dict = SymbolDictionary::new();
+        assert_eq!(dict.resolve("us-east-1", 100_000), Some(0));
+        assert_eq!(dict.resolve("us-west-2", 100_000), Some(1));
+        assert_eq!(dict.resolve("us-east-1", 100_000), Some(0));
+        assert_eq!(dict.len(), 2);
+        assert_eq!(dict.get(0), Some("us-east-1"));
+        assert_eq!(dict.get(1), Some("us-west-2"));
+        assert_eq!(dict.get_id("us-east-1"), Some(0));
+    }
+
+    #[test]
+    fn symbol_dictionary_cardinality_breaker() {
+        let mut dict = SymbolDictionary::new();
+        for i in 0..100 {
+            assert!(dict.resolve(&format!("val-{i}"), 100).is_some());
+        }
+        assert!(dict.resolve("one-too-many", 100).is_none());
+        assert_eq!(dict.len(), 100);
+    }
+
+    #[test]
+    fn symbol_dictionary_merge() {
+        let mut d1 = SymbolDictionary::new();
+        d1.resolve("a", 1000);
+        d1.resolve("b", 1000);
+
+        let mut d2 = SymbolDictionary::new();
+        d2.resolve("b", 1000);
+        d2.resolve("c", 1000);
+
+        let remap = d1.merge(&d2, 1000);
+        assert_eq!(d1.len(), 3);
+        assert_eq!(remap[0], d1.get_id("b").unwrap());
+        assert_eq!(remap[1], d1.get_id("c").unwrap());
+    }
+
+    #[test]
+    fn time_range_overlap() {
+        let r1 = TimeRange::new(100, 200);
+        let r2 = TimeRange::new(150, 250);
+        let r3 = TimeRange::new(300, 400);
+        assert!(r1.overlaps(&r2));
+        assert!(!r1.overlaps(&r3));
+    }
+}

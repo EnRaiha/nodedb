@@ -249,3 +249,97 @@ pub enum SegmentKind {
     Metric,
     Log,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn partition_interval_parse() {
+        assert_eq!(
+            PartitionInterval::parse("1h").unwrap(),
+            PartitionInterval::Duration(3_600_000)
+        );
+        assert_eq!(
+            PartitionInterval::parse("3d").unwrap(),
+            PartitionInterval::Duration(3 * 86_400_000)
+        );
+        assert_eq!(
+            PartitionInterval::parse("2w").unwrap(),
+            PartitionInterval::Duration(2 * 604_800_000)
+        );
+        assert_eq!(
+            PartitionInterval::parse("1M").unwrap(),
+            PartitionInterval::Month
+        );
+        assert_eq!(
+            PartitionInterval::parse("1y").unwrap(),
+            PartitionInterval::Year
+        );
+        assert_eq!(
+            PartitionInterval::parse("AUTO").unwrap(),
+            PartitionInterval::Auto
+        );
+        assert_eq!(
+            PartitionInterval::parse("UNBOUNDED").unwrap(),
+            PartitionInterval::Unbounded
+        );
+        assert!(matches!(
+            PartitionInterval::parse("0h"),
+            Err(IntervalParseError::ZeroInterval)
+        ));
+        assert!(matches!(
+            PartitionInterval::parse("2M"),
+            Err(IntervalParseError::UnsupportedCalendar { .. })
+        ));
+    }
+
+    #[test]
+    fn partition_interval_display_roundtrip() {
+        let cases = ["1h", "3d", "2w", "1M", "1y", "AUTO", "UNBOUNDED"];
+        for s in cases {
+            let parsed = PartitionInterval::parse(s).unwrap();
+            let displayed = parsed.to_string();
+            let reparsed = PartitionInterval::parse(&displayed).unwrap();
+            assert_eq!(parsed, reparsed, "roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn partition_meta_queryable() {
+        let meta = PartitionMeta {
+            min_ts: 1000,
+            max_ts: 2000,
+            row_count: 500,
+            size_bytes: 1024,
+            schema_version: 1,
+            state: PartitionState::Sealed,
+            interval_ms: 86_400_000,
+            last_flushed_wal_lsn: 42,
+            column_stats: HashMap::new(),
+            max_system_ts: 0,
+        };
+        assert!(meta.is_queryable());
+        assert!(meta.overlaps(&TimeRange::new(1500, 2500)));
+        assert!(!meta.overlaps(&TimeRange::new(3000, 4000)));
+    }
+
+    #[test]
+    fn partition_meta_not_queryable_when_deleted() {
+        let meta = PartitionMeta {
+            min_ts: 0,
+            max_ts: 0,
+            row_count: 0,
+            size_bytes: 0,
+            schema_version: 1,
+            state: PartitionState::Deleted,
+            interval_ms: 0,
+            last_flushed_wal_lsn: 0,
+            column_stats: HashMap::new(),
+            max_system_ts: 0,
+        };
+        assert!(!meta.is_queryable());
+    }
+}

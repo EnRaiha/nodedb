@@ -162,6 +162,41 @@ pub struct ResolvedSeries {
 mod catalog_tests {
     use super::*;
 
+    #[test]
+    fn series_key_sorted_tags() {
+        let k1 = SeriesKey::new(
+            "cpu",
+            vec![("host".into(), "a".into()), ("dc".into(), "us".into())],
+        );
+        let k2 = SeriesKey::new(
+            "cpu",
+            vec![("dc".into(), "us".into()), ("host".into(), "a".into())],
+        );
+        assert_eq!(k1, k2);
+        assert_eq!(k1.to_series_id(0), k2.to_series_id(0));
+    }
+
+    #[test]
+    fn series_catalog_resolve() {
+        let mut catalog = SeriesCatalog::new();
+        let k = SeriesKey::new("cpu", vec![("host".into(), "prod-1".into())]);
+        let id1 = catalog.resolve(&k);
+        let id2 = catalog.resolve(&k);
+        assert_eq!(id1, id2);
+        assert_eq!(catalog.len(), 1);
+    }
+
+    #[test]
+    fn series_catalog_different_keys() {
+        let mut catalog = SeriesCatalog::new();
+        let k1 = SeriesKey::new("cpu", vec![("host".into(), "a".into())]);
+        let k2 = SeriesKey::new("mem", vec![("host".into(), "a".into())]);
+        let id1 = catalog.resolve(&k1);
+        let id2 = catalog.resolve(&k2);
+        assert_ne!(id1, id2);
+        assert_eq!(catalog.len(), 2);
+    }
+
     /// A real 64-bit collision cannot be searched for, so the colliding slot is
     /// planted directly — `entries` is reachable from inside this module, which
     /// is the only way to exercise the rehash branch deterministically.

@@ -298,3 +298,112 @@ fn decode_limit_field(data: &[u8], pos: &mut usize) -> Option<u32> {
     *pos += 5;
     if present == 1 { Some(value) } else { None }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_frame_roundtrip() {
+        let frame = HelloFrame {
+            proto_min: 1,
+            proto_max: 3,
+            capabilities: CAP_STREAMING | CAP_GRAPHRAG | CAP_FTS,
+        };
+        let buf = frame.encode();
+        let decoded = HelloFrame::decode(&buf).expect("decode failed");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn hello_frame_bad_magic() {
+        let mut buf = HelloFrame {
+            proto_min: 1,
+            proto_max: 1,
+            capabilities: 0,
+        }
+        .encode();
+        buf[0] = 0xFF;
+        assert!(HelloFrame::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn hello_ack_frame_roundtrip_all_limits() {
+        let frame = HelloAckFrame {
+            proto_version: 1,
+            capabilities: CAP_STREAMING | CAP_CRDT,
+            server_version: "0.1.0-dev".into(),
+            limits: Limits {
+                max_vector_dim: Some(1536),
+                max_top_k: Some(1000),
+                max_scan_limit: Some(10_000),
+                max_batch_size: Some(512),
+                max_crdt_delta_bytes: Some(1 << 20),
+                max_query_text_bytes: Some(4096),
+                max_graph_depth: Some(16),
+            },
+        };
+        let enc = frame.encode();
+        let decoded = HelloAckFrame::decode(&enc).expect("decode failed");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn hello_ack_frame_roundtrip_some_limits() {
+        let frame = HelloAckFrame {
+            proto_version: 1,
+            capabilities: 0,
+            server_version: "1.0.0".into(),
+            limits: Limits {
+                max_vector_dim: Some(768),
+                max_top_k: None,
+                max_scan_limit: None,
+                max_batch_size: None,
+                max_crdt_delta_bytes: None,
+                max_query_text_bytes: None,
+                max_graph_depth: None,
+            },
+        };
+        let enc = frame.encode();
+        let decoded = HelloAckFrame::decode(&enc).expect("decode failed");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn hello_ack_frame_roundtrip_no_limits() {
+        let frame = HelloAckFrame {
+            proto_version: 1,
+            capabilities: CAP_STREAMING,
+            server_version: "0.2.0".into(),
+            limits: Limits::default(),
+        };
+        let enc = frame.encode();
+        let decoded = HelloAckFrame::decode(&enc).expect("decode failed");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn hello_ack_bad_magic() {
+        let frame = HelloAckFrame {
+            proto_version: 1,
+            capabilities: 0,
+            server_version: "x".into(),
+            limits: Limits::default(),
+        };
+        let mut enc = frame.encode();
+        enc[0] = 0xFF;
+        assert!(HelloAckFrame::decode(&enc).is_none());
+    }
+
+    #[test]
+    fn cap_bits_non_overlapping() {
+        let all = CAP_STREAMING
+            | CAP_GRAPHRAG
+            | CAP_FTS
+            | CAP_CRDT
+            | CAP_SPATIAL
+            | CAP_TIMESERIES
+            | CAP_COLUMNAR;
+        assert_eq!(all.count_ones(), 7);
+    }
+}

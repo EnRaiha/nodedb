@@ -41,6 +41,33 @@ pub struct AuthResponse {
 mod tests {
     use super::AuthMethod;
 
+    #[test]
+    fn auth_method_variants() {
+        let trust = AuthMethod::Trust {
+            username: "admin".into(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&trust).unwrap();
+        let decoded: AuthMethod = zerompk::from_msgpack(&bytes).unwrap();
+        match decoded {
+            AuthMethod::Trust { username } => assert_eq!(username, "admin"),
+            _ => panic!("expected Trust variant"),
+        }
+
+        let pw = AuthMethod::Password {
+            username: "user".into(),
+            password: "secret".into(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&pw).unwrap();
+        let decoded: AuthMethod = zerompk::from_msgpack(&bytes).unwrap();
+        match decoded {
+            AuthMethod::Password { username, password } => {
+                assert_eq!(username, "user");
+                assert_eq!(password, "secret");
+            }
+            _ => panic!("expected Password variant"),
+        }
+    }
+
     /// A `trust` auth frame that omits `username` entirely must fail to
     /// decode via serde/JSON — never silently resolve to a default identity.
     #[test]

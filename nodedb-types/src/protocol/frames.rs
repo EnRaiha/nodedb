@@ -229,7 +229,84 @@ impl NativeResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::super::opcodes::OpCode;
+    use super::super::text_fields::TextFields;
     use super::*;
+
+    #[test]
+    fn native_response_ok() {
+        let r = NativeResponse::ok(42);
+        assert_eq!(r.seq, 42);
+        assert_eq!(r.status, ResponseStatus::Ok);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn native_response_error() {
+        let r = NativeResponse::error(1, "42P01", "collection not found");
+        assert_eq!(r.status, ResponseStatus::Error);
+        let e = r.error.unwrap();
+        assert_eq!(e.code, "42P01");
+        assert_eq!(e.message, "collection not found");
+    }
+
+    #[test]
+    fn native_response_from_query_result() {
+        let qr = crate::result::QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![
+                Value::String("u1".into()),
+                Value::String("Alice".into()),
+            ]],
+            rows_affected: 0,
+        };
+        let r = NativeResponse::from_query_result(5, qr, 100);
+        assert_eq!(r.seq, 5);
+        assert_eq!(r.watermark_lsn, 100);
+        assert_eq!(r.columns.as_ref().unwrap().len(), 2);
+        assert_eq!(r.rows.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_response_status_row() {
+        let r = NativeResponse::status_row(3, "OK");
+        assert_eq!(r.columns.as_ref().unwrap(), &["status"]);
+        assert_eq!(r.rows.as_ref().unwrap()[0][0].as_str(), Some("OK"));
+    }
+
+    #[test]
+    fn msgpack_roundtrip_request() {
+        let req = NativeRequest {
+            op: OpCode::Sql,
+            seq: 1,
+            fields: RequestFields::Text(TextFields {
+                sql: Some("SELECT 1".into()),
+                ..Default::default()
+            }),
+        };
+        let bytes = zerompk::to_msgpack_vec(&req).unwrap();
+        let decoded: NativeRequest = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.op, OpCode::Sql);
+        assert_eq!(decoded.seq, 1);
+    }
+
+    #[test]
+    fn msgpack_roundtrip_response() {
+        let resp = NativeResponse::from_query_result(
+            7,
+            crate::result::QueryResult {
+                columns: vec!["x".into()],
+                rows: vec![vec![Value::Integer(42)]],
+                rows_affected: 0,
+            },
+            99,
+        );
+        let bytes = zerompk::to_msgpack_vec(&resp).unwrap();
+        let decoded: NativeResponse = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.seq, 7);
+        assert_eq!(decoded.watermark_lsn, 99);
+        assert_eq!(decoded.rows.unwrap()[0][0].as_i64(), Some(42));
+    }
 
     #[test]
     fn error_payload_round_trips_the_numeric_code() {

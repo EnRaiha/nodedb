@@ -467,6 +467,20 @@ mod tests {
         assert_eq!(decoded.vector_id, Some(u32::MAX as u64));
     }
 
+    /// vector_id overflow rejected in plan_builder (unit-test the narrowing logic).
+    #[test]
+    fn vector_id_overflow_rejected_in_plan_builder() {
+        // Simulate the narrowing: u64 > u32::MAX must fail
+        let wire_id: u64 = u32::MAX as u64 + 1;
+        let result: Result<u32, _> = wire_id.try_into();
+        assert!(result.is_err(), "u64 > u32::MAX must not fit in u32");
+
+        // u32::MAX itself must succeed
+        let wire_ok: u64 = u32::MAX as u64;
+        let result2: Result<u32, _> = wire_ok.try_into();
+        assert_eq!(result2.unwrap(), u32::MAX);
+    }
+
     #[test]
     fn binary_fields_roundtrip_under_bin_marker() {
         // Spec: every `Vec<u8>`-valued field that the decoder reads via

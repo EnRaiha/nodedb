@@ -155,3 +155,24 @@ impl TieredPartitionConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiered_config_validation() {
+        let mut cfg = TieredPartitionConfig::origin_defaults();
+        assert!(cfg.validate().is_ok());
+
+        cfg.merge_count = 1;
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "merge_count");
+
+        cfg.merge_count = 10;
+        cfg.retention_period_ms = 1000;
+        cfg.archive_after_ms = 2000;
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "retention_period");
+    }
+}
