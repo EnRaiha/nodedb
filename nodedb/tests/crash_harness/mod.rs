@@ -71,6 +71,31 @@ pub fn check_healthz(port: u16) -> bool {
     }
 }
 
+/// Raw `/healthz` response — status line, headers, and body.
+///
+/// Sibling to [`check_healthz`], which caps its read at 256 bytes and can
+/// truncate a body. The request sends `Connection: close`, so this reads to
+/// EOF instead of racing a fixed buffer against body length.
+pub fn fetch_healthz(port: u16) -> Option<String> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream =
+        TcpStream::connect_timeout(&addr.parse().expect("addr"), Duration::from_millis(200))
+            .ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let req = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).ok()?;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
 pub fn wait_for_healthz(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
