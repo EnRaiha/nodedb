@@ -3,6 +3,7 @@
 pub mod core;
 pub mod epoch_seed;
 pub mod reservations;
+pub mod verdict_entry;
 
 // `self::` is required: a bare `core` in a `use` path resolves to the `core`
 // crate, not this module's sibling.

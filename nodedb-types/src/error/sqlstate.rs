@@ -109,6 +109,10 @@ pub const INVALID_CATALOG_NAME: &str = "3D000";
 
 // ── Class 40 — Transaction Rollback ──────────────────────────────────────────
 
+/// `40000` — `transaction_rollback` (rolled back for a reason other than a
+/// serialization conflict; class 40 tells the client to retry)
+pub const TRANSACTION_ROLLBACK: &str = "40000";
+
 /// `40001` — `serialization_failure` (write conflict; client should retry)
 pub const SERIALIZATION_FAILURE: &str = "40001";
 

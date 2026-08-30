@@ -35,6 +35,11 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             "cross-shard",
             "global OCC verdict was abort (read-set validation failed)",
         ),
+        // Not a write conflict: no read-set was validated, a participant failed.
+        Error::CalvinParticipantError => NodeDbError::cluster(
+            "cross-shard transaction aborted: a participant vShard returned an error before \
+             any read-set was validated",
+        ),
         Error::SourceFrozen { database_id } => NodeDbError::write_conflict(
             format!("database:{database_id}"),
             "source database is frozen for clone materialization; retry shortly".to_owned(),

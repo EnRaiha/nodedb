@@ -76,6 +76,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::CalvinSerializationConflict => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
+        // A participant error aborted the transaction before any read-set was
+        // validated, so it is NOT a serialization conflict. TRANSACTION_ROLLBACK
+        // (40000) keeps it in the retryable class 40 without claiming 40001.
+        crate::Error::CalvinParticipantError => {
+            ("ERROR", sqlstate::TRANSACTION_ROLLBACK, err.to_string())
+        }
         crate::Error::SourceFrozen { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }

@@ -33,10 +33,11 @@ use crate::calvin::sequencer::config::SequencerConfig;
 use crate::calvin::sequencer::entry::SequencerEntry;
 use crate::calvin::sequencer::inbox::{AdmittedTx, InboxReceiver};
 use crate::calvin::sequencer::reservation_inbox::ReservationInboxReceiver;
+use crate::calvin::sequencer::service::verdict_entry::verdict_entry;
 use crate::calvin::sequencer::state_machine::SequencerStateMachine;
 use crate::calvin::sequencer::validator::validate_batch_with_assignments;
 use crate::calvin::types::EpochBatch;
-use crate::calvin::{CalvinCompletionRegistry, TxnId};
+use crate::calvin::{CalvinCompletionRegistry, TxnId, VerdictOutcome};
 use crate::error::ClusterError;
 use crate::multi_raft::MultiRaft;
 
@@ -105,7 +106,7 @@ pub struct SequencerService {
     /// Stored as `Option` so `run` can move it out of `&mut self` into an owned
     /// local, avoiding a borrow conflict with `self.tick()` in a sibling
     /// `select!` arm; it is always `Some` after construction.
-    verdict_rx: Option<mpsc::Receiver<(TxnId, bool)>>,
+    verdict_rx: Option<mpsc::Receiver<(TxnId, VerdictOutcome)>>,
 }
 
 impl SequencerService {
@@ -123,7 +124,7 @@ impl SequencerService {
         receivers: SequencerReceivers,
         state_machine: Arc<Mutex<SequencerStateMachine>>,
         completion_registry: Arc<CalvinCompletionRegistry>,
-        verdict_rx: mpsc::Receiver<(TxnId, bool)>,
+        verdict_rx: mpsc::Receiver<(TxnId, VerdictOutcome)>,
     ) -> Self {
         let SequencerReceivers {
             inbox,
@@ -177,13 +178,9 @@ impl SequencerService {
                 } => {
                     // Every replica's registry emits deterministically, but only
                     // the leader proposes — same leader-gate as OllpMismatch/Vote.
-                    if let Some((txn, commit)) = verdict
+                    if let Some((txn, outcome)) = verdict
                         && self.is_leader()
-                        && let Err(e) = self.propose_entry(&SequencerEntry::Verdict {
-                            epoch: txn.epoch,
-                            position: txn.position,
-                            commit,
-                        })
+                        && let Err(e) = self.propose_entry(&verdict_entry(txn, outcome))
                     {
                         warn!(
                             epoch = txn.epoch,
@@ -473,12 +470,8 @@ impl SequencerService {
     /// stored the registry stops returning that txn — so this cannot loop or
     /// double-commit. Runs only on the leader; the caller gates on `is_leader`.
     fn redrive_unproposed_verdicts(&self) {
-        for (txn, commit) in self.completion_registry.drain_unproposed_verdicts() {
-            if let Err(e) = self.propose_entry(&SequencerEntry::Verdict {
-                epoch: txn.epoch,
-                position: txn.position,
-                commit,
-            }) {
+        for (txn, outcome) in self.completion_registry.drain_unproposed_verdicts() {
+            if let Err(e) = self.propose_entry(&verdict_entry(txn, outcome)) {
                 warn!(
                     epoch = txn.epoch,
                     position = txn.position,
@@ -512,6 +505,8 @@ fn entry_txn_count(entry: &SequencerEntry) -> usize {
         SequencerEntry::TxnRoutingFailed { .. } => 0,
         SequencerEntry::Vote { .. } => 0,
         SequencerEntry::Verdict { .. } => 0,
+        SequencerEntry::AbortVote { .. } => 0,
+        SequencerEntry::AbortVerdict { .. } => 0,
         SequencerEntry::ReserveRead { .. } => 0,
         SequencerEntry::ReleaseReservation { .. } => 0,
     }
@@ -726,7 +721,7 @@ mod tests {
         /// Kept alive so the service's receiver stays open, and used directly by
         /// the tests that submit reservation requests to a leader tick.
         reservations: ReservationInbox,
-        _verdict_tx: mpsc::Sender<(TxnId, bool)>,
+        _verdict_tx: mpsc::Sender<(TxnId, VerdictOutcome)>,
         _dir: tempfile::TempDir,
     }
 

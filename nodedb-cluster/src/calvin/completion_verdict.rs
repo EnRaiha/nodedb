@@ -13,7 +13,10 @@ use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 use super::TxnId;
-use super::completion::{CalvinCompletionRegistry, PendingCompletion};
+use super::completion::{
+    CalvinCompletionRegistry, ParticipantVote, PendingCompletion, VerdictOutcome,
+};
+use super::sequencer::AbortReason;
 
 /// Push notification that a staged cross-shard txn's authoritative global
 /// verdict is now durable on this node.
@@ -29,7 +32,8 @@ use super::completion::{CalvinCompletionRegistry, PendingCompletion};
 pub struct VerdictSignal {
     pub epoch: u64,
     pub position: u32,
-    pub commit: bool,
+    /// The decision, carrying the abort reason when it aborts.
+    pub verdict: VerdictOutcome,
 }
 
 impl CalvinCompletionRegistry {
@@ -69,19 +73,19 @@ impl CalvinCompletionRegistry {
     }
 
     /// Record one participant vshard's durable commit vote for `txn`, tallied
-    /// from a replicated `SequencerEntry::Vote` (last write wins per `vshard`,
+    /// from a replicated `Vote` / `AbortVote` (last write wins per `vshard`,
     /// deterministic across retries). On the transition to a complete tally it
     /// emits the aggregated verdict signal exactly once (deduped by
     /// `verdict_proposed`); the leader turns that into a replicated
     /// `SequencerEntry::Verdict` whose apply stores the durable `verdict` gating
     /// each parked participant's flush (commit) or drop (abort).
-    pub fn note_vote(&self, txn_id: TxnId, vshard: u32, commit: bool) {
+    pub fn note_vote(&self, txn_id: TxnId, vshard: u32, vote: ParticipantVote) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner
             .completions
             .entry(txn_id)
             .or_insert_with(|| PendingCompletion::new(0));
-        entry.votes.insert(vshard, commit);
+        entry.votes.insert(vshard, vote);
 
         // On the transition to a complete tally, emit the aggregated verdict
         // exactly once. `expected_participants` is seeded deterministically on
@@ -98,29 +102,30 @@ impl CalvinCompletionRegistry {
             && entry.votes.len() == entry.expected_participants
             && !entry.verdict_proposed
         {
-            let commit_all = entry.votes.values().all(|&v| v);
+            let tally = tally_verdict(&entry.votes);
             entry.verdict_proposed = true;
             // Non-blocking: a full channel drops the signal, mirroring how the
             // apply fan-out drops on backpressure. A dropped signal is a missed
             // proposal (the leader re-drives on the next tally that isn't
             // deduped), never lost state — the verdict is stored separately via
             // `note_verdict` when the leader's proposal is applied.
-            let _ = self.verdict_tx.try_send((txn_id, commit_all));
+            let _ = self.verdict_tx.try_send((txn_id, tally));
         }
     }
 
-    /// Returns `(TxnId, commit)` for every txn whose vote tally is COMPLETE but
+    /// Returns `(TxnId, verdict)` for every txn whose vote tally is COMPLETE but
     /// whose global `Verdict` has NOT been applied (`verdict.is_none()`), so a
     /// newly elected sequencer leader can (re-)propose it. Deliberately IGNORES
     /// `verdict_proposed` (per-node, non-durable, already `true` on a follower
     /// that tallied completeness before failover) — the durable `verdict` is the
-    /// only authority for "already decided". `commit = all votes true`.
+    /// only authority for "already decided". The verdict is the aggregated
+    /// tally: commit only when every participant voted commit.
     ///
     /// Read-only: it scans and returns candidates, never mutating/removing
     /// entries. A txn stays returnable until its replicated `Verdict` applies
     /// (via `note_verdict`) and sets `verdict` — so re-proposing on every leader
     /// tick self-heals and cannot loop.
-    pub fn drain_unproposed_verdicts(&self) -> Vec<(TxnId, bool)> {
+    pub fn drain_unproposed_verdicts(&self) -> Vec<(TxnId, VerdictOutcome)> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner
             .completions
@@ -130,7 +135,7 @@ impl CalvinCompletionRegistry {
                     && entry.votes.len() == entry.expected_participants
                     && entry.verdict.is_none()
             })
-            .map(|(txn, entry)| (*txn, entry.votes.values().all(|&v| v)))
+            .map(|(txn, entry)| (*txn, tally_verdict(&entry.votes)))
             .collect()
     }
 
@@ -149,7 +154,7 @@ impl CalvinCompletionRegistry {
     /// that probed just before the store. A `try_send` that fails (full/closed
     /// channel) is a non-fatal drop — the scheduler's stall re-probe backstops
     /// it — never a block or panic, mirroring the apply fan-out drop discipline.
-    pub fn note_verdict(&self, txn: TxnId, commit: bool) {
+    pub fn note_verdict(&self, txn: TxnId, verdict: VerdictOutcome) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         {
             let entry = inner
@@ -157,19 +162,22 @@ impl CalvinCompletionRegistry {
                 .entry(txn)
                 .or_insert_with(|| PendingCompletion::new(0));
             match entry.verdict {
-                Some(existing) if existing != commit => {
+                Some(existing) if existing.is_commit() != verdict.is_commit() => {
                     tracing::warn!(
                         epoch = txn.epoch,
                         position = txn.position,
-                        existing,
-                        proposed = commit,
+                        existing = ?existing,
+                        proposed = ?verdict,
                         "calvin verdict differs from a previously applied one; \
                          determinism bug — overwriting with the latest"
                     );
-                    entry.verdict = Some(commit);
+                    entry.verdict = Some(verdict);
                 }
+                // Same decision, but a legacy abort recorded no reason: adopt the
+                // one this apply carries.
+                Some(VerdictOutcome::Abort(None)) => entry.verdict = Some(verdict),
                 Some(_) => {}
-                None => entry.verdict = Some(commit),
+                None => entry.verdict = Some(verdict),
             }
         }
 
@@ -179,15 +187,17 @@ impl CalvinCompletionRegistry {
         let signal = VerdictSignal {
             epoch: txn.epoch,
             position: txn.position,
-            commit,
+            verdict,
         };
         for tx in inner.verdict_signal_senders.values() {
             let _ = tx.try_send(signal);
         }
     }
 
-    /// Test/inspection accessor: returns the stored commit/abort verdict for
-    /// `txn_id`, or `None` if no verdict has been applied yet.
+    /// The parked scheduler's flush/drop gate: `Some(true)` commit, `Some(false)`
+    /// abort, `None` if no verdict has been applied yet. Deliberately drops the
+    /// abort reason — the reason reaches the coordinator via `AttemptOutcome`,
+    /// and a participant only needs to know whether to flush.
     pub fn verdict(&self, txn_id: TxnId) -> Option<bool> {
         self.inner
             .lock()
@@ -195,17 +205,44 @@ impl CalvinCompletionRegistry {
             .completions
             .get(&txn_id)
             .and_then(|entry| entry.verdict)
+            .map(VerdictOutcome::is_commit)
     }
 
     /// Test/inspection accessor: returns the current per-vshard vote tally for
     /// `txn_id`, or `None` if no entry (and therefore no votes) exist yet.
-    pub fn vote_tally(&self, txn_id: TxnId) -> Option<BTreeMap<u32, bool>> {
+    pub fn vote_tally(&self, txn_id: TxnId) -> Option<BTreeMap<u32, ParticipantVote>> {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .completions
             .get(&txn_id)
             .map(|entry| entry.votes.clone())
+    }
+}
+
+/// Aggregate a complete vote tally: commit only when every participant voted
+/// commit, otherwise abort with the highest-precedence reason.
+///
+/// Precedence: `ParticipantError` outranks `SerializationConflict` — a peer that
+/// never staged makes a stale read-set unverifiable, and the infrastructure
+/// failure is the actionable diagnosis.
+fn tally_verdict(votes: &BTreeMap<u32, ParticipantVote>) -> VerdictOutcome {
+    let mut aborted = false;
+    let mut reason: Option<AbortReason> = None;
+    for vote in votes.values() {
+        let ParticipantVote::Abort(vote_reason) = vote else {
+            continue;
+        };
+        aborted = true;
+        match (reason, vote_reason) {
+            (Some(AbortReason::ParticipantError), _) | (Some(_), None) => {}
+            _ => reason = *vote_reason,
+        }
+    }
+    if aborted {
+        VerdictOutcome::Abort(reason)
+    } else {
+        VerdictOutcome::Commit
     }
 }
 
@@ -217,12 +254,21 @@ mod tests {
     async fn note_vote_tallies_one_vote_per_vshard() {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(30, 0);
-        reg.note_vote(txn, 1, true);
-        reg.note_vote(txn, 2, false);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
+        reg.note_vote(
+            txn,
+            2,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
         let tally = reg.vote_tally(txn).expect("entry created by note_vote");
         assert_eq!(tally.len(), 2);
-        assert_eq!(tally.get(&1), Some(&true));
-        assert_eq!(tally.get(&2), Some(&false));
+        assert_eq!(tally.get(&1), Some(&ParticipantVote::Commit));
+        assert_eq!(
+            tally.get(&2),
+            Some(&ParticipantVote::Abort(Some(
+                AbortReason::SerializationConflict
+            )))
+        );
     }
 
     #[tokio::test]
@@ -233,16 +279,19 @@ mod tests {
         // Seed the expected participant count the way the leader does.
         reg.note_assigned(1, txn, 2);
 
-        reg.note_vote(txn, 1, true);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
         // First vote: tally incomplete (1 of 2), nothing emitted yet.
         assert!(rx.try_recv().is_err());
 
-        reg.note_vote(txn, 2, true);
+        reg.note_vote(txn, 2, ParticipantVote::Commit);
         // Second vote completes the tally → commit verdict emitted exactly once.
-        assert_eq!(rx.try_recv().expect("verdict emitted"), (txn, true));
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted"),
+            (txn, VerdictOutcome::Commit)
+        );
 
         // A re-proposed vote re-tallies but must NOT emit again (dedup).
-        reg.note_vote(txn, 2, true);
+        reg.note_vote(txn, 2, ParticipantVote::Commit);
         assert!(
             rx.try_recv().is_err(),
             "dedup: verdict must emit only on the first complete tally"
@@ -256,11 +305,76 @@ mod tests {
         let txn = TxnId::new(31, 0);
         reg.note_assigned(1, txn, 2);
 
-        reg.note_vote(txn, 1, true);
-        reg.note_vote(txn, 2, false);
-        // Any abort vote makes the aggregated verdict false.
-        assert_eq!(rx.try_recv().expect("verdict emitted"), (txn, false));
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
+        reg.note_vote(
+            txn,
+            2,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
+        // Any abort vote makes the aggregated verdict an abort.
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted"),
+            (
+                txn,
+                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+            )
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn participant_error_outranks_serialization_conflict_in_the_tally() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+        let txn = TxnId::new(31, 1);
+        reg.note_assigned(1, txn, 2);
+
+        // Lower-precedence reason first, so the winner cannot be "last write".
+        reg.note_vote(
+            txn,
+            1,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
+        reg.note_vote(
+            txn,
+            2,
+            ParticipantVote::Abort(Some(AbortReason::ParticipantError)),
+        );
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted"),
+            (
+                txn,
+                VerdictOutcome::Abort(Some(AbortReason::ParticipantError))
+            ),
+            "a peer that never staged makes the stale read-set unverifiable"
+        );
+    }
+
+    #[tokio::test]
+    async fn participant_error_outranks_a_later_serialization_conflict() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+        let txn = TxnId::new(31, 2);
+        reg.note_assigned(1, txn, 2);
+
+        // Reverse arrival order: precedence must not depend on vote order.
+        reg.note_vote(
+            txn,
+            1,
+            ParticipantVote::Abort(Some(AbortReason::ParticipantError)),
+        );
+        reg.note_vote(
+            txn,
+            2,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted"),
+            (
+                txn,
+                VerdictOutcome::Abort(Some(AbortReason::ParticipantError))
+            )
+        );
     }
 
     #[tokio::test]
@@ -276,16 +390,16 @@ mod tests {
         reg.seed_expected(txn, 2);
         reg.seed_expected(txn, 1);
 
-        reg.note_vote(txn, 1, true);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
         assert!(
             rx.try_recv().is_err(),
             "only 1 of 2 expected votes in; must not emit yet"
         );
 
-        reg.note_vote(txn, 2, true);
+        reg.note_vote(txn, 2, ParticipantVote::Commit);
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
-            (txn, true),
+            (txn, VerdictOutcome::Commit),
             "seed_expected alone (no note_assigned) must make completeness detectable"
         );
     }
@@ -300,16 +414,16 @@ mod tests {
         let txn_a = TxnId::new(41, 0);
         reg.seed_expected(txn_a, 3);
         reg.note_assigned(1, txn_a, 1);
-        reg.note_vote(txn_a, 1, true);
-        reg.note_vote(txn_a, 2, true);
+        reg.note_vote(txn_a, 1, ParticipantVote::Commit);
+        reg.note_vote(txn_a, 2, ParticipantVote::Commit);
         assert!(
             rx.try_recv().is_err(),
             "expected_participants must be max(3, 1) = 3; 2 votes is not complete"
         );
-        reg.note_vote(txn_a, 3, true);
+        reg.note_vote(txn_a, 3, ParticipantVote::Commit);
         assert_eq!(
             rx.try_recv().expect("verdict emitted at the 3rd vote"),
-            (txn_a, true)
+            (txn_a, VerdictOutcome::Commit)
         );
 
         // note_assigned first (smaller), then seed_expected with a larger count:
@@ -317,16 +431,16 @@ mod tests {
         let txn_b = TxnId::new(41, 1);
         reg.note_assigned(2, txn_b, 1);
         reg.seed_expected(txn_b, 3);
-        reg.note_vote(txn_b, 1, true);
-        reg.note_vote(txn_b, 2, true);
+        reg.note_vote(txn_b, 1, ParticipantVote::Commit);
+        reg.note_vote(txn_b, 2, ParticipantVote::Commit);
         assert!(
             rx.try_recv().is_err(),
             "expected_participants must be max(1, 3) = 3, not the smaller seed"
         );
-        reg.note_vote(txn_b, 3, true);
+        reg.note_vote(txn_b, 3, ParticipantVote::Commit);
         assert_eq!(
             rx.try_recv().expect("verdict emitted at the 3rd vote"),
-            (txn_b, true)
+            (txn_b, VerdictOutcome::Commit)
         );
     }
 
@@ -337,7 +451,7 @@ mod tests {
         reg.register_verdict_signal_sender(7, tx);
 
         let txn = TxnId::new(50, 2);
-        reg.note_verdict(txn, true);
+        reg.note_verdict(txn, VerdictOutcome::Commit);
 
         // The stored verdict and the pushed signal must agree.
         assert_eq!(reg.verdict(txn), Some(true));
@@ -346,7 +460,7 @@ mod tests {
             VerdictSignal {
                 epoch: 50,
                 position: 2,
-                commit: true,
+                verdict: VerdictOutcome::Commit,
             }
         );
     }
@@ -360,12 +474,25 @@ mod tests {
         reg.register_verdict_signal_sender(2, tx2);
 
         let txn = TxnId::new(51, 0);
-        reg.note_verdict(txn, false);
+        reg.note_verdict(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+        );
 
         // Both locally registered vShard schedulers receive the broadcast; each
         // filters by its own parked (epoch, position).
-        assert!(!rx1.try_recv().expect("push to vshard 1").commit);
-        assert!(!rx2.try_recv().expect("push to vshard 2").commit);
+        assert!(
+            !rx1.try_recv()
+                .expect("push to vshard 1")
+                .verdict
+                .is_commit()
+        );
+        assert!(
+            !rx2.try_recv()
+                .expect("push to vshard 2")
+                .verdict
+                .is_commit()
+        );
     }
 
     #[tokio::test]
@@ -375,11 +502,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         reg.register_verdict_signal_sender(9, tx);
         let filler = TxnId::new(60, 0);
-        reg.note_verdict(filler, true);
+        reg.note_verdict(filler, VerdictOutcome::Commit);
         // Buffer now holds one signal; do NOT drain it.
 
         let txn = TxnId::new(60, 1);
-        reg.note_verdict(txn, true);
+        reg.note_verdict(txn, VerdictOutcome::Commit);
         // The push was dropped (channel full) but the durable verdict is stored —
         // the scheduler's stall re-probe reads it back. No panic, no block.
         assert_eq!(reg.verdict(txn), Some(true));
@@ -397,7 +524,10 @@ mod tests {
 
         let txn = TxnId::new(61, 0);
         // Must not panic despite the closed channel; the verdict still stores.
-        reg.note_verdict(txn, false);
+        reg.note_verdict(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+        );
         assert_eq!(reg.verdict(txn), Some(false));
     }
 
@@ -413,21 +543,21 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(70, 0);
         reg.seed_expected(txn, 2);
-        reg.note_vote(txn, 1, true);
-        reg.note_vote(txn, 2, true);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
+        reg.note_vote(txn, 2, ParticipantVote::Commit);
         // Tally complete (verdict_proposed now set) but NO verdict stored — the
         // `Verdict` entry never committed before failover.
         assert_eq!(reg.verdict(txn), None);
         assert_eq!(
             reg.drain_unproposed_verdicts(),
-            vec![(txn, true)],
+            vec![(txn, VerdictOutcome::Commit)],
             "a complete all-commit tally with no stored verdict must be drainable \
              despite verdict_proposed already being set"
         );
 
         // Once the re-proposed `Verdict` applies, the txn stops draining — idempotent
         // stop, so re-driving on every tick cannot loop.
-        reg.note_verdict(txn, true);
+        reg.note_verdict(txn, VerdictOutcome::Commit);
         assert!(
             reg.drain_unproposed_verdicts().is_empty(),
             "a stored verdict must stop the txn from being re-drained"
@@ -439,13 +569,20 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(71, 0);
         reg.seed_expected(txn, 2);
-        reg.note_vote(txn, 1, true);
-        reg.note_vote(txn, 2, false);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
+        reg.note_vote(
+            txn,
+            2,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
         assert_eq!(reg.verdict(txn), None);
         assert_eq!(
             reg.drain_unproposed_verdicts(),
-            vec![(txn, false)],
-            "any abort vote makes the re-proposed verdict false"
+            vec![(
+                txn,
+                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+            )],
+            "any abort vote makes the re-proposed verdict an abort"
         );
     }
 
@@ -454,7 +591,7 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(72, 0);
         reg.seed_expected(txn, 2);
-        reg.note_vote(txn, 1, true);
+        reg.note_vote(txn, 1, ParticipantVote::Commit);
         // Only 1 of 2 expected votes in: not complete, must not be drainable.
         assert!(
             reg.drain_unproposed_verdicts().is_empty(),

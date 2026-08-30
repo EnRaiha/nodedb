@@ -13,6 +13,7 @@ use nodedb_cluster::calvin::{AttemptOutcome, CalvinCompletionRegistry, TxnId};
 
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
+use crate::control::planner::calvin::abort_error::calvin_abort_error;
 use crate::control::planner::calvin::submit::RoutedAssignment;
 use crate::{Error, OllpExhaustedCause};
 
@@ -141,13 +142,14 @@ where
             // Return the completed txn's id so the caller can drain the applied
             // Response (RETURNING rows) the scheduler deposited before the ack.
             AttemptOutcome::Completed => return Ok(DependentOutcome::Committed(txn_id)),
-            // Terminal, NON-retryable: the global cross-shard OCC verdict was
-            // ABORT (read-set validation failed). A serialization failure is a
-            // terminal verdict, not OLLP predicate drift — a fresh reconnaissance
-            // cannot change a committed verdict, so surface it to the client as
-            // SQLSTATE 40001 immediately instead of burning retries.
-            AttemptOutcome::Aborted => {
-                return Err(Error::CalvinSerializationConflict);
+            // Terminal, NON-retryable: the global cross-shard verdict was ABORT.
+            // A committed verdict is not OLLP predicate drift — a fresh
+            // reconnaissance cannot change it — so surface it to the client
+            // immediately instead of burning retries. The verdict's reason picks
+            // the error: a stale read-set is SQLSTATE 40001, a participant error
+            // is not.
+            AttemptOutcome::Aborted { reason } => {
+                return Err(calvin_abort_error(reason));
             }
             // Terminal, NON-retryable: the scheduler rejected the transaction's
             // local plan routing and broadcast `TxnRoutingFailed`. A fresh

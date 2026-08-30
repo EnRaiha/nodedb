@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod abort_error;
 pub mod cross_shard_mode;
 pub mod dependent_recon;
 pub mod dependent_recon_plan;
@@ -16,6 +17,7 @@ pub mod tx_class;
 pub mod types;
 pub mod write_class;
 
+pub use abort_error::calvin_abort_error;
 pub use cross_shard_mode::CrossShardTxnMode;
 pub(crate) use dependent_recon::dispatch_dependent_edge_recon;
 pub use dependent_recon::{

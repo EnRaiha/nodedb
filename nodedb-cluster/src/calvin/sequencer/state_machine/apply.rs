@@ -301,7 +301,27 @@ impl SequencerStateMachine {
                 self.completion_registry.note_vote(
                     crate::calvin::TxnId::new(epoch, position),
                     vshard,
-                    commit,
+                    if commit {
+                        crate::calvin::ParticipantVote::Commit
+                    } else {
+                        // A pre-existing abort vote records no reason.
+                        crate::calvin::ParticipantVote::Abort(None)
+                    },
+                );
+            }
+            // Durable per-participant ABORT vote carrying its cause. Split from
+            // `Vote` so the reason reaches the coordinator without changing
+            // `Vote`'s wire shape.
+            SequencerEntry::AbortVote {
+                epoch,
+                position,
+                vshard,
+                reason,
+            } => {
+                self.completion_registry.note_vote(
+                    crate::calvin::TxnId::new(epoch, position),
+                    vshard,
+                    crate::calvin::ParticipantVote::Abort(Some(reason)),
                 );
             }
             // Authoritative commit/abort verdict for a staged cross-shard txn,
@@ -314,8 +334,28 @@ impl SequencerStateMachine {
                 position,
                 commit,
             } => {
+                // A pre-existing abort verdict records no reason; `Abort(None)`
+                // is exactly that unknown cause.
+                let outcome = if commit {
+                    crate::calvin::VerdictOutcome::Commit
+                } else {
+                    crate::calvin::VerdictOutcome::Abort(None)
+                };
                 self.completion_registry
-                    .note_verdict(crate::calvin::TxnId::new(epoch, position), commit);
+                    .note_verdict(crate::calvin::TxnId::new(epoch, position), outcome);
+            }
+            // Authoritative ABORT verdict carrying the winning participant
+            // reason. Split from `Verdict` for the same wire-shape reason as
+            // `AbortVote`.
+            SequencerEntry::AbortVerdict {
+                epoch,
+                position,
+                reason,
+            } => {
+                self.completion_registry.note_verdict(
+                    crate::calvin::TxnId::new(epoch, position),
+                    crate::calvin::VerdictOutcome::Abort(Some(reason)),
+                );
             }
             // Fan a hot-key read reservation out to its owning vShard's scheduler,
             // which installs the SHARED lock. Same `try_send` backpressure
@@ -861,6 +901,78 @@ mod tests {
         // Verdict is not an EpochBatch, so it must not perturb the epoch counter
         // (mirrors OllpMismatch/TxnRoutingFailed's non-effect).
         assert_eq!(sm.last_applied_epoch(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_abort_verdict_reports_its_reason_to_the_coordinator() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
+        let txn = crate::calvin::TxnId::new(9, 5);
+
+        let data = encode_entry(&SequencerEntry::AbortVerdict {
+            epoch: 9,
+            position: 5,
+            reason: crate::calvin::AbortReason::ParticipantError,
+        });
+        sm.apply(1, &data);
+
+        // The participant gate still reads a plain abort...
+        assert_eq!(registry.verdict(txn), Some(false));
+        // ...and the coordinator gets the cause, not a blanket conflict.
+        let rx = registry.register_completion(txn, 1);
+        registry.note_completion_ack(txn, 3);
+        assert_eq!(
+            rx.await.expect("completion fires"),
+            crate::calvin::AttemptOutcome::Aborted {
+                reason: Some(crate::calvin::AbortReason::ParticipantError)
+            }
+        );
+        assert_eq!(sm.last_applied_epoch(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_abort_vote_tallies_with_its_reason() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
+        let txn = crate::calvin::TxnId::new(9, 6);
+        registry.seed_expected(txn, 1);
+
+        let data = encode_entry(&SequencerEntry::AbortVote {
+            epoch: 9,
+            position: 6,
+            vshard: 3,
+            reason: crate::calvin::AbortReason::ParticipantError,
+        });
+        sm.apply(1, &data);
+
+        assert_eq!(
+            registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
+            Some(crate::calvin::ParticipantVote::Abort(Some(
+                crate::calvin::AbortReason::ParticipantError
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_legacy_abort_vote_tallies_without_a_reason() {
+        // A `Vote { commit: false }` durable before abort reasons existed must
+        // still decode and tally — with an unknown cause, never an invented one.
+        let registry = CalvinCompletionRegistry::new_detached();
+        let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
+        let txn = crate::calvin::TxnId::new(9, 7);
+
+        let data = encode_entry(&SequencerEntry::Vote {
+            epoch: 9,
+            position: 7,
+            vshard: 3,
+            commit: false,
+        });
+        sm.apply(1, &data);
+
+        assert_eq!(
+            registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
+            Some(crate::calvin::ParticipantVote::Abort(None))
+        );
     }
 
     #[test]

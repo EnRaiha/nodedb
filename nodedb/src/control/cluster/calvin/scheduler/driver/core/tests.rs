@@ -350,7 +350,9 @@ async fn drain_catch_up_is_noop_when_no_drop_recorded() {
 use std::time::{Duration, Instant};
 
 use nodedb_cluster::calvin::types::EpochBatch;
-use nodedb_cluster::calvin::{SEQUENCER_GROUP_ID, SequencerEntry};
+use nodedb_cluster::calvin::{
+    AbortReason, ParticipantVote, SEQUENCER_GROUP_ID, SequencerEntry, VerdictOutcome,
+};
 use nodedb_types::id::{DatabaseId, VShardId};
 
 /// Ensure the sequencer Raft group exists on this scheduler's `MultiRaft` and
@@ -707,11 +709,24 @@ async fn two_participant_false_vote_broadcasts_global_abort_to_every_scheduler()
     // Model the replicated vote entries and their resulting durable verdict.
     // The shared registry sends each scheduler's actual registered channel.
     registry.seed_expected(txn, 2);
-    registry.note_vote(txn, 7, true);
+    registry.note_vote(txn, 7, ParticipantVote::Commit);
     assert!(registry.drain_unproposed_verdicts().is_empty());
-    registry.note_vote(txn, 9, false);
-    assert_eq!(registry.drain_unproposed_verdicts(), vec![(txn, false)]);
-    registry.note_verdict(txn, false);
+    registry.note_vote(
+        txn,
+        9,
+        ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+    );
+    assert_eq!(
+        registry.drain_unproposed_verdicts(),
+        vec![(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+        )]
+    );
+    registry.note_verdict(
+        txn,
+        VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+    );
     assert_eq!(registry.verdict(txn), Some(false));
 
     let first_signal = first_scheduler

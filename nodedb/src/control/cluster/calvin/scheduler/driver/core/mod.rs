@@ -21,6 +21,8 @@
 //!   `dispatch`'s local-plan filtering.
 //! - [`commit_resolve`] — verdict-driven flush-or-drop of a staged static
 //!   transaction, plus the shared commit tail.
+//! - [`staged_vote`] — derives a participant's local commit vote from its
+//!   staged executor response, keeping the two abort causes apart.
 //! - [`commit_redo`] — resolves a committed staged transaction's post-images
 //!   into a replayable `TransactionRedo` WAL record ahead of the flush.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
@@ -55,6 +57,7 @@ pub mod read_result;
 pub mod request;
 pub mod routing;
 pub mod scheduler;
+pub mod staged_vote;
 pub mod write_version_record;
 
 #[cfg(test)]

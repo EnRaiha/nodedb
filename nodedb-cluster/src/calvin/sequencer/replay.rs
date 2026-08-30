@@ -151,6 +151,8 @@ impl SequencerStateMachine {
                 SequencerEntry::TxnRoutingFailed { .. } => {}
                 SequencerEntry::Vote { .. } => {}
                 SequencerEntry::Verdict { .. } => {}
+                SequencerEntry::AbortVote { .. } => {}
+                SequencerEntry::AbortVerdict { .. } => {}
             }
         }
 

@@ -47,6 +47,12 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
             nodedb_types::error::sqlstate::SERIALIZATION_FAILURE,
             format!("{e}"),
         ),
+        // A participant error aborted the txn before any read-set was validated:
+        // retryable class 40, but never 40001.
+        crate::Error::CalvinParticipantError => (
+            nodedb_types::error::sqlstate::TRANSACTION_ROLLBACK,
+            format!("{e}"),
+        ),
         other => ("XX000", format!("{other}")),
     };
     let ndb_code = crate::error_classify::classify(e).code().0;

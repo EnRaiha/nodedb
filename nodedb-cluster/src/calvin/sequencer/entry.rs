@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::calvin::types::{EpochBatch, LockKeyWire, ReleaseReason, TxnIdWire};
 
+/// Why a staged cross-shard txn aborted. Carried on the abort-only entry
+/// variants so the coordinator reports the actual cause, not a blanket
+/// serialization conflict.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum AbortReason {
+    /// A participant's read-set was stale at validation.
+    SerializationConflict,
+    /// A participant returned an error, so its read-set was never validated.
+    ParticipantError,
+}
+
 /// An entry in the replicated sequencer log.
 ///
 /// Every epoch batch committed by the sequencer is encoded as one of these
@@ -61,8 +82,9 @@ pub enum SequencerEntry {
     /// Generalizes `OllpMismatch` (an implicit vote=abort). Unlike
     /// `OllpMismatch`/`CompletionAck` which key only on `(epoch, position)`, `Vote`
     /// carries `vshard` because the verdict aggregator must attribute exactly one
-    /// vote per participant to know when the tally is complete. `commit` is the
-    /// participant's `read_set_valid` outcome (true = valid/commit, false = abort).
+    /// vote per participant to know when the tally is complete. `commit: true`
+    /// is the read-set-valid vote; `commit: false` appears only in log entries
+    /// written before `AbortVote` existed, and carries no reason.
     Vote {
         epoch: u64,
         position: u32,
@@ -71,9 +93,10 @@ pub enum SequencerEntry {
     },
     /// The global commit/abort verdict for a staged cross-shard txn, proposed by
     /// the sequencer leader once every participant has voted (see `Vote`).
-    /// `commit = all participant votes are true`. Every replica applies this to
-    /// store the authoritative decision; participants later flush (commit) or drop
-    /// (abort) their staged buffer on it.
+    /// `commit: true` means every participant voted commit. Every replica applies
+    /// this to store the authoritative decision; participants later flush (commit)
+    /// or drop (abort) their staged buffer on it. `commit: false` appears only in
+    /// log entries written before `AbortVerdict` existed.
     Verdict {
         epoch: u64,
         position: u32,
@@ -92,6 +115,23 @@ pub enum SequencerEntry {
         owner: TxnIdWire,
         vshard: u32,
         reason: ReleaseReason,
+    },
+    /// One participant vShard's durable ABORT vote, carrying why it aborted.
+    /// `Vote` stays the commit-only vote: adding a field to it would break
+    /// decode of already-durable log entries, so the reason rides a new variant.
+    AbortVote {
+        epoch: u64,
+        position: u32,
+        vshard: u32,
+        reason: AbortReason,
+    },
+    /// The global ABORT verdict for a staged cross-shard txn, carrying the
+    /// winning participant reason. `Verdict` stays the commit-only verdict, for
+    /// the same wire-compatibility reason as `AbortVote`.
+    AbortVerdict {
+        epoch: u64,
+        position: u32,
+        reason: AbortReason,
     },
 }
 
@@ -231,6 +271,83 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
         let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn abort_vote_msgpack_roundtrip() {
+        let entry = SequencerEntry::AbortVote {
+            epoch: 5,
+            position: 2,
+            vshard: 9,
+            reason: AbortReason::ParticipantError,
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn abort_verdict_msgpack_roundtrip() {
+        let entry = SequencerEntry::AbortVerdict {
+            epoch: 5,
+            position: 2,
+            reason: AbortReason::SerializationConflict,
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn vote_and_verdict_keep_their_pre_existing_wire_shape() {
+        // Guards the compat claim behind adding `AbortVote`/`AbortVerdict`:
+        // already-durable log entries must still decode. Variant payloads are
+        // positional arrays under a strict length check, so the name tag and the
+        // field count are what a field addition would have broken.
+        let vote = zerompk::to_msgpack_vec(&SequencerEntry::Vote {
+            epoch: 5,
+            position: 2,
+            vshard: 9,
+            commit: true,
+        })
+        .expect("encode");
+        assert_eq!(vote[0], 0x92, "enum stays a 2-element [tag, payload] array");
+        assert_eq!(&vote[1..6], b"\xA4Vote", "fixstr(4) name tag");
+        assert_eq!(vote[6], 0x94, "Vote payload must stay a 4-element array");
+
+        let verdict = zerompk::to_msgpack_vec(&SequencerEntry::Verdict {
+            epoch: 5,
+            position: 2,
+            commit: false,
+        })
+        .expect("encode");
+        assert_eq!(&verdict[1..9], b"\xA7Verdict");
+        assert_eq!(
+            verdict[9], 0x93,
+            "Verdict payload must stay a 3-element array"
+        );
+
+        // And both still round-trip through the widened enum.
+        let decoded: SequencerEntry = zerompk::from_msgpack(&vote).expect("decode legacy Vote");
+        assert_eq!(
+            decoded,
+            SequencerEntry::Vote {
+                epoch: 5,
+                position: 2,
+                vshard: 9,
+                commit: true,
+            }
+        );
+        let decoded: SequencerEntry =
+            zerompk::from_msgpack(&verdict).expect("decode legacy Verdict");
+        assert_eq!(
+            decoded,
+            SequencerEntry::Verdict {
+                epoch: 5,
+                position: 2,
+                commit: false,
+            }
+        );
     }
 
     #[test]

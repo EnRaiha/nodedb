@@ -14,6 +14,7 @@ use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 
 use crate::Error;
 use crate::bridge::envelope::Response;
+use crate::control::planner::calvin::abort_error::calvin_abort_error;
 use crate::control::state::{CalvinApplyResult, SharedState};
 
 /// Build a minimal Control-Plane [`Response`] carrying only the RETURNING
@@ -121,15 +122,14 @@ pub async fn submit_and_await_calvin_with_timeout(
             detail: format!("calvin transaction routing failed: {detail}"),
         });
     }
-    // Terminal, NON-retryable: the global cross-shard OCC verdict was ABORT
-    // (read-set validation failed) and the writes were dropped. This is a
-    // fall-through chain, NOT a match — without this explicit check `Aborted`
-    // would fall through to the RETURNING drain below and silently return
-    // `Ok(None)`, reporting COMMIT SUCCESS for a transaction that never applied.
-    // Surface it as a serialization failure (SQLSTATE 40001) so the client
-    // retries the whole transaction.
-    if outcome == AttemptOutcome::Aborted {
-        return Err(Error::CalvinSerializationConflict);
+    // Terminal, NON-retryable: the global cross-shard verdict was ABORT and the
+    // writes were dropped. This is a fall-through chain, NOT a match — without
+    // this explicit check `Aborted` would fall through to the RETURNING drain
+    // below and silently return `Ok(None)`, reporting COMMIT SUCCESS for a
+    // transaction that never applied. The verdict's reason picks the error the
+    // client retries on.
+    if let AttemptOutcome::Aborted { reason } = &outcome {
+        return Err(calvin_abort_error(*reason));
     }
     // The static (non-dependent) Calvin path never produces an OLLP mismatch —
     // `note_ollp_mismatch` only fires on the dependent-predicate retry path — so

@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::calvin::sequencer::AbortReason;
+
 /// Calvin transaction identity in the sequencer-assigned coordinate space.
 ///
 /// `(epoch, position)` is the unique key the sequencer Raft state machine
@@ -34,13 +36,41 @@ impl TxnId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Completed,
-    /// The global cross-shard verdict was ABORT (read-set/OCC validation failed).
-    /// A serialization failure — surfaced to the client as SQLSTATE 40001, never retried.
-    Aborted,
+    /// The global cross-shard verdict was ABORT. `reason` names the cause; it is
+    /// `None` for a pre-existing durable verdict that recorded no reason.
+    Aborted {
+        reason: Option<AbortReason>,
+    },
     Mismatch,
     Failed {
         detail: String,
     },
+}
+
+/// One participant vShard's durable commit vote. `Abort(None)` is a
+/// pre-existing durable `SequencerEntry::Vote { commit: false }`, written before
+/// abort reasons existed on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParticipantVote {
+    Commit,
+    Abort(Option<AbortReason>),
+}
+
+/// A commit/abort decision: the tally aggregated from votes, and the
+/// authoritative verdict stored on a `PendingCompletion`. `Abort(None)` carries
+/// no reason, either from a legacy vote or a legacy stored verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerdictOutcome {
+    Commit,
+    Abort(Option<AbortReason>),
+}
+
+impl VerdictOutcome {
+    /// `true` for a commit decision. The scheduler's flush/drop gate needs only
+    /// this bit; the reason travels to the coordinator instead.
+    pub fn is_commit(self) -> bool {
+        matches!(self, Self::Commit)
+    }
 }
 
 pub(crate) struct PendingCompletion {
@@ -58,18 +88,18 @@ pub(crate) struct PendingCompletion {
     /// `mismatched` and completion: a routing failure is never retried and never
     /// falsely reported as success.
     routing_failed: Option<String>,
-    /// Durable per-participant commit votes tallied from `SequencerEntry::Vote`,
-    /// keyed by vshard so a re-proposed vote (retry) overwrites deterministically.
+    /// Durable per-participant commit votes tallied from `SequencerEntry::Vote`
+    /// and `SequencerEntry::AbortVote`, keyed by vshard so a re-proposed vote (retry) overwrites deterministically.
     /// Once complete, the leader aggregates the tally into the global `verdict`
     /// that gates each participant's flush/drop at the cross-shard commit barrier.
-    pub(crate) votes: BTreeMap<u32, bool>,
+    pub(crate) votes: BTreeMap<u32, ParticipantVote>,
     /// The authoritative commit/abort verdict, applied from a replicated
-    /// `SequencerEntry::Verdict`; `None` until applied. This is the durable
+    /// `SequencerEntry::Verdict` or `AbortVerdict`; `None` until applied. This is the durable
     /// barrier gate: a participant parked in `AwaitingVerdict` resumes into its
     /// flush (commit) or drop (abort) once it is set. It is also the ONLY
     /// authority for "already decided" — a post-failover leader re-proposes from
     /// `votes` until it is stored (see `drain_unproposed_verdicts`).
-    pub(crate) verdict: Option<bool>,
+    pub(crate) verdict: Option<VerdictOutcome>,
     /// Dedup guard for the LOCAL emit path: set the first time the tally becomes
     /// complete so the verdict signal is emitted exactly once across vote
     /// re-proposals. Per-node, non-durable, never reset on failover — so it is
@@ -83,14 +113,14 @@ pub(crate) struct PendingCompletion {
 ///
 /// The verdict is applied from a replicated `SequencerEntry::Verdict` that is
 /// strictly ordered BEFORE the abort's `CompletionAck` in the sequencer Raft
-/// log, so an ABORT verdict is always stored (`verdict == Some(false)`) by the
-/// time this entry's completion fires. `Some(false)` is a serialization abort
-/// (`Aborted`); `None` (single-shard / no-verdict paths) and `Some(true)` are
-/// `Completed`. We deliberately do NOT gate on `verdict.is_some()` — that would
-/// stall the no-verdict completion paths.
+/// log, so an ABORT verdict is always stored by the time this entry's
+/// completion fires. A stored abort becomes `Aborted`, carrying the reason the
+/// verdict recorded; `None` (single-shard / no-verdict paths) and a commit
+/// verdict are `Completed`. We deliberately do NOT gate on `verdict.is_some()`
+/// — that would stall the no-verdict completion paths.
 fn outcome_for(entry: &PendingCompletion) -> AttemptOutcome {
     match entry.verdict {
-        Some(false) => AttemptOutcome::Aborted,
+        Some(VerdictOutcome::Abort(reason)) => AttemptOutcome::Aborted { reason },
         _ => AttemptOutcome::Completed,
     }
 }
@@ -140,19 +170,19 @@ pub struct CalvinCompletionRegistry {
     /// `completion_verdict.rs` (a sibling module in the same crate); never
     /// exposed beyond the crate.
     pub(crate) inner: Mutex<Inner>,
-    /// Emits `(txn, commit)` exactly once when a staged cross-shard txn's vote
+    /// Emits `(txn, verdict)` exactly once when a staged cross-shard txn's vote
     /// tally becomes complete (all expected participants voted). The paired
     /// receiver lives in the `SequencerService`, whose leader-guarded arm turns
     /// the signal into a `SequencerEntry::Verdict` proposal. `pub(crate)`: also
     /// used by `note_vote` in `completion_verdict.rs`.
-    pub(crate) verdict_tx: mpsc::Sender<(TxnId, bool)>,
+    pub(crate) verdict_tx: mpsc::Sender<(TxnId, VerdictOutcome)>,
 }
 
 impl CalvinCompletionRegistry {
     /// Construct a registry wired to a verdict signal channel. The paired
     /// receiver must be handed to the `SequencerService` on this node so the
     /// leader can propose the aggregated verdict.
-    pub fn new(verdict_tx: mpsc::Sender<(TxnId, bool)>) -> Arc<Self> {
+    pub fn new(verdict_tx: mpsc::Sender<(TxnId, VerdictOutcome)>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             verdict_tx,
@@ -572,14 +602,19 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(31, 0);
         reg.note_assigned(1, txn, 2);
-        reg.note_verdict(txn, false);
+        reg.note_verdict(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+        );
         let rx = reg.register_completion(txn, 2);
         reg.note_completion_ack(txn, 10);
         reg.note_completion_ack(txn, 20);
         let outcome = rx.await.expect("completion fires");
         assert_eq!(
             outcome,
-            AttemptOutcome::Aborted,
+            AttemptOutcome::Aborted {
+                reason: Some(AbortReason::SerializationConflict)
+            },
             "a stored ABORT verdict must surface as Aborted, not Completed"
         );
         assert_eq!(reg.pending_completions_len(), 0);
@@ -593,27 +628,52 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(32, 1);
         reg.note_assigned(1, txn, 2);
-        reg.note_verdict(txn, false);
+        reg.note_verdict(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::ParticipantError)),
+        );
         reg.note_completion_ack(txn, 10);
         reg.note_completion_ack(txn, 20);
         let rx = reg.register_completion(txn, 2);
         let outcome = rx.await.expect("completion fires");
-        assert_eq!(outcome, AttemptOutcome::Aborted);
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Aborted {
+                reason: Some(AbortReason::ParticipantError)
+            }
+        );
         assert_eq!(reg.pending_completions_len(), 0);
     }
 
     #[tokio::test]
     async fn commit_verdict_reports_completed() {
-        // A COMMIT verdict (Some(true)) must still report `Completed`.
+        // A COMMIT verdict must still report `Completed`.
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(33, 2);
         reg.note_assigned(1, txn, 2);
-        reg.note_verdict(txn, true);
+        reg.note_verdict(txn, VerdictOutcome::Commit);
         let rx = reg.register_completion(txn, 2);
         reg.note_completion_ack(txn, 10);
         reg.note_completion_ack(txn, 20);
         let outcome = rx.await.expect("completion fires");
         assert_eq!(outcome, AttemptOutcome::Completed);
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_abort_verdict_reports_aborted_with_no_reason() {
+        // A durable `SequencerEntry::Verdict { commit: false }` written before
+        // abort reasons existed applies as `Abort(None)`. The coordinator must
+        // still get `Aborted`, with `reason: None` marking the unknown cause.
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(35, 0);
+        reg.note_assigned(1, txn, 2);
+        reg.note_verdict(txn, VerdictOutcome::Abort(None));
+        let rx = reg.register_completion(txn, 2);
+        reg.note_completion_ack(txn, 10);
+        reg.note_completion_ack(txn, 20);
+        let outcome = rx.await.expect("completion fires");
+        assert_eq!(outcome, AttemptOutcome::Aborted { reason: None });
         assert_eq!(reg.pending_completions_len(), 0);
     }
 

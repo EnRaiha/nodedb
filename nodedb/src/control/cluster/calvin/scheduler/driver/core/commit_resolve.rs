@@ -19,6 +19,7 @@ use nodedb_cluster::calvin::{SequencerEntry, VerdictSignal};
 
 use super::super::types::CommitState;
 use super::scheduler::Scheduler;
+use super::staged_vote::{StagedVote, staged_commit_vote};
 use crate::bridge::envelope::{Response, Status};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason;
@@ -53,29 +54,37 @@ impl Scheduler {
         // responses may use `None` for the dependent-read path; accepting an
         // error-plus-None as commit would let a failed participant flush after
         // its peers received a global commit verdict.
-        let committed = staged_commit_vote(staged_response);
+        let vote = staged_commit_vote(staged_response);
 
         // Durably propose this participant's commit vote via the sequencer
         // Raft group, leader-guarded like `OllpMismatch`: only the data-group
         // leader ran read-set validation, so only a leader's vote is
         // authoritative. The sequencer aggregates every participant's vote into
-        // the single `SequencerEntry::Verdict` this txn parks on below.
+        // the single global verdict this txn parks on below. An abort travels as
+        // `AbortVote` so its cause survives to the coordinator.
         if self.is_group_leader() {
-            self.propose_sequencer_entry(
-                SequencerEntry::Vote {
+            let entry = match vote.abort_reason() {
+                Some(reason) => SequencerEntry::AbortVote {
                     epoch: txn_id.epoch,
                     position: txn_id.position,
                     vshard: self.vshard_id,
-                    commit: committed,
+                    reason,
                 },
-                txn_id,
-                "commit vote",
-            );
+                None => SequencerEntry::Vote {
+                    epoch: txn_id.epoch,
+                    position: txn_id.position,
+                    vshard: self.vshard_id,
+                    commit: true,
+                },
+            };
+            self.propose_sequencer_entry(entry, txn_id, "commit vote");
         }
 
-        if !committed {
+        if vote == StagedVote::SerializationConflict {
             // The staged slice's read-set was no longer current: observe it, the
-            // same node-global signal the direct-apply path records.
+            // same node-global signal the direct-apply path records. A
+            // participant error never validated a read-set, so it must not count
+            // here.
             self.shared
                 .calvin_counters
                 .read_set_validation_failures
@@ -195,7 +204,7 @@ impl Scheduler {
         signal: VerdictSignal,
     ) {
         let txn_id = TxnId::new(signal.epoch, signal.position);
-        self.resume_on_verdict(txn_id, signal.commit);
+        self.resume_on_verdict(txn_id, signal.verdict.is_commit());
     }
 
     /// Sweep parked `AwaitingVerdict` txns whose stall deadline has passed.
@@ -483,49 +492,5 @@ impl Scheduler {
             "completion ack",
         );
         true
-    }
-}
-
-/// Derive a local staged vote without ever treating an executor error as a
-/// commit. `None` remains affirmative only for a successful dependent-read or
-/// active staged response, which has no versioned read-set.
-fn staged_commit_vote(response: &Response) -> bool {
-    response.status == Status::Ok && response.read_set_valid != Some(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::staged_commit_vote;
-    use crate::bridge::envelope::{Payload, Response, Status};
-    use crate::types::{Lsn, RequestId};
-
-    fn staged_response(status: Status, read_set_valid: Option<bool>) -> Response {
-        Response {
-            request_id: RequestId::new(1),
-            status,
-            attempt: 1,
-            partial: false,
-            payload: Payload::empty(),
-            watermark_lsn: Lsn::ZERO,
-            error_code: None,
-            read_set_valid,
-            read_version_lsn: Lsn::ZERO,
-            write_set: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn executor_error_is_an_explicit_abort_vote_even_without_read_set_field() {
-        assert!(!staged_commit_vote(&staged_response(Status::Error, None)));
-        assert!(!staged_commit_vote(&staged_response(
-            Status::Error,
-            Some(true)
-        )));
-        assert!(!staged_commit_vote(&staged_response(
-            Status::Ok,
-            Some(false)
-        )));
-        assert!(staged_commit_vote(&staged_response(Status::Ok, None)));
-        assert!(staged_commit_vote(&staged_response(Status::Ok, Some(true))));
     }
 }

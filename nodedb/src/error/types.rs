@@ -57,6 +57,14 @@ pub enum Error {
     )]
     CalvinSerializationConflict,
 
+    /// Cross-shard abort caused by a participant error, NOT by OCC: no read-set
+    /// was validated, so it is never reported as a serialization conflict.
+    #[error(
+        "cross-shard transaction aborted: a participant vShard returned an error before any \
+         read-set was validated; retry"
+    )]
+    CalvinParticipantError,
+
     #[error("CRDT delta pre-validation rejected: {constraint} — {reason}")]
     RejectedPrevalidation { constraint: String, reason: String },
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{self, Sender};
 
 use nodedb_cluster::calvin::{
-    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine, TxnId,
+    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine, TxnId, VerdictOutcome,
 };
 
 use crate::control::cluster::array_executor::DataPlaneArrayExecutor;
@@ -36,7 +36,7 @@ pub(super) struct GroupSetup {
     /// Handed to the `SequencerService` (built in the loop-build phase) so the
     /// leader can propose `SequencerEntry::Verdict` once a cross-shard txn's
     /// vote tally completes.
-    pub(super) calvin_verdict_rx: mpsc::Receiver<(TxnId, bool)>,
+    pub(super) calvin_verdict_rx: mpsc::Receiver<(TxnId, VerdictOutcome)>,
     pub(super) sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
     pub(super) calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     pub(super) metadata_applier: Arc<dyn nodedb_cluster::MetadataApplier>,
