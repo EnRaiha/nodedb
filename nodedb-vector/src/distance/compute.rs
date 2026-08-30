@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::distance::scalar::*;
-use crate::distance::simd;
-use nodedb_types::vector_distance::DistanceMetric;
+//! Top-level distance and batch-distance computation, dispatched to SIMD.
+
+use super::scalar::*;
+use super::simd;
 
 /// Compute distance between two vectors using the specified metric.
 ///
@@ -27,7 +28,7 @@ pub fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
         DistanceMetric::Hamming => hamming_f32(a, b),
         DistanceMetric::Jaccard => jaccard(a, b),
         DistanceMetric::Pearson => pearson(a, b),
-        // DistanceMetric is #[non_exhaustive]; unknown future variants fall back to L2.
+        // Unknown future metric — fall back to L2.
         _ => (rt.l2_squared)(a, b),
     }
 }

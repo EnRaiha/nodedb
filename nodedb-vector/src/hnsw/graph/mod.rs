@@ -6,18 +6,11 @@
 //! FP32 construction for structural integrity; heuristic neighbor selection.
 
 pub mod index;
+mod limits;
 pub mod types;
 
-/// Initial arena capacity used when constructing a new [`index::HnswIndex`].
-///
-/// Sized to cover `ef_construction = 200` (the default) without needing a
-/// reallocation on the first insert or search.
-pub(crate) const ARENA_INITIAL_CAPACITY: usize = 256;
-
-/// Hard cap on the layer assigned to any node during insertion.
-/// Standard HNSW practice — prevents pathological RNG draws from inflating
-/// `max_layer` and slowing every subsequent search.
-pub const MAX_LAYER_CAP: usize = 16;
+pub(crate) use limits::ARENA_INITIAL_CAPACITY;
+pub use limits::MAX_LAYER_CAP;
 
 pub use index::HnswIndex;
 pub use nodedb_types::hnsw::HnswParams;
