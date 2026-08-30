@@ -164,8 +164,12 @@ impl<Req, Rsp> ControlHandle<Req, Rsp> {
     }
 
     /// Drain up to `max` responses into the buffer.
+    ///
+    /// The disconnect flag is dropped here: this handle exposes the dead
+    /// channel through `try_recv_response`, which returns
+    /// `BridgeError::Disconnected` once the buffer is empty.
     pub fn drain_responses(&mut self, buf: &mut Vec<Rsp>, max: usize) -> usize {
-        let count = self.consumer.drain_into(buf, max);
+        let (count, _disconnected) = self.consumer.drain_into(buf, max);
         if count > 0 {
             let _ = self.rsp_wake.producer_wake.notify();
         }
@@ -212,8 +216,12 @@ impl<Req, Rsp> DataHandle<Req, Rsp> {
     }
 
     /// Drain up to `max` requests into the buffer.
+    ///
+    /// The disconnect flag is dropped here: this handle exposes the dead
+    /// channel through `try_recv_request`, which returns
+    /// `BridgeError::Disconnected` once the buffer is empty.
     pub fn drain_requests(&mut self, buf: &mut Vec<Req>, max: usize) -> usize {
-        let count = self.consumer.drain_into(buf, max);
+        let (count, _disconnected) = self.consumer.drain_into(buf, max);
         if count > 0 {
             let _ = self.req_wake.producer_wake.notify();
         }

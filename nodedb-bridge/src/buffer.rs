@@ -219,6 +219,15 @@ impl<T> Producer<T> {
         self.shared.capacity
     }
 
+    /// Returns `true` once either half of the channel has been dropped.
+    ///
+    /// On the producer this means the consumer — a Data Plane core — is gone,
+    /// so every subsequent `try_push` will fail and anything still staged for
+    /// that core must be failed rather than queued.
+    pub fn is_disconnected(&self) -> bool {
+        self.shared.disconnected.load(Ordering::Acquire)
+    }
+
     /// Returns a reference to the shared metrics.
     pub fn metrics(&self) -> &BridgeMetrics {
         &self.shared.metrics
@@ -264,11 +273,19 @@ impl<T> Consumer<T> {
         Ok(value.expect("BUG: slot was None despite tail > head"))
     }
 
-    /// Drain up to `max` items into the provided vector. Returns the count drained.
+    /// Drain up to `max` items into the provided vector.
+    ///
+    /// Returns `(count, disconnected)`: the number of items moved into `buf`,
+    /// and whether the far end of the channel is gone. The disconnect is
+    /// reported *alongside* the count, never instead of it — items the
+    /// producer published before it died are still delivered, and only then
+    /// does the caller learn the channel is dead. Without this flag a caller
+    /// draining responses cannot tell an idle core from a dead one, and every
+    /// request outstanding on a dead core is stranded.
     ///
     /// More efficient than calling `try_pop` in a loop because it batches the
     /// atomic tail load.
-    pub fn drain_into(&mut self, buf: &mut Vec<T>, max: usize) -> usize {
+    pub fn drain_into(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         let head = self.shared.head.value.load(Ordering::Relaxed);
         self.cached_tail = self.shared.tail.value.load(Ordering::Acquire);
 
@@ -290,7 +307,15 @@ impl<T> Consumer<T> {
             self.shared.metrics.record_pops(count as u64);
         }
 
-        count
+        (count, self.shared.disconnected.load(Ordering::Acquire))
+    }
+
+    /// Returns `true` once either half of the channel has been dropped.
+    ///
+    /// On the consumer this means the producer is gone and no further items
+    /// will ever arrive beyond what is already buffered.
+    pub fn is_disconnected(&self) -> bool {
+        self.shared.disconnected.load(Ordering::Acquire)
     }
 
     /// Returns the number of items currently in the queue.
@@ -391,12 +416,14 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        let drained = rx.drain_into(&mut buf, 5);
+        let (drained, disconnected) = rx.drain_into(&mut buf, 5);
         assert_eq!(drained, 5);
+        assert!(!disconnected);
         assert_eq!(buf, vec![0, 1, 2, 3, 4]);
 
-        let drained = rx.drain_into(&mut buf, 100);
+        let (drained, disconnected) = rx.drain_into(&mut buf, 100);
         assert_eq!(drained, 5);
+        assert!(!disconnected);
         assert_eq!(buf, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -435,6 +462,56 @@ mod tests {
                 assert_eq!(rx.try_pop().unwrap(), round * 4 + i);
             }
         }
+    }
+
+    #[test]
+    fn is_disconnected_false_while_both_ends_alive() {
+        let (tx, rx) = RingBuffer::channel::<u64>(4);
+        assert!(!tx.is_disconnected());
+        assert!(!rx.is_disconnected());
+    }
+
+    #[test]
+    fn is_disconnected_true_on_producer_after_consumer_drop() {
+        let (tx, rx) = RingBuffer::channel::<u64>(4);
+        drop(rx);
+        assert!(tx.is_disconnected());
+    }
+
+    #[test]
+    fn is_disconnected_true_on_consumer_after_producer_drop() {
+        let (tx, rx) = RingBuffer::channel::<u64>(4);
+        drop(tx);
+        assert!(rx.is_disconnected());
+    }
+
+    #[test]
+    fn drain_into_reports_disconnect_on_dead_producer() {
+        let (tx, mut rx) = RingBuffer::channel::<u64>(4);
+        drop(tx);
+
+        let mut buf = Vec::new();
+        let (drained, disconnected) = rx.drain_into(&mut buf, 10);
+        assert_eq!(drained, 0);
+        assert!(buf.is_empty());
+        assert!(disconnected);
+    }
+
+    #[test]
+    fn drain_into_drains_pending_items_then_reports_disconnect() {
+        // Consequence #3 of the dead-core defect: items already pushed before
+        // the producer died must still be drained, not lost — the disconnect
+        // flag is reported *alongside* the count, never instead of it.
+        let (mut tx, mut rx) = RingBuffer::channel::<u64>(4);
+        tx.try_push(1).unwrap();
+        tx.try_push(2).unwrap();
+        drop(tx);
+
+        let mut buf = Vec::new();
+        let (drained, disconnected) = rx.drain_into(&mut buf, 10);
+        assert_eq!(drained, 2);
+        assert_eq!(buf, vec![1, 2]);
+        assert!(disconnected);
     }
 
     #[test]

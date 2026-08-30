@@ -193,6 +193,20 @@ impl<T> WeightedFairQueue<T> {
         None
     }
 
+    /// Remove and return every queued item, leaving the queue empty.
+    ///
+    /// Ordering is DRR order, the same order `pop_next` would have produced,
+    /// so a caller failing the drained items reports them in the order they
+    /// would have been dispatched. Used when the destination core is gone and
+    /// the staged items can never be flushed.
+    pub fn drain(&mut self) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.total);
+        while let Some(item) = self.pop_next() {
+            out.push(item);
+        }
+        out
+    }
+
     /// Number of items queued for a specific database.
     pub fn depth_for(&self, database_id: u64) -> usize {
         self.queues

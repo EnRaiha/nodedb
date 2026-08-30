@@ -184,7 +184,7 @@ fn bridge_bidirectional_roundtrip() {
         }
 
         // Drain responses.
-        let drained = rsp_rx.drain_into(&mut responses, 1024);
+        let (drained, _disconnected) = rsp_rx.drain_into(&mut responses, 1024);
         received += drained as u64;
 
         if drained == 0 {

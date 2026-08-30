@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use tracing::{error, warn};
+use tracing::warn;
 
-use nodedb_bridge::BridgeError;
 use nodedb_bridge::backpressure::{BackpressureConfig, BackpressureController, PressureState};
-use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
+use nodedb_bridge::buffer::RingBuffer;
 use nodedb_bridge::wfq::WeightedFairQueue;
 use nodedb_types::PriorityClass;
 
 use crate::bridge::envelope;
+use crate::bridge::envelope::{ErrorCode, Payload, Status};
 use crate::control::router::vshard::VShardRouter;
 use crate::data::eventfd::EventFdNotifier;
+use crate::types::{Lsn, RequestId};
 
 use crate::bridge::admission_chokepoint::{assert_write_admitted, reject_uninjected_write};
+
+use super::core_channel::{CoreChannel, CoreChannelDataSide};
 
 /// Serialized form of a request that goes through the SPSC ring buffer.
 ///
@@ -53,133 +56,6 @@ impl DatabasePriorityResolver for DefaultPriorityResolver {
     fn priority_for(&self, _database_id: u64) -> PriorityClass {
         PriorityClass::Standard
     }
-}
-
-/// A pair of SPSC channels for one Data Plane core, augmented with a
-/// weighted-fair staging queue that enforces per-database fairness before
-/// requests reach the physical ring buffer.
-pub struct CoreChannel {
-    /// Control Plane pushes requests to the Data Plane core.
-    pub request_tx: Producer<BridgeRequest>,
-
-    /// Control Plane pops responses from the Data Plane core.
-    pub response_rx: Consumer<BridgeResponse>,
-
-    /// Backpressure controller for the request queue (global, across all DBs).
-    pub backpressure: BackpressureController,
-
-    /// Per-database weighted-fair staging queue. Items are popped from here in
-    /// DRR order and forwarded to `request_tx`.
-    pub wfq: WeightedFairQueue<envelope::Request>,
-
-    /// Per-virtual-queue backpressure states, keyed by `database_id`.
-    ///
-    /// **Writer**: `dispatch` and `flush_wfq` call `update_db_pressure` after
-    /// each enqueue/pop, snapshotting the WFQ throttle/suspend predicates for
-    /// that database into this map.
-    ///
-    /// **Reader**: `Dispatcher::db_pressure_on_core` for the metrics exporter.
-    ///
-    /// **Lifetime**: entries are written in place and never reach a "remove"
-    /// path on their own. Stale databases that no longer enqueue requests
-    /// retain a `Normal` (or last-observed) entry until the surrounding
-    /// dispatcher is dropped or `recalculate_tenant_limits` rotates state.
-    /// The map is bounded by the universe of `database_id`s that have ever
-    /// been dispatched against this core, so unbounded growth is not a
-    /// concern in practice.
-    ///
-    /// **Threading**: this field is accessed only from the Control Plane
-    /// thread that owns the `Dispatcher`. `HashMap` is intentional —
-    /// the field is never shared across threads.
-    pub db_pressure: HashMap<u64, PressureState>,
-
-    /// Eventfd notifier to wake the Data Plane core after pushing a request.
-    /// `None` until `set_notifier` is called (after core thread startup).
-    pub wake_notifier: Option<EventFdNotifier>,
-}
-
-impl CoreChannel {
-    /// Flush as many items from the WFQ into the physical ring as will fit.
-    /// Updates per-DB pressure states and returns the number of items flushed.
-    ///
-    /// `try_push` consumes the request by value, so a failure on push would
-    /// drop the request. The two failure modes are handled explicitly so
-    /// nothing is lost silently:
-    ///
-    /// - `BridgeError::Full` is unreachable: the SPSC ring has a single
-    ///   producer (this dispatcher), and we re-check `utilization() < 100`
-    ///   on every iteration before popping from the WFQ. If it ever fires,
-    ///   the SPSC invariant is violated and we trip an `unreachable!` so
-    ///   the bug surfaces loudly rather than as silent request loss.
-    /// - `BridgeError::Disconnected` means the Data Plane core has gone
-    ///   away. Continuing to drain the WFQ into a dead consumer would lose
-    ///   every queued request. We log an `error!` (not `warn!`) and stop
-    ///   flushing — outstanding requests stay in the WFQ where supervisor
-    ///   logic can observe them, and the next dispatch attempt will see
-    ///   the disconnected state.
-    fn flush_wfq(&mut self) -> usize {
-        let mut flushed = 0;
-        while self.request_tx.utilization() < 100 {
-            let Some(req) = self.wfq.pop_next() else {
-                break;
-            };
-            let db_id = req.database_id.as_u64();
-            let req_id = req.request_id.as_u64();
-            match self.request_tx.try_push(BridgeRequest { inner: req }) {
-                Ok(()) => {
-                    flushed += 1;
-                    self.update_db_pressure(db_id);
-                }
-                Err(BridgeError::Full { capacity, pending }) => {
-                    unreachable!(
-                        "SPSC ring reported Full (capacity={capacity}, pending={pending}) \
-                         despite utilization < 100 immediately before push — \
-                         single-producer invariant violated"
-                    );
-                }
-                Err(e @ BridgeError::Disconnected { .. }) => {
-                    error!(
-                        request_id = req_id,
-                        database_id = db_id,
-                        "data plane core disconnected during WFQ flush — stopping; request was lost: {e}"
-                    );
-                    break;
-                }
-                Err(
-                    e @ (BridgeError::Empty
-                    | BridgeError::Backpressure { .. }
-                    | BridgeError::DeadlineExceeded { .. }),
-                ) => {
-                    // `Producer::try_push` only ever produces `Full` or
-                    // `Disconnected`; these other variants are returned by
-                    // consumer/backpressure paths and cannot reach here.
-                    unreachable!("Producer::try_push returned non-producer BridgeError: {e}");
-                }
-            }
-        }
-        flushed
-    }
-
-    /// Recompute and store the pressure state for a single database.
-    fn update_db_pressure(&mut self, database_id: u64) {
-        let state = if self.wfq.is_suspended_for(database_id) {
-            PressureState::Suspended
-        } else if self.wfq.is_throttled_for(database_id) {
-            PressureState::Throttled
-        } else {
-            PressureState::Normal
-        };
-        self.db_pressure.insert(database_id, state);
-    }
-}
-
-/// Data Plane side of a core's channel pair.
-pub struct CoreChannelDataSide {
-    /// Data Plane pops requests from the Control Plane.
-    pub request_rx: Consumer<BridgeRequest>,
-
-    /// Data Plane pushes responses back to the Control Plane.
-    pub response_tx: Producer<BridgeResponse>,
 }
 
 /// The dispatcher: routes requests from the Control Plane to the correct
@@ -244,6 +120,7 @@ impl Dispatcher {
                 wfq: WeightedFairQueue::new(queue_capacity, queue_capacity),
                 db_pressure: HashMap::new(),
                 wake_notifier: None,
+                outstanding: HashSet::new(),
             });
 
             data_sides.push(CoreChannelDataSide {
@@ -341,6 +218,10 @@ impl Dispatcher {
             );
         }
 
+        // Track the request as outstanding on this core, so a later core death
+        // can fail it instead of stranding the caller's waiter.
+        channel.outstanding.insert(req_id);
+
         // Track per-tenant in-flight + request→tenant mapping for response routing.
         *self.tenant_inflight.entry(tenant_id).or_insert(0) += 1;
         self.request_tenant.insert(req_id, tenant_id);
@@ -413,6 +294,8 @@ impl Dispatcher {
             );
         }
 
+        channel.outstanding.insert(req_id);
+
         *self.tenant_inflight.entry(tenant_id).or_insert(0) += 1;
         self.request_tenant.insert(req_id, tenant_id);
 
@@ -444,13 +327,24 @@ impl Dispatcher {
     }
 
     /// Poll responses from all Data Plane cores.
+    ///
+    /// A core whose channel has been observed dead contributes a synthesized
+    /// error `Response` for every request still outstanding on it: the one a
+    /// failed `try_push` consumed, everything still staged in its WFQ, and
+    /// everything dispatched earlier that it never answered. Those travel back
+    /// with the real responses so the single completion loop in the caller
+    /// finishes each waiter, and the loop below releases each request's
+    /// `tenant_inflight` slot exactly as a real response would — without which
+    /// one dead core ratchets the tenant's in-flight count until the tenant is
+    /// rejected on healthy cores too.
     pub fn poll_responses(&mut self) -> Vec<envelope::Response> {
         let mut responses = Vec::new();
-        for channel in &mut self.cores {
+        for (core_id, channel) in self.cores.iter_mut().enumerate() {
             let mut batch = Vec::new();
-            channel.response_rx.drain_into(&mut batch, 64);
+            let (_drained, producer_gone) = channel.response_rx.drain_into(&mut batch, 64);
             for br in batch {
                 let rid = br.inner.request_id.as_u64();
+                channel.outstanding.remove(&rid);
                 if let Some(tid) = self.request_tenant.remove(&rid)
                     && let Some(count) = self.tenant_inflight.get_mut(&tid)
                 {
@@ -458,8 +352,60 @@ impl Dispatcher {
                 }
                 responses.push(br.inner);
             }
-            // Opportunistically flush WFQ after draining responses to fill headroom.
-            channel.flush_wfq();
+
+            if !(producer_gone || channel.request_tx.is_disconnected()) {
+                // Opportunistically flush WFQ after draining responses to fill headroom.
+                channel.flush_wfq();
+                continue;
+            }
+
+            // The core is gone. Collect every request it can no longer answer:
+            // items still staged in the WFQ first (dispatch order), then the
+            // rest of the outstanding set. A staged item is also in
+            // `outstanding`, so `seen` keeps each id to a single response.
+            let mut seen = HashSet::new();
+            let mut lost = Vec::new();
+            for staged in channel.wfq.drain() {
+                let rid = staged.request_id.as_u64();
+                if seen.insert(rid) {
+                    lost.push(rid);
+                }
+            }
+            for rid in channel.outstanding.drain() {
+                if seen.insert(rid) {
+                    lost.push(rid);
+                }
+            }
+
+            // Idempotence: both sources are emptied here — `wfq.drain` leaves
+            // the staging queue empty and `outstanding.drain` clears the set —
+            // and `flush_wfq` refuses to stage anything new onto a
+            // disconnected producer. A later poll therefore finds both empty
+            // and emits nothing, so a permanently dead core costs one pass
+            // over two empty containers rather than a repeating failure storm.
+            for rid in lost {
+                if let Some(tid) = self.request_tenant.remove(&rid)
+                    && let Some(count) = self.tenant_inflight.get_mut(&tid)
+                {
+                    *count = count.saturating_sub(1);
+                }
+                responses.push(envelope::Response {
+                    request_id: RequestId::new(rid),
+                    status: Status::Error,
+                    attempt: 1,
+                    partial: false,
+                    payload: Payload::empty(),
+                    watermark_lsn: Lsn::ZERO,
+                    error_code: Some(Box::new(ErrorCode::Internal {
+                        detail: format!(
+                            "core-{core_id} is gone; the request can never be executed"
+                        ),
+                    })),
+                    read_set_valid: None,
+                    read_version_lsn: Lsn::ZERO,
+                    write_set: Vec::new(),
+                });
+            }
         }
         responses
     }
@@ -672,5 +618,204 @@ mod tests {
         // The test confirms per-DB pressure is being tracked without panic.
         let _ = dispatcher.db_pressure_on_core(0, 1);
         let _ = dispatcher.db_pressure_on_core(0, 2);
+    }
+
+    // --- Dead-core request loss (GitHub #265) ---
+    //
+    // When a Data Plane core's consumer/producer is dropped (the core thread
+    // died), `Dispatcher` must synthesize an error `Response` for every
+    // request it knows is outstanding on that core, rather than dropping the
+    // request silently and leaking the caller's waiter + `tenant_inflight`
+    // slot forever. Dropping one element of the `data_sides` vector handed
+    // back by `Dispatcher::new`/`with_resolver` simulates that core thread
+    // dying, matching how `dispatch_routes_to_correct_core` and
+    // `response_roundtrip` above obtain the data-plane side of the channel.
+
+    #[test]
+    fn dead_core_synthesizes_error_response_for_lost_request() {
+        let (mut dispatcher, mut data_sides) = Dispatcher::new(3, 64);
+
+        // Core 2's thread has died: both halves of its data-plane side are gone.
+        let dead_core = 2;
+        drop(data_sides.remove(dead_core));
+
+        let request = make_request_for_db(0, 1, 7);
+        let request_id = request.request_id.as_u64();
+
+        // `dispatch_to_core` still reports success: the request was already
+        // moved into the doomed `try_push` inside `flush_wfq` before the
+        // failure is observed, which is exactly the defect being covered.
+        dispatcher.dispatch_to_core(dead_core, request).unwrap();
+
+        let responses = dispatcher.poll_responses();
+        assert_eq!(responses.len(), 1, "expected one synthesized response");
+        let resp = &responses[0];
+        assert_eq!(resp.request_id.as_u64(), request_id);
+        assert_eq!(resp.status, Status::Error);
+        match resp.error_code.as_deref() {
+            Some(ErrorCode::Internal { detail }) => {
+                assert!(
+                    detail.contains(&dead_core.to_string()),
+                    "error detail should name the dead core, got: {detail}"
+                );
+            }
+            other => panic!("expected ErrorCode::Internal naming the core, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dead_core_synthesized_response_resets_tenant_inflight() {
+        // The ratchet: `tenant_inflight` is incremented on dispatch and must
+        // return to its pre-dispatch value once the synthesized response for
+        // the lost request is drained through `poll_responses` — otherwise it
+        // climbs forever and eventually starves the tenant on healthy cores.
+        let (mut dispatcher, mut data_sides) = Dispatcher::new(2, 64);
+        let dead_core = 0;
+        drop(data_sides.remove(dead_core));
+
+        let request = make_request_for_db(0, 1, 1);
+        let tenant_id = request.tenant_id.as_u64();
+
+        let before = dispatcher
+            .tenant_inflight
+            .get(&tenant_id)
+            .copied()
+            .unwrap_or(0);
+
+        dispatcher.dispatch_to_core(dead_core, request).unwrap();
+        assert_eq!(
+            dispatcher.tenant_inflight.get(&tenant_id).copied(),
+            Some(before + 1),
+            "dispatch must still increment tenant_inflight even though the core is dead"
+        );
+
+        let responses = dispatcher.poll_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            dispatcher
+                .tenant_inflight
+                .get(&tenant_id)
+                .copied()
+                .unwrap_or(0),
+            before,
+            "tenant_inflight must return to its pre-dispatch value, not ratchet upward"
+        );
+        assert!(!dispatcher.request_tenant.contains_key(&1));
+    }
+
+    #[test]
+    fn dead_core_does_not_affect_live_core() {
+        let (mut dispatcher, mut data_sides) = Dispatcher::new(2, 64);
+        let dead_core = 0;
+        let live_core = 1;
+        drop(data_sides.remove(dead_core));
+        // Removing index 0 shifted core 1's data side down to index 0.
+        let live_data_side = &mut data_sides[0];
+
+        let dead_request = make_request_for_db(0, 1, 1);
+        let live_request = make_request_for_db(0, 2, 2);
+        let live_request_id = live_request.request_id.as_u64();
+
+        dispatcher
+            .dispatch_to_core(dead_core, dead_request)
+            .unwrap();
+        dispatcher
+            .dispatch_to_core(live_core, live_request)
+            .unwrap();
+
+        // The live core answers normally, through the real ring buffer.
+        let _req = live_data_side.request_rx.try_pop().unwrap();
+        live_data_side
+            .response_tx
+            .try_push(BridgeResponse {
+                inner: envelope::Response {
+                    request_id: RequestId::new(live_request_id),
+                    status: Status::Ok,
+                    attempt: 1,
+                    partial: false,
+                    payload: Payload::empty(),
+                    watermark_lsn: Lsn::ZERO,
+                    error_code: None,
+                    read_set_valid: None,
+                    read_version_lsn: crate::types::Lsn::ZERO,
+                    write_set: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        let responses = dispatcher.poll_responses();
+        assert_eq!(
+            responses.len(),
+            2,
+            "one synthesized error from the dead core, one real Ok from the live core"
+        );
+
+        let live_resp = responses
+            .iter()
+            .find(|r| r.request_id.as_u64() == live_request_id)
+            .expect("live core's real response must be present");
+        assert_eq!(live_resp.status, Status::Ok);
+        assert!(live_resp.error_code.is_none());
+
+        let dead_resp = responses
+            .iter()
+            .find(|r| r.request_id.as_u64() != live_request_id)
+            .expect("dead core's synthesized response must be present");
+        assert_eq!(dead_resp.status, Status::Error);
+        assert!(dead_resp.error_code.is_some());
+    }
+
+    #[test]
+    fn dead_core_fails_requests_still_queued_in_wfq() {
+        // Fill the physical ring to capacity while the core is alive, so a
+        // request dispatched afterward parks in the WFQ without ever
+        // attempting a push (flush_wfq's utilization check breaks before it
+        // reaches the doomed try_push). Then kill the core and confirm the
+        // WFQ-queued request is failed too, not left sitting in the queue
+        // forever.
+        let (mut dispatcher, mut data_sides) = Dispatcher::new(1, 4);
+
+        for i in 0..4u64 {
+            dispatcher
+                .dispatch_to_core(0, make_request_for_db(0, i + 1, i + 1))
+                .unwrap();
+        }
+        assert_eq!(data_sides[0].request_rx.len(), 4);
+
+        // Core 0's thread dies with 4 unanswered requests sitting in its ring.
+        drop(data_sides.remove(0));
+
+        // This request cannot reach the (full, dead) physical ring — it stays
+        // parked in the WFQ.
+        let parked_request_id = 99u64;
+        dispatcher
+            .dispatch_to_core(0, make_request_for_db(0, 99, parked_request_id))
+            .unwrap();
+
+        let responses = dispatcher.poll_responses();
+        let ids: std::collections::HashSet<u64> =
+            responses.iter().map(|r| r.request_id.as_u64()).collect();
+
+        // The 4 previously-dispatched-but-unanswered requests, plus the one
+        // still parked in the WFQ, must all be failed.
+        assert_eq!(
+            responses.len(),
+            5,
+            "expected all 5 outstanding requests failed"
+        );
+        for id in 1..=4u64 {
+            assert!(
+                ids.contains(&id),
+                "request {id} in the dead ring must be failed"
+            );
+        }
+        assert!(
+            ids.contains(&parked_request_id),
+            "request parked in the WFQ must be failed, not left queued"
+        );
+        for r in &responses {
+            assert_eq!(r.status, Status::Error);
+            assert!(r.error_code.is_some());
+        }
     }
 }

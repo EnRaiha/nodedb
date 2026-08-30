@@ -23,7 +23,12 @@ impl CoreLoop {
         }
         let depth = self.spsc_read_depth.max(1);
         let mut batch = Vec::new();
-        self.request_rx.drain_into(&mut batch, depth);
+        // A disconnected producer here means the Control Plane is gone, which
+        // only happens as the process itself terminates: a core thread has no
+        // shutdown signal of its own and relies on process exit. Whatever is
+        // already buffered is still drained and executed; there is no separate
+        // action for the core to take, so the flag is not acted on.
+        let (_drained, _control_plane_gone) = self.request_rx.drain_into(&mut batch, depth);
         for br in batch {
             self.task_queue.push(ExecutionTask::new(br.inner));
         }
