@@ -478,8 +478,17 @@ mod tests {
         let credentials =
             Arc::new(CredentialStore::open(&tmp.path().join("system.redb")).expect("open catalog"));
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
+        let mut state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
             .expect("construct shared state");
+        // `_data_sides` is dropped with this fixture, so the schema-register
+        // barrier can never be answered. Keep its deadline short: the test
+        // covers finalize semantics, not the production deadline. Sole
+        // reference here, so `get_mut` always succeeds.
+        Arc::get_mut(&mut state)
+            .expect("sole reference to the fixture's SharedState")
+            .tuning
+            .network
+            .default_deadline_secs = 1;
         let (tx, _rx) = broadcast::channel(16);
         let token_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let applier = MetadataCommitApplier::new(

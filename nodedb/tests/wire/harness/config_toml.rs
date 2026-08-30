@@ -54,6 +54,10 @@ pub(super) fn write_config(
          password_expiry_days = 0\n\
          audit_retention_days = 0\n"
     );
+    // A test's own client connections are still open at shutdown. The
+    // production drain outlives the harness's 20s SIGTERM patience, so the
+    // server would be force-killed instead of exiting gracefully.
+    toml.push_str("\n[tuning.network]\ndrain_timeout_secs = 2\n");
     if let Some(threshold) = columnar_flush_threshold {
         toml.push_str(&format!(
             "\n[tuning.query]\ncolumnar_flush_threshold = {threshold}\n"

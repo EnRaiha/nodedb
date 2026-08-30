@@ -32,6 +32,10 @@ pub struct SyncListenerConfig {
     pub max_sessions: usize,
     pub idle_timeout_secs: u64,
     pub rate_limit: RateLimitConfig,
+    /// How long shutdown waits for admitted connections to finish before
+    /// aborting them. Injectable so a test need not wait out the production
+    /// value.
+    pub drain_timeout: std::time::Duration,
 }
 
 impl Default for SyncListenerConfig {
@@ -48,6 +52,7 @@ impl Default for SyncListenerConfig {
             max_sessions: 1024,
             idle_timeout_secs: 300,
             rate_limit: RateLimitConfig::default(),
+            drain_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -409,9 +414,8 @@ async fn run_sync_listener(
         let _ = sweeper.await;
     }
 
-    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     if !connections.is_empty()
-        && tokio::time::timeout(DRAIN_TIMEOUT, async {
+        && tokio::time::timeout(state.config.drain_timeout, async {
             while connections.join_next().await.is_some() {}
         })
         .await
@@ -585,6 +589,9 @@ mod tests {
             listener,
             SyncListenerConfig {
                 listen_addr: addr,
+                // The admitted task below never finishes, so the production
+                // drain would be waited out in full.
+                drain_timeout: Duration::from_millis(200),
                 ..SyncListenerConfig::default()
             },
             None,
@@ -612,7 +619,13 @@ mod tests {
     }
 
     fn listener_state() -> Arc<SyncListenerState> {
-        Arc::new(SyncListenerState::new(SyncListenerConfig::default()))
+        // A short drain: the admitted task in these tests never finishes, so
+        // the production default would be waited out in full.
+        let config = SyncListenerConfig {
+            drain_timeout: Duration::from_millis(200),
+            ..SyncListenerConfig::default()
+        };
+        Arc::new(SyncListenerState::new(config))
     }
 
     fn test_shared_state() -> (Arc<SharedState>, tempfile::TempDir) {

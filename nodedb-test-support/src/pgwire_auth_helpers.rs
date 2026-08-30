@@ -19,13 +19,26 @@ use nodedb::control::state::SharedState;
 use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
 
+/// Shorten the Data Plane dispatch deadline on a fixture whose data side was
+/// dropped at construction.
+///
+/// These fixtures own no live core, so any dispatch can only ever time out.
+/// The production deadline turns each such test into a 30s wall wait.
+fn shorten_dead_core_deadline(state: &mut Arc<SharedState>) {
+    if let Some(state) = Arc::get_mut(state) {
+        state.tuning.network.default_deadline_secs = 1;
+    }
+}
+
 /// Create a minimal `SharedState` (no Data Plane needed for DDL tests).
 pub fn make_state() -> Arc<SharedState> {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("test.wal");
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    SharedState::new(dispatcher, wal).expect("build shared state")
+    let mut state = SharedState::new(dispatcher, wal).expect("build shared state");
+    shorten_dead_core_deadline(&mut state);
+    state
 }
 
 /// Create a `SharedState` whose `CredentialStore` is backed by a real redb
@@ -41,8 +54,10 @@ pub fn make_state_with_catalog() -> Arc<SharedState> {
     );
     let _ = credentials.catalog().bootstrap_default_database();
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    SharedState::new_with_credentials(dispatcher, wal, credentials, false)
-        .expect("build shared state")
+    let mut state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
+        .expect("build shared state");
+    shorten_dead_core_deadline(&mut state);
+    state
     // `dir` drops here. On Linux, file handles held by `wal` and the redb
     // catalog keep both files readable for the test's lifetime even after
     // the directory entry is removed (open-then-unlink semantics).

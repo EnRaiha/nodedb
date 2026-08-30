@@ -80,8 +80,8 @@ impl PgListener {
         let absolute_timeout_secs = conn_state.session_absolute_timeout_secs();
         let factory = Arc::new(NodeDbPgHandlerFactory::new(state, auth_mode));
 
-        // Active pgwire sessions can drain for up to 30 seconds. Their cleanup
-        // must finish before Data/Event/WAL shutdown begins.
+        // Active pgwire sessions drain for up to `network.drain_timeout_secs`.
+        // Their cleanup must finish before Data/Event/WAL shutdown begins.
         let drain_guard = bus.register_critical_task(
             crate::control::shutdown::ShutdownPhase::DrainingListeners,
             "pgwire",
@@ -212,7 +212,7 @@ impl PgListener {
         }
 
         // Graceful drain: wait for in-flight connections with timeout.
-        let drain_timeout = Duration::from_secs(30);
+        let drain_timeout = Duration::from_secs(conn_state.tuning.network.drain_timeout_secs);
         if !connections.is_empty() {
             info!(
                 active = connections.len(),
