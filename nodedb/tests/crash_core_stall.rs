@@ -24,8 +24,8 @@ use nodedb_types::id::VShardId;
 use std::time::{Duration, Instant};
 
 /// Freeze duration. The monitor samples every 5s, so a stall needs two
-/// consecutive frozen samples — 10s worst case. 16s leaves slack for jitter.
-const WEDGE_SLEEP_MILLIS: u64 = 16_000;
+/// consecutive frozen samples — 10s worst case. 12s covers it with slack.
+const WEDGE_SLEEP_MILLIS: u64 = 12_000;
 
 /// Deadline for `/healthz` to report 503. Covers the freeze plus two sampling
 /// windows, with slack for a loaded runner.

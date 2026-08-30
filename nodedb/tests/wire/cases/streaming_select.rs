@@ -13,6 +13,9 @@ use std::collections::HashSet;
 /// `stream_chunk_size` so the scan streams as multiple frames per core.
 const ROW_COUNT: usize = 2_500;
 
+/// Rows per multi-statement INSERT batch.
+const INSERT_BATCH: usize = 100;
+
 /// A multi-chunk `SELECT n FROM coll` (no ORDER BY) over a multi-core
 /// single-node server must return every inserted row through the streaming
 /// path — not a truncated first chunk.
@@ -24,10 +27,18 @@ async fn streaming_select_returns_all_rows_across_chunks() {
         .await
         .unwrap();
 
-    for i in 0..ROW_COUNT {
-        srv.exec(&format!("INSERT INTO stream_doc {{ id: 'r{i}', n: {i} }}"))
+    // Batched: the row count and the server's `stream_chunk_size` are what
+    // this test pins, not the per-statement round trip. One statement per row
+    // costs ~20ms each and dominates the runtime without adding coverage.
+    for chunk_start in (0..ROW_COUNT).step_by(INSERT_BATCH) {
+        let chunk_end = (chunk_start + INSERT_BATCH).min(ROW_COUNT);
+        let batch = (chunk_start..chunk_end)
+            .map(|i| format!("INSERT INTO stream_doc {{ id: 'r{i}', n: {i} }}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        srv.exec(&batch)
             .await
-            .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+            .unwrap_or_else(|e| panic!("insert batch at {chunk_start} failed: {e}"));
     }
 
     // No ORDER BY / DISTINCT / OFFSET / aggregate → streamable unordered scan.
