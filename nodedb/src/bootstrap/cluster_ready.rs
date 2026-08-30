@@ -99,7 +99,13 @@ pub async fn await_cluster_ready(
     // cross-table integrity, and in-memory registry ⇔ redb
     // verification. Any unrepairable divergence or any redb
     // integrity violation aborts startup.
-    let verify_report = crate::control::cluster::verify_and_repair(shared).await?;
+    let verify_report = match crate::control::cluster::verify_and_repair(shared).await {
+        Ok(report) => report,
+        Err(e) => {
+            sanity_gate.fail(format!("catalog sanity check could not run: {e}"));
+            return Err(anyhow::anyhow!("catalog sanity check could not run: {e}"));
+        }
+    };
     if verify_report.is_acceptable() {
         info!(report = %verify_report, "catalog sanity check passed");
     } else {

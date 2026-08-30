@@ -34,7 +34,29 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(server_main())
+    if let Err(error) = runtime.block_on(server_main()) {
+        // Mirror the success path's std::process::exit(0) at main.rs's end:
+        // returning Err from main() is not enough. Data Plane cores block in
+        // an infinite eventfd poll loop with no shutdown signal, so a boot
+        // failure that only unwinds server_main() leaves them running with
+        // every listener port closed — the process looks alive but serves
+        // nothing.
+        //
+        // A boot error can happen before tracing is initialised (e.g. a
+        // malformed config file, read before init_tracing() runs), so
+        // tracing::error! alone would silently drop it. exit(1) also skips
+        // the anyhow Debug print the runtime would have made on a returned
+        // Err. eprintln! with "{error:?}" is the only channel guaranteed to
+        // reach the operator in both cases — it prints the full anyhow
+        // context chain, not just the top-level message — so it runs
+        // unconditionally; tracing::error! runs alongside it for
+        // subscribers already wired up when the failure happened later in
+        // boot.
+        eprintln!("StartupError: server failed to start — aborting startup\n{error:?}");
+        tracing::error!(error = %error, "StartupError: server failed to start — aborting startup");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn server_main() -> anyhow::Result<()> {
