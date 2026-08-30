@@ -11,7 +11,8 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, TimeseriesOp};
 
-use super::{DispatchCtx, collection_type, require_doc_id};
+use super::super::DispatchCtx;
+use super::{collection_type, require_doc_id};
 
 pub(crate) fn build_point_get(
     ctx: &DispatchCtx<'_>,

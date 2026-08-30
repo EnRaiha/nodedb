@@ -229,7 +229,8 @@ mod tests {
     use nodedb_array::types::domain::{Domain, DomainBound};
     use tempfile::TempDir;
 
-    use super::super::{ArrayStoreError, parse_segment_seq};
+    use super::super::error::ArrayStoreError;
+    use super::super::segments::parse_segment_seq;
     use super::*;
 
     fn schema() -> Arc<ArraySchema> {

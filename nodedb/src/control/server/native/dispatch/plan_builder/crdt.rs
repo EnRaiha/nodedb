@@ -9,7 +9,7 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::CrdtOp;
 
-use super::DispatchCtx;
+use super::super::DispatchCtx;
 use super::require_doc_id;
 
 pub(crate) fn build_read(

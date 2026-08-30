@@ -438,3 +438,404 @@ impl CoreLoop {
         encode_value_rows(self, task, &rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use nodedb_array::query::slice::{DimRange, Slice as ArraySlice};
+    use nodedb_array::schema::ArraySchema;
+    use nodedb_array::schema::ArraySchemaBuilder;
+    use nodedb_array::schema::attr_spec::{AttrSpec, AttrType};
+    use nodedb_array::schema::dim_spec::{DimSpec, DimType};
+    use nodedb_array::types::cell_value::value::CellValue;
+    use nodedb_array::types::coord::value::CoordValue;
+    use nodedb_array::types::domain::{Domain, DomainBound};
+    use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
+    use nodedb_types::{ArrayCell, Value};
+
+    use nodedb_types::{Surrogate, SurrogateBitmap};
+
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::engine::array::wal::ArrayPutCell;
+    use crate::types::*;
+    use nodedb_physical::physical_plan::ArrayOp;
+
+    use super::*;
+
+    fn make_request(plan: PhysicalPlan, id: u64) -> Request {
+        Request {
+            request_id: RequestId::new(id),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan,
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: crate::bridge::envelope::Admission::Admitted,
+        }
+    }
+
+    fn schema_2d_f64(name: &str) -> ArraySchema {
+        ArraySchemaBuilder::new(name)
+            .dim(DimSpec::new(
+                "x",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .dim(DimSpec::new(
+                "y",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![4, 4])
+            .build()
+            .unwrap()
+    }
+
+    struct Harness {
+        core: CoreLoop,
+        req_tx: Producer<BridgeRequest>,
+        resp_rx: Consumer<BridgeResponse>,
+        next_id: u64,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+            let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+            let core = CoreLoop::open(
+                0,
+                req_rx,
+                resp_tx,
+                dir.path(),
+                Arc::new(nodedb_types::OrdinalClock::new()),
+            )
+            .unwrap();
+            Harness {
+                core,
+                req_tx,
+                resp_rx,
+                next_id: 1,
+                _dir: dir,
+            }
+        }
+
+        fn send(&mut self, op: ArrayOp) -> crate::bridge::envelope::Response {
+            self.send_plan(PhysicalPlan::Array(op))
+        }
+
+        fn send_plan(&mut self, plan: PhysicalPlan) -> crate::bridge::envelope::Response {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.req_tx
+                .try_push(BridgeRequest {
+                    inner: make_request(plan, id),
+                })
+                .unwrap();
+            self.core.tick();
+            let resp = self.resp_rx.try_pop().unwrap();
+            resp.inner
+        }
+
+        fn open(&mut self, aid: &ArrayId, schema: &ArraySchema, schema_hash: u64) {
+            let bytes = zerompk::to_msgpack_vec(schema).unwrap();
+            let r = self.send(ArrayOp::OpenArray {
+                array_id: aid.clone(),
+                schema_msgpack: bytes,
+                schema_hash,
+                prefix_bits: 8,
+                audit_retain_ms: None,
+                minimum_audit_retain_ms: None,
+            });
+            assert_eq!(r.status, Status::Ok, "open failed: {r:?}");
+        }
+
+        fn put(&mut self, aid: &ArrayId, cells: Vec<ArrayPutCell>, lsn: u64) {
+            let bytes = zerompk::to_msgpack_vec(&cells).unwrap();
+            let r = self.send(ArrayOp::Put {
+                array_id: aid.clone(),
+                cells_msgpack: bytes,
+                wal_lsn: lsn,
+                provenance: None,
+            });
+            assert_eq!(r.status, Status::Ok, "put failed: {r:?}");
+        }
+
+        fn flush(&mut self, aid: &ArrayId) {
+            let r = self.send(ArrayOp::Flush {
+                array_id: aid.clone(),
+                wal_lsn: 0,
+            });
+            assert_eq!(r.status, Status::Ok, "flush failed: {r:?}");
+        }
+    }
+
+    fn cell(x: i64, y: i64, v: f64) -> ArrayPutCell {
+        ArrayPutCell {
+            coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
+            attrs: vec![CellValue::Float64(v)],
+            surrogate: nodedb_types::Surrogate::ZERO,
+            system_from_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        }
+    }
+
+    fn cell_sur(x: i64, y: i64, v: f64, sur: u32) -> ArrayPutCell {
+        ArrayPutCell {
+            coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
+            attrs: vec![CellValue::Float64(v)],
+            surrogate: Surrogate(sur),
+            system_from_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        }
+    }
+
+    fn decode_slice_rows(bytes: &[u8]) -> Vec<Value> {
+        // Slice responses are wrapped in `ArraySliceResponse { rows_msgpack, truncated_before_horizon }`.
+        use crate::data::executor::response_codec::ArraySliceResponse;
+        let envelope: ArraySliceResponse =
+            zerompk::from_msgpack(bytes).expect("ArraySliceResponse envelope decode");
+        let json = nodedb_types::msgpack_to_json_string(&envelope.rows_msgpack)
+            .expect("slice rows msgpack→json");
+        let arr: serde_json::Value = serde_json::from_str(&json).expect("slice rows json parse");
+        let arr = arr.as_array().expect("slice rows are an array").clone();
+        arr.into_iter().map(json_to_value).collect()
+    }
+
+    fn json_to_value(v: serde_json::Value) -> Value {
+        match v {
+            serde_json::Value::Object(map)
+                if map.contains_key("coords") && map.contains_key("attrs") =>
+            {
+                let coords = map["coords"]
+                    .as_array()
+                    .expect("coords array")
+                    .iter()
+                    .cloned()
+                    .map(json_to_value)
+                    .collect();
+                let attrs = map["attrs"]
+                    .as_array()
+                    .expect("attrs array")
+                    .iter()
+                    .cloned()
+                    .map(json_to_value)
+                    .collect();
+                Value::ArrayCell(ArrayCell {
+                    coords,
+                    attrs,
+                    system_time: None,
+                })
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Integer(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float(f)
+                } else {
+                    Value::Null
+                }
+            }
+            serde_json::Value::String(s) => Value::String(s),
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Array(a) => Value::Array(a.into_iter().map(json_to_value).collect()),
+            serde_json::Value::Object(_) => Value::Null,
+        }
+    }
+
+    #[test]
+    fn slice_returns_only_cells_in_range() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("t6_slice");
+        let aid = ArrayId::new(TenantId::new(1), "t6_slice");
+        h.open(&aid, &s, 0xA1);
+        h.put(
+            &aid,
+            vec![
+                cell(0, 0, 1.0),
+                cell(1, 1, 2.0),
+                cell(5, 5, 3.0),
+                cell(7, 7, 4.0),
+            ],
+            100,
+        );
+        h.flush(&aid);
+
+        // Slice x in [4, 9]: expects (5,5)=3 and (7,7)=4.
+        let slice = ArraySlice::new(vec![
+            Some(DimRange::new(DomainBound::Int64(4), DomainBound::Int64(9))),
+            None,
+        ]);
+        let slice_bytes = zerompk::to_msgpack_vec(&slice).unwrap();
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: slice_bytes,
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
+        let rows = decode_slice_rows(r.payload.as_ref());
+        assert_eq!(rows.len(), 2, "expected two cells, got {rows:?}");
+        let mut sums = 0.0;
+        for v in rows {
+            match v {
+                Value::ArrayCell(ArrayCell { attrs, .. }) => match &attrs[0] {
+                    Value::Float(f) => sums += f,
+                    other => panic!("attr not Float: {other:?}"),
+                },
+                other => panic!("row not ArrayCell: {other:?}"),
+            }
+        }
+        assert!((sums - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slice_all_versions_emits_audit_log_ascending() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("t6_audit");
+        let aid = ArrayId::new(TenantId::new(1), "t6_audit");
+        h.open(&aid, &s, 0xA7);
+
+        // Three system-time versions of the same cell (0,0), each sealed into
+        // its own segment so they are distinct retained tile-versions.
+        let mk = |v: f64, sys: i64| ArrayPutCell {
+            coord: vec![CoordValue::Int64(0), CoordValue::Int64(0)],
+            attrs: vec![CellValue::Float64(v)],
+            surrogate: Surrogate::ZERO,
+            system_from_ms: sys,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        };
+        h.put(&aid, vec![mk(1.0, 100)], 1);
+        h.flush(&aid);
+        h.put(&aid, vec![mk(2.0, 200)], 2);
+        h.flush(&aid);
+        h.put(&aid, vec![mk(3.0, 300)], 3);
+        h.flush(&aid);
+
+        let slice = ArraySlice::new(vec![None, None]);
+        let slice_bytes = zerompk::to_msgpack_vec(&slice).unwrap();
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: slice_bytes,
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::AllVersions,
+            valid_at_ms: None,
+        });
+        assert_eq!(r.status, Status::Ok, "all-versions slice failed: {r:?}");
+
+        // Read rows as raw JSON: `json_to_value` drops the injected `_ts_system`
+        // column, so inspect the envelope directly.
+        use crate::data::executor::response_codec::ArraySliceResponse;
+        let env: ArraySliceResponse =
+            zerompk::from_msgpack(r.payload.as_ref()).expect("ArraySliceResponse envelope");
+        assert!(
+            !env.truncated_before_horizon,
+            "AllVersions applies no system-time horizon"
+        );
+        let json =
+            nodedb_types::msgpack_to_json_string(&env.rows_msgpack).expect("rows msgpack→json");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("rows json parse");
+
+        let got: Vec<(i64, f64)> = rows
+            .iter()
+            .map(|row| {
+                let ts = row
+                    .get("_ts_system")
+                    .and_then(|v| v.as_i64())
+                    .expect("_ts_system column present on audit-log rows");
+                let v = row
+                    .get("attrs")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_f64())
+                    .expect("attr value");
+                (ts, v)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(100, 1.0), (200, 2.0), (300, 3.0)],
+            "audit log must return every version ascending by system time"
+        );
+    }
+
+    #[test]
+    fn slice_cell_filter_excludes_non_member_surrogates() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("t6_sf_slice");
+        let aid = ArrayId::new(TenantId::new(1), "t6_sf_slice");
+        h.open(&aid, &s, 0xC1);
+        // Three cells in the same tile region; surrogates 1, 2, 3.
+        h.put(
+            &aid,
+            vec![
+                cell_sur(0, 0, 10.0, 1),
+                cell_sur(1, 1, 20.0, 2),
+                cell_sur(2, 2, 30.0, 3),
+            ],
+            1,
+        );
+        h.flush(&aid);
+
+        // Filter allows only surrogates 1 and 3 — surrogate 2 must be absent.
+        let mut bm = SurrogateBitmap::new();
+        bm.insert(Surrogate(1));
+        bm.insert(Surrogate(3));
+
+        let slice = nodedb_array::query::slice::Slice::new(vec![None, None]);
+        let slice_bytes = zerompk::to_msgpack_vec(&slice).unwrap();
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: slice_bytes,
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: Some(bm),
+            hilbert_range: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        assert_eq!(r.status, Status::Ok, "slice+filter failed: {r:?}");
+        let rows = decode_slice_rows(r.payload.as_ref());
+        assert_eq!(rows.len(), 2, "expected 2 cells, got {rows:?}");
+        let mut total = 0.0;
+        for v in rows {
+            match v {
+                Value::ArrayCell(ArrayCell { attrs, .. }) => match &attrs[0] {
+                    Value::Float(f) => total += f,
+                    other => panic!("attr not Float: {other:?}"),
+                },
+                other => panic!("row not ArrayCell: {other:?}"),
+            }
+        }
+        // 10.0 + 30.0 = 40.0; 20.0 must have been excluded.
+        assert!((total - 40.0).abs() < 1e-9, "total got {total}");
+    }
+}

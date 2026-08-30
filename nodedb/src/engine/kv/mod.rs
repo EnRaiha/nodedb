@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod batch_put;
+mod clock;
 pub mod engine;
 pub mod engine_atomic;
 pub mod engine_atomic_compute;
@@ -20,6 +21,7 @@ pub mod slab;
 pub mod sorted_index;
 
 pub use batch_put::KvBatchPutParams;
+pub use clock::current_ms;
 pub use engine::{KvEngine, RestoreCompositeIndexParams, RestoreFieldIndexParams};
 pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult, IncrAdmission, admit_any};
 pub use engine_atomic_compute as atomic_compute;
@@ -29,16 +31,3 @@ pub use engine_sorted::SortedIndexRangeParams;
 pub use engine_stats::{ExpiredKey, KvStats};
 pub use engine_write::KvPutParams;
 pub use scan::KvScanParams;
-
-/// Get current wall-clock time in milliseconds since Unix epoch.
-///
-/// Used as a fallback for non-Calvin write paths. Calvin write paths call
-/// `CoreLoop::epoch_system_ms.unwrap_or_else(current_ms)` so that the epoch's
-/// deterministic timestamp anchor is used when available.
-pub fn current_ms() -> u64 {
-    // no-determinism: fallback for non-Calvin paths; Calvin paths gate through epoch_system_ms
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}

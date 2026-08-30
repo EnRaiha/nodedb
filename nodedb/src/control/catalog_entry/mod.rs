@@ -22,7 +22,8 @@
 //! 2. Add an arm to [`apply::apply_to`].
 //! 3. Add an arm to [`post_apply::spawn_post_apply_side_effects`]
 //!    (often a no-op).
-//! 4. Add a roundtrip test in [`tests`].
+//! 4. Add a roundtrip test inline in the file that applies the new
+//!    variant, as a `#[cfg(test)] mod tests` block.
 //! 5. Migrate the pgwire DDL handler to build the new variant and
 //!    call `propose_catalog_entry`.
 //!
@@ -37,9 +38,6 @@ pub mod entry;
 pub mod kind;
 pub mod persist_collection;
 pub mod post_apply;
-
-#[cfg(test)]
-mod tests;
 
 pub use codec::{decode, encode};
 pub use entry::CatalogEntry;

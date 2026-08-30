@@ -32,7 +32,7 @@ const ALLOWED: &[&str] = &[
     "engine/bitemporal/enforcement.rs",
     // Backup capture and restore reissue.
     "control/backup/orchestrator.rs",
-    "control/backup/restore/orchestrate/mod.rs",
+    "control/backup/restore/orchestrate/restore.rs",
     "control/backup/restore/columnar_reissue.rs",
     "control/backup/restore/timeseries_reissue.rs",
     "control/backup/restore/vector_reissue.rs",

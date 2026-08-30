@@ -15,52 +15,13 @@
 //! write per-collection checkpoint or partition files under
 //! `{data_dir}/...`.
 
-use std::path::PathBuf;
-
-use thiserror::Error;
-
 pub mod crdt;
+mod error;
 pub mod sparse_vector;
 pub mod spatial;
+mod stats;
 pub mod timeseries;
 pub mod vector;
 
-/// A persistent L1 surface could not be fully reclaimed. Callers must not
-/// release the collection lifecycle barrier after this error.
-#[derive(Debug, Error)]
-pub enum ReclaimError {
-    #[error("{operation} failed for '{}': {source}", path.display())]
-    Io {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// A checkpoint manifest could not be read, so the live generation — and
-    /// therefore the set of files this collection still owns — is unknown.
-    /// Fail-closed: releasing the barrier here would let a same-name CREATE
-    /// proceed while the predecessor's files stay reachable.
-    #[error("{engine} manifest at '{}' is unreadable: {detail}", path.display())]
-    Manifest {
-        engine: &'static str,
-        path: PathBuf,
-        detail: String,
-    },
-}
-
-pub type Result<T> = std::result::Result<T, ReclaimError>;
-
-/// Summary of a single engine's reclaim pass. Missing files count as zero;
-/// actual I/O failures are returned to the lifecycle barrier.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ReclaimStats {
-    pub files_unlinked: u32,
-    pub bytes_freed: u64,
-}
-
-impl ReclaimStats {
-    pub fn merge(&mut self, other: ReclaimStats) {
-        self.files_unlinked = self.files_unlinked.saturating_add(other.files_unlinked);
-        self.bytes_freed = self.bytes_freed.saturating_add(other.bytes_freed);
-    }
-}
+pub use error::{ReclaimError, Result};
+pub use stats::ReclaimStats;
