@@ -133,6 +133,7 @@ pub async fn create_materialized_view(
         name: name.clone(),
         owner: identity.username.clone(),
         created_at: now,
+        deactivated_at_ns: 0,
         descriptor_version: 0,
         constraint_version: 0,
         crdt_signing_required: false,

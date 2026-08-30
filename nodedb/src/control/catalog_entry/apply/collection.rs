@@ -233,6 +233,10 @@ pub fn deactivate(
             if stamp.descriptor_version != 0 {
                 stored.descriptor_version = stamp.descriptor_version;
                 stored.modification_hlc = stamp.modification_hlc;
+                // Retention (`resolve_retention`) reads `deactivated_at_ns`,
+                // not `modification_hlc`, as the drop time — stamp both from
+                // the same value so the two never diverge.
+                stored.deactivated_at_ns = stamp.modification_hlc.wall_ns;
             }
             if let Err(e) = catalog.put_collection(database_id, &stored) {
                 warn!(

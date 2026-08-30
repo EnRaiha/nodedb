@@ -40,8 +40,16 @@ pub async fn dropped_collections(
         if !is_admin && coll.tenant_id != caller_tenant {
             continue;
         }
-        let deactivated_ns = coll.modification_hlc.wall_ns;
-        let expires_ns = deactivated_ns.saturating_add(retention_ns);
+        // `deactivated_at_ns == 0` is the field's own documented "unknown"
+        // sentinel (pre-upgrade row, or not yet adopted by the GC sweeper's
+        // `AdoptDeactivationTime` path) — surface both columns as `0` rather
+        // than deriving a misleadingly-near expiry from `0 + retention`.
+        let deactivated_ns = coll.deactivated_at_ns;
+        let expires_ns = if deactivated_ns == 0 {
+            0
+        } else {
+            deactivated_ns.saturating_add(retention_ns)
+        };
         let engine_type = coll.collection_type.as_str().to_string();
 
         let size_estimate = if coll.size_bytes_estimate > 0 {

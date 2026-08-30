@@ -260,6 +260,18 @@ pub struct StoredCollection {
     /// the safe, zero-migration value.
     #[msgpack(default)]
     pub declared_primary_key: Option<String>,
+
+    /// Wall-clock nanoseconds when this collection was soft-deleted
+    /// (`DROP COLLECTION`), stamped from the same `modification_hlc.wall_ns`
+    /// the drop assigns. `0` means either "active" or "deactivated before
+    /// this field existed, drop time unknown" — the two cases are
+    /// indistinguishable and both must be treated as "unknown" by readers.
+    ///
+    /// Readers MUST gate on `is_active` first: this field is never read for
+    /// an active row, and `UNDROP COLLECTION` never resets it back to `0`
+    /// because a row with `is_active == true` never consults it.
+    #[msgpack(default)]
+    pub deactivated_at_ns: u64,
 }
 
 impl StoredCollection {
@@ -318,6 +330,7 @@ impl StoredCollection {
             clone_status: CloneStatus::default(),
             has_implicit_edges: false,
             declared_primary_key: None,
+            deactivated_at_ns: 0,
         }
     }
 

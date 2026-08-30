@@ -153,6 +153,51 @@ fn apply_deactivate_collection_advances_descriptor_version_and_hlc() {
     );
 }
 
+/// `deactivate()` must stamp `deactivated_at_ns` from the same
+/// `modification_hlc.wall_ns` it stamps on the row — this is the field
+/// `resolve_retention` reads instead of `modification_hlc`, so a mismatch
+/// here reproduces the pre-fix bug one field over.
+#[test]
+fn apply_deactivate_collection_stamps_deactivated_at_ns_from_modification_hlc() {
+    let (credentials, _tmp) = open_catalog();
+    let catalog = credentials.catalog();
+    let clock = HlcClock::new();
+
+    let stored = StoredCollection::new(1, "deactivated_stamp", "carol");
+    let create = stamp(
+        CatalogEntry::PutCollection(Box::new(stored)),
+        &clock,
+        catalog,
+    );
+    apply_to(&create, catalog).expect("apply put_collection");
+
+    let deactivate = stamp(
+        CatalogEntry::DeactivateCollection {
+            database_id: 0,
+            tenant_id: 1,
+            name: "deactivated_stamp".into(),
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        },
+        &clock,
+        catalog,
+    );
+    apply_to(&deactivate, catalog).expect("apply deactivate_collection");
+
+    let loaded = catalog
+        .get_collection(DatabaseId::DEFAULT, 1, "deactivated_stamp")
+        .unwrap()
+        .expect("record preserved");
+    assert_ne!(
+        loaded.deactivated_at_ns, 0,
+        "deactivate() must stamp a non-zero deactivated_at_ns"
+    );
+    assert_eq!(
+        loaded.deactivated_at_ns, loaded.modification_hlc.wall_ns,
+        "deactivated_at_ns must equal the stamped modification_hlc.wall_ns"
+    );
+}
+
 #[test]
 fn purge_collection_is_scoped_to_database() {
     let (credentials, _tmp) = open_catalog();

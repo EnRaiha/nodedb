@@ -102,6 +102,57 @@ fn effective_retention_for_tenant(
     }
 }
 
+/// Adopt `now_ns` as the drop time for a collection deactivated before
+/// `deactivated_at_ns` existed (or otherwise stamped with the `0`
+/// sentinel), so its retention window starts from first observation
+/// instead of never elapsing.
+///
+/// Re-proposes `CatalogEntry::PutCollection` with the field patched in,
+/// mirroring `clone_materializer::reaper::reap_materialized_collection`'s
+/// shape for a background loop repairing a catalog row in place.
+/// Idempotent: once adopted, `deactivated_at_ns` is non-zero and the next
+/// sweep takes the normal `Wait`/`Purge` path instead of revisiting this
+/// branch. A propose that fails (expected on a follower — the leader's own
+/// sweeper will adopt it) is logged at debug, not warn.
+async fn adopt_deactivation_time(
+    shared: &SharedState,
+    coll: &crate::control::security::catalog::StoredCollection,
+    now_ns: u64,
+) {
+    let mut patched = coll.clone();
+    patched.deactivated_at_ns = now_ns;
+    let entry = CatalogEntry::PutCollection(Box::new(patched.clone()));
+    match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
+        Ok(outcome) => {
+            if outcome.needs_local_apply() {
+                let catalog = shared.credentials.catalog();
+                if let Err(e) = catalog.put_collection(patched.database_id, &patched) {
+                    warn!(
+                        tenant = coll.tenant_id,
+                        collection = %coll.name,
+                        error = %e,
+                        "collection-gc: local apply of adopted deactivated_at_ns failed"
+                    );
+                }
+            }
+            debug!(
+                tenant = coll.tenant_id,
+                collection = %coll.name,
+                deactivated_at_ns = now_ns,
+                "collection-gc: adopted deactivation time for pre-upgrade drop"
+            );
+        }
+        Err(e) => {
+            debug!(
+                tenant = coll.tenant_id,
+                collection = %coll.name,
+                error = %e,
+                "collection-gc: adopt-deactivation-time propose failed (expected on follower)"
+            );
+        }
+    }
+}
+
 /// Single sweep pass. Public for testability — callers can drive the
 /// sweeper synchronously in tests without waiting on the interval.
 pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Result<()> {
@@ -204,6 +255,9 @@ pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Res
             }
             PurgeDecision::Wait { .. } => waiting += 1,
             PurgeDecision::NotDeactivated => {}
+            PurgeDecision::AdoptDeactivationTime => {
+                adopt_deactivation_time(shared, coll, now_ns).await;
+            }
         }
     }
 

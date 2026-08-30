@@ -62,7 +62,17 @@ impl SqlCatalog for OriginCatalog {
             let retention = crate::config::server::RetentionSettings::default()
                 .retention_window()
                 .as_nanos() as u64;
-            let retention_expires_at_ns = stored.modification_hlc.wall_ns.saturating_add(retention);
+            // `deactivated_at_ns == 0` means the drop time is unknown (a
+            // pre-upgrade row the GC sweeper has not yet adopted a time
+            // for — see `event::collection_gc::policy::PurgeDecision`,
+            // which never purges such a row). Report `u64::MAX` rather
+            // than `0 + retention`, which would falsely tell the caller
+            // the row is already past its window.
+            let retention_expires_at_ns = if stored.deactivated_at_ns == 0 {
+                u64::MAX
+            } else {
+                stored.deactivated_at_ns.saturating_add(retention)
+            };
             return Err(SqlCatalogError::CollectionDeactivated {
                 name: name.to_string(),
                 retention_expires_at_ns,

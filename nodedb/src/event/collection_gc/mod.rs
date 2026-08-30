@@ -5,7 +5,7 @@
 //!
 //! Runs on the Tokio runtime. Scans `_system.collections` on each eval
 //! tick, filters rows with `is_active = false` whose
-//! `modification_hlc + retention_window < now()`, and proposes
+//! `deactivated_at_ns + retention_window < now()`, and proposes
 //! `CatalogEntry::PurgeCollection` for each. Never touches Data Plane
 //! directly — proposes through the normal metadata-raft path, which
 //! fans out through the existing apply + post_apply pipeline
