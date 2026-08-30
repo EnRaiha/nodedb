@@ -161,3 +161,157 @@ pub fn decode_payload_to_json(payload: &[u8]) -> String {
     nodedb_types::msgpack_to_json_string(payload)
         .unwrap_or_else(|_| String::from_utf8_lossy(payload).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_count_msg() {
+        let bytes = encode_count("inserted", 42).unwrap();
+        let json = decode_payload_to_json(&bytes);
+        assert!(json.contains("\"inserted\""));
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn json_passthrough() {
+        let json_str = r#"[{"id":1}]"#;
+        let result = decode_payload_to_json(json_str.as_bytes());
+        assert_eq!(result, json_str);
+    }
+
+    #[test]
+    fn msgpack_to_json_roundtrip() {
+        let value = serde_json::json!({"key": "value", "num": 42});
+        let msgpack = nodedb_types::json_to_msgpack(&value).unwrap();
+        let json = decode_payload_to_json(&msgpack);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["key"], "value");
+        assert_eq!(parsed["num"], 42);
+    }
+
+    // ── decode_payload: the counterpart every encoder here needs ────────────
+    //
+    // Each case below pins one Control-Plane read whose decoder used to be a bare
+    // JSON parser with the failure defaulted away. The shared assertion is the same
+    // one in every case: the bytes an encoder produced must NOT parse as JSON (that
+    // is the trap), and must decode through `decode_payload` to exactly what went
+    // in.
+
+    /// A JSON parser must fail on these bytes. If it ever stops failing, the
+    /// encoders changed format and the `decode_payload` contract needs rechecking —
+    /// but while it does fail, any decoder that defaults the failure away is
+    /// silently reporting an empty result.
+    fn assert_not_json(payload: &[u8]) {
+        assert!(
+            sonic_rs::from_slice::<serde_json::Value>(payload).is_err(),
+            "encoder output parsed as JSON; the trap this guards no longer exists"
+        );
+    }
+
+    /// `TOPK` / `RANGE` rows — `encode_json_vec_as_msgpack`.
+    #[test]
+    fn decode_payload_reads_back_json_vec_rows() {
+        let rows = vec![
+            serde_json::json!({ "rank": 1, "key": "p2" }),
+            serde_json::json!({ "rank": 2, "key": "p1" }),
+        ];
+        let payload = encode_json_vec_as_msgpack(&rows).unwrap();
+        assert_not_json(&payload);
+
+        let decoded: Vec<serde_json::Value> = decode_payload(&payload).unwrap();
+        assert_eq!(decoded, rows, "the rows encoded must be the rows decoded");
+    }
+
+    /// `LAST_VALUES` — `encode` over a tuple list.
+    #[test]
+    fn decode_payload_reads_back_last_values() {
+        let entries: Vec<(u64, i64, f64)> =
+            vec![(7, 1_700_000_000_000, 21.5), (9, 1_700_000_001_000, 4.0)];
+        let payload = encode(&entries).unwrap();
+        assert_not_json(&payload);
+
+        let decoded: Vec<(u64, i64, f64)> = decode_payload(&payload).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    /// `LAST_VALUE` — `encode` over an `Option`. A present series and an absent one
+    /// are different facts, and both must survive the round trip.
+    #[test]
+    fn decode_payload_distinguishes_present_and_absent_last_value() {
+        let present = encode(&Some((1_700_000_000_000i64, 21.5f64))).unwrap();
+        assert_not_json(&present);
+        let decoded: Option<(i64, f64)> = decode_payload(&present).unwrap();
+        assert_eq!(decoded, Some((1_700_000_000_000, 21.5)));
+
+        let absent = encode(&Option::<(i64, f64)>::None).unwrap();
+        let decoded: Option<(i64, f64)> = decode_payload(&absent).unwrap();
+        assert_eq!(
+            decoded, None,
+            "an absent series decodes to None, not an error"
+        );
+    }
+
+    /// Remote graph traverse node ids — `encode` over a string list. Dropping one
+    /// of these payloads makes a cross-shard traversal report the local shard's
+    /// nodes as the whole answer.
+    #[test]
+    fn decode_payload_reads_back_traverse_node_ids() {
+        let nodes: Vec<String> = vec!["n1".into(), "n2".into(), "n3".into()];
+        let payload = encode(&nodes).unwrap();
+        assert_not_json(&payload);
+
+        let decoded: Vec<String> = decode_payload(&payload).unwrap();
+        assert_eq!(decoded, nodes);
+    }
+
+    /// `SHOW CONTINUOUS AGGREGATES` runtime stats — `encode_serde` over a
+    /// `Serialize` type.
+    #[test]
+    fn decode_payload_reads_back_serde_encoded_stats() {
+        #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+        struct Stats {
+            name: String,
+            watermark_ts: i64,
+            stale: bool,
+        }
+        let stats = vec![Stats {
+            name: "hourly".into(),
+            watermark_ts: 1_700_000_000_000,
+            stale: false,
+        }];
+        let payload = encode_serde(&stats).unwrap();
+        assert_not_json(&payload);
+
+        let decoded: Vec<Stats> = decode_payload(&payload).unwrap();
+        assert_eq!(decoded, stats);
+    }
+
+    /// An empty payload is an empty result: a handler with nothing to report sends
+    /// no bytes, and that is a fact, not a failure.
+    #[test]
+    fn decode_payload_treats_an_empty_payload_as_an_empty_result() {
+        let decoded: Vec<serde_json::Value> = decode_payload(&[]).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    /// A NON-empty payload that will not deserialize must be an error. This is the
+    /// distinction whose absence turned every one of the decode bugs above into a
+    /// successful empty answer instead of a loud one.
+    #[test]
+    fn decode_payload_errors_on_an_undecodable_payload() {
+        // Valid msgpack, wrong shape for the target type.
+        let payload = encode_json_as_msgpack(&serde_json::json!("not a row list")).unwrap();
+        let decoded: crate::Result<Vec<serde_json::Value>> = decode_payload(&payload);
+        assert!(
+            decoded.is_err(),
+            "an unreadable payload must surface as an error, never as zero rows"
+        );
+
+        // Bytes that are neither msgpack nor JSON.
+        let garbage: Vec<u8> = vec![0xC1, 0xC1, 0xC1];
+        let decoded: crate::Result<Vec<String>> = decode_payload(&garbage);
+        assert!(decoded.is_err());
+    }
+}

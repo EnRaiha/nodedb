@@ -8,7 +8,4 @@ pub mod lifecycle;
 pub mod reservations;
 pub mod savepoints;
 
-#[cfg(test)]
-mod tests;
-
 pub use lifecycle::CommitDrain;

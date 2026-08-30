@@ -312,3 +312,178 @@ pub(super) fn prior_doc_length(
         .and_then(|v| zerompk::from_msgpack::<u32>(v.value()).ok());
     Ok(prior)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use redb::Database;
+
+    use nodedb_fts::FtsSearchParams;
+    use nodedb_fts::posting::QueryMode;
+
+    use super::*;
+
+    const DB: u64 = 0;
+    const T: TenantId = TenantId::new(1);
+
+    fn open_temp() -> (InvertedIndex, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-inverted.redb");
+        let db = Arc::new(Database::create(&path).unwrap());
+        let idx = InvertedIndex::open(db).unwrap();
+        (idx, dir)
+    }
+
+    /// A term that an UPDATE removed from a document must leave no posting for
+    /// that document, and its `df` must fall back to the documents that really do
+    /// contain it — a stale posting would keep the document matching a word it no
+    /// longer has AND inflate the term's IDF for every other query.
+    #[test]
+    fn update_dropping_a_term_removes_its_posting_and_restores_df() {
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo")
+            .unwrap();
+        idx.index_document(DB, T, "docs", Surrogate::new(2), "bravo charlie")
+            .unwrap();
+        assert_eq!(idx.term_df(DB, T, "docs", "bravo").unwrap(), 2);
+
+        // Document 1 loses "bravo" and gains "delta".
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha delta")
+            .unwrap();
+
+        assert_eq!(
+            idx.term_df(DB, T, "docs", "bravo").unwrap(),
+            1,
+            "only the document that still contains the term may be counted"
+        );
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "bravo",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1, "the updated document must not match");
+        assert_eq!(results[0].doc_id, Surrogate::new(2));
+
+        // The corpus itself is unchanged: still two documents, both two tokens.
+        let (count, avg_len) = idx.corpus_stats(DB, T, "docs").unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(avg_len, 2.0);
+    }
+
+    /// A term the update ADDS must be indexed, so the retraction above cannot be
+    /// implemented by simply refusing to touch a re-indexed document.
+    #[test]
+    fn update_adding_a_term_indexes_it() {
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha")
+            .unwrap();
+        assert_eq!(idx.term_df(DB, T, "docs", "delta").unwrap(), 0);
+
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha delta")
+            .unwrap();
+
+        assert_eq!(idx.term_df(DB, T, "docs", "alpha").unwrap(), 1);
+        assert_eq!(
+            idx.term_df(DB, T, "docs", "delta").unwrap(),
+            1,
+            "a term introduced by the update must be searchable"
+        );
+    }
+
+    /// Re-indexing with an UNCHANGED token set must not move any count — this is
+    /// the WAL-replay shape, and the retraction path must not disturb it.
+    #[test]
+    fn reindex_with_unchanged_tokens_is_a_no_op_for_counts() {
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo charlie")
+            .unwrap();
+        idx.index_document(DB, T, "docs", Surrogate::new(2), "bravo")
+            .unwrap();
+
+        let before = (
+            idx.corpus_stats(DB, T, "docs").unwrap(),
+            idx.term_df(DB, T, "docs", "alpha").unwrap(),
+            idx.term_df(DB, T, "docs", "bravo").unwrap(),
+            idx.term_df(DB, T, "docs", "charlie").unwrap(),
+        );
+
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo charlie")
+            .unwrap();
+
+        let after = (
+            idx.corpus_stats(DB, T, "docs").unwrap(),
+            idx.term_df(DB, T, "docs", "alpha").unwrap(),
+            idx.term_df(DB, T, "docs", "bravo").unwrap(),
+            idx.term_df(DB, T, "docs", "charlie").unwrap(),
+        );
+        assert_eq!(before, after, "an identical re-index must change nothing");
+    }
+
+    /// A document indexed before term sets were recorded has no stored set. Its
+    /// first re-index must still retract dropped terms, via the fallback scan.
+    #[test]
+    fn update_of_a_document_without_a_stored_term_set_still_retracts() {
+        use crate::engine::sparse::fts_redb::tables::DOC_TERMS;
+
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo")
+            .unwrap();
+
+        // Drop the term-set row to reproduce a document written by a build that
+        // did not maintain one.
+        {
+            let db = idx.backend().db();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(DOC_TERMS).unwrap();
+                table.remove((DB, T.as_u64(), "docs", 1u32)).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha")
+            .unwrap();
+
+        assert_eq!(
+            idx.term_df(DB, T, "docs", "bravo").unwrap(),
+            0,
+            "the fallback scan must retract the dropped term"
+        );
+        assert_eq!(idx.term_df(DB, T, "docs", "alpha").unwrap(), 1);
+    }
+
+    /// An update that leaves a document with no indexable text at all is the
+    /// extreme case of the same bug: every term dropped out, so the document must
+    /// leave the index entirely rather than keep matching its old words.
+    #[test]
+    fn update_to_empty_text_removes_the_document() {
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo")
+            .unwrap();
+        idx.index_document(DB, T, "docs", Surrogate::new(2), "bravo")
+            .unwrap();
+
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "")
+            .unwrap();
+
+        assert_eq!(idx.term_df(DB, T, "docs", "alpha").unwrap(), 0);
+        assert_eq!(
+            idx.term_df(DB, T, "docs", "bravo").unwrap(),
+            1,
+            "the other document keeps its posting"
+        );
+        let (count, avg_len) = idx.corpus_stats(DB, T, "docs").unwrap();
+        assert_eq!(count, 1, "the emptied document is no longer in the corpus");
+        assert_eq!(avg_len, 1.0);
+    }
+}

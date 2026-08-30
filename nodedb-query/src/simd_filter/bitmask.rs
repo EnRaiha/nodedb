@@ -246,3 +246,53 @@ pub fn bitmask_to_indices(mask: &[u64]) -> Vec<u32> {
 pub fn words_for(row_count: usize) -> usize {
     row_count.div_ceil(64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitmask_and_works() {
+        let a = vec![0b1111_0000u64];
+        let b = vec![0b1010_1010u64];
+        let c = bitmask_and(&a, &b);
+        assert_eq!(c, vec![0b1010_0000u64]);
+    }
+
+    #[test]
+    fn bitmask_or_works() {
+        let a = vec![0b1111_0000u64];
+        let b = vec![0b0000_1111u64];
+        let c = bitmask_or(&a, &b);
+        assert_eq!(c, vec![0b1111_1111u64]);
+    }
+
+    #[test]
+    fn bitmask_not_works() {
+        let mask = vec![0u64];
+        let inv = bitmask_not(&mask, 10);
+        assert_eq!(popcount(&inv), 10);
+    }
+
+    #[test]
+    fn bitmask_all_works() {
+        let mask = bitmask_all(100);
+        assert_eq!(popcount(&mask), 100);
+        // Should have exactly 2 words (64 + 36 bits).
+        assert_eq!(mask.len(), 2);
+    }
+
+    #[test]
+    fn bitmask_to_indices_works() {
+        let mask = vec![0b1010_0101u64];
+        let indices = bitmask_to_indices(&mask);
+        assert_eq!(indices, vec![0, 2, 5, 7]);
+    }
+
+    #[test]
+    fn popcount_works() {
+        assert_eq!(popcount(&[u64::MAX, u64::MAX]), 128);
+        assert_eq!(popcount(&[0, 0]), 0);
+        assert_eq!(popcount(&[1]), 1);
+    }
+}

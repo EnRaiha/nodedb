@@ -14,7 +14,4 @@ mod runner;
 mod segments;
 mod stats;
 
-#[cfg(test)]
-mod tests;
-
 pub use stats::CompactionStats;

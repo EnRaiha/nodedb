@@ -166,6 +166,105 @@ mod tests {
     use crate::types::{DatabaseId, Lsn, TenantId};
 
     #[test]
+    fn live_subscription_store_and_check() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        store.ensure_session(addr);
+
+        assert!(!store.has_live_subscriptions(addr));
+
+        let stream = ChangeStream::new(64);
+        let sub = stream.subscribe(Some("orders".into()), None);
+        store.add_live_subscription(addr, "live_orders".into(), sub);
+
+        assert!(store.has_live_subscriptions(addr));
+    }
+
+    #[test]
+    fn live_subscription_drain_empty() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        store.ensure_session(addr);
+
+        let stream = ChangeStream::new(64);
+        let sub = stream.subscribe(Some("orders".into()), None);
+        store.add_live_subscription(addr, "live_orders".into(), sub);
+
+        // No events published — drain returns empty.
+        let notifications = store.drain_live_notifications(addr);
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn live_subscription_drain_receives_events() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5003".parse().unwrap();
+        store.ensure_session(addr);
+
+        let stream = ChangeStream::new(64);
+        let sub = stream.subscribe(Some("orders".into()), None);
+        store.add_live_subscription(addr, "live_orders".into(), sub);
+
+        // Publish a matching event.
+        stream.publish(ChangeEvent {
+            lsn: Lsn::new(1),
+            tenant_id: TenantId::new(1),
+            collection: "orders".into(),
+            document_id: "o42".into(),
+            operation: ChangeOperation::Insert,
+            timestamp_ms: 0,
+            after: None,
+        });
+
+        let notifications = store.drain_live_notifications(addr);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, "live_orders");
+        // The payload keeps the `OPERATION:document_id` prefix and appends an
+        // opaque `;cursor=<token>` suffix clients persist as a delivery position.
+        // The token itself is not asserted here — it is covered where it is built.
+        assert!(
+            notifications[0].1.starts_with("INSERT:o42;cursor="),
+            "unexpected live payload: {}",
+            notifications[0].1
+        );
+    }
+
+    #[test]
+    fn live_subscription_filters_by_collection() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5004".parse().unwrap();
+        store.ensure_session(addr);
+
+        let stream = ChangeStream::new(64);
+        let sub = stream.subscribe(Some("orders".into()), None);
+        store.add_live_subscription(addr, "live_orders".into(), sub);
+
+        // Publish event for a different collection — should be filtered out.
+        stream.publish(ChangeEvent {
+            lsn: Lsn::new(1),
+            tenant_id: TenantId::new(1),
+            collection: "users".into(),
+            document_id: "u1".into(),
+            operation: ChangeOperation::Update,
+            timestamp_ms: 0,
+            after: None,
+        });
+
+        let notifications = store.drain_live_notifications(addr);
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn live_subscription_no_session_returns_empty() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5005".parse().unwrap();
+        // No session created — should return empty, not panic.
+        let notifications = store.drain_live_notifications(addr);
+        assert!(notifications.is_empty());
+        assert!(!store.has_live_subscriptions(addr));
+    }
+
+    #[test]
     fn drain_live_notifications_isolates_selected_database() {
         let sessions = SessionStore::new();
         let stream = ChangeStream::new(8);

@@ -13,6 +13,3 @@ pub mod put;
 pub mod versioned;
 
 pub use batch::DocumentEngine;
-
-#[cfg(test)]
-mod tests;

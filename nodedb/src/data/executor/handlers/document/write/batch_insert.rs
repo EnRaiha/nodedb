@@ -375,11 +375,12 @@ mod tests {
     use crate::bridge::envelope::{Priority, Request, Status};
     use crate::data::executor::core_loop::CoreLoop;
     use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::doc_format;
     use crate::data::executor::task::ExecutionTask;
-    use crate::engine::document::store::surrogate_to_doc_id;
+    use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
     use crate::engine::sparse::fts_redb::tables::DOC_LENGTHS;
     use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
-    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan, ResolvedSumTarget};
     use nodedb_types::Surrogate;
     use std::time::{Duration, Instant};
 
@@ -568,5 +569,117 @@ mod tests {
             0,
             "and must leave nothing in the FTS corpus"
         );
+    }
+
+    // ── The batch insert an `INSERT ... SELECT` page ships must credit its
+    // materialized-sum targets, exactly like every other write path ─────────
+
+    const SUM_SOURCE: &str = "point_txns";
+    const SUM_TARGET: &str = "point_holders";
+    const SUM_A1: &str = "a1";
+    const SUM_T1: Surrogate = Surrogate(4001);
+
+    fn sum_binding() -> nodedb_physical::physical_plan::MaterializedSumBinding {
+        nodedb_physical::physical_plan::MaterializedSumBinding {
+            target_collection: SUM_TARGET.to_string(),
+            target_column: "balance".to_string(),
+            join_column: "account_id".to_string(),
+            value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
+        }
+    }
+
+    fn sum_config_key(collection: &str) -> (DatabaseId, TenantId, String) {
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            collection.to_string(),
+        )
+    }
+
+    /// A source collection bound to the sum, and a target row starting at zero.
+    fn sum_seeded_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+
+        let mut source = CollectionConfig::new(SUM_SOURCE);
+        source.enforcement.materialized_sum_sources = vec![sum_binding()];
+        core.doc_configs.insert(sum_config_key(SUM_SOURCE), source);
+        core.doc_configs.insert(
+            sum_config_key(SUM_TARGET),
+            CollectionConfig::new(SUM_TARGET),
+        );
+
+        let seed = serde_json::json!({"id": SUM_A1, "balance": "100"});
+        core.sparse
+            .put(
+                DatabaseId::DEFAULT.as_u64(),
+                TID,
+                SUM_TARGET,
+                &surrogate_to_doc_id(SUM_T1),
+                &doc_format::encode_to_msgpack(&seed),
+            )
+            .expect("seed target row");
+        core
+    }
+
+    /// A source row body, in the MessagePack every handler receives.
+    fn sum_entry(account: &str, amount: i64) -> Vec<u8> {
+        doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": account,
+            "amount": amount,
+        }))
+    }
+
+    /// The balance the target row currently holds.
+    fn sum_balance(core: &CoreLoop, surrogate: Surrogate) -> String {
+        let stored = core
+            .sparse
+            .get(
+                DatabaseId::DEFAULT.as_u64(),
+                TID,
+                SUM_TARGET,
+                &surrogate_to_doc_id(surrogate),
+            )
+            .expect("read target row")
+            .expect("target row must still exist");
+        doc_format::decode_document(&stored)
+            .expect("target row must decode")
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .expect("target row must carry a balance")
+            .to_string()
+    }
+
+    /// The orchestrator re-issues the copy through `dispatch_local`, which
+    /// never passes through the statement-level resolution pass — so a page
+    /// shipping an empty resolution would leave the total short of the rows it
+    /// inserted.
+    #[test]
+    fn insert_select_page_credits_its_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = sum_seeded_core(dir.path());
+
+        let documents = vec![
+            (surrogate_to_doc_id(Surrogate(1)), sum_entry(SUM_A1, 25)),
+            (surrogate_to_doc_id(Surrogate(2)), sum_entry(SUM_A1, 75)),
+        ];
+        let surrogates = vec![Surrogate(1), Surrogate(2)];
+        let resolved = vec![ResolvedSumTarget::new(SUM_TARGET, SUM_A1, SUM_T1)];
+        let task = batch_task(&documents, &surrogates);
+        let response = core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: SUM_SOURCE,
+                documents: &documents,
+                surrogates: &surrogates,
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &resolved,
+                deferred_sum_targets: &[],
+            },
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(sum_balance(&core, SUM_T1), "200");
     }
 }

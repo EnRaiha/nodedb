@@ -235,3 +235,238 @@ impl KvEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::Surrogate;
+
+    use crate::engine::kv::{KvPutParams, RegisterIndexParams};
+
+    use super::*;
+
+    fn now() -> u64 {
+        1_000_000
+    }
+
+    fn make_engine() -> KvEngine {
+        KvEngine::new(now(), 16, 0.75, 4, 64, 1000, 1024)
+    }
+
+    /// Helper: create a MessagePack-encoded JSON object value.
+    fn mp_obj(fields: &[(&str, &str)]) -> Vec<u8> {
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        nodedb_types::json_to_msgpack(&serde_json::Value::Object(obj)).unwrap()
+    }
+
+    #[test]
+    fn ttl_expiry_via_tick() {
+        let mut e = make_engine();
+        let n = now();
+
+        // Put with 5-second TTL.
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: b"s1",
+            value: b"data",
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert!(e.get(0, 1, "sess", b"s1", n).is_some());
+
+        // Still alive at t+4999.
+        assert!(e.get(0, 1, "sess", b"s1", n + 4999).is_some());
+
+        // Expired at t+5000 (lazy fallback).
+        assert!(e.get(0, 1, "sess", b"s1", n + 5000).is_none());
+
+        // Tick reaps it.
+        let reaped = e.tick_expiry(n + 5000);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].collection, "sess");
+        assert_eq!(reaped[0].key, b"s1");
+        assert_eq!(e.total_entries(), 0);
+    }
+
+    #[test]
+    fn stats() {
+        let mut e = make_engine();
+        let n = now();
+
+        assert_eq!(e.total_entries(), 0);
+
+        for i in 0..10u32 {
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &i.to_be_bytes(),
+                value: &[0; 32],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+        assert_eq!(e.total_entries(), 10);
+        assert_eq!(e.collection_len(0, 1, "c"), 10);
+        assert!(e.total_mem_usage() > 0);
+    }
+
+    // ── TTL × index interaction ──────────────────────────────────────────────
+    //
+    // The expiry reaper is a delete path, so every index a DELETE maintains it
+    // must maintain too. These cases put a TTL and an index on the SAME
+    // collection: `ttl_expiry_via_tick` covers TTL on an index-less collection
+    // and `index_cleaned_on_delete` covers an index on a TTL-less collection, so
+    // neither observes the reaper touching an index.
+
+    /// The reaper must remove a single-field index entry along with the row.
+    /// Pre-fix `tick_expiry` reaped the hash slot only, so the index kept
+    /// pointing at a key that no longer existed — an unbounded leak that the
+    /// checkpoint then persisted verbatim.
+    #[test]
+    fn index_cleaned_on_ttl_reap() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us")]),
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+
+        let reaped = e.tick_expiry(n + 5000);
+        assert_eq!(reaped.len(), 1);
+
+        assert_eq!(e.total_entries(), 0);
+        assert!(
+            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            "reaping the row must remove its index entry"
+        );
+        assert_eq!(
+            e.stats().total_index_entries,
+            0,
+            "no index entry may outlive the row it points at"
+        );
+    }
+
+    /// Composite indexes are cleaned by a separate loop in `KvIndexSet::on_delete`
+    /// than single-field ones, so the reaper needs its own case for them.
+    ///
+    /// Seeded through `KvIndexSet::add_composite_index` directly: that is the only
+    /// registration path a composite index has — the engine exposes no
+    /// `register_composite_index` counterpart to `register_index`.
+    #[test]
+    fn composite_index_cleaned_on_ttl_reap() {
+        let mut e = make_engine();
+        let n = now();
+        let tkey = table_key(0, 1, "sess");
+
+        e.indexes
+            .entry(tkey)
+            .or_default()
+            .add_composite_index(vec!["region".into(), "status".into()], vec![0, 1]);
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us"), ("status", "active")]),
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+
+        let ci_fields = vec!["region".to_string(), "status".to_string()];
+        let hits = |e: &KvEngine| -> usize {
+            e.indexes
+                .get(&tkey)
+                .and_then(|s| s.get_composite_index(&ci_fields))
+                .map(|ci| ci.lookup_eq(&[b"us", b"active"]).len())
+                .unwrap_or(0)
+        };
+        assert_eq!(hits(&e), 1);
+
+        let reaped = e.tick_expiry(n + 5000);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(
+            hits(&e),
+            0,
+            "reaping the row must remove its composite entry"
+        );
+    }
+
+    /// A rehash moves every existing entry into `rehash_source`; a row reaped
+    /// while it sits there is exactly the row whose index cleanup a probe of the
+    /// primary slots alone would skip. Guards `get_ignoring_expiry`'s
+    /// `rehash_source` fallback.
+    #[test]
+    fn index_cleaned_on_ttl_reap_during_rehash() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+
+        // make_engine's table starts at capacity 16 with a 0.75 rehash threshold,
+        // so the 13th insert starts a rehash and parks all 13 rows in the source.
+        // No PUT follows, so none of them get migrated back out.
+        let rows = 13u32;
+        for i in 0..rows {
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "sess",
+                key: &i.to_be_bytes(),
+                value: &mp_obj(&[("region", "us")]),
+                ttl_ms: 5000,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+        assert!(
+            e.stats().is_rehashing,
+            "test premise: the reaped rows must sit in the rehash source"
+        );
+        assert_eq!(
+            e.index_lookup_eq(0, 1, "sess", "region", b"us").len(),
+            rows as usize
+        );
+
+        let reaped = e.tick_expiry(n + 5000);
+        assert_eq!(reaped.len(), rows as usize);
+        assert_eq!(e.total_entries(), 0);
+        assert!(
+            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            "rows reaped out of the rehash source must clean their index entries too"
+        );
+    }
+}

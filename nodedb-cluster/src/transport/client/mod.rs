@@ -17,6 +17,3 @@ pub mod transport;
 
 pub use send::ShufflePushStream;
 pub use transport::{NexarTransport, TransportPeerSnapshot};
-
-#[cfg(test)]
-mod tests;

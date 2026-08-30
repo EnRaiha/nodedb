@@ -791,3 +791,159 @@ pub enum ReplicatedWrite {
         response_payload: Vec<u8>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::replicated_entry::ReplicatedEntry;
+    use super::*;
+
+    #[test]
+    fn constraint_change_roundtrip() {
+        let entry = ReplicatedEntry::new(
+            7,
+            0,
+            3,
+            ReplicatedWrite::ConstraintChange {
+                collection: "orders".into(),
+                op: ConstraintChangeOp::Set,
+                constraint_version: 9,
+                constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
+            },
+        );
+        let original_key = entry.idempotency_key;
+
+        let bytes = entry.to_bytes();
+        let decoded = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        assert_eq!(decoded.tenant_id, 7);
+        assert_eq!(decoded.vshard_id, 3);
+        assert_eq!(decoded.idempotency_key, original_key);
+        match decoded.write {
+            ReplicatedWrite::ConstraintChange {
+                collection,
+                op,
+                constraint_version,
+                constraints,
+            } => {
+                assert_eq!(collection, "orders");
+                assert_eq!(op, ConstraintChangeOp::Set);
+                assert_eq!(constraint_version, 9);
+                assert_eq!(constraints, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
+            }
+            other => panic!("expected ConstraintChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constraint_change_encoding_is_deterministic() {
+        let write = ReplicatedWrite::ConstraintChange {
+            collection: "orders".into(),
+            op: ConstraintChangeOp::Drop,
+            constraint_version: 4,
+            constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
+        };
+        let a = zerompk::to_msgpack_vec(&write).expect("encode a failed");
+        let b = zerompk::to_msgpack_vec(&write).expect("encode b failed");
+        assert_eq!(
+            a, b,
+            "encoding the same ConstraintChange must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn all_write_variants_serialize() {
+        let writes = vec![
+            ReplicatedWrite::PointPut {
+                collection: "c".into(),
+                document_id: "d".into(),
+                value: vec![1, 2, 3],
+                surrogate: 1,
+                resolved_sum_targets: vec![("acc-1".into(), 4242)],
+                resolved_sum_target_bindings: vec![ReplicatedSumTarget {
+                    target_collection: "accounts".into(),
+                    join_value: "acc-1".into(),
+                    surrogate: 4242,
+                }],
+                returning: None,
+                rls_filters: Vec::new(),
+            },
+            ReplicatedWrite::PointDelete {
+                collection: "c".into(),
+                document_id: "d".into(),
+                surrogate: 1,
+                resolved_sum_targets: Vec::new(),
+                resolved_sum_target_bindings: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+            },
+            ReplicatedWrite::VectorInsert {
+                collection: "v".into(),
+                vector: vec![1.0, 2.0, 3.0],
+                dim: 3,
+                field_name: "embedding".into(),
+                surrogate: 7,
+                pk_bytes: Some(b"doc-1".to_vec()),
+                provenance: None,
+            },
+            ReplicatedWrite::CrdtApply {
+                collection: "c".into(),
+                document_id: "d".into(),
+                delta: vec![0xAB],
+                peer_id: 7,
+                provenance: None,
+                constraint_version_required: 0,
+                surrogate: 5,
+            },
+            ReplicatedWrite::CrdtApplyFenced {
+                collection: "c".into(),
+                document_id: "d".into(),
+                delta: vec![0xAC],
+                peer_id: 8,
+                provenance: None,
+                constraint_version_required: 1,
+                expected_frontier_digest: [1; 32],
+                surrogate: 6,
+            },
+            ReplicatedWrite::EdgePut {
+                collection: "col".into(),
+                src_id: "a".into(),
+                label: "knows".into(),
+                dst_id: "b".into(),
+                properties: vec![],
+                src_surrogate: 10,
+                dst_surrogate: 20,
+            },
+            ReplicatedWrite::EdgeDelete {
+                collection: "col".into(),
+                src_id: "a".into(),
+                label: "knows".into(),
+                dst_id: "b".into(),
+                src_surrogate: 10,
+                dst_surrogate: 20,
+            },
+            ReplicatedWrite::ArrayOp {
+                array: "genome".into(),
+                op_bytes: vec![0xde, 0xad],
+                schema_hlc_bytes: [0u8; 18],
+                provenance: None,
+            },
+            ReplicatedWrite::ArraySchema {
+                array: "genome".into(),
+                snapshot_payload: vec![0xbe, 0xef],
+                schema_hlc_bytes: [1u8; 18],
+            },
+            ReplicatedWrite::ConstraintChange {
+                collection: "orders".into(),
+                op: ConstraintChangeOp::Set,
+                constraint_version: 1,
+                constraints: vec![vec![1, 2, 3]],
+            },
+        ];
+
+        for write in writes {
+            let entry = ReplicatedEntry::new(1, 0, 0, write);
+            let bytes = entry.to_bytes();
+            let decoded = ReplicatedEntry::from_bytes(&bytes);
+            assert!(decoded.is_some(), "failed to roundtrip: {entry:?}");
+        }
+    }
+}

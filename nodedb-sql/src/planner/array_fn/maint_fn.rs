@@ -44,3 +44,109 @@ pub fn try_plan_array_maint_fn(
         _ => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog::{ArrayCatalogView, SqlCatalogError};
+    use crate::error::Result;
+    use crate::functions::registry::FunctionRegistry;
+    use crate::parser::statement::parse_sql;
+    use crate::types::{CollectionInfo, SqlCatalog, SqlPlan};
+    use crate::types_array::{
+        ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound,
+    };
+
+    struct StubCatalog {
+        view: Option<ArrayCatalogView>,
+        right_view: Option<ArrayCatalogView>,
+    }
+    impl SqlCatalog for StubCatalog {
+        fn get_collection(
+            &self,
+            _: nodedb_types::DatabaseId,
+            _name: &str,
+        ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
+            Ok(None)
+        }
+        fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
+            if name == "g" || name == "left" {
+                self.view.clone()
+            } else if name == "right" {
+                self.right_view.clone()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn view() -> ArrayCatalogView {
+        ArrayCatalogView {
+            name: "g".into(),
+            dims: vec![
+                ArrayDimAst {
+                    name: "chrom".into(),
+                    dtype: ArrayDimType::Int64,
+                    lo: ArrayDomainBound::Int64(1),
+                    hi: ArrayDomainBound::Int64(23),
+                },
+                ArrayDimAst {
+                    name: "pos".into(),
+                    dtype: ArrayDimType::Int64,
+                    lo: ArrayDomainBound::Int64(0),
+                    hi: ArrayDomainBound::Int64(1_000_000),
+                },
+            ],
+            attrs: vec![
+                ArrayAttrAst {
+                    name: "variant".into(),
+                    dtype: ArrayAttrType::String,
+                    nullable: true,
+                },
+                ArrayAttrAst {
+                    name: "qual".into(),
+                    dtype: ArrayAttrType::Float64,
+                    nullable: true,
+                },
+            ],
+            tile_extents: vec![1, 1_000_000],
+        }
+    }
+
+    fn cat() -> StubCatalog {
+        StubCatalog {
+            view: Some(view()),
+            right_view: Some(view()),
+        }
+    }
+
+    fn plan_one(sql: &str) -> Result<SqlPlan> {
+        let stmts = parse_sql(sql)?;
+        let q = match &stmts[0] {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("not a query"),
+        };
+        crate::planner::select::plan_query(
+            q,
+            &cat(),
+            &FunctionRegistry::new(),
+            crate::TemporalScope::default(),
+        )
+    }
+
+    #[test]
+    fn flush_happy() {
+        let p = plan_one("SELECT ARRAY_FLUSH('g')").unwrap();
+        assert!(matches!(p, SqlPlan::ArrayFlush { .. }));
+    }
+
+    #[test]
+    fn compact_happy() {
+        let p = plan_one("SELECT ARRAY_COMPACT('g')").unwrap();
+        assert!(matches!(p, SqlPlan::ArrayCompact { .. }));
+    }
+
+    #[test]
+    fn flush_unknown_array_rejected() {
+        assert!(plan_one("SELECT ARRAY_FLUSH('nope')").is_err());
+    }
+}

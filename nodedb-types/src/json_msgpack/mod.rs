@@ -3,8 +3,6 @@
 pub mod error;
 pub mod json_value;
 pub mod reader;
-#[cfg(test)]
-mod tests;
 pub mod transcoder;
 pub mod writer;
 

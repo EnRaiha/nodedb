@@ -43,8 +43,5 @@ mod sync_and_routing;
 mod types;
 mod wedge;
 
-#[cfg(test)]
-mod tests;
-
 pub use types::{CATALOG_CHANNEL_CAPACITY, CatalogChangeEvent, MetadataCommitApplier};
 pub use wedge::{ApplyFailureClass, MetadataApplyWedge, WedgeReport, classify};

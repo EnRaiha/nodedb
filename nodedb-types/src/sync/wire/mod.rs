@@ -69,9 +69,6 @@ pub mod stream_id;
 pub mod timeseries;
 pub mod vector;
 
-#[cfg(test)]
-mod tests;
-
 pub use ack_result::{SyncAckResult, SyncOutcome};
 pub use ack_status::AckStatus;
 pub use array::{

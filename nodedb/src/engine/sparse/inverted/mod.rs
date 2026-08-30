@@ -23,9 +23,6 @@ mod removal;
 mod search;
 mod synonyms;
 
-#[cfg(test)]
-mod tests;
-
 pub use core::InvertedIndex;
 pub use indexing::IndexDocScope;
 pub use nodedb_fts::FtsSearchParams;

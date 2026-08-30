@@ -77,8 +77,6 @@ mod index_decode;
 mod index_export;
 mod index_format;
 mod index_restore;
-#[cfg(test)]
-mod index_tests;
 mod load;
 mod manifest;
 mod paths;

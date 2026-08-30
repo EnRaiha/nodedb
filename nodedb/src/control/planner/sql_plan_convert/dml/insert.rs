@@ -390,3 +390,126 @@ pub(in super::super) fn convert_insert(
 
     Ok(tasks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::control::security::catalog::StoredCollection;
+    use crate::control::security::credential::CredentialStore;
+
+    /// Build a `ConvertContext` whose credential store carries a catalog with
+    /// three collections under tenant 0 / DEFAULT database: `edges`
+    /// (`has_implicit_edges = true`), `plain` (all flags false), and `crdt_coll`
+    /// (`crdt = true`). The returned `TempDir` must be kept alive for the lifetime
+    /// of the context (it backs the catalog's redb file).
+    fn ctx_with_catalog() -> (ConvertContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
+        {
+            let catalog = store.catalog();
+            let mut edges = StoredCollection::new(0, "edges", "owner");
+            edges.has_implicit_edges = true;
+            catalog
+                .put_collection(crate::types::DatabaseId::DEFAULT, &edges)
+                .expect("put edges collection");
+            let plain = StoredCollection::new(0, "plain", "owner");
+            catalog
+                .put_collection(crate::types::DatabaseId::DEFAULT, &plain)
+                .expect("put plain collection");
+            let mut crdt_coll = StoredCollection::new(0, "crdt_coll", "owner");
+            crdt_coll.crdt = true;
+            catalog
+                .put_collection(crate::types::DatabaseId::DEFAULT, &crdt_coll)
+                .expect("put crdt collection");
+        }
+
+        let ctx = ConvertContext {
+            purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
+            retention_registry: None,
+            array_catalog: None,
+            credentials: Some(Arc::new(store)),
+            wal: None,
+            surrogate_assigner: None,
+            cluster_enabled: false,
+            bitemporal_retention_registry: None,
+            max_vector_dim: 0,
+            force_shuffle_join: false,
+            shuffle_num_parts: 0,
+            force_shuffle_agg: false,
+            shuffle_agg_num_parts: 0,
+            broadcast_threshold_bytes: 8 * 1024 * 1024,
+            shuffle_agg_threshold: 10_000,
+            database_id: crate::types::DatabaseId::DEFAULT,
+            tenant_id: crate::types::TenantId::new(0),
+        };
+        (ctx, dir)
+    }
+
+    fn crdt_row(id: &str) -> Vec<(String, SqlValue)> {
+        vec![
+            ("id".to_string(), SqlValue::String(id.to_string())),
+            ("name".to_string(), SqlValue::String("alice".to_string())),
+        ]
+    }
+
+    #[test]
+    fn insert_into_crdt_collection_routes_doc_upsert() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let rows = vec![crdt_row("k1")];
+        let tasks = convert_insert(ConvertInsertArgs {
+            collection: "crdt_coll",
+            engine: &EngineType::DocumentSchemaless,
+            rows: &rows,
+            column_defaults: &[],
+            column_schema: &[],
+            if_absent: false,
+            primary_key: Some("id"),
+            tenant_id: TenantId::new(0),
+            ctx: &ctx,
+        })
+        .expect("convert_insert");
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].plan {
+            PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+                document_id,
+                fields_json,
+                partial,
+                ..
+            }) => {
+                assert_eq!(document_id, "k1");
+                assert!(!partial, "INSERT must be a full-replace DocUpsert");
+                assert!(fields_json.contains("alice"));
+            }
+            other => panic!("expected CrdtOp::DocUpsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_into_non_crdt_collection_routes_point_insert() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let rows = vec![crdt_row("k1")];
+        let tasks = convert_insert(ConvertInsertArgs {
+            collection: "plain",
+            engine: &EngineType::DocumentSchemaless,
+            rows: &rows,
+            column_defaults: &[],
+            column_schema: &[],
+            if_absent: false,
+            primary_key: Some("id"),
+            tenant_id: TenantId::new(0),
+            ctx: &ctx,
+        })
+        .expect("convert_insert");
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            matches!(
+                &tasks[0].plan,
+                PhysicalPlan::Document(DocumentOp::PointInsert { .. })
+            ),
+            "non-crdt INSERT must remain a PointInsert"
+        );
+    }
+}

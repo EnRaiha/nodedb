@@ -112,3 +112,126 @@ fn decode_provenance(bytes: &Option<Vec<u8>>) -> crate::Result<Option<SyncProven
             }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::ReplicatedEntry;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_array::types::cell_value::value::CellValue;
+    use nodedb_array::types::coord::value::CoordValue;
+    use nodedb_types::Surrogate;
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn array_cell_put_roundtrips_and_carries_surrogate() {
+        let tenant = TenantId::new(3);
+        let vshard = VShardId::new(7);
+        let array_id = ArrayId::new(tenant, "genome");
+
+        // A cell carrying a real surrogate — the losslessness subject.
+        let cell = ArrayPutCell {
+            coord: vec![CoordValue::Int64(5), CoordValue::Int64(7)],
+            attrs: vec![CellValue::Float64(42.0)],
+            surrogate: Surrogate::new(9999),
+            system_from_ms: 1,
+            valid_from_ms: 1,
+            valid_until_ms: i64::MAX,
+        };
+        let cells_msgpack = zerompk::to_msgpack_vec(&vec![cell]).unwrap();
+
+        let plan = PhysicalPlan::Array(ArrayOp::Put {
+            array_id: array_id.clone(),
+            cells_msgpack: cells_msgpack.clone(),
+            wal_lsn: 123,
+            provenance: None,
+        });
+
+        // Must encode (no longer a replication gap).
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("ArrayOp::Put must encode to a ReplicatedWrite");
+        let bytes = entry.to_bytes();
+
+        // Decode with no assigner (surrogate binding is a no-op) — the cells (and
+        // thus the carried surrogate) must survive verbatim, wal_lsn resets to 0.
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("ArrayCellPut must decode to a plan");
+        match decoded_plan {
+            PhysicalPlan::Array(ArrayOp::Put {
+                array_id: decoded_id,
+                cells_msgpack: decoded_cells,
+                wal_lsn,
+                provenance,
+            }) => {
+                assert_eq!(
+                    decoded_id, array_id,
+                    "array id reconstructed from header tenant + name"
+                );
+                assert_eq!(
+                    decoded_cells, cells_msgpack,
+                    "cells (with surrogate) carried verbatim"
+                );
+                assert_eq!(wal_lsn, 0, "follower allocates its own wal_lsn at apply");
+                assert!(provenance.is_none());
+            }
+            other => panic!("expected Array(Put), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_cell_delete_roundtrips_verbatim() {
+        let tenant = TenantId::new(2);
+        let vshard = VShardId::new(4);
+        let array_id = ArrayId::new(tenant, "genome");
+
+        let coords = vec![vec![CoordValue::Int64(1), CoordValue::Int64(2)]];
+        let coords_msgpack = zerompk::to_msgpack_vec(&coords).unwrap();
+
+        let plan = PhysicalPlan::Array(ArrayOp::Delete {
+            array_id: array_id.clone(),
+            coords_msgpack: coords_msgpack.clone(),
+            wal_lsn: 55,
+            provenance: None,
+        });
+
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("ArrayOp::Delete must encode to a ReplicatedWrite");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("ArrayCellDelete must decode to a plan");
+        match decoded_plan {
+            PhysicalPlan::Array(ArrayOp::Delete {
+                array_id: decoded_id,
+                coords_msgpack: decoded_coords,
+                wal_lsn,
+                provenance,
+            }) => {
+                assert_eq!(decoded_id, array_id);
+                assert_eq!(decoded_coords, coords_msgpack, "coords carried verbatim");
+                assert_eq!(wal_lsn, 0);
+                assert!(provenance.is_none());
+            }
+            other => panic!("expected Array(Delete), got {other:?}"),
+        }
+    }
+}

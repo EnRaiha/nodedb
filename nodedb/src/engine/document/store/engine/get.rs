@@ -44,3 +44,41 @@ impl<'a> DocumentEngine<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::sparse::btree::SparseEngine;
+
+    use super::*;
+
+    fn make_engine() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("doc.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+        assert!(doc_engine.get("users", "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn collections_are_isolated() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine
+            .put("users", "id1", &serde_json::json!({"type": "user"}))
+            .unwrap();
+        doc_engine
+            .put("orders", "id1", &serde_json::json!({"type": "order"}))
+            .unwrap();
+
+        let user = doc_engine.get("users", "id1").unwrap().unwrap();
+        let order = doc_engine.get("orders", "id1").unwrap().unwrap();
+        assert_eq!(user["type"], "user");
+        assert_eq!(order["type"], "order");
+    }
+}

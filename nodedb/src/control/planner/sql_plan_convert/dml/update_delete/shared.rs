@@ -77,3 +77,18 @@ pub(super) fn delete_effective_filter(
 ) -> crate::Result<Vec<u8>> {
     pk_effective_filter(serialize_filters(filters)?, target_keys)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_effective_filter_never_empty_for_non_empty_keys() {
+        let keys = vec![
+            SqlValue::String("a".to_string()),
+            SqlValue::String("b".to_string()),
+        ];
+        let bytes = delete_effective_filter(&[], &keys).expect("synthesize filter");
+        assert!(!bytes.is_empty());
+    }
+}

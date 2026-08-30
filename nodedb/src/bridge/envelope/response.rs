@@ -90,3 +90,47 @@ pub struct Response {
     /// only for post-apply-redo writes (see [`WriteSetEntry`]).
     pub write_set: Vec<WriteSetEntry>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_ok() {
+        let resp = Response {
+            request_id: RequestId::new(1),
+            status: Status::Ok,
+            attempt: 1,
+            partial: false,
+            payload: Payload::from_vec(b"result".to_vec()),
+            watermark_lsn: Lsn::new(42),
+            error_code: None,
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        };
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(resp.watermark_lsn, Lsn::new(42));
+        assert_eq!(&*resp.payload, b"result");
+    }
+
+    #[test]
+    fn response_error() {
+        let resp = Response {
+            request_id: RequestId::new(2),
+            status: Status::Error,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: Some(Box::new(ErrorCode::DeadlineExceeded)),
+            read_set_valid: None,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        };
+        assert_eq!(
+            resp.error_code.as_deref(),
+            Some(&ErrorCode::DeadlineExceeded)
+        );
+    }
+}

@@ -28,9 +28,6 @@ mod encode;
 mod hits;
 mod raw;
 
-#[cfg(test)]
-mod tests;
-
 pub use arrow::encode_as_arrow_ipc;
 pub(in crate::data::executor) use decode::decode_response_to_docs;
 pub use encode::{decode_payload, decode_payload_to_json};

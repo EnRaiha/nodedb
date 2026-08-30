@@ -25,8 +25,6 @@ pub mod payload;
 pub mod purge;
 pub mod query;
 pub mod read;
-#[cfg(test)]
-mod tests;
 pub mod write;
 
 pub use keys::{

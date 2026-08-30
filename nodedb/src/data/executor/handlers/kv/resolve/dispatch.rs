@@ -310,3 +310,140 @@ fn kv_op_name(op: &KvOp) -> &'static str {
         KvOp::PredicateDelete { .. } => "PredicateDelete",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::task::ExecutionTask;
+    use nodedb_physical::physical_plan::KvOp;
+    use std::sync::Arc;
+
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
+
+    use crate::bridge::envelope::Status;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+
+    const TID: u64 = 1;
+    const COLLECTION: &str = "kv_resolved";
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        use nodedb_bridge::buffer::RingBuffer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    fn did() -> u64 {
+        DatabaseId::DEFAULT.as_u64()
+    }
+
+    fn task() -> ExecutionTask {
+        CoreLoop::replay_task(
+            TenantId::new(TID),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            crate::bridge::envelope::PhysicalPlan::Kv(KvOp::Get {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+                key: b"seed".to_vec(),
+                rls_filters: Vec::new(),
+                surrogate_ceiling: None,
+            }),
+            None,
+        )
+    }
+
+    fn seed(core: &mut CoreLoop, collection: &str, key: &[u8], value: &[u8]) {
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did(),
+            tenant_id: TID,
+            collection,
+            key,
+            value,
+            ttl_ms: 0,
+            now_ms: crate::engine::kv::current_ms(),
+            surrogate: Surrogate::new(1),
+        });
+    }
+
+    fn stored(core: &CoreLoop, collection: &str, key: &[u8]) -> Option<Vec<u8>> {
+        core.kv_engine
+            .get(did(), TID, collection, key, crate::engine::kv::current_ms())
+    }
+
+    fn i64_bytes(v: i64) -> Vec<u8> {
+        zerompk::to_msgpack_vec(&v).expect("encode i64")
+    }
+
+    /// Run the resolve handler and decode its outcome.
+    fn resolve(h: &CoreHarness, op: &KvOp) -> nodedb_physical::physical_plan::KvResolveOutcome {
+        let t = task();
+        let resp = h.core.execute_kv_resolve_write(&t, did(), TID, op);
+        assert_eq!(
+            resp.status,
+            Status::Ok,
+            "resolve failed: {:?}",
+            resp.error_code
+        );
+        zerompk::from_msgpack(resp.payload.as_bytes()).expect("decode resolve outcome")
+    }
+
+    fn incr_op(key: &[u8], delta: i64) -> KvOp {
+        KvOp::Incr {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+            key: key.to_vec(),
+            delta,
+            ttl_ms: 0,
+            surrogate: Surrogate::new(1),
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_an_op_with_no_state_dependent_image() {
+        let h = make_core();
+        let op = KvOp::Get {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+            key: b"k".to_vec(),
+            rls_filters: Vec::new(),
+            surrogate_ceiling: None,
+        };
+        let t = task();
+        let resp = h.core.execute_kv_resolve_write(&t, did(), TID, &op);
+        assert_eq!(resp.status, Status::Error);
+    }
+
+    #[test]
+    fn resolve_mutates_nothing() {
+        let mut h = make_core();
+        seed(&mut h.core, COLLECTION, b"counter", &i64_bytes(5));
+        let _ = resolve(&h, &incr_op(b"counter", 3));
+        assert_eq!(
+            stored(&h.core, COLLECTION, b"counter"),
+            Some(i64_bytes(5)),
+            "resolve is read-only"
+        );
+    }
+}

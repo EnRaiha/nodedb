@@ -14,7 +14,5 @@
 mod begin_rollback;
 mod commit;
 mod errors;
-#[cfg(test)]
-mod tests;
 
 pub(in crate::control::server::pgwire::handler) use commit::PgwireTxnDp;

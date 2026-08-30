@@ -60,8 +60,5 @@ pub mod scheduler;
 pub mod staged_vote;
 pub mod write_version_record;
 
-#[cfg(test)]
-mod tests;
-
 pub use propose::{CalvinReadResultProposal, propose_calvin_read_result};
 pub use scheduler::{Scheduler, SchedulerParams};

@@ -124,3 +124,32 @@ fn parse_column_type(ty_str: &str) -> Result<ColumnType, SegmentError> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_v2_roundtrip() {
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp),
+                ("cpu".into(), ColumnType::Float64),
+                ("host".into(), ColumnType::Symbol),
+            ],
+            timestamp_idx: 0,
+            codecs: vec![
+                ColumnCodec::DoubleDelta,
+                ColumnCodec::Gorilla,
+                ColumnCodec::Raw,
+            ],
+        };
+        let json = sonic_rs::to_vec(&schema_to_json(&schema)).unwrap();
+        let parsed: SchemaJson = sonic_rs::from_slice(&json).unwrap();
+        let recovered = schema_from_parsed(&parsed).unwrap();
+
+        assert_eq!(recovered.columns, schema.columns);
+        assert_eq!(recovered.timestamp_idx, 0);
+        assert_eq!(recovered.codecs, schema.codecs);
+    }
+}

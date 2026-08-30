@@ -184,3 +184,33 @@ pub(in crate::data::executor) struct GraphRagMetadata {
     /// Consumers can use this to verify they are reading a consistent view.
     pub watermark_lsn: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::encode::{decode_payload_to_json, encode};
+    use super::*;
+
+    #[test]
+    fn encode_vector_hits() {
+        let hits = vec![
+            VectorSearchHit {
+                id: 1,
+                distance: 0.5,
+                doc_id: None,
+                body: None,
+            },
+            VectorSearchHit {
+                id: 2,
+                distance: 0.8,
+                doc_id: None,
+                body: None,
+            },
+        ];
+        let bytes = encode(&hits).unwrap();
+        assert!(!bytes.is_empty());
+
+        let json = decode_payload_to_json(&bytes);
+        assert!(json.contains("\"id\""));
+        assert!(json.contains("\"distance\""));
+    }
+}

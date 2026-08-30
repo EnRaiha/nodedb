@@ -359,4 +359,31 @@ mod tests {
         let expected = crc32c::crc32c(&body);
         assert_eq!(stored, expected);
     }
+
+    #[test]
+    fn frame_roundtrip() {
+        let ping = crate::sync::wire::PingPongMsg {
+            timestamp_ms: 12345,
+            is_pong: false,
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::PingPong, &ping).unwrap();
+        let bytes = frame.to_bytes();
+        let decoded = SyncFrame::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.msg_type, SyncMessageType::PingPong);
+        let decoded_ping: crate::sync::wire::PingPongMsg = decoded.decode_body().unwrap();
+        assert_eq!(decoded_ping.timestamp_ms, 12345);
+        assert!(!decoded_ping.is_pong);
+    }
+
+    #[test]
+    fn message_type_roundtrip() {
+        for v in [
+            0x01, 0x02, 0x10, 0x11, 0x12, 0x14, 0x20, 0x21, 0x22, 0x23, 0x30, 0x40, 0x41, 0x50,
+            0x52, 0x60, 0x61, 0x70, 0x80, 0x81, 0x82, 0xFF,
+        ] {
+            let mt = SyncMessageType::from_u8(v).unwrap();
+            assert_eq!(mt as u8, v);
+        }
+        assert!(SyncMessageType::from_u8(0x99).is_none());
+    }
 }

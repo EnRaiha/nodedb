@@ -262,6 +262,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_parameters() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        store.ensure_session(addr);
+
+        assert_eq!(
+            store.get_parameter(addr, "client_encoding"),
+            Some("UTF8".into())
+        );
+
+        store.set_parameter(addr, "application_name".into(), "test_app".into());
+        assert_eq!(
+            store.get_parameter(addr, "application_name"),
+            Some("test_app".into())
+        );
+    }
+
+    #[test]
     fn reset_parameter_restores_canonical_defaults() {
         let store = SessionStore::new();
         let addr = "127.0.0.1:5000".parse().expect("socket address");

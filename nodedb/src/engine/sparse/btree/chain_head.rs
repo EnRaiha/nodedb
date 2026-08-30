@@ -246,3 +246,64 @@ impl SparseEngine {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (engine, dir)
+    }
+
+    /// A chain head written inside a caller-owned transaction must be readable
+    /// after that transaction commits, and must survive reopening the database —
+    /// the whole point of persisting it.
+    #[test]
+    fn chain_heads_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.redb");
+        {
+            let engine = SparseEngine::open(&path).unwrap();
+            let txn = engine.begin_write().unwrap();
+            engine
+                .put_chain_head_in_txn(&txn, 0, 1, "ledger", "abc123")
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let engine = SparseEngine::open(&path).unwrap();
+        assert_eq!(
+            engine.get_chain_head(0, 1, "ledger").unwrap(),
+            Some("abc123".to_string())
+        );
+        let heads = engine.load_chain_heads().unwrap();
+        assert_eq!(
+            heads.get(&(
+                nodedb_types::DatabaseId::new(0),
+                nodedb_types::TenantId::new(1),
+                "ledger".to_string()
+            )),
+            Some(&"abc123".to_string())
+        );
+    }
+
+    /// A dropped head must not be resurrected by the tenant sweep or by a reopen.
+    #[test]
+    fn chain_heads_are_removable_per_collection_and_per_tenant() {
+        let (engine, _dir) = open_temp();
+        engine.put_chain_head(0, 1, "ledger", "h1").unwrap();
+        engine.put_chain_head(0, 1, "audit", "h2").unwrap();
+        engine.put_chain_head(0, 2, "ledger", "h3").unwrap();
+
+        engine.delete_chain_head(0, 1, "ledger").unwrap();
+        assert_eq!(engine.get_chain_head(0, 1, "ledger").unwrap(), None);
+
+        assert_eq!(engine.delete_chain_heads_for_tenant(1).unwrap(), 1);
+        assert_eq!(engine.get_chain_head(0, 1, "audit").unwrap(), None);
+        assert_eq!(
+            engine.get_chain_head(0, 2, "ledger").unwrap(),
+            Some("h3".to_string())
+        );
+    }
+}

@@ -18,8 +18,5 @@ mod helpers;
 mod maint_fn;
 mod table_fn;
 
-#[cfg(test)]
-mod tests;
-
 pub use maint_fn::try_plan_array_maint_fn;
 pub use table_fn::try_plan_array_table_fn;

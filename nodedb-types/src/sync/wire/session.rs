@@ -101,3 +101,27 @@ pub struct PingPongMsg {
     /// Whether this is a pong (response to ping).
     pub is_pong: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::wire::{SyncFrame, SyncMessageType};
+
+    #[test]
+    fn handshake_serialization() {
+        let msg = HandshakeMsg {
+            jwt_token: "test.jwt.token".into(),
+            vector_clock: HashMap::new(),
+            subscribed_shapes: vec!["shape1".into()],
+            client_version: "0.1.0".into(),
+            lite_id: String::new(),
+            epoch: 0,
+            wire_version: 1,
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::Handshake, &msg).unwrap();
+        let bytes = frame.to_bytes();
+        assert!(bytes.len() > SyncFrame::HEADER_SIZE);
+        assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+        assert_eq!(bytes[1], 0x01);
+    }
+}

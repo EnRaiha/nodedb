@@ -88,3 +88,38 @@ pub(super) fn parse_interval_to_micros(s: &str) -> Option<i64> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_interval_to_micros;
+
+    #[test]
+    fn parse_interval_sql_word_forms() {
+        assert_eq!(parse_interval_to_micros("1 hour"), Some(3_600_000_000));
+        assert_eq!(parse_interval_to_micros("5 days"), Some(5 * 86_400_000_000));
+        assert_eq!(
+            parse_interval_to_micros("30 minutes"),
+            Some(30 * 60_000_000)
+        );
+        assert_eq!(
+            parse_interval_to_micros("2 hours 30 minutes"),
+            Some(9_000_000_000)
+        );
+        assert_eq!(parse_interval_to_micros("1 week"), Some(604_800_000_000));
+        assert_eq!(parse_interval_to_micros("100 milliseconds"), Some(100_000));
+    }
+
+    #[test]
+    fn parse_interval_shorthand() {
+        assert_eq!(parse_interval_to_micros("1h"), Some(3_600_000_000));
+        assert_eq!(parse_interval_to_micros("30m"), Some(30 * 60_000_000));
+        assert_eq!(parse_interval_to_micros("1h30m"), Some(5_400_000_000));
+        assert_eq!(parse_interval_to_micros("500ms"), Some(500_000));
+    }
+
+    #[test]
+    fn parse_interval_invalid() {
+        assert_eq!(parse_interval_to_micros(""), None);
+        assert_eq!(parse_interval_to_micros("abc"), None);
+    }
+}

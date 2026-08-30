@@ -86,6 +86,3 @@ pub mod vector_sparse;
 pub mod vector_upsert;
 pub mod vector_write;
 pub mod write_batch;
-
-#[cfg(test)]
-mod write_hook_tests;

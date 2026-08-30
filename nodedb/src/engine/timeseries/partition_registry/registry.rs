@@ -215,3 +215,103 @@ impl PartitionRegistry {
         self.partitions.iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> TieredPartitionConfig {
+        let mut cfg = TieredPartitionConfig::origin_defaults();
+        cfg.partition_by = PartitionInterval::Duration(86_400_000); // 1d
+        cfg.merge_after_ms = 7 * 86_400_000;
+        cfg.merge_count = 3;
+        cfg.retention_period_ms = 30 * 86_400_000;
+        cfg
+    }
+
+    #[test]
+    fn create_partition() {
+        let mut reg = PartitionRegistry::new(test_config());
+        let (entry, is_new) = reg.get_or_create_partition(86_400_000 * 5 + 1000);
+        assert!(is_new);
+        assert_eq!(entry.meta.state, PartitionState::Active);
+        assert!(entry.dir_name.starts_with("ts-"));
+
+        // Same timestamp range → same partition.
+        let (_, is_new2) = reg.get_or_create_partition(86_400_000 * 5 + 2000);
+        assert!(!is_new2);
+        assert_eq!(reg.partition_count(), 1);
+    }
+
+    #[test]
+    fn different_days_different_partitions() {
+        let mut reg = PartitionRegistry::new(test_config());
+        reg.get_or_create_partition(86_400_000); // day 1
+        reg.get_or_create_partition(86_400_000 * 2); // day 2
+        reg.get_or_create_partition(86_400_000 * 3); // day 3
+        assert_eq!(reg.partition_count(), 3);
+    }
+
+    #[test]
+    fn seal_partition() {
+        let mut reg = PartitionRegistry::new(test_config());
+        let day1_start = 86_400_000i64;
+        reg.get_or_create_partition(day1_start);
+        assert_eq!(reg.active_count(), 1);
+
+        assert!(reg.seal_partition(day1_start));
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.sealed_count(), 1);
+    }
+
+    #[test]
+    fn auto_mode_widen_on_small_partition() {
+        let mut cfg = test_config();
+        cfg.partition_by = PartitionInterval::Auto;
+        let mut reg = PartitionRegistry::new(cfg);
+
+        // Start at 1d.
+        assert_eq!(reg.current_interval().as_millis(), Some(86_400_000));
+
+        // Create and seal a partition with < 1000 rows.
+        let start = 86_400_000i64;
+        reg.get_or_create_partition(start);
+        if let Some(entry) = reg.partitions.get_mut(&start) {
+            entry.meta.row_count = 50;
+        }
+        reg.seal_partition(start);
+
+        // Interval should have doubled to 2d.
+        assert_eq!(reg.current_interval().as_millis(), Some(2 * 86_400_000));
+    }
+
+    #[test]
+    fn set_partition_interval_online() {
+        let mut reg = PartitionRegistry::new(test_config());
+        let day_ms = 86_400_000i64;
+
+        // Create some 1d partitions.
+        reg.get_or_create_partition(day_ms);
+        reg.get_or_create_partition(2 * day_ms);
+
+        // Change to 3d.
+        reg.set_partition_interval(PartitionInterval::Duration(3 * day_ms as u64));
+        assert_eq!(reg.current_interval().as_millis(), Some(3 * 86_400_000));
+
+        // New partition uses 3d boundaries.
+        reg.get_or_create_partition(10 * day_ms);
+        assert_eq!(reg.partition_count(), 3);
+    }
+
+    #[test]
+    fn unbounded_partition() {
+        let mut cfg = test_config();
+        cfg.partition_by = PartitionInterval::Unbounded;
+        let mut reg = PartitionRegistry::new(cfg);
+
+        reg.get_or_create_partition(1000);
+        reg.get_or_create_partition(999_999_999);
+        // All go to the same unbounded partition.
+        assert_eq!(reg.partition_count(), 1);
+    }
+}

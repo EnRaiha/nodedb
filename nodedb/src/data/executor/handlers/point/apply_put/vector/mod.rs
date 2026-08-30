@@ -7,8 +7,6 @@
 mod fields;
 mod put;
 mod remove;
-#[cfg(test)]
-mod tests;
 mod types;
 
 pub(in crate::data::executor) use types::{VectorIndexDelta, VectorIndexPutParams};

@@ -51,3 +51,100 @@ impl CoreLoop {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::types::TenantId;
+
+    const DB: u64 = 0;
+    const TID: u64 = 1;
+
+    fn spatial_key() -> (nodedb_types::DatabaseId, TenantId, String, String) {
+        (
+            nodedb_types::DatabaseId::new(DB),
+            TenantId::new(TID),
+            "c".to_string(),
+            "geom".to_string(),
+        )
+    }
+
+    fn rtree_has(core: &crate::data::executor::core_loop::CoreLoop, entry_id: u64) -> bool {
+        core.spatial_indexes
+            .get(&spatial_key())
+            .map(|rt| rt.entries().into_iter().any(|e| e.id == entry_id))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn spatial_insert_undo_removes_entry_and_reverse_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let key = spatial_key();
+        let entry_id: u64 = 42;
+        let bbox = nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0);
+
+        // Seed as though a forward spatial insert had run.
+        let rtree = core.spatial_indexes.entry(key.clone()).or_default();
+        rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
+        core.spatial_doc_map.insert(
+            (key.0, key.1, key.2.clone(), key.3.clone(), entry_id),
+            "d1".to_string(),
+        );
+        assert!(rtree_has(&core, entry_id));
+
+        let undo = UndoEntry::SpatialInsert {
+            key: key.clone(),
+            entry_id,
+        };
+        core.apply_undo_spatial(0, undo).unwrap();
+
+        assert!(!rtree_has(&core, entry_id), "R-tree entry must be removed");
+        assert!(
+            !core
+                .spatial_doc_map
+                .contains_key(&(key.0, key.1, key.2, key.3, entry_id)),
+            "reverse map record must be removed"
+        );
+    }
+
+    #[test]
+    fn spatial_delete_undo_reinserts_entry_with_bbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let key = spatial_key();
+        let entry_id: u64 = 7;
+        let bbox = nodedb_types::BoundingBox::new(10.0, 20.0, 30.0, 40.0);
+
+        // R-tree starts empty (the forward op removed the entry).
+        assert!(!rtree_has(&core, entry_id));
+
+        let undo = UndoEntry::SpatialDelete {
+            key: key.clone(),
+            entry_id,
+            bbox,
+            document_id: "d1".to_string(),
+        };
+        core.apply_undo_spatial(0, undo).unwrap();
+
+        let restored = core
+            .spatial_indexes
+            .get(&key)
+            .and_then(|rt| rt.entries().into_iter().find(|e| e.id == entry_id).cloned());
+        let restored = restored.expect("R-tree entry must be re-inserted");
+        assert_eq!(
+            restored.bbox, bbox,
+            "restored bbox must match captured bbox"
+        );
+        assert_eq!(
+            core.spatial_doc_map
+                .get(&(key.0, key.1, key.2, key.3, entry_id))
+                .map(String::as_str),
+            Some("d1"),
+            "reverse map record must be restored"
+        );
+    }
+}

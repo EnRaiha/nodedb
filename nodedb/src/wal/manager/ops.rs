@@ -56,3 +56,93 @@ impl WalManager {
         wal.list_segments().map_err(crate::Error::Wal)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+
+    #[test]
+    fn next_lsn_continues_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_dir");
+
+        {
+            let wal = WalManager::open_for_testing(&path).unwrap();
+            wal.append_put(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                b"a",
+            )
+            .unwrap();
+            wal.append_put(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                b"b",
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let wal = WalManager::open_for_testing(&path).unwrap();
+        assert_eq!(wal.next_lsn(), Lsn::new(3));
+
+        let lsn = wal
+            .append_put(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                b"c",
+            )
+            .unwrap();
+        assert_eq!(lsn, Lsn::new(3));
+    }
+
+    #[test]
+    fn truncate_reclaims_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_dir");
+
+        let wal = WalManager::open_for_testing(&path).unwrap();
+
+        let t = TenantId::new(1);
+        let v = VShardId::new(0);
+        let db = DatabaseId::DEFAULT;
+
+        for i in 0..10u32 {
+            wal.append_put(t, v, db, format!("val-{i}").as_bytes())
+                .unwrap();
+        }
+        wal.sync().unwrap();
+
+        let result = wal.truncate_before(Lsn::new(5)).unwrap();
+        assert_eq!(result.segments_deleted, 0);
+
+        let records = wal.replay().unwrap();
+        assert_eq!(records.len(), 10);
+    }
+
+    #[test]
+    fn total_size_and_list_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_dir");
+
+        let wal = WalManager::open_for_testing(&path).unwrap();
+        wal.append_put(
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            b"data",
+        )
+        .unwrap();
+        wal.sync().unwrap();
+
+        let size = wal.total_size_bytes().unwrap();
+        assert!(size > 0);
+
+        let segments = wal.list_segments().unwrap();
+        assert_eq!(segments.len(), 1);
+    }
+}

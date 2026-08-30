@@ -97,3 +97,79 @@ impl InvertedIndex {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use redb::Database;
+
+    use nodedb_fts::FtsSearchParams;
+    use nodedb_fts::posting::QueryMode;
+
+    use super::*;
+
+    const DB: u64 = 0;
+    const T: TenantId = TenantId::new(1);
+
+    fn open_temp() -> (InvertedIndex, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-inverted.redb");
+        let db = Arc::new(Database::create(&path).unwrap());
+        let idx = InvertedIndex::open(db).unwrap();
+        (idx, dir)
+    }
+
+    #[test]
+    fn remove_document() {
+        let (idx, _dir) = open_temp();
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "hello world")
+            .unwrap();
+        idx.index_document(DB, T, "docs", Surrogate::new(2), "hello rust")
+            .unwrap();
+
+        idx.remove_document(DB, T, "docs", Surrogate::new(1))
+            .unwrap();
+
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "hello",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, Surrogate::new(2));
+    }
+
+    /// Removing a document must decrement both doc count and total token sum
+    /// by its prior length, consistent with how insert/re-index adjust STATS.
+    #[test]
+    fn remove_document_decrements_stats() {
+        let (idx, _dir) = open_temp();
+
+        idx.index_document(DB, T, "docs", Surrogate::new(1), "alpha bravo charlie")
+            .unwrap();
+        idx.index_document(DB, T, "docs", Surrogate::new(2), "delta echo")
+            .unwrap();
+        let (count, avg_len) = idx.corpus_stats(DB, T, "docs").unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(avg_len, 2.5); // (3 + 2) / 2
+
+        idx.remove_document(DB, T, "docs", Surrogate::new(1))
+            .unwrap();
+        let (count, avg_len) = idx.corpus_stats(DB, T, "docs").unwrap();
+        assert_eq!(count, 1, "remove must decrement doc count");
+        assert_eq!(
+            avg_len, 2.0,
+            "remove must subtract the removed doc's length"
+        );
+    }
+}

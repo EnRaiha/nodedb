@@ -494,3 +494,243 @@ impl Scheduler {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use nodedb_cluster::MultiRaft;
+    use nodedb_cluster::RoutingTable;
+    use nodedb_cluster::calvin::types::{
+        EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass, VersionedReadSet,
+    };
+    use nodedb_cluster::calvin::{
+        AbortReason, CalvinCompletionRegistry, ParticipantVote, SequencerStateMachine,
+        VerdictOutcome,
+    };
+    use nodedb_physical::physical_plan::PhysicalPlan;
+    use nodedb_physical::physical_plan::meta::MetaOp;
+    use nodedb_types::TenantId;
+
+    use super::super::scheduler::{Scheduler, SchedulerParams};
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::envelope::Payload;
+    use crate::control::cluster::calvin::scheduler::driver::types::PendingTxn;
+    use crate::control::cluster::calvin::scheduler::lock_manager::LockManager;
+    use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
+    use crate::control::cluster::calvin::scheduler::{NOT_YET_APPLIED_EPOCH, SchedulerConfig};
+    use crate::control::state::SharedState;
+    use crate::types::{Lsn, RequestId};
+    use crate::wal::WalManager;
+
+    /// Same minimal scheduler fixture as the process/catch_up driver tests,
+    /// retaining its Data-Plane request receiver for tests that must observe
+    /// scheduler dispatches.
+    fn build_test_scheduler_with_data_side(
+        vshard_id: u32,
+        registry: Arc<CalvinCompletionRegistry>,
+    ) -> (
+        Scheduler,
+        tempfile::TempDir,
+        crate::bridge::dispatch::CoreChannelDataSide,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
+        let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
+        let data_side = data_sides
+            .pop()
+            .expect("one configured core has one data side");
+        let shared = SharedState::new(dispatcher, wal).unwrap();
+
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let multi_raft = Arc::new(Mutex::new(MultiRaft::new(1, rt, dir.path().to_path_buf())));
+
+        let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
+            HashMap::new(),
+            Arc::clone(&registry),
+        )));
+
+        let (_tx, receiver) = tokio::sync::mpsc::channel(16);
+        let (_rr_tx, read_result_rx) = tokio::sync::mpsc::channel(16);
+        let (_prom_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (verdict_tx, verdict_rx) = tokio::sync::mpsc::channel(16);
+        registry.register_verdict_signal_sender(vshard_id, verdict_tx);
+
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+
+        let scheduler = Scheduler::new(SchedulerParams {
+            vshard_id,
+            receiver,
+            shared,
+            multi_raft,
+            sequencer_state_machine,
+            fully_applied_epoch: NOT_YET_APPLIED_EPOCH,
+            applied_tail: std::collections::BTreeSet::new(),
+            rebuild_target_epoch: 0,
+            config: SchedulerConfig::default(),
+            metrics: SchedulerMetrics::new(),
+            read_result_rx,
+            lock_manager,
+            promotion_rx,
+            registry,
+            verdict_rx,
+        });
+        (scheduler, dir, data_side)
+    }
+
+    /// Build a static-write `SequencedTxn` at `(epoch, position)`.
+    fn staged_pending(txn: SequencedTxn, txn_id: TxnId) -> PendingTxn {
+        PendingTxn {
+            txn,
+            lock_owner: txn_id,
+            dispatch_time: std::time::Instant::now(),
+            has_primary_write: true,
+            has_returning: false,
+            change_sets: Vec::new(),
+            commit_state: Some(CommitState::Staged),
+            verdict_deadline: None,
+        }
+    }
+
+    fn staged_response(status: Status, read_set_valid: Option<bool>) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: None,
+            read_set_valid,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    fn make_sequenced_txn(epoch: u64, position: u32) -> SequencedTxn {
+        let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: "test_coll".to_string(),
+            surrogates: SortedVec::new(vec![1]),
+        }]);
+        let tx_class = TxClass::new_single_vshard(
+            ReadWriteSet::new(vec![]),
+            write_set,
+            vec![],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        SequencedTxn {
+            epoch,
+            position,
+            tx_class,
+            epoch_system_ms: 1_700_000_000_000,
+            epoch_vshard_txn_count: 1,
+            lock_owner: None,
+        }
+    }
+
+    /// A false vote from either participant makes the only global verdict abort;
+    /// applying that durable verdict broadcasts the abort to every parked local
+    /// participant. The scheduler's `resume_on_verdict(false)` then dispatches a
+    /// drop, never a resolve/flush, on each recipient.
+    #[tokio::test]
+    async fn two_participant_false_vote_broadcasts_global_abort_to_every_scheduler() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let txn = nodedb_cluster::calvin::TxnId::new(14, 2);
+        let txn_id = TxnId::new(14, 2);
+        let (mut first_scheduler, _first_dir, mut first_data) =
+            build_test_scheduler_with_data_side(7, Arc::clone(&registry));
+        let (mut second_scheduler, _second_dir, mut second_data) =
+            build_test_scheduler_with_data_side(9, Arc::clone(&registry));
+        first_scheduler
+            .pending
+            .insert(txn_id, staged_pending(make_sequenced_txn(14, 2), txn_id));
+        second_scheduler
+            .pending
+            .insert(txn_id, staged_pending(make_sequenced_txn(14, 2), txn_id));
+
+        // Local staging votes only park their own staged slices; neither the
+        // affirmative nor the failed participant may resolve or drop unilaterally.
+        first_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Ok, Some(true)));
+        second_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Error, None));
+        for (scheduler, data_side) in [
+            (&first_scheduler, &mut first_data),
+            (&second_scheduler, &mut second_data),
+        ] {
+            assert!(matches!(
+                scheduler
+                    .pending
+                    .get(&txn_id)
+                    .and_then(|pending| pending.commit_state),
+                Some(CommitState::AwaitingVerdict)
+            ));
+            assert!(data_side.request_rx.try_pop().is_err());
+        }
+
+        // Model the replicated vote entries and their resulting durable verdict.
+        // The shared registry sends each scheduler's actual registered channel.
+        registry.seed_expected(txn, 2);
+        registry.note_vote(txn, 7, ParticipantVote::Commit);
+        assert!(registry.drain_unproposed_verdicts().is_empty());
+        registry.note_vote(
+            txn,
+            9,
+            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+        );
+        assert_eq!(
+            registry.drain_unproposed_verdicts(),
+            vec![(
+                txn,
+                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+            )]
+        );
+        registry.note_verdict(
+            txn,
+            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+        );
+        assert_eq!(registry.verdict(txn), Some(false));
+
+        let first_signal = first_scheduler
+            .verdict_rx
+            .try_recv()
+            .expect("registry must signal the first registered scheduler");
+        let second_signal = second_scheduler
+            .verdict_rx
+            .try_recv()
+            .expect("registry must signal the second registered scheduler");
+        first_scheduler.handle_verdict_signal(first_signal);
+        second_scheduler.handle_verdict_signal(second_signal);
+
+        for (scheduler, data_side) in [
+            (&first_scheduler, &mut first_data),
+            (&second_scheduler, &mut second_data),
+        ] {
+            assert!(matches!(
+                scheduler
+                    .pending
+                    .get(&txn_id)
+                    .and_then(|pending| pending.commit_state),
+                Some(CommitState::AwaitingResolve {
+                    committed: false,
+                    redo_lsn: None
+                })
+            ));
+            let request = data_side
+                .request_rx
+                .try_pop()
+                .expect("global abort must dispatch a drop to every participant");
+            assert!(matches!(
+                request.inner.plan,
+                PhysicalPlan::Meta(MetaOp::CalvinDrop {
+                    epoch: 14,
+                    position: 2
+                })
+            ));
+            assert!(data_side.request_rx.try_pop().is_err());
+        }
+    }
+}

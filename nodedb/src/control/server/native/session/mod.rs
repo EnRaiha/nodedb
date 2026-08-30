@@ -9,9 +9,6 @@ mod session_chunk;
 mod session_stream;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use self::state::NativeConnectionResources;
 pub use self::state::NativeSession;
 pub(super) use super::{codec, dispatch};

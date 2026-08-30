@@ -31,6 +31,3 @@ pub use error::SegmentError;
 pub use mmap::{ColumnMmap, observability};
 pub use reader::ColumnarSegmentReader;
 pub use writer::ColumnarSegmentWriter;
-
-#[cfg(test)]
-mod tests;

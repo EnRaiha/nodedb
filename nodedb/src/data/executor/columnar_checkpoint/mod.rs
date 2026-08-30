@@ -122,6 +122,4 @@ mod geometry_restore;
 mod load;
 mod manifest;
 mod paths;
-#[cfg(test)]
-mod tests;
 mod write;

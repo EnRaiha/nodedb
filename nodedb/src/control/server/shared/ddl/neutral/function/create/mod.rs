@@ -10,9 +10,6 @@ pub mod deps;
 pub mod handler;
 pub mod parse;
 
-#[cfg(test)]
-mod tests;
-
 pub use handler::create_function;
 pub(super) use handler::emit_function_put;
 // Re-export so `super::create::ParsedCreateFunction` continues to

@@ -25,3 +25,15 @@ pub enum Status {
     /// Request failed with error.
     Error,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_ordering() {
+        assert!(Priority::Background < Priority::Normal);
+        assert!(Priority::Normal < Priority::High);
+        assert!(Priority::High < Priority::Critical);
+    }
+}

@@ -40,3 +40,52 @@ impl LegacyReplicatedEntry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::PhysicalPlan;
+    use crate::control::wal_replication::decode;
+    use nodedb_physical::physical_plan::DocumentOp;
+
+    #[test]
+    fn pre_database_id_entry_decodes_to_default_database() {
+        // Pre-database_id 4-field shape must fall back to `LegacyReplicatedEntry`
+        // (database_id defaults to 0), not fail to decode.
+        let legacy = LegacyReplicatedEntry {
+            tenant_id: 1,
+            vshard_id: 0,
+            idempotency_key: 0xabcd,
+            write: ReplicatedWrite::PointPut {
+                collection: "c".into(),
+                document_id: "d".into(),
+                value: vec![9, 9, 9],
+                surrogate: 1,
+                resolved_sum_targets: Vec::new(),
+                resolved_sum_target_bindings: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+            },
+        };
+        let bytes = zerompk::to_msgpack_vec(&legacy).expect("legacy entry encode failed");
+
+        let decoded = ReplicatedEntry::from_bytes(&bytes).expect("legacy entry must decode");
+        assert_eq!(decoded.tenant_id, 1);
+        assert_eq!(decoded.vshard_id, 0);
+        assert_eq!(decoded.idempotency_key, 0xabcd);
+        assert_eq!(
+            decoded.database_id, 0,
+            "old-leader entries lacking database_id must decode to DatabaseId::DEFAULT (0)"
+        );
+
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => {
+                assert_eq!(collection.as_str(), "c");
+            }
+            other => panic!("expected Document(PointPut), got {other:?}"),
+        }
+    }
+}

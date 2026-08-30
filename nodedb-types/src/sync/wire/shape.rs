@@ -69,3 +69,32 @@ pub struct VectorClockSyncMsg {
     /// Sender's node/peer ID.
     pub sender_id: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::shape::ShapeType;
+    use crate::sync::wire::{SyncFrame, SyncMessageType};
+
+    #[test]
+    fn shape_subscribe_roundtrip() {
+        let msg = ShapeSubscribeMsg {
+            shape: ShapeDefinition {
+                shape_id: "s1".into(),
+                tenant_id: 1,
+                shape_type: ShapeType::Vector {
+                    collection: "embeddings".into(),
+                    field_name: None,
+                },
+                description: "all embeddings".into(),
+                field_filter: vec![],
+            },
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::ShapeSubscribe, &msg).unwrap();
+        let decoded: ShapeSubscribeMsg = SyncFrame::from_bytes(&frame.to_bytes())
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.shape.shape_id, "s1");
+    }
+}

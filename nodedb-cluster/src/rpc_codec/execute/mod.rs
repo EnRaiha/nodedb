@@ -7,9 +7,6 @@
 pub mod codec;
 pub mod types;
 
-#[cfg(test)]
-mod tests;
-
 pub use types::{
     DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd,
     PLAN_DECODE_FAILED, TypedClusterError,

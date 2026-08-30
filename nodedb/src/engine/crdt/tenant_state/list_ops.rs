@@ -78,3 +78,52 @@ impl TenantCrdtEngine {
             .map_err(crate::Error::Crdt)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_crdt::constraint::ConstraintSet;
+
+    use crate::types::TenantId;
+
+    use super::*;
+
+    #[test]
+    fn list_operations_stay_behind_engine_methods() {
+        let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+        engine
+            .doc_upsert(
+                "pages",
+                "one",
+                &[("title", LoroValue::String("draft".into()))],
+            )
+            .unwrap();
+        engine
+            .list_insert_fields(
+                "pages",
+                "one",
+                "blocks",
+                0,
+                &[("id".into(), LoroValue::String("block-0".into()))],
+            )
+            .unwrap();
+        engine
+            .list_insert_fields(
+                "pages",
+                "one",
+                "blocks",
+                1,
+                &[("id".into(), LoroValue::String("block-1".into()))],
+            )
+            .unwrap();
+        engine.list_move("pages", "one", "blocks", 1, 0).unwrap();
+
+        assert_eq!(engine.list_length("pages", "one", "blocks").unwrap(), 2);
+        let Some(LoroValue::Map(first)) = engine.list_get("pages", "one", "blocks", 0).unwrap()
+        else {
+            panic!("first list value must be a block map");
+        };
+        assert_eq!(first.get("id"), Some(&LoroValue::String("block-1".into())));
+        engine.list_delete("pages", "one", "blocks", 0).unwrap();
+        assert_eq!(engine.list_length("pages", "one", "blocks").unwrap(), 1);
+    }
+}

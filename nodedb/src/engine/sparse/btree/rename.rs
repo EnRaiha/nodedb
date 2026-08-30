@@ -136,3 +136,34 @@ impl SparseEngine {
         Ok(doc_count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (engine, dir)
+    }
+
+    /// Renaming a collection moves its chain head with its rows. Leaving the head
+    /// under the old name would restart the renamed collection at genesis while
+    /// its already-chained rows travelled to the new name.
+    #[test]
+    fn rename_moves_the_chain_head() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "ledger", "0000002a", b"row").unwrap();
+        engine.put_chain_head(0, 1, "ledger", "h1").unwrap();
+
+        engine
+            .rename_collection(0, 0, 1, "ledger", "journal")
+            .unwrap();
+
+        assert_eq!(engine.get_chain_head(0, 1, "ledger").unwrap(), None);
+        assert_eq!(
+            engine.get_chain_head(0, 1, "journal").unwrap(),
+            Some("h1".to_string())
+        );
+    }
+}

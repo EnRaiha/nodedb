@@ -249,3 +249,209 @@ impl Validator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use loro::LoroValue;
+
+    use super::*;
+    use crate::constraint::ConstraintSet;
+    use crate::state::CrdtState;
+
+    fn setup() -> (CrdtState, ConstraintSet) {
+        let state = CrdtState::new(1).unwrap();
+        let mut cs = ConstraintSet::new();
+        cs.add_unique("users_email_unique", "users", "email");
+        cs.add_not_null("users_name_nn", "users", "name");
+        cs.add_foreign_key("posts_author_fk", "posts", "author_id", "users", "id");
+        (state, cs)
+    }
+
+    #[test]
+    fn validate_with_policy_last_writer_wins() {
+        let (state, cs) = setup();
+        let mut policies = crate::policy::PolicyRegistry::new();
+        policies.set("users", crate::policy::CollectionPolicy::ephemeral());
+
+        let mut policy = crate::policy::CollectionPolicy::ephemeral();
+        policy.not_null = crate::policy::ConflictPolicy::LastWriterWins;
+        policies.set("users", policy);
+
+        let mut validator = Validator::new_with_policies(cs, 100, policies, 100);
+
+        let change = ProposedChange {
+            collection: "users".into(),
+            row_id: "u1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![("email".into(), LoroValue::String("a@b.com".into()))],
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let resolution = validator
+            .validate_with_policy(
+                &state,
+                42,
+                CrdtAuthContext::default(),
+                &change,
+                b"delta".to_vec(),
+                now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            resolution,
+            PolicyResolution::AutoResolved(ResolvedAction::OverwriteExisting)
+        ));
+    }
+
+    #[test]
+    fn validate_with_policy_rename_suffix() {
+        let (state, cs) = setup();
+        let mut policies = crate::policy::PolicyRegistry::new();
+        let mut policy = crate::policy::CollectionPolicy::ephemeral();
+        policy.unique = crate::policy::ConflictPolicy::RenameSuffix;
+        policies.set("users", policy);
+
+        let mut validator = Validator::new_with_policies(cs, 100, policies, 100);
+
+        state
+            .upsert(
+                "users",
+                "u1",
+                &[
+                    ("name", LoroValue::String("Alice".into())),
+                    ("email", LoroValue::String("alice@example.com".into())),
+                ],
+            )
+            .unwrap();
+
+        let change = ProposedChange {
+            collection: "users".into(),
+            row_id: "u2".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![
+                ("name".into(), LoroValue::String("Bob".into())),
+                (
+                    "email".into(),
+                    LoroValue::String("alice@example.com".into()),
+                ),
+            ],
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let resolution = validator
+            .validate_with_policy(
+                &state,
+                42,
+                CrdtAuthContext::default(),
+                &change,
+                b"delta".to_vec(),
+                now,
+            )
+            .unwrap();
+
+        match resolution {
+            PolicyResolution::AutoResolved(ResolvedAction::RenamedField { field, new_value }) => {
+                assert_eq!(field, "email");
+                assert!(new_value.contains("_1"));
+            }
+            _ => panic!("expected RenamedField resolution"),
+        }
+    }
+
+    #[test]
+    fn validate_with_policy_cascade_defer() {
+        let (state, cs) = setup();
+        let mut policies = crate::policy::PolicyRegistry::new();
+        let mut policy = crate::policy::CollectionPolicy::ephemeral();
+        policy.foreign_key = crate::policy::ConflictPolicy::CascadeDefer {
+            max_retries: 3,
+            ttl_secs: 60,
+        };
+        policies.set("posts", policy);
+
+        let mut validator = Validator::new_with_policies(cs, 100, policies, 100);
+
+        let change = ProposedChange {
+            collection: "posts".into(),
+            row_id: "p1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![("author_id".into(), LoroValue::String("u1".into()))],
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let resolution = validator
+            .validate_with_policy(
+                &state,
+                42,
+                CrdtAuthContext::default(),
+                &change,
+                b"delta".to_vec(),
+                now,
+            )
+            .unwrap();
+
+        match resolution {
+            PolicyResolution::Deferred {
+                retry_after_ms,
+                attempt,
+                ..
+            } => {
+                assert_eq!(attempt, 0);
+                assert_eq!(retry_after_ms, 500);
+            }
+            _ => panic!("expected Deferred resolution"),
+        }
+
+        assert_eq!(validator.deferred().len(), 1);
+    }
+
+    #[test]
+    fn validate_with_policy_escalate_to_dlq() {
+        let (state, cs) = setup();
+        let mut policies = crate::policy::PolicyRegistry::new();
+        let mut policy = crate::policy::CollectionPolicy::ephemeral();
+        policy.not_null = crate::policy::ConflictPolicy::EscalateToDlq;
+        policies.set("users", policy);
+
+        let mut validator = Validator::new_with_policies(cs, 100, policies, 100);
+
+        let change = ProposedChange {
+            collection: "users".into(),
+            row_id: "u1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![("email".into(), LoroValue::String("a@b.com".into()))],
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let resolution = validator
+            .validate_with_policy(
+                &state,
+                42,
+                CrdtAuthContext::default(),
+                &change,
+                b"delta".to_vec(),
+                now,
+            )
+            .unwrap();
+
+        assert!(matches!(resolution, PolicyResolution::Escalate { .. }));
+        assert_eq!(validator.dlq().len(), 1);
+    }
+}

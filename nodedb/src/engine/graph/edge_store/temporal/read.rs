@@ -103,3 +103,95 @@ pub(crate) fn edge_from_versioned_entry(
         payload,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::{DatabaseId, TenantId};
+
+    use super::*;
+
+    const T: TenantId = TenantId::new(1);
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+    const COLL: &str = "people";
+
+    fn make_store() -> (EdgeStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        (store, dir)
+    }
+
+    fn e<'a>(src: &'a str, label: &'a str, dst: &'a str) -> EdgeRef<'a> {
+        EdgeRef::new(DB, T, COLL, src, label, dst)
+    }
+
+    #[test]
+    fn put_and_ceiling_resolves_latest_at_cutoff() {
+        let (store, _dir) = make_store();
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v1", 100, 100, i64::MAX)
+            .unwrap();
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v2", 200, 200, i64::MAX)
+            .unwrap();
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v3", 300, 300, i64::MAX)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 99, None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 100, None)
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 250, None)
+                .unwrap(),
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 1_000, None)
+                .unwrap(),
+            Some(b"v3".to_vec())
+        );
+    }
+
+    #[test]
+    fn valid_time_filter_skips_nonmatching_versions() {
+        let (store, _dir) = make_store();
+        // v1: valid_time [0, 100)
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v1", 10, 0, 100)
+            .unwrap();
+        // v2: valid_time [200, 300)  — disjoint hole between 100 and 200
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v2", 20, 200, 300)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 1_000, Some(150))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 1_000, Some(50))
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 1_000, Some(250))
+                .unwrap(),
+            Some(b"v2".to_vec())
+        );
+    }
+}

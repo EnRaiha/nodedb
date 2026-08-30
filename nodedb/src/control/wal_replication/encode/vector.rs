@@ -237,3 +237,94 @@ pub(super) fn set_params(f: SetParamsFields) -> ReplicatedWrite {
         ivf_nprobe: f.ivf_nprobe,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::bridge::envelope::PhysicalPlan;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::VectorOp;
+    use nodedb_types::{PayloadIndexKind, QualifiedCollection, Surrogate};
+    use nodedb_types::{VectorQuantization, VectorStorageDtype};
+
+    use super::super::super::types::ReplicatedEntry;
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    // ---- Regression coverage: six `VectorOp` writes must not fall through
+    // `to_replicated_entry`'s `_ => return None` catch-all, or they never
+    // reach Raft. Each test runs the real encode/decode path end to end.
+
+    #[test]
+    fn vector_extended_variants_all_encode_to_some() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let plans = vec![
+            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                surrogate: Surrogate::new(1),
+                field_name: "emb".into(),
+                provenance: None,
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseInsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                field_name: "sparse".into(),
+                doc_id: "d1".into(),
+                entries: vec![(1, 0.5)],
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseDelete {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                field_name: "sparse".into(),
+                doc_id: "d1".into(),
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                field_name: "colbert".into(),
+                document_surrogate: Surrogate::new(2),
+                vectors: vec![0.1, 0.2, 0.3, 0.4],
+                count: 2,
+                dim: 2,
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                field_name: "colbert".into(),
+                document_surrogate: Surrogate::new(2),
+            }),
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+                field: "emb".into(),
+                surrogate: Surrogate::new(3),
+                vector: vec![0.5, 0.6],
+                payload: vec![1, 2, 3],
+                quantization: VectorQuantization::RaBitQ,
+                storage_dtype: VectorStorageDtype::F16,
+                payload_indexes: vec![("tenant_id".into(), PayloadIndexKind::Equality)],
+                returning: None,
+                rls_filters: Vec::new(),
+            }),
+        ];
+        for plan in &plans {
+            // Must not be `None` for any of the six.
+            assert!(
+                to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan)
+                    .expect("encode must not error")
+                    .is_some(),
+                "expected {plan:?} to be replicated, but to_replicated_entry returned None \
+                 (this Vector write would execute locally and never reach Raft)"
+            );
+        }
+    }
+}

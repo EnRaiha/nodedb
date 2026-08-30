@@ -259,3 +259,114 @@ fn write_signing_root(
         })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+
+    #[test]
+    fn crdt_signing_root_survives_chained_runtime_rotation_and_restart() {
+        fn write_key(path: &std::path::Path, byte: u8) {
+            std::fs::write(path, [byte; 32]).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal_dir");
+        let key_a = dir.path().join("key-a");
+        let key_b = dir.path().join("key-b");
+        let key_c = dir.path().join("key-c");
+        write_key(&key_a, 0x11);
+        write_key(&key_b, 0x22);
+        write_key(&key_c, 0x33);
+
+        let mut wal = WalManager::open_encrypted(&wal_dir, false, &key_a).unwrap();
+        let stable_root = wal.crdt_signing_root().unwrap().unwrap();
+        wal.append_put(
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            b"a",
+        )
+        .unwrap();
+        wal.rotate_key(&key_b).unwrap();
+        drop(wal);
+
+        let mut wal = WalManager::open_encrypted_rotating(&wal_dir, false, &key_b, &key_a).unwrap();
+        assert_eq!(wal.crdt_signing_root().unwrap(), Some(stable_root));
+        wal.append_put(
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            b"b",
+        )
+        .unwrap();
+        wal.rotate_key(&key_c).unwrap();
+        drop(wal);
+
+        let wal = WalManager::open_encrypted_rotating(&wal_dir, false, &key_c, &key_b).unwrap();
+        assert_eq!(wal.crdt_signing_root().unwrap(), Some(stable_root));
+    }
+
+    #[test]
+    fn set_encryption_ring_rewraps_root_across_chained_transitions() {
+        fn write_key(path: &std::path::Path, byte: u8) {
+            std::fs::write(path, [byte; 32]).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal_dir");
+        let key_a_path = dir.path().join("key-a");
+        let key_b_path = dir.path().join("key-b");
+        let key_c_path = dir.path().join("key-c");
+        write_key(&key_a_path, 0x41);
+        write_key(&key_b_path, 0x42);
+        write_key(&key_c_path, 0x43);
+        let key_a = nodedb_wal::crypto::WalEncryptionKey::from_file(&key_a_path).unwrap();
+        let key_b = nodedb_wal::crypto::WalEncryptionKey::from_file(&key_b_path).unwrap();
+        let key_c = nodedb_wal::crypto::WalEncryptionKey::from_file(&key_c_path).unwrap();
+
+        let mut wal = WalManager::open_for_testing(&wal_dir).unwrap();
+        wal.set_encryption_ring(nodedb_wal::crypto::KeyRing::new(key_a.clone()))
+            .unwrap();
+        let root = wal.crdt_signing_root().unwrap();
+        wal.append_put(
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            b"a",
+        )
+        .unwrap();
+        wal.set_encryption_ring(nodedb_wal::crypto::KeyRing::with_previous(
+            key_b.clone(),
+            key_a,
+        ))
+        .unwrap();
+        assert_eq!(wal.crdt_signing_root().unwrap(), root);
+        wal.append_put(
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            b"b",
+        )
+        .unwrap();
+        wal.set_encryption_ring(nodedb_wal::crypto::KeyRing::with_previous(key_c, key_b))
+            .unwrap();
+        assert_eq!(wal.crdt_signing_root().unwrap(), root);
+        drop(wal);
+
+        let wal =
+            WalManager::open_encrypted_rotating(&wal_dir, false, &key_c_path, &key_b_path).unwrap();
+        assert_eq!(wal.crdt_signing_root().unwrap(), root);
+    }
+}

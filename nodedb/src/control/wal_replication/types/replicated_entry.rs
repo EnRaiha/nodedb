@@ -91,3 +91,122 @@ impl ReplicatedEntry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::PhysicalPlan;
+    use crate::control::wal_replication::decode;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::DocumentOp;
+    use nodedb_types::{QualifiedCollection, Surrogate};
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn replicated_entry_roundtrip() {
+        let entry = ReplicatedEntry::new(
+            1,
+            0,
+            42,
+            ReplicatedWrite::PointPut {
+                collection: "users".into(),
+                document_id: "u1".into(),
+                value: b"alice".to_vec(),
+                surrogate: 1,
+                resolved_sum_targets: Vec::new(),
+                resolved_sum_target_bindings: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+            },
+        );
+        let original_key = entry.idempotency_key;
+        assert_ne!(original_key, 0, "idempotency_key must be non-zero");
+
+        let bytes = entry.to_bytes();
+        let decoded = ReplicatedEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.tenant_id, 1);
+        assert_eq!(decoded.vshard_id, 42);
+        assert_eq!(
+            decoded.idempotency_key, original_key,
+            "idempotency_key roundtrip"
+        );
+        match decoded.write {
+            ReplicatedWrite::PointPut {
+                collection,
+                document_id,
+                value,
+                surrogate,
+                resolved_sum_targets,
+                resolved_sum_target_bindings,
+                returning,
+                rls_filters,
+            } => {
+                assert_eq!(collection, "users");
+                assert_eq!(document_id, "u1");
+                assert_eq!(value, b"alice");
+                assert_eq!(surrogate, 1);
+                assert!(resolved_sum_targets.is_empty());
+                assert!(resolved_sum_target_bindings.is_empty());
+                assert_eq!(returning, None);
+                assert!(rls_filters.is_empty());
+            }
+            other => panic!("expected PointPut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_default_database_id_roundtrips_through_encode_decode() {
+        let tenant = TenantId::new(1);
+        let database = DatabaseId::new(1024);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+            document_id: "d".into(),
+            value: vec![1, 2, 3],
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+        });
+
+        let entry = to_replicated_entry(tenant, database, vshard, &plan)
+            .expect("encode must not error")
+            .expect("PointPut should produce a ReplicatedEntry");
+        assert_eq!(entry.database_id, database.as_u64());
+
+        let bytes = entry.to_bytes();
+        let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        assert_eq!(
+            decoded_entry.database_id,
+            database.as_u64(),
+            "database_id must survive the byte round-trip"
+        );
+
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => {
+                assert_eq!(collection.as_str(), "c");
+            }
+            other => panic!("expected Document(PointPut), got {other:?}"),
+        }
+    }
+}

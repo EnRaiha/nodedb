@@ -411,6 +411,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_rejects_invalid_jwt() {
+        let mut session = SyncSession::new("test-session-1".into());
+
+        let msg = HandshakeMsg {
+            jwt_token: "invalid.token.here".into(),
+            vector_clock: HashMap::new(),
+            subscribed_shapes: vec![],
+            client_version: "0.1".into(),
+            lite_id: String::new(),
+            epoch: 0,
+            wire_version: 1,
+        };
+
+        let response = session
+            .handle_handshake(&msg, HashMap::new(), None)
+            .await
+            .expect("handshake response");
+        assert_eq!(response.msg_type, SyncMessageType::HandshakeAck);
+
+        let ack: HandshakeAckMsg = response.decode_body().unwrap();
+        assert!(!ack.success);
+        assert!(ack.error.is_some());
+        assert!(!session.authenticated);
+    }
+
+    #[tokio::test]
     async fn empty_token_uses_configured_durable_trust_identity() {
         let (state, _dir) = trust_state();
         let mut session = SyncSession::new("test-session".into());

@@ -64,3 +64,27 @@ impl<'a> DocumentEngine<'a> {
             .is_some())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::sparse::btree::SparseEngine;
+
+    use super::*;
+
+    fn make_engine() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("doc.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn delete_document() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        let doc = serde_json::json!({"name": "Bob"});
+        doc_engine.put("users", "u1", &doc).unwrap();
+        assert!(doc_engine.delete("users", "u1").unwrap());
+        assert!(doc_engine.get("users", "u1").unwrap().is_none());
+    }
+}

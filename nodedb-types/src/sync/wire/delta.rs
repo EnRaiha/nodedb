@@ -180,3 +180,53 @@ pub struct RowPushMsg {
     #[serde(default)]
     pub sequence: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::wire::{SyncFrame, SyncMessageType};
+
+    #[test]
+    fn delta_reject_with_compensation() {
+        let reject = DeltaRejectMsg {
+            mutation_id: 42,
+            reason: "unique violation".into(),
+            compensation: Some(CompensationHint::UniqueViolation {
+                field: "email".into(),
+                conflicting_value: "alice@example.com".into(),
+            }),
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::DeltaReject, &reject).unwrap();
+        let decoded: DeltaRejectMsg = SyncFrame::from_bytes(&frame.to_bytes())
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.mutation_id, 42);
+        assert!(matches!(
+            decoded.compensation,
+            Some(CompensationHint::UniqueViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn collection_purged_roundtrip() {
+        let msg = CollectionPurgedMsg {
+            tenant_id: 7,
+            database_id: DatabaseId::new(42),
+            name: "embeddings".into(),
+            purge_lsn: 987_654_321,
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::CollectionPurged, &msg).unwrap();
+        let bytes = frame.to_bytes();
+        assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+        assert_eq!(bytes[1], 0x14);
+        let decoded: CollectionPurgedMsg = SyncFrame::from_bytes(&bytes)
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.tenant_id, 7);
+        assert_eq!(decoded.database_id, DatabaseId::new(42));
+        assert_eq!(decoded.name, "embeddings");
+        assert_eq!(decoded.purge_lsn, 987_654_321);
+    }
+}

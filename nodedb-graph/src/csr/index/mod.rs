@@ -15,9 +15,6 @@ pub mod mutation;
 pub mod scoped;
 pub mod types;
 
-#[cfg(test)]
-mod tests;
-
 pub use types::CsrIndex;
 // Re-export shared Direction from nodedb-types via the types submodule.
 pub use types::Direction;

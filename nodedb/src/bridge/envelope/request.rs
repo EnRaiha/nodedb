@@ -167,3 +167,82 @@ impl Admission {
         matches!(self, Admission::Exempt(ExemptReason::Read))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DatabaseId, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::{DocumentOp, MetaOp};
+    use std::time::Duration;
+
+    fn sample_request() -> Request {
+        Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Document(DocumentOp::PointGet {
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
+                document_id: "doc-1".into(),
+                surrogate: nodedb_types::Surrogate::ZERO,
+                pk_bytes: Vec::new(),
+                rls_filters: Vec::new(),
+                system_time: nodedb_types::SystemTimeScope::Current,
+                valid_at_ms: None,
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::generate(),
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        }
+    }
+
+    #[test]
+    fn request_fields_accessible() {
+        let req = sample_request();
+        assert_eq!(req.request_id, RequestId::new(1));
+        assert_eq!(req.tenant_id, TenantId::new(1));
+        assert_ne!(req.trace_id, TraceId::ZERO);
+    }
+
+    #[test]
+    fn cancel_plan() {
+        let req = Request {
+            request_id: RequestId::new(99),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Meta(MetaOp::Cancel {
+                target_request_id: RequestId::new(42),
+            }),
+            deadline: Instant::now() + Duration::from_secs(1),
+            priority: Priority::Critical,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Eventual,
+            idempotency_key: None,
+            event_source: EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        };
+        match req.plan {
+            PhysicalPlan::Meta(MetaOp::Cancel { target_request_id }) => {
+                assert_eq!(target_request_id, RequestId::new(42));
+            }
+            _ => panic!("expected Cancel plan"),
+        }
+    }
+}

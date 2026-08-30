@@ -213,3 +213,204 @@ impl KvEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::Surrogate;
+
+    use crate::engine::kv::{KvPutParams, RegisterIndexParams};
+
+    use super::*;
+
+    fn now() -> u64 {
+        1_000_000
+    }
+
+    fn make_engine() -> KvEngine {
+        KvEngine::new(now(), 16, 0.75, 4, 64, 1000, 1024)
+    }
+
+    /// Helper: create a MessagePack-encoded JSON object value.
+    fn mp_obj(fields: &[(&str, &str)]) -> Vec<u8> {
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        nodedb_types::json_to_msgpack(&serde_json::Value::Object(obj)).unwrap()
+    }
+
+    /// Build the full-visibility, no-filter scan params used by the normalizer.
+    fn scan_params<'a>(collection: &'a str, count: usize, now_ms: u64) -> KvScanParams<'a> {
+        KvScanParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection,
+            cursor: &[],
+            count,
+            now_ms,
+            match_pattern: None,
+            filter_field: None,
+            filter_value: None,
+            surrogate_ceiling: None,
+        }
+    }
+
+    #[test]
+    fn scan_for_each_matches_scan() {
+        let mut e = make_engine();
+        let n = now();
+        for i in 0..5u8 {
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &[i],
+                value: &[i * 10],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+
+        let (materialized, _next) = e.scan(scan_params("c", usize::MAX, n));
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(scan_params("c", usize::MAX, n), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        // Same order, same keys, same bytes.
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_respects_count() {
+        let mut e = make_engine();
+        let n = now();
+        for i in 0..10u8 {
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &[i],
+                value: &[i * 10],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+
+        let (materialized, _next) = e.scan(scan_params("c", 3, n));
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(scan_params("c", 3, n), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(materialized.len(), 3);
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_matches_scan_index_path() {
+        let mut e = make_engine();
+        let n = now();
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us-east")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s2",
+            value: &mp_obj(&[("region", "us-east")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s3",
+            value: &mp_obj(&[("region", "eu-west")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+
+        let indexed_params = || KvScanParams {
+            filter_field: Some("region"),
+            filter_value: Some(b"us-east"),
+            ..scan_params("sessions", usize::MAX, n)
+        };
+        let (materialized, _next) = e.scan(indexed_params());
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(indexed_params(), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_propagates_callback_error() {
+        let mut e = make_engine();
+        let n = now();
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: b"v1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k2",
+            value: b"v2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+
+        let mut seen = 0usize;
+        let result = e.scan_for_each(scan_params("c", usize::MAX, n), |_k, _v| {
+            seen += 1;
+            Err(crate::Error::Internal {
+                detail: "stop".to_string(),
+            })
+        });
+
+        assert!(result.is_err());
+        // Stops at the first row — does not visit every row.
+        assert_eq!(seen, 1);
+    }
+}

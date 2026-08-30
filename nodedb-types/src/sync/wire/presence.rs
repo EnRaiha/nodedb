@@ -64,3 +64,73 @@ pub struct PresenceLeaveMsg {
     /// User who left.
     pub user_id: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::wire::{SyncFrame, SyncMessageType};
+
+    #[test]
+    fn presence_update_roundtrip() {
+        let msg = PresenceUpdateMsg {
+            channel: "doc:doc-123".into(),
+            state: b"user_id:user-42,cursor:blk-7:42".to_vec(),
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::PresenceUpdate, &msg).unwrap();
+        let bytes = frame.to_bytes();
+        assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+        assert_eq!(bytes[1], 0x80);
+        let decoded: PresenceUpdateMsg = SyncFrame::from_bytes(&bytes)
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.channel, "doc:doc-123");
+        assert!(!decoded.state.is_empty());
+    }
+
+    #[test]
+    fn presence_broadcast_roundtrip() {
+        let msg = PresenceBroadcastMsg {
+            channel: "doc:doc-123".into(),
+            peers: vec![
+                PeerPresence {
+                    user_id: "user-42".into(),
+                    state: vec![0xDE, 0xAD],
+                    last_seen_ms: 150,
+                },
+                PeerPresence {
+                    user_id: "user-99".into(),
+                    state: vec![0xBE, 0xEF],
+                    last_seen_ms: 2300,
+                },
+            ],
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::PresenceBroadcast, &msg).unwrap();
+        let decoded: PresenceBroadcastMsg = SyncFrame::from_bytes(&frame.to_bytes())
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.channel, "doc:doc-123");
+        assert_eq!(decoded.peers.len(), 2);
+        assert_eq!(decoded.peers[0].user_id, "user-42");
+        assert_eq!(decoded.peers[1].last_seen_ms, 2300);
+    }
+
+    #[test]
+    fn presence_leave_roundtrip() {
+        let msg = PresenceLeaveMsg {
+            channel: "doc:doc-123".into(),
+            user_id: "user-42".into(),
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::PresenceLeave, &msg).unwrap();
+        let bytes = frame.to_bytes();
+        assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+        assert_eq!(bytes[1], 0x82);
+        let decoded: PresenceLeaveMsg = SyncFrame::from_bytes(&bytes)
+            .unwrap()
+            .decode_body()
+            .unwrap();
+        assert_eq!(decoded.channel, "doc:doc-123");
+        assert_eq!(decoded.user_id, "user-42");
+    }
+}

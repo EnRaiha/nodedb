@@ -8,9 +8,6 @@ pub mod request;
 pub mod response;
 pub mod status;
 
-#[cfg(test)]
-mod tests;
-
 pub use error_code::ErrorCode;
 pub use nodedb_physical::physical_plan::PhysicalPlan;
 pub use payload::Payload;

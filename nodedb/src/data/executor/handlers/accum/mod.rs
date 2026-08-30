@@ -20,7 +20,4 @@ mod merge;
 mod new;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use state::GroupState;

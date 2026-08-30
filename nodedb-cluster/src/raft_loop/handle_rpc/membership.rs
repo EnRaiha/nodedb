@@ -112,3 +112,41 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         Ok(ack)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{JoinDecision, decide_join};
+
+    #[test]
+    fn decide_join_self_leader_admits() {
+        assert_eq!(
+            decide_join(7, 7, Some("10.0.0.7:9400".into())),
+            JoinDecision::Admit
+        );
+    }
+
+    #[test]
+    fn decide_join_no_leader_yet_admits() {
+        assert_eq!(decide_join(0, 7, None), JoinDecision::Admit);
+    }
+
+    #[test]
+    fn decide_join_other_leader_redirects() {
+        assert_eq!(
+            decide_join(1, 7, Some("10.0.0.1:9400".into())),
+            JoinDecision::Redirect {
+                leader_addr: "10.0.0.1:9400".into()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_join_other_leader_unknown_addr_still_redirects() {
+        assert_eq!(
+            decide_join(1, 7, None),
+            JoinDecision::Redirect {
+                leader_addr: String::new()
+            }
+        );
+    }
+}

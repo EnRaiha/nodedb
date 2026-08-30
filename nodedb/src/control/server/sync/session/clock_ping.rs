@@ -41,3 +41,46 @@ impl SyncSession {
         SyncFrame::try_encode(SyncMessageType::PingPong, &pong)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_session() -> SyncSession {
+        SyncSession::new("test-session-1".into())
+    }
+
+    #[test]
+    fn ping_pong() {
+        let mut session = make_session();
+
+        let ping = PingPongMsg {
+            timestamp_ms: 99999,
+            is_pong: false,
+        };
+        let response = session.handle_ping(&ping).expect("ping response");
+        let pong: PingPongMsg = response.decode_body().unwrap();
+        assert!(pong.is_pong);
+        assert_eq!(pong.timestamp_ms, 99999);
+    }
+
+    #[test]
+    fn vector_clock_sync() {
+        let mut session = make_session();
+        session.authenticated = true;
+
+        let mut clocks = HashMap::new();
+        clocks.insert("orders".into(), 42u64);
+
+        let msg = VectorClockSyncMsg {
+            clocks,
+            sender_id: 5,
+        };
+        let response = session
+            .handle_vector_clock_sync(&msg)
+            .expect("clock sync response");
+        let sync: VectorClockSyncMsg = response.decode_body().unwrap();
+        assert_eq!(*sync.clocks.get("orders").unwrap(), 42);
+    }
+}

@@ -33,8 +33,6 @@ pub mod staging_gate;
 mod state;
 mod store;
 pub mod temp_tables;
-#[cfg(test)]
-mod tests;
 mod transaction;
 pub mod txn_expand;
 

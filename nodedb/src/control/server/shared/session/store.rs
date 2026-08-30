@@ -354,6 +354,64 @@ mod tests {
     }
 
     #[test]
+    fn session_cleanup() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        store.ensure_session(addr);
+        assert_eq!(store.count(), 1);
+
+        store.remove(addr);
+        assert_eq!(store.count(), 0);
+    }
+
+    fn task() -> nodedb_physical::physical_task::PhysicalTask {
+        nodedb_physical::physical_task::PhysicalTask {
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: crate::types::VShardId::new(1),
+            plan: nodedb_physical::physical_plan::PhysicalPlan::Meta(
+                nodedb_physical::physical_plan::MetaOp::WalAppend {
+                    payload: Vec::new(),
+                },
+            ),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    #[test]
+    fn rollback_and_database_switch_clear_aligned_lease_holders() {
+        use std::sync::Arc;
+
+        use crate::control::lease::QueryLeaseScope;
+        use crate::types::Lsn;
+
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:6011".parse().expect("address");
+        store.ensure_session(addr);
+        let scope = Arc::new(QueryLeaseScope::empty());
+        store.begin(addr, Lsn::new(1), 0).expect("begin");
+        assert!(store.buffer_write(addr, task()));
+        assert!(store.attach_tx_lease_scope_since(addr, 0, Arc::clone(&scope)));
+        store.rollback(addr).expect("rollback");
+        store.read_session(addr, |session| {
+            assert!(session.tx_buffer.is_empty());
+            assert!(session.tx_lease_scopes.is_empty());
+            assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
+        });
+
+        store.begin(addr, Lsn::new(2), 0).expect("begin");
+        assert!(store.buffer_write(addr, task()));
+        assert!(store.attach_tx_lease_scope_since(addr, 0, scope));
+        store.reset_for_database_switch(addr, DatabaseId::new(2));
+        store.read_session(addr, |session| {
+            assert!(session.tx_buffer.is_empty());
+            assert!(session.tx_lease_scopes.is_empty());
+            assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
+        });
+    }
+
+    #[test]
     fn database_switch_clears_all_cursors() {
         let store = SessionStore::new();
         let session = address(4998);

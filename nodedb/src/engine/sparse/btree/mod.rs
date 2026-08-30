@@ -9,9 +9,6 @@ pub mod keys;
 pub mod rename;
 pub mod tables;
 
-#[cfg(test)]
-mod tests;
-
 pub use engine::SparseEngine;
 pub(crate) use keys::coll_prefix;
 pub(in crate::engine::sparse) use keys::{tenant_prefix, with_tenant_key4};

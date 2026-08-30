@@ -491,3 +491,56 @@ pub fn index_key_for(entry: IndexEntryTxn<'_>) -> String {
         |key| key.to_string(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn range_scan_with_index() {
+        let (engine, _dir) = open_temp();
+        engine.index_put(0, 1, "users", "age", "025", "u1").unwrap();
+        engine.index_put(0, 1, "users", "age", "030", "u2").unwrap();
+        engine.index_put(0, 1, "users", "age", "035", "u3").unwrap();
+        engine.index_put(0, 1, "users", "age", "040", "u4").unwrap();
+        let results = engine
+            .range_scan(RangeScanParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "users",
+                field: "age",
+                lower: Some(b"025"),
+                upper: Some(b"036"),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn delete_index_entries_for_field() {
+        let (engine, _dir) = open_temp();
+        engine
+            .index_put(0, 1, "users", "email", "alice@example.com", "u1")
+            .unwrap();
+        engine
+            .index_put(0, 1, "users", "email", "bob@example.com", "u2")
+            .unwrap();
+        engine.index_put(0, 1, "users", "age", "30", "u1").unwrap();
+        engine.index_put(0, 1, "users", "age", "25", "u2").unwrap();
+        let removed = engine
+            .delete_index_entries_for_field(0, 1, "users", "email")
+            .unwrap();
+        assert_eq!(removed, 2);
+        let age_entries = engine.scan_index_groups(0, 1, "users", "age").unwrap();
+        assert_eq!(age_entries.len(), 2);
+        let email_entries = engine.scan_index_groups(0, 1, "users", "email").unwrap();
+        assert!(email_entries.is_empty());
+    }
+}

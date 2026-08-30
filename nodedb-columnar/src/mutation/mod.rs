@@ -12,8 +12,5 @@ pub mod flush;
 pub mod snapshot;
 pub mod write;
 
-#[cfg(test)]
-mod tests;
-
 pub use engine::{MutationEngine, MutationResult};
 pub use snapshot::{ColumnDataSnapshot, ColumnarEngineSnapshot};

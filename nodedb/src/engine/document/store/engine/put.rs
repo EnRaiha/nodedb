@@ -100,3 +100,71 @@ impl<'a> DocumentEngine<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::sparse::btree::SparseEngine;
+
+    use super::*;
+
+    fn make_engine() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("doc.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn put_and_get_document() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        let doc = serde_json::json!({
+            "name": "Alice",
+            "email": "alice@example.com",
+            "age": 30
+        });
+
+        doc_engine.put("users", "u1", &doc).unwrap();
+        let retrieved = doc_engine.get("users", "u1").unwrap().unwrap();
+
+        assert_eq!(retrieved["name"], "Alice");
+        assert_eq!(retrieved["email"], "alice@example.com");
+        assert_eq!(retrieved["age"], 30);
+    }
+
+    #[test]
+    fn overwrite_document() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine
+            .put("users", "u1", &serde_json::json!({"v": 1}))
+            .unwrap();
+        doc_engine
+            .put("users", "u1", &serde_json::json!({"v": 2}))
+            .unwrap();
+
+        let doc = doc_engine.get("users", "u1").unwrap().unwrap();
+        assert_eq!(doc["v"], 2);
+    }
+
+    #[test]
+    fn raw_msgpack_roundtrip() {
+        let (sparse, _dir) = make_engine();
+        let doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        let doc = serde_json::json!({"key": "value", "num": 42});
+        let rmpv_val = json_to_msgpack(&doc);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv_val).unwrap();
+
+        doc_engine.put_raw("col", "id1", &buf).unwrap();
+
+        let raw = doc_engine.get_raw("col", "id1").unwrap().unwrap();
+        assert_eq!(raw, buf);
+
+        let decoded = doc_engine.get("col", "id1").unwrap().unwrap();
+        assert_eq!(decoded["key"], "value");
+        assert_eq!(decoded["num"], 42);
+    }
+}

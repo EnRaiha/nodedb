@@ -13,8 +13,5 @@ mod policy_dispatch;
 mod types;
 mod validate;
 
-#[cfg(test)]
-mod tests;
-
 pub use core::Validator;
 pub use types::{ProposedChange, ValidationOutcome, Violation};

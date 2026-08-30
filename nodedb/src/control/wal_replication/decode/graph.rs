@@ -172,3 +172,92 @@ pub(super) fn edge_delete_batch(
         edges: bind_batch_edges(ctx, edges)?,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::{ReplicatedEntry, ReplicatedWrite};
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_types::QualifiedCollection;
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn edge_put_surrogates_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "graph"),
+            src_id: "alice".into(),
+            label: "knows".into(),
+            dst_id: "bob".into(),
+            properties: vec![],
+            src_surrogate: nodedb_types::Surrogate::new(11),
+            dst_surrogate: nodedb_types::Surrogate::new(22),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("EdgePut should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+
+        // Verify wire representation carries the raw u32 values.
+        let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        match &decoded_entry.write {
+            ReplicatedWrite::EdgePut {
+                src_surrogate,
+                dst_surrogate,
+                ..
+            } => {
+                assert_eq!(
+                    *src_surrogate, 11u32,
+                    "src_surrogate must roundtrip on wire"
+                );
+                assert_eq!(
+                    *dst_surrogate, 22u32,
+                    "dst_surrogate must roundtrip on wire"
+                );
+            }
+            other => panic!("expected EdgePut, got {other:?}"),
+        }
+
+        // Verify the decoded PhysicalPlan uses the carried (authoritative) surrogates.
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Graph(GraphOp::EdgePut {
+                src_surrogate,
+                dst_surrogate,
+                ..
+            }) => {
+                assert_eq!(
+                    src_surrogate,
+                    nodedb_types::Surrogate::new(11),
+                    "src_surrogate must survive encode→decode"
+                );
+                assert_eq!(
+                    dst_surrogate,
+                    nodedb_types::Surrogate::new(22),
+                    "dst_surrogate must survive encode→decode"
+                );
+            }
+            other => panic!("expected Graph(EdgePut), got {other:?}"),
+        }
+    }
+}

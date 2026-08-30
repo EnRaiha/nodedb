@@ -248,3 +248,87 @@ impl ProposeTracker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propose_tracker_register_and_complete() {
+        let tracker = ProposeTracker::new();
+        let mut rx = tracker.register(1, 5, 0xdead_beef);
+
+        // Waiter must receive both payload and coll_write_lsn — its only channel
+        // for a version minted on the apply path.
+        assert!(tracker.complete(
+            1,
+            5,
+            0xdead_beef,
+            Ok(AppliedWrite {
+                payload: b"result".to_vec(),
+                write_version: Lsn::new(137),
+            }),
+        ));
+
+        let result = rx.try_recv().unwrap().unwrap();
+        assert_eq!(result.payload, b"result");
+        assert_eq!(result.write_version, Lsn::new(137));
+    }
+
+    #[test]
+    fn propose_tracker_no_waiter_returns_false() {
+        let tracker = ProposeTracker::new();
+        assert!(!tracker.complete(1, 99, 0, Ok(AppliedWrite::unversioned(Vec::new()))));
+    }
+
+    #[test]
+    fn propose_tracker_key_mismatch_surfaces_retryable_leader_change() {
+        let tracker = ProposeTracker::new();
+        let mut rx = tracker.register(1, 5, 0xaaaa);
+
+        // A different proposer's entry committed at the same (group_id,
+        // log_index); waiter must see RetryableLeaderChange, not its result.
+        assert!(tracker.complete(
+            1,
+            5,
+            0xbbbb,
+            Ok(AppliedWrite::unversioned(
+                b"other-proposers-payload".to_vec()
+            )),
+        ));
+
+        let result = rx.try_recv().unwrap();
+        match result {
+            Err(crate::Error::RetryableLeaderChange {
+                group_id,
+                log_index,
+            }) => {
+                assert_eq!(group_id, 1);
+                assert_eq!(log_index, 5);
+            }
+            other => panic!("expected RetryableLeaderChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn propose_tracker_zero_applied_key_passes_through_explicit_error() {
+        // applied_key = 0 (leader-change no-op) must forward the explicit
+        // RetryableLeaderChange, not be treated as a key mismatch.
+        let tracker = ProposeTracker::new();
+        let mut rx = tracker.register(1, 5, 0xaaaa);
+        assert!(tracker.complete(
+            1,
+            5,
+            0,
+            Err(crate::Error::RetryableLeaderChange {
+                group_id: 1,
+                log_index: 5,
+            }),
+        ));
+        let result = rx.try_recv().unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::Error::RetryableLeaderChange { .. })
+        ));
+    }
+}

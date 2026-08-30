@@ -180,3 +180,565 @@ pub fn spatial_delete(
         provenance,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::{ReplicatedEntry, ReplicatedWrite};
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_types::geometry::Geometry;
+    use nodedb_types::sync::wire::SyncProvenance;
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck};
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn columnar_ingest_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 11,
+            epoch: 3,
+            stream_id: 2,
+            seq: 77,
+        };
+
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: vec![
+                nodedb_types::Surrogate::new(42),
+                nodedb_types::Surrogate::new(43),
+            ],
+            schema_bytes: Vec::new(),
+            provenance: Some(prov.clone()),
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        match &decoded_entry.write {
+            ReplicatedWrite::ColumnarIngest { surrogates, .. } => {
+                assert_eq!(surrogates, &vec![42u32, 43u32], "surrogates must roundtrip");
+            }
+            other => panic!("expected ColumnarIngest, got {other:?}"),
+        }
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                surrogates,
+                provenance,
+                wal_lsn,
+                intent,
+                on_conflict_updates,
+                ..
+            }) => {
+                assert_eq!(
+                    surrogates,
+                    vec![
+                        nodedb_types::Surrogate::new(42),
+                        nodedb_types::Surrogate::new(43)
+                    ]
+                );
+                assert_eq!(provenance, Some(prov));
+                assert_eq!(wal_lsn, None, "wal_lsn must be None on decode");
+                assert_eq!(intent, ColumnarInsertIntent::Insert);
+                assert!(on_conflict_updates.is_empty());
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeseries_ingest_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 5,
+            epoch: 1,
+            stream_id: 0,
+            seq: 200,
+        };
+
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "temps"),
+            payload: b"data".to_vec(),
+            format: "ilp".into(),
+            wal_lsn: None,
+            surrogates: vec![nodedb_types::Surrogate::new(99)],
+            provenance: Some(prov.clone()),
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("TimeseriesIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                surrogates,
+                provenance,
+                wal_lsn,
+                ..
+            }) => {
+                assert_eq!(surrogates, vec![nodedb_types::Surrogate::new(99)]);
+                assert_eq!(provenance, Some(prov));
+                assert_eq!(wal_lsn, None, "wal_lsn must be None on decode");
+            }
+            other => panic!("expected Timeseries(Ingest), got {other:?}"),
+        }
+    }
+
+    /// Decode must not hardcode `on_conflict_updates: Vec::new()` — that turns
+    /// `ON CONFLICT DO UPDATE` into a plain overwrite on followers.
+    #[test]
+    fn columnar_ingest_on_conflict_updates_roundtrip() {
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::Put,
+            on_conflict_updates: vec![("count".into(), UpdateValue::Literal(b"5".to_vec()))],
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                on_conflict_updates,
+                ..
+            }) => {
+                assert_eq!(
+                    on_conflict_updates,
+                    vec![("count".to_owned(), UpdateValue::Literal(b"5".to_vec()))],
+                    "ON CONFLICT DO UPDATE assignments must survive replication"
+                );
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    /// Decode must not hardcode `intent: ColumnarInsertIntent::Insert` — that
+    /// silently drops `ON CONFLICT DO NOTHING` on replication.
+    #[test]
+    fn columnar_ingest_intent_roundtrip() {
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::InsertIfAbsent,
+            on_conflict_updates: Vec::new(),
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert { intent, .. }) => {
+                assert_eq!(
+                    intent,
+                    ColumnarInsertIntent::InsertIfAbsent,
+                    "ON CONFLICT DO NOTHING must not degrade to a plain insert on replication"
+                );
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    /// Decode must not hardcode `format: "msgpack"` — that mis-tags a
+    /// native-protocol JSON payload on replication.
+    #[test]
+    fn columnar_ingest_json_format_roundtrip() {
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "json".into(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert { format, .. }) => {
+                assert_eq!(
+                    format, "json",
+                    "a JSON payload must not be mis-tagged as msgpack on replication"
+                );
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    /// Decode must not hardcode `returning: None` — that silently drops
+    /// `RETURNING` rows once the write is replicated.
+    #[test]
+    fn columnar_ingest_returning_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Named(vec![
+                nodedb_physical::physical_plan::ReturningItem {
+                    name: "id".into(),
+                    alias: None,
+                },
+            ]),
+        };
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: Some(spec.clone()),
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert { returning, .. }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING request must not silently yield no rows on replication"
+                );
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    /// Decode must not hardcode `rls_filters: Vec::new()` — an unreplicated read
+    /// policy lets a `RETURNING` row set exceed what a `SELECT` may see.
+    #[test]
+    fn columnar_ingest_rls_filters_roundtrip() {
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"[{}]".to_vec(),
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: b"rls-predicate".to_vec(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("ColumnarIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Columnar(ColumnarOp::Insert { rls_filters, .. }) => {
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Columnar(Insert), got {other:?}"),
+        }
+    }
+
+    /// Pins the same `returning` / `rls_filters` bug as the columnar tests above,
+    /// on the `TimeseriesOp::Ingest` sibling.
+    #[test]
+    fn timeseries_ingest_returning_and_rls_filters_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "temps"),
+            payload: b"data".to_vec(),
+            format: "ilp".into(),
+            wal_lsn: None,
+            surrogates: vec![nodedb_types::Surrogate::new(99)],
+            provenance: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("TimeseriesIngest should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING request must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Timeseries(Ingest), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fts_index_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 7,
+            epoch: 4,
+            stream_id: 1,
+            seq: 33,
+        };
+
+        let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
+            surrogate: nodedb_types::Surrogate::new(500),
+            text: "hello world".into(),
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("FtsIndex should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Text(TextOp::FtsIndexDoc {
+                surrogate,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(surrogate, nodedb_types::Surrogate::new(500));
+                assert_eq!(provenance, Some(prov));
+            }
+            other => panic!("expected Text(FtsIndexDoc), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fts_delete_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 8,
+            epoch: 2,
+            stream_id: 0,
+            seq: 10,
+        };
+
+        let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
+            surrogate: nodedb_types::Surrogate::new(501),
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("FtsDelete should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Text(TextOp::FtsDeleteDoc {
+                surrogate,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(surrogate, nodedb_types::Surrogate::new(501));
+                assert_eq!(provenance, Some(prov));
+            }
+            other => panic!("expected Text(FtsDeleteDoc), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spatial_insert_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 3,
+            epoch: 9,
+            stream_id: 2,
+            seq: 44,
+        };
+        let geometry = Geometry::Point {
+            coordinates: [-73.985, 40.758],
+        };
+
+        let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
+            field: "location".into(),
+            surrogate: nodedb_types::Surrogate::new(700),
+            geometry: geometry.clone(),
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("SpatialInsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Spatial(SpatialOp::Insert {
+                surrogate,
+                geometry: decoded_geom,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(surrogate, nodedb_types::Surrogate::new(700));
+                assert_eq!(decoded_geom, geometry);
+                assert_eq!(provenance, Some(prov));
+            }
+            other => panic!("expected Spatial(Insert), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spatial_delete_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 2,
+            epoch: 1,
+            stream_id: 0,
+            seq: 5,
+        };
+
+        let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
+            field: "location".into(),
+            surrogate: nodedb_types::Surrogate::new(701),
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("SpatialDelete should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Spatial(SpatialOp::Delete {
+                surrogate,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(surrogate, nodedb_types::Surrogate::new(701));
+                assert_eq!(provenance, Some(prov));
+            }
+            other => panic!("expected Spatial(Delete), got {other:?}"),
+        }
+    }
+}

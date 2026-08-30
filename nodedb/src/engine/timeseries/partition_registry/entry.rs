@@ -59,3 +59,15 @@ fn epoch_to_datetime(epoch_secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
     (y as i32, m, d, hour, min, sec)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_partition_dir_test() {
+        let dir = format_partition_dir(1_704_067_200_000, 1_704_153_600_000);
+        // 2024-01-01 00:00:00 to 2024-01-02 00:00:00
+        assert_eq!(dir, "ts-20240101-000000_20240102-000000");
+    }
+}

@@ -75,3 +75,19 @@ impl Default for RateEstimator {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_estimator_basic() {
+        let mut est = RateEstimator::new();
+        // Simulate 1000 rows/sec for 5 seconds.
+        for i in 0..5 {
+            est.record(1000, i * 1000);
+        }
+        // Rate should be approaching 1000.
+        assert!(est.rate() > 100.0); // EWMA takes time to converge.
+    }
+}

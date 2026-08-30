@@ -181,3 +181,89 @@ impl SparseEngine {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("v.redb")).unwrap();
+        (engine, dir)
+    }
+
+    fn idx_entry<'a>(
+        coll: &'a str,
+        field: &'a str,
+        value: &'a str,
+        doc_id: &'a str,
+        sys_from_ms: i64,
+    ) -> VersionedIndexEntry<'a> {
+        VersionedIndexEntry {
+            database_id: 1,
+            tenant: 1,
+            coll,
+            field,
+            value,
+            doc_id,
+            sys_from_ms,
+        }
+    }
+
+    #[test]
+    fn index_lookup_honors_cutoff_and_tombstone() {
+        let (e, _d) = open_temp();
+        e.versioned_index_put(idx_entry("c", "email", "a@x", "u1", 100))
+            .unwrap();
+        e.versioned_index_put(idx_entry("c", "email", "a@x", "u2", 150))
+            .unwrap();
+        e.versioned_index_tombstone(idx_entry("c", "email", "a@x", "u1", 200))
+            .unwrap();
+
+        let at_120 = e
+            .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(120))
+            .unwrap();
+        assert_eq!(at_120, vec!["u1"]);
+
+        let at_175 = e
+            .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(175))
+            .unwrap();
+        assert_eq!(at_175.len(), 2);
+
+        let at_250 = e
+            .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(250))
+            .unwrap();
+        assert_eq!(at_250, vec!["u2"]);
+    }
+
+    #[test]
+    fn versioned_index_remove_in_txn_removes_entry() {
+        let (e, _d) = open_temp();
+        e.versioned_index_put(idx_entry("c", "email", "a@x", "u1", 100))
+            .unwrap();
+        let before = e
+            .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(150))
+            .unwrap();
+        assert_eq!(before, vec!["u1"]);
+
+        let txn = e.db.begin_write().unwrap();
+        e.versioned_index_remove_in_txn(&txn, idx_entry("c", "email", "a@x", "u1", 100))
+            .unwrap();
+        txn.commit().unwrap();
+
+        let after = e
+            .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(150))
+            .unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn versioned_index_remove_in_txn_on_missing_key_is_ok() {
+        let (e, _d) = open_temp();
+        let txn = e.db.begin_write().unwrap();
+        let r =
+            e.versioned_index_remove_in_txn(&txn, idx_entry("c", "email", "nobody@x", "u9", 999));
+        assert!(r.is_ok());
+        txn.commit().unwrap();
+    }
+}

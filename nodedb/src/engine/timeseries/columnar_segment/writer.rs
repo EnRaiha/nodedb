@@ -195,3 +195,335 @@ fn maybe_encrypt(kek: Option<&WalEncryptionKey>, bytes: &[u8]) -> Result<Vec<u8>
 pub(super) fn file_is_encrypted(bytes: &[u8]) -> Result<bool, SegmentError> {
     super::encrypt::is_encrypted(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_codec::{ColumnCodec, ResolvedColumnCodec};
+    use nodedb_types::timeseries::MetricSample;
+    use tempfile::TempDir;
+
+    use super::super::super::columnar_memtable::{
+        ColumnValue, ColumnarMemtable, ColumnarMemtableConfig,
+    };
+    use super::super::reader::ColumnarSegmentReader;
+    use super::*;
+
+    fn test_config() -> ColumnarMemtableConfig {
+        ColumnarMemtableConfig {
+            max_memory_bytes: 10 * 1024 * 1024,
+            hard_memory_limit: 20 * 1024 * 1024,
+            max_tag_cardinality: 1000,
+        }
+    }
+
+    fn test_kek() -> WalEncryptionKey {
+        WalEncryptionKey::from_bytes(&[0x42u8; 32]).unwrap()
+    }
+
+    fn build_simple_drain() -> (
+        TempDir,
+        crate::engine::timeseries::columnar_memtable::ColumnarDrainResult,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let mut mt = ColumnarMemtable::new_metric(test_config());
+        for i in 0..100 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1_000_000 + i * 1000,
+                    value: i as f64 * 2.0,
+                },
+            );
+        }
+        (tmp, mt.drain())
+    }
+
+    #[test]
+    fn write_and_read_simple_partition() {
+        let tmp = TempDir::new().unwrap();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+
+        let mut mt = ColumnarMemtable::new_metric(test_config());
+        for i in 0..100 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1000 + i,
+                    value: i as f64 * 0.5,
+                },
+            );
+        }
+        let drain = mt.drain();
+
+        let meta = writer
+            .write_partition("ts-test", &drain.view(), 86_400_000, 42, None)
+            .unwrap();
+        assert_eq!(meta.row_count, 100);
+        assert_eq!(meta.min_ts, 1000);
+        assert_eq!(meta.max_ts, 1099);
+        assert_eq!(meta.last_flushed_wal_lsn, 42);
+        assert!(meta.size_bytes > 0);
+
+        assert!(meta.column_stats.contains_key("timestamp"));
+        assert!(meta.column_stats.contains_key("value"));
+        let ts_stats = &meta.column_stats["timestamp"];
+        assert_eq!(ts_stats.count, 100);
+        assert_eq!(ts_stats.codec, ResolvedColumnCodec::DoubleDelta);
+        let val_stats = &meta.column_stats["value"];
+        assert_eq!(val_stats.count, 100);
+        assert_eq!(val_stats.codec, ResolvedColumnCodec::Gorilla);
+
+        let part_dir = tmp.path().join("ts-test");
+        let read_meta = ColumnarSegmentReader::read_meta(&part_dir, None).unwrap();
+        assert_eq!(read_meta.row_count, 100);
+        assert!(read_meta.column_stats.contains_key("timestamp"));
+
+        let schema = ColumnarSegmentReader::read_schema(&part_dir, None).unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.codec(0), ColumnCodec::DoubleDelta);
+        assert_eq!(schema.codec(1), ColumnCodec::Gorilla);
+
+        let ts_col = ColumnarSegmentReader::read_column_with_codec(
+            &part_dir,
+            "timestamp",
+            ColumnType::Timestamp,
+            Some(ResolvedColumnCodec::DoubleDelta),
+            None,
+        )
+        .unwrap();
+        let timestamps = ts_col.as_timestamps();
+        assert_eq!(timestamps.len(), 100);
+        assert_eq!(timestamps[0], 1000);
+        assert_eq!(timestamps[99], 1099);
+
+        let val_col = ColumnarSegmentReader::read_column_with_codec(
+            &part_dir,
+            "value",
+            ColumnType::Float64,
+            Some(ResolvedColumnCodec::Gorilla),
+            None,
+        )
+        .unwrap();
+        let values = val_col.as_f64();
+        assert_eq!(values.len(), 100);
+        assert!((values[0] - 0.0).abs() < f64::EPSILON);
+        assert!((values[99] - 49.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn write_and_read_with_tags() {
+        let tmp = TempDir::new().unwrap();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp),
+                ("cpu".into(), ColumnType::Float64),
+                ("host".into(), ColumnType::Symbol),
+            ],
+            timestamp_idx: 0,
+            codecs: vec![ColumnCodec::Auto; 3],
+        };
+        let mut mt = ColumnarMemtable::new(schema, test_config());
+
+        for i in 0..50 {
+            let host = if i % 2 == 0 { "prod-1" } else { "prod-2" };
+            mt.ingest_row(
+                i % 2,
+                &[
+                    ColumnValue::Timestamp(5000 + i as i64),
+                    ColumnValue::Float64(50.0 + i as f64),
+                    ColumnValue::Symbol(host.to_string()),
+                ],
+            )
+            .unwrap();
+        }
+        let drain = mt.drain();
+
+        let meta = writer
+            .write_partition("ts-tags", &drain.view(), 86_400_000, 99, None)
+            .unwrap();
+        assert_eq!(meta.row_count, 50);
+        assert_eq!(
+            meta.column_stats["host"].codec,
+            ResolvedColumnCodec::FastLanesLz4
+        );
+        assert_eq!(meta.column_stats["host"].cardinality, Some(2));
+
+        let part_dir = tmp.path().join("ts-tags");
+        let host_col = ColumnarSegmentReader::read_column_with_codec(
+            &part_dir,
+            "host",
+            ColumnType::Symbol,
+            Some(ResolvedColumnCodec::FastLanesLz4),
+            None,
+        )
+        .unwrap();
+        assert_eq!(host_col.as_symbols().len(), 50);
+
+        let host_dict = ColumnarSegmentReader::read_symbol_dict(&part_dir, "host", None).unwrap();
+        assert_eq!(host_dict.len(), 2);
+    }
+
+    #[test]
+    fn explicit_codec_override() {
+        let tmp = TempDir::new().unwrap();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp),
+                ("value".into(), ColumnType::Float64),
+            ],
+            timestamp_idx: 0,
+            codecs: vec![ColumnCodec::Gorilla, ColumnCodec::Gorilla],
+        };
+        let mut mt = ColumnarMemtable::new(schema, test_config());
+        for i in 0..100 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1_700_000_000_000 + i * 10_000,
+                    value: 42.0 + i as f64 * 0.1,
+                },
+            );
+        }
+        let drain = mt.drain();
+        let meta = writer
+            .write_partition("ts-gorilla", &drain.view(), 86_400_000, 0, None)
+            .unwrap();
+
+        assert_eq!(
+            meta.column_stats["timestamp"].codec,
+            ResolvedColumnCodec::Gorilla
+        );
+        assert_eq!(
+            meta.column_stats["value"].codec,
+            ResolvedColumnCodec::Gorilla
+        );
+
+        let part_dir = tmp.path().join("ts-gorilla");
+        let ts_col = ColumnarSegmentReader::read_column_with_codec(
+            &part_dir,
+            "timestamp",
+            ColumnType::Timestamp,
+            Some(ResolvedColumnCodec::Gorilla),
+            None,
+        )
+        .unwrap();
+        let timestamps = ts_col.as_timestamps();
+        assert_eq!(timestamps.len(), 100);
+        assert_eq!(timestamps[0], 1_700_000_000_000);
+    }
+
+    #[test]
+    fn compression_stats_in_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+
+        let mut mt = ColumnarMemtable::new_metric(test_config());
+        for i in 0..10_000 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1_700_000_000_000 + i * 10_000,
+                    value: 42.0,
+                },
+            );
+        }
+        let drain = mt.drain();
+        let meta = writer
+            .write_partition("ts-stats", &drain.view(), 86_400_000, 0, None)
+            .unwrap();
+
+        let ts_stats = &meta.column_stats["timestamp"];
+        assert!(ts_stats.compression_ratio() > 3.0);
+        assert_eq!(ts_stats.min, Some(1_700_000_000_000.0));
+        assert_eq!(ts_stats.count, 10_000);
+
+        let val_stats = &meta.column_stats["value"];
+        assert!(val_stats.compression_ratio() > 1.0);
+        assert_eq!(val_stats.min, Some(42.0));
+        assert_eq!(val_stats.max, Some(42.0));
+        assert_eq!(val_stats.sum, Some(420_000.0));
+    }
+
+    #[test]
+    fn sparse_index_written_during_flush() {
+        let tmp = TempDir::new().unwrap();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+
+        let mut mt = ColumnarMemtable::new_metric(test_config());
+        for i in 0..2048 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1_700_000_000_000 + i * 10_000,
+                    value: (i % 100) as f64,
+                },
+            );
+        }
+        let drain = mt.drain();
+        writer
+            .write_partition("ts-sparse", &drain.view(), 86_400_000, 0, None)
+            .unwrap();
+
+        let part_dir = tmp.path().join("ts-sparse");
+        let sparse = ColumnarSegmentReader::read_sparse_index(&part_dir, None)
+            .unwrap()
+            .expect("sparse index should exist");
+
+        assert_eq!(sparse.total_rows(), 2048);
+        assert_eq!(sparse.block_count(), 2);
+        assert_eq!(sparse.column_names, vec!["timestamp", "value"]);
+
+        assert_eq!(sparse.blocks[0].min_ts, 1_700_000_000_000);
+        assert_eq!(sparse.blocks[0].max_ts, 1_700_000_000_000 + 1023 * 10_000);
+        assert_eq!(sparse.blocks[1].min_ts, 1_700_000_000_000 + 1024 * 10_000);
+    }
+
+    #[test]
+    fn columnar_segment_encrypted_at_rest() {
+        let kek = test_kek();
+        let (tmp, drain) = build_simple_drain();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+        writer
+            .write_partition("enc-part", &drain.view(), 86_400_000, 1, Some(&kek))
+            .unwrap();
+
+        let part_dir = tmp.path().join("enc-part");
+
+        // Each on-disk file must start with SEGT magic.
+        for filename in &[
+            "timestamp.col",
+            "value.col",
+            "schema.json",
+            "sparse_index.bin",
+            "partition.meta",
+        ] {
+            let bytes = std::fs::read(part_dir.join(filename)).unwrap();
+            assert!(
+                file_is_encrypted(&bytes).unwrap(),
+                "{filename} must start with SEGT when KEK is set"
+            );
+        }
+
+        // Read-back via reader must succeed with the KEK.
+        let meta = ColumnarSegmentReader::read_meta(&part_dir, Some(&kek)).unwrap();
+        assert_eq!(meta.row_count, 100);
+
+        let ts_col = ColumnarSegmentReader::read_column(
+            &part_dir,
+            "timestamp",
+            ColumnType::Timestamp,
+            Some(&kek),
+        )
+        .unwrap();
+        assert_eq!(ts_col.as_timestamps().len(), 100);
+
+        let sparse = ColumnarSegmentReader::read_sparse_index(&part_dir, Some(&kek))
+            .unwrap()
+            .expect("sparse index must exist");
+        assert_eq!(sparse.total_rows(), 100);
+    }
+}

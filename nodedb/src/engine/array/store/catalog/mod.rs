@@ -7,8 +7,6 @@
 //! Data-Plane only (`!Send`-compatible — no atomics, no shared mutability).
 
 mod scan;
-#[cfg(test)]
-mod tests;
 mod versions;
 
 use std::collections::HashMap;

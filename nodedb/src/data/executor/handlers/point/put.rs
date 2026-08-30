@@ -217,3 +217,133 @@ impl CoreLoop {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::doc_format;
+    use crate::engine::document::store::CollectionConfig;
+    use crate::types::{DatabaseId, TenantId};
+
+    const DB: u64 = 0;
+    const TID: u64 = 1;
+    const SOURCE: &str = "point_txns";
+    const TARGET: &str = "point_holders";
+
+    /// The premise every test below rests on.
+    #[test]
+    fn the_fixture_is_co_resident() {
+        assert!(
+            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            "'{SOURCE}' and '{TARGET}' must share a vShard: a cross-shard binding's balance \
+             travels on its own task and is never folded into the source write's transaction"
+        );
+    }
+    const A1: &str = "a1";
+    const T1: Surrogate = Surrogate(4001);
+
+    fn binding() -> nodedb_physical::physical_plan::MaterializedSumBinding {
+        nodedb_physical::physical_plan::MaterializedSumBinding {
+            target_collection: TARGET.to_string(),
+            target_column: "balance".to_string(),
+            join_column: "account_id".to_string(),
+            value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
+        }
+    }
+
+    fn resolved() -> Vec<ResolvedSumTarget> {
+        vec![ResolvedSumTarget::new(TARGET, A1, T1)]
+    }
+
+    fn config_key(collection: &str) -> (DatabaseId, TenantId, String) {
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            collection.to_string(),
+        )
+    }
+
+    /// A source collection bound to the sum, and a target row starting at zero.
+    fn seeded_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+
+        let mut source = CollectionConfig::new(SOURCE);
+        source.enforcement.materialized_sum_sources = vec![binding()];
+        core.doc_configs.insert(config_key(SOURCE), source);
+        core.doc_configs
+            .insert(config_key(TARGET), CollectionConfig::new(TARGET));
+
+        let seed = serde_json::json!({"id": A1, "balance": "0"});
+        core.sparse
+            .put(
+                DB,
+                TID,
+                TARGET,
+                &surrogate_to_doc_id(T1),
+                &doc_format::encode_to_msgpack(&seed),
+            )
+            .expect("seed target row");
+        core
+    }
+
+    /// A source row body, in the MessagePack every handler receives.
+    fn entry(account: &str, amount: i64) -> Vec<u8> {
+        doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": account,
+            "amount": amount,
+        }))
+    }
+
+    /// The balance the target row currently holds.
+    fn balance(core: &CoreLoop, surrogate: Surrogate) -> String {
+        let stored = core
+            .sparse
+            .get(DB, TID, TARGET, &surrogate_to_doc_id(surrogate))
+            .expect("read target")
+            .expect("target row must exist");
+        doc_format::decode_document(&stored)
+            .expect("target row must decode")
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .expect("target row must carry a balance")
+            .to_string()
+    }
+
+    /// One PUT of `body` onto the same source row.
+    fn put(core: &mut CoreLoop, task: &ExecutionTask, body: &[u8]) -> Status {
+        let targets = resolved();
+        core.execute_point_put(
+            task,
+            PointPutExec {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e1",
+                surrogate: Surrogate(21),
+                value: body,
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &targets,
+            },
+        )
+        .status
+    }
+
+    #[test]
+    fn point_put_credits_an_insert_and_deltas_an_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+
+        assert_eq!(put(&mut core, &task, &entry(A1, 10)), Status::Ok);
+        assert_eq!(put(&mut core, &task, &entry(A1, 30)), Status::Ok);
+
+        assert_eq!(
+            balance(&core, T1),
+            "30",
+            "an overwrite must delta the total, not add the new amount on top of \
+             the old one"
+        );
+    }
+}

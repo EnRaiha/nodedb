@@ -9,8 +9,6 @@
 mod checkpoint_export;
 mod checkpoint_restore;
 mod scan_ops;
-#[cfg(test)]
-mod tests;
 
 pub use checkpoint_export::KvCollectionRef;
 pub use checkpoint_restore::{RestoreCompositeIndexParams, RestoreFieldIndexParams};

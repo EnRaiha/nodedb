@@ -24,7 +24,4 @@ mod membership;
 mod plan_dispatch;
 mod shuffle_calvin;
 
-#[cfg(test)]
-mod tests;
-
 pub(super) use membership::{JoinDecision, TOPOLOGY_GROUP_ID, decide_join};

@@ -432,3 +432,137 @@ impl Scheduler {
         self.shared.next_request_id()
     }
 }
+
+// ── `is_caught_up` sentinel handling ─────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashMap};
+
+    use nodedb_cluster::RoutingTable;
+
+    use crate::bridge::dispatch::Dispatcher;
+
+    /// Build a minimally-wired `Scheduler` for driver-level unit tests. The Data
+    /// Plane is NOT started — tests exercise Control-Plane routing, guards, and
+    /// request dispatch only, so no core loop is needed. The returned `TempDir`
+    /// must be kept alive for the scheduler's lifetime (backs the WAL and
+    /// Raft storage).
+    fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(
+            crate::wal::WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap(),
+        );
+        let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
+        let _data_side = data_sides
+            .pop()
+            .expect("one configured core has one data side");
+        let shared = SharedState::new(dispatcher, wal).unwrap();
+
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let multi_raft = Arc::new(Mutex::new(MultiRaft::new(1, rt, dir.path().to_path_buf())));
+
+        let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
+            HashMap::new(),
+            Arc::clone(&registry),
+        )));
+
+        let (_tx, receiver) = mpsc::channel(16);
+        let (_rr_tx, read_result_rx) = mpsc::channel(16);
+        let (_prom_tx, promotion_rx) = mpsc::unbounded_channel();
+        let (verdict_tx, verdict_rx) = mpsc::channel(16);
+        registry.register_verdict_signal_sender(vshard_id, verdict_tx);
+
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+
+        let scheduler = Scheduler::new(SchedulerParams {
+            vshard_id,
+            receiver,
+            shared,
+            multi_raft,
+            sequencer_state_machine,
+            // A freshly-built scheduler has applied nothing, so its watermark is the
+            // not-yet-applied sentinel (matching `read_applied_recovery` for a clean
+            // node). Hardcoding `0` here would instead claim epoch 0 is fully applied,
+            // making the exactly-once gate (`AppliedGate::is_applied`) short-circuit
+            // every epoch-0 replay before it reaches the lock table — silently
+            // defeating the end-to-end drain tests below.
+            fully_applied_epoch: NOT_YET_APPLIED_EPOCH,
+            applied_tail: BTreeSet::new(),
+            rebuild_target_epoch: 0,
+            config: SchedulerConfig::default(),
+            metrics: SchedulerMetrics::new(),
+            read_result_rx,
+            lock_manager,
+            promotion_rx,
+            registry,
+            verdict_rx,
+        });
+        (scheduler, dir)
+    }
+
+    /// A freshly-recovered scheduler (`fully_applied_epoch` still the
+    /// `NOT_YET_APPLIED_EPOCH` sentinel) with a REAL, non-zero rebuild target must
+    /// NOT report caught-up. Naively comparing `u64::MAX >= rebuild_target_epoch`
+    /// (the bug) would say "caught up" before a single epoch was re-applied.
+    #[tokio::test]
+    async fn is_caught_up_false_when_fully_applied_is_sentinel_and_target_is_real() {
+        let (mut scheduler, _dir) = build_test_scheduler(0);
+        scheduler.rebuild_target_epoch = 5;
+        assert_eq!(
+            scheduler.applied.fully_applied_epoch(),
+            NOT_YET_APPLIED_EPOCH
+        );
+
+        assert!(
+            !scheduler.is_caught_up(),
+            "sentinel fully_applied_epoch with a real rebuild target must not be caught up"
+        );
+    }
+
+    /// Once the applied watermark advances to (or past) a real rebuild target,
+    /// the scheduler correctly reports caught-up.
+    #[tokio::test]
+    async fn is_caught_up_true_once_fully_applied_reaches_target() {
+        let (mut scheduler, _dir) = build_test_scheduler(0);
+        scheduler.rebuild_target_epoch = 5;
+
+        scheduler.applied = AppliedGate::new(5, BTreeSet::new());
+        assert!(
+            scheduler.is_caught_up(),
+            "fully_applied_epoch == rebuild_target_epoch must be caught up"
+        );
+
+        scheduler.applied = AppliedGate::new(7, BTreeSet::new());
+        assert!(
+            scheduler.is_caught_up(),
+            "fully_applied_epoch > rebuild_target_epoch must be caught up"
+        );
+    }
+
+    /// A greenfield node with NO Calvin history at all: `read_applied_recovery`
+    /// seeds `max_applied_epoch` (hence `rebuild_target_epoch`) to
+    /// `NOT_YET_APPLIED_EPOCH` too (see `recovery.rs`'s
+    /// `greenfield_returns_sentinel_and_empty_tail` test) — this is distinct from
+    /// a real target of epoch 0 (which would report `max_applied_epoch == 0`).
+    /// With nothing to rebuild, the scheduler is trivially caught up even though
+    /// `fully_applied_epoch` is still the sentinel.
+    #[tokio::test]
+    async fn is_caught_up_true_when_no_rebuild_target_exists() {
+        let (mut scheduler, _dir) = build_test_scheduler(0);
+        // `build_test_scheduler` defaults `rebuild_target_epoch` to `0` (a REAL
+        // target) for its own catch-up-drain tests; set it to the sentinel here to
+        // model the actual greenfield-recovery value.
+        scheduler.rebuild_target_epoch = NOT_YET_APPLIED_EPOCH;
+        assert_eq!(
+            scheduler.applied.fully_applied_epoch(),
+            NOT_YET_APPLIED_EPOCH
+        );
+
+        assert!(
+            scheduler.is_caught_up(),
+            "no rebuild target (greenfield node) must report caught-up"
+        );
+    }
+}

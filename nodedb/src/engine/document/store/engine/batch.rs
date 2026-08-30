@@ -112,3 +112,111 @@ impl<'a> DocumentEngine<'a> {
         Ok(doc_ids)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::document::store::extract::json_to_msgpack;
+
+    use super::*;
+
+    fn make_engine() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("doc.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn secondary_index_extraction() {
+        let (sparse, _dir) = make_engine();
+        let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine.register_collection(CollectionConfig::new("users").with_index("$.email"));
+
+        doc_engine
+            .put(
+                "users",
+                "u1",
+                &serde_json::json!({"name": "Alice", "email": "alice@example.com"}),
+            )
+            .unwrap();
+        doc_engine
+            .put(
+                "users",
+                "u2",
+                &serde_json::json!({"name": "Bob", "email": "bob@example.com"}),
+            )
+            .unwrap();
+
+        let results = doc_engine
+            .index_lookup("users", "$.email", "alice@example.com", false)
+            .unwrap();
+        assert_eq!(results, vec!["u1"]);
+    }
+
+    #[test]
+    fn array_index_extraction() {
+        let (sparse, _dir) = make_engine();
+        let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine.register_collection(CollectionConfig::new("users").with_index("$.tags[]"));
+
+        doc_engine
+            .put(
+                "users",
+                "u1",
+                &serde_json::json!({"name": "Alice", "tags": ["admin", "editor"]}),
+            )
+            .unwrap();
+
+        let results = doc_engine
+            .index_lookup("users", "$.tags", "admin", false)
+            .unwrap();
+        assert_eq!(results, vec!["u1"]);
+
+        let results = doc_engine
+            .index_lookup("users", "$.tags", "editor", false)
+            .unwrap();
+        assert_eq!(results, vec!["u1"]);
+    }
+
+    #[test]
+    fn nested_field_index() {
+        let (sparse, _dir) = make_engine();
+        let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine.register_collection(CollectionConfig::new("docs").with_index("$.metadata.lang"));
+
+        doc_engine
+            .put(
+                "docs",
+                "d1",
+                &serde_json::json!({"title": "Hello", "metadata": {"lang": "en"}}),
+            )
+            .unwrap();
+
+        let results = doc_engine
+            .index_lookup("docs", "$.metadata.lang", "en", false)
+            .unwrap();
+        assert_eq!(results, vec!["d1"]);
+    }
+
+    #[test]
+    fn put_raw_with_index_extraction() {
+        let (sparse, _dir) = make_engine();
+        let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
+
+        doc_engine.register_collection(CollectionConfig::new("items").with_index("$.category"));
+
+        let doc = serde_json::json!({"name": "Widget", "category": "tools"});
+        let rmpv_val = json_to_msgpack(&doc);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv_val).unwrap();
+
+        doc_engine.put_raw("items", "i1", &buf).unwrap();
+
+        let results = doc_engine
+            .index_lookup("items", "$.category", "tools", false)
+            .unwrap();
+        assert_eq!(results, vec!["i1"]);
+    }
+}

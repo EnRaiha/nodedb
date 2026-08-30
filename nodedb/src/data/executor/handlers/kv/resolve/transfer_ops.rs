@@ -184,3 +184,189 @@ impl CoreLoop {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::data::executor::core_loop::CoreLoop;
+    use std::sync::Arc;
+
+    use nodedb_physical::physical_plan::KvOp;
+    use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
+
+    use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Status};
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+
+    const TID: u64 = 1;
+    const COLLECTION: &str = "kv_resolved";
+    const DEST_COLLECTION: &str = "kv_resolved_dest";
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        use nodedb_bridge::buffer::RingBuffer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    fn did() -> u64 {
+        DatabaseId::DEFAULT.as_u64()
+    }
+
+    fn task() -> ExecutionTask {
+        CoreLoop::replay_task(
+            TenantId::new(TID),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            PhysicalPlan::Kv(KvOp::Get {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+                key: b"seed".to_vec(),
+                rls_filters: Vec::new(),
+                surrogate_ceiling: None,
+            }),
+            None,
+        )
+    }
+
+    fn seed(core: &mut CoreLoop, collection: &str, key: &[u8], value: &[u8]) {
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did(),
+            tenant_id: TID,
+            collection,
+            key,
+            value,
+            ttl_ms: 0,
+            now_ms: crate::engine::kv::current_ms(),
+            surrogate: Surrogate::new(1),
+        });
+    }
+
+    fn stored(core: &CoreLoop, collection: &str, key: &[u8]) -> Option<Vec<u8>> {
+        core.kv_engine
+            .get(did(), TID, collection, key, crate::engine::kv::current_ms())
+    }
+
+    /// Run the resolve handler and decode its outcome.
+    fn resolve(h: &CoreHarness, op: &KvOp) -> nodedb_physical::physical_plan::KvResolveOutcome {
+        let t = task();
+        let resp = h.core.execute_kv_resolve_write(&t, did(), TID, op);
+        assert_eq!(
+            resp.status,
+            Status::Ok,
+            "resolve failed: {:?}",
+            resp.error_code
+        );
+        zerompk::from_msgpack(resp.payload.as_bytes()).expect("decode resolve outcome")
+    }
+
+    /// Apply an already-resolved outcome, as a replica does.
+    fn apply(
+        h: &mut CoreHarness,
+        outcome: &nodedb_physical::physical_plan::KvResolveOutcome,
+    ) -> crate::bridge::envelope::Response {
+        let t = task();
+        h.core.execute_kv_resolved_write(
+            &t,
+            did(),
+            TID,
+            &outcome.mutations,
+            &outcome.response_payload,
+            &RlsWriteCheck::decided_earlier_in_request(),
+        )
+    }
+
+    #[test]
+    fn transfer_item_resolves_a_delete_and_a_put_across_two_collections() {
+        let mut h = make_core();
+        let body =
+            nodedb_types::json_to_msgpack(&serde_json::json!({ "sword": 1 })).expect("encode");
+        seed(&mut h.core, COLLECTION, b"item", &body);
+
+        let op = KvOp::TransferItem {
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, DEST_COLLECTION),
+            item_key: b"item".to_vec(),
+            dest_key: b"owned".to_vec(),
+            surrogate: Surrogate::new(7),
+            source_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            dest_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+        };
+        let outcome = resolve(&h, &op);
+        assert_eq!(outcome.mutations.len(), 2);
+        match &outcome.mutations[0] {
+            nodedb_physical::physical_plan::KvResolvedMutation::Delete {
+                collection,
+                key,
+                precondition,
+            } => {
+                assert_eq!(collection.as_str(), COLLECTION);
+                assert_eq!(key.as_slice(), b"item");
+                assert_eq!(precondition.as_deref(), Some(body.as_slice()));
+            }
+            other => panic!("expected the source Delete first, got {other:?}"),
+        }
+        match &outcome.mutations[1] {
+            nodedb_physical::physical_plan::KvResolvedMutation::Put {
+                collection,
+                key,
+                value,
+                precondition,
+                ..
+            } => {
+                assert_eq!(collection.as_str(), DEST_COLLECTION);
+                assert_eq!(key.as_slice(), b"owned");
+                assert_eq!(value, &body);
+                assert_eq!(
+                    precondition.as_deref(),
+                    None,
+                    "the destination key was absent, so the apply requires it to stay absent"
+                );
+            }
+            other => panic!("expected the destination Put second, got {other:?}"),
+        }
+
+        let resp = apply(&mut h, &outcome);
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert_eq!(stored(&h.core, COLLECTION, b"item"), None);
+        assert_eq!(stored(&h.core, DEST_COLLECTION, b"owned"), Some(body));
+    }
+
+    #[test]
+    fn transfer_item_on_a_missing_row_is_not_found() {
+        let h = make_core();
+        let op = KvOp::TransferItem {
+            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+            dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, DEST_COLLECTION),
+            item_key: b"nope".to_vec(),
+            dest_key: b"owned".to_vec(),
+            surrogate: Surrogate::new(7),
+            source_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+            dest_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+        };
+        let t = task();
+        let resp = h.core.execute_kv_resolve_write(&t, did(), TID, &op);
+        assert_eq!(resp.error_code.as_deref(), Some(&ErrorCode::NotFound));
+    }
+}

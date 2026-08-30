@@ -13,13 +13,4 @@ pub(super) mod rollback;
 pub(super) mod spatial;
 pub(super) mod stats;
 
-#[cfg(test)]
-mod fts_strict_tests;
-#[cfg(test)]
-mod kv_ttl_sorted_tests;
-#[cfg(test)]
-mod parity_tests;
-#[cfg(test)]
-mod tests;
-
 pub(in crate::data::executor) use entry::{TimeseriesIngestUndo, UndoEntry};

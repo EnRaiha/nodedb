@@ -18,9 +18,6 @@ pub(crate) mod restore_containers;
 pub mod snapshot;
 pub mod write_set;
 
-#[cfg(test)]
-mod tests;
-
 pub use core::CrdtState;
 pub use import_admission::{
     CrdtImportLimits, DEFAULT_MAX_IMPORT_BYTES, DEFAULT_MAX_IMPORT_OPS, ImportAdmission,

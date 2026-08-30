@@ -141,3 +141,61 @@ impl PartitionRegistry {
         removed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::timeseries::{PartitionInterval, PartitionMeta, TimeRange};
+
+    use super::*;
+
+    fn test_config() -> TieredPartitionConfig {
+        let mut cfg = TieredPartitionConfig::origin_defaults();
+        cfg.partition_by = PartitionInterval::Duration(86_400_000); // 1d
+        cfg.merge_after_ms = 7 * 86_400_000;
+        cfg.merge_count = 3;
+        cfg.retention_period_ms = 30 * 86_400_000;
+        cfg
+    }
+
+    /// Two partitions can legitimately span the same start timestamp (late or
+    /// duplicate-timestamp ingest). Both must stay reachable — filing the second
+    /// under the first's key would make its on-disk rows invisible to every query
+    /// even though a checkpoint reported them durable.
+    #[test]
+    fn colliding_start_timestamps_keep_both_partitions() {
+        fn entry(dir: &str, min_ts: i64) -> PartitionEntry {
+            PartitionEntry {
+                meta: PartitionMeta {
+                    min_ts,
+                    max_ts: min_ts,
+                    row_count: 1,
+                    size_bytes: 1,
+                    schema_version: 1,
+                    state: PartitionState::Sealed,
+                    interval_ms: 0,
+                    last_flushed_wal_lsn: 0,
+                    column_stats: std::collections::HashMap::new(),
+                    max_system_ts: 0,
+                },
+                dir_name: dir.to_string(),
+            }
+        }
+
+        let mut reg = PartitionRegistry::new(test_config());
+        let first = reg.insert_partition(entry("ts-a", 100));
+        let second = reg.insert_partition(entry("ts-b", 100));
+
+        assert_ne!(first, second);
+        assert_eq!(reg.partition_count(), 2);
+
+        let found = reg.query_partitions(&TimeRange::new(0, 1000));
+        let mut dirs: Vec<&str> = found.iter().map(|e| e.dir_name.as_str()).collect();
+        dirs.sort_unstable();
+        assert_eq!(dirs, vec!["ts-a", "ts-b"]);
+
+        // Re-registering the same directory is idempotent (restore / boot rescan).
+        let again = reg.insert_partition(entry("ts-a", 100));
+        assert_eq!(again, first);
+        assert_eq!(reg.partition_count(), 2);
+    }
+}

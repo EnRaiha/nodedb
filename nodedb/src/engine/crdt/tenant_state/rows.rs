@@ -106,3 +106,38 @@ impl TenantCrdtEngine {
         Ok(removed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_crdt::constraint::ConstraintSet;
+    use nodedb_crdt::validator::ProposedChange;
+
+    use crate::types::TenantId;
+
+    use super::*;
+
+    #[test]
+    fn separate_collections_have_isolated_docs() {
+        let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+
+        let change = ProposedChange {
+            collection: "users".into(),
+            row_id: "u1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![("name".into(), LoroValue::String("Alice".into()))],
+        };
+        engine
+            .validate_and_apply(
+                1,
+                nodedb_crdt::CrdtAuthContext::default(),
+                &change,
+                b"d".to_vec(),
+            )
+            .unwrap();
+
+        assert!(engine.row_exists("users", "u1"));
+        assert!(!engine.row_exists("orders", "u1"));
+        assert!(engine.read_row("users", "u1").is_some());
+        assert!(engine.read_row("orders", "u1").is_none());
+    }
+}

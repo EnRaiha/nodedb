@@ -21,9 +21,6 @@ pub(crate) mod runtime;
 pub(crate) mod scalar;
 pub(crate) mod wasm;
 
-#[cfg(test)]
-mod tests;
-
 pub use bitmask::{
     bitmask_all, bitmask_and, bitmask_not, bitmask_or, bitmask_to_indices, popcount, words_for,
 };

@@ -26,10 +26,3 @@ pub use crate::control::distributed_applier::{
     AppliedWrite, ApplyBatch, DistributedApplier, ProposeResult, ProposeTracker,
     create_distributed_applier, run_apply_loop,
 };
-
-#[cfg(test)]
-mod kv_ttl_tests;
-#[cfg(test)]
-mod test_support;
-#[cfg(test)]
-mod tests;

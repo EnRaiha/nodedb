@@ -78,3 +78,166 @@ pub fn to_replicated_entry(
         )
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, KvOp};
+    use nodedb_types::{QualifiedCollection, Surrogate};
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    /// Shadows this file's `to_replicated_entry`, which takes a decided
+    /// [`ReplicableWrite`].
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = ReplicableWrite::decide_for_replication(plan)?;
+        super::to_replicated_entry(tenant_id, database_id, vshard_id, &write)
+    }
+
+    #[test]
+    fn to_replicated_entry_writes_only() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+            document_id: "d".into(),
+            value: vec![],
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+        });
+        assert!(
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+                .expect("encode must not error")
+                .is_some()
+        );
+
+        let plan = PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+            document_id: "d".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        assert!(
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+                .expect("encode must not error")
+                .is_none()
+        );
+    }
+
+    // ---- Pinned replication gaps: writes with no `ReplicatedWrite` shape yet,
+    // so `to_replicated_entry` returns `None` on purpose. Each assertion is a
+    // tripwire — wiring one of these must fail loudly and update this list.
+
+    #[test]
+    fn known_write_gaps_are_not_replicated() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let gaps: Vec<(&str, PhysicalPlan)> = vec![
+            (
+                "Document::Merge",
+                PhysicalPlan::Document(DocumentOp::Merge {
+                    target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                    source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+                    source_alias: "s".into(),
+                    target_join_col: "id".into(),
+                    source_join_col: "id".into(),
+                    clauses: Vec::new(),
+                    returning: None,
+                    resolved_inserts: None,
+                    source_rows: None,
+                    rls_filters: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                    resolved_sum_targets: Vec::new(),
+                }),
+            ),
+            (
+                "Document::UpdateFromJoin",
+                PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+                    target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                    source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+                    source_alias: "s".into(),
+                    target_join_col: "id".into(),
+                    source_join_col: "id".into(),
+                    updates: Vec::new(),
+                    target_filters: Vec::new(),
+                    returning: None,
+                    source_rows: None,
+                    rls_filters: Vec::new(),
+                    rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                    resolved_sum_targets: Vec::new(),
+                }),
+            ),
+            (
+                "Crdt::RestoreToVersion",
+                PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
+                    collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                    document_id: "id1".into(),
+                    target_version_json: "{}".into(),
+                    surrogate: Surrogate::new(1),
+                }),
+            ),
+        ];
+
+        for (name, plan) in &gaps {
+            assert!(
+                to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan)
+                    .expect("encode must not error")
+                    .is_none(),
+                "{name} is a known replication gap; wiring is a tracked follow-up — \
+                 this test fails loudly if someone wires it so they update the tracking"
+            );
+        }
+    }
+
+    #[test]
+    fn representative_handled_writes_still_replicate() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        // Guard: a live document/KV write must still return `Some`.
+        let point_put = PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            document_id: "d1".into(),
+            value: vec![1, 2, 3],
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+        });
+        assert!(
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &point_put)
+                .expect("encode must not error")
+                .is_some(),
+            "Document::PointPut must still replicate"
+        );
+
+        let kv_put = PhysicalPlan::Kv(KvOp::Put {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
+            key: vec![1],
+            value: vec![2],
+            ttl_ms: 0,
+            surrogate: Surrogate::new(7),
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &kv_put)
+                .expect("encode must not error")
+                .is_some(),
+            "Kv::Put must still replicate"
+        );
+    }
+}

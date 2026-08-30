@@ -18,9 +18,6 @@ pub mod query;
 pub mod rate;
 pub mod registry;
 
-#[cfg(test)]
-mod tests;
-
 pub use entry::{PartitionEntry, format_partition_dir};
 pub use rate::RateEstimator;
 pub use registry::PartitionRegistry;

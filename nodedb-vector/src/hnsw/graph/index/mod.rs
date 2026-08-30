@@ -10,8 +10,5 @@ mod state;
 mod tombstones;
 mod vectors;
 
-#[cfg(test)]
-mod tests;
-
 pub use nodedb_types::hnsw::HnswParams;
 pub use state::HnswIndex;

@@ -12,7 +12,4 @@
 
 pub mod segment;
 
-#[cfg(test)]
-mod tests;
-
 pub use segment::{CompactionResult, DEFAULT_DELETE_RATIO_THRESHOLD, compact_segment};

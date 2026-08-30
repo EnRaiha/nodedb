@@ -167,3 +167,80 @@ impl SessionStore {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::PhysicalPlan;
+    use nodedb_physical::physical_task::PostSetOp;
+
+    use crate::control::lease::QueryLeaseScope;
+    use crate::types::{DatabaseId, TenantId};
+
+    fn task() -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(1),
+            plan: PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    #[test]
+    fn transaction_lifecycle() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        store.ensure_session(addr);
+
+        assert_eq!(store.transaction_state(addr), TransactionState::Idle);
+
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        assert_eq!(store.transaction_state(addr), TransactionState::InBlock);
+
+        store.commit(addr).unwrap();
+        assert_eq!(store.transaction_state(addr), TransactionState::Idle);
+
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        store.fail_transaction(addr);
+        assert_eq!(store.transaction_state(addr), TransactionState::Failed);
+
+        store.rollback(addr).unwrap();
+        assert_eq!(store.transaction_state(addr), TransactionState::Idle);
+    }
+
+    #[test]
+    fn commit_returns_lease_holders_after_transitioning_session_to_idle() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:6012".parse().expect("address");
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).expect("begin");
+
+        let scope = Arc::new(QueryLeaseScope::empty());
+        assert!(store.buffer_write(addr, task()));
+        assert!(store.attach_tx_lease_scope_since(addr, 0, Arc::clone(&scope)));
+
+        let (tasks, holders) = store.commit(addr).expect("commit");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(holders.len(), 1);
+        assert!(
+            holders[0]
+                .as_ref()
+                .is_some_and(|holder| Arc::ptr_eq(holder, &scope))
+        );
+        assert_eq!(store.transaction_state(addr), TransactionState::Idle);
+        store.read_session(addr, |session| {
+            assert!(session.tx_buffer.is_empty());
+            assert!(session.tx_lease_scopes.is_empty());
+        });
+
+        // The returned holders, which `run_commit` owns, keep the scope alive
+        // after the session has transitioned to Idle.
+        assert_eq!(Arc::strong_count(&scope), 2);
+        drop(holders);
+        assert_eq!(Arc::strong_count(&scope), 1);
+    }
+}

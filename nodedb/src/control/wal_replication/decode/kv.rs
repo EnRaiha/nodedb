@@ -513,3 +513,238 @@ pub(super) fn transfer_item(
         dest_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::ReplicatedEntry;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::{ReturningColumns, ReturningItem, UpdateValue};
+    use nodedb_types::{QualifiedCollection, Surrogate};
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn kv_truncate_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Kv(KvOp::Truncate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::Truncate should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::Truncate { collection }) => {
+                assert_eq!(collection.as_str(), "kv");
+            }
+            other => panic!("expected Kv(Truncate), got {other:?}"),
+        }
+    }
+
+    /// `KvOp::RegisterIndex` must produce a `ReplicatedEntry` and round-trip
+    /// verbatim — `backfill` and `field_position` aren't inferable at apply time.
+    #[test]
+    fn kv_register_index_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
+            field: "name".into(),
+            field_position: 2,
+            backfill: true,
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::RegisterIndex must now produce a ReplicatedEntry (cluster-replicated)");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        assert_eq!(resolved_now_ms, None, "index DDL carries no TTL instant");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::RegisterIndex {
+                collection,
+                field,
+                field_position,
+                backfill,
+            }) => {
+                assert_eq!(collection.as_str(), "players");
+                assert_eq!(field, "name");
+                assert_eq!(field_position, 2, "field_position must round-trip");
+                assert!(
+                    backfill,
+                    "backfill must round-trip (not inferable at apply)"
+                );
+            }
+            other => panic!("expected Kv(RegisterIndex), got {other:?}"),
+        }
+
+        // backfill = false must survive distinctly, not default to true.
+        let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
+            field: "name".into(),
+            field_position: 0,
+            backfill: false,
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::RegisterIndex must produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::RegisterIndex { backfill, .. }) => {
+                assert!(!backfill, "backfill = false must round-trip distinctly");
+            }
+            other => panic!("expected Kv(RegisterIndex), got {other:?}"),
+        }
+    }
+
+    /// `KvOp::DropIndex` (KV secondary-index DDL) — same cluster-replication
+    /// regression guard as [`kv_register_index_roundtrip`].
+    #[test]
+    fn kv_drop_index_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Kv(KvOp::DropIndex {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
+            field: "name".into(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::DropIndex must now produce a ReplicatedEntry (cluster-replicated)");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::DropIndex { collection, field }) => {
+                assert_eq!(collection.as_str(), "players");
+                assert_eq!(field, "name");
+            }
+            other => panic!("expected Kv(DropIndex), got {other:?}"),
+        }
+    }
+
+    /// `entry_kv::kv_write` must not drop `KvOp::Put::returning` / `rls_filters`
+    /// — the leader re-derives its plan from the committed entry, so a drop here
+    /// loses `RETURNING` for the originating request too, not just followers.
+    #[test]
+    fn kv_put_returning_and_rls_filters_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let spec = ReturningSpec {
+            columns: ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Kv(KvOp::Put {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "kv"),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            ttl_ms: 0,
+            surrogate: Surrogate::new(1),
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::Put should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::Put {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING write must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Kv(Put), got {other:?}"),
+        }
+    }
+
+    /// See `kv_put_returning_and_rls_filters_roundtrip`; same bug,
+    /// `KvOp::InsertOnConflictUpdate`.
+    #[test]
+    fn kv_insert_on_conflict_update_returning_and_rls_filters_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let spec = ReturningSpec {
+            columns: ReturningColumns::Named(vec![ReturningItem {
+                name: "balance".into(),
+                alias: None,
+            }]),
+        };
+        let plan = PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            key: b"a1".to_vec(),
+            value: b"v1".to_vec(),
+            ttl_ms: 0,
+            updates: vec![("balance".into(), UpdateValue::Literal(b"100".to_vec()))],
+            surrogate: Surrogate::new(2),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("KvOp::InsertOnConflictUpdate should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING write must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Kv(InsertOnConflictUpdate), got {other:?}"),
+        }
+    }
+}

@@ -295,3 +295,83 @@ impl SparseEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn put_and_get() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u2", b"bob").unwrap();
+        assert_eq!(
+            engine.get(0, 1, "users", "u1").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get(0, 1, "users", "u2").unwrap(),
+            Some(b"bob".to_vec())
+        );
+        assert_eq!(engine.get(0, 1, "users", "u3").unwrap(), None);
+    }
+
+    #[test]
+    fn databases_are_isolated() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(7, 1, "users", "u1", b"alice-db7").unwrap();
+        assert_eq!(
+            engine.get(0, 1, "users", "u1").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get(7, 1, "users", "u1").unwrap(),
+            Some(b"alice-db7".to_vec())
+        );
+    }
+
+    #[test]
+    fn put_overwrites() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u1", b"ALICE").unwrap();
+        assert_eq!(
+            engine.get(0, 1, "users", "u1").unwrap(),
+            Some(b"ALICE".to_vec())
+        );
+    }
+
+    #[test]
+    fn delete_removes() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        assert_eq!(
+            engine.delete(0, 1, "users", "u1").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(engine.get(0, 1, "users", "u1").unwrap(), None);
+        assert_eq!(engine.delete(0, 1, "users", "u1").unwrap(), None);
+    }
+
+    #[test]
+    fn collections_are_isolated() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "orders", "u1", b"order-1").unwrap();
+        assert_eq!(
+            engine.get(0, 1, "users", "u1").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get(0, 1, "orders", "u1").unwrap(),
+            Some(b"order-1".to_vec())
+        );
+    }
+}

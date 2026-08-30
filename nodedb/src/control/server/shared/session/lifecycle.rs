@@ -125,3 +125,167 @@ pub async fn run_rollback(
         super::ddl_rollback::restore_data_plane(state, &discarded).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+    use crate::control::security::identity::DatabaseSet;
+    use crate::types::{DatabaseId, Lsn, RequestId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::MetaOp;
+    use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+    /// `run_begin` anchors the session's cross-shard snapshot to the last
+    /// globally-applied Calvin epoch from `SharedState::last_applied_calvin_epoch`.
+    #[tokio::test]
+    async fn run_begin_anchors_snapshot_epoch() {
+        use std::sync::atomic::Ordering;
+
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = std::sync::Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap(),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).unwrap();
+
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5100".parse().unwrap();
+        store.ensure_session(addr);
+
+        // Seed the applied epoch to 7 and BEGIN — the session anchors to 7.
+        state.last_applied_calvin_epoch.store(7, Ordering::Release);
+        run_begin(&store, SessionId::from(&addr), &state).unwrap();
+        assert_eq!(store.snapshot_epoch(addr), Some(7));
+        store.commit(addr).unwrap();
+        assert_eq!(store.snapshot_epoch(addr), None);
+
+        // Unset (single-node / no-Calvin): BEGIN anchors to 0.
+        state.last_applied_calvin_epoch.store(0, Ordering::Release);
+        run_begin(&store, SessionId::from(&addr), &state).unwrap();
+        assert_eq!(store.snapshot_epoch(addr), Some(0));
+    }
+
+    /// A `TxnDataPlane` that records every dispatched overlay meta-op (per vShard)
+    /// instead of touching a real core. `MarkSavepoint` replies with a 16-byte
+    /// composite marker whose value component is `vshard + 1`, so a later
+    /// ROLLBACK TO can be asserted to thread each vShard's own saved marker.
+    #[derive(Default)]
+    struct RecordingDp {
+        ops: Mutex<Vec<(VShardId, MetaOp)>>,
+    }
+
+    impl TxnDataPlane for RecordingDp {
+        fn dispatch_no_wal<'a>(
+            &'a self,
+            task: PhysicalTask,
+            _wal_lsn: Option<Lsn>,
+        ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
+            let vshard = task.vshard_id;
+            let payload = if let PhysicalPlan::Meta(op) = &task.plan {
+                self.ops.lock().unwrap().push((vshard, op.clone()));
+                match op {
+                    MetaOp::MarkSavepoint { .. } => {
+                        let value = (vshard.as_u32() as u64) + 1;
+                        let graph = 0u64;
+                        let mut bytes = Vec::with_capacity(16);
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                        bytes.extend_from_slice(&graph.to_le_bytes());
+                        Payload::from_vec(bytes)
+                    }
+                    _ => Payload::empty(),
+                }
+            } else {
+                Payload::empty()
+            };
+            Box::pin(async move {
+                Ok(Response {
+                    request_id: RequestId::new(1),
+                    status: Status::Ok,
+                    attempt: 1,
+                    partial: false,
+                    payload,
+                    watermark_lsn: Lsn::ZERO,
+                    error_code: None,
+                    read_set_valid: None,
+                    read_version_lsn: crate::types::Lsn::ZERO,
+                    write_set: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// A benign staged write task homed on `vshard`. The plan content is irrelevant
+    /// to overlay teardown — only the vShard it stages to is tracked.
+    fn staged_task(vshard: u32) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(vshard),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    fn test_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_internal_service(
+            1,
+            "tester",
+            TenantId::new(1),
+            Vec::new(),
+            true,
+            None,
+            DatabaseSet::All,
+        )
+    }
+
+    /// ROLLBACK of a transaction that staged writes to TWO vShards must drop the
+    /// staging overlay on BOTH — the pre-fix single-`tx_vshard` code leaked the
+    /// second core's overlay.
+    #[tokio::test]
+    async fn multi_vshard_rollback_drops_every_overlay() {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = std::sync::Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap(),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).unwrap();
+
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5200".parse().unwrap();
+        store.ensure_session(addr);
+        run_begin(&store, SessionId::from(&addr), &state).unwrap();
+
+        // Stage to two distinct vShards/cores.
+        assert!(store.buffer_write(addr, staged_task(3)));
+        assert!(store.buffer_write(addr, staged_task(9)));
+
+        let identity = test_identity();
+        let dp = RecordingDp::default();
+        run_rollback(&store, SessionId::from(&addr), &identity, &state, &dp).await;
+
+        let ops = dp.ops.lock().unwrap();
+        let drops: Vec<VShardId> = ops
+            .iter()
+            .filter_map(|(v, op)| matches!(op, MetaOp::DropTxnOverlay { .. }).then_some(*v))
+            .collect();
+        assert!(drops.contains(&VShardId::new(3)), "core A overlay dropped");
+        assert!(
+            drops.contains(&VShardId::new(9)),
+            "core B overlay dropped (would leak pre-fix)"
+        );
+        assert_eq!(drops.len(), 2, "exactly the two staged overlays dropped");
+    }
+}

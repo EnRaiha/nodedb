@@ -276,9 +276,83 @@ pub(super) fn msgpack_write_array_header(buf: &mut Vec<u8>, len: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::encode::{decode_payload_to_json, encode_json_vec_as_msgpack};
     use super::*;
     use nodedb_types::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn raw_document_rows_roundtrip() {
+        let doc1 = serde_json::json!({"name": "alice", "age": 30});
+        let doc2 = serde_json::json!({"name": "bob", "age": 25});
+        let msgpack1 = nodedb_types::json_to_msgpack(&doc1).unwrap();
+        let msgpack2 = nodedb_types::json_to_msgpack(&doc2).unwrap();
+
+        let rows = vec![
+            ("doc1".to_string(), msgpack1),
+            ("doc2".to_string(), msgpack2),
+        ];
+
+        let encoded = encode_raw_document_rows(&rows).unwrap();
+        let json = decode_payload_to_json(&encoded);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["id"], "doc1");
+        assert_eq!(parsed[0]["data"]["name"], "alice");
+        assert_eq!(parsed[0]["data"]["age"], 30);
+        assert_eq!(parsed[1]["id"], "doc2");
+        assert_eq!(parsed[1]["data"]["name"], "bob");
+    }
+
+    #[test]
+    fn raw_document_rows_empty() {
+        let rows: Vec<(String, Vec<u8>)> = vec![];
+        let encoded = encode_raw_document_rows(&rows).unwrap();
+        let json = decode_payload_to_json(&encoded);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn decode_raw_scan_to_docs_accepts_plain_rows() {
+        let rows = vec![serde_json::json!({"avg_amount": 43.598})];
+        let encoded = encode_json_vec_as_msgpack(&rows).unwrap();
+
+        let decoded = decode_raw_scan_to_docs(&encoded);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "");
+        let decoded_json = decode_payload_to_json(&decoded[0].1);
+        let parsed: serde_json::Value = serde_json::from_str(&decoded_json).unwrap();
+        assert_eq!(parsed["avg_amount"], 43.598);
+    }
+
+    #[test]
+    fn decode_raw_scan_to_docs_handles_mixed_arrays() {
+        let wrapped_doc = serde_json::json!({"name": "alice"});
+        let wrapped_rows = vec![(
+            "doc1".to_string(),
+            nodedb_types::json_to_msgpack(&wrapped_doc).unwrap(),
+        )];
+        let wrapped = encode_raw_document_rows(&wrapped_rows).unwrap();
+
+        let plain_rows = vec![serde_json::json!({"avg_amount": 43.598})];
+        let plain = encode_json_vec_as_msgpack(&plain_rows).unwrap();
+
+        let mut combined = wrapped;
+        combined.extend_from_slice(&plain);
+
+        let decoded = decode_raw_scan_to_docs(&combined);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, "doc1");
+        assert_eq!(decode_payload_to_json(&decoded[0].1), r#"{"name":"alice"}"#);
+        assert_eq!(decoded[1].0, "");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&decode_payload_to_json(&decoded[1].1)).unwrap();
+        assert_eq!(parsed["avg_amount"], 43.598);
+    }
 
     fn bare_doc(pairs: Vec<(&str, Value)>) -> Vec<u8> {
         let map = pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();

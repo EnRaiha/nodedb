@@ -296,3 +296,276 @@ impl CoreLoop {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::doc_format;
+    use crate::data::executor::handlers::point::insert::PointInsertParams;
+    use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
+    use crate::types::{DatabaseId, TenantId};
+
+    const DB: u64 = 0;
+    const TID: u64 = 1;
+    const SOURCE: &str = "point_txns";
+    const TARGET: &str = "point_holders";
+
+    /// The premise every test below rests on.
+    #[test]
+    fn the_fixture_is_co_resident() {
+        assert!(
+            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            "'{SOURCE}' and '{TARGET}' must share a vShard: a cross-shard binding's balance \
+             travels on its own task and is never folded into the source write's transaction"
+        );
+    }
+    const A1: &str = "a1";
+    const A2: &str = "a2";
+    const T1: Surrogate = Surrogate(4001);
+    const T2: Surrogate = Surrogate(4002);
+
+    fn binding() -> nodedb_physical::physical_plan::MaterializedSumBinding {
+        nodedb_physical::physical_plan::MaterializedSumBinding {
+            target_collection: TARGET.to_string(),
+            target_column: "balance".to_string(),
+            join_column: "account_id".to_string(),
+            value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
+        }
+    }
+
+    fn resolved() -> Vec<ResolvedSumTarget> {
+        vec![
+            ResolvedSumTarget::new(TARGET, A1, T1),
+            ResolvedSumTarget::new(TARGET, A2, T2),
+        ]
+    }
+
+    fn config_key(collection: &str) -> (DatabaseId, TenantId, String) {
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            collection.to_string(),
+        )
+    }
+
+    /// A source collection bound to the sum, and two target rows starting at
+    /// zero.
+    fn seeded_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+
+        let mut source = CollectionConfig::new(SOURCE);
+        source.enforcement.materialized_sum_sources = vec![binding()];
+        core.doc_configs.insert(config_key(SOURCE), source);
+        core.doc_configs
+            .insert(config_key(TARGET), CollectionConfig::new(TARGET));
+
+        for (id, surrogate) in [(A1, T1), (A2, T2)] {
+            let seed = serde_json::json!({"id": id, "balance": "0"});
+            core.sparse
+                .put(
+                    DB,
+                    TID,
+                    TARGET,
+                    &surrogate_to_doc_id(surrogate),
+                    &doc_format::encode_to_msgpack(&seed),
+                )
+                .expect("seed target row");
+        }
+        core
+    }
+
+    /// A source row body, in the MessagePack every handler receives.
+    fn entry(account: &str, amount: i64) -> Vec<u8> {
+        doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": account,
+            "amount": amount,
+        }))
+    }
+
+    /// The balance the target row currently holds.
+    fn balance(core: &CoreLoop, surrogate: Surrogate) -> String {
+        let stored = core
+            .sparse
+            .get(DB, TID, TARGET, &surrogate_to_doc_id(surrogate))
+            .expect("read target")
+            .expect("target row must exist");
+        doc_format::decode_document(&stored)
+            .expect("target row must decode")
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .expect("target row must carry a balance")
+            .to_string()
+    }
+
+    fn insert(
+        core: &mut CoreLoop,
+        task: &ExecutionTask,
+        surrogate: Surrogate,
+        body: &[u8],
+    ) -> Status {
+        let targets = resolved();
+        let document_id = format!("e{}", surrogate.as_u32());
+        core.execute_point_insert(PointInsertParams {
+            task,
+            tid: TID,
+            collection: SOURCE,
+            document_id: &document_id,
+            surrogate,
+            value: body,
+            if_absent: false,
+            returning: None,
+            rls_filters: &[],
+            resolved_sum_targets: &targets,
+            deferred_sum_targets: &[],
+        })
+        .status
+    }
+
+    #[test]
+    fn point_update_moves_the_amount_when_the_join_key_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+        let targets = resolved();
+
+        assert_eq!(
+            insert(&mut core, &task, Surrogate(41), &entry(A1, 60)),
+            Status::Ok
+        );
+        assert_eq!(balance(&core, T1), "60");
+
+        let moved = nodedb_types::json_to_msgpack(&serde_json::json!(A2)).expect("encode");
+        let updates = vec![("account_id".to_string(), UpdateValue::Literal(moved))];
+        let resp = core.execute_point_update(
+            &task,
+            PointUpdateParams {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e41",
+                surrogate: Surrogate(41),
+                updates: &updates,
+                returning: None,
+                rls_filters: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: &targets,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+
+        assert_eq!(
+            balance(&core, T1),
+            "0",
+            "the account the row left must lose the amount"
+        );
+        assert_eq!(
+            balance(&core, T2),
+            "60",
+            "the account the row joined must gain it"
+        );
+    }
+
+    #[test]
+    fn point_update_deltas_the_amount_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+        let targets = resolved();
+
+        assert_eq!(
+            insert(&mut core, &task, Surrogate(51), &entry(A1, 10)),
+            Status::Ok
+        );
+
+        let raised = nodedb_types::json_to_msgpack(&serde_json::json!(35)).expect("encode");
+        let updates = vec![("amount".to_string(), UpdateValue::Literal(raised))];
+        let resp = core.execute_point_update(
+            &task,
+            PointUpdateParams {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e51",
+                surrogate: Surrogate(51),
+                updates: &updates,
+                returning: None,
+                rls_filters: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: &targets,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(
+            balance(&core, T1),
+            "35",
+            "the total must move by the difference, not by the new amount"
+        );
+    }
+
+    /// A hash-chained collection, exactly as DDL builds one: `HASH_CHAIN` implies
+    /// `APPEND_ONLY`.
+    fn chained_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+        let mut config = CollectionConfig::new(SOURCE);
+        config.enforcement.append_only = true;
+        config.enforcement.hash_chain = true;
+        core.doc_configs.insert(config_key(SOURCE), config);
+        core
+    }
+
+    fn insert_chained(core: &mut CoreLoop, task: &ExecutionTask) -> Status {
+        core.execute_point_insert(PointInsertParams {
+            task,
+            tid: TID,
+            collection: SOURCE,
+            document_id: "e1",
+            surrogate: Surrogate(91),
+            value: &entry(A1, 10),
+            if_absent: false,
+            returning: None,
+            rls_filters: &[],
+            resolved_sum_targets: &[],
+            deferred_sum_targets: &[],
+        })
+        .status
+    }
+
+    /// Rewriting a link has the same effect as removing one.
+    #[test]
+    fn an_update_on_a_hash_chained_collection_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = chained_core(dir.path());
+        let task = make_default_task();
+        assert_eq!(insert_chained(&mut core, &task), Status::Ok);
+
+        let raised = nodedb_types::json_to_msgpack(&serde_json::json!(999)).expect("encode");
+        let updates = vec![("amount".to_string(), UpdateValue::Literal(raised))];
+        let resp = core.execute_point_update(
+            &task,
+            PointUpdateParams {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e1",
+                surrogate: Surrogate(91),
+                updates: &updates,
+                returning: None,
+                rls_filters: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: &[],
+            },
+        );
+        assert_eq!(resp.status, Status::Error);
+
+        let stored = core
+            .sparse
+            .get(DB, TID, SOURCE, &surrogate_to_doc_id(Surrogate(91)))
+            .expect("read back")
+            .expect("row must exist");
+        let doc = doc_format::decode_document(&stored).expect("decode");
+        assert_eq!(
+            doc.get("amount").and_then(|v| v.as_i64()),
+            Some(10),
+            "a refused update must leave the chained row byte-identical"
+        );
+    }
+}

@@ -4,9 +4,7 @@
 
 mod binding;
 mod join;
-#[cfg(test)]
-pub(super) mod tests;
-mod triple;
+pub(super) mod triple;
 
 use std::collections::HashMap;
 

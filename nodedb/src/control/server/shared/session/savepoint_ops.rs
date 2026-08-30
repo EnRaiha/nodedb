@@ -249,6 +249,136 @@ pub fn parse_deferred_offset(sql: &str, upper: &str) -> Result<Option<DeferredOf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use crate::bridge::envelope::{Payload, Response, Status};
+    use crate::control::server::shared::session::store::SessionStore;
+    use crate::types::{DatabaseId, Lsn, RequestId};
+
+    /// A `TxnDataPlane` that records every dispatched overlay meta-op (per vShard)
+    /// instead of touching a real core. `MarkSavepoint` replies with a 16-byte
+    /// composite marker whose value component is `vshard + 1`, so a later
+    /// ROLLBACK TO can be asserted to thread each vShard's own saved marker.
+    #[derive(Default)]
+    struct RecordingDp {
+        ops: Mutex<Vec<(VShardId, MetaOp)>>,
+    }
+
+    impl TxnDataPlane for RecordingDp {
+        fn dispatch_no_wal<'a>(
+            &'a self,
+            task: PhysicalTask,
+            _wal_lsn: Option<Lsn>,
+        ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
+            let vshard = task.vshard_id;
+            let payload = if let PhysicalPlan::Meta(op) = &task.plan {
+                self.ops.lock().unwrap().push((vshard, op.clone()));
+                match op {
+                    MetaOp::MarkSavepoint { .. } => {
+                        let value = (vshard.as_u32() as u64) + 1;
+                        let graph = 0u64;
+                        let mut bytes = Vec::with_capacity(16);
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                        bytes.extend_from_slice(&graph.to_le_bytes());
+                        Payload::from_vec(bytes)
+                    }
+                    _ => Payload::empty(),
+                }
+            } else {
+                Payload::empty()
+            };
+            Box::pin(async move {
+                Ok(Response {
+                    request_id: RequestId::new(1),
+                    status: Status::Ok,
+                    attempt: 1,
+                    partial: false,
+                    payload,
+                    watermark_lsn: Lsn::ZERO,
+                    error_code: None,
+                    read_set_valid: None,
+                    read_version_lsn: crate::types::Lsn::ZERO,
+                    write_set: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// A benign staged write task homed on `vshard`. The plan content is irrelevant
+    /// to overlay teardown — only the vShard it stages to is tracked.
+    fn staged_task(vshard: u32) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(vshard),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// A vShard first staged AFTER a savepoint must have ALL its staged writes
+    /// rewound on ROLLBACK TO — its overlay is rewound to marker `(0, 0)`, while a
+    /// vShard present at savepoint time rewinds to its own saved marker.
+    #[tokio::test]
+    async fn multi_vshard_rollback_to_savepoint_rewinds_each_vshard() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5201".parse().unwrap();
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        let tenant = TenantId::new(1);
+        let dp = RecordingDp::default();
+
+        // Stage on core A (3), then SAVEPOINT — only A is marked.
+        assert!(store.buffer_write(addr, staged_task(3)));
+        run_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
+            .await
+            .expect("savepoint");
+
+        // Stage on core B (9) AFTER the savepoint.
+        assert!(store.buffer_write(addr, staged_task(9)));
+
+        // ROLLBACK TO s1 — A rewinds to its saved marker, B rewinds to (0, 0).
+        run_rollback_to_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
+            .await
+            .expect("rollback to savepoint");
+
+        let ops = dp.ops.lock().unwrap();
+
+        // Only core A was marked at savepoint time (B was not yet staged).
+        let marks: Vec<u32> = ops
+            .iter()
+            .filter_map(|(v, op)| matches!(op, MetaOp::MarkSavepoint { .. }).then_some(v.as_u32()))
+            .collect();
+        assert_eq!(marks, vec![3], "only the pre-savepoint vShard is marked");
+
+        // Both staged vShards are rewound; A to its saved marker (3+1), B to zero.
+        let rewinds: std::collections::BTreeMap<u32, (u64, u64)> = ops
+            .iter()
+            .filter_map(|(v, op)| match op {
+                MetaOp::RollbackToSavepoint {
+                    value_marker,
+                    graph_marker,
+                    ..
+                } => Some((v.as_u32(), (*value_marker, *graph_marker))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rewinds.get(&3),
+            Some(&(4, 0)),
+            "core A rewinds to its saved marker"
+        );
+        assert_eq!(
+            rewinds.get(&9),
+            Some(&(0, 0)),
+            "core B (staged after savepoint) rewinds to empty"
+        );
+    }
 
     #[test]
     fn deferred_commit_offset_accepts_emitted_and_legacy_tokens() {

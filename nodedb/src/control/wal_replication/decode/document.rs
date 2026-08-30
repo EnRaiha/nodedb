@@ -470,3 +470,518 @@ pub(super) fn resolved_write(
         rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::{ReplicatedEntry, ReplicatedWrite};
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_types::{QualifiedCollection, Surrogate};
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    /// The materialized-sum resolution survives the wire on the insert and
+    /// predicate shapes. A lost resolution fails the fold silently; a lost
+    /// deferral double-counts against the sibling `ApplyBalanceDelta` entry.
+    #[test]
+    fn materialized_sum_resolution_roundtrips() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
+            document_id: "e1".into(),
+            value: vec![1, 2, 3],
+            if_absent: false,
+            surrogate: Surrogate::new(900),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: vec![
+                ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                ResolvedSumTarget::new("accounts", "acc-2", Surrogate::new(4243)),
+                // A second binding on the same join column, different target.
+                ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+            ],
+            deferred_sum_targets: vec!["accounts_elsewhere".to_string()],
+        });
+        let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("a document insert must replicate")
+            .to_bytes();
+        let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded {
+            PhysicalPlan::Document(DocumentOp::PointInsert {
+                resolved_sum_targets,
+                deferred_sum_targets,
+                ..
+            }) => {
+                assert_eq!(
+                    resolved_sum_targets,
+                    vec![
+                        ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                        ResolvedSumTarget::new("accounts", "acc-2", Surrogate::new(4243)),
+                        ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+                    ],
+                    "a replica cannot resolve a join key itself — the table must arrive with \
+                     the write, and each entry must arrive with the TARGET it was resolved \
+                     against"
+                );
+                assert_eq!(
+                    deferred_sum_targets,
+                    vec!["accounts_elsewhere".to_string()],
+                    "a lost deferral is a double count, not a missing one"
+                );
+            }
+            other => panic!("expected PointInsert, got {other:?}"),
+        }
+
+        let bulk = PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
+            filters: vec![7, 7],
+            returning: None,
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: vec![ResolvedSumTarget::new(
+                "accounts",
+                "acc-1",
+                Surrogate::new(4242),
+            )],
+        });
+        let bytes = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &bulk)
+            .expect("encode must not error")
+            .expect("a single-shard bulk delete must replicate")
+            .to_bytes();
+        let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded {
+            PhysicalPlan::Document(DocumentOp::BulkDelete {
+                resolved_sum_targets,
+                ..
+            }) => assert_eq!(
+                resolved_sum_targets,
+                vec![ResolvedSumTarget::new(
+                    "accounts",
+                    "acc-1",
+                    Surrogate::new(4242)
+                )],
+                "a replica re-derives which rows matched, never which target they credit"
+            ),
+            other => panic!("expected BulkDelete, got {other:?}"),
+        }
+    }
+
+    /// A record committed before the target collection travelled on the wire
+    /// still decodes: the superseded slot's entries are lifted untargeted and
+    /// match any binding by join value alone.
+    #[test]
+    fn a_record_without_target_collections_decodes_as_untargeted() {
+        let entry = ReplicatedEntry::new(
+            1,
+            0,
+            0,
+            ReplicatedWrite::PointDelete {
+                collection: "entries".into(),
+                document_id: "e1".into(),
+                surrogate: 900,
+                resolved_sum_targets: vec![("acc-1".into(), 4242)],
+                resolved_sum_target_bindings: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+            },
+        );
+        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded {
+            PhysicalPlan::Document(DocumentOp::PointDelete {
+                resolved_sum_targets,
+                ..
+            }) => {
+                assert_eq!(
+                    resolved_sum_targets,
+                    vec![ResolvedSumTarget::untargeted("acc-1", Surrogate::new(4242))],
+                    "the older slot must still be read when the newer one is empty"
+                );
+                assert!(
+                    resolved_sum_targets[0].addresses("accounts", "acc-1"),
+                    "an untargeted entry answers for whichever binding asks"
+                );
+            }
+            other => panic!("expected PointDelete, got {other:?}"),
+        }
+    }
+
+    /// A current-node record carries the resolution in both slots; the newer one
+    /// is authoritative. The older slot stays populated so an older-binary peer
+    /// keeps working instead of seeing an empty resolution.
+    #[test]
+    fn a_current_record_carries_both_slots_and_reads_the_newer_one() {
+        let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
+            document_id: "e1".into(),
+            surrogate: Surrogate::new(900),
+            pk_bytes: b"e1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: vec![
+                ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+            ],
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("a point delete must replicate");
+        match &entry.write {
+            ReplicatedWrite::PointDelete {
+                resolved_sum_targets,
+                resolved_sum_target_bindings,
+                ..
+            } => {
+                assert_eq!(
+                    resolved_sum_target_bindings.len(),
+                    2,
+                    "both bindings must travel; the newer slot is the authoritative one"
+                );
+                assert_eq!(
+                    resolved_sum_targets,
+                    &vec![("acc-1".to_string(), 4242)],
+                    "the superseded slot keeps its one-entry-per-value shape, so an older \
+                     peer reads what it has always read"
+                );
+            }
+            other => panic!("expected PointDelete, got {other:?}"),
+        }
+
+        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded {
+            PhysicalPlan::Document(DocumentOp::PointDelete {
+                resolved_sum_targets,
+                ..
+            }) => assert_eq!(
+                resolved_sum_targets,
+                vec![
+                    ResolvedSumTarget::new("accounts", "acc-1", Surrogate::new(4242)),
+                    ResolvedSumTarget::new("audit_totals", "acc-1", Surrogate::new(9001)),
+                ],
+                "the newer slot wins, so the second binding keeps its own target row"
+            ),
+            other => panic!("expected PointDelete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doc_batch_insert_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let documents = vec![
+            ("d1".to_string(), vec![1u8, 2, 3]),
+            ("d2".to_string(), vec![4u8, 5]),
+            ("d3".to_string(), vec![6u8, 7, 8, 9]),
+        ];
+        let surrogates = vec![Surrogate::new(11), Surrogate::new(22), Surrogate::new(33)];
+
+        let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            documents: documents.clone(),
+            surrogates: surrogates.clone(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        // No assigner: carried surrogates fall through verbatim.
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection,
+                documents: decoded_docs,
+                surrogates: decoded_surrogates,
+                ..
+            }) => {
+                assert_eq!(collection.as_str(), "docs");
+                assert_eq!(
+                    decoded_docs, documents,
+                    "every (doc_id, body) pair must round-trip"
+                );
+                assert_eq!(
+                    decoded_surrogates, surrogates,
+                    "every surrogate must round-trip in order, none dropped"
+                );
+            }
+            other => panic!("expected Document(BatchInsert), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doc_truncate_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+
+        let plan = PhysicalPlan::Document(DocumentOp::Truncate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            restart_identity: true,
+            resolved_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("DocumentOp::Truncate should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::Truncate {
+                collection,
+                restart_identity,
+                ..
+            }) => {
+                assert_eq!(collection.as_str(), "docs");
+                assert!(restart_identity, "restart_identity must round-trip");
+            }
+            other => panic!("expected Document(Truncate), got {other:?}"),
+        }
+    }
+
+    /// Encode must not drop `returning` / `rls_filters` on a document write —
+    /// the leader re-derives its own plan from the committed entry, so this
+    /// would drop `RETURNING` for the originating request too.
+    #[test]
+    fn document_point_put_returning_and_rls_filters_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
+            document_id: "u1".into(),
+            value: b"alice".to_vec(),
+            surrogate: Surrogate::new(1),
+            pk_bytes: b"u1".to_vec(),
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+            resolved_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("PointPut should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::PointPut {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING insert must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Document(PointPut), got {other:?}"),
+        }
+    }
+
+    /// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+    /// `DocumentOp::PointUpdate`.
+    #[test]
+    fn document_point_update_returning_and_rls_filters_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Named(vec![
+                nodedb_physical::physical_plan::ReturningItem {
+                    name: "balance".into(),
+                    alias: None,
+                },
+            ]),
+        };
+        let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            document_id: "a1".into(),
+            surrogate: Surrogate::new(2),
+            pk_bytes: b"a1".to_vec(),
+            updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("PointUpdate should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::PointUpdate {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING update must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Document(PointUpdate), got {other:?}"),
+        }
+    }
+
+    /// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+    /// `DocumentOp::PointDelete`.
+    #[test]
+    fn document_point_delete_returning_and_rls_filters_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            document_id: "a1".into(),
+            surrogate: Surrogate::new(3),
+            pk_bytes: b"a1".to_vec(),
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("PointDelete should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::PointDelete {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING delete must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Document(PointDelete), got {other:?}"),
+        }
+    }
+
+    /// See `document_point_put_returning_and_rls_filters_roundtrip`; same bug,
+    /// `DocumentOp::Upsert` (`INSERT ... ON CONFLICT DO UPDATE`).
+    #[test]
+    fn document_upsert_returning_and_rls_filters_roundtrip() {
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Document(DocumentOp::Upsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            document_id: "a1".into(),
+            value: b"{}".to_vec(),
+            on_conflict_updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
+            surrogate: Surrogate::new(4),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+            resolved_sum_targets: Vec::new(),
+        });
+        let entry = to_replicated_entry(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            VShardId::new(0),
+            &plan,
+        )
+        .expect("encode must not error")
+        .expect("Upsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Document(DocumentOp::Upsert {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING upsert must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Document(Upsert), got {other:?}"),
+        }
+    }
+}

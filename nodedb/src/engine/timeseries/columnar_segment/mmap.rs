@@ -153,3 +153,78 @@ pub(super) fn advise_sequential(mmap: &memmap2::Mmap, col_path: &std::path::Path
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::timeseries::MetricSample;
+    use nodedb_wal::crypto::WalEncryptionKey;
+    use tempfile::TempDir;
+
+    use super::super::super::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
+    use super::super::reader::ColumnarSegmentReader;
+    use super::super::writer::ColumnarSegmentWriter;
+
+    fn test_config() -> ColumnarMemtableConfig {
+        ColumnarMemtableConfig {
+            max_memory_bytes: 10 * 1024 * 1024,
+            hard_memory_limit: 20 * 1024 * 1024,
+            max_tag_cardinality: 1000,
+        }
+    }
+
+    fn test_kek() -> WalEncryptionKey {
+        WalEncryptionKey::from_bytes(&[0x42u8; 32]).unwrap()
+    }
+
+    fn build_simple_drain() -> (
+        TempDir,
+        crate::engine::timeseries::columnar_memtable::ColumnarDrainResult,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let mut mt = ColumnarMemtable::new_metric(test_config());
+        for i in 0..100 {
+            mt.ingest_metric(
+                1,
+                MetricSample {
+                    timestamp_ms: 1_000_000 + i * 1000,
+                    value: i as f64 * 2.0,
+                },
+            );
+        }
+        (tmp, mt.drain())
+    }
+
+    #[test]
+    fn columnar_segment_mmap_plaintext_owned_buffer_encrypted() {
+        let kek = test_kek();
+        let (tmp, drain) = build_simple_drain();
+        let writer = ColumnarSegmentWriter::new(tmp.path());
+        writer
+            .write_partition("mmap-part", &drain.view(), 86_400_000, 1, Some(&kek))
+            .unwrap();
+
+        let part_dir = tmp.path().join("mmap-part");
+
+        // Encrypted path returns an owned decrypted buffer.
+        let col_mmap =
+            ColumnarSegmentReader::mmap_column(&part_dir, "timestamp", Some(&kek)).unwrap();
+        assert!(
+            col_mmap.is_decrypted_owned(),
+            "encrypted column must use owned buffer, not mmap"
+        );
+        assert!(!col_mmap.is_empty(), "decrypted buffer must not be empty");
+
+        // Plaintext path uses an actual mmap.
+        let (tmp2, drain2) = build_simple_drain();
+        let writer2 = ColumnarSegmentWriter::new(tmp2.path());
+        writer2
+            .write_partition("plain-mmap", &drain2.view(), 86_400_000, 1, None)
+            .unwrap();
+        let part_dir2 = tmp2.path().join("plain-mmap");
+        let plain_mmap = ColumnarSegmentReader::mmap_column(&part_dir2, "timestamp", None).unwrap();
+        assert!(
+            plain_mmap.is_mmap(),
+            "plaintext column must use mmap, not owned buffer"
+        );
+    }
+}

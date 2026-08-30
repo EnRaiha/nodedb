@@ -409,3 +409,371 @@ pub(super) fn direct_upsert(ctx: &DecodeCtx, f: DirectUpsertFields) -> crate::Re
         rls_filters: f.rls_filters.to_vec(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::wal_replication::decode;
+    use crate::control::wal_replication::types::ReplicatedEntry;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::ReturningSpec;
+    use nodedb_types::sync::wire::SyncProvenance;
+    use nodedb_types::{
+        PayloadIndexKind, QualifiedCollection, VectorQuantization, VectorStorageDtype,
+    };
+
+    /// Decide + encode in one call, so each test names only the plan it encodes.
+    fn to_replicated_entry(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        vshard_id: VShardId,
+        plan: &PhysicalPlan,
+    ) -> crate::Result<Option<ReplicatedEntry>> {
+        let write = crate::control::wal_replication::ReplicableWrite::decide_for_replication(plan)?;
+        crate::control::wal_replication::encode::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &write,
+        )
+    }
+
+    #[test]
+    fn vector_insert_provenance_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 42,
+            epoch: 7,
+            stream_id: 3,
+            seq: 100,
+        };
+
+        // With provenance.
+        let plan = PhysicalPlan::Vector(VectorOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            vector: vec![0.1, 0.2, 0.3],
+            dim: 3,
+            field_name: "emb".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: None,
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("VectorInsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        let decoded_plan = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decoded_plan;
+        match decoded_plan {
+            PhysicalPlan::Vector(VectorOp::Insert { provenance, .. }) => {
+                assert_eq!(
+                    provenance,
+                    Some(prov.clone()),
+                    "VectorInsert provenance should round-trip"
+                );
+            }
+            other => panic!("expected VectorInsert, got {other:?}"),
+        }
+        drop(decoded_entry);
+
+        // Without provenance.
+        let plan_none = PhysicalPlan::Vector(VectorOp::Insert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            vector: vec![0.1, 0.2, 0.3],
+            dim: 3,
+            field_name: "emb".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: None,
+            provenance: None,
+        });
+        let entry_none = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_none)
+            .expect("encode must not error")
+            .expect("VectorInsert(no provenance) should produce a ReplicatedEntry");
+        let bytes_none = entry_none.to_bytes();
+        let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_none {
+            PhysicalPlan::Vector(VectorOp::Insert { provenance, .. }) => {
+                assert_eq!(
+                    provenance, None,
+                    "None provenance should round-trip as None"
+                );
+            }
+            other => panic!("expected VectorInsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sparse_insert_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let plan = PhysicalPlan::Vector(VectorOp::SparseInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field_name: "splade".into(),
+            doc_id: "doc-42".into(),
+            entries: vec![(10, 0.25), (20, 0.75)],
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("SparseInsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        assert_eq!(decoded_plan, plan, "SparseInsert must round-trip exactly");
+    }
+
+    #[test]
+    fn sparse_delete_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let plan = PhysicalPlan::Vector(VectorOp::SparseDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field_name: "splade".into(),
+            doc_id: "doc-42".into(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("SparseDelete should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        assert_eq!(decoded_plan, plan, "SparseDelete must round-trip exactly");
+    }
+
+    #[test]
+    fn multi_vector_insert_roundtrip_shares_one_surrogate() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let shared_surrogate = Surrogate::new(777);
+        // Three vectors, dim 2 each, all bound to the SAME document_surrogate.
+        let plan = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field_name: "colbert".into(),
+            document_surrogate: shared_surrogate,
+            vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            count: 3,
+            dim: 2,
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("MultiVectorInsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+
+        // Wire representation carries the raw u32 verbatim.
+        let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+        match &decoded_entry.write {
+            ReplicatedWrite::MultiVectorInsert {
+                document_surrogate,
+                count,
+                vectors,
+                ..
+            } => {
+                assert_eq!(
+                    *document_surrogate, 777u32,
+                    "surrogate must roundtrip on wire"
+                );
+                assert_eq!(*count, 3);
+                assert_eq!(vectors.len(), 6, "flat vector data must roundtrip in full");
+            }
+            other => panic!("expected MultiVectorInsert, got {other:?}"),
+        }
+
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match &decoded_plan {
+            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+                document_surrogate,
+                count,
+                ..
+            }) => {
+                assert_eq!(
+                    *document_surrogate, shared_surrogate,
+                    "all vectors of the document must share the one carried surrogate"
+                );
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected Vector(MultiVectorInsert), got {other:?}"),
+        }
+        assert_eq!(
+            decoded_plan, plan,
+            "MultiVectorInsert must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn multi_vector_delete_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let plan = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field_name: "colbert".into(),
+            document_surrogate: Surrogate::new(888),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("MultiVectorDelete should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match &decoded_plan {
+            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+                document_surrogate, ..
+            }) => {
+                assert_eq!(*document_surrogate, Surrogate::new(888));
+            }
+            other => panic!("expected Vector(MultiVectorDelete), got {other:?}"),
+        }
+        assert_eq!(
+            decoded_plan, plan,
+            "MultiVectorDelete must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn delete_by_surrogate_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let prov = SyncProvenance {
+            producer_id: 4,
+            epoch: 1,
+            stream_id: 0,
+            seq: 9,
+        };
+        let plan = PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            surrogate: Surrogate::new(555),
+            field_name: "emb".into(),
+            provenance: Some(prov.clone()),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("DeleteBySurrogate should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match &decoded_plan {
+            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
+                surrogate,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(*surrogate, Surrogate::new(555));
+                assert_eq!(*provenance, Some(prov));
+            }
+            other => panic!("expected Vector(DeleteBySurrogate), got {other:?}"),
+        }
+        assert_eq!(
+            decoded_plan, plan,
+            "DeleteBySurrogate must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn direct_upsert_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "primary_vecs"),
+            field: "embedding".into(),
+            surrogate: Surrogate::new(999),
+            vector: vec![0.1, 0.2, 0.3, 0.4],
+            payload: b"\x81\xa4name\xa5alice".to_vec(),
+            quantization: VectorQuantization::Bbq,
+            storage_dtype: VectorStorageDtype::BF16,
+            payload_indexes: vec![
+                ("category".into(), PayloadIndexKind::Equality),
+                ("price".into(), PayloadIndexKind::Range),
+            ],
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("DirectUpsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match &decoded_plan {
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                surrogate,
+                quantization,
+                storage_dtype,
+                payload_indexes,
+                ..
+            }) => {
+                assert_eq!(*surrogate, Surrogate::new(999));
+                assert_eq!(*quantization, VectorQuantization::Bbq);
+                assert_eq!(*storage_dtype, VectorStorageDtype::BF16);
+                assert_eq!(
+                    payload_indexes,
+                    &vec![
+                        ("category".to_string(), PayloadIndexKind::Equality),
+                        ("price".to_string(), PayloadIndexKind::Range),
+                    ]
+                );
+            }
+            other => panic!("expected Vector(DirectUpsert), got {other:?}"),
+        }
+        assert_eq!(decoded_plan, plan, "DirectUpsert must round-trip exactly");
+    }
+
+    /// `entry_vector::encode` must not drop `VectorOp::DirectUpsert::returning` /
+    /// `rls_filters` — a dropped field silently yields no rows on replication.
+    #[test]
+    fn vector_direct_upsert_returning_and_rls_filters_roundtrip() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let spec = ReturningSpec {
+            columns: nodedb_physical::physical_plan::ReturningColumns::Star,
+        };
+        let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field: "emb".into(),
+            surrogate: Surrogate::new(3),
+            vector: vec![0.5, 0.6],
+            payload: vec![1, 2, 3],
+            quantization: VectorQuantization::RaBitQ,
+            storage_dtype: VectorStorageDtype::F16,
+            payload_indexes: vec![("tenant_id".into(), PayloadIndexKind::Equality)],
+            returning: Some(spec.clone()),
+            rls_filters: b"rls-predicate".to_vec(),
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+            .expect("encode must not error")
+            .expect("VectorOp::DirectUpsert should produce a ReplicatedEntry");
+        let bytes = entry.to_bytes();
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
+        match decoded_plan {
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                returning,
+                rls_filters,
+                ..
+            }) => {
+                assert_eq!(
+                    returning,
+                    Some(spec),
+                    "a RETURNING upsert must not silently yield no rows on replication"
+                );
+                assert_eq!(
+                    rls_filters,
+                    b"rls-predicate".to_vec(),
+                    "the RETURNING read-policy filter must survive replication"
+                );
+            }
+            other => panic!("expected Vector(DirectUpsert), got {other:?}"),
+        }
+    }
+}

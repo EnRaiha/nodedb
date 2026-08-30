@@ -70,3 +70,68 @@ impl InvertedIndex {
             .map_err(into_result_err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_fts::FtsSearchParams;
+    use nodedb_fts::posting::QueryMode;
+    use nodedb_types::Surrogate;
+
+    use super::*;
+
+    const DB: u64 = 0;
+
+    fn open_temp() -> (InvertedIndex, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-inverted.redb");
+        let db = Arc::new(Database::create(&path).unwrap());
+        let idx = InvertedIndex::open(db).unwrap();
+        (idx, dir)
+    }
+
+    #[test]
+    fn purge_tenant_structurally_drops_data() {
+        let (idx, _dir) = open_temp();
+        let t1 = TenantId::new(1);
+        let t2 = TenantId::new(2);
+        idx.index_document(DB, t1, "docs", Surrogate::new(1), "alpha bravo")
+            .unwrap();
+        idx.index_document(DB, t2, "docs", Surrogate::new(1), "alpha bravo")
+            .unwrap();
+
+        idx.purge_tenant(DB, t1).unwrap();
+
+        assert!(
+            idx.search(
+                DB,
+                t1,
+                "docs",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            !idx.search(
+                DB,
+                t2,
+                "docs",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}

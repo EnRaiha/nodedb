@@ -45,3 +45,63 @@ impl TenantCrdtEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use loro::LoroValue;
+    use nodedb_crdt::constraint::ConstraintSet;
+
+    use crate::types::TenantId;
+
+    use super::*;
+
+    /// Build a peer document spanning two collections and export one incremental
+    /// delta per write, mirroring how an embedded client that keeps a single Loro
+    /// document for the whole database produces its deltas.
+    ///
+    /// Returns `(first_delta_for_target, later_delta_for_target)` where the later
+    /// delta causally depends on an intervening write to the *other* collection.
+    fn interleaved_collection_deltas(peer: u64, target: &str, other: &str) -> (Vec<u8>, Vec<u8>) {
+        let state = CrdtState::new(peer).unwrap();
+
+        let v0 = state.oplog_version_vector();
+        state
+            .upsert(target, "first", &[("v", LoroValue::I64(1))])
+            .unwrap();
+        let first = state.export_updates_since(&v0).unwrap();
+
+        state
+            .upsert(other, "aside", &[("v", LoroValue::I64(2))])
+            .unwrap();
+
+        let v2 = state.oplog_version_vector();
+        state
+            .upsert(target, "later", &[("v", LoroValue::I64(3))])
+            .unwrap();
+        let later = state.export_updates_since(&v2).unwrap();
+
+        (first, later)
+    }
+
+    /// Transaction rollback replaces a collection with an exact pre-image. If the
+    /// pre-image import leaves operations pending, rollback installs an incomplete
+    /// state and tells the transaction driver it succeeded.
+    #[test]
+    fn rollback_pre_image_does_not_report_success_without_applying() {
+        let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+        let (first, later) = interleaved_collection_deltas(33, "users", "signals");
+
+        engine
+            .restore_collection_snapshot("users", Some(&first))
+            .unwrap();
+        assert!(engine.row_exists("users", "first"));
+
+        let result = engine.restore_collection_snapshot("users", Some(&later));
+
+        assert!(
+            result.is_err() || engine.row_exists("users", "later"),
+            "rollback reported success while the pre-image's operations stayed \
+             causally pending — the transaction driver believes state was restored"
+        );
+    }
+}

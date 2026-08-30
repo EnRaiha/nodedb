@@ -8,7 +8,4 @@ pub mod encryption;
 pub mod ops;
 pub mod replay;
 
-#[cfg(test)]
-mod tests;
-
 pub use core::WalManager;

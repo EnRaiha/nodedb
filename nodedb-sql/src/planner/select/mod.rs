@@ -17,9 +17,6 @@ mod query_tail;
 mod select_stmt;
 mod where_search;
 
-#[cfg(test)]
-mod tests;
-
 pub use entry::plan_query;
 pub use helpers::{
     convert_projection, convert_where_to_filters, extract_float, extract_func_args,

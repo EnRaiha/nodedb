@@ -458,7 +458,7 @@ pub fn execute_varlen_resume<'a>(
 mod tests {
     use super::super::core::MatchExecCtx;
     use super::super::core::execute;
-    use super::super::core::tests::{make_csr, make_sparse, props_for};
+    use super::super::core::triple::tests::{make_csr, make_sparse, props_for};
     use super::super::expansion::{VarLenCaps, VarLenPattern, expand_variable_length};
     use super::super::types::{BindingRow, ContinuationSeed, VarLenResume};
     use super::{execute_continuation, execute_varlen_resume};

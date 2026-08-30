@@ -4,6 +4,3 @@ pub mod apply;
 pub mod delta;
 pub mod divergence;
 pub mod rmw;
-
-#[cfg(test)]
-mod path_tests;

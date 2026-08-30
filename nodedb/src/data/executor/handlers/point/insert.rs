@@ -292,3 +292,202 @@ impl CoreLoop {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::doc_format;
+    use crate::engine::document::store::CollectionConfig;
+    use crate::types::{DatabaseId, TenantId};
+
+    const DB: u64 = 0;
+    const TID: u64 = 1;
+    /// The collection that drives the binding.
+    const SOURCE: &str = "point_txns";
+    /// The collection whose `balance` the binding maintains, sharing `SOURCE`'s
+    /// vShard. Every test asserts the INLINE fold: the target row is seeded
+    /// into, and read back out of, the SOURCE core's own document store.
+    const TARGET: &str = "point_holders";
+
+    /// The premise every test below rests on.
+    #[test]
+    fn the_fixture_is_co_resident() {
+        assert!(
+            crate::query::sum_target_is_co_resident(DatabaseId::DEFAULT, SOURCE, TARGET),
+            "'{SOURCE}' and '{TARGET}' must share a vShard: a cross-shard binding's balance \
+             travels on its own task and is never folded into the source write's transaction"
+        );
+    }
+    const A1: &str = "a1";
+    const T1: Surrogate = Surrogate(4001);
+
+    /// `SUM(amount)` per `account_id`, materialized onto the target's `balance`.
+    fn binding() -> nodedb_physical::physical_plan::MaterializedSumBinding {
+        nodedb_physical::physical_plan::MaterializedSumBinding {
+            target_collection: TARGET.to_string(),
+            target_column: "balance".to_string(),
+            join_column: "account_id".to_string(),
+            value_expr: nodedb_query::expr::SqlExpr::Column("amount".to_string()),
+        }
+    }
+
+    fn resolved() -> Vec<ResolvedSumTarget> {
+        vec![ResolvedSumTarget::new(TARGET, A1, T1)]
+    }
+
+    fn config_key(collection: &str) -> (DatabaseId, TenantId, String) {
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            collection.to_string(),
+        )
+    }
+
+    /// A source collection bound to the sum, and a target row starting at zero.
+    fn seeded_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+
+        let mut source = CollectionConfig::new(SOURCE);
+        source.enforcement.materialized_sum_sources = vec![binding()];
+        core.doc_configs.insert(config_key(SOURCE), source);
+        core.doc_configs
+            .insert(config_key(TARGET), CollectionConfig::new(TARGET));
+
+        let seed = serde_json::json!({"id": A1, "balance": "0"});
+        core.sparse
+            .put(
+                DB,
+                TID,
+                TARGET,
+                &surrogate_to_doc_id(T1),
+                &doc_format::encode_to_msgpack(&seed),
+            )
+            .expect("seed target row");
+        core
+    }
+
+    /// A source row body, in the MessagePack every handler receives.
+    fn entry(account: &str, amount: i64) -> Vec<u8> {
+        doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": account,
+            "amount": amount,
+        }))
+    }
+
+    /// The balance the target row currently holds.
+    fn balance(core: &CoreLoop, surrogate: Surrogate) -> String {
+        let stored = core
+            .sparse
+            .get(DB, TID, TARGET, &surrogate_to_doc_id(surrogate))
+            .expect("read target")
+            .expect("target row must exist");
+        doc_format::decode_document(&stored)
+            .expect("target row must decode")
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .expect("target row must carry a balance")
+            .to_string()
+    }
+
+    fn insert(
+        core: &mut CoreLoop,
+        task: &ExecutionTask,
+        surrogate: Surrogate,
+        body: &[u8],
+    ) -> Status {
+        let targets = resolved();
+        let document_id = format!("e{}", surrogate.as_u32());
+        core.execute_point_insert(PointInsertParams {
+            task,
+            tid: TID,
+            collection: SOURCE,
+            document_id: &document_id,
+            surrogate,
+            value: body,
+            if_absent: false,
+            returning: None,
+            rls_filters: &[],
+            resolved_sum_targets: &targets,
+            deferred_sum_targets: &[],
+        })
+        .status
+    }
+
+    #[test]
+    fn point_insert_credits_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+
+        assert_eq!(
+            insert(&mut core, &task, Surrogate(11), &entry(A1, 25)),
+            Status::Ok
+        );
+        assert_eq!(
+            insert(&mut core, &task, Surrogate(12), &entry(A1, 75)),
+            Status::Ok
+        );
+
+        assert_eq!(balance(&core, T1), "100", "both inserts must be totalled");
+    }
+
+    /// A hash-chained collection, exactly as DDL builds one: `HASH_CHAIN` implies
+    /// `APPEND_ONLY`.
+    fn chained_core(dir: &std::path::Path) -> CoreLoop {
+        let (mut core, _req, _resp) = make_core_with_dir(dir);
+        let mut config = CollectionConfig::new(SOURCE);
+        config.enforcement.append_only = true;
+        config.enforcement.hash_chain = true;
+        core.doc_configs.insert(config_key(SOURCE), config);
+        core
+    }
+
+    fn insert_chained(core: &mut CoreLoop, task: &ExecutionTask) -> Status {
+        core.execute_point_insert(PointInsertParams {
+            task,
+            tid: TID,
+            collection: SOURCE,
+            document_id: "e1",
+            surrogate: Surrogate(91),
+            value: &entry(A1, 10),
+            if_absent: false,
+            returning: None,
+            rls_filters: &[],
+            resolved_sum_targets: &[],
+            deferred_sum_targets: &[],
+        })
+        .status
+    }
+
+    /// The chain must actually be built by the autocommit INSERT path, or the
+    /// refusal tests in `point/delete.rs` and `point/update/exec.rs` would pass
+    /// over rows that carry no link at all.
+    #[test]
+    fn a_point_insert_links_the_row_into_the_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = chained_core(dir.path());
+        let task = make_default_task();
+
+        assert_eq!(insert_chained(&mut core, &task), Status::Ok);
+
+        let stored = core
+            .sparse
+            .get(DB, TID, SOURCE, &surrogate_to_doc_id(Surrogate(91)))
+            .expect("read back")
+            .expect("row must exist");
+        let doc = doc_format::decode_document(&stored).expect("decode");
+        assert!(
+            doc.get("_chain_hash").and_then(|v| v.as_str()).is_some(),
+            "an autocommit INSERT into a hash-chained collection must store its link"
+        );
+        assert!(
+            core.sparse
+                .get_chain_head(DB, TID, SOURCE)
+                .expect("read head")
+                .is_some(),
+            "and must persist the advanced head"
+        );
+    }
+}

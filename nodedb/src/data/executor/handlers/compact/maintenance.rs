@@ -205,3 +205,19 @@ impl CoreLoop {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn maintenance_respects_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        // First call should run.
+        assert!(core.maybe_run_maintenance());
+
+        // Immediate second call should skip.
+        assert!(!core.maybe_run_maintenance());
+    }
+}

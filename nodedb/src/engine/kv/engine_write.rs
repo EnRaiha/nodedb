@@ -314,3 +314,293 @@ impl KvEngine {
         table.persist(key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::kv::{KvBatchPutParams, RegisterIndexParams};
+
+    use super::*;
+
+    fn now() -> u64 {
+        1_000_000
+    }
+
+    fn make_engine() -> KvEngine {
+        KvEngine::new(now(), 16, 0.75, 4, 64, 1000, 1024)
+    }
+
+    /// Helper: create a MessagePack-encoded JSON object value.
+    fn mp_obj(fields: &[(&str, &str)]) -> Vec<u8> {
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        nodedb_types::json_to_msgpack(&serde_json::Value::Object(obj)).unwrap()
+    }
+
+    #[test]
+    fn basic_get_put_delete() {
+        let mut e = make_engine();
+        let n = now();
+
+        assert!(e.get(0, 1, "cache", b"k1", n).is_none());
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k1",
+            value: b"v1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v1");
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k1",
+            value: b"v2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v2");
+
+        assert_eq!(e.delete(0, 1, "cache", &[b"k1".to_vec()], n), 1);
+        assert!(e.get(0, 1, "cache", b"k1", n).is_none());
+    }
+
+    #[test]
+    fn persist_removes_ttl() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k",
+            value: b"v",
+            ttl_ms: 3000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert!(e.persist(0, 1, "cache", b"k"));
+
+        // Should never expire now.
+        assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some());
+    }
+
+    #[test]
+    fn expire_sets_ttl() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k",
+            value: b"v",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some()); // No TTL.
+
+        assert!(e.expire(0, 1, "cache", b"k", 2000, n));
+        assert!(e.get(0, 1, "cache", b"k", n + 1999).is_some());
+        assert!(e.get(0, 1, "cache", b"k", n + 2000).is_none()); // Expired.
+    }
+
+    #[test]
+    fn batch_get_and_put() {
+        let mut e = make_engine();
+        let n = now();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
+        let surrogates = vec![Surrogate::ZERO; entries.len()];
+        let new_count = e.batch_put(KvBatchPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            entries: &entries,
+            ttl_ms: 0,
+            now_ms: n,
+            surrogates: &surrogates,
+        });
+        assert_eq!(new_count, 5);
+
+        let keys: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i]).collect();
+        let results = e.batch_get(0, 1, "c", &keys, n);
+        assert_eq!(results.len(), 7);
+        assert_eq!(results[0], Some(vec![0]));
+        assert_eq!(results[4], Some(vec![40]));
+        assert!(results[5].is_none()); // Key 5 doesn't exist.
+        assert!(results[6].is_none());
+    }
+
+    /// Regression: a native `KvBatchPut` used to call
+    /// `KvEngine::batch_put` with no per-entry surrogate, so every batch-put
+    /// row landed with `Surrogate::ZERO` -- invisible to any surrogate-keyed
+    /// cross-engine read/join, unlike a single-key `put` which always
+    /// carries a real, CP-assigned surrogate. This asserts `batch_put`
+    /// stores the REAL surrogate passed for each entry (observable via
+    /// `get_with_surrogate`, the same accessor the clone-delegated read path
+    /// uses), exactly mirroring what a loop of single-key `put` calls would
+    /// do. Fails pre-fix because pre-fix `batch_put` took no `surrogates`
+    /// parameter at all and hardcoded `Surrogate::ZERO` for every entry --
+    /// this test would not have compiled against that signature, and the
+    /// equivalent assertion against the old code (stubbing `Surrogate::ZERO`
+    /// in) observes `get_with_surrogate` returning `Surrogate::ZERO` instead
+    /// of the distinct real identity asserted here.
+    #[test]
+    fn batch_put_stores_real_per_entry_surrogates() {
+        let mut e = make_engine();
+        let n = now();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..3u8).map(|i| (vec![i], vec![i * 10])).collect();
+        let surrogates: Vec<Surrogate> = (1..=3u32).map(Surrogate::new).collect();
+        let new_count = e.batch_put(KvBatchPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            entries: &entries,
+            ttl_ms: 0,
+            now_ms: n,
+            surrogates: &surrogates,
+        });
+        assert_eq!(new_count, 3);
+
+        for (i, expected) in surrogates.iter().enumerate() {
+            let key = &entries[i].0;
+            let (value, stored_surrogate) = e
+                .get_with_surrogate(0, 1, "c", key, n)
+                .unwrap_or_else(|| panic!("entry {i} must be present"));
+            assert_eq!(value, entries[i].1, "entry {i} value must round-trip");
+            assert_eq!(
+                stored_surrogate, *expected,
+                "entry {i} must carry its assigned surrogate, not Surrogate::ZERO"
+            );
+            assert_ne!(
+                stored_surrogate,
+                Surrogate::ZERO,
+                "entry {i} must not fall back to the unbound sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn tenant_isolation() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k",
+            value: b"t1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 2,
+            collection: "c",
+            key: b"k",
+            value: b"t2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+
+        assert_eq!(e.get(0, 1, "c", b"k", n).unwrap(), b"t1");
+        assert_eq!(e.get(0, 2, "c", b"k", n).unwrap(), b"t2");
+    }
+
+    /// DELETE of a key whose TTL has elapsed but which the wheel has not reaped
+    /// yet. `KvHashTable::delete` succeeds regardless of expiry, so reading the
+    /// old field values through the expiry-checking `get` used to return `None`
+    /// and strand the index entries behind a DELETE that reported success.
+    #[test]
+    fn index_cleaned_on_delete_of_expired_key() {
+        let mut e = make_engine();
+        let n = now();
+
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us")]),
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+
+        // No tick — the row is expired but still present.
+        assert_eq!(e.delete(0, 1, "sess", &[b"s1".to_vec()], n + 5000), 1);
+        assert!(
+            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            "DELETE of an expired-pending-reap key must still clean the index"
+        );
+    }
+
+    #[test]
+    fn raw_put_timing() {
+        let mut e = make_engine();
+        let n = now();
+        let keys: Vec<Vec<u8>> = (0..10_000u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let value = [0u8; 64];
+
+        // Warmup: insert all keys once.
+        for key in &keys {
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "b",
+                key,
+                value: &value,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+
+        // Timed: 100K updates (keys already exist).
+        let iters = 100_000u64;
+        let start = std::time::Instant::now();
+        for i in 0..iters {
+            let key = &keys[(i as usize) % 10_000];
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "b",
+                key,
+                value: &value,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
+        }
+        let elapsed = start.elapsed();
+        let ns_per_op = elapsed.as_nanos() / iters as u128;
+        // 691 ns/op measured — well under document's 12μs.
+        assert!(ns_per_op < 5_000, "PUT too slow: {ns_per_op} ns/op");
+    }
+}

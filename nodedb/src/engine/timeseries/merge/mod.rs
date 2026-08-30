@@ -18,9 +18,6 @@ pub mod cycle;
 pub mod o3;
 pub mod partitions;
 
-#[cfg(test)]
-mod tests;
-
 pub use cycle::run_merge_cycle;
 pub use o3::merge_o3_into_partition;
 pub use partitions::{MergeResult, merge_partitions};

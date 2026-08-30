@@ -33,8 +33,5 @@ mod infer;
 mod scope;
 mod slots;
 
-#[cfg(test)]
-mod tests;
-
 pub use infer::infer_placeholder_types;
 pub use slots::InferredParamType;
