@@ -13,10 +13,12 @@ services:
     environment:
       NODEDB_HOST: "0.0.0.0"
       NODEDB_DATA_DIR: "/var/lib/nodedb"
-      # NODEDB_MEMORY_LIMIT: "4GiB"       # default: 75% of system RAM
+      # NODEDB_MEMORY_LIMIT: "4GiB"       # default: 1 GiB
       # NODEDB_DATA_PLANE_CORES: "4"       # default: all CPUs minus one
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6480/health"]
+      # The runtime image ships no shell and no curl. Use the built-in
+      # subcommand, the same probe the Dockerfile's HEALTHCHECK runs.
+      test: ["CMD", "/usr/local/bin/nodedb", "healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5

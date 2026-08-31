@@ -4,8 +4,12 @@
 //!
 //! Exists primarily so distroless / Chainguard runtime images can run
 //! a Docker `HEALTHCHECK` without shipping `curl`. Performs a single
-//! synchronous HTTP `GET /health` against the local HTTP API port and
+//! synchronous HTTP `GET /healthz` against the local HTTP API port and
 //! exits 0 on a 2xx response, non-zero otherwise.
+//!
+//! `/healthz` is the readiness probe: it reports 503 while the node is
+//! draining or has not reached `GatewayEnable`, so a container runtime stops
+//! routing to a node that cannot serve.
 //!
 //! Kept dependency-free (`std::net` only) so it's cheap to invoke from
 //! the container runtime every few seconds — no tokio runtime spin-up,
@@ -22,7 +26,7 @@ const DEFAULT_PORT: u16 = 6480;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Run the healthcheck. Returns process exit code:
-/// - `0` — `/health` returned 2xx
+/// - `0` — `/healthz` returned 2xx
 /// - `1` — connection / I/O / non-2xx
 pub fn run(port: u16) -> i32 {
     match probe(port) {
@@ -45,7 +49,7 @@ fn probe(port: u16) -> Result<(), String> {
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
 
-    let req = b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let req = b"GET /healthz HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     stream.write_all(req).map_err(|e| format!("write: {e}"))?;
     stream.flush().ok();
 

@@ -195,3 +195,60 @@ async fn http_health_bare_returns_404() {
         "/health (bare) must return 404 — use /healthz instead"
     );
 }
+
+/// The `nodedb healthcheck` subcommand must agree with the router about which
+/// path a probe hits.
+///
+/// The runtime image ships no shell and no curl, so this subcommand IS the
+/// container healthcheck. Probing a path the router does not serve makes every
+/// container report unhealthy, and an orchestrator restarts a node that is
+/// serving perfectly well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_healthcheck_subcommand_probes_a_route_the_server_serves() {
+    let (shared, _seq, gw_gate, _dir) = make_gated_state();
+
+    let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .await
+            .unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (shutdown_bus, _) =
+        nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+    let shared_http = Arc::clone(&shared);
+    let bus_http = shutdown_bus.clone();
+    tokio::spawn(async move {
+        nodedb::control::server::http::server::run_with_listener(
+            listener,
+            shared_http,
+            AuthMode::Trust,
+            None,
+            bus_http,
+        )
+        .await
+        .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Before the gate fires the node is not ready, so the probe must fail —
+    // this is the signal that keeps traffic away from a starting node.
+    let starting = tokio::task::spawn_blocking(move || nodedb::ctl::healthcheck::run(port))
+        .await
+        .unwrap();
+    assert_eq!(
+        starting, 1,
+        "the probe must report unhealthy before GatewayEnable"
+    );
+
+    gw_gate.fire();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let ready = tokio::task::spawn_blocking(move || nodedb::ctl::healthcheck::run(port))
+        .await
+        .unwrap();
+    assert_eq!(
+        ready, 0,
+        "a ready node must report healthy — a non-zero exit here means the \
+         subcommand probes a path the router does not serve"
+    );
+}
