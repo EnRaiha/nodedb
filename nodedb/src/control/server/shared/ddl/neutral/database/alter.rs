@@ -121,6 +121,10 @@ pub fn alter_database(
                     gov.clear_database_budget(db_id);
                 }
             }
+            // `max_connections == 0` clears the cap inside the registry.
+            state
+                .admission_registry
+                .set_database_limit(db_id, record.max_connections);
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseQuotaChanged,

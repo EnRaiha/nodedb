@@ -138,6 +138,7 @@ mod pgwire_tls_e2e;
 mod procedure_execution;
 mod quarantine_integration;
 mod quiesce_drain;
+mod quota_live_enforcement_apply;
 mod quota_three_level_denial;
 mod redaction_policy_ddl;
 mod reindex_vector_concurrent;

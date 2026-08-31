@@ -4,7 +4,9 @@
 //!
 //! Loads the tenant's stored `QuotaRecord` (or `QuotaRecord::DEFAULT`), merges
 //! the partial spec, validates the result, and persists it to
-//! `_system.tenant_quotas`.
+//! `_system.tenant_quotas`. The persisted record is then pushed into live
+//! enforcement: the admission registry's tenant connection cap and the memory
+//! governor's tenant byte ceiling.
 //!
 //! Ported verbatim from the pgwire `ddl::tenant::alter_quota` handler. The
 //! `require_tenant_admin` gate is byte-identical to the pgwire
@@ -66,6 +68,19 @@ pub fn handle_alter_tenant_quota(
     catalog
         .put_tenant_quota(db_id, tenant_id, &record)
         .map_err(|e| ddl_err("53400", format!("{e}")))?;
+
+    // Push the new quota into live enforcement components.
+    // `max_connections == 0` clears the cap inside the registry.
+    state
+        .admission_registry
+        .set_tenant_limit(db_id, tenant_id, record.max_connections);
+    if let Some(ref gov) = state.governor {
+        if record.max_memory_bytes > 0 {
+            gov.set_tenant_budget(db_id, tenant_id, record.max_memory_bytes as usize);
+        } else {
+            gov.clear_tenant_budget(db_id, tenant_id);
+        }
+    }
 
     state.audit_record(
         AuditEvent::AdminAction,
