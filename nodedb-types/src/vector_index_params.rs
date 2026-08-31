@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
+#[msgpack(map, allow_unknown_fields)]
 pub struct StoredVectorIndexParams {
+    /// Database that owns the collection.
+    pub database_id: u64,
     /// Tenant that owns the collection.
     pub tenant_id: u64,
     /// Collection the index is on.
@@ -45,6 +48,7 @@ mod tests {
     #[test]
     fn msgpack_roundtrip() {
         let e = StoredVectorIndexParams {
+            database_id: 7,
             tenant_id: 1,
             collection: "docs".into(),
             field_name: "embedding".into(),
@@ -62,5 +66,6 @@ mod tests {
         assert_eq!(back.collection, "docs");
         assert_eq!(back.dim, 4);
         assert_eq!(back.field_name, "embedding");
+        assert_eq!(back.database_id, 7);
     }
 }

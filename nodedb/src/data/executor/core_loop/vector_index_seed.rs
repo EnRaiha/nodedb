@@ -30,13 +30,17 @@ impl CoreLoop {
     /// `execute_set_vector_params` keys a live `CREATE VECTOR INDEX`.
     /// Called once at core startup, before the durable HNSW rebuild.
     ///
-    /// `CREATE VECTOR INDEX` computes its vshard with `DatabaseId::DEFAULT`
-    /// and the stored entry carries no database id, so the seed keys under
-    /// `DatabaseId::DEFAULT` to match.
+    /// Keys on the stored entry's own database, matching how
+    /// `execute_set_vector_params` keys a live `CREATE VECTOR INDEX` from
+    /// `task.request.database_id`.
     pub fn seed_vector_index_params(&mut self, entries: &[nodedb_types::StoredVectorIndexParams]) {
         for e in entries {
-            let db = crate::types::DatabaseId::DEFAULT.as_u64();
-            let key = CoreLoop::vector_index_key(db, e.tenant_id, &e.collection, &e.field_name);
+            let key = CoreLoop::vector_index_key(
+                e.database_id,
+                e.tenant_id,
+                &e.collection,
+                &e.field_name,
+            );
             let (params, config) = build_index_config_from_stored(e);
             if e.dim > 0 {
                 self.declared_dims.insert(key.clone(), e.dim);
@@ -116,7 +120,17 @@ mod tests {
     const FIELD: &str = "embedding";
 
     fn stored(metric: &str, m: usize, ef: usize) -> nodedb_types::StoredVectorIndexParams {
+        stored_in_database(crate::types::DatabaseId::DEFAULT.as_u64(), metric, m, ef)
+    }
+
+    fn stored_in_database(
+        database_id: u64,
+        metric: &str,
+        m: usize,
+        ef: usize,
+    ) -> nodedb_types::StoredVectorIndexParams {
         nodedb_types::StoredVectorIndexParams {
+            database_id,
             tenant_id: TID,
             collection: COLL.to_string(),
             field_name: FIELD.to_string(),
@@ -176,5 +190,33 @@ mod tests {
         assert_eq!(params.m, 32);
         assert_eq!(params.m0, 64);
         assert_eq!(params.ef_construction, 400);
+    }
+
+    /// An index created outside the default database must seed under its own
+    /// database, not under `DatabaseId::DEFAULT`. Keying it anywhere else
+    /// loses the index across a restart.
+    #[test]
+    fn an_index_in_a_non_default_database_seeds_under_that_database() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut core, _wal, _guard) = make_core_with_dir(dir.path());
+        const DB: u64 = 7;
+
+        core.seed_vector_index_params(&[stored_in_database(DB, "l2", 32, 400)]);
+
+        let owning = CoreLoop::vector_index_key(DB, TID, COLL, FIELD);
+        assert!(
+            core.vector_params.contains_key(&owning),
+            "the index must be keyed under the database that owns it"
+        );
+        let default_key = CoreLoop::vector_index_key(
+            crate::types::DatabaseId::DEFAULT.as_u64(),
+            TID,
+            COLL,
+            FIELD,
+        );
+        assert!(
+            !core.vector_params.contains_key(&default_key),
+            "keying under the default database is what loses the index on restart"
+        );
     }
 }

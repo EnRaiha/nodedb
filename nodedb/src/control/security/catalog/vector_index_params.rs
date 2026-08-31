@@ -3,7 +3,8 @@
 //! Catalog operations for durable vector-index parameters.
 //!
 //! Stores `CREATE VECTOR INDEX` build parameters in
-//! `_system.vector_index_params`. Key format: `"{tenant_id}:{collection}:{field_name}"`.
+//! `_system.vector_index_params`. Key format:
+//! `"{database_id}:{tenant_id}:{collection}:{field_name}"`.
 
 use nodedb_types::StoredVectorIndexParams;
 use redb::{ReadableDatabase, ReadableTable};
@@ -13,7 +14,12 @@ use super::types::{SystemCatalog, VECTOR_INDEX_PARAMS, catalog_err};
 impl SystemCatalog {
     /// Store vector index parameters for a collection/field.
     pub fn put_vector_index_params(&self, entry: &StoredVectorIndexParams) -> crate::Result<()> {
-        let key = vector_index_params_key(entry.tenant_id, &entry.collection, &entry.field_name);
+        let key = vector_index_params_key(
+            entry.database_id,
+            entry.tenant_id,
+            &entry.collection,
+            &entry.field_name,
+        );
         let bytes = zerompk::to_msgpack_vec(entry)
             .map_err(|e| catalog_err("serialize vector index params", e))?;
         let write_txn = self
@@ -34,11 +40,12 @@ impl SystemCatalog {
     /// Load vector index parameters for a specific collection/field.
     pub fn get_vector_index_params(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field_name: &str,
     ) -> crate::Result<Option<StoredVectorIndexParams>> {
-        let key = vector_index_params_key(tenant_id, collection, field_name);
+        let key = vector_index_params_key(database_id, tenant_id, collection, field_name);
         let read_txn = self
             .db
             .begin_read()
@@ -47,14 +54,14 @@ impl SystemCatalog {
             .open_table(VECTOR_INDEX_PARAMS)
             .map_err(|e| catalog_err("open vector_index_params", e))?;
 
-        match table.get(key.as_str()) {
-            Ok(Some(value)) => {
-                let entry: StoredVectorIndexParams = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser vector index params", e))?;
-                Ok(Some(entry))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(catalog_err("get vector index params", e)),
+        match table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get vector index params", e))?
+        {
+            Some(value) => zerompk::from_msgpack(value.value())
+                .map(Some)
+                .map_err(|e| catalog_err("deser vector index params", e)),
+            None => Ok(None),
         }
     }
 
@@ -67,11 +74,12 @@ impl SystemCatalog {
     /// dropped.
     pub fn delete_vector_index_params(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field_name: &str,
     ) -> crate::Result<bool> {
-        let key = vector_index_params_key(tenant_id, collection, field_name);
+        let key = vector_index_params_key(database_id, tenant_id, collection, field_name);
         let write_txn = self
             .db
             .begin_write()
@@ -121,6 +129,11 @@ pub(super) fn list_all_vector_index_params_in(
     Ok(entries)
 }
 
-fn vector_index_params_key(tenant_id: u64, collection: &str, field_name: &str) -> String {
-    format!("{tenant_id}:{collection}:{field_name}")
+fn vector_index_params_key(
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+    field_name: &str,
+) -> String {
+    format!("{database_id}:{tenant_id}:{collection}:{field_name}")
 }

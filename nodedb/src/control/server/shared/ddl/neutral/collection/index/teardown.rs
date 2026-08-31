@@ -151,7 +151,12 @@ async fn vector(
     state
         .credentials
         .catalog()
-        .delete_vector_index_params(tenant_id.as_u64(), &record.collection, &field_name)
+        .delete_vector_index_params(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            &record.collection,
+            &field_name,
+        )
         .map_err(|e| {
             err(
                 "XX000",

@@ -186,7 +186,12 @@ fn purge_index_records(
     let records = catalog.list_index_records_for_collection(database_id, tenant_id, name)?;
     for record in &records {
         if record.kind == crate::control::security::catalog::IndexKind::Vector {
-            catalog.delete_vector_index_params(tenant_id, name, record.primary_field())?;
+            catalog.delete_vector_index_params(
+                database_id,
+                tenant_id,
+                name,
+                record.primary_field(),
+            )?;
         }
         catalog.delete_owner(
             record.kind.owner_object_type(),

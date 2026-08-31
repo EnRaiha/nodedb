@@ -27,20 +27,20 @@ impl CoreLoop {
         entries: &[nodedb_types::StoredVectorIndexParams],
     ) {
         use std::collections::HashSet;
-        let db = crate::types::DatabaseId::DEFAULT.as_u64();
-
-        // One scan per (tenant, collection): `apply_point_put_vector_indexes`
-        // re-indexes ALL of the document's vector fields, so multiple field
-        // indexes on one collection need only a single scan.
-        let mut seen: HashSet<(u64, String)> = HashSet::new();
-        let mut targets: Vec<(u64, String)> = Vec::new();
+        // One scan per (database, tenant, collection):
+        // `apply_point_put_vector_indexes` re-indexes ALL of the document's
+        // vector fields, so multiple field indexes on one collection need only
+        // a single scan. The database comes from the stored entry — an index
+        // created outside the default database rebuilds under its own.
+        let mut seen: HashSet<(u64, u64, String)> = HashSet::new();
+        let mut targets: Vec<(u64, u64, String)> = Vec::new();
         for e in entries {
-            if seen.insert((e.tenant_id, e.collection.clone())) {
-                targets.push((e.tenant_id, e.collection.clone()));
+            if seen.insert((e.database_id, e.tenant_id, e.collection.clone())) {
+                targets.push((e.database_id, e.tenant_id, e.collection.clone()));
             }
         }
 
-        for (tenant_id, collection) in targets {
+        for (db, tenant_id, collection) in targets {
             // `entries` comes from the `CREATE VECTOR INDEX` param seed, so
             // every target here is a classic collection with a vector index
             // over a document field, and `apply_point_put_vector_indexes`

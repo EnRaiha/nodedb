@@ -113,7 +113,12 @@ pub async fn create_vector_index(
     let existing = state
         .credentials
         .catalog()
-        .get_vector_index_params(tenant_id.as_u64(), collection, &field_name)
+        .get_vector_index_params(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            collection,
+            &field_name,
+        )
         .map_err(|e| ddl_err("XX000", format!("read vector index params: {e}")))?;
     if existing.is_some() {
         if stmt.header.if_not_exists {
@@ -205,6 +210,7 @@ pub async fn create_vector_index(
         .credentials
         .catalog()
         .put_vector_index_params(&nodedb_types::StoredVectorIndexParams {
+            database_id: database_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             collection: collection.to_string(),
             field_name: field_name.clone(),

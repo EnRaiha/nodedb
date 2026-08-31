@@ -266,6 +266,7 @@ mod vector_index_restart_batch_insert;
 mod vector_index_restart_bulk;
 mod vector_index_restart_durability;
 mod vector_index_restart_merge;
+mod vector_index_restart_non_default_database;
 mod vector_index_restart_truncate;
 mod vector_index_restart_update_from_join;
 mod vector_index_txn_insert_select_stmt_stage;
