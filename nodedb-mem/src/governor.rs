@@ -31,6 +31,7 @@ use crate::engine::EngineId;
 use crate::error::{MemError, Result};
 use crate::pressure::{PressureLevel, PressureThresholds};
 use crate::reservation_token::ReservationToken;
+use crate::scoped_budget::{ScopedBudget, clear_scoped_limit, set_scoped_limit};
 
 /// Shared atomic global usage tracker.
 ///
@@ -47,49 +48,6 @@ impl std::fmt::Debug for GlobalCounter {
             .field("allocated", &self.allocated.load(Ordering::Relaxed))
             .field("ceiling", &self.ceiling)
             .finish()
-    }
-}
-
-/// A named budget with an atomic allocated counter.
-///
-/// Used for per-database and per-tenant budget layers.
-#[derive(Debug)]
-struct ScopedBudget {
-    limit: usize,
-    allocated: Arc<AtomicUsize>,
-}
-
-impl ScopedBudget {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            allocated: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// Attempt a CAS-based reservation. Returns the `Arc` to the counter on
-    /// success so the token can hold a reference for drop-release.
-    fn try_reserve(&self, size: usize) -> Option<Arc<AtomicUsize>> {
-        loop {
-            let current = self.allocated.load(Ordering::Relaxed);
-            if current + size > self.limit {
-                return None;
-            }
-            match self.allocated.compare_exchange_weak(
-                current,
-                current + size,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Arc::clone(&self.allocated)),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    fn available(&self) -> usize {
-        let alloc = self.allocated.load(Ordering::Relaxed);
-        self.limit.saturating_sub(alloc)
     }
 }
 
@@ -184,7 +142,7 @@ impl MemoryGovernor {
             .database_budgets
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        map.insert(db, ScopedBudget::new(max_bytes));
+        set_scoped_limit(&mut map, db, max_bytes);
     }
 
     /// Remove the per-database budget ceiling, making that database uncapped.
@@ -193,7 +151,7 @@ impl MemoryGovernor {
             .database_budgets
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        map.remove(&db);
+        clear_scoped_limit(&mut map, &db);
     }
 
     // ── Tenant budget setters ─────────────────────────────────────────────────
@@ -204,7 +162,7 @@ impl MemoryGovernor {
             .tenant_budgets
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        map.insert((db, tenant), ScopedBudget::new(max_bytes));
+        set_scoped_limit(&mut map, (db, tenant), max_bytes);
     }
 
     /// Remove the per-tenant budget ceiling.
@@ -213,7 +171,7 @@ impl MemoryGovernor {
             .tenant_budgets
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        map.remove(&(db, tenant));
+        clear_scoped_limit(&mut map, &(db, tenant));
     }
 
     // ── 4-arity reservation ───────────────────────────────────────────────────
@@ -267,10 +225,11 @@ impl MemoryGovernor {
                 .database_budgets
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some(budget) = map.get(&db) {
-                match budget.try_reserve(size) {
-                    Some(arc) => Some(arc),
-                    None => {
+            match map.get(&db) {
+                None => None,
+                Some(budget) => match budget.try_reserve(size) {
+                    Ok(arc) => Some(arc),
+                    Err(denied) => {
                         // Roll back global.
                         if size > 0 {
                             global_arc.allocated.fetch_sub(size, Ordering::Relaxed);
@@ -279,12 +238,10 @@ impl MemoryGovernor {
                             db,
                             requested: size,
                             available: budget.available(),
-                            limit: budget.limit,
+                            limit: denied.limit,
                         });
                     }
-                }
-            } else {
-                None
+                },
             }
         };
 
@@ -294,10 +251,11 @@ impl MemoryGovernor {
                 .tenant_budgets
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some(budget) = map.get(&(db, tenant)) {
-                match budget.try_reserve(size) {
-                    Some(arc) => Some(arc),
-                    None => {
+            match map.get(&(db, tenant)) {
+                None => None,
+                Some(budget) => match budget.try_reserve(size) {
+                    Ok(arc) => Some(arc),
+                    Err(denied) => {
                         // Roll back database and global.
                         if let Some(ref ctr) = db_counter
                             && size > 0
@@ -312,12 +270,10 @@ impl MemoryGovernor {
                             tenant,
                             requested: size,
                             available: budget.available(),
-                            limit: budget.limit,
+                            limit: denied.limit,
                         });
                     }
-                }
-            } else {
-                None
+                },
             }
         };
 
@@ -780,6 +736,112 @@ mod tests {
             .unwrap();
         assert_eq!(gov.engine_pressure(EngineId::Vector), PressureLevel::Normal);
         assert_eq!(gov.worst_engine_pressure(), PressureLevel::Critical);
+    }
+
+    // ── Quota changes must not orphan a live counter ─────────────────────────
+
+    #[test]
+    fn raising_a_live_quota_keeps_the_allocated_bytes_tracked() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        gov.set_database_budget(db(), 500);
+
+        let _held = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 400)
+            .unwrap();
+        gov.set_database_budget(db(), 1000);
+
+        // 400 held + 700 requested exceeds the new 1000 cap.
+        let err = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 700)
+            .unwrap_err();
+        assert!(
+            matches!(err, MemError::DatabaseBudgetExhausted { .. }),
+            "raising the quota must keep the held 400 bytes counted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn raising_a_live_tenant_quota_keeps_the_allocated_bytes_tracked() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        gov.set_tenant_budget(db(), tenant(), 500);
+
+        let _held = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 400)
+            .unwrap();
+        gov.set_tenant_budget(db(), tenant(), 1000);
+
+        let err = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 700)
+            .unwrap_err();
+        assert!(
+            matches!(err, MemError::TenantBudgetExhausted { .. }),
+            "raising the quota must keep the held 400 bytes counted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_quota_with_live_tokens_keeps_the_counter() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        gov.set_database_budget(db(), 500);
+
+        let _held = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 400)
+            .unwrap();
+        gov.clear_database_budget(db());
+        gov.set_database_budget(db(), 1000);
+
+        let err = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 700)
+            .unwrap_err();
+        assert!(
+            matches!(err, MemError::DatabaseBudgetExhausted { .. }),
+            "clear-then-set must keep the held 400 bytes counted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_quota_with_no_live_tokens_drops_the_entry() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        gov.set_database_budget(db(), 500);
+        gov.set_tenant_budget(db(), tenant(), 500);
+
+        {
+            let _tok = gov
+                .try_reserve(db(), tenant(), EngineId::Vector, 400)
+                .unwrap();
+        }
+        gov.clear_database_budget(db());
+        gov.clear_tenant_budget(db(), tenant());
+
+        assert!(
+            !gov.database_budgets.read().unwrap().contains_key(&db()),
+            "database entry must be removed once no token holds its counter"
+        );
+        assert!(
+            !gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(db(), tenant())),
+            "tenant entry must be removed once no token holds its counter"
+        );
+    }
+
+    #[test]
+    fn released_bytes_do_not_count_against_a_later_quota() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        gov.set_database_budget(db(), 500);
+
+        {
+            let _tok = gov
+                .try_reserve(db(), tenant(), EngineId::Vector, 400)
+                .unwrap();
+        }
+        gov.set_database_budget(db(), 500);
+
+        // The released 400 bytes are gone, so the full 500 is available.
+        let _tok = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 500)
+            .expect("released bytes must not be double-counted");
     }
 
     #[test]

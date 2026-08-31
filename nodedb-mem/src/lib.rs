@@ -43,6 +43,7 @@ pub mod governor;
 pub mod metrics;
 pub mod pressure;
 pub mod reservation_token;
+mod scoped_budget;
 pub mod spill;
 
 pub use arena::{bind_thread_to_local_numa, current_thread_arena, pin_thread_arena};
