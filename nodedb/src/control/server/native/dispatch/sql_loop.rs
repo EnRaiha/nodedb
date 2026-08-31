@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Per-task dispatch loop for the DataFusion-planned SQL path. Split out of
-//! `sql.rs` to keep that file under the file-size limit; behavior is unchanged
-//! — this is the same code that used to run inline in `execute_planned`.
+//! `sql.rs` to keep that file under the file-size limit, with no behavior
+//! change from running inline in `execute_planned`.
 //!
 //! The single-task dispatch primitive it calls lives in `sql_dispatch_task.rs`.
 
@@ -286,9 +286,9 @@ pub(super) async fn run_dispatch_loop(
         let mut task_rows: Option<u64> = None;
         let plan_kind = describe_plan(&plan_for_response);
         if let crate::control::server::response_shape::types::PlanKind::DmlResult(_) = plan_kind {
-            // A count-bearing write reports the rows it actually touched. Adding
-            // 1 per dispatched task instead — which is what the empty-payload
-            // branch below used to do — reported a row for a delete that removed
+            // A count-bearing write must report the rows it actually touched.
+            // Adding 1 per dispatched task instead, as the empty-payload
+            // branch below does, would report a row for a delete that removed
             // nothing and for an `ON CONFLICT DO NOTHING` insert that skipped.
             match crate::control::server::shared::sql::staging_predicates::require_affected_count(
                 &task_resp.payload,

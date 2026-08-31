@@ -20,8 +20,8 @@
 //! INSERT / UPDATE / DELETE over a real `tokio_postgres` client and assert one
 //! event per statement, in statement order, with the right operation kind.
 //! Single node: `cluster_transport` is `None`, so no NOTIFY broadcast is
-//! involved and every event observed here was published locally by the write
-//! funnel. Before the fix this test times out on the first `recv_filtered`.
+//! involved and every event observed here must be published locally by the
+//! write funnel, or the first `recv_filtered` times out.
 
 use std::time::Duration;
 

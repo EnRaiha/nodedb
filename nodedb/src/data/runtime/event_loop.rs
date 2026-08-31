@@ -133,12 +133,12 @@ pub(super) fn run_event_loop(
 
         // Periodic vector checkpoint (when idle and interval elapsed).
         //
-        // The sparse-vector flush used to ride along here. It no longer
-        // does: this timer has no ordering relationship with the
-        // coordinated checkpoint that authorises WAL truncation, so a
-        // flush driven from here could land AFTER the truncation that
-        // had already deleted the records it was meant to make
-        // redundant. `execute_checkpoint` is the only place a flush can
+        // The sparse-vector flush must not ride along here: this timer has
+        // no ordering relationship with the coordinated checkpoint that
+        // authorises WAL truncation, so a flush driven from here could
+        // land AFTER the truncation that already deleted the records it
+        // was meant to make redundant. `execute_checkpoint` is the only
+        // place a flush can
         // both make state durable and report the LSN that authorises
         // deleting its WAL, so that is where it belongs.
         //

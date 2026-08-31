@@ -20,16 +20,17 @@
 //! function being invoked exactly once per record, in ascending LSN order,
 //! against engine state that does not already contain it.
 //!
-//! That used to be guaranteed by the state being rebuilt from scratch on every
-//! restart: `ColumnarOp::Update` / `ColumnarOp::Delete` target only the
-//! plain-columnar and spatial profiles (`sql_plan_convert/dml/update_delete`
-//! routes `EngineType::Columnar | EngineType::Spatial` here and nothing else),
-//! and those profiles live in `CoreLoop::columnar_engines` /
+//! Without `columnar_checkpoint`, that guarantee would hold trivially: state is
+//! rebuilt from scratch on every restart. `ColumnarOp::Update` / `ColumnarOp::Delete`
+//! target only the plain-columnar and spatial profiles
+//! (`sql_plan_convert/dml/update_delete` routes
+//! `EngineType::Columnar | EngineType::Spatial` here and nothing else), and
+//! those profiles live in `CoreLoop::columnar_engines` /
 //! `columnar_flushed_segments` — an in-memory `MutationEngine` plus in-memory
-//! flushed segment bytes with no store behind them. Replay always started from
-//! empty, so there was no durable partial state to double-apply against.
+//! flushed segment bytes with no store behind them. Replay from empty state has
+//! no durable partial state to double-apply against.
 //!
-//! `columnar_checkpoint` ends that. Restoring a generation means replay now
+//! `columnar_checkpoint` changes that. Restoring a generation means replay
 //! starts from state that already contains every record at or below the
 //! manifest's LSN, which is exactly the precondition this function's
 //! non-idempotence depends on. [`ReplayFloors::columnar`] carries that LSN and

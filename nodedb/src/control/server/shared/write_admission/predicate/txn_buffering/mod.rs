@@ -3,12 +3,12 @@
 //! `plan_requires_txn_buffering`: is this in-transaction statement a write
 //! that must be buffered until COMMIT, or a read that executes immediately?
 //!
-//! `route_in_tx_write` (`control/server/shared/session/staging_gate.rs`) used
-//! to answer this by calling `to_replicated_entry(..).is_some()` — but that
-//! function is a WAL/Raft ENCODER, not a classifier: it ends in a catch-all
-//! `_ => None`, so any `PhysicalPlan` variant it has no encoder arm for is
-//! silently treated as a read (executed immediately, visible before COMMIT,
-//! and NOT rolled back by ROLLBACK).
+//! `route_in_tx_write` (`control/server/shared/session/staging_gate.rs`) must
+//! not answer this by calling `to_replicated_entry(..).is_some()` directly —
+//! that function is a WAL/Raft ENCODER, not a classifier: it ends in a
+//! catch-all `_ => None`, so any `PhysicalPlan` variant it has no encoder arm
+//! for would be silently treated as a read (executed immediately, visible
+//! before COMMIT, and NOT rolled back by ROLLBACK).
 //!
 //! `plan_requires_txn_buffering` reproduces `to_replicated_entry(..).is_some()`
 //! variant-for-variant as a compile-time-exhaustive match, so a new
@@ -25,22 +25,22 @@
 //! for any of them — a deliberate divergence from the oracle (see the
 //! equivalence test below, which pins the divergence explicitly rather than
 //! papering over it).
-//! `ArrayOp::{Put, Delete}` used to be in this same exception list, but
-//! `to_replicated_entry` now has encoder arms for both (see
+//! `ArrayOp::{Put, Delete}` are NOT in this exception list:
+//! `to_replicated_entry` has encoder arms for both (see
 //! `control/wal_replication/encode/entry_array.rs::array_write`, which emits
 //! the Raft-native `ArrayCellPut` / `ArrayCellDelete` cluster-write variants),
-//! so they no longer diverge from the oracle and were moved into
+//! so they do not diverge from the oracle and are covered by
 //! `array_and_cluster_array_variants_match_oracle` below.
 //! `VectorOp::{DeleteBySurrogate, SparseInsert, SparseDelete,
-//! MultiVectorInsert, MultiVectorDelete, DirectUpsert}` used to be in this
-//! same exception list, but `to_replicated_entry` now has encoder arms for
+//! MultiVectorInsert, MultiVectorDelete, DirectUpsert}` are likewise NOT in
+//! this exception list: `to_replicated_entry` has encoder arms for
 //! all six (see `control/wal_replication/encode/vector.rs::encode`), so they
-//! no longer diverge from the oracle and were moved to
+//! do not diverge from the oracle and are covered by
 //! `vector_variants_match_oracle` below.
-//! `CrdtOp::{ListInsert, ListDelete, ListMove}` similarly used to be in this
-//! exception list, but `to_replicated_entry` now has encoder arms for all
-//! three (see `control/wal_replication/encode/crdt.rs::encode`), so they no
-//! longer diverge from the oracle and were moved into
+//! `CrdtOp::{ListInsert, ListDelete, ListMove}` are likewise NOT in this
+//! exception list: `to_replicated_entry` has encoder arms for all
+//! three (see `control/wal_replication/encode/crdt.rs::encode`), so they do
+//! not diverge from the oracle and are covered by
 //! `crdt_variants_match_oracle` below.
 //! `DocumentOp::BatchInsert` and `CrdtOp::{SetConstraints, DropConstraints}`
 //! were also in this exception list, but `to_replicated_entry` now has

@@ -127,8 +127,8 @@ impl CoreLoop {
             // The two storage shapes (msgpack map vs raw bytes) are resolved by
             // the one shared shaper, so this scan, the streaming/materializing
             // scans, and a write's `RETURNING` projection cannot disagree about
-            // what a KV row looks like. This loop used to carry its own copy of
-            // that logic, and the copies diverged on the raw-bytes case.
+            // what a KV row looks like. A private copy of that logic in this
+            // loop risks diverging from the others on the raw-bytes case.
             let (_key_str, entry_mp) = crate::data::executor::scan_normalize::kv_row_to_doc(k, v);
 
             // Apply filter predicates post-scan (already works on raw msgpack).

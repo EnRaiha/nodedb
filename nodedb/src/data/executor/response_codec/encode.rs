@@ -193,8 +193,8 @@ mod tests {
 
     // ── decode_payload: the counterpart every encoder here needs ────────────
     //
-    // Each case below pins one Control-Plane read whose decoder used to be a bare
-    // JSON parser with the failure defaulted away. The shared assertion is the same
+    // Each case below pins one Control-Plane read whose decoder must not be a bare
+    // JSON parser that defaults the failure away. The shared assertion is the same
     // one in every case: the bytes an encoder produced must NOT parse as JSON (that
     // is the trap), and must decode through `decode_payload` to exactly what went
     // in.

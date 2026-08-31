@@ -3,12 +3,13 @@
 //! Regression coverage: an RLS write policy created inside a non-default
 //! database must actually be enforced.
 //!
-//! Before the fix, `db_qualified` prefixes every physical-plan op's
+//! `db_qualified` prefixes every physical-plan op's
 //! `collection` field with the owning database ID for any non-default
-//! database, but `CREATE RLS POLICY` stored (and looked up) the bare
-//! collection name. The two keys only coincided in `default`, so a policy
-//! created anywhere else was silently unenforced while `SHOW RLS POLICIES`
-//! still reported it enabled.
+//! database, so `CREATE RLS POLICY` must store (and look up) the
+//! same prefixed key, not the bare collection name. Storing the bare name
+//! makes the two keys coincide only in `default`: a policy created anywhere
+//! else would be silently unenforced while `SHOW RLS POLICIES` still
+//! reports it enabled.
 
 use crate::harness::TestServer;
 

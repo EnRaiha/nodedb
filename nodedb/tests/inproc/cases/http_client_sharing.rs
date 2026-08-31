@@ -34,7 +34,7 @@ fn shared_state_exposes_shared_reqwest_client() {
 }
 
 /// Alert webhook dispatch must accept a shared client rather than building
-/// a fresh one per call. Locks in the function shape after the fix.
+/// a fresh one per call. Locks in the function shape.
 #[test]
 fn alert_webhook_accepts_shared_client() {
     use nodedb::event::alert::notify::notify_webhook_with_client;

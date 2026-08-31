@@ -14,26 +14,12 @@
 //! records ONE read-set entry PER SIDE, each stamped with that side's real
 //! max-folded read version.
 //!
-//! Before the fix the shuffle-JOIN resolver had TWO bugs:
-//!
-//!  * Bug 1 (spurious over-abort): the probe (left) side's read version was
-//!    recorded as `Lsn::ZERO`. With any prior committed write to the left
-//!    collection (`coll_write_lsn > 0`), the barrier's
-//!    `coll_write_lsn(left) <= read_version` check was `>0 <= 0` → false → a
-//!    SPURIOUS serialization abort (SQLSTATE 40001) for a read never
-//!    concurrently written.
-//!  * Bug 2 (serializability HOLE): the build (right) side collection was NEVER
-//!    recorded in the read-set at all — `extract_collection(HashJoin)` returns
-//!    ONLY the left collection, so the build side's vShard was never validated.
-//!    A concurrent write to the build side between the in-txn read and COMMIT
-//!    went UNDETECTED → the transaction silently committed a stale join result.
 //!
 //! Three cases bound the fixed behavior:
 //!
 //!  * `commits_when_neither_side_concurrently_written` — neither join side is
 //!    written during the txn, so both recorded real versions still validate and
-//!    COMMIT must SUCCEED. Kills Bug 1's spurious abort (before the fix the left
-//!    side recorded ZERO and aborted).
+//!    COMMIT must SUCCEED.
 //!  * `occ_aborts_on_stale_probe_read` — a confirmed-visible concurrent write to
 //!    the LEFT/probe collection advances it past the captured probe version, so
 //!    COMMIT must abort with 40001.

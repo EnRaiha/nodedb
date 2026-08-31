@@ -8,13 +8,13 @@
 //! The request-admission gate needs two things about a request: the resolved
 //! [`RequestAuthScope`] (for the identity, account status, `$auth.risk_score`
 //! and the rate-limit key) and the client's peer address (for the IP half of
-//! the blacklist). Those used to be two independent arguments, which meant a
-//! transport could hand the gate a real peer address while having built its
-//! scope without one. That is not a hypothetical: the ingest and sync
-//! admission doors did exactly that, so `$auth.risk_score` was never stamped,
-//! the gate refused every request as unassessed the moment `[auth.risk]` was
-//! enabled, and every `REQUIRE IP` scope grant was silently withheld — while
-//! the call site looked correct, because the address *was* right there in the
+//! the blacklist). Passing those as two independent arguments lets a
+//! transport hand the gate a real peer address while having built its scope
+//! without one. That is not a hypothetical: the ingest and sync admission
+//! doors did exactly that, so `$auth.risk_score` was never stamped, the gate
+//! refused every request as unassessed the moment `[auth.risk]` was enabled,
+//! and every `REQUIRE IP` scope grant was silently withheld — while the call
+//! site looked correct, because the address *was* right there in the
 //! argument list.
 //!
 //! Pairing them in one value removes the failure mode by construction: the

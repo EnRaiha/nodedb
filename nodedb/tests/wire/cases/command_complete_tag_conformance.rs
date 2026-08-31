@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Pins two `CommandComplete` tag conformance fixes: the object-literal
-//! `INSERT INTO t { ... }` path used to omit its affected-row count
+//! Pins two `CommandComplete` tag contracts: the object-literal
+//! `INSERT INTO t { ... }` path must not omit its affected-row count
 //! entirely (a bare `INSERT` tag real `psql` cannot parse), and `TRUNCATE
-//! TABLE` used to append a row count Postgres's tag never carries.
+//! TABLE` must not append a row count Postgres's tag never carries.
 //!
 //! `tokio_postgres::SimpleQueryMessage::CommandComplete` exposes only a
 //! `u64`, derived by `tokio_postgres::query::extract_row_affected` as
@@ -43,11 +43,12 @@ async fn affected(server: &TestServer, sql: &str) -> u64 {
         .unwrap_or_else(|| panic!("statement reported no command tag: {sql}"))
 }
 
-/// Before the fix, `INSERT INTO t { ... }` (the object-literal insert path,
-/// distinct from `INSERT ... VALUES`) returned `DdlResult::Status {
+/// `INSERT INTO t { ... }` (the object-literal insert path,
+/// distinct from `INSERT ... VALUES`) must not return `DdlResult::Status {
 /// rows_affected: None, .. }`, which pgwire renders as a bare `INSERT` tag.
 /// `extract_row_affected` falls back to `0` for a tag with no trailing
-/// integer, so a real single-row insert misreported as touching 0 rows.
+/// integer, so returning `None` would misreport a real single-row insert as
+/// touching 0 rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_literal_insert_reports_one_row_affected() {
     let server = TestServer::start().await;
@@ -71,9 +72,9 @@ async fn object_literal_insert_reports_one_row_affected() {
     );
 }
 
-/// Before the fix, `TRUNCATE TABLE` rendered `TRUNCATE <rows-removed>` — a
-/// count Postgres's `TRUNCATE TABLE` tag never carries. `extract_row_affected`
-/// would then report the pre-truncate row count instead of falling back to
+/// `TRUNCATE TABLE` must not render `TRUNCATE <rows-removed>` — a
+/// count Postgres's `TRUNCATE TABLE` tag never carries. Rendering it that way
+/// would report the pre-truncate row count instead of falling back to
 /// `0` for the count-less tag a real Postgres server sends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_table_reports_no_row_count() {

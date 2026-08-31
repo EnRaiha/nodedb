@@ -73,7 +73,7 @@ impl ScanFilter {
     /// `false` or the first evaluation error — same semantics as
     /// `group.iter().all(|f| f.matches_value(doc))` had before filter
     /// evaluation could fail. `pub` so the many call
-    /// sites across the `nodedb` crate that used to write
+    /// sites across the `nodedb` crate that would otherwise write
     /// `filters.iter().all(|f| f.matches_value(doc))` have a drop-in
     /// replacement instead of each hand-rolling the same short-circuit loop.
     pub fn all_match_value(
@@ -96,10 +96,10 @@ impl ScanFilter {
     /// Returns `Err(EvalError::DivisionByZero)` when the filter is (or
     /// contains, via an `OR` group) a `FilterOp::Expr` predicate whose
     /// expression divides or takes a modulus by zero.
-    /// This is the deliberate WHERE-clause behavior flip: a predicate like
-    /// `10 / denom > 1` used to evaluate to `Value::Null`/`false` (silently
-    /// filtering the row out) when `denom` was `0`; it now fails the whole
-    /// query with SQLSTATE `22012`, matching Postgres.
+    /// This is the deliberate WHERE-clause behavior: a predicate like
+    /// `10 / denom > 1` must fail the whole query with SQLSTATE `22012`,
+    /// matching Postgres, rather than evaluate to `Value::Null`/`false`
+    /// (silently filtering the row out) when `denom` is `0`.
     pub fn matches_value(&self, doc: &nodedb_types::Value) -> Result<bool, EvalError> {
         match self.op {
             FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return Ok(true),

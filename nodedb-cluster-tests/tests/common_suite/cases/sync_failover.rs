@@ -309,8 +309,8 @@ async fn cluster_sync_columnar_dedup_survives_failover() {
     // THE KEYSTONE: a re-send of seq=1 against the NEW leader must still be
     // deduped. This only holds if the survivor advanced its gate HWM when it
     // applied the replicated write as a follower — i.e. the write was routed
-    // through Raft (Stage 5R-b). Before the fix, the survivor's gate started
-    // empty and would re-apply this delta.
+    // through Raft (Stage 5R-b). A survivor whose gate starts
+    // empty would re-apply this delta instead of deduping it.
     let ctx_post = ColumnarSendCtx {
         shared: &cluster.nodes[0].shared,
         tenant,

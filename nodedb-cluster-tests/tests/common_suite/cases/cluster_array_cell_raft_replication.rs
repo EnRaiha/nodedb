@@ -2,9 +2,10 @@
 //! End-to-end 3-node cluster test for Raft-native array cell-write replication
 //! (`ReplicatedWrite::ArrayCellPut`).
 //!
-//! Closes the cluster-lossy gap: a cluster `INSERT INTO ARRAY` used to execute
-//! on the shard owner's Data Plane and never propose to the shard's data Raft
-//! group, so replicas never received the cells. The owner now proposes
+//! Closes the cluster-lossy gap: a cluster `INSERT INTO ARRAY` must not execute
+//! on the shard owner's Data Plane without proposing to the shard's data Raft
+//! group — skipping the proposal leaves replicas never receiving the cells.
+//! The owner proposes
 //! `ArrayCellPut` to the data group; every replica re-executes it through the
 //! distributed apply loop (opening the array + dispatching to its local Data
 //! Plane) and binds each cell's carried surrogate to its coord tuple.

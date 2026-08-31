@@ -30,9 +30,9 @@
 //! the cross-shard Calvin barrier instead of the single-shard fast path. It also
 //! READS a third collection on a distinct vShard (`bread`), making `bread`'s
 //! vShard a read-only participant whose captured read slice the barrier must
-//! revalidate. Before the read-only-participant validate-only dispatch fix, no
-//! validate task reaches `bread`'s vShard → a stale read commits; after the fix,
-//! the stale read aborts the COMMIT with SQLSTATE 40001.
+//! revalidate. A validate task must reach `bread`'s vShard — one that does not
+//! reach it lets a stale read commit — so the stale read
+//! aborts the COMMIT with SQLSTATE 40001.
 //!
 //! ## Determinism
 //!

@@ -4,14 +4,14 @@
 //! `SHOW COLLECTIONS`, `SHOW INDEXES`) must resolve against the session's
 //! current database, not hardcoded `DatabaseId::DEFAULT`.
 //!
-//! Before the fix, the string-recognized introspection router
-//! (`string_introspection::try_string`) accepted the session's
-//! `database_id` but discarded it (bound to `_database_id`), so every
-//! `DESCRIBE` / `SHOW COLLECTIONS` / `SHOW INDEXES` / `UNDROP COLLECTION`
-//! resolved against the DEFAULT database regardless of an active
-//! `USE DATABASE <name>` — collections created in a non-default database
-//! were invisible to introspection even though DML (`SELECT` / `INSERT`)
-//! against them worked correctly via the already-fixed planner path.
+//! The string-recognized introspection router
+//! (`string_introspection::try_string`) must use the session's
+//! `database_id`, not discard it (bound to `_database_id`) — discarding it
+//! would resolve every `DESCRIBE` / `SHOW COLLECTIONS` / `SHOW INDEXES` /
+//! `UNDROP COLLECTION` against the DEFAULT database regardless of an active
+//! `USE DATABASE <name>`, making collections created in a non-default
+//! database invisible to introspection even though DML (`SELECT` / `INSERT`)
+//! against them works correctly via the planner path.
 
 use crate::harness::TestServer;
 
@@ -56,8 +56,8 @@ async fn describe_collection_finds_it_in_non_default_database() {
     .await;
     query_ok(&server, "INSERT INTO t { id: 'row1', v: 'hello' }").await;
 
-    // DML confirms the collection genuinely exists in `mydb` (already-fixed
-    // planner path) — this must succeed both before and after the fix.
+    // DML confirms the collection genuinely exists in `mydb` via the
+    // planner path — this must succeed regardless of introspection routing.
     let dml_rows = server
         .client
         .simple_query("SELECT * FROM t")

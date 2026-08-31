@@ -122,9 +122,9 @@ async fn create_text_index(
     };
     let fuzzy_default = stmt.options.boolean("FUZZY");
 
-    // One index, under the name the statement declared. The name used to be
-    // synthesized per column and the declared one discarded, so
-    // `DROP INDEX <the name I typed>` could never match.
+    // One index, under the name the statement declared. Synthesizing a
+    // per-column name and discarding the declared one would leave
+    // `DROP INDEX <the name I typed>` unable to match.
     let index_name = resolve_index_name(&stmt, &collection);
     if let Some(taken) = state
         .credentials

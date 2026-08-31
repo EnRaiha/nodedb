@@ -249,7 +249,7 @@ pub async fn run_commit(
     // stageable ("Staged") write was already metered at STATEMENT time
     // (`staging_gate::stage_write`, when it applied to the per-transaction
     // overlay), and is re-identified and skipped here by the exact same
-    // `is_stageable_write` predicate `route_in_tx_write` used to route it —
+    // `is_stageable_write` predicate `route_in_tx_write` uses to route it —
     // metering it again here would double-bill it, since it is buffered for
     // durable replay same as a non-stageable write. `buffered` still holds
     // the peeked (not yet drained) task list, so this reads the same tasks
@@ -281,8 +281,8 @@ pub async fn run_commit(
     };
 
     // Release the per-transaction staging overlay on every vShard that hosted a
-    // staged write, now that the durable batch(es) have flushed. Uses the peeked
-    // buffer (identical contents to the drained one). Guarded on a staged
+    // staged write, only after the durable batch(es) have flushed. Uses the
+    // peeked buffer (identical contents to the drained one). Guarded on a staged
     // (txn_id-carrying) buffer.
     if let Some(txn_id) = buffered.first().and_then(|t| t.txn_id) {
         let mut dropped = std::collections::HashSet::new();

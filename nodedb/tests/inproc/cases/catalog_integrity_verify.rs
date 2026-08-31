@@ -107,8 +107,8 @@ fn verify_redb_integrity_flags_orphan_change_stream() {
 /// On a freshly-bootstrapped catalog (clean data dir, no DDL yet) the
 /// startup integrity walk must complete with no divergences. The walk
 /// opens every `_system.*` table it cross-checks; a table missing from
-/// the bootstrap registry now surfaces as a `TableLoadError` divergence
-/// (it used to be a swallowed `tracing::error!`), so an empty divergence
+/// the bootstrap registry must surface as a `TableLoadError` divergence,
+/// not a swallowed `tracing::error!`, so an empty divergence
 /// list is positive proof that every walked table was bootstrapped —
 /// and the list stays in lockstep with the walker automatically as new
 /// tables are added to it.

@@ -269,10 +269,9 @@ async fn staged_delete_drops_fused_row_in_txn_then_rollback_restores() {
     );
 }
 
-/// Autocommit (no transaction) hybrid query behaviour must be unchanged: a
+/// Autocommit (no transaction) hybrid query behaviour: a
 /// committed doc matching a unique term produces a fused row with a non-null
-/// score, exactly as before the fix. This must hold independent of the staging
-/// path.
+/// score. This must hold independent of the staging path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autocommit_hybrid_unchanged() {
     let server = TestServer::start().await;

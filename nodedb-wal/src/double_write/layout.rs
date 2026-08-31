@@ -23,9 +23,9 @@
 //!
 //! ## Format change
 //!
-//! Slots used to begin with a bare `[total_size:4]`. They now begin with
-//! `slot_magic`, whose value is far outside the range a `total_size` could
-//! ever hold, so a slot written by an older build fails the prefix check and
+//! Slots begin with `slot_magic`, not a bare `[total_size:4]`. Its value is
+//! far outside the range a `total_size` could ever hold, so a slot written
+//! by an older build that used the bare format fails the prefix check and
 //! is treated as unusable rather than being misread as a sequence-numbered
 //! slot. A DWB only ever holds records from the tail of the log — the worst
 //! case is that torn-write recovery falls back to "no copy available" for

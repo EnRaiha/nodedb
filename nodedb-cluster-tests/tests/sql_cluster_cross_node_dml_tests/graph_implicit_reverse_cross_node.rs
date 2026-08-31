@@ -5,13 +5,14 @@
 //! shards exactly like an explicit `GRAPH INSERT EDGE`.
 //!
 //! A schemaless document with the reserved `_from`/`_to`/`_type` fields is
-//! mirrored as a graph edge. That extraction used to run on the data plane,
-//! homing the edge by the DOCUMENT's vShard — so a cross-shard implicit edge
-//! (`from_key(_from) != from_key(_to)`) only landed on the document's shard and
-//! a reverse traversal from the destination missed it. Extraction now runs on
-//! the control plane: each endpoint's home vShard + canonical surrogate is
-//! resolved and the edge routes through the same single-home/Calvin dual-home
-//! path as an explicit edge. This test inserts many `src_i -> hub` edges as
+//! mirrored as a graph edge. That extraction must not run on the data plane
+//! homing the edge by the DOCUMENT's vShard — that would land a cross-shard
+//! implicit edge (`from_key(_from) != from_key(_to)`) only on the document's
+//! shard, missing it from a reverse traversal starting at the destination.
+//! Extraction runs on the control plane: each endpoint's home vShard +
+//! canonical surrogate is resolved and the edge routes through the same
+//! single-home/Calvin dual-home path as an explicit edge. This test inserts
+//! many `src_i -> hub` edges as
 //! plain documents (a meaningful fraction cross-shard) and asserts a reverse
 //! (in-direction) traversal from `hub` reaches EVERY source from ANY node —
 //! which only holds if the implicit edge's reverse copy landed on `hub`'s home

@@ -276,8 +276,8 @@ async fn insert_values_string_concat_folds() {
     );
 }
 
-// ── Unary negation (the path the removed `UnaryOp { Minus, .. }` special-case
-//    used to handle; now routed through `convert_expr` + `const_fold`) ──
+// ── Unary negation, routed through `convert_expr` + `const_fold` rather than
+//    a `UnaryOp { Minus, .. }` special-case ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn insert_values_negative_integer_literal() {

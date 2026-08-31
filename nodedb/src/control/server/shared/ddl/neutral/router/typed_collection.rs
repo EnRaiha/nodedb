@@ -25,7 +25,7 @@ pub(super) async fn try_typed(
     match stmt {
         // CREATE COLLECTION / CREATE TABLE. Migrated from the pgwire typed-AST
         // async router (`async_ops`) plus the `if_not_exists: true` guard
-        // short-circuit that used to live in the pgwire `guards` module
+        // short-circuit, formerly in the pgwire `guards` module
         // (checked here, inline, before the create handler runs — same
         // ordering). `build_and_persist` (name/duplicate/engine validation,
         // schema construction, `StoredCollection` assembly, propose+apply,

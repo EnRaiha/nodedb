@@ -343,7 +343,7 @@ impl CoreLoop {
         Ok((last_response, undo_log, crdt_deltas))
     }
 
-    /// Apply all buffered CRDT deltas now that every sub-plan and the
+    /// Apply all buffered CRDT deltas only after every sub-plan and the
     /// `BALANCED` constraint check have succeeded.
     ///
     /// A failure is returned to the caller, which rolls every forward write

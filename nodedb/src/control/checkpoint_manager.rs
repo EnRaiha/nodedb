@@ -343,7 +343,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
                 );
             }
 
-            // 8. GC the redb tombstone set now that no surviving WAL
+            // 8. GC the redb tombstone set: no surviving WAL
             // segment can carry a write older than `checkpoint_lsn`.
             // Without this, `_system.wal_tombstones` grows forever and
             // each startup replay pays to load the accumulated rows.

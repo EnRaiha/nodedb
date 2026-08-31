@@ -43,7 +43,7 @@ struct StageKvTxn<'a> {
 }
 
 /// The per-statement inputs of a staged fungible transfer, bundled so the
-/// handler stays within the argument-count bound now that it also carries the
+/// handler stays within the argument-count bound while also carrying the
 /// collection's compiled write predicate.
 struct StageTransfer<'a> {
     collection: &'a str,

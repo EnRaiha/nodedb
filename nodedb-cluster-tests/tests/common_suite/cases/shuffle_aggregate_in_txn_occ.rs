@@ -13,7 +13,7 @@
 //! time back on its `ShuffleProduceResponse`. The coordinator max-folds those and
 //! records the aggregate's read-set entry with that version.
 //!
-//! Before the fix the shuffle-aggregate resolver recorded `Lsn::ZERO` as the
+//! The shuffle-aggregate resolver must not record `Lsn::ZERO` as the
 //! read version. At the cross-shard COMMIT barrier the read-only participant is
 //! revalidated with `coll_write_lsn(coll) <= read_version`; with `read_version =
 //! 0` and any prior write to the collection (`coll_write_lsn > 0`) the comparison

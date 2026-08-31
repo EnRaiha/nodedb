@@ -63,9 +63,10 @@ async fn rows_as(server: &TestServer, user: &str, sql: &str) -> Vec<String> {
 /// reach a row: it scans every document in the collection and injects a null
 /// score for the ones the inverted index does not know. That makes it the
 /// reachable route by which a vector-primary sidecar arrives at an FTS decoder
-/// — and the decoder used to be told only "strict schema or not", a two-way
-/// answer that cannot express "tagged sidecar", so it fell through to the
-/// document decoder, which ACCEPTS the bytes and yields `[4,"alice"]`.
+/// — and the decoder must be told more than "strict schema or not", a
+/// two-way answer that cannot express "tagged sidecar". Telling it only that
+/// falls through to the document decoder, which ACCEPTS the bytes and yields
+/// `[4,"alice"]`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_vector_primary_payload_column_survives_the_bm25_score_scan() {
     let server = TestServer::start().await;

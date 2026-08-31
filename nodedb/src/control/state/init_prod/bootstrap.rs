@@ -3,11 +3,10 @@
 //! Catalog + registry bootstrap for [`super::SharedState::open`].
 //!
 //! Migrates the credential store, replays every persisted registry from the
-//! system catalog, and wires the security event buses. Pure extraction of
-//! the pre-construction setup that used to live at the top of `open()` —
-//! the returned [`ProdBootstrap`] bundles every value the constructor's
-//! `Self { .. }` literal needs, so `open()` destructures one value instead
-//! of holding ~30 separate locals.
+//! system catalog, and wires the security event buses. Extracted out of the
+//! top of `open()` so the returned [`ProdBootstrap`] bundles every value the
+//! constructor's `Self { .. }` literal needs; `open()` destructures one value
+//! instead of holding ~30 separate locals.
 
 use std::sync::{Arc, Mutex};
 
@@ -33,7 +32,7 @@ use crate::control::trigger::TriggerRegistry;
 /// Every value computed before `SharedState`'s `Self { .. }` literal in
 /// `SharedState::open`, bundled so the constructor can destructure one
 /// return value instead of ~30 separate `let`s. Field-for-field, this is
-/// the same set of locals `open()` used to build directly.
+/// the same set of locals `open()` would otherwise build directly.
 pub(super) struct ProdBootstrap {
     pub(super) credentials: Arc<CredentialStore>,
     pub(super) producer_registry: Option<Arc<SyncProducerRegistry>>,
@@ -71,8 +70,8 @@ pub(super) struct ProdBootstrap {
 }
 
 /// Run the full catalog + registry bootstrap for a production
-/// [`super::SharedState`]. Pure relocation of the setup that used to be
-/// the first ~200 lines of `SharedState::open` — no behavior change.
+/// [`super::SharedState`]. Extracted from the first ~200 lines of
+/// `SharedState::open`, with no behavior change.
 pub(super) fn run(
     wal: &Arc<crate::wal::WalManager>,
     catalog_path: &std::path::Path,

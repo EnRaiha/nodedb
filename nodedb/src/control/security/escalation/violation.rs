@@ -3,10 +3,10 @@
 //! [`record_auth_violation`] — the one place an authentication or
 //! authorization violation is recorded.
 //!
-//! Every rejection that used to write a bare
-//! `audit_record(AuditEvent::AuthFailure, ...)` calls this instead, so the
-//! audit entry and the escalation counter can never drift apart: one site
-//! adds a violation, every site gets both effects.
+//! Every rejection must call this instead of writing a bare
+//! `audit_record(AuditEvent::AuthFailure, ...)`, so the audit entry and the
+//! escalation counter can never drift apart: one site adds a violation,
+//! every site gets both effects.
 //!
 //! The verdict an escalation produces is an account-status change, and it is
 //! persisted the same way any other auth-user status change is — onto the

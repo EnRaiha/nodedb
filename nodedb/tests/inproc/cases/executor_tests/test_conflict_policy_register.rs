@@ -4,11 +4,12 @@
 //! rehydrate the per-core CRDT `PolicyRegistry`, and the rehydration must
 //! survive a restart.
 //!
-//! Before the fix, `ALTER COLLECTION ... SET ON CONFLICT ...` only mutated
-//! the in-memory `PolicyRegistry` (never the catalog). On restart the
-//! registry starts empty, so `PolicyRegistry::get_owned` silently falls back
-//! to `CollectionPolicy::ephemeral()` (UNIQUE -> `RenameSuffix`) even though
-//! the operator had explicitly set `ESCALATE_TO_DLQ`. These tests dispatch
+//! `ALTER COLLECTION ... SET ON CONFLICT ...` must mutate the catalog, not
+//! only the in-memory `PolicyRegistry` — a catalog-only mutation is lost on
+//! restart, when the registry starts empty and `PolicyRegistry::get_owned`
+//! silently falls back to `CollectionPolicy::ephemeral()` (UNIQUE ->
+//! `RenameSuffix`) even though the operator explicitly set
+//! `ESCALATE_TO_DLQ`. These tests dispatch
 //! the exact production path — `DocumentOp::Register` carrying the persisted
 //! `conflict_policy` JSON, as `build_doc_config_from_stored` /
 //! `dispatch_register_from_stored_inner` produce it from the catalog on both
@@ -97,17 +98,17 @@ fn register_with_conflict_policy_rehydrates_registry() {
     );
 }
 
-/// The durability half of the fix: a brand-new `CoreLoop` (simulating a
+/// The durability requirement: a brand-new `CoreLoop` (simulating a
 /// restart — the in-memory `PolicyRegistry` starts empty, exactly as it does
 /// on a real process restart) must ALSO resolve `ESCALATE_TO_DLQ` once it
 /// replays the same `DocumentOp::Register { conflict_policy: Some(json), .. }`
 /// that `rehydrate_schema_registry` / `dispatch_register_from_stored` issue
 /// from the durable catalog record at boot.
 ///
-/// Before the fix, this is exactly the bug: the policy lived only in the old
-/// process's in-memory registry, so the new (post-restart) registry silently
-/// reverted to `RenameSuffix` — a UNIQUE violation that should have been
-/// routed to the DLQ would instead be auto-renamed.
+/// The policy must not live only in a process's in-memory registry —
+/// that would silently revert the new (post-restart) registry to
+/// `RenameSuffix`, auto-renaming a UNIQUE violation that should route to the
+/// DLQ.
 #[test]
 fn conflict_policy_survives_simulated_restart() {
     let policy_json = escalate_unique_policy_json();

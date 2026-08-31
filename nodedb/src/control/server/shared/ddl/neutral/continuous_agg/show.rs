@@ -66,9 +66,9 @@ pub async fn show_continuous_aggregates(
     // registers has no stats to give, and the catalog rows below carry the
     // listing regardless. It does NOT cover a payload that arrived and could
     // not be read: `MetaOp::ListContinuousAggregates` encodes with
-    // `response_codec::encode_serde`, which is MessagePack, and the JSON parser
-    // that used to sit here failed on every one of those payloads and defaulted
-    // the failure away — so every aggregate reported watermark 0, zero rows
+    // `response_codec::encode_serde`, which is MessagePack, so a JSON parser
+    // here would fail on every one of those payloads and default the failure
+    // away — reporting every aggregate at watermark 0, zero rows
     // aggregated, zero materialized buckets, and the catalog's stale flag
     // instead of the live one, on every node, always.
     let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_system(

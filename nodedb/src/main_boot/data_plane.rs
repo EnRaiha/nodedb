@@ -39,8 +39,8 @@ pub(crate) struct DataPlaneBootstrap {
     pub(crate) replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
 }
 
-/// Run the full Data Plane bootstrap phase. Pure relocation of what
-/// used to be inline in `main()` between WAL init and `SharedState::open`.
+/// Run the full Data Plane bootstrap phase. Runs between WAL init and
+/// `SharedState::open`, kept out of `main()` for readability.
 pub(crate) async fn bootstrap_data_plane(
     config: &ServerConfig,
     wal_gate: &nodedb::control::startup::ReadyGate,

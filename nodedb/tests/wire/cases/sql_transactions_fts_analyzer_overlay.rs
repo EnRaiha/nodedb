@@ -5,7 +5,7 @@
 //! open transaction, exactly as it is for an already-committed document
 //! (read-your-own-writes for FTS, analyzer-consistent variant).
 //!
-//! Analyzer + word used to make the difference observable: the collection
+//! This choice of analyzer and word makes the difference observable: the collection
 //! binds the `'hindi'` analyzer (a Hindi stop-word list with no stemming
 //! change on ASCII text — see `nodedb-fts`'s `NoStemAnalyzer`), and the
 //! probe word is `"the"` — an English stop word. The DEFAULT analyzer (no

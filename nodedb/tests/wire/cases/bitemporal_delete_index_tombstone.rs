@@ -17,8 +17,8 @@
 use crate::harness::TestServer;
 
 /// STRICT + bitemporal: deleting a document must hide it from a lookup on
-/// its old indexed value. Before the fix, the stale secondary-index entry
-/// survived the delete and the WHERE lookup below still returned the row.
+/// its old indexed value — a stale secondary-index entry that survives the
+/// delete would leave the WHERE lookup below still returning the row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_bitemporal_delete_tombstones_secondary_index() {
     let srv = TestServer::start().await;

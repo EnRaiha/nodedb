@@ -16,7 +16,7 @@
 //!
 //! Also covers the KV `UPSERT INTO ... VALUES` case: KV collections route
 //! through this same DSL path, not the typed SQL `INSERT ... ON CONFLICT`
-//! path, so it belongs in this suite now that the DSL path is gated.
+//! path, so it belongs in this suite alongside the DSL path's staging gate.
 
 use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;

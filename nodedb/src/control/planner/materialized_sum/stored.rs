@@ -4,12 +4,12 @@
 //! through its STORED row rather than through anything the plan carries.
 //!
 //! `PointDelete` carries no body and `PointUpdate` carries only field
-//! assignments, so neither could say which target it contributes to — an
-//! empty resolution used to fail such statements outright. `PointPut` /
+//! assignments, so neither can say which target it contributes to on its own —
+//! an empty resolution must not fail such statements outright. `PointPut` /
 //! `Upsert` onto an existing row have the reverse gap: a join-column
-//! rewrite moves value between TWO targets, but only the body-named one was
-//! ever resolved; the one the row is leaving is readable only from the
-//! stored image.
+//! rewrite moves value between TWO targets, but only the body-named one
+//! resolves from the plan; the one the row is leaving is readable only from
+//! the stored image.
 //!
 //! [`recon_point_row`] is the only plan-time source read: two readers could
 //! disagree about where a collection lives, and the Data Plane never

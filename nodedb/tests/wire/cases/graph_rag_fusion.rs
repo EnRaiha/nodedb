@@ -86,10 +86,10 @@ async fn graph_rag_fusion_vector_top_k_cap_enforced() {
     let server = TestServer::start().await;
     server.exec("CREATE COLLECTION ragf_cap").await.unwrap();
 
-    // Once `GRAPH RAG FUSION` is routed through the handler, `VECTOR_TOP_K`
-    // values exceeding the cap must be rejected with SQLSTATE 22023 — the same
-    // guard that `SEARCH … USING FUSION` already applies. Today this gets 42601
-    // because the syntax is never routed; after the fix it must get 22023.
+    // `GRAPH RAG FUSION` must route through the handler so `VECTOR_TOP_K`
+    // values exceeding the cap are rejected with SQLSTATE 22023 — the same
+    // guard that `SEARCH … USING FUSION` already applies, not 42601 from an
+    // unrouted syntax.
     server
         .expect_error(
             "GRAPH RAG FUSION ON ragf_cap \
@@ -241,12 +241,12 @@ async fn graph_rag_fusion_graph_k_affects_expanded_node_score() {
 /// A vector hit that is not a graph node must still rank, under a key that can
 /// meet the other legs.
 ///
-/// The seeding path used to mint a node *name* from each hit's surrogate purely
-/// to start the walk, and fell back to a `__local_<hnsw_id>` sentinel when the
-/// surrogate was bound to no graph node. That sentinel is an index-internal id:
-/// it can never equal another leg's key, so such a row could never fuse, and it
-/// leaked into the response's `node_id`. Expansion now seeds from the surrogate
-/// directly and the reporting key falls back to the document identity instead.
+/// Expansion must seed from the surrogate directly, not mint a node *name*
+/// from each hit's surrogate purely to start the walk. Minting a name falls
+/// back to a `__local_<hnsw_id>` sentinel when the surrogate is bound to no
+/// graph node — an index-internal id that can never equal another leg's key,
+/// so such a row could never fuse, and it would leak into the response's
+/// `node_id`. The reporting key falls back to the document identity instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vector_only_hit_ranks_without_an_index_local_sentinel() {
     let server = TestServer::start().await;
@@ -263,7 +263,7 @@ async fn vector_only_hit_ranks_without_an_index_local_sentinel() {
         .unwrap();
 
     // `lonely` is the vector-nearest row and participates in no edge, so it has
-    // no graph node binding — exactly the case the sentinel used to cover.
+    // no graph node binding — exactly the case a local-id sentinel would cover.
     server
         .exec("INSERT INTO ragf_surrogate (id, embedding) VALUES ('lonely', ARRAY[1.0, 0.0])")
         .await

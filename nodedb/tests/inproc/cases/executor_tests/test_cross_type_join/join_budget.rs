@@ -67,8 +67,8 @@ fn batch_kv(ctx: &mut TestCtx, collection: &str, count: usize) -> String {
 ///
 /// Strategy: insert 51,000 KV entries on the left side and one matching entry
 /// whose key is `k50999` (the last one). The right side has a single entry
-/// with key `k50999` as well. With the old cap the probe never reached that
-/// row; after the fix the full scan completes and the join matches.
+/// with key `k50999` as well. The full scan must complete and the join must
+/// match, not stop the probe short of that row at a fixed 50,000-row cap.
 #[test]
 fn hash_join_completeness_past_50k_cap() {
     let mut ctx = make_ctx();

@@ -14,8 +14,8 @@
 //! - the name resolves to a different kind than a qualified statement asked
 //!   for: `42809`, naming the kind it actually is.
 //!
-//! Reporting success without removing anything — the behaviour every kind but
-//! `Secondary` used to have — is not one of them.
+//! Reporting success without removing anything is not one of them, for
+//! every kind including `Secondary`.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::{IndexKind, StoredIndexRecord};

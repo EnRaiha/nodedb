@@ -3,12 +3,12 @@
 //! Regression coverage: RequestTracker must apply bounded backpressure to
 //! streaming responses.
 //!
-//! Today `register` returns `mpsc::UnboundedReceiver`. A slow Control-Plane
-//! session (TLS back-pressure, slow TCP consumer) lets streaming `partial`
-//! chunks accumulate in RAM without bound — RSS grows as
+//! `register` must not return `mpsc::UnboundedReceiver` — a slow Control-Plane
+//! session (TLS back-pressure, slow TCP consumer) would let streaming `partial`
+//! chunks accumulate in RAM without bound, with RSS growing as
 //! `(producer_rate - consumer_rate) * duration`.
 //!
-//! After the fix, `register` returns a bounded receiver; `complete` signals
+//! `register` must return a bounded receiver; `complete` must signal
 //! backpressure (returns false, drops-with-sentinel, or similar) once the
 //! buffer is full rather than silently expanding forever.
 

@@ -218,9 +218,9 @@ mod tests {
 
     /// A DOCUMENT-collection insert whose geometry field is a JSON **string**
     /// containing GeoJSON — the exact shape SQL `ST_Point(...)` inserts
-    /// produce, as opposed to a GeoJSON **object**. Before the fix, only the
-    /// object shape was detected by `apply_point_put_spatial`, so this insert
-    /// never populated `spatial_indexes` (O(n) full-scan fallback instead of
+    /// produce, as opposed to a GeoJSON **object**. `apply_point_put_spatial`
+    /// must detect both shapes, or this insert never populates
+    /// `spatial_indexes` (O(n) full-scan fallback instead of
     /// the R-tree). This is a raw JSON document body (not msgpack) so
     /// `doc_format::decode_document`'s JSON fallback path is exercised, same
     /// as documents freshly inserted via SQL before any msgpack re-encode.

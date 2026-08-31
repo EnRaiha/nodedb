@@ -349,19 +349,19 @@ async fn native_kv_batch_get_returns_fetched_values() {
 }
 
 /// Regression test: a native direct-op `KvBatchPut` issued inside
-/// an explicit transaction used to write straight through to durable storage
+/// an explicit transaction must not write straight through to durable storage
 /// (`execute_kv_batch_put` in `data/executor/handlers/kv/batch.rs`, called
 /// unconditionally from `handle_direct_op` via `dispatch_single_task`,
-/// bypassing the protocol-neutral staging gate entirely) -- so `ROLLBACK`
-/// never undid it, a transaction-atomicity violation. `KvOp::BatchPut` was
-/// already on the `is_stageable_write` allow-list
+/// bypassing the protocol-neutral staging gate entirely) -- that would let
+/// `ROLLBACK` fail to undo it, a transaction-atomicity violation. `KvOp::BatchPut`
+/// is already on the `is_stageable_write` allow-list
 /// (`shared/sql/staging_predicates.rs`) and its Data Plane staging handler
 /// (`stage_kv_atomic::stage_kv_batch_put`) and COMMIT-replay handling
-/// (`transaction/sub_plan_kv_ops.rs`) were already implemented and correct --
-/// the SQL path just never had a way to reach `BatchPut` (`KV_BATCH_PUT` has
-/// no SQL surface) and the native `handle_direct_op` path never routed
-/// through `route_in_tx_write` for ANY direct op. The fix makes
-/// `dispatch_single_task` route every direct-op task through the same
+/// (`transaction/sub_plan_kv_ops.rs`) are already implemented and correct --
+/// the SQL path has no way to reach `BatchPut` (`KV_BATCH_PUT` has
+/// no SQL surface), so the native `handle_direct_op` path must route
+/// through `route_in_tx_write` for every direct op.
+/// `dispatch_single_task` routes every direct-op task through the same
 /// `route_in_tx_write`/`stage_write` gate `sql_loop.rs`'s SQL-planned
 /// dispatch loop already uses, so a `KvBatchPut` inside `BEGIN...COMMIT` is
 /// staged into the per-transaction overlay instead of hitting durable

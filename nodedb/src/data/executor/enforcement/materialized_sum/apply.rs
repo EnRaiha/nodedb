@@ -13,10 +13,10 @@
 //! [`super::rmw`], shared with the cross-shard handler so the two paths cannot
 //! total differently.
 //!
-//! The previous implementation wrote with a bare `sparse.put`, which has none of
-//! those. A balance updated that way left the target's FTS postings, secondary
-//! indexes and column statistics asserting the value it used to hold, and put
-//! the row's new bytes outside the transaction the source row was landing in.
+//! Writing with a bare `sparse.put` has none of those. A balance updated that
+//! way leaves the target's FTS postings, secondary indexes, and column
+//! statistics asserting the stale value, and puts the row's new bytes outside
+//! the transaction the source row is landing in.
 //!
 //! # A DEFERRED target is not applied here
 //!
@@ -1495,16 +1495,17 @@ mod tests {
     ///
     /// `execute_calvin_flush` replays every staged plan through
     /// `execute_transaction_batch`, which intercepts `PointInsert` for undo
-    /// tracking instead of re-dispatching it. That interception used to forward
-    /// `resolved_sum_targets` and drop `deferred_sum_targets`, so the source core
-    /// folded a balance the Control Plane had already shipped on its own
-    /// `ApplyBalanceDelta` task and the total moved twice.
+    /// tracking instead of re-dispatching it. That interception must forward both
+    /// `resolved_sum_targets` and `deferred_sum_targets`; dropping the latter lets
+    /// the source core fold a balance the Control Plane already shipped on its own
+    /// `ApplyBalanceDelta` task, moving the total twice.
     ///
-    /// It was invisible for two compounding reasons: a deferral is only ever set on
-    /// a CROSS-SHARD statement, and a cross-shard statement only ever commits
-    /// through Calvin — so the marker was dropped on every write that had one, and
-    /// never on a write that could notice. The direct-dispatch path forwards it
-    /// correctly, which is why every single-shard test stayed green.
+    /// A dropped marker is invisible under two compounding conditions: a deferral
+    /// is only ever set on a CROSS-SHARD statement, and a cross-shard statement
+    /// only ever commits through Calvin — so a bug here fires on every write that
+    /// carries the marker, and never on a write that could notice. The
+    /// direct-dispatch path forwards it correctly, which is why a regression here
+    /// leaves every single-shard test green.
     ///
     /// Asserted through `execute_transaction_batch` rather than through the funnel:
     /// the funnel was never where the field was lost.

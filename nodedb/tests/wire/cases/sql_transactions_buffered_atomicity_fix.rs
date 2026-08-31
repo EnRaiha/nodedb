@@ -3,9 +3,9 @@
 //! Regression coverage for the txn-buffering atomicity fix: a documented set
 //! of writes (`ArrayOp::{Put, Delete}`, `DocumentOp::{BatchInsert, Merge,
 //! UpdateFromJoin}`, plus `CrdtOp` and `VectorOp` variants not exercised by a
-//! standalone SQL surface) used to execute IMMEDIATELY against base state
-//! inside an explicit `BEGIN ... COMMIT` block — visible before COMMIT, and
-//! NOT undone by ROLLBACK. They are now buffered like every other
+//! standalone SQL surface) must not execute IMMEDIATELY against base state
+//! inside an explicit `BEGIN ... COMMIT` block — that would be visible before
+//! COMMIT, and NOT undone by ROLLBACK. They are buffered like every other
 //! transactional write: ROLLBACK discards them, COMMIT is required to
 //! persist them, and — the deliberate trade-off documented in
 //! `control/server/shared/write_admission/predicate/txn_buffering.rs` — a

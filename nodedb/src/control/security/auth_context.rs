@@ -160,12 +160,11 @@ impl AuthContext {
             .and_then(|s| s.parse::<AuthStatus>().ok())
             .unwrap_or(AuthStatus::Active);
 
-        // Every claim value is kept, whatever its JSON type. A claim that
-        // silently vanished here (the old behavior for non-string values)
-        // is indistinguishable from one the provider never sent, so an RLS
-        // policy keyed on it would fail open with no diagnostic — a numeric
-        // `seats` or boolean `beta` claim must reach `$auth.metadata.*`
-        // typed, not be dropped or coerced to text.
+        // Every claim value is kept, whatever its JSON type. A claim silently
+        // dropped for a non-string value is indistinguishable from one the
+        // provider never sent, so an RLS policy keyed on it would fail open
+        // with no diagnostic — a numeric `seats` or boolean `beta` claim must
+        // reach `$auth.metadata.*` typed, not be dropped or coerced to text.
         let mut metadata: HashMap<String, Value> = claims
             .extra
             .get("metadata")
@@ -363,9 +362,9 @@ impl AuthContext {
     /// Whether `metadata[key]` is an affirmative boolean flag.
     ///
     /// Accepts both `Value::Bool(true)` — what a provider issuing a proper
-    /// JSON boolean claim now produces — and the legacy `Value::String("true")`
-    /// that every existing deployment still sends, since the claim parser
-    /// used to coerce every metadata value to a string. Accepting only one
+    /// JSON boolean claim produces — and the legacy `Value::String("true")`
+    /// that every existing deployment still sends from a claim parser that
+    /// coerces every metadata value to a string. Accepting only one
     /// of the two forms would break either new correctly-typed providers or
     /// every deployment already in the field. An absent key, or any other
     /// value (including `Value::Bool(false)` / `Value::String("false")`), is

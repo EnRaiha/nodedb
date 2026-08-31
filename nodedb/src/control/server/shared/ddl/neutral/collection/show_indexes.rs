@@ -8,8 +8,9 @@
 //! soft-dropped collection are retained for `UNDROP` but not listed.
 //!
 //! `ON <collection>` filters by the collection each index is actually
-//! attached to. It used to filter on the index name having the collection as
-//! a prefix, which both hid correctly-named indexes and showed unrelated ones.
+//! attached to, not by whether the index name has the collection as a
+//! prefix — a name-prefix filter both hides correctly-named indexes and
+//! shows unrelated ones.
 
 use serde_json::{Map, Value as JsonValue};
 

@@ -115,7 +115,7 @@ pub(super) fn build_raft_loop(
         .with_replication_factor(replication_factor),
     );
 
-    // Spawn cluster subsystems now that the loop owns `MultiRaft`.
+    // Spawn cluster subsystems only after the loop owns `MultiRaft`.
     // They share the same `Arc<Mutex<MultiRaft>>` the loop holds, so
     // shutdown is symmetric (subsystems are torn down before the
     // loop's strong ref drops). See `nodedb_cluster::start_cluster`

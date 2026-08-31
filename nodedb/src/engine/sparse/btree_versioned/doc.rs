@@ -694,9 +694,9 @@ mod tests {
 
     #[test]
     fn scan_all_pushes_predicate_down_so_limit_counts_matches() {
-        // Regression: the audit-log handler used to fetch a capped window then
-        // filter, so a selective predicate silently under-returned. The predicate
-        // is now applied inside the scan, before `limit` truncation, so `limit`
+        // The audit-log handler must not fetch a capped window then filter —
+        // that silently under-returns for a selective predicate. The predicate
+        // must apply inside the scan, before `limit` truncation, so `limit`
         // counts MATCHING versions — not raw scanned rows.
         let (e, _d) = open_temp();
         for i in 0..10i64 {

@@ -4,8 +4,8 @@
 //! BEFORE/INSTEAD OF trigger firing (with OLD-row fetch and probe-driven
 //! event reclassification), truncate `restart_identity` extraction, and
 //! clone CoW write-path interception. Split out of `execute.rs` to keep
-//! that file under the file-size limit; behavior is unchanged — this is
-//! the same code that used to run inline in the per-task dispatch loop.
+//! that file under the file-size limit, with no behavior change from
+//! running inline in the per-task dispatch loop.
 
 use std::collections::HashMap;
 use std::sync::Arc;

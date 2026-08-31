@@ -3,12 +3,12 @@
 //! Typed error classification survives the native (MessagePack) protocol.
 //!
 //! A Data-Plane refusal is classified once, deterministically, into an
-//! `ErrorCode`. Three layers used to destroy that classification on the way
-//! out over native — the handler stringified the typed error into
-//! `Internal { detail }`, the dispatch layer stamped `XX000` and a `{:?}`
-//! dump, and the wire frame carried no numeric code at all — so every typed
-//! condition reached the client as NDB-9000 and a duplicate key was
-//! indistinguishable from a crashed database.
+//! `ErrorCode`. That classification must survive three layers on the way
+//! out over native: the handler must not stringify the typed error into
+//! `Internal { detail }`, the dispatch layer must not stamp `XX000` and a
+//! `{:?}` dump, and the wire frame must carry the numeric code — otherwise
+//! every typed condition reaches the client as NDB-9000 and a duplicate key
+//! is indistinguishable from a crashed database.
 //!
 //! These tests pin the wire contract at the frame level: the SQLSTATE comes
 //! from the same protocol-neutral mapping pgwire uses, and the stable numeric
@@ -110,8 +110,8 @@ async fn native_unique_index_violation_carries_constraint_code() {
 
     let mut stream = native_session(&server).await;
     // Fresh primary key, duplicate indexed value: the refusal comes from the
-    // secondary-index enforcement inside the apply, which is the path that
-    // used to stringify the typed error into `Internal { detail }`.
+    // secondary-index enforcement inside the apply, a path that must not
+    // stringify the typed error into `Internal { detail }`.
     let resp = send_sql(
         &mut stream,
         1,

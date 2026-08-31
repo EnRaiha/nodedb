@@ -102,9 +102,9 @@ impl CoreLoop {
         // `apply_point_delete` reports that as a `None` pre-image.
         //
         // `outcome.prior_value` is the pre-image, which is the ONLY image a
-        // delete has. An enforcement API that could report only a post-image
-        // could not express this write at all, which is why a deleted row's
-        // contribution used to stay on the total forever.
+        // delete has. An enforcement API that can report only a post-image
+        // cannot express this write at all: a deleted row's contribution would
+        // stay on the total forever.
         let enforcement = match outcome.prior_value {
             Some(ref old) => match write_hook::run(
                 self,

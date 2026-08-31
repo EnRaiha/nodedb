@@ -13,8 +13,7 @@ use nodedb::control::state::SharedState;
 /// `ShutdownWatch` and system metrics, and — only when
 /// `NODEDB_TEST_SLOW_DRAIN_TASK=1` — register a task that deliberately
 /// never reports drained, to verify the offender-abort path in
-/// integration tests. Pure relocation of what used to be inline in
-/// `main()`.
+/// integration tests. Kept out of `main()` for readability.
 ///
 /// Returns `(shutdown_rx, shutdown_bus, loop_registry_supervisor)`. All
 /// shutdown signals flow through the canonical `ShutdownWatch` held on

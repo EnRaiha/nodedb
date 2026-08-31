@@ -388,13 +388,11 @@ impl<'a> StatementExecutor<'a> {
 }
 
 /// Deterministic coverage for the cross-shard trigger ORIGINATION logic
-/// (the `execute_sql` routing branch above), replacing the un-runnable
-/// full-cluster e2e test that used to live in
-/// `nodedb-cluster-tests/tests/cluster_triggers.rs` — that harness cannot
-/// place different vShards' Raft leadership on different nodes, so a
-/// same-node "remote" route never arises there. Here the routing table is
-/// built directly, so both `Local` and `Remote` decisions are reachable
-/// without a cluster.
+/// (the `execute_sql` routing branch above). A full-cluster e2e test cannot
+/// cover this: that harness cannot place different vShards' Raft leadership
+/// on different nodes, so a same-node "remote" route never arises there.
+/// Here the routing table is built directly, so both `Local` and `Remote`
+/// decisions are reachable without a cluster.
 ///
 /// The send/receive path (dispatcher retry/DLQ/HWM-dedup, wire
 /// serialization, receiver apply) is covered separately by

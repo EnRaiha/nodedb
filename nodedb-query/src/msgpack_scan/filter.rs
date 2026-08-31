@@ -24,7 +24,7 @@ impl ScanFilter {
     /// `group.iter().all(|f| f.matches_binary(doc))` had before filter
     /// evaluation could fail. A `pub` associated
     /// function (rather than a private free function) so the many call
-    /// sites across the `nodedb` crate that used to write
+    /// sites across the `nodedb` crate that would otherwise write
     /// `filters.iter().all(|f| f.matches_binary(doc))` have a single
     /// drop-in replacement instead of each hand-rolling the same
     /// short-circuit loop.

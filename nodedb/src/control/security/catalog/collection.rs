@@ -66,10 +66,9 @@ pub struct StoredCollection {
     pub owner: String,
     pub created_at: u64,
     /// Monotonic descriptor version. Starts at 1 on create, bumped on
-    /// every `PutCollection` apply (which doubles as alter). A value
-    /// of `0` is the sentinel for "legacy entry written before
-    /// `DISTRIBUTED_CATALOG_VERSION >= 3`, version unknown" and
-    /// forces resolvers to re-fetch.
+    /// every `PutCollection` apply (which doubles as alter). `0` is the
+    /// sentinel for "no version assigned", which forces resolvers to
+    /// re-fetch rather than trust the row.
     #[msgpack(default)]
     pub descriptor_version: u64,
     /// Monotonic constraint-set version. Bumped by the metadata stamp

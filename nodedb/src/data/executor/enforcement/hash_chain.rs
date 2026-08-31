@@ -304,8 +304,8 @@ mod tests {
             "two inserts must have advanced the chain past genesis"
         );
 
-        // Reopen the same directory: this is the boot that used to reset every
-        // chain to genesis.
+        // Reopen the same directory: a boot on an existing directory must
+        // rehydrate every chain head, not reset it to genesis.
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         assert_eq!(
             core.chain_hashes.get(&config_key),

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Regression: `AS OF SYSTEM TIME NULL` on a `document_strict` collection
-//! used to silently drop every user column, since the audit-log scan
-//! decoded the stored Binary Tuple as MessagePack. Asserts user columns
+//! must not silently drop every user column by having the audit-log scan
+//! decode the stored Binary Tuple as MessagePack. Asserts user columns
 //! survive and raw reserved bitemporal columns don't leak.
 
 use crate::harness::TestServer;

@@ -44,8 +44,8 @@ pub(crate) struct BackgroundLoopsInputs<'a> {
 
 /// Start cluster Raft (if configured), spawn the descriptor lease
 /// renewal loop, start the response poller, and spawn every Event
-/// Plane background loop. Pure relocation of what used to be inline in
-/// `main()` between shutdown-bus wiring and connection-semaphore setup.
+/// Plane background loop. Runs between shutdown-bus wiring and
+/// connection-semaphore setup, kept out of `main()` for readability.
 pub(crate) fn spawn(
     shared: &Arc<SharedState>,
     config: &ServerConfig,

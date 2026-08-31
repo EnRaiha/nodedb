@@ -135,9 +135,9 @@ async fn dispatch_durable(
 ///
 /// The Data Plane encodes these rows with
 /// `response_codec::encode_json_vec_as_msgpack`, so `decode_payload` is their
-/// counterpart. A JSON parser on those bytes fails on the first byte, and the
-/// decoder that used to sit here defaulted that failure into an empty row set —
-/// reporting an empty leaderboard for every query, whatever the index held.
+/// counterpart. A JSON parser on those bytes fails on the first byte, and a
+/// decoder that defaults that failure into an empty row set would
+/// report an empty leaderboard for every query, whatever the index held.
 fn decode_rows(payload: &[u8]) -> Result<Vec<serde_json::Value>, DdlError> {
     crate::data::executor::response_codec::decode_payload(payload)
         .map_err(|e| ddl_err("XX000", format!("sorted index reply: {e}")))

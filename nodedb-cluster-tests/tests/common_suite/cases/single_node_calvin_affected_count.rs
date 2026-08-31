@@ -149,8 +149,8 @@ async fn calvin_plain_delete_surfaces_affected_count() {
          (before={admitted_before}, after={admitted_after})"
     );
 
-    // The core assertion: the reported affected count is the number of matched
-    // rows, carried through the completion sidecar. Before the fix it was 0.
+    // The core assertion: the reported affected count must be the number of
+    // matched rows, carried through the completion sidecar, not a synthesized 0.
     let count = command_count(&msgs).expect("DELETE returns a CommandComplete count");
     assert_eq!(
         count, TO_DELETE as u64,

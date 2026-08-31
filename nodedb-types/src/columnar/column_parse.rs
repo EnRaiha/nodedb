@@ -122,8 +122,8 @@ impl FromStr for ColumnType {
 
         match upper.as_str() {
             // `INT4`/`INT8`/`SMALLINT`/`INT2` are PostgreSQL wire-width integer
-            // keywords: strict/kv `CREATE COLLECTION` used to reject
-            // them as unknown types even though they're valid aliases. They
+            // keywords: strict/kv `CREATE COLLECTION` must accept
+            // them as valid aliases, not reject them as unknown types. They
             // all collapse to the same `Int64` storage variant as
             // `BIGINT`/`INTEGER`/`INT` — nodedb always stores integers as a
             // full i64. The declared width is carried separately as an

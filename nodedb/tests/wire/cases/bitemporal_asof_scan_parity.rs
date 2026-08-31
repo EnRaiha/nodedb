@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Regression: a bitemporal `AS OF SYSTEM TIME` / `AS OF VALID TIME` (and the
-//! all-versions `AS OF SYSTEM TIME NULL` audit) Document read used to route
-//! through a separate, stunted handler that DROPPED `ORDER BY`, computed /
-//! generated columns and window functions — so temporal reads returned
-//! unsorted rows with computed columns omitted, unlike a normal current-time
-//! read. The read is now unified: the temporal slice differs only in the
+//! all-versions `AS OF SYSTEM TIME NULL` audit) Document read must not route
+//! through a separate, stunted handler that drops `ORDER BY`, computed /
+//! generated columns, and window functions — that would return temporal reads
+//! as unsorted rows with computed columns omitted, unlike a normal current-time
+//! read. The read is unified: the temporal slice differs only in the
 //! row-fetch stage, and the same downstream (sort -> window -> computed ->
 //! projection -> distinct) runs for every mode.
 //!
-//! These assertions FAIL on the pre-fix tree:
+//! These assertions pin that unification:
 //! - `ORDER BY` is ignored by an `AS OF SYSTEM TIME <cutoff>` read (rows come
 //!   back in insertion order).
 //! - a `SELECT <expr> AS x` computed column is omitted from the `AS OF` output.

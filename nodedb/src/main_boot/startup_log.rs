@@ -11,8 +11,8 @@ use tracing::info;
 /// Log where the config came from (default / CLI arg / `NODEDB_CONFIG`),
 /// then emit the structured "nodedb starting" boot-banner event. Returns
 /// the cluster-mode label (`"cluster"` or `"single-node"`) for reuse by
-/// later boot steps. Pure relocation of what used to be inline in
-/// `main()` right after the root span guard was entered.
+/// later boot steps. Runs right after the root span guard is entered,
+/// kept out of `main()` for readability.
 pub(crate) fn log_boot_banner(
     config_path: &Option<PathBuf>,
     config: &ServerConfig,

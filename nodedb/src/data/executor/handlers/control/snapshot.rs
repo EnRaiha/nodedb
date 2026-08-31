@@ -373,10 +373,10 @@ impl CoreLoop {
         let mut durable_lsns: Vec<crate::types::Lsn> = vec![self.checkpoint_kv_durable_lsn()];
 
         // 2. Flush the sparse-vector indexes. Same shape as KV — in-memory
-        //    state whose only durable copy was the WAL. Its flush used to hang
-        //    off an INDEPENDENT timer in `data/runtime.rs`, which is why it had
-        //    to move here: a flush that is not ordered against the truncation
-        //    it authorises is not a checkpoint, whatever its period.
+        //    state whose only durable copy is the WAL. Its flush must run here,
+        //    not off an independent timer in `data/runtime.rs`: a flush that is
+        //    not ordered against the truncation it authorises is not a
+        //    checkpoint, whatever its period.
         durable_lsns.push(self.checkpoint_sparse_vector_durable_lsn());
 
         // 3. Flush the sync idempotency gate. Rebuilt at boot only from the

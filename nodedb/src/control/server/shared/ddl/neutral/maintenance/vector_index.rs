@@ -232,8 +232,8 @@ pub async fn handle_alter_vector_index_set(
 
     for pair in inner.split(',') {
         let pair = pair.trim();
-        // A list item with no `=` used to be skipped, so a typo'd item was
-        // dropped while the statement reported success for the ones around it.
+        // A list item with no `=` must not be skipped — silently dropping a
+        // typo'd item would report success for the ones around it.
         let Some((key, val)) = pair.split_once('=') else {
             return Err(ddl_err(
                 "42601",

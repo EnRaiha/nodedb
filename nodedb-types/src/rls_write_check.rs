@@ -179,7 +179,7 @@ mod tests {
     }
 
     /// The whole point of the type: a plan that never went through injection
-    /// is denied, where a bare empty `Vec<u8>` used to be admitted.
+    /// must be denied, not admitted the way a bare empty `Vec<u8>` would be.
     #[test]
     fn an_uninjected_plan_is_denied_rather_than_admitted() {
         let check = RlsWriteCheck::pending_injection();

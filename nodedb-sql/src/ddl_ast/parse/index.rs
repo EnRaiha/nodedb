@@ -266,9 +266,9 @@ mod tests {
 
     #[test]
     fn create_index_if_not_exists() {
-        // Regression: the `IF NOT EXISTS` keywords used to be consumed as the
-        // index name, shifting every later token — the index was named `if`
-        // and the target collection read as `exists`.
+        // The `IF NOT EXISTS` keywords must not be consumed as the
+        // index name — that would shift every later token, naming the index
+        // `if` and reading the target collection as `exists`.
         let parsed = parse_index("CREATE INDEX IF NOT EXISTS idx ON users (email)");
         assert!(parsed.if_not_exists);
         assert!(!parsed.unique);

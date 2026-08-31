@@ -159,8 +159,8 @@ mod tests {
     }
 
     /// The join-key MOVE: two targets, two deltas, opposite signs. Accounting
-    /// it as a single positive contribution — the old behaviour — leaves the
-    /// abandoned target permanently overstated and the new one short.
+    /// it as a single positive contribution leaves the abandoned target
+    /// permanently overstated and the new one short.
     #[test]
     fn update_that_moves_the_join_key_yields_two_opposite_deltas() {
         let old_doc = row("a1", 25);

@@ -99,9 +99,8 @@ pub(crate) fn shape_error_to_native(seq: u64, e: &nodedb_types::NodeDbError) -> 
 /// protocol-neutral mapping pgwire uses (`error_code_to_sqlstate`), and the
 /// stable numeric code comes from the one `ErrorCode` → `NodeDbError`
 /// conversion the crate owns. Formatting the code with `{:?}` and stamping
-/// `XX000` — which is what this path used to do — discarded that
-/// classification, leaving a native client unable to tell a duplicate key
-/// from a crashed database.
+/// `XX000` instead would discard that classification, leaving a native
+/// client unable to tell a duplicate key from a crashed database.
 pub(crate) fn error_response_to_native(seq: u64, response: &Response) -> NativeResponse {
     let mut native = error_code_to_native(seq, response.error_code.as_deref());
     // A non-empty payload on an error response is a handler-rendered message

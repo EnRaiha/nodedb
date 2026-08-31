@@ -22,12 +22,12 @@
 //!     `execute_checkpoint` folds `min` over those, and that fold is what
 //!     authorises `WalManager::truncate_before` to unlink segments.
 //!
-//! This type deliberately holds no LSN. It used to carry a `checkpoint_lsn`
-//! that `complete_checkpoint` set from the raw watermark and that nothing ever
-//! read — a second, parallel "the watermark is durable" claim of exactly the
-//! kind that let WAL truncation delete the only copy of memory-only engine
-//! state. A scheduler that cannot name an LSN cannot be misread as authorising
-//! a deletion, so the LSN half is gone rather than merely unused.
+//! This type deliberately holds no LSN. A `checkpoint_lsn` field set from the
+//! raw watermark, with nothing reading it back, would be a second, parallel
+//! "the watermark is durable" claim of exactly the kind that lets WAL
+//! truncation delete the only copy of memory-only engine state. A scheduler
+//! that cannot name an LSN cannot be misread as authorising a deletion, so the
+//! LSN half is absent rather than merely unused.
 
 use std::time::{Duration, Instant};
 

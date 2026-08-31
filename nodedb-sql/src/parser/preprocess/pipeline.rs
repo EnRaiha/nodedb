@@ -78,8 +78,8 @@ pub fn preprocess(sql: &str) -> Result<Option<PreprocessedSql>, SqlError> {
     if is_upsert {
         let rewritten = format!("INSERT INTO {}", &temporal_sql["UPSERT INTO ".len()..]);
         // `?`: a malformed object literal — or a clause the literal form cannot
-        // carry — fails the statement here rather than falling through to be
-        // reparsed as something else, which is how it used to disappear.
+        // carry — must fail the statement here rather than fall through to be
+        // reparsed as something else, which would let the error disappear.
         if let Some(result) = try_rewrite_object_literal(&rewritten)? {
             return Ok(Some(PreprocessedSql {
                 sql: result,
@@ -273,10 +273,10 @@ mod tests {
             "got: {}",
             result.sql
         );
-        // Regression guard: the rewriter used to compute the left-operand
-        // start with `before.len() - left.len()`, which is off-by-one when
-        // there is whitespace between the column and `<->` — the column's
-        // leading character was left in the prefix, producing
+        // Guard against computing the left-operand start with
+        // `before.len() - left.len()`, which is off-by-one when
+        // there is whitespace between the column and `<->` — that leaves the
+        // column's leading character in the prefix, producing
         // `WHERE evector_distance(embedding, ...)`. Lock the corrected slice.
         assert!(
             !result.sql.contains("evector_distance"),

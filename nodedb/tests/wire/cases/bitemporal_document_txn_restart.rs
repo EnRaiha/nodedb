@@ -5,10 +5,11 @@
 //! resolve-time bitemporal-stamp mechanism targets.
 //!
 //! `BEGIN; INSERT; COMMIT` on a bitemporal collection journals the transaction
-//! as one `TransactionRedo` WAL record. Before the fix, the document `Put`
-//! sub-record carried NO bitemporal stamp, and at WAL replay `doc_configs` is
-//! EMPTY (replay runs before the `Register` ops that repopulate it). So
-//! `is_bitemporal` returned false, the replayed put landed on the PLAIN table
+//! as one `TransactionRedo` WAL record. The document `Put`
+//! sub-record must carry a bitemporal stamp: at WAL replay `doc_configs` is
+//! EMPTY (replay runs before the `Register` ops that repopulate it), so a
+//! sub-record with no stamp makes `is_bitemporal` return false, landing the
+//! replayed put on the PLAIN table
 //! (invisible to the versioned reads `AS OF SYSTEM TIME` / current bitemporal
 //! reads consult) — data loss in the crash window, or an orphan plain row plus
 //! a double-stamped version in the normal case.

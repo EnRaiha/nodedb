@@ -227,7 +227,7 @@ fn config_template_is_structurally_valid() {
 
 #[test]
 fn server_config_rejects_jwt_provider_with_empty_issuer() {
-    // After the fix, loading a config with a JWT provider that omits
+    // Loading a config with a JWT provider that omits
     // `issuer` must return Err — fail-closed at startup, not
     // silently-skip at validate time.
     let toml = config_toml_with_provider(

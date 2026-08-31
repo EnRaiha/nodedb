@@ -46,11 +46,11 @@ use super::guards::{check_blacklist, check_rate_limit, check_risk};
 ///
 /// The request arrives as a [`ClientRequestScope`], never as a bare
 /// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
-/// plus a separate address argument. Those used to be two independent
-/// parameters, and a transport that resolved an address-less scope while
-/// passing a real address here looked correct at the call site but left
+/// plus a separate address argument. Passing those as two independent
+/// parameters lets a transport resolve an address-less scope while
+/// passing a real address here, looking correct at the call site but leaving
 /// `$auth.risk_score` unstamped — refused as unassessed by step 4 the moment
-/// risk scoring was enabled, and silently short of every `REQUIRE IP` grant.
+/// risk scoring is enabled, and silently short of every `REQUIRE IP` grant.
 /// One value means the address the blacklist parses is provably the address
 /// the scope was scored and IP-matched against.
 pub fn check_request_admission(

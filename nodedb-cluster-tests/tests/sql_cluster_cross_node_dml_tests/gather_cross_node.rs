@@ -2,12 +2,12 @@
 
 //! Regression test for the "gather local-only" cross-node correctness bug.
 //!
-//! Before the fix, `resolve_exchange` called `gather_all_cores`, which fanned
-//! the plan to LOCAL Data-Plane cores only.  On a multi-node cluster a sharded
-//! SELECT therefore returned only the coordinator node's rows — a silent
+//! `resolve_exchange` must not call `gather_all_cores`, which fans
+//! the plan to LOCAL Data-Plane cores only — on a multi-node cluster a sharded
+//! SELECT would then return only the coordinator node's rows, a silent
 //! partial-result bug.
 //!
-//! After the fix, `resolve_exchange` calls `gather_all_vshards`, which
+//! `resolve_exchange` must call `gather_all_vshards`, which
 //! delegates to the gateway on multi-node clusters so every vShard on every
 //! node is queried and the full result set is returned.
 
@@ -32,8 +32,8 @@ async fn count_rows(client: &tokio_postgres::Client, sql: &str) -> usize {
 /// (Placement is by key hash, not by client connection; no routing hint is
 /// given so the planner distributes naturally.)
 ///
-/// Before the fix this test would return a partial count (rows on the
-/// coordinator only).  After the fix it must return exactly 20.
+/// The count must be exactly 20, not a partial count of only the rows on
+/// the coordinator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn select_returns_all_rows_across_cluster() {
     let cluster = TestCluster::spawn_three().await.expect("3-node cluster");

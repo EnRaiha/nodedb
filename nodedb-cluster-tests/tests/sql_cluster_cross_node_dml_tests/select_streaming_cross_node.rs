@@ -5,13 +5,13 @@
 //! A SELECT whose result exceeds `stream_chunk_size` (default 1000 rows) is
 //! emitted by the Data Plane as several `Partial` frames followed by a terminal
 //! frame. On the LOCAL dispatch path the Control Plane drains and concatenates
-//! every frame. The cross-node remote executor (`LocalPlanExecutor`), however,
-//! used to consume only the FIRST frame off the response channel — so a SELECT
-//! issued from a node that does not lead the collection's vShard returned only
-//! the first 1000-row chunk and silently dropped the rest (and orphaned the
-//! request's tracker entry).
+//! every frame. The cross-node remote executor (`LocalPlanExecutor`) must not
+//! consume only the FIRST frame off the response channel — doing so would
+//! make a SELECT issued from a node that does not lead the collection's
+//! vShard return only the first 1000-row chunk and silently drop the rest
+//! (and orphan the request's tracker entry).
 //!
-//! After the fix the remote executor drains the full bounded response, so a
+//! The remote executor must drain the full bounded response, so a
 //! SELECT returns every row regardless of which node it is issued from.
 //!
 //! The collection is a single-vShard-homed standard collection, so all rows

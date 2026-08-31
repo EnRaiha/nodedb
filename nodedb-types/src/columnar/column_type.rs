@@ -287,8 +287,8 @@ mod tests {
     }
 
     /// `INT4`/`INT8`/`SMALLINT`/`INT2` are wire-width DDL keywords: strict/kv
-    /// `CREATE COLLECTION` used to reject them as unknown column
-    /// types even though they're valid PostgreSQL integer aliases. They all
+    /// `CREATE COLLECTION` must accept them as valid PostgreSQL integer
+    /// aliases, not reject them as unknown column types. They all
     /// map to the same `Int64` storage variant as `BIGINT`/`INTEGER`/`INT` —
     /// nodedb's columnar/strict/kv storage always keeps integers as a full
     /// i64; only the wire (`DdlColType`) layer narrows the advertised OID.

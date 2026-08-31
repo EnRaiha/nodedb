@@ -114,8 +114,8 @@ async fn drop_recreate_schemaless_bitemporal_starts_empty() {
 
 /// A freshly re-created bitemporal collection must expose NO resurrected
 /// state: zero current rows and zero audit-log versions. Both reads go through
-/// the versioned store the old purge failed to clear, so before the fix each
-/// returns the resurrected history (or a corrupt current row).
+/// the versioned store, so a purge that fails to clear it would leave each
+/// returning the resurrected history (or a corrupt current row).
 async fn assert_recreated_collection_is_empty(srv: &TestServer, name: &str) {
     let current = srv
         .query_rows(&format!("SELECT * FROM {name}"))

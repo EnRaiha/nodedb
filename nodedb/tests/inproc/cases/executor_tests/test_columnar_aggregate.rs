@@ -183,9 +183,9 @@ fn columnar_insert_triggers_memtable_flush() {
         .collect();
     let payload = nodedb_types::json_to_msgpack(&serde_json::Value::Array(rows)).unwrap();
 
-    // The write must succeed without error. Before the fix this would succeed
-    // but silently accumulate all rows in RAM; after the fix the engine flushes
-    // the memtable to a segment once the threshold is crossed.
+    // The write must succeed without error, and the engine must flush
+    // the memtable to a segment once the threshold is crossed, not silently
+    // accumulate all rows in RAM.
     send_ok(
         &mut ctx.core,
         &mut ctx.tx,

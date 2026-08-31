@@ -142,7 +142,7 @@ async fn calvin_returning_delete_surfaces_deleted_row() {
         .collect();
 
     // The core assertion: the response CONTAINS the deleted row, not just a bare
-    // `DELETE 1` command tag. Before the fix this vec is empty.
+    // `DELETE 1` command tag with an empty row vec.
     assert_eq!(
         rows.len(),
         1,

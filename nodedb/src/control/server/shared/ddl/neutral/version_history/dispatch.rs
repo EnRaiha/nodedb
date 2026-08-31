@@ -84,8 +84,8 @@ pub(super) async fn dispatch_authorized_read(
 ///
 /// An authorization denial keeps the `42501` it had when this door called
 /// `authorize_task_set` directly — the gate wraps the same `AuthorizationError`
-/// into [`crate::Error::RejectedAuthz`], so the client-visible SQLSTATE does not
-/// change now that clone interception runs ahead of it. Everything else the gate
+/// into [`crate::Error::RejectedAuthz`], so the client-visible SQLSTATE stays
+/// the same with clone interception running ahead of it. Everything else the gate
 /// can raise (a clone read shape with no sound rewrite, a catalog read failure)
 /// is an internal-error class the client cannot act on by SQLSTATE alone, so it
 /// carries its own message under `XX000`. Both SQLSTATEs have exactly one

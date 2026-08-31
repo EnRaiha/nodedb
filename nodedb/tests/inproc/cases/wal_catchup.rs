@@ -358,8 +358,8 @@ async fn catchup_from_next_lsn_misses_all_records() {
         ilp_payload(collection, 500, 1_700_000_000_000_000_000),
     );
 
-    // BAD: Start catch-up from next_lsn (past all records).
-    // This is what main.rs USED to do — catch-up finds 0 records.
+    // BAD: Start catch-up from next_lsn (past all records) — catch-up
+    // finds 0 records from this starting point.
     let next_lsn = stack.wal.next_lsn();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     nodedb::control::wal_catchup::spawn_wal_catchup_task(

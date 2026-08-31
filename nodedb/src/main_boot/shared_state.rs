@@ -31,9 +31,9 @@ pub(crate) struct SharedStateInputs<'a> {
 }
 
 /// Open `SharedState`, wire subsystems/cluster handles into it, then apply
-/// the global quota ceiling and login rate-limit capacities. Pure
-/// relocation of what used to be inline in `main()` between Data Plane
-/// bootstrap and the post-open catalog steps.
+/// the global quota ceiling and login rate-limit capacities. Runs between
+/// Data Plane bootstrap and the post-open catalog steps, kept out of
+/// `main()` for readability.
 pub(crate) async fn open_and_wire_state(
     config: &ServerConfig,
     inputs: SharedStateInputs<'_>,

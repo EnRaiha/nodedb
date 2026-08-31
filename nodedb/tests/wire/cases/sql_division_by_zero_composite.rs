@@ -10,17 +10,16 @@
 //! error:
 //!
 //! - **Aggregate argument** — `SUM(1/denom)` evaluates the argument per row in
-//!   the streaming accumulator. A zero divisor used to exclude that row from
-//!   the accumulation; it must now fail the statement with `22012`.
+//!   the streaming accumulator. A zero divisor must fail the statement with
+//!   `22012`, not exclude that row from the accumulation.
 //! - **GROUP BY key** — `GROUP BY 10/denom` evaluates the key expression per
-//!   row to build the group key. A zero divisor used to bucket the row under a
-//!   `null` key; it must now fail with `22012`.
+//!   row to build the group key. A zero divisor must fail with `22012`,
+//!   not bucket the row under a `null` key.
 //! - **Window ORDER BY** — `... OVER (ORDER BY 1/denom)` evaluates the order
-//!   key per row. A zero divisor used to fold to NULL; it must now fail.
+//!   key per row. A zero divisor must fail, not fold to NULL.
 //! - **Join residual ON predicate** — `JOIN ... ON a.grp = b.grp AND
 //!   1/a.denom > 0` evaluates the non-equijoin residual per candidate pair in
-//!   the hash-join probe. A zero divisor used to fold to "no match"; it must
-//!   now fail.
+//!   the hash-join probe. A zero divisor must fail, not fold to "no match".
 //!
 //! Every divisor is a stored column so the expression is never plan-time
 //! constant-folded (see `sql_division_by_zero.rs`'s module doc for why), and

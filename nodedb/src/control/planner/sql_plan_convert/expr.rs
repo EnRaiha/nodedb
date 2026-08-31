@@ -267,8 +267,8 @@ fn convert_expr_inner(expr: &SqlExpr, qualify: bool) -> crate::bridge::expr_eval
 
 /// Lower planner sort keys to their physical form.
 ///
-/// Every key is carried, expression and all. A key the Data Plane could not
-/// name as a stored column used to be dropped here, which silently answered
+/// Every key is carried, expression and all. Dropping a key the Data Plane
+/// cannot name as a stored column would silently answer
 /// `ORDER BY 100 / weight` with rows in storage order.
 pub(super) fn convert_sort_keys(keys: &[SortKey]) -> Vec<SortKeySpec> {
     keys.iter()

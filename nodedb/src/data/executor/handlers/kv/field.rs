@@ -12,7 +12,7 @@ use crate::engine::kv::current_ms;
 
 /// Arguments for [`CoreLoop::execute_kv_field_get`].
 ///
-/// Bundled so the handler keeps a readable signature now that the read carries
+/// Bundled so the handler keeps a readable signature while the read carries
 /// its row-level-security filters alongside the field selection.
 pub(in crate::data::executor) struct KvFieldGetArgs<'a> {
     pub did: u64,

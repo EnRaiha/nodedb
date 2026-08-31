@@ -121,10 +121,9 @@ impl DetachedTxnScope {
 /// logical failure (`Status::Error` + `error_code`) -- the same signal
 /// `response_status_to_sqlstate` decodes today. Keeping the two separate
 /// lets each protocol's caller reproduce its exact prior mapping: a real
-/// dispatch `Err` maps through that protocol's generic error mapper (as
-/// before), while a staged-write rejection maps through the precise
-/// `ErrorCode` -> wire-format mapping the status check used to apply
-/// inline.
+/// dispatch `Err` maps through that protocol's generic error mapper, while a
+/// staged-write rejection maps through the precise
+/// `ErrorCode` -> wire-format mapping an inline status check applies.
 pub enum StagingGateError {
     /// The dispatch closure itself returned an error.
     Dispatch(crate::Error),

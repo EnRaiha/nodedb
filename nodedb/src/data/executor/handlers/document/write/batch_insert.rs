@@ -304,8 +304,8 @@ impl CoreLoop {
         }
 
         // Record each committed row's touched secondary-index values into the
-        // per-index write-value substrate, now that the batch has durably
-        // committed.
+        // per-index write-value substrate. This runs only after the batch has
+        // durably committed.
         if let Some(lsn) = task.wal_lsn() {
             for tuples in &row_index_tuples {
                 self.note_index_write_values(
@@ -493,10 +493,10 @@ mod tests {
         );
     }
 
-    /// The defect this guards: a row whose indexing failed used to be committed
-    /// anyway and counted into `inserted`, so the client was told the write
-    /// succeeded while full-text search could never return the row and nothing
-    /// — not replay, not the next write — would re-index it. The batch must now
+    /// The contract this guards: a row whose indexing fails must not be committed
+    /// and counted into `inserted` — that would tell the client the write
+    /// succeeded while full-text search could never return the row and nothing,
+    /// not replay, not the next write, would re-index it. The batch must
     /// fail as a whole, leaving no row behind and no partial corpus.
     #[test]
     fn a_row_that_cannot_be_indexed_fails_the_whole_batch() {

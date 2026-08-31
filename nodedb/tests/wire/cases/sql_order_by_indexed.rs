@@ -4,9 +4,10 @@
 //!
 //! An equality predicate on a `Ready` indexed column lets the planner swap the
 //! table scan for an index lookup. That access path returns rows in index
-//! order and used to swallow the query's ORDER BY and LIMIT with it, so
-//! `WHERE indexed_col = $1 ORDER BY id DESC LIMIT 1` answered with the OLDEST
-//! row and `LIMIT` became the converter's 10,000-row default. The rewrite must
+//! order, so it must not swallow the query's ORDER BY and LIMIT with it —
+//! swallowing them would answer `WHERE indexed_col = $1 ORDER BY id DESC LIMIT 1`
+//! with the OLDEST row and fall back to the converter's 10,000-row default
+//! `LIMIT`. The rewrite must
 //! decline whenever a sort is asked for, and must carry the row bound
 //! otherwise.
 //!

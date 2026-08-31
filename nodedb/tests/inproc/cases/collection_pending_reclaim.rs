@@ -20,12 +20,12 @@
 //! exercises that durable at-least-once contract at the reachable
 //! SystemCatalog layer.
 //!
-//! ## Why this fails on the pre-fix tree
+//! ## Why this surface must exist
 //!
-//! The `_system.pending_reclaim` table, `StoredPendingReclaim`, and the
+//! Without the `_system.pending_reclaim` table, `StoredPendingReclaim`, and the
 //! `{enqueue,load,record_pending_reclaim_attempt,remove}_pending_reclaim`
-//! surface do not exist before the fix — a failed engine purge had
-//! nowhere durable to go and was warn-and-forgotten. This test asserts
+//! surface, a failed engine purge has
+//! nowhere durable to go and is warn-and-forgotten. This test asserts
 //! the failure is durably captured, survives a catalog reopen (the
 //! boot-drain's input), and is only cleared once the purge succeeds.
 //!

@@ -407,8 +407,8 @@ mod tests {
     #[test]
     fn decode_truncated_i64_returns_error() {
         // Tag 1 (i64) requires 8 payload bytes; supply none.
-        // Today the slice index `data[cursor..cursor+8]` panics with an index
-        // out-of-bounds. After the fix, `try_into()` returns the
+        // A slice index `data[cursor..cursor+8]` here would panic with an
+        // index out-of-bounds. `try_into()` must return the
         // Serialization error instead.
         let result = decode_row_from_wal(&[1]);
         assert!(
@@ -421,7 +421,7 @@ mod tests {
     fn decode_truncated_string_returns_error() {
         // Tag 4 (string): length prefix says 255 bytes but the slice ends
         // immediately after the 4-byte length field. The read of
-        // `data[cursor..cursor+255]` panics today; after the fix it errors.
+        // `data[cursor..cursor+255]` must error, not panic.
         let input = {
             let mut v = vec![4u8]; // tag = string
             v.extend_from_slice(&255u32.to_le_bytes()); // len = 255
@@ -439,8 +439,8 @@ mod tests {
     fn decode_huge_vector_count_returns_error() {
         // Tag 9 (vector array): count = 0x7FFFFFFF. After reading the count,
         // the very first iteration tries to read 4 bytes of f32 from an empty
-        // slice, which panics today. After the fix the loop errors out cleanly
-        // before any allocation proportional to count is attempted.
+        // slice. The loop must error out cleanly there, before any allocation
+        // proportional to count is attempted, rather than panic.
         let input = {
             let mut v = vec![9u8]; // tag = vector array
             v.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes()); // count
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn decode_truncated_decimal_returns_error() {
         // Tag 7 (Decimal) requires 16 bytes; supply only 4.
-        // `data[cursor..cursor+16]` panics today; after the fix it errors.
+        // `data[cursor..cursor+16]` must error, not panic.
         let input = {
             let mut v = vec![7u8]; // tag = decimal
             v.extend_from_slice(&[0u8; 4]); // only 4 bytes, need 16

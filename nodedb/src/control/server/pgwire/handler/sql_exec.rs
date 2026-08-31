@@ -409,10 +409,10 @@ impl NodeDbPgHandler {
         // Request-admission gate: internal-service exemption, blacklist,
         // account status, then rate limit — run exactly once per statement,
         // right here, before it can branch to `shared::ddl::dispatch` below
-        // or fall through to the DataFusion planner (`plan_statement_to_tasks`,
-        // which used to admit but no longer does — this call replaces it and
-        // is positioned earlier specifically so DDL/DSL text is covered too,
-        // not just the statements that reach the planner).
+        // or fall through to the DataFusion planner (`plan_statement_to_tasks`
+        // does not admit; this call is the admission gate, positioned earlier
+        // specifically so DDL/DSL text is covered too, not just the
+        // statements that reach the planner).
         self.admit_statement(identity, session_id, database_id)
             .await?;
 

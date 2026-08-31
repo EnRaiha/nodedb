@@ -818,12 +818,12 @@ fn counts_by_host(ctx: &mut super::helpers::TestCtx, collection: &str) -> Vec<(S
 /// existing tag values fails and succeeds ALTERNATELY — the failures are not a
 /// suffix of the batch.
 ///
-/// The ingest path used to react to any rejection by flushing and re-ingesting
-/// `lines[accepted..]`, a slice that is only the untouched remainder if the
-/// rejections WERE a suffix. Here `accepted` is 2 while 4 lines have been
-/// consumed, so the retry re-ingested lines already in the memtable — and
-/// because the flush it had just done resets the dictionaries, the retry
-/// succeeded and duplicated them on the spot.
+/// The ingest path must not react to any rejection by flushing and
+/// re-ingesting `lines[accepted..]` — that slice is only the untouched
+/// remainder if the rejections ARE a suffix. Here `accepted` is 2 while 4
+/// lines have been consumed, so such a retry would re-ingest lines already
+/// in the memtable — and because the flush it just did resets the
+/// dictionaries, the retry would succeed and duplicate them on the spot.
 ///
 /// COUNT(*) alone cannot see this: the duplicated lines and the dropped ones
 /// cancel out. The per-host counts are what make it visible.

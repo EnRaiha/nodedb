@@ -5,12 +5,12 @@
 //! A cross-node `SELECT ... FROM fact JOIN dim ON fact.fk = dim.id` joins two
 //! single-vShard-homed collections that live on DIFFERENT vShards (and so,
 //! potentially, different nodes). The HashJoin task routes to the LEFT (probe)
-//! collection's owning vShard, where the LEFT side is scanned locally. Before
-//! the fix, the RIGHT (build) collection was scanned BY NAME from that same
-//! node — but the build collection is homed elsewhere, so the by-name scan
-//! returned nothing and the join silently dropped all matching rows.
+//! collection's owning vShard, where the LEFT side is scanned locally. The
+//! RIGHT (build) collection must not be scanned BY NAME from that same
+//! node — the build collection is homed elsewhere, so a by-name scan there
+//! returns nothing and the join silently drops all matching rows.
 //!
-//! After the fix, `resolve_exchange` (cluster mode) gathers the build
+//! `resolve_exchange` (cluster mode) gathers the build
 //! collection across all vShards on the coordinator and inlines it as a
 //! `ProviderScan`, so the HashJoin shipped to the probe node is self-contained.
 

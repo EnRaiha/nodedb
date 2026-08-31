@@ -120,13 +120,13 @@ async fn modulo_by_zero_errors_22012() {
     .await;
 }
 
-/// The WHERE-clause behavior flip (intended and Postgres-correct): a WHERE
+/// The WHERE-clause behavior (Postgres-correct): a WHERE
 /// predicate that divides by a column whose
-/// value is zero for some row used to fold that row's predicate to
-/// `Value::Null`/false and silently exclude it from the result — a
-/// division-by-zero was indistinguishable from a legitimate non-match.
-/// It must now fail the whole statement with `22012` instead, exactly like
-/// evaluating the same expression in the SELECT list would.
+/// value is zero for some row must fail the whole statement with `22012`,
+/// exactly like evaluating the same expression in the SELECT list would —
+/// not fold that row's predicate to `Value::Null`/false and silently exclude
+/// it from the result, which would make a division-by-zero indistinguishable
+/// from a legitimate non-match.
 #[tokio::test]
 async fn where_clause_division_by_zero_errors_22012() {
     let srv = TestServer::start().await;

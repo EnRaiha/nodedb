@@ -244,12 +244,12 @@ pub async fn coordinate_cross_shard_hop(
                             // `execute_graph_hop` encodes its `Vec<String>` of
                             // node ids with `response_codec::encode`, which is
                             // MessagePack — so `decode_payload` is the
-                            // counterpart. The JSON parser that used to sit here
-                            // failed on every payload and the `if let Ok`
-                            // dropped each one, which is not a tolerated shard
-                            // failure but a silent one: the traversal returned
-                            // only the nodes the local shard found, and reported
-                            // that as the complete answer. A shard whose reply
+                            // counterpart. A JSON parser here would fail on
+                            // every payload, and an `if let Ok` would drop
+                            // each one — not a tolerated shard failure but a
+                            // silent one: the traversal would return only the
+                            // nodes the local shard found, and report that as
+                            // the complete answer. A shard whose reply
                             // cannot be read is flagged like a shard that failed
                             // to answer, so the caller sees a partial result
                             // rather than a wrong complete one.

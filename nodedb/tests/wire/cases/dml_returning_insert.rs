@@ -402,8 +402,8 @@ async fn on_conflict_do_update_returning_shows_the_merged_post_image() {
 /// The `UPSERT INTO` form returns the STORED row, not the submitted one.
 ///
 /// This path rebuilds the statement from its own parse before planning, and it
-/// used to answer `RETURNING` from that parse — reporting the caller's own
-/// values, merged with nothing, gated by nothing.
+/// must not answer `RETURNING` from that parse — doing so would report the
+/// caller's own values, merged with nothing, gated by nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upsert_returning_shows_the_stored_row_not_the_submitted_one() {
     let server = TestServer::start().await;
@@ -461,9 +461,9 @@ async fn insert_returning_into_every_supported_engine_returns_its_row() {
         .await;
 }
 
-/// The key-value engine DOES carry the clause now, so the same statement that
-/// used to be refused returns its stored row. Pinned here beside the refusal so
-/// the two cannot drift into claiming the same thing.
+/// The key-value engine DOES carry the clause, returning its stored row for
+/// a statement another engine may still refuse. Pinned here beside the
+/// refusal so the two cannot drift into claiming the same thing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn insert_returning_into_a_key_value_collection_returns_its_row() {
     let server = TestServer::start().await;

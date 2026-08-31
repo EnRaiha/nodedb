@@ -20,7 +20,7 @@
 //!   Two adjacent NULs, or a value ending in one, always land here.
 //! - Otherwise the walk happens to re-synchronise on the next real field. No
 //!   error, but the message is silently truncated at the NUL and a junk field is
-//!   injected where the remainder used to be.
+//!   injected in place of the remainder.
 //!
 //! Both come from the same interior NUL and both are closed by removing it. The
 //! failure that exposed this took the first branch: a strict collection's stored

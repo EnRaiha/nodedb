@@ -4,7 +4,7 @@
 //!
 //! When [`super::grace_spill::PartitionedSpiller::finish_and_probe`] finds that
 //! one spilled partition's BUILD side is larger than `per_partition_budget`,
-//! materializing it whole (the old behavior) would re-introduce the very OOM the
+//! materializing it whole would re-introduce the very OOM the
 //! spiller exists to prevent: under heavy join-key skew one partition can hold
 //! most of the build side. Instead, that partition is RE-PARTITIONED — its
 //! spill file is read back STREAMING (frame-by-frame, one row resident at a

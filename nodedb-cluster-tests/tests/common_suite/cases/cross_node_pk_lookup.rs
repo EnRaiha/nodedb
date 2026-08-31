@@ -15,12 +15,12 @@
 //! Scans are unaffected: they route + scan on the owner with no surrogate
 //! resolution, which is why `COUNT(*)` worked even while the point-get failed.
 //!
-//! ## The fix being verified
+//! ## The invariant being verified
 //!
 //! The owner's `exec_receiver` re-resolves a ZERO `DocumentOp::PointGet`
 //! surrogate against ITS OWN local catalog (it is a group member, so it holds
 //! the binding) after decoding the plan and before dispatching to the Data
-//! Plane. After the fix, the point-get must succeed from EVERY coordinator in
+//! Plane. The point-get must succeed from EVERY coordinator in
 //! the cluster — member or not.
 //!
 //! ## Test shape
@@ -28,8 +28,8 @@
 //!  1. Spawn a 3-node cluster, create a `document_strict` collection with a PK,
 //!     insert a few rows via one node, and converge.
 //!  2. For EVERY node, `SELECT payload FROM coll WHERE id = 'row-0'` and assert
-//!     it returns the expected value. Before the fix, the non-member
-//!     coordinator(s) returned nothing.
+//!     it returns the expected value, including from a non-member
+//!     coordinator.
 //!  3. Sanity: `COUNT(*)` from every node equals the row count (scans already
 //!     worked even with the bug — this proves the cluster is healthy and the
 //!     point-get failure was isolated to surrogate resolution).
@@ -143,8 +143,8 @@ async fn count_rows(client: &tokio_postgres::Client, coll: &str, timeout: Durati
 
 /// Every node in the cluster — including coordinators that are NOT members of
 /// the collection's single-homed data group — must resolve a PK point-lookup
-/// to the owning row's value. Before the fix the non-member coordinator(s)
-/// shipped `Surrogate::ZERO` and got an empty result.
+/// to the owning row's value, not ship `Surrogate::ZERO` from a non-member
+/// coordinator and get an empty result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_node_pk_point_lookup_resolves_from_every_coordinator() {
     let cluster = TestCluster::spawn_three()

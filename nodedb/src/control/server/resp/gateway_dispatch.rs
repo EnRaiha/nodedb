@@ -391,11 +391,11 @@ mod tests {
     use super::*;
 
     /// RESP deliberately pins every dispatch to `DatabaseId::DEFAULT` (the
-    /// protocol has no session/database selector). Before the fix, the
-    /// `PhysicalTask` was pinned to `DatabaseId::DEFAULT` directly while
-    /// `$auth.database_id` came from `build_auth_context(identity)`, which
-    /// stamps `identity.default_database` — so a user whose default database
-    /// was not DEFAULT got a task/RLS database mismatch. This test uses an
+    /// protocol has no session/database selector). `$auth.database_id` must
+    /// be pinned to that same `DatabaseId::DEFAULT`, not resolved from
+    /// `build_auth_context(identity)`, which stamps `identity.default_database`
+    /// — resolving it that way gives a user whose default database is not
+    /// DEFAULT a task/RLS database mismatch. This test uses an
     /// identity whose `default_database` is deliberately NOT
     /// `DatabaseId::DEFAULT` and asserts both halves of the resolved scope
     /// still land on DEFAULT and agree with each other. It fails if

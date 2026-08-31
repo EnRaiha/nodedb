@@ -22,7 +22,7 @@ pub(crate) struct StartupGates {
 }
 
 /// Register all gates up-front so the sequencer knows every phase has
-/// an owner. Pure relocation of what used to be inline in `main()`.
+/// an owner, kept out of `main()` for readability.
 pub(crate) fn register_startup_gates(startup_seq: &StartupSequencer) -> StartupGates {
     let wal_gate = startup_seq.register_gate(StartupPhase::WalRecovery, "wal");
     let catalog_gate =

@@ -3,12 +3,12 @@
 //!
 //! ## What this guards
 //!
-//! The SQL `crdt_apply('coll','doc','<hex>')` entry point used to dispatch the
-//! built `CrdtOp::Apply` plan straight to the local SPSC bridge — never proposing
-//! it through the data group's Raft log. Under replication factor > 1 the delta
-//! then lands ONLY on the receiving node: every follower is missing it, and if the
-//! receiving node was the leader, the delta is lost entirely on failover when a
-//! former follower takes over.
+//! The SQL `crdt_apply('coll','doc','<hex>')` entry point must not dispatch the
+//! built `CrdtOp::Apply` plan straight to the local SPSC bridge without
+//! proposing it through the data group's Raft log. With a replication factor
+//! above 1, skipping the proposal lands the delta ONLY on the receiving node.
+//! Every follower misses it, and a leader that took this path loses the delta
+//! entirely on failover.
 //!
 //! The `ReplicatedWrite::CrdtApply` variant and the follower-apply machinery
 //! already existed (the Lite-sync path uses them); the gateway entry points just

@@ -443,9 +443,9 @@ mod tests {
         assert!(results[6].is_none());
     }
 
-    /// Regression: a native `KvBatchPut` used to call
-    /// `KvEngine::batch_put` with no per-entry surrogate, so every batch-put
-    /// row landed with `Surrogate::ZERO` -- invisible to any surrogate-keyed
+    /// A native `KvBatchPut` must call `KvEngine::batch_put` with a
+    /// per-entry surrogate. Without one, every batch-put row lands with
+    /// `Surrogate::ZERO` -- invisible to any surrogate-keyed
     /// cross-engine read/join, unlike a single-key `put` which always
     /// carries a real, CP-assigned surrogate. This asserts `batch_put`
     /// stores the REAL surrogate passed for each entry (observable via
@@ -524,9 +524,10 @@ mod tests {
     }
 
     /// DELETE of a key whose TTL has elapsed but which the wheel has not reaped
-    /// yet. `KvHashTable::delete` succeeds regardless of expiry, so reading the
-    /// old field values through the expiry-checking `get` used to return `None`
-    /// and strand the index entries behind a DELETE that reported success.
+    /// yet. `KvHashTable::delete` succeeds regardless of expiry, so index
+    /// cleanup must not read the old field values through the
+    /// expiry-checking `get` — that returns `None` and strands the index
+    /// entries behind a DELETE that reported success.
     #[test]
     fn index_cleaned_on_delete_of_expired_key() {
         let mut e = make_engine();

@@ -35,9 +35,8 @@ pub(crate) struct ListenerSetup {
 
 /// Create the connection semaphore + admission registry, bind all
 /// listeners, print the startup banner, spawn signal handlers, and
-/// build the shared TLS acceptor. Pure relocation of what used to be
-/// inline in `main()` between background-loop spawn and cluster-ready
-/// wait.
+/// build the shared TLS acceptor. Runs between background-loop spawn
+/// and cluster-ready wait, kept out of `main()` for readability.
 pub(crate) async fn setup(
     shared: &Arc<SharedState>,
     config: &ServerConfig,

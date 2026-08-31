@@ -441,7 +441,7 @@ impl Scheduler {
                 // The CalvinApplied WAL LSN is the committed write-LSN for this
                 // apply — the SAME shard-local WAL-LSN space fast-path writes and
                 // read watermarks use. Record the apply's per-key write versions
-                // at it now that it exists (it did not at dispatch time).
+                // at it once it exists; it does not exist yet at dispatch time.
                 Ok(applied_lsn) => {
                     self.record_calvin_write_versions(txn_id, applied_lsn);
                     Some(applied_lsn)

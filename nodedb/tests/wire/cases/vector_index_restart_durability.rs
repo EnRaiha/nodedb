@@ -10,9 +10,9 @@
 //! search projects the user primary key (e.g. `'persisted'`) rather than a
 //! headless internal id — or nothing at all.
 //!
-//! Before the fix, a WAL-only restart leaves the secondary vector index empty
-//! (the document `Put` records were never replayed into the HNSW), so the
-//! search below returns no row and the PK assertion fails.
+//! A WAL-only restart must not leave the secondary vector index empty by
+//! skipping replay of the document `Put` records into the HNSW — that would
+//! leave the search below returning no row and the PK assertion failing.
 
 use crate::harness::TestServer;
 

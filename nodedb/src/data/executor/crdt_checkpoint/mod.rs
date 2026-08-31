@@ -19,11 +19,11 @@
 //!
 //! ## Why a generation + manifest
 //!
-//! One file is written PER COLLECTION, and the directory used to be flat. A
-//! collection dropped between two cycles therefore left its file as the newest
-//! thing on disk while the flush still reported the core watermark — so the
-//! deletes were truncated out of the WAL and the collection reloaded at every
-//! subsequent boot, forever. Publishing every live collection into a fresh
+//! One file is written PER COLLECTION. A flat directory lets a collection
+//! dropped between two cycles leave its file as the newest thing on disk while
+//! the flush still reports the core watermark — so the deletes get truncated
+//! out of the WAL and the collection reloads at every subsequent boot,
+//! forever. Publishing every live collection into a fresh
 //! `gen-{n}/` and swinging one manifest makes the live set self-describing:
 //! what the generation does not name does not exist.
 

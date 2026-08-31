@@ -157,9 +157,9 @@ async fn tenant_user_prepared_select_resolves_own_collection() {
         .unwrap();
 
     // `prepare` drives Parse + Describe through NodeDbQueryParser::parse_sql,
-    // which constructs an OriginCatalog. Before the fix this catalog was
-    // hardcoded to tenant 1 and could not see tenant-2 collections —
-    // `prepare` would surface the server's "unknown table" error.
+    // which constructs an OriginCatalog. That catalog must not be
+    // hardcoded to tenant 1 — a catalog that is would surface the server's
+    // "unknown table" error for tenant-2 collections.
     svc.prepare("SELECT content FROM t2_prep WHERE id = 'a'")
         .await
         .expect("prepare must resolve tenant-owned collection via parser.rs");

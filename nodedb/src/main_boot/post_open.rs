@@ -11,8 +11,8 @@ use nodedb::bootstrap;
 use nodedb::control::startup::ReadyGate;
 use nodedb::control::state::SharedState;
 
-/// Pure relocation of what used to be inline in `main()` right after
-/// `SharedState::open` + wiring returned.
+/// Runs the post-open catalog steps that belong right after
+/// `SharedState::open` + wiring return, kept out of `main()` for readability.
 pub(crate) async fn run(
     shared: &Arc<SharedState>,
     wal_records: &Arc<[nodedb_wal::WalRecord]>,

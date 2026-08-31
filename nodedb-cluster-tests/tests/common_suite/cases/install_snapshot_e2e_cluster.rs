@@ -315,9 +315,9 @@ async fn learner_caught_up_via_real_install_snapshot() {
     );
 
     // Spot-check a specific row round-tripped through the snapshot, not just
-    // the count: a PK point-lookup (`WHERE id = pk`) resolves the pk→surrogate
-    // binding the snapshot apply rebound into the catalog — the thing that was
-    // broken before the fix. Poll briefly: transient catch-up errors are
+    // the count: a PK point-lookup (`WHERE id = pk`) must resolve the
+    // pk→surrogate binding the snapshot apply rebinds into the catalog.
+    // Poll briefly: transient catch-up errors are
     // retried, but a successful query returning the wrong/no value fails.
     let deadline = Instant::now() + Duration::from_secs(10);
     let payload = loop {

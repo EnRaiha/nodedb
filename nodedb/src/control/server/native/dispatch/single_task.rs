@@ -32,9 +32,9 @@ use super::{DispatchCtx, error_code_to_native, error_to_native, error_to_native_
 /// so autocommit direct ops (including `KvBatchPut`) dispatch exactly as
 /// before. Inside a transaction block, a stageable write (e.g. `KvBatchPut`)
 /// is applied to the per-transaction overlay at statement time instead of
-/// hitting durable storage directly -- fixing the atomicity gap where a
-/// native direct-op write inside `BEGIN...COMMIT` used to commit immediately
-/// and survive `ROLLBACK`. A non-stageable write is buffered for COMMIT-time
+/// hitting durable storage directly. Otherwise a native direct-op write
+/// inside `BEGIN...COMMIT` would commit immediately and survive `ROLLBACK`,
+/// an atomicity gap. A non-stageable write is buffered for COMMIT-time
 /// replay, matching the SQL path's deferral for the same plan shapes.
 pub(super) async fn dispatch_single_task(
     ctx: &DispatchCtx<'_>,

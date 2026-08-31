@@ -7,10 +7,10 @@
 //! after the literal survives that reconstruction, so a trailing `ON CONFLICT`
 //! — or trailing text that is not a clause at all — has nowhere to go.
 //!
-//! Such a statement used to succeed with the clause quietly removed — a write
-//! that applied, an empty result set, and no indication that half of what the
-//! author wrote had been discarded. These tests pin that it now fails instead,
-//! naming the clause, and that the write does not apply: a refusal that still
+//! Such a statement must fail, naming the clause, rather than succeed with
+//! the clause quietly removed — a write that applies, an empty result set,
+//! and no indication that half of what the author wrote was discarded. These
+//! tests pin that the write does not apply either: a refusal that still
 //! wrote the row would be the same failure wearing an error message.
 //!
 //! The limit itself is deliberate. Carrying a clause is not a matter of

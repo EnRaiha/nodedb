@@ -268,11 +268,12 @@ async fn show_collections_row_description_preserves_int8_column() {
 /// PostgreSQL integer width — `INT`, `INTEGER`, `INT4`, `BIGINT`, `INT8`,
 /// `SMALLINT`, `INT2` — must advertise each column's *own* wire OID in
 /// `RowDescription`: 23 (int4) for the 4-byte aliases, 20 (int8) for the
-/// 8-byte aliases, 21 (int2) for the 2-byte aliases. Before the fix, every
-/// declared width collapsed to `SqlDataType::Int64`'s single wire mapping —
-/// `INT`/`INTEGER`/`INT4`/`BIGINT`/`INT8` all rendered as OID 20 (int8), and
-/// `SMALLINT`/`INT2` (unlisted in the type-string parser) fell through to
-/// the `String` default and rendered as OID 25 (text) instead of an integer
+/// 8-byte aliases, 21 (int2) for the 2-byte aliases. Every declared width
+/// must keep its own wire OID rather than collapsing to
+/// `SqlDataType::Int64`'s single mapping —
+/// `INT`/`INTEGER`/`INT4`/`BIGINT`/`INT8` all rendering as OID 20 (int8), and
+/// `SMALLINT`/`INT2` (unlisted in the type-string parser) falling through to
+/// the `String` default and rendering as OID 25 (text) instead of an integer
 /// OID at all.
 #[tokio::test]
 async fn create_collection_int_widths_preserve_wire_oids() {

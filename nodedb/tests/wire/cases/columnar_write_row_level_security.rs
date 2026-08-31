@@ -2,10 +2,11 @@
 
 //! Row-level security over writes to the columnar storage core.
 //!
-//! The columnar family used to refuse every write on a governed collection
-//! outright, on the reasoning that no point in the plan held a row image. Half
-//! of that is wrong: a plain `INSERT` carries every row it will persist, so the
-//! policy decides those rows before anything is dispatched. The other half is
+//! The columnar family must not refuse every write on a governed collection
+//! outright on the reasoning that no point in the plan holds a row image. Half
+//! of that reasoning is wrong: a plain `INSERT` carries every row it will
+//! persist, so the policy decides those rows before anything is dispatched.
+//! The other half is
 //! real but solvable — an update's post-image, a delete's pre-image and an
 //! upsert's merged body only exist inside the handler, so the compiled
 //! predicate travels with the plan and the handler decides the actual rows.

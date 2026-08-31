@@ -330,9 +330,9 @@ mod tests {
         .status
     }
 
-    /// An UPSERT that lands on an existing chained row is an update, and is refused
-    /// on the same terms — the arm that used to write with a bare `sparse.put` ran
-    /// no admission at all.
+    /// An UPSERT that lands on an existing chained row is an update, and must be
+    /// refused on the same terms — an arm that writes with a bare `sparse.put`
+    /// runs no admission at all.
     #[test]
     fn an_upsert_onto_an_existing_hash_chained_row_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");

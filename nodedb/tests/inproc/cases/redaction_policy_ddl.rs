@@ -186,8 +186,8 @@ async fn show_redaction_policies_lists_created_policies() {
 /// `MERGE ... RETURNING` surfaces real target rows, so its response must go
 /// through the same masking pass a SELECT does.
 ///
-/// It used to be classified as an opaque execution result and forwarded to the
-/// client undecoded, which was harmless only while a MERGE returned nothing but
+/// It must not be classified as an opaque execution result and forwarded to the
+/// client undecoded — that is harmless only while a MERGE returns nothing but
 /// an affected count. Both halves of that are load-bearing: the plan must be
 /// recognised as row-returning, AND it must report its target collection, or
 /// the masking pass finds no policy to key on and runs inert.

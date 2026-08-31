@@ -492,11 +492,10 @@ mod tests {
     fn skip_many_unknown_optional_records_is_iterative() {
         // Record type 99 has bit 15 clear (99 & 0x8000 == 0) and is not a
         // known variant, so the reader must skip it as an unknown optional.
-        // With the current recursive implementation (line 118: `return
-        // self.next_record()`), 50 000 consecutive unknown optional records
-        // exhaust the stack and panic. After the fix converts the skip to a
-        // loop, all 50 000 are skipped without overflow and the one valid
-        // record at the end is returned.
+        // A recursive skip (`return self.next_record()`) would exhaust the
+        // stack and panic on 50 000 consecutive unknown optional records.
+        // The skip must be a loop, so all 50 000 are skipped without
+        // overflow and the one valid record at the end is returned.
         const UNKNOWN_OPTIONAL: u32 = 99; // no 0x8000 bit → optional, not in enum
         const SKIP_COUNT: usize = 50_000;
 

@@ -177,9 +177,9 @@ pub async fn upsert_document(
     // Build SQL and route through nodedb-sql → EngineRules → sql_plan_convert.
     //
     // The statement is REBUILT from `fields`, so the author's `RETURNING` list
-    // has to be re-attached here or the planner would never see it and the
-    // clause would be silently dropped — which is what used to happen, with the
-    // caller's own submitted values echoed back in its place.
+    // has to be re-attached here. Otherwise the planner never sees it and the
+    // clause is silently dropped, with the caller's own submitted values
+    // echoed back in its place.
     let mut upsert_sql = fields_to_upsert_sql(&parsed.coll_name, &fields);
     if let Some(ref columns) = parsed.returning_clause {
         upsert_sql.push_str(" RETURNING ");

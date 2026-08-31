@@ -99,9 +99,9 @@ fn ceiling_at(
 /// Cell A (x=0) written at T=100, Cell B (x=1) written at T=200. Same tile.
 /// `audit_retain_ms=100`, `now_ms=400` → horizon=300; both versions outside.
 ///
-/// Before the cell-level fix, the tile at T=100 was "superseded" by T=200 at
-/// the tile-version level, so cell A (which only appears in T=100) was silently
-/// dropped. After the fix, the ceiling tile must carry BOTH A and B.
+/// Treating the tile at T=100 as "superseded" by T=200 at the tile-version
+/// level would silently drop cell A (which only appears in T=100). The
+/// ceiling tile must carry BOTH A and B.
 #[test]
 fn compaction_preserves_cells_in_separate_tile_versions() {
     let dir = TempDir::new().unwrap();

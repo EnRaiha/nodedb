@@ -549,9 +549,9 @@ async fn returning_arithmetic_expression_rejected() {
 
 /// `INSERT ... RETURNING` on a document collection returns the STORED row.
 ///
-/// It used to be parsed and discarded, which meant the write applied, the
-/// client got a command tag, and a statement that asked for rows came back with
-/// none and no error. Engines that still cannot carry the clause refuse it by
+/// The clause must not be parsed and discarded — that would apply the write,
+/// give the client a command tag, and answer a statement that asked for rows
+/// with none and no error. Engines that still cannot carry the clause refuse it by
 /// name rather than dropping it — pinned in `dml_returning_insert.rs`.
 #[tokio::test]
 async fn insert_returning_returns_the_inserted_row() {

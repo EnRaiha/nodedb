@@ -13,12 +13,13 @@
 //! `ProviderScan`. Each of those two gathers observes its own collection's
 //! `coll_write_lsn` at read time.
 //!
-//! Before the fix the GATHER path had a serializability HOLE: only the plan's
-//! collapsed left collection reached the read-set (`extract_collection` of an
+//! The GATHER path must not have a serializability HOLE where only the plan's
+//! collapsed left collection reaches the read-set (`extract_collection` of an
 //! `Exchange{Gather{HashJoin}}` returns the left collection), while the build
-//! side's gathered read-version was DISCARDED — its vShard was never validated at
-//! commit. A concurrent write to the build collection between the in-txn read and
-//! COMMIT went UNDETECTED and the transaction silently committed a stale join.
+//! side's gathered read-version is DISCARDED — that would leave its vShard
+//! never validated at commit. A concurrent write to the build collection
+//! between the in-txn read and COMMIT must be detected, not silently commit
+//! a stale join.
 //! The fix threads a per-collection capture accumulator through the Gather
 //! resolution so BOTH sides are recorded, mirroring the shuffle path.
 //!

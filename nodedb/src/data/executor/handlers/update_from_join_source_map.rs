@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(map_local.len(), 3, "local read must see all source rows");
 
         // Cross-core: core B does NOT hold the source. A local read there is
-        // empty — the exact silent-wrong-result the guard used to fail-close on.
+        // empty — the exact silent-wrong-result the guard must fail-close on.
         let map_b_local = core_b
             .build_source_join_map(DB, TID, SRC, JOIN, None)
             .unwrap();

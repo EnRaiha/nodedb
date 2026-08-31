@@ -124,7 +124,7 @@ async fn server_main() -> anyhow::Result<()> {
     // remains accessible for the late record() call after cluster wiring.
     let _root_guard = root_span.enter();
 
-    // Re-apply env overrides now that tracing is initialised so that
+    // Re-apply env overrides after tracing initializes so that
     // info!/warn! messages are actually emitted for operators.
     apply_env_overrides(&mut config);
 

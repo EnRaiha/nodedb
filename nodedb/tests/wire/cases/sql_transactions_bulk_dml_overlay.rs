@@ -364,8 +364,8 @@ async fn strict_bulk_delete_sees_row_staged_earlier_in_txn_case() {
 /// A predicate `UPDATE ... RETURNING` inside a transaction is REFUSED, naming
 /// the limitation.
 ///
-/// It used to succeed with the real `UPDATE n` tag and zero data rows — a
-/// caller that asked for rows got silence, which is precisely the failure this
+/// Succeeding with the real `UPDATE n` tag and zero data rows would give a
+/// caller that asked for rows silence, precisely the failure this
 /// clause exists to remove. The write is staged into the per-transaction
 /// overlay, and staging answers with a count rather than a row image, while
 /// COMMIT answers with one tag for the whole transaction; so there is no point

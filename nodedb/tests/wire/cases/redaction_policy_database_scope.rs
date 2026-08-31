@@ -3,14 +3,15 @@
 //! Regression coverage: a column-redaction policy created inside a
 //! non-default database must actually be enforced.
 //!
-//! Before the fix, `db_qualified` prefixes every physical-plan op's
+//! `db_qualified` prefixes every physical-plan op's
 //! `collection` field with the owning database ID for any non-default
-//! database, but `CREATE REDACTION POLICY` stored (and looked up) the bare
-//! collection name. The two keys only coincided in `default`, so a policy
-//! created anywhere else was silently inert: the masking hook found no
-//! policy and shipped the protected column in the clear, and the
-//! aggregate/graph fail-closed refusal never fired either, since it consults
-//! the same store under the same mismatched key.
+//! database, so `CREATE REDACTION POLICY` must store (and look up) the
+//! same prefixed key, not the bare collection name. Storing the bare name
+//! makes the two keys coincide only in `default`: a policy created anywhere
+//! else is silently inert — the masking hook finds no policy and ships the
+//! protected column in the clear, and the aggregate/graph fail-closed
+//! refusal never fires either, since it consults the same store under the
+//! same mismatched key.
 
 use crate::harness::TestServer;
 

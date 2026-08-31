@@ -101,9 +101,9 @@ async fn create_vector_index_per_column_two_embeddings_on_one_collection() {
     // GAP-9: `CREATE VECTOR INDEX ... ON <coll> (<column>) ...` names the
     // embedding column the index covers, so one collection can carry several
     // vector indexes (e.g. a text-embedding and an image-embedding column),
-    // each with its own params. Before the fix the `(<column>)` token was
-    // silently discarded and every index's config landed on the default
-    // (unnamed) field.
+    // each with its own params. The `(<column>)` token must not be
+    // silently discarded — discarding it lands every index's config on the
+    // default (unnamed) field.
     let server = TestServer::start().await;
     server
         .exec("CREATE COLLECTION vi_multi TYPE document")

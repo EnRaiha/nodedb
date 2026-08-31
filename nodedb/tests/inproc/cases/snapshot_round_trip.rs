@@ -353,9 +353,10 @@ async fn snapshot_round_trip_vector() {
 /// Edges live in their own snapshot section (`snap.edges`) keyed by the
 /// versioned composite key `{collection}\x00{src}\x00{label}\x00{dst}\x00{sys}`
 /// — the collection is the first component, so the builder routes each edge
-/// through the same vshard filter every other section uses. Before the fix the
-/// builder dropped this section entirely, so a snapshot-installed follower lost
-/// all edge data; this test would fail (empty traversal) without the fix.
+/// through the same vshard filter every other section uses. The builder must
+/// not drop this section entirely — that would lose all edge data on a
+/// snapshot-installed follower, and this test would fail with an empty
+/// traversal.
 ///
 /// SQL is copied verbatim from `graph_cross_core_bfs.rs`:
 /// - `CREATE COLLECTION <name>`               (e.g. `bfs_nodes`)

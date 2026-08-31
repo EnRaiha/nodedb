@@ -44,8 +44,8 @@ impl DispatchCtx<'_> {
     }
 
     /// The resolved, scope-enriched `AuthContext` for `$auth.*` RLS
-    /// substitution. Every native call site that used to read
-    /// `ctx.auth_context` reads this instead, so RLS enforcement (including
+    /// substitution. Every native call site must read this instead of
+    /// `ctx.auth_context`, so RLS enforcement (including
     /// `$auth.scope_status(...)`) is identical regardless of which opcode
     /// dispatched the request.
     pub(crate) fn auth_context(&self) -> &crate::control::security::auth_context::AuthContext {

@@ -543,8 +543,8 @@ async fn extended_query_binary_typed_columns_decode() {
     assert_eq!(rows.len(), 1);
 
     // `n` is declared INT (the INT4 alias), so it advertises OID 23 and
-    // decodes as i32; before the fix every declared integer
-    // width collapsed to int8. float8 -> f64, bool -> bool, text -> String.
+    // decodes as i32; every declared integer width must keep its own OID
+    // rather than collapsing to int8. float8 -> f64, bool -> bool, text -> String.
     let n: i32 = rows[0].get("n");
     let amt: f64 = rows[0].get("amt");
     let flag: bool = rows[0].get("flag");
@@ -939,9 +939,9 @@ async fn extended_query_client_declared_param_type_wins_over_inference() {
 }
 
 /// **The headline regression lock.** A plain `client.query` with a bound
-/// `i64` and NO `prepare_typed`, NO cast — the exact call that used to fail
-/// client-side with `WrongType { postgres: Unknown, rust: "i64" }` because
-/// Describe answered oid 0 for the column-backed `$1`.
+/// `i64` and NO `prepare_typed`, NO cast must not fail
+/// client-side with `WrongType { postgres: Unknown, rust: "i64" }` from
+/// Describe answering oid 0 for the column-backed `$1`.
 ///
 /// `tokio-postgres` refuses to serialize an `i64` against an unknown oid, so
 /// this fails before a byte reaches the server unless the parameter is
