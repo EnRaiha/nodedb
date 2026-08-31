@@ -61,25 +61,32 @@ impl DistributedApplier {
         &self.tracker
     }
 
-    /// Highest already-handed-off index for `group_id`, or 0 when this applier
-    /// has seen nothing for the group yet (Raft indices are 1-based, so 0 never
-    /// suppresses a real entry).
-    fn delivered_index(&self, group_id: u64) -> u64 {
-        self.delivered
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&group_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Move `group_id`'s hand-off watermark to `index`. Monotonic — a batch
-    /// that only partially made it through must never pull the watermark back
-    /// over entries an earlier batch already delivered.
-    fn advance_delivered(&self, group_id: u64, index: u64) {
+    /// Claim every entry above this group's watermark, moving the watermark in
+    /// the SAME critical section as the read.
+    ///
+    /// Returns the watermark that was in force, so the caller filters against
+    /// the range it claimed. Reading and advancing under separate acquisitions
+    /// lets two concurrent calls for one group claim the same entries and hand
+    /// the batch off twice, applying every append-shaped write in it twice.
+    fn claim_undelivered(&self, group_id: u64, entries: &[LogEntry]) -> u64 {
         let mut delivered = self.delivered.lock().unwrap_or_else(|p| p.into_inner());
         let slot = delivered.entry(group_id).or_insert(0);
-        if index > *slot {
+        let watermark = *slot;
+        if let Some(last) = entries.iter().rfind(|e| e.index > watermark) {
+            *slot = last.index;
+        }
+        watermark
+    }
+
+    /// Return the watermark to `index` when the claim could not be handed off.
+    ///
+    /// Only moves it back when it still holds `claimed`, so a concurrent claim
+    /// that already advanced past this batch is never pulled backwards.
+    fn release_claim(&self, group_id: u64, claimed: u64, index: u64) {
+        let mut delivered = self.delivered.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = delivered.get_mut(&group_id)
+            && *slot == claimed
+        {
             *slot = index;
         }
     }
@@ -100,8 +107,19 @@ impl CommitApplier for DistributedApplier {
         // and DML audit fire twice, and `ProposeTracker::complete` runs a second
         // time on an index whose waiter was already resolved and removed —
         // parking an orphan `Completed` slot that nothing ever reaps.
-        let watermark = self.delivered_index(group_id);
-        let fresh: Vec<&LogEntry> = entries.iter().filter(|e| e.index > watermark).collect();
+        let watermark = self.claim_undelivered(group_id, entries);
+        // Take each index at most once. A batch that repeats an index hands the
+        // same committed entry to the apply loop twice, and an append-shaped
+        // write (spatial/columnar/timeseries insert) lands twice with it — a
+        // PK-carrying write absorbs the repeat as an upsert and hides it.
+        let mut taken = watermark;
+        let mut fresh: Vec<&LogEntry> = Vec::with_capacity(entries.len());
+        for e in entries {
+            if e.index > taken {
+                taken = e.index;
+                fresh.push(e);
+            }
+        }
         if fresh.is_empty() {
             debug!(
                 group_id,
@@ -156,8 +174,8 @@ impl CommitApplier for DistributedApplier {
             .collect();
 
         let Some(first_real_index) = real_entries.first().map(|e| e.index) else {
-            // Nothing but no-ops, and they are now fully handled.
-            self.advance_delivered(group_id, fresh_last);
+            // Nothing but no-ops, and they are now fully handled. The claim
+            // already covers them.
             return last_index;
         };
 
@@ -168,16 +186,16 @@ impl CommitApplier for DistributedApplier {
             entries: real_entries,
         }) {
             warn!(group_id, error = %e, "apply queue full, entries will be retried on next tick");
-            // The rejected entries stay undelivered, so the watermark may only
-            // cover the no-ops strictly BELOW the first of them — those were
-            // completed above and must not fire a second time. Everything from
-            // `first_real_index` up is re-collected on the next tick.
-            self.advance_delivered(group_id, first_real_index.saturating_sub(1));
+            // Release the part of the claim that was never handed off. The
+            // watermark may only cover the no-ops strictly BELOW the first
+            // rejected entry — those were completed above and must not fire a
+            // second time. Everything from `first_real_index` up is re-collected
+            // on the next tick.
+            self.release_claim(group_id, fresh_last, first_real_index.saturating_sub(1));
             // Don't advance applied index — entries will be re-delivered.
             return 0;
         }
 
-        self.advance_delivered(group_id, fresh_last);
         last_index
     }
 }
@@ -321,5 +339,61 @@ mod tests {
             .expect("the rejected entry must be re-accepted");
         let indexes: Vec<u64> = batch.entries.iter().map(|e| e.index).collect();
         assert_eq!(indexes, vec![3]);
+    }
+
+    /// Two concurrent deliveries of one group must not both claim the same
+    /// entries. Handing a batch off twice applies every append-shaped write in
+    /// it twice, which a PK-less engine records as duplicate rows.
+    #[test]
+    fn concurrent_deliveries_claim_disjoint_entries() {
+        let (applier, mut rx) = create_distributed_applier(Arc::new(ProposeTracker::new()));
+        let applier = Arc::new(applier);
+        let entries = vec![entry(1, b"a"), entry(2, b"b"), entry(3, b"c")];
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let applier = Arc::clone(&applier);
+                let entries = entries.clone();
+                std::thread::spawn(move || applier.apply_committed(4, &entries))
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("delivery thread");
+        }
+
+        let mut claimed: Vec<u64> = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            claimed.extend(batch.entries.iter().map(|e| e.index));
+        }
+        claimed.sort_unstable();
+        assert_eq!(
+            claimed,
+            vec![1, 2, 3],
+            "each committed index must be handed off exactly once"
+        );
+    }
+
+    /// A batch that repeats a committed index must hand that entry off once.
+    /// The second copy would apply the same write again, which an append-shaped
+    /// engine records as a duplicate row.
+    #[test]
+    fn a_repeated_index_in_one_batch_is_handed_off_once() {
+        let (applier, mut rx) = create_distributed_applier(Arc::new(ProposeTracker::new()));
+        let entries = vec![
+            entry(6, b"a"),
+            entry(7, b"b"),
+            entry(7, b"b"),
+            entry(8, b"c"),
+        ];
+
+        assert_eq!(applier.apply_committed(4, &entries), 8);
+
+        let batch = rx.try_recv().expect("batch queued");
+        let indices: Vec<u64> = batch.entries.iter().map(|e| e.index).collect();
+        assert_eq!(
+            indices,
+            vec![6, 7, 8],
+            "the repeated index must appear once in the handed-off batch"
+        );
     }
 }
