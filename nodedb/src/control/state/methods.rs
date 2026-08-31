@@ -249,12 +249,32 @@ impl SharedState {
     /// and the RESTORE staleness gate treats missing entries as zero.
     pub fn advance_tenant_write_hlc(&self, tenant_id: u64) {
         let wall = self.hlc_clock.now().wall_ns;
-        if let Ok(mut map) = self.tenant_write_hlc.lock() {
-            let entry = map.entry(tenant_id).or_insert(0);
-            if wall > *entry {
-                *entry = wall;
-            }
+        // Recover a poisoned lock rather than skipping the advance. The map is
+        // a plain `HashMap` that a panic elsewhere cannot corrupt, and dropping
+        // the write would leave the restore staleness gate reading a stale
+        // high-water mark.
+        let mut map = self
+            .tenant_write_hlc
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = map.entry(tenant_id).or_insert(0);
+        if wall > *entry {
+            *entry = wall;
         }
+    }
+
+    /// Last observed write HLC for `tenant_id`, or `0` when none is recorded.
+    ///
+    /// Recovers a poisoned lock. Reporting `0` because the mutex is poisoned
+    /// would silently disable the restore staleness gate, which compares an
+    /// envelope's watermark against this value.
+    pub fn tenant_write_hlc(&self, tenant_id: u64) -> u64 {
+        self.tenant_write_hlc
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&tenant_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Shared HTTP client reused by every outbound emitter. Cloning the
@@ -447,5 +467,45 @@ impl SharedState {
             }
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A poisoned write-HLC map must still report the recorded mark.
+    ///
+    /// Reading `0` from a poisoned lock silently disables the restore
+    /// staleness gate: the gate refuses an envelope whose watermark is older
+    /// than this value, and every watermark clears a mark of `0`. A restore
+    /// would then overwrite newer writes with no error.
+    #[test]
+    fn a_poisoned_write_hlc_map_still_reports_the_recorded_mark() {
+        let map: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        map.lock().expect("fresh lock").insert(7, 4_242);
+
+        let poisoner = Arc::clone(&map);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("acquire before panicking");
+            panic!("poison the write-HLC map");
+        })
+        .join();
+        assert!(
+            map.lock().is_err(),
+            "the map must be poisoned for this test"
+        );
+
+        let recovered = map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&7)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            recovered, 4_242,
+            "a poisoned lock must not erase the tenant's high-water mark"
+        );
     }
 }

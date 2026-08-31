@@ -51,12 +51,7 @@ pub async fn restore_tenant(
     }
 
     if !dry_run && env.meta.snapshot_watermark != 0 {
-        let current_high_water = state
-            .tenant_write_hlc
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&tenant_id).copied())
-            .unwrap_or(0);
+        let current_high_water = state.tenant_write_hlc(tenant_id);
         if env.meta.snapshot_watermark < current_high_water {
             if force {
                 tracing::warn!(
