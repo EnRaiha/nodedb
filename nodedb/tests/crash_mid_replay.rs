@@ -109,6 +109,11 @@ async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
     let mut h = CrashHarness::new();
     h.spawn();
     h.wait_ready();
+    // `/healthz` reports ready before the Calvin sequencer elects a leader.
+    // A write issued in that window can be re-proposed after a leader-change
+    // no-op and applied twice, which only the PK-less timeseries shows.
+    h.wait_for_calvin_ready(std::time::Duration::from_secs(30))
+        .await;
 
     h.exec("CREATE COLLECTION replay_kv (k STRING PRIMARY KEY, v STRING) WITH (engine='kv')")
         .await;
@@ -151,7 +156,9 @@ async fn replay_is_idempotent_when_interrupted_at(fail_point: &str) {
             ROWS as u64,
             "{collection} must hold {ROWS} rows before the crash (test-setup sanity), got \
              {live}. An over-count means one acknowledged INSERT applied twice — only the \
-             PK-less timeseries can gain a row that way.\nServer log:\n{}",
+             PK-less timeseries can gain a row that way.\nRows: {:?}\nServer log:\n{}",
+            h.query_col(&format!("SELECT id FROM {collection}"), "id")
+                .await,
             diagnostics::log_tail_section(&h.server_log())
         );
     }
