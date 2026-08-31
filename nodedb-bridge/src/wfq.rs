@@ -24,7 +24,7 @@
 //! A database at its threshold does not block other databases that have
 //! remaining headroom.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use nodedb_types::PriorityClass;
 
@@ -77,6 +77,15 @@ pub struct WeightedFairQueue<T> {
 
     /// Per-database priority class, consulted during `pop_next`.
     priorities: HashMap<u64, PriorityClass>,
+    /// Databases whose priority was refreshed since the last reap.
+    ///
+    /// `priorities` deliberately counts a registered-but-idle database in
+    /// `fair_share_slots`, so it cannot be reaped the moment its queue drains.
+    /// Without an expiry it never shrinks: `set_priority` runs on every
+    /// dispatch, so every database that ever dispatched inflates the
+    /// fair-share denominator for the process lifetime, suspending live
+    /// databases at ever-shallower depth.
+    touched_since_reap: HashSet<u64>,
 
     /// Number of `pop_next` calls since the last queue was reaped; used to
     /// garbage-collect drained virtual queues lazily.
@@ -97,6 +106,7 @@ impl<T> WeightedFairQueue<T> {
             total: 0,
             capacity,
             priorities: HashMap::new(),
+            touched_since_reap: HashSet::new(),
             pops_since_reap: 0,
             reap_after_pops,
         }
@@ -123,6 +133,7 @@ impl<T> WeightedFairQueue<T> {
     /// `pop_next` call after this update.
     pub fn set_priority(&mut self, database_id: u64, cls: PriorityClass) {
         self.priorities.insert(database_id, cls);
+        self.touched_since_reap.insert(database_id);
     }
 
     /// Pop the next item using deficit round-robin across all virtual queues.
@@ -255,12 +266,22 @@ impl<T> WeightedFairQueue<T> {
     /// registered (via `set_priority`) or have an active virtual queue.
     /// This prevents the fair-share from inflating when only one DB has
     /// enqueued items but multiple DBs are known to the scheduler.
+    #[cfg(test)]
+    pub(crate) fn fair_share_slots_for_test(&self) -> usize {
+        self.fair_share_slots()
+    }
+
     fn fair_share_slots(&self) -> usize {
         let active = self.priorities.len().max(self.queues.len()).max(1);
         (self.capacity / active).max(1)
     }
 
-    /// Remove virtual queues that have been empty for a full reap cycle.
+    /// Remove virtual queues that have been empty for a full reap cycle, and
+    /// priority registrations for databases idle across one.
+    ///
+    /// A database that dispatched during the cycle keeps its registration, so
+    /// the fair-share denominator still counts a database between requests.
+    /// One that dispatched nothing and holds no queued item is forgotten.
     fn reap_empty_queues(&mut self) {
         let empty_ids: Vec<u64> = self
             .queues
@@ -272,6 +293,9 @@ impl<T> WeightedFairQueue<T> {
             self.queues.remove(&id);
             self.db_order.retain(|&x| x != id);
         }
+        let touched = std::mem::take(&mut self.touched_since_reap);
+        self.priorities
+            .retain(|id, _| touched.contains(id) || self.queues.contains_key(id));
     }
 }
 
@@ -407,5 +431,38 @@ mod tests {
 
         // DB 2 is untouched → not throttled.
         assert!(!wfq.is_throttled_for(2));
+    }
+
+    /// A database that stops dispatching must stop inflating the fair-share
+    /// denominator. `set_priority` runs on every dispatch, so without an
+    /// expiry the denominator only grows and live databases are suspended at
+    /// ever-shallower depth.
+    #[test]
+    fn an_idle_database_stops_counting_toward_fair_share() {
+        let mut wfq: WeightedFairQueue<u32> = WeightedFairQueue::new(100, 1);
+        wfq.set_priority(1, PriorityClass::Standard);
+        wfq.set_priority(2, PriorityClass::Standard);
+
+        // Database 2 goes quiet. Database 1 keeps working, and each pop
+        // crosses a reap cycle.
+        for round in 0..4 {
+            wfq.set_priority(1, PriorityClass::Standard);
+            wfq.try_enqueue(1, round).expect("enqueue");
+            assert_eq!(wfq.pop_next(), Some(round));
+        }
+
+        let busy = wfq.fair_share_slots_for_test();
+        wfq.set_priority(2, PriorityClass::Standard);
+        wfq.try_enqueue(1, 99).expect("enqueue");
+        assert_eq!(wfq.pop_next(), Some(99));
+        assert!(
+            wfq.fair_share_slots_for_test() <= busy,
+            "a database that resumed dispatching may share capacity again, \
+             never widen it beyond the one-active-database share"
+        );
+        assert_eq!(
+            busy, 100,
+            "with only database 1 dispatching, it must get the whole capacity"
+        );
     }
 }
