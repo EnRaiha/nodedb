@@ -26,6 +26,7 @@ use crate::control::security::catalog::{
     sequence_types::{SequenceState, StoredSequence},
     trigger_types::StoredTrigger,
 };
+use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
 use crate::types::DatabaseId;
@@ -410,5 +411,19 @@ pub enum CatalogEntry {
     /// Drops the row and the in-memory definition on every node.
     DeleteScopeQuota {
         scope_name: String,
+    },
+
+    // ── Retention policy ───────────────────────────────────────────
+    /// Retention policy row in `_system.retention_policies`, keyed by
+    /// `(database_id, tenant_id, name)`. CREATE and ALTER both ship the
+    /// full record; post-apply installs it in every node's registry.
+    PutRetentionPolicy(Box<RetentionPolicyDef>),
+    /// Drops the row and the registry entry on every node.
+    DeleteRetentionPolicy {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+        /// Target collection, carried so plan-cache eviction stays precise.
+        collection: String,
     },
 }

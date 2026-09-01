@@ -11,6 +11,7 @@ mod data_plane;
 mod ingest;
 mod quota;
 mod recovery;
+mod retention;
 mod write_path;
 
 pub(in crate::diag) use catalog::{
@@ -26,6 +27,7 @@ pub(in crate::diag) use quota::{
     ScopeQuotaNotInstalled,
 };
 pub(in crate::diag) use recovery::ReplayRecordUnapplied;
+pub(in crate::diag) use retention::RetentionAutowireOrphaned;
 pub(in crate::diag) use write_path::{
     BatchInsertWithoutSurrogates, FtsIndexUpdateFailed, WriteAckedWithoutDurability,
 };

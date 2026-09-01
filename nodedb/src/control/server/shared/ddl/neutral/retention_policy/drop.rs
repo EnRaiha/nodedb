@@ -2,14 +2,9 @@
 
 //! Protocol-neutral `DROP RETENTION POLICY` DDL handler.
 //!
-//! Ported from the pgwire `ddl::retention_policy::drop` handler. The registry
-//! existence check, the direct catalog delete (`delete_retention_policy`), the
-//! CRDT tombstone delta emission, the best-effort continuous-aggregate
-//! auto-wire unregistration (warn-and-continue on failure, preserved verbatim
-//! because the pgwire handler treated it identically), the in-memory registry
-//! unregister, and the audit record are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! Existence is decided on the leader, before the propose. The removal is a
+//! replicated `DeleteRetentionPolicy`, so every node drops the row and its
+//! registry entry.
 //!
 //! Syntax:
 //! ```sql
@@ -23,6 +18,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::require_tenant_admin;
+use super::replicate::propose_delete;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
@@ -45,12 +41,8 @@ pub async fn drop_retention_policy(
         .get(database_id.as_u64(), tenant_id, &name)
         .ok_or_else(|| err("42704", format!("retention policy '{name}' does not exist")))?;
 
-    // Delete from catalog.
-    let catalog = state.credentials.catalog();
-
-    catalog
-        .delete_retention_policy(database_id.as_u64(), tenant_id, &name)
-        .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
+    // Replicated: every node deletes the row and drops its registry entry.
+    propose_delete(state, &policy_def)?;
 
     // Emit CRDT tombstone delta.
     {
@@ -76,6 +68,13 @@ pub async fn drop_retention_policy(
         )
         .await
     {
+        crate::diag::retention_autowire_orphaned(
+            &e,
+            database_id.as_u64(),
+            tenant_id,
+            &name,
+            &policy_def.collection,
+        );
         tracing::warn!(
             policy = name,
             error = %e,
@@ -84,11 +83,6 @@ pub async fn drop_retention_policy(
     }
 
     let collection = policy_def.collection.clone();
-
-    // Remove from in-memory registry.
-    state
-        .retention_policy_registry
-        .unregister(database_id.as_u64(), tenant_id, &name);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

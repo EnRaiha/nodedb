@@ -44,6 +44,7 @@ use crate::control::state::SharedState;
 /// | PutPermission / DeletePermission        | ❌ no       | permission checked at exec time |
 /// | PutScopeGrant / DeleteScopeGrant        | ❌ no       | scope enrichment resolves grants per request against the live store; no scope field in any PhysicalPlan variant |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
+/// | PutRetentionPolicy / DeleteRetentionPolicy | ✅ yes   | `auto_tier` rewrites a timeseries scan onto tier aggregates, so the policy is baked into the plan |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
     let Some(inv) = shared.gateway_invalidator.get() else {
         return;
@@ -294,6 +295,15 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::PutScopeQuota(_) | CatalogEntry::DeleteScopeQuota { .. } => {
             // no-op: token quotas gate dispatch admission, not plan shape.
+        }
+        CatalogEntry::PutRetentionPolicy(def) => {
+            // `auto_tier` rewrites a scan onto tier aggregates, so the policy
+            // is baked into the plan. Version 0 evicts every cached plan.
+            inv.invalidate(&def.collection, 0);
+        }
+        CatalogEntry::DeleteRetentionPolicy { collection, .. } => {
+            // Dropping the policy removes any tier rewrite from the plan.
+            inv.invalidate(collection, 0);
         }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
@@ -661,6 +671,68 @@ mod tests {
             },
             "DeleteOwner",
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Retention policy — `auto_tier` rewrites the scan, so plans go stale
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    fn retention_policy(
+        collection: &str,
+    ) -> crate::engine::timeseries::retention_policy::RetentionPolicyDef {
+        crate::engine::timeseries::retention_policy::RetentionPolicyDef {
+            database_id: 0,
+            tenant_id: 1,
+            name: "ret_pol".into(),
+            collection: collection.into(),
+            tiers: Vec::new(),
+            auto_tier: true,
+            enabled: true,
+            eval_interval_ms: 3_600_000,
+            owner: "alice".into(),
+            created_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn put_retention_policy_evicts_plans_for_its_collection() {
+        let (shared, cache, _dir) = make_test_state();
+        let key = plant_sentinel(&cache, "metrics");
+        let other = plant_sentinel(&cache, "orders");
+
+        invalidate_gateway_cache_for_entry(
+            &CatalogEntry::PutRetentionPolicy(Box::new(retention_policy("metrics"))),
+            &shared,
+        );
+
+        assert!(
+            cache.get(&key).is_none(),
+            "the policy's collection is evicted"
+        );
+        assert!(cache.get(&other).is_some(), "unrelated plans survive");
+    }
+
+    #[tokio::test]
+    async fn delete_retention_policy_evicts_plans_for_its_collection() {
+        let (shared, cache, _dir) = make_test_state();
+        let key = plant_sentinel(&cache, "metrics");
+        let other = plant_sentinel(&cache, "orders");
+
+        invalidate_gateway_cache_for_entry(
+            &CatalogEntry::DeleteRetentionPolicy {
+                database_id: 0,
+                tenant_id: 1,
+                name: "ret_pol".into(),
+                collection: "metrics".into(),
+            },
+            &shared,
+        );
+
+        assert!(
+            cache.get(&key).is_none(),
+            "the policy's collection is evicted"
+        );
+        assert!(cache.get(&other).is_some(), "unrelated plans survive");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

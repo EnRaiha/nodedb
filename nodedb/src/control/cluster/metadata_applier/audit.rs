@@ -279,6 +279,21 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         E::DeleteScopeQuota { scope_name } => {
             (format!("quota:scope:{scope_name}"), 0, String::new())
         }
+        E::PutRetentionPolicy(p) => (
+            format!("retention:{}:{}:{}", p.database_id, p.tenant_id, p.name),
+            0,
+            String::new(),
+        ),
+        E::DeleteRetentionPolicy {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => (
+            format!("retention:{database_id}:{tenant_id}:{name}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

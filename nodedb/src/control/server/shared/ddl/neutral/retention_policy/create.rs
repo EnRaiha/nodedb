@@ -2,13 +2,10 @@
 
 //! Protocol-neutral `CREATE RETENTION POLICY` DDL handler.
 //!
-//! Ported from the pgwire `ddl::retention_policy::create` handler. The direct
-//! catalog write (`put_retention_policy`), the CRDT sync delta emission, the
-//! in-memory registry registration, the continuous-aggregate auto-wiring with
-//! catalog+registry rollback on failure, the collection / duplicate-name /
-//! per-collection checks, and the audit record are preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The collection, duplicate-name, and per-collection checks run on the
+//! leader, before the row is proposed as a replicated catalog entry. A failed
+//! continuous-aggregate auto-wire rolls the policy back through the same
+//! replicated path, so no node keeps a half-wired policy.
 //!
 //! Syntax:
 //! ```sql
@@ -26,11 +23,13 @@ use nodedb_types::{DatabaseId, quote_ident, quote_literal};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::require_tenant_admin;
 use super::RETENTION_POLICIES_CRDT_COLLECTION;
 use super::parse::parse_create_retention_policy;
+use super::replicate::{propose_delete, propose_put};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
@@ -129,7 +128,7 @@ pub async fn create_retention_policy(
         .map_err(|_| err("XX000", "system clock error".to_string()))?
         .as_secs();
 
-    let def = crate::engine::timeseries::retention_policy::types::RetentionPolicyDef {
+    let def = RetentionPolicyDef {
         database_id: database_id.as_u64(),
         tenant_id,
         name: parsed.name.clone(),
@@ -142,12 +141,9 @@ pub async fn create_retention_policy(
         created_at: now,
     };
 
-    // Persist to catalog.
-    let catalog = state.credentials.catalog();
-
-    catalog
-        .put_retention_policy(&def)
-        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+    // Replicated: every node writes the row and installs the definition in
+    // its own `RetentionPolicyRegistry` via post-apply.
+    propose_put(state, &def)?;
 
     // Emit CRDT sync delta for Lite visibility.
     {
@@ -166,23 +162,23 @@ pub async fn create_retention_policy(
         state.crdt_sync_delivery.enqueue(delta);
     }
 
-    // Register in memory.
-    state.retention_policy_registry.register(def.clone());
-
     // Auto-wire continuous aggregates for each downsample tier.
-    if !def.downsample_tiers().is_empty() {
-        crate::engine::timeseries::retention_policy::autowire::register_tiers(state, &def)
-            .await
-            .map_err(|e| {
-                // Roll back: remove from registry and catalog on failure.
-                state.retention_policy_registry.unregister(
-                    database_id.as_u64(),
-                    tenant_id,
-                    &def.name,
-                );
-                let _ = catalog.delete_retention_policy(database_id.as_u64(), tenant_id, &def.name);
-                err("XX000", format!("failed to auto-wire aggregates: {e}"))
-            })?;
+    if !def.downsample_tiers().is_empty()
+        && let Err(e) =
+            crate::engine::timeseries::retention_policy::autowire::register_tiers(state, &def).await
+    {
+        // Roll back through the same replicated path that created it, so the
+        // policy disappears on every node, not only on this one.
+        if let Err(rollback) = propose_delete(state, &def) {
+            return Err(err(
+                "XX000",
+                format!(
+                    "failed to auto-wire aggregates: {e}; rollback left the policy in place: {}",
+                    rollback.message
+                ),
+            ));
+        }
+        return Err(err("XX000", format!("failed to auto-wire aggregates: {e}")));
     }
 
     state.audit_record(

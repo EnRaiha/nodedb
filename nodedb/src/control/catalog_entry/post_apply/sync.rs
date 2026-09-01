@@ -20,9 +20,9 @@ use std::sync::Arc;
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
-    function, materialized_view, owner, permission, procedure, quota, redaction, rls, role,
-    schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
-    tenant, trigger, user,
+    function, materialized_view, owner, permission, procedure, quota, redaction, retention_policy,
+    rls, role, schedule, scope_grant, scope_quota, sequence, streaming_materialized_view,
+    synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -361,6 +361,17 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::DeleteScopeQuota { scope_name } => {
             scope_quota::delete(scope_name, shared);
+        }
+        CatalogEntry::PutRetentionPolicy(def) => {
+            retention_policy::put(def, shared);
+        }
+        CatalogEntry::DeleteRetentionPolicy {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => {
+            retention_policy::delete(*database_id, *tenant_id, name, shared);
         }
         CatalogEntry::MoveTenantCutover {
             tenant_id,

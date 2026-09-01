@@ -10,7 +10,7 @@ use crate::control::security::catalog::SystemCatalog;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
     function, index_registry, materialized_view, oidc_provider, owner, permission, procedure,
-    quota, redaction, rls, role, schedule, scope_grant, scope_quota, sequence,
+    quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
     streaming_materialized_view, synonym_group, tenant, trigger, user, wal_tombstone,
 };
 
@@ -258,6 +258,13 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
         }
         CatalogEntry::PutScopeQuota(stored) => scope_quota::put(stored, catalog),
         CatalogEntry::DeleteScopeQuota { scope_name } => scope_quota::delete(scope_name, catalog),
+        CatalogEntry::PutRetentionPolicy(def) => retention_policy::put(def, catalog),
+        CatalogEntry::DeleteRetentionPolicy {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => retention_policy::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

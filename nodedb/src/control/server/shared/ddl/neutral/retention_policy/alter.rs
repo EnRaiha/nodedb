@@ -2,12 +2,8 @@
 
 //! Protocol-neutral `ALTER RETENTION POLICY` DDL handler.
 //!
-//! Ported from the pgwire `ddl::retention_policy::alter` handler. The registry
-//! load, the ENABLE / DISABLE / SET (AUTO_TIER, EVAL_INTERVAL) mutations, the
-//! direct catalog write (`put_retention_policy`), the in-memory registry update,
-//! and the audit record are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! ENABLE / DISABLE / SET mutate the loaded record and re-put it. The write is
+//! a replicated `PutRetentionPolicy`, so the change reaches every node.
 //!
 //! Syntax:
 //! ```sql
@@ -23,6 +19,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::require_tenant_admin;
+use super::replicate::propose_put;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
@@ -90,15 +87,8 @@ pub fn alter_retention_policy(
         }
     }
 
-    // Persist updated policy.
-    let catalog = state.credentials.catalog();
-
-    catalog
-        .put_retention_policy(&def)
-        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
-
-    // Update in-memory registry.
-    state.retention_policy_registry.register(def);
+    // Replicated: every node writes the row and refreshes its registry.
+    propose_put(state, &def)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -7,6 +7,7 @@ mod constants;
 pub mod create;
 pub mod drop;
 mod parse;
+mod replicate;
 pub mod show;
 
 pub use alter::alter_retention_policy;

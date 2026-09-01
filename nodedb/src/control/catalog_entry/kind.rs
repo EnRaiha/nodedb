@@ -77,6 +77,8 @@ impl CatalogEntry {
             Self::DeleteTenantQuota { .. } => "delete_tenant_quota",
             Self::PutScopeQuota(_) => "put_scope_quota",
             Self::DeleteScopeQuota { .. } => "delete_scope_quota",
+            Self::PutRetentionPolicy(_) => "put_retention_policy",
+            Self::DeleteRetentionPolicy { .. } => "delete_retention_policy",
         }
     }
 }

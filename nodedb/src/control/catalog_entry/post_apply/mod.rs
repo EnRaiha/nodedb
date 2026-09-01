@@ -30,6 +30,7 @@ pub mod permission;
 pub mod procedure;
 pub mod quota;
 pub mod redaction;
+pub mod retention_policy;
 pub mod rls;
 pub mod role;
 pub mod schedule;
