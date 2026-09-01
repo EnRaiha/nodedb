@@ -2,38 +2,29 @@
 
 //! Descriptor versioning stamp helpers.
 //!
-//! Called by the metadata commit applier right before any `Put*`
-//! `CatalogEntry` is written to `SystemCatalog` redb. Reads the prior
-//! persisted record, increments `descriptor_version` by one (or
-//! assigns `1` on create), and stamps `modification_hlc` from the
-//! node-local [`HlcClock`]. Returns the entry with stamped fields
-//! so the applier calls `apply_to` with the stamped value.
+//! The metadata commit applier calls this right before writing any `Put*`
+//! `CatalogEntry` to `SystemCatalog` redb. It reads the prior persisted
+//! record, sets `descriptor_version` to prior + 1 (or `1` on create), and
+//! stamps `modification_hlc` from the node-local [`HlcClock`].
 //!
-//! The stamp is a pure function of the prior state, the clock, and
-//! the incoming entry — no global side effects beyond advancing the
-//! local HLC. This makes it safe to call on every tick of every node
-//! inside the raft apply path.
+//! The stamp is a pure function of prior state, clock, and entry, with no side
+//! effect beyond advancing the local HLC. Safe on every node's apply path.
 //!
-//! ## Rolling upgrade contract
+//! Every prior read is committed-only. Deriving a version from the
+//! transaction's own uncommitted DDL overlay stamps one descriptor twice.
 //!
-//! In mixed-version clusters, stamping is gated by
-//! [`crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION`].
-//! When the cluster is in compat mode the applier must skip this
-//! helper entirely — the gate check lives at the call site so this
-//! module is oblivious to it.
+//! Rolling upgrade: stamping is gated by
+//! [`crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION`], and the
+//! applier skips this helper in compat mode. That gate lives at the call site.
 //!
-//! ## Variants without descriptor fields
-//!
-//! Not every `CatalogEntry` variant carries descriptor version/HLC.
-//! `PutUser`, `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`,
-//! `PutApiKey`, `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
-//! `PutSequenceState`, and the `Delete*` / `Purge*` variants
-//! are returned unchanged. `DeactivateCollection` does carry them:
-//! a soft delete rewrites the collection row, so it consumes a
-//! version like any other mutation. The helper is exhaustive on
-//! [`CatalogEntry`] so adding a new variant is a compile-time
-//! error here — the compiler forces you to make a conscious
-//! decision about whether it needs a version stamp.
+//! Variants without descriptor fields pass through unchanged: `PutUser`,
+//! `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`, `PutApiKey`,
+//! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
+//! `PutSequenceState`, and every `Delete*` / `Purge*` variant.
+//! `DeactivateCollection` does carry them: a soft delete rewrites the row, so it
+//! consumes a version like any other mutation.
+//! The match is exhaustive on [`CatalogEntry`], so a new variant is a compile
+//! error here. Deciding whether it needs a stamp is deliberate.
 
 use nodedb_types::{Hlc, HlcClock};
 
@@ -41,9 +32,7 @@ use crate::control::catalog_entry::CatalogEntry;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 
 /// Derive `(descriptor_version, modification_hlc)` for a collection mutation
-/// from its prior committed row. Shared by the `PutCollection` and
-/// `DeactivateCollection` arms below — a soft delete advances the same
-/// ordering metadata a `PutCollection` would, from the same prior row.
+/// from its prior committed row. A soft delete advances the same metadata.
 fn next_collection_stamp(
     prior: Option<&StoredCollection>,
     clock: &HlcClock,
@@ -57,23 +46,16 @@ fn next_collection_stamp(
     (prior_descriptor.saturating_add(1), hlc)
 }
 
-/// Read the prior persisted descriptor (if any), assign
-/// `descriptor_version = prior + 1` (or `1` on create), stamp
-/// `modification_hlc = clock.now()`, and return the entry.
+/// Read the prior persisted descriptor, assign `descriptor_version = prior + 1`
+/// (or `1` on create), stamp `modification_hlc = clock.now()`, return the entry.
 ///
-/// Infallible by design: if a redb read fails (unlikely — the
-/// applier already holds the only writer and the read txn can't
-/// race), we log at debug level and stamp as if the record was
-/// absent (version `1`). Version `0` is never emitted by this
-/// function — it is strictly the "pre-stamping compat mode"
-/// sentinel.
+/// Infallible by design: a failed redb read stamps as if the record was absent
+/// (version `1`). Version `0` is never emitted — it is strictly the
+/// pre-stamping compat-mode sentinel.
 pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> CatalogEntry {
     let mut hlc = clock.now();
     match entry {
         CatalogEntry::PutCollection(mut stored) => {
-            // Committed-only: a version must be derived from what the catalog
-            // actually holds, never from the transaction's own uncommitted DDL
-            // overlay, or the same descriptor stamps twice at one version.
             let prior = catalog
                 .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
@@ -82,11 +64,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 next_collection_stamp(prior.as_ref(), clock, hlc);
             stored.descriptor_version = descriptor_version;
             hlc = stamped_hlc;
-            // Constraint version bumps ONLY when the derived constraint set
-            // actually changes, so an unrelated ALTER never advances the
-            // apply-time fence key and never transiently rejects in-flight
-            // CRDT deltas. `Constraint: Eq` + name-sorted translator make the
-            // set comparison exact and order-stable.
+            // Constraint version bumps ONLY when the derived set changes, so an
+            // unrelated ALTER never advances the apply-time fence key nor rejects
+            // in-flight CRDT deltas. Set comparison is exact and order-stable.
             let prior_constraint_version =
                 prior.as_ref().map(|c| c.constraint_version).unwrap_or(0);
             let prior_set = prior
@@ -103,17 +83,12 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutCollection(stored)
         }
         CatalogEntry::PutCollectionIfAbsent(mut stored) => {
-            // Committed-only: a version must be derived from what the catalog
-            // actually holds, never from the transaction's own uncommitted DDL
-            // overlay, or the same descriptor stamps twice at one version.
             let prior = catalog
                 .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
-            // Existing is a semantic no-op. Freeze the exact persisted record
-            // rather than manufacturing an unpersisted next version; this also
-            // makes later full-log replay payload-identical and lets a following
-            // real mutation in the same batch advance from the true prior.
+            // Existing is a semantic no-op: freeze the exact persisted record, so
+            // replay stays payload-identical and later batch entries see the prior.
             if let Some(prior) = prior {
                 return CatalogEntry::PutCollectionIfAbsent(Box::new(prior));
             }
@@ -124,7 +99,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutCollectionIfAbsent(stored)
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
-            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
                 .get_committed_materialized_view(stored.tenant_id, &stored.name)
                 .ok()
@@ -136,7 +110,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutMaterializedView(stored)
         }
         CatalogEntry::PutFunction(mut stored) => {
-            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
                 .get_committed_function_in_database(
                     stored.database_id,
@@ -152,7 +125,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutFunction(stored)
         }
         CatalogEntry::PutProcedure(mut stored) => {
-            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
                 .get_committed_procedure_in_database(
                     stored.database_id,
@@ -168,7 +140,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutProcedure(stored)
         }
         CatalogEntry::PutTrigger(mut stored) => {
-            // Committed-only: see the `PutCollection` arm above for why.
             let prior = catalog
                 .get_committed_trigger_in_database(
                     stored.database_id,
@@ -211,9 +182,8 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             name,
             ..
         } => {
-            // A soft delete rewrites the row, so it advances the same
-            // ordering metadata a `PutCollection` would. Committed-only for
-            // the same reason as that arm.
+            // A soft delete rewrites the row, advancing the same ordering
+            // metadata a `PutCollection` would.
             let prior = catalog
                 .get_committed_collection(
                     crate::types::DatabaseId::new(database_id),
@@ -232,9 +202,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 modification_hlc: stamped_hlc,
             }
         }
-        // Variants without descriptor versioning pass through
-        // unchanged. Exhaustive match forces explicit handling of
-        // any future variant added to `CatalogEntry`.
+        // Variants without descriptor versioning pass through unchanged.
         entry @ (CatalogEntry::PurgeCollection { .. }
         | CatalogEntry::DeleteFunction { .. }
         | CatalogEntry::DeleteProcedure { .. }
@@ -255,19 +223,16 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRole { .. }
         | CatalogEntry::PutApiKey(_)
         | CatalogEntry::RevokeApiKey { .. }
-        // Auth-user records carry no descriptor version.
         | CatalogEntry::PutAuthUser(_)
         | CatalogEntry::PutTenant(_)
         | CatalogEntry::PutTenantWithAdmin { .. }
         | CatalogEntry::DeleteTenant { .. }
         | CatalogEntry::PutRlsPolicy(_)
         | CatalogEntry::DeleteRlsPolicy { .. }
-        // Redaction policies carry no descriptor version, same as RLS.
         | CatalogEntry::PutRedactionPolicy(_)
         | CatalogEntry::DeleteRedactionPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
-        // Scope grants carry no descriptor version, same as permissions.
         | CatalogEntry::PutScopeGrant(_)
         | CatalogEntry::DeleteScopeGrant { .. }
         | CatalogEntry::PutIndexRecord(_)
@@ -296,9 +261,8 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
     }
 }
 
-/// Stamp a transactional DDL batch in statement order. Persisted catalog
-/// state seeds the first mutation of each descriptor; a prior mutation of the
-/// same descriptor in this batch seeds the next one.
+/// Stamp a transactional DDL batch in statement order. Persisted catalog state
+/// seeds each descriptor's first mutation, a prior batch mutation the next.
 pub fn stamp_batch(
     entries: Vec<CatalogEntry>,
     clock: &HlcClock,
@@ -319,9 +283,8 @@ pub fn stamp_batch(
     stamped_entries
 }
 
-/// The `(database, tenant, name)` a versioned collection entry mutates.
-/// A soft delete shares this key with the puts: `CREATE t; DROP t;` in one
-/// transaction is two mutations of one descriptor, not two firsts.
+/// The `(database, tenant, name)` a versioned collection entry mutates. A soft
+/// delete shares this key with the puts, so `CREATE t; DROP t;` is one descriptor.
 fn collection_key(entry: &CatalogEntry) -> Option<(u64, u64, &str)> {
     match entry {
         CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
@@ -421,8 +384,7 @@ fn advance_after(prior: &CatalogEntry, current: CatalogEntry) -> CatalogEntry {
             },
             CatalogEntry::PutCollection(mut current),
         ) => {
-            // A soft delete leaves the constraint set untouched, so only the
-            // descriptor version advances past it.
+            // A soft delete leaves the constraint set untouched.
             current.descriptor_version = prior_version.saturating_add(1);
             CatalogEntry::PutCollection(current)
         }
@@ -456,8 +418,8 @@ fn advance_after(prior: &CatalogEntry, current: CatalogEntry) -> CatalogEntry {
     }
 }
 
-/// The version a preceding collection entry in the same batch stamped, or `0`
-/// when the entry is not a versioned collection mutation.
+/// The version a preceding batch entry stamped, or `0` when it is not a
+/// versioned collection mutation.
 fn collection_version(entry: &CatalogEntry) -> u64 {
     match entry {
         CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {

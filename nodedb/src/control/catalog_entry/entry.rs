@@ -2,11 +2,16 @@
 
 //! The `CatalogEntry` enum itself.
 //!
-//! Every variant corresponds to a single mutation on the host-side
-//! `SystemCatalog` redb and/or an in-memory registry on
-//! `SharedState`. Adding a variant forces every consumer to handle
-//! it (the apply / post_apply / tests modules use exhaustive
-//! matches).
+//! Each variant is one mutation on the host-side `SystemCatalog` redb
+//! and/or an in-memory registry on `SharedState`. The apply, post_apply,
+//! and test modules match exhaustively, so adding a variant forces every
+//! consumer to handle it.
+//!
+//! `Put*` variants carry the full updated record, so followers apply
+//! verbatim without a diff. Leader-side preparation (hashing, compiling,
+//! validating) happens before the proposal; apply writes what consensus
+//! accepted. Variants appended at the end of the enum stay there to keep
+//! MessagePack discriminants stable across rolling upgrades.
 
 use crate::control::security::catalog::{
     StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
@@ -28,53 +33,32 @@ use crate::types::DatabaseId;
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub enum CatalogEntry {
     // ── Collection ─────────────────────────────────────────────────
-    /// Upsert a collection record. Used by CREATE COLLECTION and by
-    /// every ALTER COLLECTION path that ships a full updated record
-    /// (strict schema changes, retention / legal_hold / LVC /
-    /// append_only toggles, materialized_sum bindings).
+    /// CREATE COLLECTION, and every ALTER COLLECTION path that ships a
+    /// full updated record.
     PutCollection(Box<StoredCollection>),
-    /// Create-only collection upsert: applies iff the collection is
-    /// absent, and never clobbers an existing schema. Used by CRDT
-    /// sync to materialize announced collections without racing or
-    /// overwriting a locally-authored definition of the same name.
+    /// Create-only: applies iff the collection is absent, never clobbering an
+    /// existing schema. Used by CRDT sync to materialize announced collections.
     PutCollectionIfAbsent(Box<StoredCollection>),
-    /// Mark a collection as `is_active = false`. Record is
-    /// preserved for audit + undrop. The soft-delete step in the
-    /// two-step DROP → retention-expiry → PURGE flow.
-    ///
-    /// A soft delete mutates the row, so it consumes a descriptor
-    /// version of its own: leaving the CREATE's ordering metadata in
-    /// place makes a replayed CREATE unorderable against the dropped
-    /// row. Both stamped values are carried inside the entry because
-    /// they are frozen once at propose time — an apply-time stamp
-    /// from each node's local clock diverges across replicas.
+    /// Soft delete: sets `is_active = false`, keeping the row for audit and
+    /// undrop. Step one of DROP → retention-expiry → PURGE.
     DeactivateCollection {
         database_id: u64,
         tenant_id: u64,
         name: String,
-        /// Version the row carries after the drop: prior committed
-        /// version + 1. `0` is the pre-stamping compat sentinel.
+        /// Prior committed version + 1. `0` is the pre-stamping compat sentinel.
+        /// Frozen at propose time — an apply-time stamp diverges across replicas.
         descriptor_version: u64,
         /// Drop time, and the instant retention measures from.
         modification_hlc: nodedb_types::Hlc,
     },
-    /// Hard-delete a collection: remove the `StoredCollection`
-    /// row + owner row + cascade-dependent catalog entries, and
-    /// dispatch `MetaOp::UnregisterCollection` to every node's Data
-    /// Plane so per-engine storage is reclaimed.
+    /// Hard delete: removes the `StoredCollection` row, owner row, and cascade
+    /// dependents, then dispatches `MetaOp::UnregisterCollection` to every node.
     ///
-    /// Reached by three paths:
-    ///
-    /// 1. `DROP COLLECTION ... PURGE` (immediate, operator-requested,
-    ///    superuser / tenant_admin only).
-    /// 2. `CollectionGC` sweeper on the Event Plane, after the
-    ///    configured `deactivated_collection_retention_days` window
-    ///    has elapsed since `DeactivateCollection`.
-    /// 3. `SELECT _system.purge_collection(...)` operator function.
-    ///
-    /// Preserves the two-step safety net: soft-deleted collections
-    /// are UNDROP-able until retention expires; after purge the
-    /// record is gone and data is unrecoverable (except from backup).
+    /// Reached by `DROP COLLECTION ... PURGE` (superuser / tenant_admin only),
+    /// the `CollectionGC` sweeper after
+    /// `deactivated_collection_retention_days`, or
+    /// `SELECT _system.purge_collection(...)`. After purge the data is
+    /// unrecoverable except from backup.
     PurgeCollection {
         database_id: u64,
         tenant_id: u64,
@@ -82,25 +66,21 @@ pub enum CatalogEntry {
     },
 
     // ── Sequence ───────────────────────────────────────────────────
-    /// Upsert a sequence record. Used by CREATE SEQUENCE and ALTER
-    /// SEQUENCE FORMAT. Carries the full updated record so
-    /// followers can apply the change without shipping a diff.
+    /// CREATE SEQUENCE and ALTER SEQUENCE FORMAT.
     PutSequence(Box<StoredSequence>),
-    /// Delete a sequence record entirely. Used by DROP SEQUENCE and
-    /// by the cascade path in DROP COLLECTION that removes implicit
+    /// DROP SEQUENCE, and the DROP COLLECTION cascade that removes implicit
     /// `{coll}_{field}_seq` sequences for SERIAL columns.
-    DeleteSequence { tenant_id: u64, name: String },
-    /// Upsert the runtime state of a sequence (current value,
-    /// is_called, epoch, period_key). Used by ALTER SEQUENCE
-    /// RESTART to propagate the new counter across nodes.
+    DeleteSequence {
+        tenant_id: u64,
+        name: String,
+    },
+    /// Runtime state (current value, is_called, epoch, period_key). Used by
+    /// ALTER SEQUENCE RESTART to propagate the new counter across nodes.
     PutSequenceState(Box<SequenceState>),
 
     // ── Trigger ────────────────────────────────────────────────────
-    /// Upsert a trigger record. Used by CREATE [OR REPLACE] TRIGGER
-    /// and by ALTER TRIGGER ENABLE/DISABLE paths that ship a full
-    /// updated record.
+    /// CREATE [OR REPLACE] TRIGGER, and ALTER TRIGGER ENABLE/DISABLE.
     PutTrigger(Box<StoredTrigger>),
-    /// Delete a trigger record.
     DeleteTrigger {
         database_id: DatabaseId,
         tenant_id: u64,
@@ -108,12 +88,9 @@ pub enum CatalogEntry {
     },
 
     // ── Function ───────────────────────────────────────────────────
-    /// Upsert a function record. Used by CREATE [OR REPLACE]
-    /// FUNCTION. WASM module bytes, when present, travel in the
-    /// transient `StoredFunction::wasm_module` proposal payload and
-    /// are installed by every local applier before metadata persists.
+    /// CREATE [OR REPLACE] FUNCTION. WASM bytes travel in the transient
+    /// `StoredFunction::wasm_module` and install before metadata persists.
     PutFunction(Box<StoredFunction>),
-    /// Delete a function record.
     DeleteFunction {
         database_id: DatabaseId,
         tenant_id: u64,
@@ -121,11 +98,9 @@ pub enum CatalogEntry {
     },
 
     // ── Procedure ──────────────────────────────────────────────────
-    /// Upsert a stored procedure. Same body-cache invalidation
-    /// pattern as `PutFunction` — the `block_cache` is cleared so
-    /// the next CALL re-parses the new body.
+    /// CREATE PROCEDURE. Post-apply clears `block_cache` so the next CALL
+    /// re-parses the body.
     PutProcedure(Box<StoredProcedure>),
-    /// Delete a stored procedure.
     DeleteProcedure {
         database_id: DatabaseId,
         tenant_id: u64,
@@ -133,11 +108,9 @@ pub enum CatalogEntry {
     },
 
     // ── Schedule ───────────────────────────────────────────────────
-    /// Upsert a scheduled-job definition. Post-apply syncs the
-    /// in-memory `schedule_registry` so the cron executor on every
-    /// node picks up the new / updated schedule immediately.
+    /// Scheduled-job definition. Post-apply syncs `schedule_registry` so every
+    /// node's cron executor picks it up immediately.
     PutSchedule(Box<ScheduleDef>),
-    /// Delete a scheduled-job definition.
     DeleteSchedule {
         database_id: DatabaseId,
         tenant_id: u64,
@@ -145,25 +118,29 @@ pub enum CatalogEntry {
     },
 
     // ── Synonym group ──────────────────────────────────────────────
-    /// Upsert a synonym group. Post-apply syncs the in-memory `synonym_registry`.
+    /// Post-apply syncs the in-memory `synonym_registry`.
     PutSynonymGroup(Box<StoredSynonymGroup>),
-    /// Delete a synonym group. Post-apply removes it from the registry.
-    DeleteSynonymGroup { tenant_id: u64, name: String },
+    /// Post-apply removes it from `synonym_registry`.
+    DeleteSynonymGroup {
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Custom type ────────────────────────────────────────────────
-    /// Upsert a custom type (enum or composite). Post-apply syncs the
-    /// in-memory `custom_type_registry`.
+    /// Enum or composite type. Post-apply syncs `custom_type_registry`.
     PutCustomType(Box<StoredCustomType>),
-    /// Delete a custom type. Post-apply removes it from the registry.
-    DeleteCustomType { tenant_id: u64, name: String },
+    /// Post-apply removes it from `custom_type_registry`.
+    DeleteCustomType {
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Change stream ──────────────────────────────────────────────
-    /// Upsert a CDC change-stream definition. Post-apply syncs the
-    /// in-memory `stream_registry` so the Event Plane starts
-    /// buffering matching WriteEvents on every node.
+    /// CDC stream definition. Post-apply syncs `stream_registry` so every node
+    /// starts buffering matching WriteEvents.
     PutChangeStream(Box<ChangeStreamDef>),
-    /// Delete a CDC change-stream definition + tear down its
-    /// buffer via `cdc_router.remove_buffer`.
+    /// Removes the definition and tears down its buffer via
+    /// `cdc_router.remove_buffer`.
     DeleteChangeStream {
         database_id: u64,
         tenant_id: u64,
@@ -171,71 +148,57 @@ pub enum CatalogEntry {
     },
 
     // ── User ───────────────────────────────────────────────────────
-    /// Upsert a user record. The leader builds the full `StoredUser`
-    /// (including Argon2 hash, SCRAM salt, and user_id) via
-    /// `CredentialStore::prepare_user` before proposing — followers
-    /// accept the pre-computed record verbatim and bump their local
-    /// `next_user_id` counter to stay ahead of replicated IDs.
+    /// The leader builds the full record (Argon2 hash, SCRAM salt, user_id) via
+    /// `CredentialStore::prepare_user`; followers bump their `next_user_id`.
     PutUser(Box<StoredUser>),
-    /// Drop a user: fully remove the identity record from every
-    /// node's in-memory cache and redb catalog, freeing the
-    /// username for reuse.
-    DropUser { username: String },
+    /// Removes the identity from every node's cache and redb catalog, freeing
+    /// the username for reuse.
+    DropUser {
+        username: String,
+    },
 
     // ── Role ───────────────────────────────────────────────────────
-    /// Upsert a custom role. Built-in roles (Superuser/TenantAdmin/
-    /// ReadWrite/ReadOnly/Monitor) never flow through this variant —
-    /// they're hardcoded in `identity.rs`.
+    /// Custom roles only. Built-in roles are hardcoded in `identity.rs`.
     PutRole(Box<StoredRole>),
-    /// Delete a custom role. Does not cascade to grants that
-    /// reference it (matching current local-only DROP semantics).
-    DeleteRole { name: String },
+    /// Does not cascade to grants that reference the role.
+    DeleteRole {
+        name: String,
+    },
 
     // ── ApiKey ─────────────────────────────────────────────────────
-    /// Upsert an API key record. The leader builds the full
-    /// `StoredApiKey` (including SHA-256 secret_hash) via
-    /// `ApiKeyStore::prepare_key`; followers accept the pre-computed
-    /// record verbatim. The plaintext secret NEVER enters raft —
-    /// only the proposing client receives the token.
+    /// The leader builds the record (SHA-256 secret_hash) via
+    /// `ApiKeyStore::prepare_key`. The plaintext secret NEVER enters raft.
     PutApiKey(Box<StoredApiKey>),
-    /// Revoke an API key — sets `is_revoked = true` in the cached
-    /// record and re-writes the redb row. Preserves the record for
-    /// audit trails.
-    RevokeApiKey { key_id: String },
+    /// Sets `is_revoked = true` and rewrites the row, preserving it for audit.
+    RevokeApiKey {
+        key_id: String,
+    },
 
     // ── Auth user ──────────────────────────────────────────────────
-    /// Upsert an externally-authenticated (`_system.auth_users`) record.
-    /// Carries the full record, so followers install it verbatim.
+    /// Externally-authenticated (`_system.auth_users`) record, proposed by
+    /// auto-escalation on a `Suspended` / `Banned` verdict.
     ///
-    /// Proposed by auto-escalation when repeated violations turn into a
-    /// `Suspended` / `Banned` verdict. Unlike the DDL variants, the
-    /// originating node has already written and installed the record before
-    /// proposing: an enforcement decision must hold on the node that reached
-    /// it even if replication is unavailable. Applying it is therefore an
-    /// idempotent upsert on every node, including the proposer.
+    /// The proposer has already written and installed the record: an
+    /// enforcement decision must hold even if replication is unavailable.
+    /// Apply is an idempotent upsert on every node, proposer included.
     PutAuthUser(Box<StoredAuthUser>),
 
     // ── Materialized View ──────────────────────────────────────────
-    /// Upsert a materialized view definition. The Data Plane
-    /// refresh loop picks up the new definition on its next tick
-    /// and starts materializing rows from source → target.
+    /// The Data Plane refresh loop picks up the definition on its next tick.
     PutMaterializedView(Box<StoredMaterializedView>),
-    /// Delete a materialized-view definition and its implementation-owned
-    /// target collection as one replicated catalog mutation. Post-apply waits
-    /// for collection-wide Data Plane reclaim before advancing the applied
-    /// index, so a same-name re-CREATE starts from a fresh incarnation.
-    DeleteMaterializedView { tenant_id: u64, name: String },
+    /// Removes the definition and its implementation-owned target collection as
+    /// one mutation. Post-apply waits for Data Plane reclaim before advancing
+    /// the applied index, so a same-name re-CREATE starts fresh.
+    DeleteMaterializedView {
+        tenant_id: u64,
+        name: String,
+    },
     // ── Continuous Aggregate ───────────────────────────────────────
-    /// Upsert a continuous-aggregate definition. The applier writes
-    /// the catalog row plus the owner row; the post-apply sync
-    /// re-dispatches `MetaOp::RegisterContinuousAggregate` to the
-    /// local Data Plane so the runtime manager picks up the change
-    /// without re-issuing DDL.
+    /// Writes the catalog row plus the owner row. Post-apply re-dispatches
+    /// `MetaOp::RegisterContinuousAggregate` to the local Data Plane.
     PutContinuousAggregate(Box<StoredContinuousAggregate>),
-    /// Delete a continuous-aggregate definition. The target
-    /// collection that holds materialized rows is NOT deleted —
-    /// operators drop it separately with `DROP COLLECTION` if
-    /// desired (mirrors the materialized-view contract).
+    /// The target collection holding materialized rows is NOT deleted —
+    /// operators drop it separately, mirroring the materialized-view contract.
     DeleteContinuousAggregate {
         database_id: u64,
         tenant_id: u64,
@@ -243,29 +206,25 @@ pub enum CatalogEntry {
     },
 
     // ── Tenant ─────────────────────────────────────────────────────
-    /// Upsert a tenant identity record. Quotas are NOT part of
-    /// `StoredTenant`; they live in the in-memory `TenantStore` and
-    /// quota replication is handled separately. Post-apply seeds
-    /// default quota on every node so reads work immediately after
-    /// creation.
+    /// Quotas are not part of `StoredTenant` and replicate separately.
+    /// Post-apply seeds default quota so reads work right after creation.
     PutTenant(Box<StoredTenant>),
     /// Atomically create a tenant and its authoritative administrator.
     PutTenantWithAdmin {
         tenant: Box<StoredTenant>,
         admin: Box<StoredUser>,
     },
-    /// Hard-delete a tenant identity record. Tenant data is not
-    /// purged — that is a separate `PURGE TENANT CONFIRM` Data
-    /// Plane meta op.
-    DeleteTenant { tenant_id: u64 },
+    /// Hard-deletes the identity record only. Tenant data is purged separately
+    /// by the `PURGE TENANT CONFIRM` Data Plane meta op.
+    DeleteTenant {
+        tenant_id: u64,
+    },
 
     // ── RLS policy ─────────────────────────────────────────────────
-    /// Upsert an RLS policy. The leader serializes the runtime
-    /// `RlsPolicy` (compiled predicate + deny mode) into the
-    /// catalog-shape `StoredRlsPolicy` before proposing; followers
-    /// re-hydrate the runtime form via `to_runtime()` in post_apply.
+    /// The leader serializes the runtime `RlsPolicy` into `StoredRlsPolicy`;
+    /// followers re-hydrate via `to_runtime()` in post_apply.
     PutRlsPolicy(Box<StoredRlsPolicy>),
-    /// Delete a single RLS policy by `(tenant_id, collection, name)`.
+    /// Keyed by `(tenant_id, collection, name)`.
     DeleteRlsPolicy {
         tenant_id: u64,
         collection: String,
@@ -273,12 +232,10 @@ pub enum CatalogEntry {
     },
 
     // ── Redaction policy ──────────────────────────────────────────
-    /// Upsert a redaction policy. The leader serializes the runtime
-    /// `RedactionPolicy` (flattened rule list) into the catalog-shape
-    /// `StoredRedactionPolicy` before proposing; followers re-hydrate
-    /// the runtime form via `to_runtime()` in post_apply.
+    /// The leader flattens the runtime `RedactionPolicy` rule list into
+    /// `StoredRedactionPolicy`; followers re-hydrate via `to_runtime()`.
     PutRedactionPolicy(Box<StoredRedactionPolicy>),
-    /// Delete a single redaction policy by `(tenant_id, collection, for_role)`.
+    /// Keyed by `(tenant_id, collection, for_role)`.
     DeleteRedactionPolicy {
         tenant_id: u64,
         collection: String,
@@ -286,14 +243,11 @@ pub enum CatalogEntry {
     },
 
     // ── Permission grant ───────────────────────────────────────────
-    /// Upsert an explicit permission grant
-    /// (`GRANT <perm> ON <target> TO <grantee>`). The catalog row is
-    /// the authoritative copy on every node; the in-memory
-    /// `PermissionStore.grants` set is rebuilt from it on apply.
+    /// `GRANT <perm> ON <target> TO <grantee>`. The catalog row is
+    /// authoritative; `PermissionStore.grants` is rebuilt from it on apply.
     PutPermission(Box<StoredPermission>),
-    /// Delete a permission grant by `(target, grantee, permission)`.
-    /// `permission` is the lowercase canonical name
-    /// (`read|write|create|drop|alter|admin|monitor|execute`).
+    /// Keyed by `(target, grantee, permission)`. `permission` is the lowercase
+    /// canonical name (`read|write|create|drop|alter|admin|monitor|execute`).
     DeletePermission {
         target: String,
         grantee: String,
@@ -301,27 +255,22 @@ pub enum CatalogEntry {
     },
 
     // ── Database lifecycle ─────────────────────────────────────────
-    /// Upsert a database descriptor. Used by `CREATE DATABASE` and by
-    /// `ALTER DATABASE RENAME`, `SET QUOTA`, `MATERIALIZE`, `PROMOTE`.
-    /// Followers apply the full updated record verbatim.
+    /// `CREATE DATABASE`, `ALTER DATABASE RENAME`, `SET QUOTA`, `MATERIALIZE`,
+    /// `PROMOTE`.
     PutDatabase(Box<crate::control::security::catalog::database_types::DatabaseDescriptor>),
-    /// Hard-delete a database descriptor and its reverse-lookup row from
-    /// `_system.databases` and `_system.databases_by_name`. Used by
-    /// `DROP DATABASE` after all collections have been cascaded. Does not
-    /// touch collection rows — those must be removed before proposing this.
+    /// `DROP DATABASE`: removes the descriptor and its `_system.databases_by_name`
+    /// row. Does not touch collection rows — cascade those before proposing.
     DeleteDatabase {
         /// Numeric database id.
         db_id: u64,
     },
-    /// Upsert a database-level permission grant.
-    /// Stored in `_system.database_grants`. Mirrors `PutPermission` for
-    /// collection-level grants but keyed by `(db_id, user_id, privilege)`.
+    /// Database-level grant in `_system.database_grants`, keyed by
+    /// `(db_id, user_id, privilege)`.
     PutDatabaseGrant {
         db_id: u64,
         user_id: u64,
         privilege: String,
     },
-    /// Delete a database-level permission grant.
     DeleteDatabaseGrant {
         db_id: u64,
         user_id: u64,
@@ -329,33 +278,26 @@ pub enum CatalogEntry {
     },
 
     // ── Index registry ─────────────────────────────────────────────
-    /// Upsert an index identity record. Written by every
-    /// `CREATE [<kind>] INDEX` path so the index is listable and
-    /// droppable by name on every node, whatever engine backs it.
+    /// Written by every `CREATE [<kind>] INDEX` path, whatever engine backs it,
+    /// so the index is listable and droppable by name on every node.
     PutIndexRecord(Box<StoredIndexRecord>),
-    /// Delete an index identity record by `(database_id, tenant_id, name)`.
-    /// Paired with the kind-specific teardown the DROP handler performs
-    /// before proposing this entry.
+    /// Keyed by `(database_id, tenant_id, name)`. The DROP handler performs the
+    /// kind-specific teardown before proposing this.
     DeleteIndexRecord {
         database_id: u64,
         tenant_id: u64,
         name: String,
-        /// The collection the index was attached to. Not needed to locate the
-        /// record (the name is the key) — it lets the post-apply hook
-        /// invalidate exactly the cached plans that could still hold an
-        /// `IndexLookup` against the dropped index.
+        /// Not needed to locate the record. It lets post-apply invalidate exactly
+        /// the cached plans still holding an `IndexLookup` on the dropped index.
         collection: String,
     },
 
     // ── Object ownership ───────────────────────────────────────────
-    /// Upsert an ownership record. Used by handlers whose object
-    /// has no replicated parent variant (indexes, spatial indexes,
-    /// `ALTER OBJECT OWNER`). Objects that already ship a parent
-    /// `Stored*` carrying an `owner` field replicate ownership via
-    /// the parent's post_apply instead — this variant is only for
-    /// the orphan path.
+    /// Orphan path only: objects with no replicated parent variant (indexes,
+    /// spatial indexes, `ALTER OBJECT OWNER`). A parent `Stored*` carrying an
+    /// `owner` field replicates ownership through its own post_apply instead.
     PutOwner(Box<StoredOwner>),
-    /// Delete an ownership record by database-scoped object identity.
+    /// Keyed by database-scoped object identity.
     DeleteOwner {
         object_type: String,
         database_id: u64,
@@ -364,37 +306,32 @@ pub enum CatalogEntry {
     },
 
     // ── Move Tenant lifecycle ──────────────────────────────────────
-    /// Atomically move a tenant's collections from one database to another.
+    /// The single proposal that makes the `MOVE TENANT` cutover atomic: writes
+    /// each collection to `target_db_id`, then deletes it from `source_db_id`.
     ///
-    /// This is the single Raft proposal that makes the cutover phase of
-    /// `MOVE TENANT` atomic. On apply it:
-    /// 1. Writes each `StoredCollection` in `collections` to `target_db_id`.
-    /// 2. Deletes each collection from `source_db_id`.
-    ///
-    /// The handler builds this entry after snapshot succeeds; the Raft
-    /// proposal is a complete, self-contained mutation that any follower
-    /// can replay without external lookups.
+    /// Built after snapshot succeeds, and self-contained so any follower
+    /// replays it without external lookups.
     MoveTenantCutover {
         tenant_id: u64,
         source_db_id: u64,
         target_db_id: u64,
-        /// The tenant's collections serialized at their source state.
-        /// Each will be re-keyed to `target_db_id` on apply.
+        /// Collections serialized at their source state. Each is re-keyed to
+        /// `target_db_id` on apply.
         collections: Vec<StoredCollection>,
     },
 
     // ── OIDC provider lifecycle ────────────────────────────────────
-    /// Upsert an OIDC provider. Used by `CREATE / ALTER OIDC PROVIDER`.
-    /// Post-apply refreshes the in-memory `oidc_provider_cache`.
+    /// `CREATE / ALTER OIDC PROVIDER`. Post-apply refreshes
+    /// `oidc_provider_cache`.
     PutOidcProvider(Box<StoredOidcProvider>),
-    /// Delete an OIDC provider record by name.
-    DeleteOidcProvider { name: String },
+    DeleteOidcProvider {
+        name: String,
+    },
 
     // ── WAL replay tombstone ───────────────────────────────────────
-    /// Record (or raise) a per-(database, tenant, collection) WAL replay tombstone.
-    /// Replicated on RESTORE so every replica's boot-time WAL replay barrier
-    /// (`purge_lsn`) matches — without it, purged writes resurrect on follower
-    /// restart. Idempotent + monotone (see `record_wal_tombstone`).
+    /// Records (or raises) a per-(database, tenant, collection) replay barrier.
+    /// Replicated on RESTORE so `purge_lsn` matches everywhere — otherwise
+    /// purged writes resurrect on follower restart. Idempotent and monotone.
     RecordWalTombstone {
         database_id: u64,
         tenant_id: u64,
@@ -403,18 +340,13 @@ pub enum CatalogEntry {
     },
 
     // ── Clone lifecycle ────────────────────────────────────────────
-    /// Atomically record a new CoW clone database.
+    /// Records a new CoW clone database as one unit: writes the target
+    /// descriptor (`status = Cloning`, `parent_clone` set) into
+    /// `_system.databases`, and adds `target_db_id` to the `clone_lineage`
+    /// children of `source_db_id`.
     ///
-    /// On apply this entry does three things as a single unit:
-    /// 1. Writes the target `DatabaseDescriptor` (with `status = Cloning`
-    ///    and `parent_clone` populated) into `_system.databases`.
-    /// 2. Upserts `clone_lineage`: adds `target_db_id` to the children
-    ///    list of `source_db_id`.
-    ///
-    /// The handler builds this entry after resolving `as_of_lsn` and
-    /// allocating `target_db_id` so that the Raft proposal is a complete,
-    /// self-contained mutation that any follower can replay without
-    /// external lookups.
+    /// Built after `as_of_lsn` resolves and `target_db_id` is allocated, so any
+    /// follower replays it without external lookups.
     CloneDatabase {
         /// The descriptor for the newly created target database.
         target_descriptor:
@@ -423,13 +355,10 @@ pub enum CatalogEntry {
         source_db_id: u64,
     },
 
-    // Appended to preserve MessagePack enum discriminants for existing
-    // metadata-raft entries during rolling upgrades.
-    /// Upsert a streaming MV definition and its database-scoped owner row.
+    /// Streaming MV definition plus its database-scoped owner row.
     PutStreamingMaterializedView(Box<crate::event::streaming_mv::StreamingMvDef>),
-    /// Delete a streaming materialized-view definition. Streaming MVs are
-    /// Event-Plane objects, so this removes both the database-scoped catalog
-    /// record and the matching in-memory registry entry on every replica.
+    /// Streaming MVs are Event-Plane objects, so this removes both the
+    /// database-scoped catalog record and the in-memory registry entry.
     DeleteStreamingMaterializedView {
         database_id: u64,
         tenant_id: u64,
@@ -437,18 +366,13 @@ pub enum CatalogEntry {
     },
 
     // ── Scope grant ────────────────────────────────────────────────
-    // Also appended rather than filed next to the permission variants,
-    // for the same discriminant-stability reason.
-    /// Upsert a scope grant (`GRANT SCOPE`, and `RENEW SCOPE`, which is
-    /// the same upsert carrying a later `expires_at`). The catalog row is
-    /// the authoritative copy on every node; the in-memory
-    /// `ScopeGrantStore` map is installed from it on apply, so a grant
-    /// authorizes identically on the node that received the statement and
-    /// on every other node.
+    /// `GRANT SCOPE`, and `RENEW SCOPE` as the same upsert with a later
+    /// `expires_at`. The catalog row is authoritative; `ScopeGrantStore` is
+    /// installed from it on apply, so the grant authorizes identically
+    /// everywhere.
     PutScopeGrant(Box<StoredScopeGrant>),
-    /// Delete a scope grant by `(scope_name, grantee_type, grantee_id)` —
-    /// the same triple the catalog and the in-memory map are keyed on.
-    /// `grantee_type` is the lowercase form (`user|role|org|team`).
+    /// Keyed by `(scope_name, grantee_type, grantee_id)`. `grantee_type` is the
+    /// lowercase form (`user|role|org|team`).
     DeleteScopeGrant {
         scope_name: String,
         grantee_type: String,
@@ -456,37 +380,35 @@ pub enum CatalogEntry {
     },
 
     // ── Resource quota ─────────────────────────────────────────────
-    // Appended for the same discriminant-stability reason as the
-    // variants above.
-    /// Upsert a database quota record in `_system.database_quotas`.
-    /// The leader validates the record and the global ceiling before
-    /// proposing; apply writes what consensus accepted. Post-apply
-    /// pushes the record into live enforcement on every node.
+    /// Database quota row in `_system.database_quotas`. The leader checks the
+    /// global ceiling before proposing; post-apply pushes it into enforcement.
     PutDatabaseQuota {
         db_id: u64,
         record: Box<nodedb_types::QuotaRecord>,
     },
-    /// Delete a database quota record. Enforcement falls back to
-    /// `QuotaRecord::DEFAULT` on every node.
-    DeleteDatabaseQuota { db_id: u64 },
-    /// Upsert a tenant quota record in `_system.tenant_quotas`,
-    /// keyed by `(db_id, tenant_id)`. Same leader-validates /
-    /// apply-writes split as `PutDatabaseQuota`.
+    /// Enforcement falls back to `QuotaRecord::DEFAULT` on every node.
+    DeleteDatabaseQuota {
+        db_id: u64,
+    },
+    /// Tenant quota row in `_system.tenant_quotas`, keyed by
+    /// `(db_id, tenant_id)`.
     PutTenantQuota {
         db_id: u64,
         tenant_id: u64,
         record: Box<nodedb_types::QuotaRecord>,
     },
-    /// Delete a tenant quota record by `(db_id, tenant_id)`.
-    DeleteTenantQuota { db_id: u64, tenant_id: u64 },
+    /// Keyed by `(db_id, tenant_id)`.
+    DeleteTenantQuota {
+        db_id: u64,
+        tenant_id: u64,
+    },
 
     // ── Scope token quota ──────────────────────────────────────────
-    /// Upsert a per-scope token quota row in `_system.scope_quotas`.
-    /// The leader parses and range-checks the definition before
-    /// proposing; apply writes the accepted row and post-apply
-    /// installs it in every node's `QuotaManager`.
+    /// Per-scope token quota row in `_system.scope_quotas`. The leader parses
+    /// and range-checks it; post-apply installs it in every `QuotaManager`.
     PutScopeQuota(Box<StoredScopeQuota>),
-    /// Delete a per-scope token quota by scope name. Drops the row and
-    /// the in-memory definition on every node.
-    DeleteScopeQuota { scope_name: String },
+    /// Drops the row and the in-memory definition on every node.
+    DeleteScopeQuota {
+        scope_name: String,
+    },
 }
