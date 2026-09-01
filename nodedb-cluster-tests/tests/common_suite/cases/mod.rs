@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod a4_placement_convergence;
+mod alter_quota_cross_node;
 mod array_raft_partition_recovery;
 mod array_raft_replication;
 mod array_raft_snapshot_install;
