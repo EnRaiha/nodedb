@@ -223,6 +223,33 @@ impl AdmissionRegistry {
         set_limit(&mut map, (db, tenant), limit);
     }
 
+    /// Remove every connection entry of a dropped database, tenants included.
+    /// A dropped scope is never re-capped, so live permits keep no entry alive.
+    pub fn clear_database_scope(&self, db: DatabaseId) {
+        {
+            let mut map = self
+                .db_semaphores
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            map.remove(&db);
+        }
+        let mut map = self
+            .tenant_semaphores
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.retain(|(entry_db, _), _| *entry_db != db);
+    }
+
+    /// Remove a dropped tenant's connection entries in every database.
+    /// A dropped scope is never re-capped, so live permits keep no entry alive.
+    pub fn clear_tenant_scope(&self, tenant: TenantId) {
+        let mut map = self
+            .tenant_semaphores
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.retain(|(_, entry_tenant), _| *entry_tenant != tenant);
+    }
+
     // ── Live counts ───────────────────────────────────────────────────────────
 
     /// Connections holding a database permit. `None` when the database has no
@@ -387,6 +414,39 @@ mod tests {
         assert!(b.is_some());
         assert_eq!(reg.database_live_connections(db(1)), Some(1));
         assert_eq!(reg.database_live_connections(db(2)), Some(1));
+    }
+
+    // ── Scope teardown tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn clear_database_scope_drops_the_database_and_its_tenants() {
+        let reg = AdmissionRegistry::new();
+        reg.set_database_limit(db(1), 2);
+        reg.set_tenant_limit(db(1), tenant(1), 2);
+        reg.set_database_limit(db(2), 2);
+        reg.set_tenant_limit(db(2), tenant(1), 2);
+        let _held = reg.try_acquire_database(db(1)).unwrap().unwrap();
+
+        reg.clear_database_scope(db(1));
+
+        assert_eq!(reg.database_live_connections(db(1)), None);
+        assert_eq!(reg.tenant_live_connections(db(1), tenant(1)), None);
+        assert_eq!(reg.database_live_connections(db(2)), Some(0));
+        assert_eq!(reg.tenant_live_connections(db(2), tenant(1)), Some(0));
+    }
+
+    #[test]
+    fn clear_tenant_scope_drops_that_tenant_in_every_database() {
+        let reg = AdmissionRegistry::new();
+        reg.set_tenant_limit(db(1), tenant(1), 2);
+        reg.set_tenant_limit(db(2), tenant(1), 2);
+        reg.set_tenant_limit(db(1), tenant(2), 2);
+
+        reg.clear_tenant_scope(tenant(1));
+
+        assert_eq!(reg.tenant_live_connections(db(1), tenant(1)), None);
+        assert_eq!(reg.tenant_live_connections(db(2), tenant(1)), None);
+        assert_eq!(reg.tenant_live_connections(db(1), tenant(2)), Some(0));
     }
 
     // ── Tenant cap tests ──────────────────────────────────────────────────────

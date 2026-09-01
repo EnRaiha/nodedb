@@ -454,4 +454,29 @@ pub enum CatalogEntry {
         grantee_type: String,
         grantee_id: String,
     },
+
+    // ── Resource quota ─────────────────────────────────────────────
+    // Appended for the same discriminant-stability reason as the
+    // variants above.
+    /// Upsert a database quota record in `_system.database_quotas`.
+    /// The leader validates the record and the global ceiling before
+    /// proposing; apply writes what consensus accepted. Post-apply
+    /// pushes the record into live enforcement on every node.
+    PutDatabaseQuota {
+        db_id: u64,
+        record: Box<nodedb_types::QuotaRecord>,
+    },
+    /// Delete a database quota record. Enforcement falls back to
+    /// `QuotaRecord::DEFAULT` on every node.
+    DeleteDatabaseQuota { db_id: u64 },
+    /// Upsert a tenant quota record in `_system.tenant_quotas`,
+    /// keyed by `(db_id, tenant_id)`. Same leader-validates /
+    /// apply-writes split as `PutDatabaseQuota`.
+    PutTenantQuota {
+        db_id: u64,
+        tenant_id: u64,
+        record: Box<nodedb_types::QuotaRecord>,
+    },
+    /// Delete a tenant quota record by `(db_id, tenant_id)`.
+    DeleteTenantQuota { db_id: u64, tenant_id: u64 },
 }

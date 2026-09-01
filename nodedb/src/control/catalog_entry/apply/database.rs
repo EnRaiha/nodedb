@@ -22,8 +22,8 @@ pub fn put(descriptor: &DatabaseDescriptor, catalog: &SystemCatalog) {
     }
 }
 
-/// Apply a `DeleteDatabase` entry — remove the descriptor and its
-/// reverse-lookup row from the catalog.
+/// Apply a `DeleteDatabase` entry — remove the descriptor, its
+/// reverse-lookup row, and the quota rows of the dropped scope.
 pub fn delete(db_id: u64, catalog: &SystemCatalog) {
     if let Err(e) = catalog.delete_database(DatabaseId::new(db_id)) {
         warn!(
@@ -32,6 +32,8 @@ pub fn delete(db_id: u64, catalog: &SystemCatalog) {
             "catalog_entry: delete_database failed"
         );
     }
+    // A stale quota row keeps consuming the sum-of-quotas ceiling.
+    super::quota::purge_database_scope(db_id, catalog);
 }
 
 /// Apply a `PutDatabaseGrant` entry.

@@ -56,12 +56,21 @@ impl SystemCatalog {
         }
     }
 
-    /// Write a quota record for a database.
-    ///
-    /// If `ceiling` contains non-zero values, the sum of all existing database
-    /// quotas (including this one) is checked against each ceiling dimension.
-    /// Returns `NodeDbError` with code `QUOTA_OVERCOMMIT` on violation.
+    /// Validate a database quota record against its own invariants and the
+    /// global ceiling, then write it. Leader-side entry point.
     pub fn put_database_quota(
+        &self,
+        db_id: DatabaseId,
+        record: &QuotaRecord,
+        ceiling: &GlobalQuotaCeiling,
+    ) -> crate::Result<()> {
+        self.check_database_quota(db_id, record, ceiling)?;
+        self.write_database_quota(db_id, record)
+    }
+
+    /// Leader-side gate ahead of a replicated write: record invariants plus
+    /// the sum-of-database-quotas ceiling. Writes nothing.
+    pub fn check_database_quota(
         &self,
         db_id: DatabaseId,
         record: &QuotaRecord,
@@ -80,7 +89,16 @@ impl SystemCatalog {
         {
             self.check_database_quota_ceiling(db_id, record, ceiling)?;
         }
+        Ok(())
+    }
 
+    /// Write a database quota record consensus already accepted. No validation
+    /// and no ceiling check — a rejection here would diverge nodes.
+    pub fn write_database_quota(
+        &self,
+        db_id: DatabaseId,
+        record: &QuotaRecord,
+    ) -> crate::Result<()> {
         let bytes =
             zerompk::to_msgpack_vec(record).map_err(|e| catalog_err("serialize QuotaRecord", e))?;
         let txn = self

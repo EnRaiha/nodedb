@@ -174,6 +174,35 @@ impl MemoryGovernor {
         clear_scoped_limit(&mut map, &(db, tenant));
     }
 
+    // ── Scope teardown ────────────────────────────────────────────────────────
+
+    /// Remove every memory budget of a dropped database, tenants included.
+    /// A dropped scope is never re-capped, so live tokens keep no entry alive.
+    pub fn clear_database_scope(&self, db: DatabaseId) {
+        {
+            let mut map = self
+                .database_budgets
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            map.remove(&db);
+        }
+        let mut map = self
+            .tenant_budgets
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.retain(|(entry_db, _), _| *entry_db != db);
+    }
+
+    /// Remove a dropped tenant's memory budgets in every database.
+    /// A dropped scope is never re-capped, so live tokens keep no entry alive.
+    pub fn clear_tenant_scope(&self, tenant: TenantId) {
+        let mut map = self
+            .tenant_budgets
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.retain(|(_, entry_tenant), _| *entry_tenant != tenant);
+    }
+
     // ── 4-arity reservation ───────────────────────────────────────────────────
 
     /// Reserve `size` bytes for the given (database, tenant, engine) triple.
@@ -842,6 +871,69 @@ mod tests {
         let _tok = gov
             .try_reserve(db(), tenant(), EngineId::Vector, 500)
             .expect("released bytes must not be double-counted");
+    }
+
+    #[test]
+    fn clear_database_scope_drops_the_database_and_its_tenants() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        let other = DatabaseId::new(9);
+        gov.set_database_budget(db(), 500);
+        gov.set_tenant_budget(db(), tenant(), 500);
+        gov.set_database_budget(other, 500);
+        gov.set_tenant_budget(other, tenant(), 500);
+        let held = gov
+            .try_reserve(db(), tenant(), EngineId::Vector, 400)
+            .unwrap();
+
+        gov.clear_database_scope(db());
+
+        assert!(!gov.database_budgets.read().unwrap().contains_key(&db()));
+        assert!(
+            !gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(db(), tenant())),
+            "a live token must not keep a dropped scope's entry alive"
+        );
+        assert!(gov.database_budgets.read().unwrap().contains_key(&other));
+        assert!(
+            gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(other, tenant()))
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn clear_tenant_scope_drops_that_tenant_in_every_database() {
+        let gov = MemoryGovernor::new(test_config()).unwrap();
+        let other_db = DatabaseId::new(9);
+        let other_tenant = TenantId::new(2);
+        gov.set_tenant_budget(db(), tenant(), 500);
+        gov.set_tenant_budget(other_db, tenant(), 500);
+        gov.set_tenant_budget(db(), other_tenant, 500);
+
+        gov.clear_tenant_scope(tenant());
+
+        assert!(
+            !gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(db(), tenant()))
+        );
+        assert!(
+            !gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(other_db, tenant()))
+        );
+        assert!(
+            gov.tenant_budgets
+                .read()
+                .unwrap()
+                .contains_key(&(db(), other_tenant))
+        );
     }
 
     #[test]

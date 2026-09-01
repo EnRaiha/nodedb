@@ -218,6 +218,11 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteOidcProvider { .. }
         | CatalogEntry::RecordWalTombstone { .. }
         | CatalogEntry::CloneDatabase { .. }
+        // Quota enforcement is installed synchronously, in `sync.rs`.
+        | CatalogEntry::PutDatabaseQuota { .. }
+        | CatalogEntry::DeleteDatabaseQuota { .. }
+        | CatalogEntry::PutTenantQuota { .. }
+        | CatalogEntry::DeleteTenantQuota { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;

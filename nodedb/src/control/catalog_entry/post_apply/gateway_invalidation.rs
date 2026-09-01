@@ -285,6 +285,13 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::RecordWalTombstone { .. } => {
             // WAL replay barrier only; no plan shape is affected.
         }
+        CatalogEntry::PutDatabaseQuota { .. } | CatalogEntry::DeleteDatabaseQuota { .. } => {
+            // no-op: quotas gate admission and memory at exec time; they do
+            // not change plan shape.
+        }
+        CatalogEntry::PutTenantQuota { .. } | CatalogEntry::DeleteTenantQuota { .. } => {
+            // no-op: same as the database-scoped quota variants.
+        }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
             // This forces re-planning on the next query touching those collections.

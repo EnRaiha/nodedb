@@ -261,6 +261,20 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::PutDatabaseQuota { db_id, .. } => (format!("quota:db:{db_id}"), 0, String::new()),
+        E::DeleteDatabaseQuota { db_id } => (format!("quota:db:{db_id}"), 0, String::new()),
+        E::PutTenantQuota {
+            db_id, tenant_id, ..
+        } => (
+            format!("quota:db:{db_id}:tenant:{tenant_id}"),
+            0,
+            String::new(),
+        ),
+        E::DeleteTenantQuota { db_id, tenant_id } => (
+            format!("quota:db:{db_id}:tenant:{tenant_id}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

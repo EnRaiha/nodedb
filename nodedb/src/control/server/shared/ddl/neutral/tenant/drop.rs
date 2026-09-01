@@ -114,11 +114,20 @@ pub fn drop_tenant(
                 .delete_tenant(tid)
                 .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
         }
-        let mut tenants = match state.tenants.lock() {
-            Ok(t) => t,
-            Err(p) => p.into_inner(),
-        };
-        tenants.remove_quota(tenant_id);
+        {
+            let mut tenants = match state.tenants.lock() {
+                Ok(t) => t,
+                Err(p) => p.into_inner(),
+            };
+            tenants.remove_quota(tenant_id);
+        }
+        // Single-node path: no applier runs, so this branch owns both the
+        // quota row deletion and the live cap release.
+        crate::control::catalog_entry::apply::quota::purge_tenant_scope(
+            tid,
+            state.credentials.catalog(),
+        );
+        crate::control::catalog_entry::post_apply::quota::release_tenant_scope(tenant_id, state);
     }
 
     state.audit_record(

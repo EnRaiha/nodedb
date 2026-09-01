@@ -220,6 +220,10 @@ pub fn drop_database(
         catalog
             .delete_database(db_id)
             .map_err(|e| ddl_err("XX000", format!("catalog delete failed: {e}")))?;
+        // Single-node path: no applier runs, so this branch owns both the
+        // quota row deletion and the live cap release.
+        crate::control::catalog_entry::apply::quota::purge_database_scope(db_id.as_u64(), catalog);
+        crate::control::catalog_entry::post_apply::quota::release_database_scope(db_id, state);
     }
 
     // Remove per-database metrics entries on drop.

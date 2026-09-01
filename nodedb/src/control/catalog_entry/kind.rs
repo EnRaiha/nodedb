@@ -71,6 +71,10 @@ impl CatalogEntry {
             Self::RecordWalTombstone { .. } => "record_wal_tombstone",
             Self::MoveTenantCutover { .. } => "move_tenant_cutover",
             Self::CloneDatabase { .. } => "clone_database",
+            Self::PutDatabaseQuota { .. } => "put_database_quota",
+            Self::DeleteDatabaseQuota { .. } => "delete_database_quota",
+            Self::PutTenantQuota { .. } => "put_tenant_quota",
+            Self::DeleteTenantQuota { .. } => "delete_tenant_quota",
         }
     }
 }

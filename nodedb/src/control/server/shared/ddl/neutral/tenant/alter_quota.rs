@@ -3,19 +3,19 @@
 //! Handler for `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)`.
 //!
 //! Loads the tenant's stored `QuotaRecord` (or `QuotaRecord::DEFAULT`), merges
-//! the partial spec, validates the result, and persists it to
-//! `_system.tenant_quotas`. The persisted record is then pushed into live
-//! enforcement: the admission registry's tenant connection cap and the memory
-//! governor's tenant byte ceiling.
+//! the partial spec, validates the result, and replicates it to
+//! `_system.tenant_quotas` through the metadata raft group. Post-apply pushes
+//! the record into live enforcement on every node: the admission registry's
+//! tenant connection cap and the memory governor's tenant byte ceiling.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::alter_quota` handler. The
-//! `require_tenant_admin` gate is byte-identical to the pgwire
-//! `types::privilege::require_tenant_admin` gate used here originally, so it
-//! is reused directly from `neutral::database::gate` rather than duplicated.
+//! The `require_tenant_admin` gate is reused directly from
+//! `neutral::database::gate` rather than duplicated.
 
 use nodedb_sql::ddl_ast::AlterTenantOperation;
 use nodedb_types::QuotaRecord;
 
+use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -57,7 +57,7 @@ pub fn handle_alter_tenant_quota(
 
     // Load existing record (or DEFAULT) and keep a verbatim copy so the audit
     // entry records the exact before/after; the catalog layer enforces the
-    // sum-of-tenant-quotas ≤ database-quota invariant on `put_tenant_quota`.
+    // sum-of-tenant-quotas ≤ database-quota invariant on `check_tenant_quota`.
     let before = catalog
         .get_tenant_quota(db_id, tenant_id)
         .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
@@ -66,20 +66,27 @@ pub fn handle_alter_tenant_quota(
     record.merge(spec);
 
     catalog
-        .put_tenant_quota(db_id, tenant_id, &record)
+        .check_tenant_quota(db_id, tenant_id, &record)
         .map_err(|e| ddl_err("53400", format!("{e}")))?;
 
-    // Push the new quota into live enforcement components.
-    // `max_connections == 0` clears the cap inside the registry.
-    state
-        .admission_registry
-        .set_tenant_limit(db_id, tenant_id, record.max_connections);
-    if let Some(ref gov) = state.governor {
-        if record.max_memory_bytes > 0 {
-            gov.set_tenant_budget(db_id, tenant_id, record.max_memory_bytes as usize);
-        } else {
-            gov.clear_tenant_budget(db_id, tenant_id);
-        }
+    // Replicated: every node writes the row and installs the quota in its live
+    // enforcement components via post-apply.
+    let outcome = propose_catalog_entry(
+        state,
+        &CatalogEntry::PutTenantQuota {
+            db_id: db_id.as_u64(),
+            tenant_id: tenant_id.as_u64(),
+            record: Box::new(record.clone()),
+        },
+    )
+    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+    if outcome.needs_local_apply() {
+        catalog
+            .write_tenant_quota(db_id, tenant_id, &record)
+            .map_err(|e| ddl_err("53400", format!("{e}")))?;
+        crate::control::catalog_entry::post_apply::quota::put_tenant(
+            db_id, tenant_id, &record, state,
+        );
     }
 
     state.audit_record(

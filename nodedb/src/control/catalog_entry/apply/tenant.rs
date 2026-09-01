@@ -37,6 +37,8 @@ pub fn put_with_admin(tenant: &StoredTenant, admin: &StoredUser, catalog: &Syste
     }
 }
 
+/// Apply a `DeleteTenant` entry — remove the tenant row and its quota
+/// rows in every database.
 pub fn delete(tenant_id: u64, catalog: &SystemCatalog) {
     if let Err(e) = catalog.delete_tenant(tenant_id) {
         warn!(
@@ -45,6 +47,8 @@ pub fn delete(tenant_id: u64, catalog: &SystemCatalog) {
             "catalog_entry: delete_tenant failed"
         );
     }
+    // A stale quota row keeps consuming the database's tenant ceiling.
+    super::quota::purge_tenant_scope(tenant_id, catalog);
 }
 
 /// Apply `MoveTenantCutover`: atomically re-key all `collections` from

@@ -44,13 +44,21 @@ impl SystemCatalog {
         }
     }
 
-    /// Write a quota record for a tenant within a database.
-    ///
-    /// Validates the record and checks that the sum of all tenant quotas in
-    /// the database (including this one) does not exceed the database's own
-    /// quota on any non-zero dimension. Returns `crate::Error::QuotaOvercommit`
-    /// on violation.
+    /// Validate a tenant quota record against its own invariants and the
+    /// database quota ceiling, then write it. Leader-side entry point.
     pub fn put_tenant_quota(
+        &self,
+        db_id: DatabaseId,
+        tenant_id: TenantId,
+        record: &QuotaRecord,
+    ) -> crate::Result<()> {
+        self.check_tenant_quota(db_id, tenant_id, record)?;
+        self.write_tenant_quota(db_id, tenant_id, record)
+    }
+
+    /// Leader-side gate ahead of a replicated write: record invariants plus
+    /// the sum-of-tenant-quotas ceiling. Writes nothing.
+    pub fn check_tenant_quota(
         &self,
         db_id: DatabaseId,
         tenant_id: TenantId,
@@ -62,8 +70,17 @@ impl SystemCatalog {
         })?;
 
         // Check sum-of-tenant-quotas ≤ database quota.
-        self.check_tenant_quota_ceiling(db_id, tenant_id, record)?;
+        self.check_tenant_quota_ceiling(db_id, tenant_id, record)
+    }
 
+    /// Write a tenant quota record consensus already accepted. No validation
+    /// and no ceiling check — a rejection here would diverge nodes.
+    pub fn write_tenant_quota(
+        &self,
+        db_id: DatabaseId,
+        tenant_id: TenantId,
+        record: &QuotaRecord,
+    ) -> crate::Result<()> {
         let bytes = zerompk::to_msgpack_vec(record)
             .map_err(|e| catalog_err("serialize tenant QuotaRecord", e))?;
         let key = (db_id.as_u64(), tenant_id.as_u64());

@@ -6,9 +6,10 @@
 //! so reads work immediately on every node. Quota replication itself
 //! is not part of `StoredTenant` — that is a separate concern.
 //!
-//! `DeleteTenant` removes the in-memory quota entry. Tenant data is
-//! left in place — operators must call `PURGE TENANT <id> CONFIRM`
-//! separately if they want it gone.
+//! `DeleteTenant` removes the in-memory quota entry and releases the
+//! tenant's caps in every database. Tenant data is left in place —
+//! operators must call `PURGE TENANT <id> CONFIRM` separately if they
+//! want it gone.
 
 use std::sync::Arc;
 
@@ -42,11 +43,14 @@ pub fn put_with_admin(tenant: StoredTenant, admin: StoredUser, shared: Arc<Share
 
 pub fn delete(tenant_id: u64, shared: Arc<SharedState>) {
     let tid = TenantId::new(tenant_id);
-    let mut tenants = match shared.tenants.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    tenants.remove_quota(tid);
+    {
+        let mut tenants = match shared.tenants.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        tenants.remove_quota(tid);
+    }
+    super::quota::release_tenant_scope(tid, &shared);
     tracing::debug!(tenant = tenant_id, "post_apply: tenant identity removed");
 }
 

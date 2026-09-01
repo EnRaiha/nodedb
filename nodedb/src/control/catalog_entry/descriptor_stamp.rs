@@ -286,6 +286,10 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteOidcProvider { .. }
         | CatalogEntry::RecordWalTombstone { .. }
         | CatalogEntry::CloneDatabase { .. }
+        | CatalogEntry::PutDatabaseQuota { .. }
+        | CatalogEntry::DeleteDatabaseQuota { .. }
+        | CatalogEntry::PutTenantQuota { .. }
+        | CatalogEntry::DeleteTenantQuota { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }

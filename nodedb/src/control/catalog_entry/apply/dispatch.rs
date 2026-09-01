@@ -10,7 +10,7 @@ use crate::control::security::catalog::SystemCatalog;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
     function, index_registry, materialized_view, oidc_provider, owner, permission, procedure,
-    redaction, rls, role, schedule, scope_grant, sequence, streaming_materialized_view,
+    quota, redaction, rls, role, schedule, scope_grant, sequence, streaming_materialized_view,
     synonym_group, tenant, trigger, user, wal_tombstone,
 };
 
@@ -243,6 +243,18 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             collection,
             purge_lsn,
         } => wal_tombstone::record(*database_id, *tenant_id, collection, *purge_lsn, catalog),
+        CatalogEntry::PutDatabaseQuota { db_id, record } => {
+            quota::put_database(*db_id, record, catalog)
+        }
+        CatalogEntry::DeleteDatabaseQuota { db_id } => quota::delete_database(*db_id, catalog),
+        CatalogEntry::PutTenantQuota {
+            db_id,
+            tenant_id,
+            record,
+        } => quota::put_tenant(*db_id, *tenant_id, record, catalog),
+        CatalogEntry::DeleteTenantQuota { db_id, tenant_id } => {
+            quota::delete_tenant(*db_id, *tenant_id, catalog)
+        }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

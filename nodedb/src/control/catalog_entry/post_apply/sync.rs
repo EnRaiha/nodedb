@@ -20,11 +20,13 @@ use std::sync::Arc;
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
-    function, materialized_view, owner, permission, procedure, redaction, rls, role, schedule,
-    scope_grant, sequence, streaming_materialized_view, synonym_group, tenant, trigger, user,
+    function, materialized_view, owner, permission, procedure, quota, redaction, rls, role,
+    schedule, scope_grant, sequence, streaming_materialized_view, synonym_group, tenant, trigger,
+    user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
+use crate::types::{DatabaseId, TenantId};
 
 /// Run every **synchronous** post-apply side effect inline. Must be
 /// called from the metadata applier BEFORE the watcher bump so
@@ -332,6 +334,27 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::RecordWalTombstone { .. } => {
             // WAL replay barrier only; no in-memory cache to refresh.
+        }
+        CatalogEntry::PutDatabaseQuota { db_id, record } => {
+            quota::put_database(DatabaseId::new(*db_id), record, shared);
+        }
+        CatalogEntry::DeleteDatabaseQuota { db_id } => {
+            quota::delete_database(DatabaseId::new(*db_id), shared);
+        }
+        CatalogEntry::PutTenantQuota {
+            db_id,
+            tenant_id,
+            record,
+        } => {
+            quota::put_tenant(
+                DatabaseId::new(*db_id),
+                TenantId::new(*tenant_id),
+                record,
+                shared,
+            );
+        }
+        CatalogEntry::DeleteTenantQuota { db_id, tenant_id } => {
+            quota::delete_tenant(DatabaseId::new(*db_id), TenantId::new(*tenant_id), shared);
         }
         CatalogEntry::MoveTenantCutover {
             tenant_id,

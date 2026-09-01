@@ -107,24 +107,27 @@ pub fn alter_database(
             // sum-of-database-quotas invariant against it.
             let ceiling = state.quota_ceiling_snapshot();
             catalog
-                .put_database_quota(db_id, &record, &ceiling)
+                .check_database_quota(db_id, &record, &ceiling)
                 .map_err(|e| ddl_err("53400", format!("{e}")))?;
 
-            // Push the new quota into live enforcement components.
-            state
-                .maintenance_budget
-                .set_cap(db_id, record.maintenance_cpu_pct);
-            if let Some(ref gov) = state.governor {
-                if record.max_memory_bytes > 0 {
-                    gov.set_database_budget(db_id, record.max_memory_bytes as usize);
-                } else {
-                    gov.clear_database_budget(db_id);
-                }
+            // Replicated: every node writes the row and installs the quota in
+            // its live enforcement components via post-apply.
+            let outcome = propose_catalog_entry(
+                state,
+                &CatalogEntry::PutDatabaseQuota {
+                    db_id: db_id.as_u64(),
+                    record: Box::new(record.clone()),
+                },
+            )
+            .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
+            if outcome.needs_local_apply() {
+                catalog
+                    .write_database_quota(db_id, &record)
+                    .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                crate::control::catalog_entry::post_apply::quota::put_database(
+                    db_id, &record, state,
+                );
             }
-            // `max_connections == 0` clears the cap inside the registry.
-            state
-                .admission_registry
-                .set_database_limit(db_id, record.max_connections);
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseQuotaChanged,
