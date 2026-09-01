@@ -187,6 +187,7 @@ mod sync_shape_read_authorization;
 mod system_task_call_sites;
 mod tenant_drop_owned_objects;
 mod tls_policy_enforcement;
+mod topic_replication_apply;
 mod transaction_batch_cross_engine;
 mod transaction_batch_cross_engine_crash;
 mod transaction_batch_cross_engine_mixed;

@@ -46,6 +46,7 @@ use crate::control::state::SharedState;
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 /// | PutRetentionPolicy / DeleteRetentionPolicy | ✅ yes   | `auto_tier` rewrites a timeseries scan onto tier aggregates, so the policy is baked into the plan |
 /// | PutAlertRule / DeleteAlertRule          | ❌ no       | alert rules drive their own eval loop and never enter a PhysicalPlan |
+/// | Topic / consumer-group variants         | ❌ no       | Event Plane delivery identities that never enter a PhysicalPlan |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
     let Some(inv) = shared.gateway_invalidator.get() else {
         return;
@@ -309,6 +310,14 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::PutAlertRule(_) | CatalogEntry::DeleteAlertRule { .. } => {
             // no-op: alert rules run their own eval loop and never enter a
             // query plan.
+        }
+        CatalogEntry::CreateTopicIfAbsent(_)
+        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
+        | CatalogEntry::PutConsumerGroupIfAbsent(_)
+        | CatalogEntry::DeleteConsumerGroup { .. }
+        | CatalogEntry::MigrateConsumerGroupStream { .. } => {
+            // no-op: topics and consumer groups are Event Plane delivery
+            // identities and never enter a query plan.
         }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.

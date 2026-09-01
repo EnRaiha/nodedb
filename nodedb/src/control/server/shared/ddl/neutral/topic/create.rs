@@ -2,14 +2,10 @@
 
 //! Protocol-neutral `CREATE TOPIC` DDL handler.
 //!
-//! Ported from the pgwire `ddl::topic::create` handler. The tenant-admin gate,
-//! the duplicate-topic check, the optional `WITH (RETENTION = '…')` parse, the
-//! `TopicDef` build, the durable insert-if-absent catalog write +
-//! `ep_topic_registry` registration path (NOT `propose_and_apply` — this
-//! family writes the catalog directly), and the `audit_record` call are
-//! preserved; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The definition is replicated: the row and the `EpTopicRegistry` install
+//! both land on every node, so a topic created here is publishable cluster
+//! wide. The registry is the duplicate authority, and it is rebuilt from the
+//! catalog at boot.
 //!
 //! Syntax: `CREATE TOPIC <name> [WITH (RETENTION = '1 hour')]`
 
@@ -85,11 +81,10 @@ pub async fn create_topic(
         last_lsn: 0,
     };
 
-    let catalog = state.credentials.catalog();
-
-    if !catalog
-        .create_ep_topic(&def)
-        .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?
+    if state
+        .ep_topic_registry
+        .get(database_id, tenant_id, &name)
+        .is_some()
     {
         return Err(DdlError::new(
             "42710",
@@ -97,7 +92,7 @@ pub async fn create_topic(
         ));
     }
 
-    state.ep_topic_registry.register(def);
+    super::replicate::propose_create(state, &def)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

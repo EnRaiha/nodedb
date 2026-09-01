@@ -54,6 +54,14 @@ impl SystemCatalog {
     /// cannot both observe success.
     pub fn create_ep_topic(&self, def: &TopicDef) -> crate::Result<bool> {
         validate_topic_name(&def.name).map_err(|error| catalog_err("create topic", error))?;
+        self.create_ep_topic_unchecked(def)
+    }
+
+    /// Insert a topic definition without re-checking its name.
+    ///
+    /// Replicated apply uses this: the leader validated before proposing, so a
+    /// rejection here would diverge this node from the accepted entry.
+    pub fn create_ep_topic_unchecked(&self, def: &TopicDef) -> crate::Result<bool> {
         let key = topic_key(def.database_id, def.tenant_id, &def.name);
         let write_txn = self
             .db
@@ -266,6 +274,19 @@ impl SystemCatalog {
         name: &str,
     ) -> crate::Result<bool> {
         validate_topic_name(name).map_err(|error| catalog_err("delete topic", error))?;
+        self.delete_ep_topic_with_consumer_groups_unchecked(database_id, tenant_id, name)
+    }
+
+    /// Delete a topic and its groups without re-checking the topic name.
+    ///
+    /// Replicated apply uses this: the name was validated before the entry was
+    /// proposed, and a rejection here would leave the row on this node alone.
+    pub fn delete_ep_topic_with_consumer_groups_unchecked(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
         let write_txn = self
             .db
             .begin_write()

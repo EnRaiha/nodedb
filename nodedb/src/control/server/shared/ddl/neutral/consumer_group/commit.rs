@@ -71,7 +71,6 @@ fn migrate_legacy_group(
         group_name,
     )
     .map(|_| ())
-    .map_err(|error| DdlError::new("XX000", format!("consumer-group migration: {error}")))
 }
 
 /// Handle `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`.

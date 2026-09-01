@@ -2,13 +2,10 @@
 
 //! Protocol-neutral `CREATE CONSUMER GROUP` DDL handler.
 //!
-//! Ported from the pgwire `ddl::consumer_group::create` handler. The stream /
-//! topic existence check, the duplicate-group check, the `ConsumerGroupDef`
-//! build, the durable insert-if-absent catalog write + `group_registry.register`
-//! path (NOT `propose_and_apply` — this family writes the catalog directly), and
-//! the `audit_record` call are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! The definition is replicated: the row and the `GroupRegistry` install both
+//! land on every node, so a group created here resolves cluster wide. The
+//! registry is the duplicate authority, and it is rebuilt from the catalog at
+//! boot.
 //!
 //! Syntax: `CREATE CONSUMER GROUP <name> ON <stream>`
 
@@ -80,16 +77,22 @@ pub async fn create_consumer_group(
         None => None,
     };
 
-    if let Err(error) = super::identity::migrate_legacy_topic_group(
+    super::identity::migrate_legacy_topic_group(
         state,
         database_id,
         tenant_id,
         &stream_name,
         &group_name,
-    ) {
+    )?;
+
+    if state
+        .group_registry
+        .get(database_id, tenant_id, &stream_name, &group_name)
+        .is_some()
+    {
         return Err(DdlError::new(
-            "XX000",
-            format!("consumer-group migration: {error}"),
+            "42710",
+            format!("consumer group '{group_name}' already exists on stream '{stream_name}'"),
         ));
     }
 
@@ -107,19 +110,7 @@ pub async fn create_consumer_group(
         created_at: now,
     };
 
-    let catalog = state.credentials.catalog();
-
-    let inserted = catalog
-        .put_consumer_group_if_absent(&def)
-        .map_err(|e| DdlError::new("XX000", format!("catalog write: {e}")))?;
-    if !inserted {
-        return Err(DdlError::new(
-            "42710",
-            format!("consumer group '{group_name}' already exists on stream '{stream_name}'"),
-        ));
-    }
-
-    state.group_registry.register(def);
+    super::replicate::propose_create(state, &def)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

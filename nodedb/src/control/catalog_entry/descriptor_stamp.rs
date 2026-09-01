@@ -261,6 +261,11 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRetentionPolicy { .. }
         | CatalogEntry::PutAlertRule(_)
         | CatalogEntry::DeleteAlertRule { .. }
+        | CatalogEntry::CreateTopicIfAbsent(_)
+        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
+        | CatalogEntry::PutConsumerGroupIfAbsent(_)
+        | CatalogEntry::DeleteConsumerGroup { .. }
+        | CatalogEntry::MigrateConsumerGroupStream { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }

@@ -251,6 +251,16 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         // StoredOwner row, so there is no orphan pair to verify.
         CatalogEntry::PutAlertRule(_) => VariantClass::Exempt,
         CatalogEntry::DeleteAlertRule { .. } => VariantClass::Exempt,
+        // Topics and consumer groups are Event Plane delivery identities kept
+        // in `_system.topics_ep`, `_system.topic_messages`, and
+        // `_system.consumer_groups`. The apply path writes no StoredOwner row,
+        // and the verifier walks none of those tables, so there is no orphan
+        // pair to report.
+        CatalogEntry::CreateTopicIfAbsent(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteTopicWithConsumerGroups { .. } => VariantClass::Exempt,
+        CatalogEntry::PutConsumerGroupIfAbsent(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteConsumerGroup { .. } => VariantClass::Exempt,
+        CatalogEntry::MigrateConsumerGroupStream { .. } => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.

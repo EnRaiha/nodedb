@@ -137,3 +137,49 @@ impl DomainContext for CollectionPurgeRowMissing<'_> {
         })
     }
 }
+
+/// Consumer-group offsets that a replicated topic or group deletion could not
+/// clear on this node, so a recreated stream resumes from a stale cursor.
+pub(in crate::diag) struct ConsumerGroupOffsetsRetained<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    /// Stream the group consumed.
+    pub stream: &'a str,
+    /// Group whose cursors survived.
+    pub group: &'a str,
+    /// Offset-store call that failed (`delete_group`, `migrate_group_stream`).
+    pub operation: &'a str,
+    /// What failed, without the per-occurrence detail.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for ConsumerGroupOffsetsRetained<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.consumer_group_offsets_retained"
+    }
+
+    fn grouping_key(&self) -> String {
+        // Operation + error class name the bug; the ids are the occurrence.
+        format!("op={};cause={}", self.operation, self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "stream": self.stream,
+            "group": self.group,
+            "operation": self.operation,
+            "error_class": self.error_class,
+            "why_fatal": "the offset store is node-local durable state that the catalog \
+                          entry cannot carry. A cursor left behind on this node alone \
+                          survives DROP, so recreating the stream or topic makes this \
+                          node resume mid-history and silently skip events every other \
+                          node delivers",
+            "operator_action": "inspect the offset database on this node for the named \
+                                 stream and group, and delete the group again once the \
+                                 underlying I/O failure clears. A recreated stream must \
+                                 not be consumed from this node until then",
+        })
+    }
+}

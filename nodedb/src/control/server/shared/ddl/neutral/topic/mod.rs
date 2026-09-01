@@ -5,6 +5,7 @@
 pub mod create;
 pub mod drop;
 pub mod publish;
+mod replicate;
 pub mod show;
 
 pub use create::create_topic;

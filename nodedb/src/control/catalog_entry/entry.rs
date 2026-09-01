@@ -28,8 +28,10 @@ use crate::control::security::catalog::{
 };
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 use crate::event::alert::types::AlertDef;
+use crate::event::cdc::consumer_group::ConsumerGroupDef;
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
+use crate::event::topic::TopicDef;
 use crate::types::DatabaseId;
 
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -439,5 +441,35 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+    },
+
+    // ── Topic ──────────────────────────────────────────────────────
+    /// Create-only topic row in `_system.topics_ep`. Apply keeps an existing
+    /// definition, so a replay never rewinds its durable high-water marks.
+    CreateTopicIfAbsent(Box<TopicDef>),
+    /// Drops the topic row, its retained messages, and every consumer-group
+    /// row attached to it, in one catalog transaction.
+    DeleteTopicWithConsumerGroups {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
+
+    // ── Consumer group ─────────────────────────────────────────────
+    /// Create-only consumer-group row in `_system.consumer_groups`. The leader
+    /// reports the duplicate; apply stays idempotent under replay.
+    PutConsumerGroupIfAbsent(Box<ConsumerGroupDef>),
+    /// Drops the canonical row, and the legacy unscoped row under DEFAULT.
+    DeleteConsumerGroup {
+        database_id: u64,
+        tenant_id: u64,
+        stream_name: String,
+        name: String,
+    },
+    /// Re-keys a bare-topic group row onto its canonical `topic:<name>` stream.
+    /// `def` carries the legacy record; `legacy_stream` is its bare topic name.
+    MigrateConsumerGroupStream {
+        def: Box<ConsumerGroupDef>,
+        legacy_stream: String,
     },
 }

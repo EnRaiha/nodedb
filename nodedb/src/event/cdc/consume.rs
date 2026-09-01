@@ -107,9 +107,7 @@ pub fn consume_stream(
                 .map_err(|_| ConsumeError::LifecycleBusy)?;
             crate::control::server::shared::ddl::neutral::consumer_group::identity::migrate_legacy_topic_group(
                 state, params.database_id, params.tenant_id, &canonical_stream, params.group_name,
-            ).map_err(|error| ConsumeError::RemoteError(format!(
-                "consumer-group migration failed: {error}"
-            )))?;
+            ).map_err(|error| ConsumeError::RemoteError(error.message))?;
         }
     }
     let params = ConsumeParams {

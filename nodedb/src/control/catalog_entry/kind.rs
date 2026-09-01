@@ -81,6 +81,11 @@ impl CatalogEntry {
             Self::DeleteRetentionPolicy { .. } => "delete_retention_policy",
             Self::PutAlertRule(_) => "put_alert_rule",
             Self::DeleteAlertRule { .. } => "delete_alert_rule",
+            Self::CreateTopicIfAbsent(_) => "create_topic_if_absent",
+            Self::DeleteTopicWithConsumerGroups { .. } => "delete_topic_with_consumer_groups",
+            Self::PutConsumerGroupIfAbsent(_) => "put_consumer_group_if_absent",
+            Self::DeleteConsumerGroup { .. } => "delete_consumer_group",
+            Self::MigrateConsumerGroupStream { .. } => "migrate_consumer_group_stream",
         }
     }
 }

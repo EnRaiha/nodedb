@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
-    alert_rule, api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type,
-    database, function, materialized_view, owner, permission, procedure, quota, redaction,
-    retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
-    streaming_materialized_view, synonym_group, tenant, trigger, user,
+    alert_rule, api_key, auth_user, change_stream, collection, consumer_group,
+    continuous_aggregate, custom_type, database, function, materialized_view, owner, permission,
+    procedure, quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota,
+    sequence, streaming_materialized_view, synonym_group, tenant, topic, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -382,6 +382,30 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             name,
         } => {
             alert_rule::delete(*database_id, *tenant_id, name, shared);
+        }
+        CatalogEntry::CreateTopicIfAbsent(def) => {
+            topic::create_if_absent(def, shared);
+        }
+        CatalogEntry::DeleteTopicWithConsumerGroups {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            topic::delete_with_consumer_groups(*database_id, *tenant_id, name, shared);
+        }
+        CatalogEntry::PutConsumerGroupIfAbsent(def) => {
+            consumer_group::put_if_absent(def, shared);
+        }
+        CatalogEntry::DeleteConsumerGroup {
+            database_id,
+            tenant_id,
+            stream_name,
+            name,
+        } => {
+            consumer_group::delete(*database_id, *tenant_id, stream_name, name, shared);
+        }
+        CatalogEntry::MigrateConsumerGroupStream { def, legacy_stream } => {
+            consumer_group::migrate_stream(def, legacy_stream, shared);
         }
         CatalogEntry::MoveTenantCutover {
             tenant_id,

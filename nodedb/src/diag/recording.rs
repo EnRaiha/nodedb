@@ -447,3 +447,32 @@ pub fn quota_scope_purge_incomplete(
     .with_backtrace()
     .emit();
 }
+
+/// Report consumer-group offsets that a replicated deletion or migration left
+/// behind on this node. Called from the post-apply offset-store arms.
+pub fn consumer_group_offsets_retained(
+    err: &crate::Error,
+    database_id: u64,
+    tenant_id: u64,
+    stream: &str,
+    group: &str,
+    operation: &'static str,
+) {
+    let class = error_class(err);
+    let ctx = context::ConsumerGroupOffsetsRetained {
+        database_id,
+        tenant_id,
+        stream,
+        group,
+        operation,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "post-apply: consumer-group offsets survived a replicated deletion on this node",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

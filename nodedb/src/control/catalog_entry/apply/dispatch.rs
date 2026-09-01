@@ -8,10 +8,11 @@ use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
 use super::{
-    alert_rule, api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type,
-    database, function, index_registry, materialized_view, oidc_provider, owner, permission,
-    procedure, quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota,
-    sequence, streaming_materialized_view, synonym_group, tenant, trigger, user, wal_tombstone,
+    alert_rule, api_key, auth_user, change_stream, collection, consumer_group,
+    continuous_aggregate, custom_type, database, function, index_registry, materialized_view,
+    oidc_provider, owner, permission, procedure, quota, redaction, retention_policy, rls, role,
+    schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
+    tenant, topic, trigger, user, wal_tombstone,
 };
 
 /// Apply `entry` to `catalog`.
@@ -271,6 +272,22 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             tenant_id,
             name,
         } => alert_rule::delete(*database_id, *tenant_id, name, catalog),
+        CatalogEntry::CreateTopicIfAbsent(def) => topic::create_if_absent(def, catalog),
+        CatalogEntry::DeleteTopicWithConsumerGroups {
+            database_id,
+            tenant_id,
+            name,
+        } => topic::delete_with_consumer_groups(*database_id, *tenant_id, name, catalog),
+        CatalogEntry::PutConsumerGroupIfAbsent(def) => consumer_group::put_if_absent(def, catalog),
+        CatalogEntry::DeleteConsumerGroup {
+            database_id,
+            tenant_id,
+            stream_name,
+            name,
+        } => consumer_group::delete(*database_id, *tenant_id, stream_name, name, catalog),
+        CatalogEntry::MigrateConsumerGroupStream { def, legacy_stream } => {
+            consumer_group::migrate_stream(def, legacy_stream, catalog)
+        }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

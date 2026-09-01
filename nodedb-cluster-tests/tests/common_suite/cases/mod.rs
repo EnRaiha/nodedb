@@ -93,4 +93,5 @@ mod sync_delta_reject_unique_violation;
 mod sync_failover;
 mod sync_peer_id_collision;
 mod sync_retryable_delta_refusal;
+mod topic_consumer_group_cross_node;
 mod write_admission_concurrent_same_key_replay;

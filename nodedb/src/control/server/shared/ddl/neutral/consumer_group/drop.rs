@@ -2,14 +2,9 @@
 
 //! Protocol-neutral `DROP CONSUMER GROUP` DDL handler.
 //!
-//! Ported from the pgwire `ddl::consumer_group::drop` handler. The token-based
-//! syntax check, the direct `catalog.delete_consumer_group` path (NOT a
-//! `propose_catalog_entry` proposal — this family writes the catalog directly),
-//! the `group_registry.unregister`, the best-effort `offset_store.delete_group`
-//! (warn-and-continue, preserved verbatim as the pre-existing behavior), and the
-//! `audit_record` call are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! The removal is replicated: the row, the `GroupRegistry` entry, and the
+//! node-local committed offsets are dropped on every node. The registry is the
+//! existence authority, and it is rebuilt from the catalog at boot.
 //!
 //! Syntax: `DROP CONSUMER GROUP <name> ON <stream>`
 
@@ -66,47 +61,28 @@ pub async fn drop_consumer_group(
         Some(lock) => Some(lock.lock_owned().await),
         None => None,
     };
-    if let Err(error) = super::identity::migrate_legacy_topic_group(
+    super::identity::migrate_legacy_topic_group(
         state,
         database_id,
         tenant_id,
         &stream_name,
         &group_name,
-    ) {
-        return Err(DdlError::new(
-            "XX000",
-            format!("consumer-group migration: {error}"),
-        ));
-    }
+    )?;
 
-    let catalog = state.credentials.catalog();
-
-    let existed = catalog
-        .delete_consumer_group(database_id, tenant_id, &stream_name, &group_name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
-
-    if !existed {
+    if state
+        .group_registry
+        .get(database_id, tenant_id, &stream_name, &group_name)
+        .is_none()
+    {
         return Err(DdlError::new(
             "42704",
             format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
         ));
     }
 
-    state
-        .group_registry
-        .unregister(database_id, tenant_id, &stream_name, &group_name);
-
-    // Delete committed offsets for this group.
-    if let Err(e) =
-        state
-            .offset_store
-            .delete_group(database_id, tenant_id, &stream_name, &group_name)
-    {
-        tracing::warn!(
-            error = %e,
-            "failed to delete offsets for consumer group {group_name}"
-        );
-    }
+    // The entry carries the registry teardown and the committed-offset delete
+    // to every node; the offset store is node-local and no entry can hold it.
+    super::replicate::propose_delete(state, database_id, tenant_id, &stream_name, &group_name)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

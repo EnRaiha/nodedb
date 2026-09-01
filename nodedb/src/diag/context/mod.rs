@@ -15,7 +15,8 @@ mod retention;
 mod write_path;
 
 pub(in crate::diag) use catalog::{
-    CatalogApplyOrphanRow, CollectionPurgeRowMissing, MetadataApplyWedged,
+    CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
+    MetadataApplyWedged,
 };
 pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{CalvinCompletionTimeout, DataPlaneResponseLost};

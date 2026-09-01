@@ -3,8 +3,9 @@
 //! Protocol-neutral `DROP TOPIC` DDL handler.
 //!
 //! The topic mutation lock serializes durable deletion with publication. Offset
-//! cleanup commits first in its separate database; then one catalog transaction
-//! removes the definition, messages, and both consumer-group identities.
+//! cleanup commits first in its separate database; then one replicated entry
+//! removes the definition, messages, and both consumer-group identities on
+//! every node.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -34,6 +35,17 @@ pub async fn drop_topic(
         .ep_topic_registry
         .lifecycle_lock(database_id, tenant_id, &name);
     let _guard = lifecycle_lock.lock().await;
+
+    if state
+        .ep_topic_registry
+        .get(database_id, tenant_id, &name)
+        .is_none()
+    {
+        return Err(DdlError::new(
+            "42704",
+            format!("topic '{name}' does not exist"),
+        ));
+    }
 
     let catalog = state.credentials.catalog();
     let buffer_key = format!("topic:{name}");
@@ -97,30 +109,9 @@ pub async fn drop_topic(
         })?;
 
     // Definition, retained messages, and both consumer-group identities share
-    // one catalog transaction. There is no best-effort path after this point.
-    let existed = catalog
-        .delete_ep_topic_with_consumer_groups(database_id, tenant_id, &name)
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))?;
-    if !existed {
-        return Err(DdlError::new(
-            "42704",
-            format!("topic '{name}' does not exist"),
-        ));
-    }
-
-    state
-        .ep_topic_registry
-        .unregister(database_id, tenant_id, &name);
-    state
-        .cdc_router
-        .remove_buffer(database_id, tenant_id, &buffer_key);
-    for group_name in &group_names {
-        for stream in [&buffer_key, &name] {
-            state
-                .group_registry
-                .unregister(database_id, tenant_id, stream, group_name);
-        }
-    }
+    // one catalog transaction, and the registry teardown rides the same entry
+    // to every node. There is no best-effort path after this point.
+    super::replicate::propose_delete(state, database_id, tenant_id, &name)?;
     drop(group_guards);
 
     state.audit_record(

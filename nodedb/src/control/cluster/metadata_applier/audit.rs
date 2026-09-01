@@ -308,6 +308,46 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::CreateTopicIfAbsent(t) => (
+            format!("topic:{}:{}:{}", t.database_id, t.tenant_id, t.name),
+            0,
+            String::new(),
+        ),
+        E::DeleteTopicWithConsumerGroups {
+            database_id,
+            tenant_id,
+            name,
+        } => (
+            format!("topic:{database_id}:{tenant_id}:{name}"),
+            0,
+            String::new(),
+        ),
+        E::PutConsumerGroupIfAbsent(g) => (
+            format!(
+                "consumer_group:{}:{}:{}:{}",
+                g.database_id, g.tenant_id, g.stream_name, g.name
+            ),
+            0,
+            String::new(),
+        ),
+        E::DeleteConsumerGroup {
+            database_id,
+            tenant_id,
+            stream_name,
+            name,
+        } => (
+            format!("consumer_group:{database_id}:{tenant_id}:{stream_name}:{name}"),
+            0,
+            String::new(),
+        ),
+        E::MigrateConsumerGroupStream { def, legacy_stream } => (
+            format!(
+                "consumer_group:{}:{}:{legacy_stream}:{}",
+                def.database_id, def.tenant_id, def.name
+            ),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

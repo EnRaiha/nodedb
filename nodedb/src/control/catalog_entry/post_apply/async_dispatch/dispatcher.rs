@@ -231,6 +231,12 @@ pub fn spawn_post_apply_async_side_effects(
         // Registry install happens in `sync.rs`.
         | CatalogEntry::PutAlertRule(_)
         | CatalogEntry::DeleteAlertRule { .. }
+        // Registry, CDC buffer, and offset teardown all happen in `sync.rs`.
+        | CatalogEntry::CreateTopicIfAbsent(_)
+        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
+        | CatalogEntry::PutConsumerGroupIfAbsent(_)
+        | CatalogEntry::DeleteConsumerGroup { .. }
+        | CatalogEntry::MigrateConsumerGroupStream { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;
