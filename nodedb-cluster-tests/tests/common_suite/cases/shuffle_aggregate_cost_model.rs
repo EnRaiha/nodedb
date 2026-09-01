@@ -17,11 +17,10 @@
 //! captured before any threshold is set). A regression in either path is
 //! distinguishable.
 //!
-//! IMPORTANT: column statistics are written to the *local* catalog of the node
-//! that runs ANALYZE — they are NOT Raft-replicated like collection DDL. The
-//! cost model reads stats from the local catalog of whichever node *plans* the
-//! aggregate. So ANALYZE and the auto-shuffle query MUST run on the SAME node
-//! for the stats-driven decision to be deterministic. We pin both to node 0.
+//! ANALYZE proposes its column statistics through the metadata raft group, so
+//! every node persists them. The cost model reads them from the local catalog
+//! of whichever node plans the aggregate. This test pins ANALYZE and the
+//! auto-shuffle query to node 0 so the decision needs no replication wait.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -142,8 +141,8 @@ async fn cost_model_auto_selects_shuffle_aggregate_from_analyze_stats() {
     // The accepted form is `ANALYZE <collection>` (the maintenance handler splits
     // on whitespace and reads the second token). This computes and persists
     // per-column stats — crucially `distinct_count` for `k` and `row_count` > 0.
-    // Pin ANALYZE and the subsequent query to node 0 because column stats are
-    // local-catalog only (not Raft-replicated).
+    // Pin ANALYZE and the subsequent query to node 0 so the plan reads the
+    // statistics without waiting for their replication.
     let analyze_node = &cluster.nodes[0];
     analyze_node
         .client

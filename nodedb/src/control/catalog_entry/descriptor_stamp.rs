@@ -272,6 +272,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::PutVectorModel(_)
         | CatalogEntry::PutVectorIndexParams(_)
         | CatalogEntry::DeleteVectorIndexParams { .. }
+        | CatalogEntry::PutColumnStats(_)
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }

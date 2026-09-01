@@ -12,6 +12,7 @@ pub mod auth_user;
 pub mod change_stream;
 pub mod checkpoint;
 pub mod collection;
+pub mod column_stats;
 pub mod consumer_group;
 pub mod continuous_aggregate;
 pub mod custom_type;

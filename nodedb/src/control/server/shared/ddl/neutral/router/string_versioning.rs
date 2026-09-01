@@ -86,15 +86,25 @@ pub(super) async fn try_string(
     // guard above, preserving that `COMPACT HISTORY ON …` routes to
     // version_history exactly as the pgwire dispatch (neutral-first) did.
     if upper.starts_with("ANALYZE ") {
-        return Some(maintenance::handle_analyze(state, identity, sql).await);
+        return Some(maintenance::handle_analyze(state, identity, sql, database_id).await);
     }
     if upper.starts_with("COMPACT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(maintenance::handle_compact(state, identity, &parts));
+        return Some(maintenance::handle_compact(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
     }
     if upper.starts_with("SHOW STORAGE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(maintenance::handle_show_storage(state, identity, &parts));
+        return Some(maintenance::handle_show_storage(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
     }
     if upper == "SHOW COMPACTION STATUS" || upper.starts_with("SHOW COMPACTION STATUS ") {
         return Some(maintenance::handle_show_compaction_status(state, identity));

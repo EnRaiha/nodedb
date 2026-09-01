@@ -13,6 +13,7 @@
 //! accepted. Variants appended at the end of the enum stay there to keep
 //! MessagePack discriminants stable across rolling upgrades.
 
+use crate::control::security::catalog::column_stats::StoredColumnStats;
 use crate::control::security::catalog::types::CheckpointRecord;
 use crate::control::security::catalog::{
     StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
@@ -512,4 +513,12 @@ pub enum CatalogEntry {
         collection: String,
         field_name: String,
     },
+
+    // ── Column statistics ──────────────────────────────────────────
+    /// Statistics rows in `_system.column_stats` for one collection, keyed by
+    /// `(database_id, tenant_id, collection, column)`. ANALYZE scans every
+    /// vShard, so the numbers describe the whole collection and every node
+    /// plans from the same figures. One entry carries every column so a
+    /// planner never sees a subset and costs against it.
+    PutColumnStats(Box<Vec<StoredColumnStats>>),
 }

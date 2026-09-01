@@ -9,6 +9,8 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::security::catalog::column_stats::StoredColumnStats;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
@@ -19,11 +21,16 @@ use super::support::ddl_err;
 /// Handle `ANALYZE collection [(col1, col2)]`.
 ///
 /// Scans the collection via the Data Plane, computes per-column statistics
-/// using SIMD-accelerated kernels, and stores them in the system catalog.
+/// using SIMD-accelerated kernels, and replicates them as one catalog entry.
+///
+/// The scan reaches every vShard leader, so the numbers describe the whole
+/// collection. The planner runs on whichever node received the query. The
+/// rows go through the metadata raft group, so every node costs alike.
 pub async fn handle_analyze(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -38,7 +45,7 @@ pub async fn handle_analyze(
     let catalog = state.credentials.catalog();
 
     let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
+        .get_collection(database_id, tenant_id, &collection)
         .map_err(|e| ddl_err("XX000", format!("catalog error: {e}")))?
         .ok_or_else(|| {
             ddl_err(
@@ -60,7 +67,7 @@ pub async fn handle_analyze(
             state,
             identity,
             &scan_sql,
-            DatabaseId::DEFAULT,
+            database_id,
         )
         .await?;
     let mut rows = Vec::new();
@@ -83,33 +90,39 @@ pub async fn handle_analyze(
         .map_err(|error| ddl_err("XX000", format!("ANALYZE scan failed: {error}")))?;
         if !resp.payload.is_empty() {
             let json = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            rows.push(json);
+            push_scan_rows(&json, &mut rows);
         }
     }
 
     let now = now_ms();
 
-    if !columns_to_analyze.is_empty() && !rows.is_empty() {
+    // One vector carries every column, so a planner reads the whole set or
+    // none of it.
+    let stats_rows: Vec<StoredColumnStats> = if !columns_to_analyze.is_empty() && !rows.is_empty() {
         // Use stats_collector to compute real statistics via SIMD kernels.
-        let computed = super::stats_collector::collect_stats_from_json_rows(
+        super::stats_collector::collect_stats_from_json_rows(
+            database_id.as_u64(),
             tenant_id,
             &collection,
             &columns_to_analyze,
             &rows,
             now,
-        );
-        for stats in &computed {
-            catalog
-                .put_column_stats(stats)
-                .map_err(|e| ddl_err("XX000", format!("failed to store column stats: {e}")))?;
-        }
+        )
     } else {
-        // No rows or no fields — store metadata-only stats.
-        for col_name in &columns_to_analyze {
-            let stats = crate::control::security::catalog::column_stats::StoredColumnStats {
+        // No rows or no fields — store metadata-only stats. An empty column
+        // list still records the collection's row count under `*`.
+        let metadata_columns: Vec<String> = if columns_to_analyze.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            columns_to_analyze.clone()
+        };
+        metadata_columns
+            .into_iter()
+            .map(|column| StoredColumnStats {
+                database_id: database_id.as_u64(),
                 tenant_id,
                 collection: collection.clone(),
-                column: col_name.clone(),
+                column,
                 row_count: rows.len() as u64,
                 null_count: 0,
                 distinct_count: 0,
@@ -117,27 +130,21 @@ pub async fn handle_analyze(
                 max_value: None,
                 avg_value_len: None,
                 analyzed_at: now,
-            };
-            let _ = catalog.put_column_stats(&stats);
-        }
-        if columns_to_analyze.is_empty() {
-            let stats = crate::control::security::catalog::column_stats::StoredColumnStats {
-                tenant_id,
-                collection: collection.clone(),
-                column: "*".to_string(),
-                row_count: rows.len() as u64,
-                null_count: 0,
-                distinct_count: 0,
-                min_value: None,
-                max_value: None,
-                avg_value_len: None,
-                analyzed_at: now,
-            };
-            let _ = catalog.put_column_stats(&stats);
-        }
-    }
+            })
+            .collect()
+    };
 
-    state.dml_counter.reset(tenant_id, &collection);
+    let local_rows = stats_rows.clone();
+    let entry = CatalogEntry::PutColumnStats(Box::new(stats_rows));
+    super::super::replicate::propose_and_apply(state, &entry, || {
+        catalog
+            .put_column_stats_batch(&local_rows)
+            .map_err(|e| ddl_err("XX000", format!("failed to store column stats: {e}")))
+    })?;
+
+    state
+        .dml_counter
+        .reset(database_id.as_u64(), tenant_id, &collection);
 
     tracing::info!(
         %collection,
@@ -149,6 +156,29 @@ pub async fn handle_analyze(
         command: "ANALYZE".to_string(),
         rows_affected: None,
     }])
+}
+
+/// Split one task's scan payload into per-row JSON objects.
+///
+/// A task answers a scan with a JSON array of rows. The statistics
+/// collector counts one entry per row. It reads each column out of a row
+/// object, so an array must arrive flattened. A payload that is not an
+/// array carries a single row and passes through whole.
+fn push_scan_rows(payload: &str, rows: &mut Vec<String>) {
+    match sonic_rs::from_str::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::Array(items)) => {
+            for item in items {
+                match sonic_rs::to_string(&item) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "skipping an ANALYZE scan row that will not re-encode"
+                    ),
+                }
+            }
+        }
+        _ => rows.push(payload.to_string()),
+    }
 }
 
 /// Parse optional `(col1, col2)` column list from ANALYZE statement.

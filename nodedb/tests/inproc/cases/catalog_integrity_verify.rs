@@ -278,6 +278,10 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutVectorModel(_) => VariantClass::Exempt,
         CatalogEntry::PutVectorIndexParams(_) => VariantClass::Exempt,
         CatalogEntry::DeleteVectorIndexParams { .. } => VariantClass::Exempt,
+        // ANALYZE statistics are optimizer hints on a collection's columns,
+        // keyed by (database_id, tenant_id, collection, column). The apply
+        // path writes no StoredOwner row and there is no orphan pair.
+        CatalogEntry::PutColumnStats(_) => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.

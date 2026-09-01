@@ -331,6 +331,14 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // no-op: vector build parameters are read by the Data Plane index,
             // never by a cached plan.
         }
+        CatalogEntry::PutColumnStats(rows) => {
+            // The join and aggregate cost models read these rows, so a cached
+            // plan carries the previous figures. Version 0 evicts every plan
+            // over the collection.
+            if let Some(first) = rows.first() {
+                inv.invalidate(&first.collection, 0);
+            }
+        }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
             // This forces re-planning on the next query touching those collections.

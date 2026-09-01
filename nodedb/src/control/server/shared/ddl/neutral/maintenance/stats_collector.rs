@@ -17,6 +17,7 @@ use sonic_rs;
 /// aggregate statistics. For numeric columns, delegates to SIMD
 /// kernels for min/max/sum computation.
 pub fn collect_stats_from_json_rows(
+    database_id: u64,
     tenant_id: u64,
     collection: &str,
     columns: &[String],
@@ -81,6 +82,7 @@ pub fn collect_stats_from_json_rows(
         };
 
         results.push(StoredColumnStats {
+            database_id,
             tenant_id,
             collection: collection.to_string(),
             column: col_name.clone(),
@@ -104,16 +106,35 @@ enum FieldValue {
     Text(String),
 }
 
+/// The map holding one scan row's user columns.
+///
+/// A document scan row is the two-key map `{"id": …, "data": {…}}`, and its
+/// `data` member holds the columns. Every other row is the column map itself.
+fn row_columns(row: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let map = row.as_object()?;
+    let wrapped = map.len() == 2 && map.contains_key("id");
+    if wrapped && let Some(serde_json::Value::Object(data)) = map.get("data") {
+        return Some(data);
+    }
+    Some(map)
+}
+
 /// Extract a field value from a JSON row string.
+///
+/// A scan row arrives in one of two shapes. A document scan wraps each row as
+/// `{"id": "<doc_id>", "data": {…}}`, and the user's columns live under `data`.
+/// A columnar, KV, spatial, or aggregate scan emits the column map directly.
+/// Reading the wrapper as the column map finds no column and scores every
+/// row null. The wrapper is unwrapped first.
 fn extract_field_from_json(json_str: &str, field_name: &str) -> FieldValue {
     let parsed: Result<serde_json::Value, _> = sonic_rs::from_str(json_str);
     let Ok(obj) = parsed else {
         return FieldValue::Null;
     };
 
-    let val = match &obj {
-        serde_json::Value::Object(map) => map.get(field_name),
-        _ => None,
+    let val = match row_columns(&obj) {
+        Some(map) => map.get(field_name),
+        None => None,
     };
 
     match val {
@@ -142,7 +163,7 @@ mod tests {
         let rows: Vec<String> = (0..100)
             .map(|i| format!("{{\"id\": {i}, \"value\": {:.2}}}", i as f64 * 1.5))
             .collect();
-        let stats = collect_stats_from_json_rows(1, "test", &["id".into()], &rows, 0);
+        let stats = collect_stats_from_json_rows(9, 1, "test", &["id".into()], &rows, 0);
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].row_count, 100);
         assert_eq!(stats[0].null_count, 0);
@@ -158,8 +179,49 @@ mod tests {
             r#"{"name": null}"#.to_string(),
             r#"{"other": 1}"#.to_string(),
         ];
-        let stats = collect_stats_from_json_rows(1, "t", &["name".into()], &rows, 0);
+        let stats = collect_stats_from_json_rows(9, 1, "t", &["name".into()], &rows, 0);
         assert_eq!(stats[0].null_count, 2); // null + missing field
         assert_eq!(stats[0].distinct_count, 1);
+    }
+
+    #[test]
+    fn collect_reads_columns_under_the_document_scan_wrapper() {
+        let rows: Vec<String> = (0..12)
+            .map(|i| format!(r#"{{"id":"{i:08}","data":{{"k":"k{i}","v":{}}}}}"#, i * 10))
+            .collect();
+
+        let stats = collect_stats_from_json_rows(9, 1, "t", &["k".into(), "v".into()], &rows, 0);
+
+        let k = stats.iter().find(|s| s.column == "k").expect("column k");
+        assert_eq!(k.null_count, 0, "every wrapped row carries a k value");
+        assert_eq!(k.distinct_count, 12);
+        assert_eq!(k.min_value, Some("k0".to_string()));
+
+        let v = stats.iter().find(|s| s.column == "v").expect("column v");
+        assert_eq!(v.min_value, Some("0".to_string()));
+        assert_eq!(v.max_value, Some("110".to_string()));
+    }
+
+    #[test]
+    fn the_wrapper_id_never_masks_the_user_column() {
+        let rows = vec![r#"{"id":"00000001","data":{"id":"r0","v":1}}"#.to_string()];
+
+        let stats = collect_stats_from_json_rows(9, 1, "t", &["id".into()], &rows, 0);
+
+        assert_eq!(
+            stats[0].min_value,
+            Some("r0".to_string()),
+            "the column named id is the row's own id, not the surrogate doc id",
+        );
+    }
+
+    #[test]
+    fn a_two_key_row_without_a_data_object_stays_the_column_map() {
+        let rows = vec![r#"{"id":7,"data":"not-an-object"}"#.to_string()];
+
+        let stats = collect_stats_from_json_rows(9, 1, "t", &["data".into()], &rows, 0);
+
+        assert_eq!(stats[0].null_count, 0);
+        assert_eq!(stats[0].min_value, Some("not-an-object".to_string()));
     }
 }

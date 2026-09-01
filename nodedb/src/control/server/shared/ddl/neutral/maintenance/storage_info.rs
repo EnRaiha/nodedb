@@ -24,6 +24,7 @@ pub fn handle_show_storage(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // SHOW STORAGE FOR collection
     let collection = parts
@@ -37,7 +38,7 @@ pub fn handle_show_storage(
     if state
         .credentials
         .catalog()
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
+        .get_collection(database_id, tenant_id, &collection)
         .ok()
         .flatten()
         .is_none()
@@ -52,7 +53,7 @@ pub fn handle_show_storage(
     let stats = state
         .credentials
         .catalog()
-        .load_column_stats(tenant_id, &collection)
+        .load_column_stats(database_id.as_u64(), tenant_id, &collection)
         .ok()
         .unwrap_or_default();
 

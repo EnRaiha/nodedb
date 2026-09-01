@@ -75,8 +75,7 @@ pub(super) fn cost_model_picks_aggregate_shuffle(
 /// ```
 ///
 /// `row_count` is identical across a collection's columns (it is the table's
-/// row count at ANALYZE time), so any column's value is representative; we take
-/// the maximum to be robust against partially-written stat rows.
+/// row count at ANALYZE time), so the maximum equals any column's value.
 fn estimated_group_cardinality(
     ctx: &ConvertContext,
     collection: &str,
@@ -85,7 +84,7 @@ fn estimated_group_cardinality(
     let credentials = ctx.credentials.as_ref()?;
     let catalog = credentials.catalog();
     let stats = catalog
-        .load_column_stats(ctx.tenant_id.as_u64(), collection)
+        .load_column_stats(ctx.database_id.as_u64(), ctx.tenant_id.as_u64(), collection)
         .ok()?;
     if stats.is_empty() {
         return None;

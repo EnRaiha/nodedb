@@ -19,10 +19,12 @@ use std::sync::Mutex;
 /// mutation volume per collection. Checked periodically or on-demand
 /// to decide whether to re-ANALYZE.
 pub struct DmlCounter {
-    /// `(tenant_id, collection)` → mutation count since last ANALYZE.
+    /// `(database_id, tenant_id, collection)` → mutation count since last
+    /// ANALYZE. The database scopes the key, so two databases holding a
+    /// same-named collection count apart.
     /// Uses Mutex + HashMap (not RwLock) because `record_dml` always
     /// needs write access to insert new entries via the entry API.
-    counts: Mutex<HashMap<(u64, String), u64>>,
+    counts: Mutex<HashMap<(u64, u64, String), u64>>,
 }
 
 impl DmlCounter {
@@ -36,28 +38,35 @@ impl DmlCounter {
     ///
     /// Called after each successful INSERT/UPDATE/DELETE dispatch.
     /// Uses the entry API to atomically insert-or-increment (no TOCTOU).
-    pub fn record_dml(&self, tenant_id: u64, collection: &str) {
+    pub fn record_dml(&self, database_id: u64, tenant_id: u64, collection: &str) {
         let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        *map.entry((tenant_id, collection.to_string())).or_insert(0) += 1;
+        *map.entry((database_id, tenant_id, collection.to_string()))
+            .or_insert(0) += 1;
     }
 
     /// Check if a collection has exceeded the auto-ANALYZE threshold.
     ///
     /// Returns `true` if the DML count since last ANALYZE exceeds
     /// `max(last_row_count * 0.10, 1000)`.
-    pub fn should_analyze(&self, tenant_id: u64, collection: &str, last_row_count: u64) -> bool {
+    pub fn should_analyze(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        last_row_count: u64,
+    ) -> bool {
         let threshold = (last_row_count / 10).max(1000);
         let map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&(tenant_id, collection.to_string()))
+        map.get(&(database_id, tenant_id, collection.to_string()))
             .copied()
             .unwrap_or(0)
             >= threshold
     }
 
     /// Reset the DML count for a collection (called after ANALYZE completes).
-    pub fn reset(&self, tenant_id: u64, collection: &str) {
+    pub fn reset(&self, database_id: u64, tenant_id: u64, collection: &str) {
         let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(&(tenant_id, collection.to_string()));
+        map.remove(&(database_id, tenant_id, collection.to_string()));
     }
 }
 
@@ -74,38 +83,58 @@ mod tests {
     #[test]
     fn basic_counting() {
         let counter = DmlCounter::new();
-        counter.record_dml(1, "users");
-        counter.record_dml(1, "users");
-        counter.record_dml(1, "users");
-        assert!(!counter.should_analyze(1, "users", 0));
+        counter.record_dml(4, 1, "users");
+        counter.record_dml(4, 1, "users");
+        counter.record_dml(4, 1, "users");
+        assert!(!counter.should_analyze(4, 1, "users", 0));
     }
 
     #[test]
     fn threshold_exceeded() {
         let counter = DmlCounter::new();
         for _ in 0..1001 {
-            counter.record_dml(1, "users");
+            counter.record_dml(4, 1, "users");
         }
-        assert!(counter.should_analyze(1, "users", 0));
+        assert!(counter.should_analyze(4, 1, "users", 0));
     }
 
     #[test]
     fn percentage_threshold() {
         let counter = DmlCounter::new();
         for _ in 0..10_001 {
-            counter.record_dml(1, "big_table");
+            counter.record_dml(4, 1, "big_table");
         }
-        assert!(counter.should_analyze(1, "big_table", 100_000));
+        assert!(counter.should_analyze(4, 1, "big_table", 100_000));
     }
 
     #[test]
     fn reset_clears() {
         let counter = DmlCounter::new();
         for _ in 0..2000 {
-            counter.record_dml(1, "users");
+            counter.record_dml(4, 1, "users");
         }
-        assert!(counter.should_analyze(1, "users", 0));
-        counter.reset(1, "users");
-        assert!(!counter.should_analyze(1, "users", 0));
+        assert!(counter.should_analyze(4, 1, "users", 0));
+        counter.reset(4, 1, "users");
+        assert!(!counter.should_analyze(4, 1, "users", 0));
+    }
+
+    #[test]
+    fn two_databases_count_apart() {
+        let counter = DmlCounter::new();
+        for _ in 0..1001 {
+            counter.record_dml(4, 1, "users");
+        }
+        assert!(counter.should_analyze(4, 1, "users", 0));
+        assert!(
+            !counter.should_analyze(5, 1, "users", 0),
+            "the key is scoped by database, so the sibling collection is untouched"
+        );
+
+        counter.reset(4, 1, "users");
+        for _ in 0..1001 {
+            counter.record_dml(5, 1, "users");
+        }
+        assert!(counter.should_analyze(5, 1, "users", 0));
+        assert!(!counter.should_analyze(4, 1, "users", 0));
     }
 }

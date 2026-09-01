@@ -421,6 +421,10 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // reader goes to the catalog, and the Data Plane takes its copy
             // from the boot seed.
         }
+        CatalogEntry::PutColumnStats(_) => {
+            // no-op: column statistics have no in-memory mirror. The planner
+            // reads them from the catalog, which `apply` already wrote.
+        }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

@@ -8,11 +8,12 @@ use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
 use super::{
-    alert_rule, api_key, auth_user, change_stream, checkpoint, collection, consumer_group,
-    continuous_aggregate, custom_type, database, function, index_registry, materialized_view,
-    oidc_provider, owner, permission, procedure, quota, redaction, retention_policy, rls, role,
-    schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
-    tenant, topic, trigger, user, vector, wal_tombstone,
+    alert_rule, api_key, auth_user, change_stream, checkpoint, collection, column_stats,
+    consumer_group, continuous_aggregate, custom_type, database, function, index_registry,
+    materialized_view, oidc_provider, owner, permission, procedure, quota, redaction,
+    retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
+    streaming_materialized_view, synonym_group, tenant, topic, trigger, user, vector,
+    wal_tombstone,
 };
 
 /// Apply `entry` to `catalog`.
@@ -309,6 +310,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             collection,
             field_name,
         } => vector::delete_params(*database_id, *tenant_id, collection, field_name, catalog),
+        CatalogEntry::PutColumnStats(rows) => column_stats::put_rows(rows, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

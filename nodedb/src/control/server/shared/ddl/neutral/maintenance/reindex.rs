@@ -76,7 +76,12 @@ pub async fn handle_reindex(
         );
     } else {
         // Non-concurrent path: fire-and-forget (same as legacy Checkpoint).
-        super::distributed::dispatch_maintenance_to_all_cores(state, tenant_id, MetaOp::Checkpoint);
+        super::distributed::dispatch_maintenance_to_all_cores(
+            state,
+            tenant_id,
+            database_id,
+            MetaOp::Checkpoint,
+        );
         tracing::info!(%collection, concurrent = false, "REINDEX dispatched");
     }
 

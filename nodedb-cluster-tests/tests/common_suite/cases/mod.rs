@@ -31,6 +31,7 @@ mod cluster_execute_request;
 mod cluster_partition_strategy_replication;
 mod cluster_post_apply_follower_dispatch;
 mod cluster_surrogate_replication;
+mod column_stats_cross_node;
 mod constraint_delivery;
 mod cross_node_pk_lookup;
 mod cross_node_pk_write;

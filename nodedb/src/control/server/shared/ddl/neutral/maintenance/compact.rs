@@ -18,6 +18,7 @@ pub fn handle_compact(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 2 {
         return Err(ddl_err("42601", "COMPACT requires a collection name"));
@@ -30,7 +31,7 @@ pub fn handle_compact(
     if state
         .credentials
         .catalog()
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .ok()
         .flatten()
         .is_none()
@@ -45,6 +46,7 @@ pub fn handle_compact(
     super::distributed::dispatch_maintenance_to_all_cores(
         state,
         tenant_id,
+        database_id,
         nodedb_physical::physical_plan::MetaOp::Compact,
     );
 

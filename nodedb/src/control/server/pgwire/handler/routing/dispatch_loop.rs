@@ -367,9 +367,11 @@ impl NodeDbPgHandler {
                     )))
                 })?;
 
-                self.state
-                    .dml_counter
-                    .record_dml(tenant_id.as_u64(), &info.collection);
+                self.state.dml_counter.record_dml(
+                    task_database_id.as_u64(),
+                    tenant_id.as_u64(),
+                    &info.collection,
+                );
             }
 
             // This task's own row count, for metering below — `None` for the

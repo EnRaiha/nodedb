@@ -16,11 +16,16 @@ use nodedb_physical::physical_plan::MetaOp;
 ///
 /// In single-node: dispatches to core 0 (the only core in most test configs).
 /// In cluster: would dispatch to each shard leader. Currently dispatches locally.
-pub fn dispatch_maintenance_to_all_cores(state: &SharedState, tenant_id: TenantId, op: MetaOp) {
+pub fn dispatch_maintenance_to_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    op: MetaOp,
+) {
     let request = Request {
         request_id: RequestId::new(0),
         tenant_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id,
         vshard_id: VShardId::new(0),
         plan: PhysicalPlan::Meta(op),
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
@@ -108,6 +113,7 @@ mod tests {
     #[test]
     fn merge_two_shards() {
         let a = StoredColumnStats {
+            database_id: 4,
             tenant_id: 1,
             collection: "t".into(),
             column: "c".into(),
@@ -120,6 +126,7 @@ mod tests {
             analyzed_at: 0,
         };
         let b = StoredColumnStats {
+            database_id: 4,
             tenant_id: 1,
             collection: "t".into(),
             column: "c".into(),
