@@ -8,7 +8,7 @@
 //! an unrecognised mode is a decode error the loader can skip and report,
 //! not a variant-index mismatch that shifts every field after it.
 
-#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct StoredScopeQuota {
     /// Scope this quota applies to — the primary key.
     pub scope_name: String,

@@ -9,14 +9,15 @@
 //! SHOW QUOTAS
 //! ```
 //!
-//! `QuotaDefinition` and the usage ledger it is checked against both already
-//! existed; what did not was any way for an operator to create one. Without
-//! this grammar `QuotaManager::define_quota` had no non-test caller, so
-//! `get_status` always answered `None`, the `quota_remaining.*` enrichment
-//! never appeared, and `QuotaEnforcement::Hard` could never refuse anything.
+//! Definitions are replicated catalog state. Each statement proposes a
+//! `CatalogEntry`, so every node writes the row and installs the definition
+//! in its own `QuotaManager`. A cap defined on one node enforces on all.
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::catalog_entry::post_apply::scope_quota as scope_quota_post_apply;
+use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
 use crate::control::server::response_shape::types::ShapedRows;
@@ -109,16 +110,30 @@ pub fn define_quota(
         None => DEFAULT_WARNING_THRESHOLD,
     };
 
-    state
-        .quota_manager
-        .define_quota(QuotaDefinition {
-            scope_name: scope_name.clone(),
-            max_tokens,
-            period_secs,
-            enforcement,
-            warning_threshold,
-        })
-        .map_err(|e| err("XX000", e.to_string()))?;
+    let stored = QuotaDefinition {
+        scope_name: scope_name.clone(),
+        max_tokens,
+        period_secs,
+        enforcement,
+        warning_threshold,
+    }
+    .to_stored();
+
+    // Replicated: every node writes the row and installs the definition in
+    // its `QuotaManager` via post-apply.
+    let outcome = propose_catalog_entry(
+        state,
+        &CatalogEntry::PutScopeQuota(Box::new(stored.clone())),
+    )
+    .map_err(|e| err("XX000", format!("catalog propose failed: {e}")))?;
+    if outcome.needs_local_apply() {
+        state
+            .credentials
+            .catalog()
+            .put_scope_quota(&stored)
+            .map_err(|e| err("XX000", e.to_string()))?;
+        scope_quota_post_apply::put(&stored, state);
+    }
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -151,15 +166,29 @@ pub fn drop_quota(
         .trim_matches('\'')
         .to_string();
 
-    let removed = state
-        .quota_manager
-        .remove_quota(&scope_name)
-        .map_err(|e| err("XX000", e.to_string()))?;
-    if !removed {
+    // Absence is decided on the leader, before the propose: a rejection at
+    // apply time would leave the followers disagreeing with the leader.
+    if !state.quota_manager.has_quota(&scope_name) {
         return Err(err(
             "42704",
             format!("no quota defined on scope '{scope_name}'"),
         ));
+    }
+
+    let outcome = propose_catalog_entry(
+        state,
+        &CatalogEntry::DeleteScopeQuota {
+            scope_name: scope_name.clone(),
+        },
+    )
+    .map_err(|e| err("XX000", format!("catalog propose failed: {e}")))?;
+    if outcome.needs_local_apply() {
+        state
+            .credentials
+            .catalog()
+            .delete_scope_quota(&scope_name)
+            .map_err(|e| err("XX000", e.to_string()))?;
+        scope_quota_post_apply::delete(&scope_name, state);
     }
 
     state.audit_record(

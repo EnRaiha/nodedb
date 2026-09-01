@@ -62,6 +62,7 @@ mod pgwire_gateway_migration;
 mod planner_local_only;
 mod prepared_cache_invalidation;
 mod resp_gateway_migration;
+mod scope_quota_cross_node;
 mod shuffle_aggregate_cost_model;
 mod shuffle_aggregate_cross_node;
 mod shuffle_aggregate_e2e;

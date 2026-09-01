@@ -23,6 +23,7 @@ pub use ingest::IlpFlushOutcome;
 pub use quota::{DATABASE_SCOPE, TENANT_SCOPE};
 pub(in crate::diag) use quota::{
     QuotaRowNotInstalled, QuotaRowWriteFailed, QuotaScopePurgeIncomplete, QuotaScopeReplayAborted,
+    ScopeQuotaNotInstalled,
 };
 pub(in crate::diag) use recovery::ReplayRecordUnapplied;
 pub(in crate::diag) use write_path::{

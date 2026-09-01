@@ -238,6 +238,9 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::DeleteDatabaseQuota { .. } => VariantClass::Exempt,
         CatalogEntry::PutTenantQuota { .. } => VariantClass::Exempt,
         CatalogEntry::DeleteTenantQuota { .. } => VariantClass::Exempt,
+        // Scope token quotas are standalone config rows keyed by scope name.
+        CatalogEntry::PutScopeQuota(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteScopeQuota { .. } => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.

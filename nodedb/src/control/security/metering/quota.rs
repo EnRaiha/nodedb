@@ -195,28 +195,52 @@ impl QuotaManager {
 
     /// Define or update a quota for a scope.
     ///
-    /// Persistence happens first: a definition cached but not stored would
-    /// report a cap the next restart does not have.
+    /// Test-only. The DDL path proposes a `PutScopeQuota` catalog entry
+    /// instead; apply writes redb and post-apply calls
+    /// [`Self::install_replicated_quota`].
+    #[cfg(test)]
     pub fn define_quota(&self, quota: QuotaDefinition) -> crate::Result<()> {
         if let Some(ref catalog) = self.catalog {
             catalog.put_scope_quota(&quota.to_stored())?;
         }
+        self.install_replicated_quota(quota);
+        Ok(())
+    }
+
+    /// Install a definition into the in-memory map without touching redb.
+    ///
+    /// The replicated path's post-apply step: the row is already durable,
+    /// written by the applier on every node from the accepted entry.
+    pub fn install_replicated_quota(&self, quota: QuotaDefinition) {
         let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
         quotas.insert(quota.scope_name.clone(), quota);
-        Ok(())
+    }
+
+    /// Drop a definition from the in-memory map without touching redb,
+    /// reporting whether one was present. Mirror of
+    /// [`Self::install_replicated_quota`] for the delete entry.
+    pub fn install_replicated_removal(&self, scope_name: &str) -> bool {
+        let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
+        quotas.remove(scope_name).is_some()
+    }
+
+    /// Whether a definition is cached for `scope_name`.
+    pub fn has_quota(&self, scope_name: &str) -> bool {
+        let quotas = self.quotas.read().unwrap_or_else(|p| p.into_inner());
+        quotas.contains_key(scope_name)
     }
 
     /// Remove a quota definition, reporting whether one was present.
     ///
-    /// As with [`Self::define_quota`], a catalog failure is fatal to the whole
-    /// removal rather than leaving the cache and the catalog disagreeing about
-    /// whether a cap still applies.
+    /// Test-only. The DDL path proposes a `DeleteScopeQuota` catalog entry
+    /// instead; apply deletes the redb row and post-apply calls
+    /// [`Self::install_replicated_removal`].
+    #[cfg(test)]
     pub fn remove_quota(&self, scope_name: &str) -> crate::Result<bool> {
         if let Some(ref catalog) = self.catalog {
             catalog.delete_scope_quota(scope_name)?;
         }
-        let mut quotas = self.quotas.write().unwrap_or_else(|p| p.into_inner());
-        Ok(quotas.remove(scope_name).is_some())
+        Ok(self.install_replicated_removal(scope_name))
     }
 
     /// Record token usage against a quota.

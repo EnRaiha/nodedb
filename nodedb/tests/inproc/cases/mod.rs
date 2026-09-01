@@ -147,6 +147,7 @@ mod request_tracker_backpressure;
 mod resp_row_level_security;
 mod rls_fuzz;
 mod scope_quota_hard_refusal;
+mod scope_quota_replication_apply;
 mod security;
 mod segment_encryption;
 mod segment_encryption_g13;

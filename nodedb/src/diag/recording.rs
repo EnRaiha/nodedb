@@ -333,6 +333,26 @@ pub fn quota_row_invalid(
     .emit();
 }
 
+/// Report a replicated per-scope token quota whose stored enforcement mode
+/// this build cannot parse, so post-apply skips installing it. Called from
+/// the post-apply `put` arm that logs and continues.
+pub fn scope_quota_not_installed(err: &crate::Error, scope_name: &str, enforcement: &str) {
+    let detail = err.to_string();
+    let ctx = context::ScopeQuotaNotInstalled {
+        scope_name,
+        enforcement,
+        detail: &detail,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "scope quota post-apply: enforcement mode did not parse, so the cap does not install",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a boot quota replay that could not list its catalog table, so no
 /// row of that scope was installed. Called from each listing's error arm.
 pub fn quota_scope_replay_aborted(err: &crate::Error, scope: &'static str) {

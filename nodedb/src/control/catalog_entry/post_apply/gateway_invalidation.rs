@@ -292,6 +292,9 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::PutTenantQuota { .. } | CatalogEntry::DeleteTenantQuota { .. } => {
             // no-op: same as the database-scoped quota variants.
         }
+        CatalogEntry::PutScopeQuota(_) | CatalogEntry::DeleteScopeQuota { .. } => {
+            // no-op: token quotas gate dispatch admission, not plan shape.
+        }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
             // This forces re-planning on the next query touching those collections.

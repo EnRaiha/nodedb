@@ -141,6 +141,44 @@ impl DomainContext for QuotaRowWriteFailed<'_> {
     }
 }
 
+/// A replicated per-scope token quota whose stored enforcement mode this
+/// build's `QuotaEnforcement::parse` rejects, so the cap never installs.
+pub(in crate::diag) struct ScopeQuotaNotInstalled<'a> {
+    /// Scope the rejected quota names.
+    pub scope_name: &'a str,
+    /// Stored enforcement text `QuotaEnforcement::parse` rejected.
+    pub enforcement: &'a str,
+    /// What the parser reported.
+    pub detail: &'a str,
+}
+
+impl DomainContext for ScopeQuotaNotInstalled<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.scope_quota_not_installed"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The rejected spelling names the bug; the scope is the occurrence.
+        format!("enforcement={}", self.enforcement)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "scope_name": self.scope_name,
+            "enforcement": self.enforcement,
+            "detail": self.detail,
+            "why_fatal": "the row is already committed by consensus and durable on this \
+                          node, but the token cap never reaches the live QuotaManager, so \
+                          this node enforces no limit for the named scope while SHOW QUOTA \
+                          reports it as configured",
+            "operator_action": "re-run DEFINE QUOTA ON SCOPE for the named scope with an \
+                                 enforcement mode this build recognizes (HARD, SOFT, \
+                                 THROTTLE, OVERAGE), or upgrade this node to a build that \
+                                 parses the stored value",
+        })
+    }
+}
+
 /// A dropped scope whose tenant quota rows could not be scanned, so some of
 /// them survive the drop.
 pub(in crate::diag) struct QuotaScopePurgeIncomplete<'a> {

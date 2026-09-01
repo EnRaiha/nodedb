@@ -13,8 +13,8 @@ use crate::control::security::catalog::{
     StoredMaterializedView, StoredOidcProvider, StoredRedactionPolicy, StoredRlsPolicy,
     StoredScopeGrant, StoredSynonymGroup,
     auth_types::{
-        StoredApiKey, StoredAuthUser, StoredOwner, StoredPermission, StoredRole, StoredTenant,
-        StoredUser,
+        StoredApiKey, StoredAuthUser, StoredOwner, StoredPermission, StoredRole, StoredScopeQuota,
+        StoredTenant, StoredUser,
     },
     function_types::StoredFunction,
     procedure_types::StoredProcedure,
@@ -479,4 +479,14 @@ pub enum CatalogEntry {
     },
     /// Delete a tenant quota record by `(db_id, tenant_id)`.
     DeleteTenantQuota { db_id: u64, tenant_id: u64 },
+
+    // ── Scope token quota ──────────────────────────────────────────
+    /// Upsert a per-scope token quota row in `_system.scope_quotas`.
+    /// The leader parses and range-checks the definition before
+    /// proposing; apply writes the accepted row and post-apply
+    /// installs it in every node's `QuotaManager`.
+    PutScopeQuota(Box<StoredScopeQuota>),
+    /// Delete a per-scope token quota by scope name. Drops the row and
+    /// the in-memory definition on every node.
+    DeleteScopeQuota { scope_name: String },
 }

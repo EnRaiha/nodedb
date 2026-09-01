@@ -21,8 +21,8 @@ use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
     function, materialized_view, owner, permission, procedure, quota, redaction, rls, role,
-    schedule, scope_grant, sequence, streaming_materialized_view, synonym_group, tenant, trigger,
-    user,
+    schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
+    tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -355,6 +355,12 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::DeleteTenantQuota { db_id, tenant_id } => {
             quota::delete_tenant(DatabaseId::new(*db_id), TenantId::new(*tenant_id), shared);
+        }
+        CatalogEntry::PutScopeQuota(stored) => {
+            scope_quota::put(stored, shared);
+        }
+        CatalogEntry::DeleteScopeQuota { scope_name } => {
+            scope_quota::delete(scope_name, shared);
         }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
