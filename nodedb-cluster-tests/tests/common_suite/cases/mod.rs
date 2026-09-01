@@ -18,6 +18,7 @@ mod calvin_ollp_pk_delete;
 mod calvin_ollp_update;
 mod calvin_submit_routed_cross_node;
 mod catalog_put_if_absent;
+mod checkpoint_cross_node;
 mod cluster_array;
 mod cluster_array_cell_raft_replication;
 mod cluster_backup_restore;

@@ -8,7 +8,7 @@ use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
 use super::{
-    alert_rule, api_key, auth_user, change_stream, collection, consumer_group,
+    alert_rule, api_key, auth_user, change_stream, checkpoint, collection, consumer_group,
     continuous_aggregate, custom_type, database, function, index_registry, materialized_view,
     oidc_provider, owner, permission, procedure, quota, redaction, retention_policy, rls, role,
     schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
@@ -288,6 +288,19 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
         CatalogEntry::MigrateConsumerGroupStream { def, legacy_stream } => {
             consumer_group::migrate_stream(def, legacy_stream, catalog)
         }
+        CatalogEntry::PutCheckpoint(record) => checkpoint::put(record, catalog),
+        CatalogEntry::DeleteCheckpoint {
+            tenant_id,
+            collection,
+            doc_id,
+            checkpoint_name,
+        } => checkpoint::delete(*tenant_id, collection, doc_id, checkpoint_name, catalog),
+        CatalogEntry::DeleteCheckpointsBefore {
+            tenant_id,
+            collection,
+            doc_id,
+            before_timestamp,
+        } => checkpoint::delete_before(*tenant_id, collection, doc_id, *before_timestamp, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

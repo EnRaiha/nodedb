@@ -86,6 +86,9 @@ impl CatalogEntry {
             Self::PutConsumerGroupIfAbsent(_) => "put_consumer_group_if_absent",
             Self::DeleteConsumerGroup { .. } => "delete_consumer_group",
             Self::MigrateConsumerGroupStream { .. } => "migrate_consumer_group_stream",
+            Self::PutCheckpoint(_) => "put_checkpoint",
+            Self::DeleteCheckpoint { .. } => "delete_checkpoint",
+            Self::DeleteCheckpointsBefore { .. } => "delete_checkpoints_before",
         }
     }
 }

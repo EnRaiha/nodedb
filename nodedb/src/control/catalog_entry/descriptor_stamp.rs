@@ -266,6 +266,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::PutConsumerGroupIfAbsent(_)
         | CatalogEntry::DeleteConsumerGroup { .. }
         | CatalogEntry::MigrateConsumerGroupStream { .. }
+        | CatalogEntry::PutCheckpoint(_)
+        | CatalogEntry::DeleteCheckpoint { .. }
+        | CatalogEntry::DeleteCheckpointsBefore { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }

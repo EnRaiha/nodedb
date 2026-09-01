@@ -237,6 +237,10 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::PutConsumerGroupIfAbsent(_)
         | CatalogEntry::DeleteConsumerGroup { .. }
         | CatalogEntry::MigrateConsumerGroupStream { .. }
+        // Checkpoints have no in-memory mirror at all.
+        | CatalogEntry::PutCheckpoint(_)
+        | CatalogEntry::DeleteCheckpoint { .. }
+        | CatalogEntry::DeleteCheckpointsBefore { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;

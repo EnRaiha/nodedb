@@ -74,7 +74,8 @@ pub async fn create_checkpoint(
         created_at: now,
     };
 
-    // Check for duplicate and persist.
+    // The duplicate is reported here, on the leader. Apply is policy-free:
+    // rejecting there would leave followers without a row the leader accepted.
     let catalog = state.credentials.catalog();
     if catalog
         .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
@@ -86,9 +87,7 @@ pub async fn create_checkpoint(
             format!("checkpoint '{checkpoint_name}' already exists for {collection}/{doc_id}"),
         ));
     }
-    catalog
-        .put_checkpoint(&record)
-        .map_err(|e| err("XX000", e.to_string()))?;
+    super::replicate::propose_put(state, &record)?;
 
     state
         .audit
@@ -116,16 +115,26 @@ pub fn drop_checkpoint(
     let (checkpoint_name, collection, doc_id) = parse_checkpoint_sql(sql, "DROP CHECKPOINT")?;
     let tenant_id = identity.tenant_id;
 
+    // Existence is checked here, on the leader. The replicated delete carries
+    // no return value, so the SQLSTATE cannot be derived from apply.
     let catalog = state.credentials.catalog();
-    let existed = catalog
-        .delete_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
-        .map_err(|e| err("XX000", e.to_string()))?;
-    if !existed {
+    if catalog
+        .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
+        .map_err(|e| err("XX000", e.to_string()))?
+        .is_none()
+    {
         return Err(err(
             "42704",
             format!("checkpoint '{checkpoint_name}' not found for {collection}/{doc_id}"),
         ));
     }
+    super::replicate::propose_delete(
+        state,
+        tenant_id.as_u64(),
+        &collection,
+        &doc_id,
+        &checkpoint_name,
+    )?;
 
     state
         .audit

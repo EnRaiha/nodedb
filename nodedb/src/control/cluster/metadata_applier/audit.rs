@@ -348,6 +348,34 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::PutCheckpoint(c) => (
+            format!(
+                "checkpoint:{}:{}:{}:{}",
+                c.tenant_id, c.collection, c.doc_id, c.checkpoint_name
+            ),
+            0,
+            String::new(),
+        ),
+        E::DeleteCheckpoint {
+            tenant_id,
+            collection,
+            doc_id,
+            checkpoint_name,
+        } => (
+            format!("checkpoint:{tenant_id}:{collection}:{doc_id}:{checkpoint_name}"),
+            0,
+            String::new(),
+        ),
+        E::DeleteCheckpointsBefore {
+            tenant_id,
+            collection,
+            doc_id,
+            before_timestamp,
+        } => (
+            format!("checkpoint:{tenant_id}:{collection}:{doc_id}:<{before_timestamp}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

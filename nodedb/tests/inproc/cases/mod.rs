@@ -60,6 +60,7 @@ mod cdc_arc_fanout;
 mod cdc_drop_observability;
 mod cdc_registry_index;
 mod checkpoint_durability;
+mod checkpoint_replication_apply;
 mod clone_materialize_quiesce;
 mod clone_materializer_background_progress;
 mod collection_cascade_enumeration;

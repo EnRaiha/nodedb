@@ -5,5 +5,6 @@ pub mod checkpoint;
 pub mod compact;
 pub mod diff;
 mod dispatch;
+mod replicate;
 pub mod restore;
 pub mod show_versions;

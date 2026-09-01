@@ -10,6 +10,7 @@ pub mod alert_rule;
 pub mod api_key;
 pub mod auth_user;
 pub mod change_stream;
+pub mod checkpoint;
 pub mod collection;
 pub mod consumer_group;
 pub mod continuous_aggregate;

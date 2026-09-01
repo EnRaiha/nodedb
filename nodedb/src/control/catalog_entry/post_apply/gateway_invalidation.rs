@@ -319,6 +319,12 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // no-op: topics and consumer groups are Event Plane delivery
             // identities and never enter a query plan.
         }
+        CatalogEntry::PutCheckpoint(_)
+        | CatalogEntry::DeleteCheckpoint { .. }
+        | CatalogEntry::DeleteCheckpointsBefore { .. } => {
+            // no-op: a checkpoint names a version vector and never enters a
+            // query plan.
+        }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
             // This forces re-planning on the next query touching those collections.

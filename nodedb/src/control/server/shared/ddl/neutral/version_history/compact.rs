@@ -67,10 +67,18 @@ pub async fn compact_history(
     .await
     .map_err(|e| err("XX000", format!("compact dispatch: {e}")))?;
 
-    // Delete checkpoints created before the cutoff.
+    // Count on the leader: the replicated range delete carries the boundary,
+    // not a row count, and the audit line names how many rows it removes.
     let deleted = catalog
-        .delete_checkpoints_before(tenant_id.as_u64(), &collection, &doc_id, record.created_at)
+        .count_checkpoints_before(tenant_id.as_u64(), &collection, &doc_id, record.created_at)
         .map_err(|e| err("XX000", e.to_string()))?;
+    super::replicate::propose_delete_before(
+        state,
+        tenant_id.as_u64(),
+        &collection,
+        &doc_id,
+        record.created_at,
+    )?;
 
     state
         .audit

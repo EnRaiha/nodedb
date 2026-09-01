@@ -13,6 +13,7 @@
 //! accepted. Variants appended at the end of the enum stay there to keep
 //! MessagePack discriminants stable across rolling upgrades.
 
+use crate::control::security::catalog::types::CheckpointRecord;
 use crate::control::security::catalog::{
     StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
     StoredMaterializedView, StoredOidcProvider, StoredRedactionPolicy, StoredRlsPolicy,
@@ -471,5 +472,27 @@ pub enum CatalogEntry {
     MigrateConsumerGroupStream {
         def: Box<ConsumerGroupDef>,
         legacy_stream: String,
+    },
+
+    // ── Version-history checkpoint ─────────────────────────────────
+    /// Named checkpoint row in `_system.checkpoints`, keyed by
+    /// `(tenant_id, collection, doc_id, checkpoint_name)`.
+    PutCheckpoint(Box<CheckpointRecord>),
+    /// Drops one checkpoint row. The leader reports a missing checkpoint, so
+    /// apply stays idempotent under replay.
+    DeleteCheckpoint {
+        tenant_id: u64,
+        collection: String,
+        doc_id: String,
+        checkpoint_name: String,
+    },
+    /// Range delete behind COMPACT HISTORY: drops every checkpoint for the
+    /// document whose `created_at` is strictly below `before_timestamp`.
+    DeleteCheckpointsBefore {
+        tenant_id: u64,
+        collection: String,
+        doc_id: String,
+        /// Exclusive boundary. A checkpoint stamped exactly here survives.
+        before_timestamp: u64,
     },
 }

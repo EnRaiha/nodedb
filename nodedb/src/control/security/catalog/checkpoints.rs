@@ -121,17 +121,16 @@ impl SystemCatalog {
         Ok(records)
     }
 
-    /// Delete all checkpoints for a document created before a given timestamp.
+    /// Keys of every checkpoint for a document created before `before_timestamp`.
     ///
-    /// Used by COMPACT HISTORY to clean up checkpoints that reference
-    /// oplog entries that have been discarded.
-    pub fn delete_checkpoints_before(
+    /// The boundary is exclusive: `created_at == before_timestamp` is kept.
+    fn checkpoint_keys_before(
         &self,
         tenant_id: u64,
         collection: &str,
         doc_id: &str,
         before_timestamp: u64,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<Vec<String>> {
         let prefix = CheckpointRecord::doc_prefix(tenant_id, collection, doc_id);
         let read_txn = self
             .db
@@ -146,18 +145,45 @@ impl SystemCatalog {
             .range(prefix.as_str()..prefix_end.as_str())
             .map_err(|e| catalog_err("range scan checkpoints", e))?;
 
-        let mut keys_to_delete = Vec::new();
+        let mut keys = Vec::new();
         for entry in range {
             let (key, value) = entry.map_err(|e| catalog_err("iterate checkpoints", e))?;
             let record: CheckpointRecord = zerompk::from_msgpack(value.value())
                 .map_err(|e| catalog_err("deserialize checkpoint", e))?;
             if record.created_at < before_timestamp {
-                keys_to_delete.push(key.value().to_owned());
+                keys.push(key.value().to_owned());
             }
         }
-        drop(table);
-        drop(read_txn);
+        Ok(keys)
+    }
 
+    /// Count the checkpoints a `delete_checkpoints_before` call would remove.
+    ///
+    /// The leader reports this to the client before proposing the range delete.
+    pub fn count_checkpoints_before(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        doc_id: &str,
+        before_timestamp: u64,
+    ) -> crate::Result<usize> {
+        self.checkpoint_keys_before(tenant_id, collection, doc_id, before_timestamp)
+            .map(|keys| keys.len())
+    }
+
+    /// Delete all checkpoints for a document created before a given timestamp.
+    ///
+    /// Used by COMPACT HISTORY to clean up checkpoints that reference
+    /// oplog entries that have been discarded. The boundary is exclusive.
+    pub fn delete_checkpoints_before(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        doc_id: &str,
+        before_timestamp: u64,
+    ) -> crate::Result<usize> {
+        let keys_to_delete =
+            self.checkpoint_keys_before(tenant_id, collection, doc_id, before_timestamp)?;
         if keys_to_delete.is_empty() {
             return Ok(0);
         }

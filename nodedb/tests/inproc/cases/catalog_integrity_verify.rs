@@ -261,6 +261,14 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutConsumerGroupIfAbsent(_) => VariantClass::Exempt,
         CatalogEntry::DeleteConsumerGroup { .. } => VariantClass::Exempt,
         CatalogEntry::MigrateConsumerGroupStream { .. } => VariantClass::Exempt,
+        // Version-history checkpoints are standalone rows in
+        // `_system.checkpoints`, keyed by
+        // (tenant_id, collection, doc_id, checkpoint_name). They name a
+        // version vector on a document the collection already owns, so the
+        // apply path writes no StoredOwner row and there is no orphan pair.
+        CatalogEntry::PutCheckpoint(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteCheckpoint { .. } => VariantClass::Exempt,
+        CatalogEntry::DeleteCheckpointsBefore { .. } => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.
