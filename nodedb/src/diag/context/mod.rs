@@ -9,6 +9,7 @@
 mod catalog;
 mod data_plane;
 mod ingest;
+mod quota;
 mod recovery;
 mod write_path;
 
@@ -19,6 +20,10 @@ pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{CalvinCompletionTimeout, DataPlaneResponseLost};
 pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;
 pub use ingest::IlpFlushOutcome;
+pub use quota::{DATABASE_SCOPE, TENANT_SCOPE};
+pub(in crate::diag) use quota::{
+    QuotaRowNotInstalled, QuotaRowWriteFailed, QuotaScopePurgeIncomplete, QuotaScopeReplayAborted,
+};
 pub(in crate::diag) use recovery::ReplayRecordUnapplied;
 pub(in crate::diag) use write_path::{
     BatchInsertWithoutSurrogates, FtsIndexUpdateFailed, WriteAckedWithoutDurability,

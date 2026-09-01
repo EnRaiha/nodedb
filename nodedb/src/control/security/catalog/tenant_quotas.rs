@@ -13,6 +13,9 @@ use redb::{ReadableDatabase, ReadableTable};
 use super::database_quotas::GlobalQuotaCeiling;
 use super::types::{SystemCatalog, TENANT_QUOTAS, catalog_err};
 
+/// Decoded tenant quota rows paired with the raw keys that failed to decode.
+type LossyTenantQuotas = (Vec<(DatabaseId, TenantId, QuotaRecord)>, Vec<(u64, u64)>);
+
 impl SystemCatalog {
     // ── tenant_quotas ─────────────────────────────────────────────────────────
 
@@ -149,7 +152,8 @@ impl SystemCatalog {
         Ok(out)
     }
 
-    /// List all tenant quota records across all databases.
+    /// List all tenant quota records across all databases. Fails closed: one
+    /// undecodable row errors the whole call, so no check sums a partial set.
     pub fn list_all_tenant_quotas(
         &self,
     ) -> crate::Result<Vec<(DatabaseId, TenantId, QuotaRecord)>> {
@@ -172,6 +176,57 @@ impl SystemCatalog {
             out.push((DatabaseId::new(db), TenantId::new(tid), record));
         }
         Ok(out)
+    }
+
+    /// List tenant quota records, tolerating rows that fail to decode.
+    /// Returns the decoded rows plus the raw keys of the skipped rows.
+    pub fn list_all_tenant_quotas_lossy(&self) -> crate::Result<LossyTenantQuotas> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("list_all_tenant_quotas_lossy read txn", e))?;
+        let table = txn
+            .open_table(TENANT_QUOTAS)
+            .map_err(|e| catalog_err("open tenant_quotas lossy list", e))?;
+        let iter = table
+            .iter()
+            .map_err(|e| catalog_err("iter tenant_quotas lossy", e))?;
+        let mut out = Vec::new();
+        let mut skipped = Vec::new();
+        for row in iter {
+            let (k, v) = row.map_err(|e| catalog_err("iter tenant_quotas lossy row", e))?;
+            let (db, tid) = k.value();
+            let decoded: Result<QuotaRecord, _> = zerompk::from_msgpack(v.value());
+            match decoded {
+                Ok(record) => out.push((DatabaseId::new(db), TenantId::new(tid), record)),
+                Err(_) => skipped.push((db, tid)),
+            }
+        }
+        Ok((out, skipped))
+    }
+
+    /// Write raw bytes as a tenant quota row, bypassing serialization.
+    #[cfg(test)]
+    pub(crate) fn write_raw_tenant_quota(
+        &self,
+        db_id: DatabaseId,
+        tenant_id: TenantId,
+        bytes: &[u8],
+    ) -> crate::Result<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("raw tenant_quotas write txn", e))?;
+        {
+            let mut table = txn
+                .open_table(TENANT_QUOTAS)
+                .map_err(|e| catalog_err("open tenant_quotas raw write", e))?;
+            table
+                .insert((db_id.as_u64(), tenant_id.as_u64()), bytes)
+                .map_err(|e| catalog_err("insert raw tenant_quotas", e))?;
+        }
+        txn.commit()
+            .map_err(|e| catalog_err("raw tenant_quotas commit", e))
     }
 
     // ── sum-of-tenant-quotas validation ──────────────────────────────────────
@@ -291,6 +346,38 @@ mod tests {
             priority_class: PriorityClass::Standard,
             maintenance_cpu_pct: 25,
         }
+    }
+
+    /// Bytes redb accepts as a value but zerompk cannot decode.
+    const CORRUPT: &[u8] = &[0xc1, 0xc1, 0xc1];
+
+    #[test]
+    fn lossy_list_returns_good_rows_and_reports_bad_key() {
+        let (_dir, cat) = open_catalog();
+        let db = DatabaseId::new(1);
+        cat.write_tenant_quota(db, TenantId::new(1), &sample_record())
+            .unwrap();
+        cat.write_raw_tenant_quota(db, TenantId::new(2), CORRUPT)
+            .unwrap();
+
+        let (rows, skipped) = cat.list_all_tenant_quotas_lossy().unwrap();
+
+        assert_eq!(rows.len(), 1, "the decodable row survives");
+        assert_eq!(rows[0].1, TenantId::new(1));
+        assert_eq!(skipped, vec![(1, 2)], "the undecodable key is reported");
+    }
+
+    #[test]
+    fn strict_list_errors_on_a_bad_row() {
+        let (_dir, cat) = open_catalog();
+        let db = DatabaseId::new(1);
+        cat.write_tenant_quota(db, TenantId::new(1), &sample_record())
+            .unwrap();
+        cat.write_raw_tenant_quota(db, TenantId::new(2), CORRUPT)
+            .unwrap();
+
+        cat.list_all_tenant_quotas()
+            .expect_err("a partial set must never reach the ceiling check");
     }
 
     #[test]

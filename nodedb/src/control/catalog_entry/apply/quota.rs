@@ -9,6 +9,7 @@ use nodedb_types::{DatabaseId, QuotaRecord, TenantId};
 use tracing::warn;
 
 use crate::control::security::catalog::SystemCatalog;
+use crate::diag::{DATABASE_SCOPE, TENANT_SCOPE};
 
 /// Apply a `PutDatabaseQuota` entry.
 pub fn put_database(db_id: u64, record: &QuotaRecord, catalog: &SystemCatalog) {
@@ -18,6 +19,7 @@ pub fn put_database(db_id: u64, record: &QuotaRecord, catalog: &SystemCatalog) {
             error = %e,
             "catalog_entry: write_database_quota failed"
         );
+        crate::diag::quota_row_write_failed(&e, "write_database_quota", db_id, None);
     }
 }
 
@@ -29,6 +31,7 @@ pub fn delete_database(db_id: u64, catalog: &SystemCatalog) {
             error = %e,
             "catalog_entry: delete_database_quota failed"
         );
+        crate::diag::quota_row_write_failed(&e, "delete_database_quota", db_id, None);
     }
 }
 
@@ -43,6 +46,7 @@ pub fn put_tenant(db_id: u64, tenant_id: u64, record: &QuotaRecord, catalog: &Sy
             error = %e,
             "catalog_entry: write_tenant_quota failed"
         );
+        crate::diag::quota_row_write_failed(&e, "write_tenant_quota", db_id, Some(tenant_id));
     }
 }
 
@@ -55,6 +59,7 @@ pub fn delete_tenant(db_id: u64, tenant_id: u64, catalog: &SystemCatalog) {
             error = %e,
             "catalog_entry: delete_tenant_quota failed"
         );
+        crate::diag::quota_row_write_failed(&e, "delete_tenant_quota", db_id, Some(tenant_id));
     }
 }
 
@@ -66,11 +71,14 @@ pub fn purge_database_scope(db_id: u64, catalog: &SystemCatalog) {
                 delete_tenant(db_id, tenant_id.as_u64(), catalog);
             }
         }
-        Err(e) => warn!(
-            db_id,
-            error = %e,
-            "catalog_entry: tenant quota scan failed"
-        ),
+        Err(e) => {
+            warn!(
+                db_id,
+                error = %e,
+                "catalog_entry: tenant quota scan failed"
+            );
+            crate::diag::quota_scope_purge_incomplete(&e, DATABASE_SCOPE, Some(db_id), None);
+        }
     }
     delete_database(db_id, catalog);
 }
@@ -85,11 +93,14 @@ pub fn purge_tenant_scope(tenant_id: u64, catalog: &SystemCatalog) {
                 }
             }
         }
-        Err(e) => warn!(
-            tenant_id,
-            error = %e,
-            "catalog_entry: tenant quota scan failed"
-        ),
+        Err(e) => {
+            warn!(
+                tenant_id,
+                error = %e,
+                "catalog_entry: tenant quota scan failed"
+            );
+            crate::diag::quota_scope_purge_incomplete(&e, TENANT_SCOPE, None, Some(tenant_id));
+        }
     }
 }
 

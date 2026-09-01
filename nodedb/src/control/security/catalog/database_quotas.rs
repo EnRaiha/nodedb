@@ -13,6 +13,9 @@ use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{DATABASE_QUOTAS, SystemCatalog, catalog_err};
 
+/// Decoded database quota rows paired with the raw keys that failed to decode.
+type LossyDatabaseQuotas = (Vec<(DatabaseId, QuotaRecord)>, Vec<u64>);
+
 /// Optional global resource ceiling against which the sum of all database
 /// quotas is validated at write time.
 ///
@@ -135,7 +138,8 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("database_quotas delete commit", e))
     }
 
-    /// List all database quota records.
+    /// List all database quota records. Fails closed: one undecodable row
+    /// errors the whole call, so the ceiling check never sums a partial set.
     pub fn list_database_quotas(&self) -> crate::Result<Vec<(DatabaseId, QuotaRecord)>> {
         let txn = self
             .db
@@ -155,6 +159,55 @@ impl SystemCatalog {
             out.push((DatabaseId::new(k.value()), record));
         }
         Ok(out)
+    }
+
+    /// List database quota records, tolerating rows that fail to decode.
+    /// Returns the decoded rows plus the raw keys of the skipped rows.
+    pub fn list_database_quotas_lossy(&self) -> crate::Result<LossyDatabaseQuotas> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("list_database_quotas_lossy read txn", e))?;
+        let table = txn
+            .open_table(DATABASE_QUOTAS)
+            .map_err(|e| catalog_err("open database_quotas lossy list", e))?;
+        let iter = table
+            .iter()
+            .map_err(|e| catalog_err("iter database_quotas lossy", e))?;
+        let mut out = Vec::new();
+        let mut skipped = Vec::new();
+        for row in iter {
+            let (k, v) = row.map_err(|e| catalog_err("iter database_quotas lossy row", e))?;
+            let decoded: Result<QuotaRecord, _> = zerompk::from_msgpack(v.value());
+            match decoded {
+                Ok(record) => out.push((DatabaseId::new(k.value()), record)),
+                Err(_) => skipped.push(k.value()),
+            }
+        }
+        Ok((out, skipped))
+    }
+
+    /// Write raw bytes as a database quota row, bypassing serialization.
+    #[cfg(test)]
+    pub(crate) fn write_raw_database_quota(
+        &self,
+        db_id: DatabaseId,
+        bytes: &[u8],
+    ) -> crate::Result<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("raw database_quotas write txn", e))?;
+        {
+            let mut table = txn
+                .open_table(DATABASE_QUOTAS)
+                .map_err(|e| catalog_err("open database_quotas raw write", e))?;
+            table
+                .insert(db_id.as_u64(), bytes)
+                .map_err(|e| catalog_err("insert raw database_quotas", e))?;
+        }
+        txn.commit()
+            .map_err(|e| catalog_err("raw database_quotas commit", e))
     }
 
     // ── sum-of-quotas validation ──────────────────────────────────────────────
@@ -254,6 +307,36 @@ mod tests {
             priority_class: PriorityClass::Standard,
             maintenance_cpu_pct: 25,
         }
+    }
+
+    /// Bytes redb accepts as a value but zerompk cannot decode.
+    const CORRUPT: &[u8] = &[0xc1, 0xc1, 0xc1];
+
+    #[test]
+    fn lossy_list_returns_good_rows_and_reports_bad_key() {
+        let (_dir, cat) = open_catalog();
+        cat.write_database_quota(DatabaseId::new(1), &sample_record())
+            .unwrap();
+        cat.write_raw_database_quota(DatabaseId::new(2), CORRUPT)
+            .unwrap();
+
+        let (rows, skipped) = cat.list_database_quotas_lossy().unwrap();
+
+        assert_eq!(rows.len(), 1, "the decodable row survives");
+        assert_eq!(rows[0].0, DatabaseId::new(1));
+        assert_eq!(skipped, vec![2], "the undecodable key is reported");
+    }
+
+    #[test]
+    fn strict_list_errors_on_a_bad_row() {
+        let (_dir, cat) = open_catalog();
+        cat.write_database_quota(DatabaseId::new(1), &sample_record())
+            .unwrap();
+        cat.write_raw_database_quota(DatabaseId::new(2), CORRUPT)
+            .unwrap();
+
+        cat.list_database_quotas()
+            .expect_err("the ceiling check must never sum a partial set");
     }
 
     #[test]

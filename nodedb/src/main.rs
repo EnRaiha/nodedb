@@ -268,6 +268,10 @@ async fn server_main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Persisted quotas become live here: the catalog has caught up, and no
+    // listener has accepted a connection that could bypass a cap.
+    nodedb::bootstrap::quota_replay::replay_quotas(&shared);
+
     // Spawn all non-native protocol listeners.
     nodedb::bootstrap::listeners::spawn_protocol_listeners(
         nodedb::bootstrap::listeners::ProtocolListeners {
