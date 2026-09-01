@@ -376,6 +376,29 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::PutVectorModel(m) => (
+            format!("vector_model:{}:{}:{}", m.tenant_id, m.collection, m.column),
+            0,
+            String::new(),
+        ),
+        E::PutVectorIndexParams(p) => (
+            format!(
+                "vector_index_params:{}:{}:{}:{}",
+                p.database_id, p.tenant_id, p.collection, p.field_name
+            ),
+            0,
+            String::new(),
+        ),
+        E::DeleteVectorIndexParams {
+            database_id,
+            tenant_id,
+            collection,
+            field_name,
+        } => (
+            format!("vector_index_params:{database_id}:{tenant_id}:{collection}:{field_name}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

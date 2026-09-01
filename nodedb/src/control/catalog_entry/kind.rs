@@ -89,6 +89,9 @@ impl CatalogEntry {
             Self::PutCheckpoint(_) => "put_checkpoint",
             Self::DeleteCheckpoint { .. } => "delete_checkpoint",
             Self::DeleteCheckpointsBefore { .. } => "delete_checkpoints_before",
+            Self::PutVectorModel(_) => "put_vector_model",
+            Self::PutVectorIndexParams(_) => "put_vector_index_params",
+            Self::DeleteVectorIndexParams { .. } => "delete_vector_index_params",
         }
     }
 }

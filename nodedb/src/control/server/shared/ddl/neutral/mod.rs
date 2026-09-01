@@ -83,6 +83,7 @@ pub mod tree_ops;
 pub mod trigger;
 pub mod typeguard;
 pub mod user;
+pub mod vector_replicate;
 pub mod version_history;
 pub mod weighted_pick;
 

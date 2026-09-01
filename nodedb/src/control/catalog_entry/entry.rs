@@ -34,6 +34,7 @@ use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
 use crate::event::topic::TopicDef;
 use crate::types::DatabaseId;
+use nodedb_types::{StoredVectorIndexParams, VectorModelEntry};
 
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub enum CatalogEntry {
@@ -494,5 +495,21 @@ pub enum CatalogEntry {
         doc_id: String,
         /// Exclusive boundary. A checkpoint stamped exactly here survives.
         before_timestamp: u64,
+    },
+
+    // ── Vector model metadata / index parameters ───────────────────
+    /// Embedding-model row in `_system.vector_model_metadata`, keyed by
+    /// `(tenant_id, collection, column)`. A re-delivery rewrites the row.
+    PutVectorModel(Box<VectorModelEntry>),
+    /// Build-parameter row in `_system.vector_index_params`, keyed by
+    /// `(database_id, tenant_id, collection, field_name)`.
+    PutVectorIndexParams(Box<StoredVectorIndexParams>),
+    /// Drops one vector index's build parameters. The leader reports the
+    /// missing index, so apply stays idempotent under replay.
+    DeleteVectorIndexParams {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        field_name: String,
     },
 }

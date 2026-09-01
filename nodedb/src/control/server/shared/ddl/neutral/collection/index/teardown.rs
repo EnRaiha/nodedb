@@ -148,22 +148,15 @@ async fn vector(
 
     dispatch(state, tenant_id, database_id, &record.collection, plan).await?;
 
-    state
-        .credentials
-        .catalog()
-        .delete_vector_index_params(
-            database_id.as_u64(),
-            tenant_id.as_u64(),
-            &record.collection,
-            &field_name,
-        )
-        .map_err(|e| {
-            err(
-                "XX000",
-                format!("remove vector index params from catalog: {e}"),
-            )
-        })?;
-    Ok(())
+    // The catalog row is replicated; the WAL record and Data Plane drop above
+    // are node-local physical state each node maintains from its own log.
+    super::super::super::vector_replicate::propose_delete_params(
+        state,
+        database_id.as_u64(),
+        tenant_id.as_u64(),
+        &record.collection,
+        &field_name,
+    )
 }
 
 /// Reset the collection's FTS binding once its last full-text index is gone.

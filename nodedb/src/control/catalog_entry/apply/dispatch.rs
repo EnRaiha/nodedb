@@ -12,7 +12,7 @@ use super::{
     continuous_aggregate, custom_type, database, function, index_registry, materialized_view,
     oidc_provider, owner, permission, procedure, quota, redaction, retention_policy, rls, role,
     schedule, scope_grant, scope_quota, sequence, streaming_materialized_view, synonym_group,
-    tenant, topic, trigger, user, wal_tombstone,
+    tenant, topic, trigger, user, vector, wal_tombstone,
 };
 
 /// Apply `entry` to `catalog`.
@@ -301,6 +301,14 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             doc_id,
             before_timestamp,
         } => checkpoint::delete_before(*tenant_id, collection, doc_id, *before_timestamp, catalog),
+        CatalogEntry::PutVectorModel(entry) => vector::put_model(entry, catalog),
+        CatalogEntry::PutVectorIndexParams(entry) => vector::put_params(entry, catalog),
+        CatalogEntry::DeleteVectorIndexParams {
+            database_id,
+            tenant_id,
+            collection,
+            field_name,
+        } => vector::delete_params(*database_id, *tenant_id, collection, field_name, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

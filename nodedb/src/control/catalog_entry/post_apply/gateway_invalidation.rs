@@ -325,6 +325,12 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // no-op: a checkpoint names a version vector and never enters a
             // query plan.
         }
+        CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::DeleteVectorIndexParams { .. } => {
+            // no-op: vector build parameters are read by the Data Plane index,
+            // never by a cached plan.
+        }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.
             // This forces re-planning on the next query touching those collections.

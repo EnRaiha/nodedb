@@ -269,6 +269,15 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutCheckpoint(_) => VariantClass::Exempt,
         CatalogEntry::DeleteCheckpoint { .. } => VariantClass::Exempt,
         CatalogEntry::DeleteCheckpointsBefore { .. } => VariantClass::Exempt,
+        // Vector model metadata and vector-index build parameters are
+        // attribute rows on a collection column, keyed by
+        // (database_id, tenant_id, collection, field). The index's own
+        // ownership row is proposed separately by the CREATE / DROP handler
+        // as `PutOwner` / `DeleteOwner`, so the apply path writes no
+        // StoredOwner row and there is no orphan pair.
+        CatalogEntry::PutVectorModel(_) => VariantClass::Exempt,
+        CatalogEntry::PutVectorIndexParams(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteVectorIndexParams { .. } => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.

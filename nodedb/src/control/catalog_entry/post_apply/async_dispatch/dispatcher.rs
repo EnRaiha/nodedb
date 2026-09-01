@@ -241,6 +241,10 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::DeleteCheckpointsBefore { .. }
+        // Vector model metadata and index parameters have no in-memory mirror.
+        | CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;

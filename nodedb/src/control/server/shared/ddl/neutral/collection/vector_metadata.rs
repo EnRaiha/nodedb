@@ -145,11 +145,7 @@ pub fn handle_set_vector_metadata(
         },
     };
 
-    let catalog = state.credentials.catalog();
-
-    catalog
-        .put_vector_model(&entry)
-        .map_err(|e| err("XX000", e.to_string()))?;
+    super::super::vector_replicate::propose_put_model(state, &entry)?;
 
     tracing::info!(
         %collection,

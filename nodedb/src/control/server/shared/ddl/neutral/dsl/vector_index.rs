@@ -206,10 +206,9 @@ pub async fn create_vector_index(
     )
     .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
 
-    state
-        .credentials
-        .catalog()
-        .put_vector_index_params(&nodedb_types::StoredVectorIndexParams {
+    super::super::vector_replicate::propose_put_params(
+        state,
+        &nodedb_types::StoredVectorIndexParams {
             database_id: database_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             collection: collection.to_string(),
@@ -222,13 +221,8 @@ pub async fn create_vector_index(
             pq_m: params.pq_m,
             ivf_cells: params.ivf_cells,
             ivf_nprobe: params.ivf_nprobe,
-        })
-        .map_err(|e| {
-            ddl_err(
-                "XX000",
-                format!("persist vector index params to catalog: {e}"),
-            )
-        })?;
+        },
+    )?;
 
     propose_index_record(
         state,

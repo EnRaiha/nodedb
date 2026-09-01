@@ -414,6 +414,13 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // (SHOW VERSIONS, AT VERSION, COMPACT HISTORY) goes to the
             // catalog, which `apply` already wrote on this node.
         }
+        CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::DeleteVectorIndexParams { .. } => {
+            // no-op: the Control Plane keeps no mirror of either table. Every
+            // reader goes to the catalog, and the Data Plane takes its copy
+            // from the boot seed.
+        }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

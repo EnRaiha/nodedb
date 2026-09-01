@@ -40,6 +40,7 @@ pub mod tenant;
 pub mod topic;
 pub mod trigger;
 pub mod user;
+pub mod vector;
 pub mod wal_tombstone;
 
 pub use dispatch::apply_to;

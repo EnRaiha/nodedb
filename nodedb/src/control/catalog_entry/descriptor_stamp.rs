@@ -269,6 +269,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::DeleteCheckpointsBefore { .. }
+        | CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }
