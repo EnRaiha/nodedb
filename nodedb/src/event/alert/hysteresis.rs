@@ -5,7 +5,7 @@
 //! Prevents flapping: a brief dip below threshold doesn't clear an active alert,
 //! and a brief spike above threshold doesn't fire a cleared alert.
 //!
-//! State machine per (alert_name, group_key):
+//! State machine per (database_id, tenant_id, alert_name, group_key):
 //! - Condition true  → increment consecutive_fire, reset consecutive_recover
 //! - consecutive_fire >= fire_after AND Cleared → FIRE, set Active
 //! - Condition false → increment consecutive_recover, reset consecutive_fire
@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use super::types::AlertStatus;
+
+/// State key: database, tenant, alert name, group key.
+type StateKey = (u64, u64, String, String);
 
 /// Per-group alert state.
 #[derive(Debug, Clone)]
@@ -60,6 +63,8 @@ pub enum HysteresisTransition {
 /// Parameters for [`HysteresisManager::evaluate`].
 #[derive(Debug, Clone, Copy)]
 pub struct EvaluateParams<'a> {
+    /// Owning database of the alert rule. Scopes the state key.
+    pub database_id: u64,
     /// Tenant scope for the alert's state key.
     pub tenant_id: u64,
     /// Alert rule name.
@@ -84,8 +89,8 @@ pub struct EvaluateParams<'a> {
 /// (crash recovery: re-evaluate from data on startup, alerts re-converge
 /// within fire_after windows).
 pub struct HysteresisManager {
-    /// Key: (tenant_id, alert_name, group_key) → state.
-    states: RwLock<HashMap<(u64, String, String), AlertGroupState>>,
+    /// Per-alert-group hysteresis state.
+    states: RwLock<HashMap<StateKey, AlertGroupState>>,
 }
 
 impl HysteresisManager {
@@ -98,6 +103,7 @@ impl HysteresisManager {
     /// Evaluate a condition result for a group and return any state transition.
     pub fn evaluate(&self, params: EvaluateParams<'_>) -> HysteresisTransition {
         let EvaluateParams {
+            database_id,
             tenant_id,
             alert_name,
             group_key,
@@ -108,7 +114,12 @@ impl HysteresisManager {
             now_ms,
         } = params;
 
-        let key = (tenant_id, alert_name.to_string(), group_key.to_string());
+        let key = (
+            database_id,
+            tenant_id,
+            alert_name.to_string(),
+            group_key.to_string(),
+        );
         let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
         let state = states.entry(key).or_insert_with(AlertGroupState::new);
         state.last_value = Some(value);
@@ -139,11 +150,17 @@ impl HysteresisManager {
     /// Get the current state for a specific group.
     pub fn get_state(
         &self,
+        database_id: u64,
         tenant_id: u64,
         alert_name: &str,
         group_key: &str,
     ) -> Option<AlertGroupState> {
-        let key = (tenant_id, alert_name.to_string(), group_key.to_string());
+        let key = (
+            database_id,
+            tenant_id,
+            alert_name.to_string(),
+            group_key.to_string(),
+        );
         self.states
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -152,21 +169,29 @@ impl HysteresisManager {
     }
 
     /// List all group states for an alert (for SHOW ALERT STATUS).
-    pub fn list_states(&self, tenant_id: u64, alert_name: &str) -> Vec<(String, AlertGroupState)> {
-        let prefix = (tenant_id, alert_name.to_string());
+    pub fn list_states(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        alert_name: &str,
+    ) -> Vec<(String, AlertGroupState)> {
         self.states
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|((t, a, _), _)| *t == prefix.0 && a == &prefix.1)
-            .map(|((_, _, g), s)| (g.clone(), s.clone()))
+            .filter(|((d, t, a, _), _)| {
+                *d == database_id && *t == tenant_id && a.as_str() == alert_name
+            })
+            .map(|((_, _, _, g), s)| (g.clone(), s.clone()))
             .collect()
     }
 
     /// Remove all state for an alert (on DROP ALERT).
-    pub fn remove_alert(&self, tenant_id: u64, alert_name: &str) {
+    pub fn remove_alert(&self, database_id: u64, tenant_id: u64, alert_name: &str) {
         let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        states.retain(|(t, a, _), _| !(*t == tenant_id && a == alert_name));
+        states.retain(|(d, t, a, _), _| {
+            !(*d == database_id && *t == tenant_id && a.as_str() == alert_name)
+        });
     }
 }
 
@@ -186,6 +211,7 @@ mod tests {
 
         // fire_after = 3, need 3 consecutive true evaluations.
         let r1 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
             group_key: "g1",
@@ -198,6 +224,7 @@ mod tests {
         assert_eq!(r1, HysteresisTransition::NoChange);
 
         let r2 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
             group_key: "g1",
@@ -210,6 +237,7 @@ mod tests {
         assert_eq!(r2, HysteresisTransition::NoChange);
 
         let r3 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
             group_key: "g1",
@@ -223,6 +251,7 @@ mod tests {
 
         // Already Active, consecutive true should not re-fire.
         let r4 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
             group_key: "g1",
@@ -241,6 +270,7 @@ mod tests {
 
         // Fire first.
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -251,6 +281,7 @@ mod tests {
             now_ms: 1000,
         });
         let _fired = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -263,6 +294,7 @@ mod tests {
         // fire_after=1, so first true fires.
         assert_eq!(
             mgr.evaluate(EvaluateParams {
+                database_id: 1,
                 tenant_id: 1,
                 alert_name: "a",
                 group_key: "g",
@@ -277,6 +309,7 @@ mod tests {
 
         // Now recover: need 2 consecutive false.
         let r1 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -289,6 +322,7 @@ mod tests {
         assert_eq!(r1, HysteresisTransition::NoChange);
 
         let r2 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -307,6 +341,7 @@ mod tests {
 
         // fire_after=3: 2 true, then 1 false, then 2 true → should not fire.
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -317,6 +352,7 @@ mod tests {
             now_ms: 1000,
         });
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -327,6 +363,7 @@ mod tests {
             now_ms: 2000,
         });
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -337,6 +374,7 @@ mod tests {
             now_ms: 3000,
         }); // resets consecutive_fire
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -347,6 +385,7 @@ mod tests {
             now_ms: 4000,
         });
         let r = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g",
@@ -364,6 +403,7 @@ mod tests {
         let mgr = HysteresisManager::new();
 
         let r1 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "device-1",
@@ -377,6 +417,7 @@ mod tests {
 
         // Different group should be independent.
         let r2 = mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "device-2",
@@ -389,7 +430,7 @@ mod tests {
         assert_eq!(r2, HysteresisTransition::NoChange); // Cleared, false → no change.
 
         // device-1 still Active.
-        let state = mgr.get_state(1, "a", "device-1").unwrap();
+        let state = mgr.get_state(1, 1, "a", "device-1").unwrap();
         assert_eq!(state.status, AlertStatus::Active);
     }
 
@@ -397,6 +438,7 @@ mod tests {
     fn list_states_for_alert() {
         let mgr = HysteresisManager::new();
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g1",
@@ -407,6 +449,7 @@ mod tests {
             now_ms: 1000,
         });
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g2",
@@ -417,6 +460,7 @@ mod tests {
             now_ms: 1000,
         });
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "b",
             group_key: "g3",
@@ -427,7 +471,7 @@ mod tests {
             now_ms: 1000,
         });
 
-        let states = mgr.list_states(1, "a");
+        let states = mgr.list_states(1, 1, "a");
         assert_eq!(states.len(), 2);
     }
 
@@ -435,6 +479,7 @@ mod tests {
     fn remove_alert_clears_all_groups() {
         let mgr = HysteresisManager::new();
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g1",
@@ -445,6 +490,7 @@ mod tests {
             now_ms: 1000,
         });
         mgr.evaluate(EvaluateParams {
+            database_id: 1,
             tenant_id: 1,
             alert_name: "a",
             group_key: "g2",
@@ -454,7 +500,91 @@ mod tests {
             recover_after: 1,
             now_ms: 1000,
         });
-        mgr.remove_alert(1, "a");
-        assert!(mgr.list_states(1, "a").is_empty());
+        mgr.remove_alert(1, 1, "a");
+        assert!(mgr.list_states(1, 1, "a").is_empty());
+    }
+
+    /// Base params for a two-database collision test.
+    fn params(database_id: u64, condition_met: bool, now_ms: u64) -> EvaluateParams<'static> {
+        EvaluateParams {
+            database_id,
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met,
+            value: 91.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms,
+        }
+    }
+
+    #[test]
+    fn databases_have_independent_counters() {
+        let mgr = HysteresisManager::new();
+
+        for now_ms in [1000, 2000, 3000] {
+            let r = mgr.evaluate(params(7, true, now_ms));
+            if now_ms == 3000 {
+                assert_eq!(r, HysteresisTransition::Fired);
+            } else {
+                assert_eq!(r, HysteresisTransition::NoChange);
+            }
+        }
+
+        // Database 8 saw one true window, so it must still be Cleared.
+        let r = mgr.evaluate(params(8, true, 4000));
+        assert_eq!(r, HysteresisTransition::NoChange);
+        let state = mgr.get_state(8, 1, "a", "g").expect("state exists");
+        assert_eq!(state.status, AlertStatus::Cleared);
+        assert_eq!(state.consecutive_fire, 1);
+
+        let other = mgr.get_state(7, 1, "a", "g").expect("state exists");
+        assert_eq!(other.status, AlertStatus::Active);
+    }
+
+    #[test]
+    fn remove_alert_leaves_other_database_state() {
+        let mgr = HysteresisManager::new();
+        mgr.evaluate(params(7, true, 1000));
+        mgr.evaluate(params(8, true, 1000));
+
+        mgr.remove_alert(7, 1, "a");
+
+        assert!(mgr.get_state(7, 1, "a", "g").is_none());
+        assert!(mgr.get_state(8, 1, "a", "g").is_some());
+        assert_eq!(mgr.list_states(8, 1, "a").len(), 1);
+    }
+
+    #[test]
+    fn list_states_filters_by_database() {
+        let mgr = HysteresisManager::new();
+        mgr.evaluate(EvaluateParams {
+            group_key: "g1",
+            ..params(7, true, 1000)
+        });
+        mgr.evaluate(EvaluateParams {
+            group_key: "g2",
+            ..params(7, true, 1000)
+        });
+        mgr.evaluate(EvaluateParams {
+            group_key: "g3",
+            ..params(8, true, 1000)
+        });
+
+        let mut db7: Vec<String> = mgr
+            .list_states(7, 1, "a")
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect();
+        db7.sort();
+        assert_eq!(db7, vec!["g1".to_string(), "g2".to_string()]);
+
+        let db8: Vec<String> = mgr
+            .list_states(8, 1, "a")
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect();
+        assert_eq!(db8, vec!["g3".to_string()]);
     }
 }

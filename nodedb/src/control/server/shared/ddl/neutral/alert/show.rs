@@ -134,7 +134,9 @@ pub fn show_alert_status(
         return Err(err("42704", format!("alert '{name}' does not exist")));
     }
 
-    let states = state.alert_hysteresis.list_states(tenant_id, &name);
+    let states = state
+        .alert_hysteresis
+        .list_states(database_id.as_u64(), tenant_id, &name);
 
     let columns = vec![
         "group_key".to_string(),

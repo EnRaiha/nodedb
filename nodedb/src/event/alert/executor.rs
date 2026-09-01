@@ -114,6 +114,7 @@ async fn evaluate_alert(
             .evaluate(*agg_value, alert.condition.threshold);
 
         let transition = hysteresis.evaluate(super::hysteresis::EvaluateParams {
+            database_id: alert.database_id,
             tenant_id: alert.tenant_id,
             alert_name: &alert.name,
             group_key,

@@ -24,7 +24,9 @@ pub fn put(def: &AlertDef, shared: &SharedState) {
 
 /// Drop an applied alert rule from the live registry and its hysteresis state.
 pub fn delete(database_id: u64, tenant_id: u64, name: &str, shared: &SharedState) {
-    shared.alert_hysteresis.remove_alert(tenant_id, name);
+    shared
+        .alert_hysteresis
+        .remove_alert(database_id, tenant_id, name);
     shared
         .alert_registry
         .unregister(database_id, tenant_id, name);

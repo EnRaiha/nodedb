@@ -159,6 +159,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
     );
 
     server.shared.alert_hysteresis.evaluate(EvaluateParams {
+        database_id: DB,
         tenant_id: TENANT,
         alert_name: ALERT,
         group_key: GROUP,
@@ -172,7 +173,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
         server
             .shared
             .alert_hysteresis
-            .get_state(TENANT, ALERT, GROUP)
+            .get_state(DB, TENANT, ALERT, GROUP)
             .is_some(),
         "the evaluation must leave hysteresis state to clean up"
     );
@@ -191,7 +192,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
         server
             .shared
             .alert_hysteresis
-            .get_state(TENANT, ALERT, GROUP)
+            .get_state(DB, TENANT, ALERT, GROUP)
             .is_none(),
         "the replicated delete must clear hysteresis state on every node"
     );
