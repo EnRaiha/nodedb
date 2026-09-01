@@ -9,6 +9,7 @@
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::state::SharedState;
 
 use super::super::result::DdlError;
@@ -21,12 +22,24 @@ pub(crate) fn propose_and_apply(
     entry: &CatalogEntry,
     local: impl FnOnce() -> Result<(), DdlError>,
 ) -> Result<(), DdlError> {
+    propose_and_apply_outcome(state, entry, local).map(|_| ())
+}
+
+/// [`propose_and_apply`], returning the outcome the proposer reported.
+///
+/// A handler whose per-node side effects live in the post-apply lane needs it:
+/// only `LocalOnly` means no applier will run them for this node.
+pub(crate) fn propose_and_apply_outcome(
+    state: &SharedState,
+    entry: &CatalogEntry,
+    local: impl FnOnce() -> Result<(), DdlError>,
+) -> Result<ProposeOutcome, DdlError> {
     let outcome = propose_catalog_entry(state, entry)
         .map_err(|e| DdlError::new("XX000", format!("catalog propose failed: {e}")))?;
     if outcome.needs_local_apply() {
         local()?;
     }
-    Ok(())
+    Ok(outcome)
 }
 
 #[cfg(test)]

@@ -23,5 +23,6 @@ pub mod collection;
 pub mod continuous_aggregate;
 mod dispatcher;
 pub mod materialized_view;
+pub mod vector;
 
 pub use dispatcher::spawn_post_apply_async_side_effects;

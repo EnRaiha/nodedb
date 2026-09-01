@@ -25,6 +25,16 @@
 //! durable pending-reclaim record is drained on restart before stale state can
 //! be served.
 //!
+//! ## Applied-index contract for the vector-index variants
+//!
+//! `VectorOp::SetParams` and `VectorOp::DropIndex` MUST complete before the
+//! applied-index watcher bumps. A vector write that lands first materializes
+//! the index with default build parameters, and `execute_set_vector_params`
+//! then refuses to reconfigure a materialized index — so a late `SetParams`
+//! never applies and the node serves the wrong index for good. The same
+//! refusal makes a late `DropIndex` block the same-name re-CREATE that may
+//! follow it.
+//!
 //! Variants without a read-after-apply dependency remain fire-and-forget.
 
 use std::sync::Arc;
@@ -143,6 +153,37 @@ pub fn spawn_post_apply_async_side_effects(
                 super::continuous_aggregate::put_async(tenant_id, name, def_bytes, shared).await;
             });
         }
+        // SYNCHRONOUS: the build parameters must reach every core before the
+        // applied-index watcher bumps, or a write racing ahead of them
+        // materializes the index with defaults and pins it there.
+        CatalogEntry::PutVectorIndexParams(stored) => {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    super::vector::put_async(*stored, shared).await;
+                });
+            });
+        }
+        // SYNCHRONOUS: a same-name re-CREATE may follow immediately, and
+        // `SetParams` is refused while the dropped index is still materialized.
+        CatalogEntry::DeleteVectorIndexParams {
+            database_id,
+            tenant_id,
+            collection,
+            field_name,
+        } => {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    super::vector::delete_async(
+                        database_id,
+                        tenant_id,
+                        collection,
+                        field_name,
+                        shared,
+                    )
+                    .await;
+                });
+            });
+        }
         // `DeleteContinuousAggregate` dispatches unregister to every
         // core so per-node runtime state is reclaimed symmetrically.
         CatalogEntry::DeleteContinuousAggregate {
@@ -241,10 +282,10 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::DeleteCheckpointsBefore { .. }
-        // Vector model metadata and index parameters have no in-memory mirror.
+        // Vector model metadata has no in-memory mirror.
+        // PutVectorIndexParams / DeleteVectorIndexParams have their own
+        // async branches above; they do not appear here.
         | CatalogEntry::PutVectorModel(_)
-        | CatalogEntry::PutVectorIndexParams(_)
-        | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;

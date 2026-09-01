@@ -12,6 +12,7 @@ mod ingest;
 mod quota;
 mod recovery;
 mod retention;
+mod vector;
 mod write_path;
 
 pub(in crate::diag) use catalog::{
@@ -29,6 +30,7 @@ pub(in crate::diag) use quota::{
 };
 pub(in crate::diag) use recovery::ReplayRecordUnapplied;
 pub(in crate::diag) use retention::RetentionAutowireOrphaned;
+pub(in crate::diag) use vector::VectorIndexNotApplied;
 pub(in crate::diag) use write_path::{
     BatchInsertWithoutSurrogates, FtsIndexUpdateFailed, WriteAckedWithoutDurability,
 };

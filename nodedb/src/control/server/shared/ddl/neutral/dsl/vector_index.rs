@@ -178,10 +178,12 @@ pub async fn create_vector_index(
         ivf_nprobe: params.ivf_nprobe,
     });
 
-    // Register with the engine first and surface its verdict. The engine
-    // refuses to reconfigure an index that has already materialized, and that
-    // refusal is the difference between "your parameters were applied" and
-    // "your parameters were ignored" — it cannot be dropped on the floor.
+    // Register with the engine first and surface its verdict, before anything
+    // is durable. The engine refuses to reconfigure an index that has already
+    // materialized, and post-apply cannot propagate that refusal to the
+    // client — this pre-flight is the only place the statement can fail
+    // closed. The post-apply dispatch that follows re-installs the same
+    // parameters on this node, which is a no-op on an unmaterialized index.
     crate::control::server::shared::ddl::engine_apply::apply_in_engine(
         state,
         tenant_id,
@@ -193,20 +195,11 @@ pub async fn create_vector_index(
     )
     .await?;
 
-    // Only now make it durable. Both records below re-register the index at
-    // boot — the WAL one via `replay_vector_wal`, the catalog one via
-    // `seed_vector_index_params` — so a crash between them converges on the
-    // next start rather than leaving a half-configured index.
-    crate::control::server::wal_dispatch::wal_append_if_write(
-        &state.wal,
-        tenant_id,
-        vshard,
-        database_id,
-        &set_params_plan,
-    )
-    .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
-
-    super::super::vector_replicate::propose_put_params(
+    // Only now make it durable. The replicated catalog row re-registers the
+    // index at boot via `seed_vector_index_params`, and each node's post-apply
+    // appends its own `VectorParams` redo record for `replay_vector_wal`, so a
+    // crash between them converges on the next start.
+    let outcome = super::super::vector_replicate::propose_put_params(
         state,
         &nodedb_types::StoredVectorIndexParams {
             database_id: database_id.as_u64(),
@@ -223,6 +216,19 @@ pub async fn create_vector_index(
             ivf_nprobe: params.ivf_nprobe,
         },
     )?;
+
+    // Single node: no applier runs, so post-apply never fires. Append the
+    // per-node redo record the post-apply lane appends everywhere else.
+    if outcome.needs_local_apply() {
+        crate::control::server::wal_dispatch::wal_append_if_write(
+            &state.wal,
+            tenant_id,
+            vshard,
+            database_id,
+            &set_params_plan,
+        )
+        .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
+    }
 
     propose_index_record(
         state,

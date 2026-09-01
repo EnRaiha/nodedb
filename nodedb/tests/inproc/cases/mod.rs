@@ -195,6 +195,7 @@ mod transaction_batch_cross_engine_mixed;
 mod transaction_batch_cross_shard;
 mod trigger_batching;
 mod trigger_execution;
+mod vector_index_post_apply_dispatch;
 mod vector_metadata_replication_apply;
 mod wal_catchup;
 mod warm_storage_object_store;

@@ -16,5 +16,5 @@ pub use recording::{
     ilp_line_read_drop, metadata_apply_wedged, quota_row_invalid, quota_row_undecodable,
     quota_row_write_failed, quota_scope_purge_incomplete, quota_scope_replay_aborted,
     replay_record_unapplied, retention_autowire_orphaned, scope_quota_not_installed,
-    write_acked_without_durability,
+    vector_index_not_applied, write_acked_without_durability,
 };

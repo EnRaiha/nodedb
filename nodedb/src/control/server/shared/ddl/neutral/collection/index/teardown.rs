@@ -17,6 +17,10 @@
 //! Every failure here propagates. A teardown that logs and continues would
 //! report a successful drop over state that is still live — the same silent
 //! success that made a vector index undroppable in the first place.
+//!
+//! The vector arm is the exception a replicated catalog forces: its WAL record
+//! and Data Plane drop run on every node from the post-apply lane, which
+//! cannot propagate and files a `Capture` instead.
 
 use crate::control::security::catalog::{IndexKind, StoredIndexRecord};
 use crate::control::state::SharedState;
@@ -106,6 +110,10 @@ async fn secondary(
 
 /// Remove the vector index's durable build parameters and its Data Plane
 /// state (graph, config, declared dimension, checkpoint).
+///
+/// The catalog row is replicated, and the WAL drop record plus the Data Plane
+/// drop are node-local physical state, so every node runs them from its own
+/// post-apply lane. Only the single-node path has no applier to do that.
 async fn vector(
     state: &SharedState,
     record: &StoredIndexRecord,
@@ -113,6 +121,19 @@ async fn vector(
     tenant_id: TenantId,
 ) -> Result<(), DdlError> {
     let field_name = record.primary_field().to_string();
+    let outcome = super::super::super::vector_replicate::propose_delete_params(
+        state,
+        database_id.as_u64(),
+        tenant_id.as_u64(),
+        &record.collection,
+        &field_name,
+    )?;
+    // Only the single-node path continues: everywhere else the post-apply
+    // lane has already appended, fsynced, and dropped on this node.
+    if !outcome.needs_local_apply() {
+        return Ok(());
+    }
+
     let plan = crate::bridge::envelope::PhysicalPlan::Vector(
         nodedb_physical::physical_plan::VectorOp::DropIndex {
             collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
@@ -146,17 +167,7 @@ async fn vector(
         .await
         .map_err(|e| err("XX000", format!("fsync vector index drop: {e}")))?;
 
-    dispatch(state, tenant_id, database_id, &record.collection, plan).await?;
-
-    // The catalog row is replicated; the WAL record and Data Plane drop above
-    // are node-local physical state each node maintains from its own log.
-    super::super::super::vector_replicate::propose_delete_params(
-        state,
-        database_id.as_u64(),
-        tenant_id.as_u64(),
-        &record.collection,
-        &field_name,
-    )
+    dispatch(state, tenant_id, database_id, &record.collection, plan).await
 }
 
 /// Reset the collection's FTS binding once its last full-text index is gone.
