@@ -2,12 +2,10 @@
 
 //! Protocol-neutral `CREATE ALERT` DDL handler.
 //!
-//! Ported from the pgwire `ddl::alert::create` handler. The catalog path
-//! (DIRECT `catalog.put_alert_rule(&def)` write), the `_alert_rules` CRDT-sync
-//! delta enqueue, the in-memory registry registration, and the `audit_record`
-//! call are preserved verbatim; only the result construction changed from
-//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The rule is replicated catalog state: the handler proposes a
+//! `PutAlertRule` entry, and every node writes the row and registers the
+//! definition. The `_alert_rules` CRDT-sync delta is edge-to-cloud sync, not
+//! cluster replication, so it stays here and fires once per statement.
 
 use nodedb_types::DatabaseId;
 
@@ -127,14 +125,11 @@ pub fn create_alert(
         created_at: now,
     };
 
-    // Persist to catalog.
-    let catalog = state.credentials.catalog();
+    // Replicate the row and the registry install to every node.
+    super::replicate::propose_put(state, &def)?;
 
-    catalog
-        .put_alert_rule(&def)
-        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
-
-    // Emit CRDT sync delta for Lite visibility.
+    // Emit CRDT sync delta for Lite visibility. Handler-scoped: the apply
+    // path runs on every node, so emitting there would duplicate the delta.
     {
         let delta_payload = zerompk::to_msgpack_vec(&def).unwrap_or_default();
         let delta = crate::event::crdt_sync::types::OutboundDelta {
@@ -150,8 +145,6 @@ pub fn create_alert(
         };
         state.crdt_sync_delivery.enqueue(delta);
     }
-
-    state.alert_registry.register(def);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

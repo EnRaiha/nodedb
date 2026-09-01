@@ -8,10 +8,10 @@ use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
 use super::{
-    api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
-    function, index_registry, materialized_view, oidc_provider, owner, permission, procedure,
-    quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
-    streaming_materialized_view, synonym_group, tenant, trigger, user, wal_tombstone,
+    alert_rule, api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type,
+    database, function, index_registry, materialized_view, oidc_provider, owner, permission,
+    procedure, quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota,
+    sequence, streaming_materialized_view, synonym_group, tenant, trigger, user, wal_tombstone,
 };
 
 /// Apply `entry` to `catalog`.
@@ -265,6 +265,12 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             name,
             ..
         } => retention_policy::delete(*database_id, *tenant_id, name, catalog),
+        CatalogEntry::PutAlertRule(def) => alert_rule::put(def, catalog),
+        CatalogEntry::DeleteAlertRule {
+            database_id,
+            tenant_id,
+            name,
+        } => alert_rule::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

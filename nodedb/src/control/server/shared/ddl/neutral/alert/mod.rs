@@ -5,6 +5,7 @@
 pub mod alter;
 pub mod create;
 pub mod drop;
+mod replicate;
 pub mod show;
 
 pub use alter::alter_alert;

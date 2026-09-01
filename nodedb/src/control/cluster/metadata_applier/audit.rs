@@ -294,6 +294,20 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::PutAlertRule(a) => (
+            format!("alert:{}:{}:{}", a.database_id, a.tenant_id, a.name),
+            0,
+            String::new(),
+        ),
+        E::DeleteAlertRule {
+            database_id,
+            tenant_id,
+            name,
+        } => (
+            format!("alert:{database_id}:{tenant_id}:{name}"),
+            0,
+            String::new(),
+        ),
         E::PutOwner(o) => (o.object_name.clone(), 0, String::new()),
         E::DeleteOwner { object_name, .. } => (object_name.clone(), 0, String::new()),
         E::PutSynonymGroup(g) => (g.name.clone(), 0, String::new()),

@@ -228,6 +228,9 @@ pub fn spawn_post_apply_async_side_effects(
         // Registry install happens in `sync.rs`.
         | CatalogEntry::PutRetentionPolicy(_)
         | CatalogEntry::DeleteRetentionPolicy { .. }
+        // Registry install happens in `sync.rs`.
+        | CatalogEntry::PutAlertRule(_)
+        | CatalogEntry::DeleteAlertRule { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
             let _ = raft_index;

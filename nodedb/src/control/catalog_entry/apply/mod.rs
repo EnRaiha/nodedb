@@ -6,6 +6,7 @@
 //! [`apply_to`] is an exhaustive match routing each variant to a typed
 //! function in a per-family sibling file, one match arm per variant.
 
+pub mod alert_rule;
 pub mod api_key;
 pub mod auth_user;
 pub mod change_stream;

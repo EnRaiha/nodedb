@@ -45,6 +45,7 @@ use crate::control::state::SharedState;
 /// | PutScopeGrant / DeleteScopeGrant        | ❌ no       | scope enrichment resolves grants per request against the live store; no scope field in any PhysicalPlan variant |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 /// | PutRetentionPolicy / DeleteRetentionPolicy | ✅ yes   | `auto_tier` rewrites a timeseries scan onto tier aggregates, so the policy is baked into the plan |
+/// | PutAlertRule / DeleteAlertRule          | ❌ no       | alert rules drive their own eval loop and never enter a PhysicalPlan |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
     let Some(inv) = shared.gateway_invalidator.get() else {
         return;
@@ -304,6 +305,10 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::DeleteRetentionPolicy { collection, .. } => {
             // Dropping the policy removes any tier rewrite from the plan.
             inv.invalidate(collection, 0);
+        }
+        CatalogEntry::PutAlertRule(_) | CatalogEntry::DeleteAlertRule { .. } => {
+            // no-op: alert rules run their own eval loop and never enter a
+            // query plan.
         }
         CatalogEntry::MoveTenantCutover { collections, .. } => {
             // Invalidate cached plans for each collection that moved databases.

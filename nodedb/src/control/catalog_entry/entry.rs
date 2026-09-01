@@ -27,6 +27,7 @@ use crate::control::security::catalog::{
     trigger_types::StoredTrigger,
 };
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
+use crate::event::alert::types::AlertDef;
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
 use crate::types::DatabaseId;
@@ -425,5 +426,18 @@ pub enum CatalogEntry {
         name: String,
         /// Target collection, carried so plan-cache eviction stays precise.
         collection: String,
+    },
+
+    // ── Alert rule ─────────────────────────────────────────────────
+    /// Alert rule row in `_system.alert_rules`, keyed by
+    /// `(database_id, tenant_id, name)`. CREATE and ALTER both ship the full
+    /// record; post-apply installs it in every node's `AlertRegistry`.
+    PutAlertRule(Box<AlertDef>),
+    /// Drops the row, the registry entry, and the hysteresis state on every
+    /// node.
+    DeleteAlertRule {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
     },
 }

@@ -2,11 +2,8 @@
 
 //! Protocol-neutral `ALTER ALERT` DDL handler.
 //!
-//! Ported from the pgwire `ddl::alert::alter` handler. The registry lookup, the
-//! DIRECT `catalog.put_alert_rule` write, the in-memory registry update, and the
-//! `audit_record` call are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! ENABLE and DISABLE both re-put the full record through a `PutAlertRule`
+//! entry, so every node writes the row and updates its registry.
 //!
 //! Syntax:
 //! ```sql
@@ -48,13 +45,7 @@ pub fn alter_alert(
         _ => return Err(err("42601", "expected ENABLE or DISABLE".to_string())),
     }
 
-    let catalog = state.credentials.catalog();
-
-    catalog
-        .put_alert_rule(&def)
-        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
-
-    state.alert_registry.update(def);
+    super::replicate::propose_put(state, &def)?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -79,6 +79,8 @@ impl CatalogEntry {
             Self::DeleteScopeQuota { .. } => "delete_scope_quota",
             Self::PutRetentionPolicy(_) => "put_retention_policy",
             Self::DeleteRetentionPolicy { .. } => "delete_retention_policy",
+            Self::PutAlertRule(_) => "put_alert_rule",
+            Self::DeleteAlertRule { .. } => "delete_alert_rule",
         }
     }
 }

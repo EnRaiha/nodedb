@@ -49,10 +49,6 @@ impl AlertRegistry {
             .cloned()
     }
 
-    pub fn update(&self, def: AlertDef) {
-        self.register(def);
-    }
-
     /// List all enabled alerts (all tenants). Used by the eval loop.
     pub fn list_all_enabled(&self) -> Vec<AlertDef> {
         self.read_map()

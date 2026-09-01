@@ -246,6 +246,11 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         // StoredOwner row, so there is no orphan pair to verify.
         CatalogEntry::PutRetentionPolicy(_) => VariantClass::Exempt,
         CatalogEntry::DeleteRetentionPolicy { .. } => VariantClass::Exempt,
+        // Alert rules are standalone rows keyed by
+        // (database_id, tenant_id, name). The apply path writes no
+        // StoredOwner row, so there is no orphan pair to verify.
+        CatalogEntry::PutAlertRule(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteAlertRule { .. } => VariantClass::Exempt,
         // Clone creates a new database descriptor; no per-object owner row needed.
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.

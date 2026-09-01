@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `DROP ALERT` DDL handler.
 //!
-//! Ported from the pgwire `ddl::alert::drop` handler. The DIRECT
-//! `catalog.delete_alert_rule` write, the `_alert_rules` CRDT-sync tombstone
-//! delta, the hysteresis-state cleanup, the in-memory registry unregister, and
-//! the `audit_record` call are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! The removal is replicated: a `DeleteAlertRule` entry drops the row, the
+//! registry entry, and the hysteresis state on every node. The `_alert_rules`
+//! CRDT-sync tombstone is edge-to-cloud sync, so it stays in the handler.
 //!
 //! Syntax: `DROP ALERT <name>`
 
@@ -63,13 +60,10 @@ pub fn drop_alert(
         return Err(err("42704", format!("alert '{name}' does not exist")));
     }
 
-    let catalog = state.credentials.catalog();
+    super::replicate::propose_delete(state, database_id.as_u64(), tenant_id, &name)?;
 
-    catalog
-        .delete_alert_rule(database_id.as_u64(), tenant_id, &name)
-        .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
-
-    // Emit CRDT tombstone delta.
+    // Emit CRDT tombstone delta. Handler-scoped: the apply path runs on every
+    // node, so emitting there would duplicate the delta.
     {
         let delta = crate::event::crdt_sync::types::OutboundDelta {
             database_id,
@@ -84,14 +78,6 @@ pub fn drop_alert(
         };
         state.crdt_sync_delivery.enqueue(delta);
     }
-
-    // Clean up hysteresis state.
-    state.alert_hysteresis.remove_alert(tenant_id, &name);
-
-    // Remove from registry.
-    state
-        .alert_registry
-        .unregister(database_id.as_u64(), tenant_id, &name);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

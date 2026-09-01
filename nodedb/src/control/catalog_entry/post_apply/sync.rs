@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
-    api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
-    function, materialized_view, owner, permission, procedure, quota, redaction, retention_policy,
-    rls, role, schedule, scope_grant, scope_quota, sequence, streaming_materialized_view,
-    synonym_group, tenant, trigger, user,
+    alert_rule, api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type,
+    database, function, materialized_view, owner, permission, procedure, quota, redaction,
+    retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
+    streaming_materialized_view, synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -372,6 +372,16 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             ..
         } => {
             retention_policy::delete(*database_id, *tenant_id, name, shared);
+        }
+        CatalogEntry::PutAlertRule(def) => {
+            alert_rule::put(def, shared);
+        }
+        CatalogEntry::DeleteAlertRule {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            alert_rule::delete(*database_id, *tenant_id, name, shared);
         }
         CatalogEntry::MoveTenantCutover {
             tenant_id,

@@ -259,6 +259,8 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteScopeQuota { .. }
         | CatalogEntry::PutRetentionPolicy(_)
         | CatalogEntry::DeleteRetentionPolicy { .. }
+        | CatalogEntry::PutAlertRule(_)
+        | CatalogEntry::DeleteAlertRule { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }
 }

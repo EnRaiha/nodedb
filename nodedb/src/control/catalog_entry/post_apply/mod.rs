@@ -16,6 +16,7 @@
 //!   Data Plane observes catalog mutations symmetrically.
 
 // Per-family modules (existing).
+pub mod alert_rule;
 pub mod api_key;
 pub mod auth_user;
 pub mod change_stream;

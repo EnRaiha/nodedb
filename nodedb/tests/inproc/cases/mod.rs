@@ -9,6 +9,7 @@ mod snapshot_rt_common;
 #[path = "../../support/mod.rs"]
 mod support;
 
+mod alert_rule_replication_apply;
 mod array_cluster_sync;
 mod array_codec_roundtrip;
 mod array_sql;
