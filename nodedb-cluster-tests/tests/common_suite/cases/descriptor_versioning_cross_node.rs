@@ -9,11 +9,11 @@
 //! lease drain and execution-time version checks — without it,
 //! there is no version to lease against.
 //!
-//! The applier reads the prior persisted record under the same
-//! txn that writes the new one, increments by one (or assigns 1 on
-//! create), and stamps `modification_hlc = clock.now()`. The HLC
-//! is folded across nodes via the metadata-group raft path so
-//! every node converges on a strictly increasing sequence.
+//! The proposing node freezes the stamp: it reads the prior
+//! persisted record, increments by one (or assigns 1 on create),
+//! and stamps `modification_hlc` from its own HLC. The frozen
+//! entry replicates verbatim, so every node writes that value
+//! without re-deriving it.
 
 use crate::common;
 
@@ -47,17 +47,10 @@ async fn create_collection_stamps_version_one_on_every_node() {
     )
     .await;
 
-    // All nodes should agree on the same HLC stamp — the applier on
-    // every node reads the same propagated entry and the only
-    // source of HLC advance for that entry is the proposing
-    // leader's clock, recorded in the raft entry payload via the
-    // post-stamp serialization.
-    //
-    // NOTE: we do not assert exact HLC equality across nodes
-    // because the stamp is computed locally by each node's
-    // applier. What we DO assert is that every node sees
-    // `descriptor_version == 1` and a non-zero HLC. Lease drain
-    // builds on the version, not the wall clock.
+    // Every node writes the stamp the proposer froze into the raft
+    // entry. The assertion is `descriptor_version == 1` plus a
+    // non-zero HLC on each node: lease drain builds on the version,
+    // not the wall clock.
     let stamps: Vec<_> = cluster
         .nodes
         .iter()
@@ -106,7 +99,7 @@ async fn alter_collection_bumps_version_monotonically() {
     .await;
 
     // Five owner flips. Each one re-proposes the full
-    // `StoredCollection`, so the applier should bump
+    // `StoredCollection`, so the propose-time stamp bumps
     // `descriptor_version` from 1 → 2 → ... → 6.
     let owners = ["alice", "bob", "alice", "bob", "alice"];
     for (i, owner) in owners.iter().enumerate() {
@@ -130,9 +123,8 @@ async fn alter_collection_bumps_version_monotonically() {
         .await;
     }
 
-    // Sanity: HLC must be strictly greater on the final stamp than
-    // on the initial stamp. We compare per-node since each node's
-    // applier stamps with its own clock view.
+    // Sanity: the final stamp carries the last proposer's HLC on
+    // every node, ahead of the initial stamp.
     for node in &cluster.nodes {
         let (final_version, final_hlc) = node
             .collection_descriptor(TENANT, "assets")
@@ -218,9 +210,9 @@ async fn distinct_collections_get_independent_versions() {
     )
     .await;
 
-    // Each independent descriptor starts at v1. The applier reads
-    // the prior record per-key, so version counters are local to
-    // the descriptor identity.
+    // Each independent descriptor starts at v1. The stamp reads the
+    // prior record per-key, so version counters are local to the
+    // descriptor identity.
     for node in &cluster.nodes {
         for name in ["foo", "bar", "baz"] {
             let (v, _) = node.collection_descriptor(TENANT, name).expect("present");
