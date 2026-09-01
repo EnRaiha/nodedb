@@ -25,6 +25,8 @@ pub struct SystemCatalog {
     pub(super) fail_next_user_counter_write: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) fail_next_function_wasm_write: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_collection_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SystemCatalog {
@@ -49,6 +51,8 @@ impl SystemCatalog {
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         Ok(catalog)
@@ -69,6 +73,8 @@ impl SystemCatalog {
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         Ok(catalog)
@@ -83,6 +89,13 @@ impl SystemCatalog {
     #[cfg(test)]
     pub(crate) fn fail_next_function_wasm_write_for_test(&self) {
         self.fail_next_function_wasm_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the next `put_collection` raise, so an applier's error path runs.
+    #[cfg(test)]
+    pub(crate) fn fail_next_collection_write_for_test(&self) {
+        self.fail_next_collection_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

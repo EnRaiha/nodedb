@@ -3,20 +3,25 @@
 //! Apply Collection catalog entries to `SystemCatalog` redb.
 
 use nodedb_types::DatabaseId;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::control::security::catalog::auth_types::object_type;
-use crate::control::security::catalog::{StoredCollection, SystemCatalog};
+use crate::control::security::catalog::{StoredCollection, SystemCatalog, catalog_err};
 
-pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_collection(stored.database_id, stored) {
-        warn!(
-            collection = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_collection failed"
-        );
-    }
+pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .put_collection(stored.database_id, stored)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "put_collection '{}' (database {}, tenant {})",
+                    stored.name,
+                    stored.database_id.as_u64(),
+                    stored.tenant_id
+                ),
+                e,
+            )
+        })?;
     super::owner::put_parent_owner_in_database(
         object_type::COLLECTION,
         stored.database_id.as_u64(),
@@ -24,24 +29,27 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
         &stored.name,
         &stored.owner,
         catalog,
-    );
+    )?;
     // An index is only observable while its collection is. `UNDROP COLLECTION`
     // reaches here with `is_active = true`, which restores the indexes the
     // soft-delete hid.
-    sync_index_visibility(stored, catalog);
+    sync_index_visibility(stored, catalog)
 }
 
 /// Align the collection's index records with its own `is_active` state, so a
 /// soft-dropped collection hides its indexes and an undropped one brings them
 /// back. Indexes are never deleted here — that happens only at purge.
-pub(super) fn sync_index_visibility(stored: &StoredCollection, catalog: &SystemCatalog) {
+pub(super) fn sync_index_visibility(
+    stored: &StoredCollection,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
     set_index_visibility(
         stored.database_id.as_u64(),
         stored.tenant_id,
         &stored.name,
         stored.is_active,
         catalog,
-    );
+    )
 }
 
 fn set_index_visibility(
@@ -50,46 +58,55 @@ fn set_index_visibility(
     name: &str,
     is_active: bool,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) =
-        catalog.set_index_records_active_for_collection(database_id, tenant_id, name, is_active)
-    {
-        warn!(
-            collection = %name,
-            tenant = tenant_id,
-            is_active,
-            error = %e,
-            "catalog_entry: index visibility sync failed"
-        );
-    }
+) -> crate::Result<()> {
+    catalog
+        .set_index_records_active_for_collection(database_id, tenant_id, name, is_active)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "index visibility sync for '{name}' \
+                     (database {database_id}, tenant {tenant_id}, is_active {is_active})"
+                ),
+                e,
+            )
+        })
+        .map(|_| ())
 }
 
 /// Create-only variant of [`put`]: writes the collection (and its owner row)
 /// exactly as `put` does, but only when no collection with the same
 /// `(database_id, tenant_id, name)` already exists — a no-op otherwise, so
 /// replay/snapshot re-application stays idempotent.
-pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
-    match catalog.put_collection_if_absent(stored.database_id, stored) {
-        Ok(true) => super::owner::put_parent_owner_in_database(
-            object_type::COLLECTION,
-            stored.database_id.as_u64(),
-            stored.tenant_id,
-            &stored.name,
-            &stored.owner,
-            catalog,
-        ),
-        Ok(false) => debug!(
+pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) -> crate::Result<()> {
+    let written = catalog
+        .put_collection_if_absent(stored.database_id, stored)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "put_collection_if_absent '{}' (database {}, tenant {})",
+                    stored.name,
+                    stored.database_id.as_u64(),
+                    stored.tenant_id
+                ),
+                e,
+            )
+        })?;
+    if !written {
+        debug!(
             collection = %stored.name,
             tenant = stored.tenant_id,
             "catalog_entry: put_collection_if_absent skipped existing collection"
-        ),
-        Err(e) => warn!(
-            collection = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: atomic put_collection_if_absent failed"
-        ),
+        );
+        return Ok(());
     }
+    super::owner::put_parent_owner_in_database(
+        object_type::COLLECTION,
+        stored.database_id.as_u64(),
+        stored.tenant_id,
+        &stored.name,
+        &stored.owner,
+        catalog,
+    )
 }
 
 /// Persist the fail-closed catalog half of a purge before touching storage.
@@ -110,10 +127,15 @@ pub fn prepare_purge(
         return Ok(false);
     };
     stored.is_active = false;
-    catalog.put_collection(database_id, &stored)?;
+    catalog.put_collection(database_id, &stored).map_err(|e| {
+        catalog_err(
+            &format!("put_collection '{name}' (database {database_id:?}, tenant {tenant_id})"),
+            e,
+        )
+    })?;
     // Hide the indexes for the window between the fail-closed row write and
     // `finalize_purge`, which removes their records outright.
-    set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
+    set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog)?;
     Ok(true)
 }
 
@@ -148,7 +170,7 @@ pub fn finalize_purge(
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     let database_id = DatabaseId::new(database_id);
-    super::owner::delete_parent_owner_in_database_checked(
+    super::owner::delete_parent_owner_in_database(
         object_type::COLLECTION,
         database_id.as_u64(),
         tenant_id,
@@ -199,7 +221,17 @@ fn purge_index_records(
             tenant_id,
             &record.name,
         )?;
-        catalog.delete_index_record(database_id, tenant_id, &record.name)?;
+        catalog
+            .delete_index_record(database_id, tenant_id, &record.name)
+            .map_err(|e| {
+                catalog_err(
+                    &format!(
+                        "delete_index_record '{}' (database {database_id:?}, tenant {tenant_id})",
+                        record.name
+                    ),
+                    e,
+                )
+            })?;
     }
     debug!(
         collection = %name,
@@ -224,10 +256,22 @@ pub fn deactivate(
     name: &str,
     stamp: DeactivateStamp,
     catalog: &SystemCatalog,
-) {
+) -> crate::Result<()> {
     let database_id = DatabaseId::new(database_id);
-    match catalog.get_collection(database_id, tenant_id, name) {
-        Ok(Some(mut stored)) => {
+    let existing = catalog
+        .get_collection(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "deactivate_collection read of '{name}' \
+                     (database {}, tenant {tenant_id})",
+                    database_id.as_u64()
+                ),
+                e,
+            )
+        })?;
+    match existing {
+        Some(mut stored) => {
             stored.is_active = false;
             // The drop is itself a descriptor mutation: without its own
             // version and HLC the row keeps the CREATE's metadata, and a
@@ -243,36 +287,33 @@ pub fn deactivate(
                 // the same value so the two never diverge.
                 stored.deactivated_at_ns = stamp.modification_hlc.wall_ns;
             }
-            if let Err(e) = catalog.put_collection(database_id, &stored) {
-                warn!(
-                    collection = %name,
-                    tenant = tenant_id,
-                    error = %e,
-                    "catalog_entry: deactivate_collection put failed"
-                );
-            }
+            catalog.put_collection(database_id, &stored).map_err(|e| {
+                catalog_err(
+                    &format!(
+                        "deactivate_collection write of '{name}' \
+                         (database {}, tenant {tenant_id})",
+                        database_id.as_u64()
+                    ),
+                    e,
+                )
+            })?;
             // Hide the collection's indexes for as long as the collection
             // itself is hidden. They are retained, not dropped: `UNDROP
             // COLLECTION` must restore the collection with its indexes.
-            set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
+            set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog)?;
         }
-        Ok(None) => {
+        None => {
             debug!(
                 collection = %name,
                 tenant = tenant_id,
                 "catalog_entry: deactivate on missing collection (fresh follower)"
             );
         }
-        Err(e) => warn!(
-            collection = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: deactivate_collection get failed"
-        ),
     }
     // Intentionally preserve the `StoredOwner` row on soft-delete: the
     // primary record's `owner` field stays populated, and stripping the
     // owner row would break `UNDROP COLLECTION`'s ownership restore.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -526,6 +567,27 @@ mod tests {
         let owners = catalog.load_all_owners().unwrap();
         assert!(!owners.iter().any(|owner| owner.database_id == 9));
         assert!(owners.iter().any(|owner| owner.database_id == 0));
+    }
+
+    /// A rejected catalog write reaches the metadata applier, which halts the
+    /// watermark. Swallowing it acks an entry this node never applied.
+    #[test]
+    fn apply_put_collection_raises_when_the_catalog_write_fails() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+        catalog.fail_next_collection_write_for_test();
+
+        let stored = StoredCollection::new(1, "wedged", "carol");
+        let error = apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
+            .expect_err("a failed catalog write must raise, not be swallowed");
+
+        assert!(error.to_string().contains("wedged"), "{error}");
+        assert!(
+            catalog
+                .get_collection(DatabaseId::DEFAULT, 1, "wedged")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

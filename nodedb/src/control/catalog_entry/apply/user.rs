@@ -2,29 +2,18 @@
 
 //! Apply User catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredUser, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredUser, SystemCatalog};
-
-pub fn put(stored: &StoredUser, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_user(stored) {
-        warn!(
-            username = %stored.username,
-            error = %e,
-            "catalog_entry: put_user failed"
-        );
-    }
+pub fn put(stored: &StoredUser, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .put_user(stored)
+        .map_err(|e| catalog_err(&format!("put_user '{}'", stored.username), e))
 }
 
-pub fn delete(username: &str, catalog: &SystemCatalog) {
-    // Fully remove the user record from redb. `delete_user` is
-    // idempotent — a missing record on a fresh follower is a
-    // harmless no-op (redb `remove` on an absent key succeeds).
-    if let Err(e) = catalog.delete_user(username) {
-        warn!(
-            username = %username,
-            error = %e,
-            "catalog_entry: delete_user failed"
-        );
-    }
+/// Fully remove the user record from redb. `delete_user` is idempotent — a
+/// missing record on a fresh follower succeeds (redb `remove` tolerates it).
+pub fn delete(username: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_user(username)
+        .map_err(|e| catalog_err(&format!("delete_user '{username}'"), e))
 }

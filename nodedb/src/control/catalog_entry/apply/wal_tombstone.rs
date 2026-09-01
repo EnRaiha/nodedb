@@ -2,9 +2,7 @@
 
 //! Apply `RecordWalTombstone` catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
-
-use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::{SystemCatalog, catalog_err};
 
 pub fn record(
     database_id: u64,
@@ -12,17 +10,18 @@ pub fn record(
     collection: &str,
     purge_lsn: u64,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.record_wal_tombstone(database_id, tenant_id, collection, purge_lsn) {
-        warn!(
-            database_id,
-            tenant_id,
-            collection = %collection,
-            purge_lsn,
-            error = %e,
-            "catalog_entry: record_wal_tombstone failed"
-        );
-    }
+) -> crate::Result<()> {
+    catalog
+        .record_wal_tombstone(database_id, tenant_id, collection, purge_lsn)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "record_wal_tombstone for '{collection}' \
+                     (database {database_id}, tenant {tenant_id}, purge_lsn {purge_lsn})"
+                ),
+                e,
+            )
+        })
 }
 
 #[cfg(test)]

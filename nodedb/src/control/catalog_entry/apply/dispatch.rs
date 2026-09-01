@@ -16,18 +16,18 @@ use super::{
 
 /// Apply `entry` to `catalog`.
 ///
-/// Per-variant errors are logged and swallowed so startup replay can retry.
-/// A compound mutation whose partial application would expose stale state
-/// panics the applying node instead. Debug builds verify referential
-/// integrity after every apply — release-gated because a full rescan would
-/// wedge `raft_tick_loop` on a node with a pre-existing orphan.
+/// A failed catalog write raises: skipping a committed metadata entry
+/// diverges this node from the quorum. `Ok(false)` reports that the entry
+/// wrote nothing, which still concludes its DDL. Debug builds verify
+/// referential integrity after every apply — release-gated because a full
+/// rescan would wedge `raft_tick_loop` on a node with a pre-existing orphan.
 pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<bool, crate::Error> {
     let applied = match entry {
         CatalogEntry::PutTenantWithAdmin { tenant, admin } => {
-            tenant::put_with_admin(tenant, admin, catalog)
+            tenant::put_with_admin(tenant, admin, catalog)?
         }
         _ => {
-            apply_to_inner(entry, catalog);
+            apply_to_inner(entry, catalog)?;
             true
         }
     };
@@ -62,7 +62,7 @@ pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<bool, c
     Ok(true)
 }
 
-fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
+fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Result<()> {
     match entry {
         CatalogEntry::PutCollection(stored) => collection::put(stored, catalog),
         CatalogEntry::PutCollectionIfAbsent(stored) => collection::put_if_absent(stored, catalog),
@@ -92,12 +92,15 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             match collection::prepare_purge(*database_id, *tenant_id, name, catalog) {
                 // A node that never held the row has nothing to fence.
                 // Interactive purge paths use `prepare_purge_checked` instead.
-                Ok(found) => debug!(
-                    collection = %name,
-                    tenant = *tenant_id,
-                    found,
-                    "catalog_entry: purge preparation"
-                ),
+                Ok(found) => {
+                    debug!(
+                        collection = %name,
+                        tenant = *tenant_id,
+                        found,
+                        "catalog_entry: purge preparation"
+                    );
+                    Ok(())
+                }
                 Err(error) => panic!("collection catalog purge preparation failed: {error}"),
             }
         }
@@ -145,8 +148,9 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         CatalogEntry::PutAuthUser(stored) => auth_user::put(stored, catalog),
         CatalogEntry::PutMaterializedView(stored) => materialized_view::put(stored, catalog),
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
-            if let Err(error) = materialized_view::delete(*tenant_id, name, catalog) {
-                panic!("materialized-view catalog deletion failed: {error}");
+            match materialized_view::delete(*tenant_id, name, catalog) {
+                Ok(()) => Ok(()),
+                Err(error) => panic!("materialized-view catalog deletion failed: {error}"),
             }
         }
         CatalogEntry::PutStreamingMaterializedView(definition) => {
@@ -156,13 +160,10 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             database_id,
             tenant_id,
             name,
-        } => {
-            if let Err(error) =
-                streaming_materialized_view::delete(*database_id, *tenant_id, name, catalog)
-            {
-                panic!("streaming materialized-view catalog deletion failed: {error}");
-            }
-        }
+        } => match streaming_materialized_view::delete(*database_id, *tenant_id, name, catalog) {
+            Ok(()) => Ok(()),
+            Err(error) => panic!("streaming materialized-view catalog deletion failed: {error}"),
+        },
         CatalogEntry::PutContinuousAggregate(stored) => continuous_aggregate::put(stored, catalog),
         CatalogEntry::DeleteContinuousAggregate {
             database_id,
@@ -171,7 +172,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         } => continuous_aggregate::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutTenant(stored) => tenant::put(stored, catalog),
         // Applied by `apply_to` so its commit outcome can suppress post-apply.
-        CatalogEntry::PutTenantWithAdmin { .. } => {}
+        CatalogEntry::PutTenantWithAdmin { .. } => Ok(()),
         CatalogEntry::DeleteTenant { tenant_id } => tenant::delete(*tenant_id, catalog),
         CatalogEntry::PutRlsPolicy(stored) => rls::put(stored, catalog),
         CatalogEntry::DeleteRlsPolicy {

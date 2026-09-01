@@ -12,7 +12,7 @@ use crate::control::security::catalog::function_types::{FunctionLanguage, Stored
 /// A malformed or incomplete WASM proposal is a replicated-state violation:
 /// panic before installing metadata so a node cannot advertise a function
 /// whose module it cannot execute.
-pub fn put(stored: &StoredFunction, catalog: &SystemCatalog) {
+pub fn put(stored: &StoredFunction, catalog: &SystemCatalog) -> crate::Result<()> {
     // Validation and local-payload recovery complete before the write
     // transaction starts. The transaction then commits metadata, module
     // installation, and old-module cleanup together.
@@ -28,7 +28,7 @@ pub fn put(stored: &StoredFunction, catalog: &SystemCatalog) {
         &stored.name,
         &stored.owner,
         catalog,
-    );
+    )
 }
 
 pub fn delete(
@@ -36,7 +36,7 @@ pub fn delete(
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
-) {
+) -> crate::Result<()> {
     catalog
         .delete_function_with_unreferenced_wasm(database_id, tenant_id, name)
         .unwrap_or_else(|error| panic!("atomic function/WASM catalog delete failed: {error}"));
@@ -47,7 +47,7 @@ pub fn delete(
         tenant_id,
         name,
         catalog,
-    );
+    )
 }
 
 fn validate_module(stored: &StoredFunction, catalog: &SystemCatalog) -> Option<Vec<u8>> {
@@ -130,7 +130,7 @@ mod tests {
         let stored = wasm_function("f", Some(bytes.clone()));
         let hash = stored.wasm_hash.clone().unwrap();
 
-        put(&stored, &catalog);
+        put(&stored, &catalog).expect("apply put");
 
         assert_eq!(load_wasm_binary(&catalog, &hash).unwrap(), bytes);
         assert!(
@@ -167,15 +167,15 @@ mod tests {
         let bytes = b"\0asmshared".to_vec();
         let first = wasm_function("first", Some(bytes.clone()));
         let hash = first.wasm_hash.clone().unwrap();
-        put(&first, &catalog);
+        put(&first, &catalog).expect("apply put");
         let mut second = wasm_function("second", None);
         second.wasm_hash = Some(hash.clone());
-        put(&second, &catalog);
+        put(&second, &catalog).expect("apply put");
 
-        delete(nodedb_types::DatabaseId::DEFAULT, 1, "first", &catalog);
+        delete(nodedb_types::DatabaseId::DEFAULT, 1, "first", &catalog).expect("apply delete");
         assert_eq!(load_wasm_binary(&catalog, &hash).unwrap(), bytes);
 
-        delete(nodedb_types::DatabaseId::DEFAULT, 1, "second", &catalog);
+        delete(nodedb_types::DatabaseId::DEFAULT, 1, "second", &catalog).expect("apply delete");
         assert!(load_wasm_binary(&catalog, &hash).is_err());
     }
 
@@ -184,7 +184,7 @@ mod tests {
         let catalog = catalog();
         let first = wasm_function("replace", Some(b"\0asmold".to_vec()));
         let old_hash = first.wasm_hash.clone().unwrap();
-        put(&first, &catalog);
+        put(&first, &catalog).expect("apply put");
 
         let replacement = wasm_function("replace", Some(b"\0asmnew".to_vec()));
         let new_hash = replacement.wasm_hash.clone().unwrap();
@@ -209,10 +209,10 @@ mod tests {
         let catalog = catalog();
         let first = wasm_function("replace", Some(b"\0asmold".to_vec()));
         let old_hash = first.wasm_hash.clone().unwrap();
-        put(&first, &catalog);
+        put(&first, &catalog).expect("apply put");
         let replacement = wasm_function("replace", Some(b"\0asmnew".to_vec()));
         let new_hash = replacement.wasm_hash.clone().unwrap();
-        put(&replacement, &catalog);
+        put(&replacement, &catalog).expect("apply put");
 
         assert!(load_wasm_binary(&catalog, &old_hash).is_err());
         assert_eq!(

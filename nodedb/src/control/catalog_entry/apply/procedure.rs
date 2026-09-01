@@ -2,21 +2,22 @@
 
 //! Apply Procedure catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
-
-use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::procedure_types::StoredProcedure;
+use crate::control::security::catalog::{SystemCatalog, catalog_err};
 
-pub fn put(stored: &StoredProcedure, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_procedure(stored) {
-        warn!(
-            procedure = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_procedure failed"
-        );
-    }
+pub fn put(stored: &StoredProcedure, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_procedure(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_procedure '{}' (database {}, tenant {})",
+                stored.name,
+                stored.database_id.as_u64(),
+                stored.tenant_id
+            ),
+            e,
+        )
+    })?;
     super::owner::put_parent_owner_in_database(
         object_type::PROCEDURE,
         stored.database_id.as_u64(),
@@ -24,7 +25,7 @@ pub fn put(stored: &StoredProcedure, catalog: &SystemCatalog) {
         &stored.name,
         &stored.owner,
         catalog,
-    );
+    )
 }
 
 pub fn delete(
@@ -32,20 +33,23 @@ pub fn delete(
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.delete_procedure_in_database(database_id, tenant_id, name) {
-        warn!(
-            procedure = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_procedure failed"
-        );
-    }
+) -> crate::Result<()> {
+    catalog
+        .delete_procedure_in_database(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_procedure '{name}' (database {}, tenant {tenant_id})",
+                    database_id.as_u64()
+                ),
+                e,
+            )
+        })?;
     super::owner::delete_parent_owner_in_database(
         object_type::PROCEDURE,
         database_id.as_u64(),
         tenant_id,
         name,
         catalog,
-    );
+    )
 }

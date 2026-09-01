@@ -2,30 +2,33 @@
 
 //! Apply RLS policy catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredRlsPolicy, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredRlsPolicy, SystemCatalog};
-
-pub fn put(stored: &StoredRlsPolicy, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_rls_policy(stored) {
-        warn!(
-            policy = %stored.name,
-            collection = %stored.collection,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_rls_policy failed"
-        );
-    }
+pub fn put(stored: &StoredRlsPolicy, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_rls_policy(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_rls_policy '{}' on '{}' (tenant {})",
+                stored.name, stored.collection, stored.tenant_id
+            ),
+            e,
+        )
+    })
 }
 
-pub fn delete(tenant_id: u64, collection: &str, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_rls_policy(tenant_id, collection, name) {
-        warn!(
-            policy = %name,
-            collection = %collection,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_rls_policy failed"
-        );
-    }
+pub fn delete(
+    tenant_id: u64,
+    collection: &str,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .delete_rls_policy(tenant_id, collection, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!("delete_rls_policy '{name}' on '{collection}' (tenant {tenant_id})"),
+                e,
+            )
+        })
+        .map(|_| ())
 }

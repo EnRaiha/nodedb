@@ -94,6 +94,16 @@ impl SystemCatalog {
         database_id: DatabaseId,
         coll: &StoredCollection,
     ) -> crate::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_collection_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(catalog_err(
+                "insert collection",
+                "injected collection write failure",
+            ));
+        }
         let inner_key = format!("{}:{}", coll.tenant_id, coll.name);
         let bytes =
             zerompk::to_msgpack_vec(coll).map_err(|e| catalog_err("serialize collection", e))?;

@@ -2,20 +2,19 @@
 
 //! Apply ContinuousAggregate catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
-
 use crate::control::security::catalog::auth_types::object_type;
-use crate::control::security::catalog::{StoredContinuousAggregate, SystemCatalog};
+use crate::control::security::catalog::{StoredContinuousAggregate, SystemCatalog, catalog_err};
 
-pub fn put(stored: &StoredContinuousAggregate, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_continuous_aggregate(stored) {
-        warn!(
-            cagg = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_continuous_aggregate failed"
-        );
-    }
+pub fn put(stored: &StoredContinuousAggregate, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_continuous_aggregate(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_continuous_aggregate '{}' (database {}, tenant {})",
+                stored.name, stored.database_id, stored.tenant_id
+            ),
+            e,
+        )
+    })?;
     super::owner::put_parent_owner_in_database(
         object_type::CONTINUOUS_AGGREGATE,
         stored.database_id,
@@ -23,25 +22,33 @@ pub fn put(stored: &StoredContinuousAggregate, catalog: &SystemCatalog) {
         &stored.name,
         &stored.owner,
         catalog,
-    );
+    )
 }
 
-pub fn delete(database_id: u64, tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_continuous_aggregate(database_id, tenant_id, name) {
-        warn!(
-            cagg = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_continuous_aggregate failed"
-        );
-    }
+pub fn delete(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .delete_continuous_aggregate(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_continuous_aggregate '{name}' \
+                     (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })?;
     super::owner::delete_parent_owner_in_database(
         object_type::CONTINUOUS_AGGREGATE,
         database_id,
         tenant_id,
         name,
         catalog,
-    );
+    )
 }
 
 #[cfg(test)]

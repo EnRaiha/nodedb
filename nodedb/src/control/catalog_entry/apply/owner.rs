@@ -20,20 +20,18 @@
 //!    the call leaves redb orphaned on the next restart
 //!    (`verify_redb_integrity` aborts boot with `OrphanRow`).
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredOwner, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredOwner, SystemCatalog};
-
-pub fn put(stored: &StoredOwner, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_owner(stored) {
-        warn!(
-            object_type = %stored.object_type,
-            tenant = stored.tenant_id,
-            object = %stored.object_name,
-            error = %e,
-            "catalog_entry: put_owner failed"
-        );
-    }
+pub fn put(stored: &StoredOwner, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_owner(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_owner {} '{}' (tenant {})",
+                stored.object_type, stored.object_name, stored.tenant_id
+            ),
+            e,
+        )
+    })
 }
 
 pub fn delete(
@@ -42,16 +40,18 @@ pub fn delete(
     tenant_id: u64,
     object_name: &str,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.delete_owner(object_type, database_id, tenant_id, object_name) {
-        warn!(
-            object_type = %object_type,
-            tenant = tenant_id,
-            object = %object_name,
-            error = %e,
-            "catalog_entry: delete_owner failed"
-        );
-    }
+) -> crate::Result<()> {
+    catalog
+        .delete_owner(object_type, database_id, tenant_id, object_name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_owner {object_type} '{object_name}' \
+                     (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })
 }
 
 /// Write the `StoredOwner` row for a parent-replicated DDL object.
@@ -67,7 +67,7 @@ pub(super) fn put_parent_owner(
     object_name: &str,
     owner_username: &str,
     catalog: &SystemCatalog,
-) {
+) -> crate::Result<()> {
     put_parent_owner_in_database(
         object_type,
         0,
@@ -75,7 +75,7 @@ pub(super) fn put_parent_owner(
         object_name,
         owner_username,
         catalog,
-    );
+    )
 }
 
 pub(super) fn put_parent_owner_in_database(
@@ -85,7 +85,7 @@ pub(super) fn put_parent_owner_in_database(
     object_name: &str,
     owner_username: &str,
     catalog: &SystemCatalog,
-) {
+) -> crate::Result<()> {
     let stored = StoredOwner {
         database_id,
         object_type: object_type.to_string(),
@@ -93,15 +93,15 @@ pub(super) fn put_parent_owner_in_database(
         tenant_id,
         owner_username: owner_username.to_string(),
     };
-    if let Err(e) = catalog.put_owner(&stored) {
-        warn!(
-            object_type,
-            tenant = tenant_id,
-            object = %object_name,
-            error = %e,
-            "catalog_entry: put_parent_owner failed"
-        );
-    }
+    catalog.put_owner(&stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_parent_owner {object_type} '{object_name}' \
+                 (database {database_id}, tenant {tenant_id})"
+            ),
+            e,
+        )
+    })
 }
 
 /// Remove the `StoredOwner` row for a parent-replicated DDL object.
@@ -115,8 +115,8 @@ pub(super) fn delete_parent_owner(
     tenant_id: u64,
     object_name: &str,
     catalog: &SystemCatalog,
-) {
-    delete_parent_owner_in_database(object_type, 0, tenant_id, object_name, catalog);
+) -> crate::Result<()> {
+    delete_parent_owner_in_database(object_type, 0, tenant_id, object_name, catalog)
 }
 
 pub(super) fn delete_parent_owner_in_database(
@@ -125,36 +125,16 @@ pub(super) fn delete_parent_owner_in_database(
     tenant_id: u64,
     object_name: &str,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.delete_owner(object_type, database_id, tenant_id, object_name) {
-        warn!(
-            object_type,
-            tenant = tenant_id,
-            object = %object_name,
-            error = %e,
-            "catalog_entry: delete_parent_owner failed"
-        );
-    }
-}
-
-/// Fail-closed owner deletion for compound lifecycle mutations whose primary
-/// and owner rows must advance atomically.
-pub(super) fn delete_parent_owner_checked(
-    object_type: &'static str,
-    tenant_id: u64,
-    object_name: &str,
-    catalog: &SystemCatalog,
 ) -> crate::Result<()> {
-    delete_parent_owner_in_database_checked(object_type, 0, tenant_id, object_name, catalog)
-}
-
-pub(super) fn delete_parent_owner_in_database_checked(
-    object_type: &'static str,
-    database_id: u64,
-    tenant_id: u64,
-    object_name: &str,
-    catalog: &SystemCatalog,
-) -> crate::Result<()> {
-    catalog.delete_owner(object_type, database_id, tenant_id, object_name)?;
-    Ok(())
+    catalog
+        .delete_owner(object_type, database_id, tenant_id, object_name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_parent_owner {object_type} '{object_name}' \
+                     (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })
 }

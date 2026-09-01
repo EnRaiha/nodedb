@@ -2,21 +2,22 @@
 
 //! Apply Trigger catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
-
-use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::trigger_types::StoredTrigger;
+use crate::control::security::catalog::{SystemCatalog, catalog_err};
 
-pub fn put(stored: &StoredTrigger, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_trigger(stored) {
-        warn!(
-            trigger = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_trigger failed"
-        );
-    }
+pub fn put(stored: &StoredTrigger, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_trigger(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_trigger '{}' (database {}, tenant {})",
+                stored.name,
+                stored.database_id.as_u64(),
+                stored.tenant_id
+            ),
+            e,
+        )
+    })?;
     super::owner::put_parent_owner_in_database(
         object_type::TRIGGER,
         stored.database_id.as_u64(),
@@ -24,7 +25,7 @@ pub fn put(stored: &StoredTrigger, catalog: &SystemCatalog) {
         &stored.name,
         &stored.owner,
         catalog,
-    );
+    )
 }
 
 pub fn delete(
@@ -32,20 +33,23 @@ pub fn delete(
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.delete_trigger_in_database(database_id, tenant_id, name) {
-        warn!(
-            trigger = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_trigger failed"
-        );
-    }
+) -> crate::Result<()> {
+    catalog
+        .delete_trigger_in_database(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_trigger '{name}' (database {}, tenant {tenant_id})",
+                    database_id.as_u64()
+                ),
+                e,
+            )
+        })?;
     super::owner::delete_parent_owner_in_database(
         object_type::TRIGGER,
         database_id.as_u64(),
         tenant_id,
         name,
         catalog,
-    );
+    )
 }

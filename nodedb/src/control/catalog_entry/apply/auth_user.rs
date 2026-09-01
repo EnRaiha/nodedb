@@ -2,17 +2,13 @@
 
 //! Apply auth-user catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredAuthUser, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredAuthUser, SystemCatalog};
-
-pub fn put(stored: &StoredAuthUser, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_auth_user(stored) {
-        warn!(
-            user_id = %stored.id,
-            status = %stored.status,
-            error = %e,
-            "catalog_entry: put_auth_user failed"
-        );
-    }
+pub fn put(stored: &StoredAuthUser, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_auth_user(stored).map_err(|e| {
+        catalog_err(
+            &format!("put_auth_user {} (status {})", stored.id, stored.status),
+            e,
+        )
+    })
 }

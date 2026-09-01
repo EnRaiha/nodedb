@@ -2,35 +2,39 @@
 
 //! Apply the index-registry catalog entries.
 //!
-//! The registry is the identity spine of every index kind, so a write that
-//! fails here leaves an index that no `SHOW INDEXES` lists and no
-//! `DROP INDEX` can reach. Failures are logged at `warn` and the entry is
-//! retried by startup replay, matching every other single-row apply in this
-//! module.
+//! The registry is the identity spine of every index kind. A failed write here
+//! would leave an index that no `SHOW INDEXES` lists and no `DROP INDEX` can
+//! reach, so the error propagates and halts the metadata applier.
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredIndexRecord, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredIndexRecord, SystemCatalog};
-
-pub(super) fn put(record: &StoredIndexRecord, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_index_record(record) {
-        warn!(
-            index = %record.name,
-            collection = %record.collection,
-            tenant = record.tenant_id,
-            error = %e,
-            "catalog_entry: put_index_record failed"
-        );
-    }
+pub(super) fn put(record: &StoredIndexRecord, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_index_record(record).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_index_record '{}' on '{}' (tenant {})",
+                record.name, record.collection, record.tenant_id
+            ),
+            e,
+        )
+    })
 }
 
-pub(super) fn delete(database_id: u64, tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_index_record(database_id, tenant_id, name) {
-        warn!(
-            index = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_index_record failed"
-        );
-    }
+pub(super) fn delete(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .delete_index_record(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_index_record '{name}' (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })
+        .map(|_| ())
 }

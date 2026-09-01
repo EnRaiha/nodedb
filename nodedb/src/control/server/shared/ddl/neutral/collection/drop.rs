@@ -325,7 +325,8 @@ pub fn drop_collection(
                     modification_hlc: nodedb_types::Hlc::ZERO,
                 },
                 catalog,
-            );
+            )
+            .map_err(|error| err("XX000", format!("catalog deactivate failed: {error}")))?;
         }
     }
 

@@ -2,98 +2,97 @@
 
 //! Apply database catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
-
-use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::database_types::DatabaseDescriptor;
+use crate::control::security::catalog::{SystemCatalog, catalog_err};
 use nodedb_types::DatabaseId;
 
 /// Apply a `PutDatabase` entry — upsert the descriptor into
 /// `_system.databases` and `_system.databases_by_name`.
-pub fn put(descriptor: &DatabaseDescriptor, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_database(descriptor) {
-        warn!(
-            db_id = descriptor.id.as_u64(),
-            name = %descriptor.name,
-            error = %e,
-            "catalog_entry: put_database failed"
-        );
-    }
+pub fn put(descriptor: &DatabaseDescriptor, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_database(descriptor).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_database '{}' (database {})",
+                descriptor.name,
+                descriptor.id.as_u64()
+            ),
+            e,
+        )
+    })
 }
 
 /// Apply a `DeleteDatabase` entry — remove the descriptor, its
 /// reverse-lookup row, and the quota rows of the dropped scope.
-pub fn delete(db_id: u64, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_database(DatabaseId::new(db_id)) {
-        warn!(
-            db_id,
-            error = %e,
-            "catalog_entry: delete_database failed"
-        );
-    }
+pub fn delete(db_id: u64, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_database(DatabaseId::new(db_id))
+        .map_err(|e| catalog_err(&format!("delete_database (database {db_id})"), e))?;
     // A stale quota row keeps consuming the sum-of-quotas ceiling.
-    super::quota::purge_database_scope(db_id, catalog);
+    super::quota::purge_database_scope(db_id, catalog)
 }
 
 /// Apply a `PutDatabaseGrant` entry.
-pub fn put_grant(db_id: u64, user_id: u64, privilege: &str, catalog: &SystemCatalog) {
-    let db = DatabaseId::new(db_id);
-    if let Err(e) = catalog.put_database_grant(db, user_id, privilege) {
-        warn!(
-            db_id,
-            user_id,
-            privilege,
-            error = %e,
-            "catalog_entry: put_database_grant failed"
-        );
-    }
+pub fn put_grant(
+    db_id: u64,
+    user_id: u64,
+    privilege: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .put_database_grant(DatabaseId::new(db_id), user_id, privilege)
+        .map_err(|e| {
+            catalog_err(
+                &format!("put_database_grant '{privilege}' (database {db_id}, user {user_id})"),
+                e,
+            )
+        })
 }
 
 /// Apply a `CloneDatabase` entry — write the target descriptor, update the
 /// clone lineage table, and stamp every source collection into the target
 /// database with `cloned_from` set so the SQL planner can resolve queries
 /// against the clone without a source-side lookup at plan time.
+///
+/// Every step raises on failure: a half-stamped clone answers queries this
+/// node's peers answer differently.
 pub fn clone_apply(
     target_descriptor: &DatabaseDescriptor,
     source_db_id: u64,
     catalog: &SystemCatalog,
-) {
-    if let Err(e) = catalog.put_database(target_descriptor) {
-        warn!(
-            target_db_id = target_descriptor.id.as_u64(),
-            name = %target_descriptor.name,
-            error = %e,
-            "catalog_entry: clone_database put_database failed"
-        );
-        return;
-    }
-    let source = DatabaseId::new(source_db_id);
+) -> crate::Result<()> {
     let child = target_descriptor.id;
-    if let Err(e) = catalog.add_clone_child(source, child) {
-        warn!(
-            source_db_id,
-            child_db_id = child.as_u64(),
-            error = %e,
-            "catalog_entry: clone_database add_clone_child failed"
-        );
-    }
+    catalog.put_database(target_descriptor).map_err(|e| {
+        catalog_err(
+            &format!(
+                "clone_database descriptor write of '{}' (database {})",
+                target_descriptor.name,
+                child.as_u64()
+            ),
+            e,
+        )
+    })?;
+    let source = DatabaseId::new(source_db_id);
+    catalog.add_clone_child(source, child).map_err(|e| {
+        catalog_err(
+            &format!(
+                "clone_database lineage edge (source {source_db_id}, child {})",
+                child.as_u64()
+            ),
+            e,
+        )
+    })?;
 
     // Determine the as_of and clone_created_at LSN values from the target
     // descriptor's parent_clone reference.
-    let (as_of_lsn, clone_created_at, kv_surrogate_ceiling) = match &target_descriptor.parent_clone
-    {
-        Some(pc) => (
-            nodedb_types::Lsn::new(pc.as_of_lsn),
-            nodedb_types::Lsn::new(target_descriptor.created_at_lsn),
-            pc.kv_surrogate_ceiling,
-        ),
-        None => {
-            // No parent clone ref — nothing to stamp. Descriptor was written
-            // above; non-clone databases are complete.
-            return;
-        }
+    let Some(parent_clone) = &target_descriptor.parent_clone else {
+        // No parent clone ref — nothing to stamp. Descriptor was written
+        // above; non-clone databases are complete.
+        return Ok(());
     };
+    let as_of_lsn = nodedb_types::Lsn::new(parent_clone.as_of_lsn);
+    let clone_created_at = nodedb_types::Lsn::new(target_descriptor.created_at_lsn);
+    let kv_surrogate_ceiling = parent_clone.kv_surrogate_ceiling;
 
     // Enumerate every active collection in the source database and write a
     // shadow descriptor into the target database so the SQL planner can
@@ -106,17 +105,12 @@ pub fn clone_apply(
     // We enumerate all tenants visible in the source by walking every
     // collection row under the source database_id. The tenant_id is encoded
     // in the inner key prefix, so we collect it from the row itself.
-    let source_colls = match catalog.load_all_collections(source) {
-        Ok(cs) => cs,
-        Err(e) => {
-            warn!(
-                source_db_id,
-                error = %e,
-                "catalog_entry: clone_database: failed to enumerate source collections"
-            );
-            return;
-        }
-    };
+    let source_colls = catalog.load_all_collections(source).map_err(|e| {
+        catalog_err(
+            &format!("clone_database enumeration of source database {source_db_id}"),
+            e,
+        )
+    })?;
 
     for mut coll in source_colls.into_iter().filter(|c| c.is_active) {
         coll.database_id = child;
@@ -130,35 +124,107 @@ pub fn clone_apply(
         coll.clone_status = nodedb_types::CloneStatus::Shadowed;
         // Reset versioning so the new clone descriptor starts fresh.
         coll.descriptor_version = 0;
-        match catalog.put_collection(child, &coll) {
-            Ok(()) => super::owner::put_parent_owner_in_database(
-                object_type::COLLECTION,
-                child.as_u64(),
-                coll.tenant_id,
-                &coll.name,
-                &coll.owner,
-                catalog,
-            ),
-            Err(e) => warn!(
-                target_db_id = child.as_u64(),
-                collection = %coll.name,
-                error = %e,
-                "catalog_entry: clone_database: failed to stamp shadow collection"
-            ),
-        }
+        catalog.put_collection(child, &coll).map_err(|e| {
+            catalog_err(
+                &format!(
+                    "clone_database shadow stamp of '{}' into database {}",
+                    coll.name,
+                    child.as_u64()
+                ),
+                e,
+            )
+        })?;
+        super::owner::put_parent_owner_in_database(
+            object_type::COLLECTION,
+            child.as_u64(),
+            coll.tenant_id,
+            &coll.name,
+            &coll.owner,
+            catalog,
+        )?;
     }
+    Ok(())
 }
 
 /// Apply a `DeleteDatabaseGrant` entry.
-pub fn delete_grant(db_id: u64, user_id: u64, privilege: &str, catalog: &SystemCatalog) {
-    let db = DatabaseId::new(db_id);
-    if let Err(e) = catalog.delete_database_grant(db, user_id, privilege) {
-        warn!(
-            db_id,
-            user_id,
-            privilege,
-            error = %e,
-            "catalog_entry: delete_database_grant failed"
+pub fn delete_grant(
+    db_id: u64,
+    user_id: u64,
+    privilege: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .delete_database_grant(DatabaseId::new(db_id), user_id, privilege)
+        .map_err(|e| {
+            catalog_err(
+                &format!("delete_database_grant '{privilege}' (database {db_id}, user {user_id})"),
+                e,
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::control::catalog_entry::apply::apply_to;
+    use crate::control::catalog_entry::entry::CatalogEntry;
+    use crate::control::security::catalog::StoredCollection;
+    use crate::control::security::catalog::database_types::{DatabaseStatus, ParentCloneRef};
+    use crate::control::security::credential::store::CredentialStore;
+
+    fn open_catalog() -> (Arc<CredentialStore>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(
+            CredentialStore::open(&tmp.path().join("system.redb")).expect("open credential store"),
+        );
+        (store, tmp)
+    }
+
+    fn clone_descriptor(source: DatabaseId, child: DatabaseId) -> DatabaseDescriptor {
+        DatabaseDescriptor {
+            id: child,
+            name: "clone_target".into(),
+            status: DatabaseStatus::Cloning,
+            created_at_lsn: 20,
+            quota_ref: 0,
+            parent_clone: Some(ParentCloneRef {
+                source_db_id: source,
+                as_of_lsn: 10,
+                as_of_ms: 0,
+                kv_surrogate_ceiling: None,
+            }),
+            mirror_origin: None,
+            audit_dml: nodedb_types::AuditDmlMode::None,
+            idle_session_timeout_secs: 0,
+        }
+    }
+
+    /// A shadow-stamp failure aborts the whole clone. Finishing the remaining
+    /// collections would leave this node answering queries its peers cannot.
+    #[test]
+    fn clone_apply_raises_instead_of_stamping_the_rest() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+        let source = DatabaseId::new(1);
+        let child = DatabaseId::new(2);
+        for name in ["orders", "invoices"] {
+            let mut coll = StoredCollection::new(5, name, "cloner");
+            coll.database_id = source;
+            apply_to(&CatalogEntry::PutCollection(Box::new(coll)), catalog)
+                .expect("seed source collection");
+        }
+
+        catalog.fail_next_collection_write_for_test();
+        let error = clone_apply(&clone_descriptor(source, child), source.as_u64(), catalog)
+            .expect_err("a failed shadow stamp must raise");
+        assert!(error.to_string().contains("clone_database"), "{error}");
+
+        let stamped = catalog.load_all_collections(child).expect("load target");
+        assert!(
+            stamped.is_empty(),
+            "a raised clone leaves no partially stamped target: {stamped:?}"
         );
     }
 }

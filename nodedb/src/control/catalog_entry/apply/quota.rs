@@ -6,102 +6,91 @@
 //! validation and ceiling checks belong to the leader, before the propose.
 
 use nodedb_types::{DatabaseId, QuotaRecord, TenantId};
-use tracing::warn;
 
-use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::{SystemCatalog, catalog_err};
 use crate::diag::{DATABASE_SCOPE, TENANT_SCOPE};
 
 /// Apply a `PutDatabaseQuota` entry.
-pub fn put_database(db_id: u64, record: &QuotaRecord, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.write_database_quota(DatabaseId::new(db_id), record) {
-        warn!(
-            db_id,
-            error = %e,
-            "catalog_entry: write_database_quota failed"
-        );
-        crate::diag::quota_row_write_failed(&e, "write_database_quota", db_id, None);
-    }
+pub fn put_database(
+    db_id: u64,
+    record: &QuotaRecord,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .write_database_quota(DatabaseId::new(db_id), record)
+        .map_err(|e| {
+            crate::diag::quota_row_write_failed(&e, "write_database_quota", db_id, None);
+            catalog_err(&format!("write_database_quota (database {db_id})"), e)
+        })
 }
 
 /// Apply a `DeleteDatabaseQuota` entry.
-pub fn delete_database(db_id: u64, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_database_quota(DatabaseId::new(db_id)) {
-        warn!(
-            db_id,
-            error = %e,
-            "catalog_entry: delete_database_quota failed"
-        );
-        crate::diag::quota_row_write_failed(&e, "delete_database_quota", db_id, None);
-    }
+pub fn delete_database(db_id: u64, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_database_quota(DatabaseId::new(db_id))
+        .map_err(|e| {
+            crate::diag::quota_row_write_failed(&e, "delete_database_quota", db_id, None);
+            catalog_err(&format!("delete_database_quota (database {db_id})"), e)
+        })
 }
 
 /// Apply a `PutTenantQuota` entry.
-pub fn put_tenant(db_id: u64, tenant_id: u64, record: &QuotaRecord, catalog: &SystemCatalog) {
-    if let Err(e) =
-        catalog.write_tenant_quota(DatabaseId::new(db_id), TenantId::new(tenant_id), record)
-    {
-        warn!(
-            db_id,
-            tenant_id,
-            error = %e,
-            "catalog_entry: write_tenant_quota failed"
-        );
-        crate::diag::quota_row_write_failed(&e, "write_tenant_quota", db_id, Some(tenant_id));
-    }
+pub fn put_tenant(
+    db_id: u64,
+    tenant_id: u64,
+    record: &QuotaRecord,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .write_tenant_quota(DatabaseId::new(db_id), TenantId::new(tenant_id), record)
+        .map_err(|e| {
+            crate::diag::quota_row_write_failed(&e, "write_tenant_quota", db_id, Some(tenant_id));
+            catalog_err(
+                &format!("write_tenant_quota (database {db_id}, tenant {tenant_id})"),
+                e,
+            )
+        })
 }
 
 /// Apply a `DeleteTenantQuota` entry.
-pub fn delete_tenant(db_id: u64, tenant_id: u64, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_tenant_quota(DatabaseId::new(db_id), TenantId::new(tenant_id)) {
-        warn!(
-            db_id,
-            tenant_id,
-            error = %e,
-            "catalog_entry: delete_tenant_quota failed"
-        );
-        crate::diag::quota_row_write_failed(&e, "delete_tenant_quota", db_id, Some(tenant_id));
-    }
+pub fn delete_tenant(db_id: u64, tenant_id: u64, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_tenant_quota(DatabaseId::new(db_id), TenantId::new(tenant_id))
+        .map_err(|e| {
+            crate::diag::quota_row_write_failed(&e, "delete_tenant_quota", db_id, Some(tenant_id));
+            catalog_err(
+                &format!("delete_tenant_quota (database {db_id}, tenant {tenant_id})"),
+                e,
+            )
+        })
 }
 
 /// Delete the quota rows of a dropped database, its tenant rows included.
-pub fn purge_database_scope(db_id: u64, catalog: &SystemCatalog) {
-    match catalog.list_tenant_quotas_for_database(DatabaseId::new(db_id)) {
-        Ok(rows) => {
-            for (tenant_id, _) in rows {
-                delete_tenant(db_id, tenant_id.as_u64(), catalog);
-            }
-        }
-        Err(e) => {
-            warn!(
-                db_id,
-                error = %e,
-                "catalog_entry: tenant quota scan failed"
-            );
+pub fn purge_database_scope(db_id: u64, catalog: &SystemCatalog) -> crate::Result<()> {
+    let rows = catalog
+        .list_tenant_quotas_for_database(DatabaseId::new(db_id))
+        .map_err(|e| {
             crate::diag::quota_scope_purge_incomplete(&e, DATABASE_SCOPE, Some(db_id), None);
-        }
+            catalog_err(&format!("tenant quota scan (database {db_id})"), e)
+        })?;
+    for (tenant_id, _) in rows {
+        delete_tenant(db_id, tenant_id.as_u64(), catalog)?;
     }
-    delete_database(db_id, catalog);
+    delete_database(db_id, catalog)
 }
 
 /// Delete a dropped tenant's quota rows in every database.
-pub fn purge_tenant_scope(tenant_id: u64, catalog: &SystemCatalog) {
-    match catalog.list_all_tenant_quotas() {
-        Ok(rows) => {
-            for (db_id, row_tenant, _) in rows {
-                if row_tenant.as_u64() == tenant_id {
-                    delete_tenant(db_id.as_u64(), tenant_id, catalog);
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                tenant_id,
-                error = %e,
-                "catalog_entry: tenant quota scan failed"
-            );
-            crate::diag::quota_scope_purge_incomplete(&e, TENANT_SCOPE, None, Some(tenant_id));
+pub fn purge_tenant_scope(tenant_id: u64, catalog: &SystemCatalog) -> crate::Result<()> {
+    let rows = catalog.list_all_tenant_quotas().map_err(|e| {
+        crate::diag::quota_scope_purge_incomplete(&e, TENANT_SCOPE, None, Some(tenant_id));
+        catalog_err(&format!("tenant quota scan (tenant {tenant_id})"), e)
+    })?;
+    for (db_id, row_tenant, _) in rows {
+        if row_tenant.as_u64() == tenant_id {
+            delete_tenant(db_id.as_u64(), tenant_id, catalog)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -262,7 +251,7 @@ mod tests {
             .write_tenant_quota(other, TenantId::new(1), &sample_record())
             .unwrap();
 
-        purge_database_scope(db.as_u64(), &catalog);
+        purge_database_scope(db.as_u64(), &catalog).expect("purge database scope");
 
         assert!(catalog.get_database_quota(db).unwrap().is_none());
         assert!(
@@ -285,7 +274,7 @@ mod tests {
         let (_dir, catalog) = open_catalog();
         let db = DatabaseId::new(12);
 
-        purge_database_scope(db.as_u64(), &catalog);
+        purge_database_scope(db.as_u64(), &catalog).expect("purge database scope");
 
         assert!(catalog.get_database_quota(db).unwrap().is_none());
     }
@@ -307,7 +296,7 @@ mod tests {
             .write_tenant_quota(first, kept, &sample_record())
             .unwrap();
 
-        purge_tenant_scope(dropped.as_u64(), &catalog);
+        purge_tenant_scope(dropped.as_u64(), &catalog).expect("purge tenant scope");
 
         assert!(catalog.get_tenant_quota(first, dropped).unwrap().is_none());
         assert!(catalog.get_tenant_quota(second, dropped).unwrap().is_none());
@@ -366,7 +355,7 @@ mod tests {
             cache_weight: 0,
             ..sample_record()
         };
-        put_database(6, &record, &catalog);
+        put_database(6, &record, &catalog).expect("apply put_database quota");
         assert_eq!(
             catalog
                 .get_database_quota(DatabaseId::new(6))

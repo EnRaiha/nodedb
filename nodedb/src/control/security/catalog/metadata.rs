@@ -97,11 +97,14 @@ impl SystemCatalog {
     }
 
     /// Atomically persist a tenant and its authoritative administrator.
+    ///
+    /// Reports `false` when both rows already exist with identical bytes, so
+    /// the replicated applier can tell an idempotent replay from a real write.
     pub fn put_tenant_with_admin(
         &self,
         tenant: &StoredTenant,
         admin: &StoredUser,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         if tenant.tenant_id != admin.tenant_id || tenant.admin_username != admin.username {
             return Err(catalog_err(
                 "validate tenant administrator",
@@ -169,7 +172,7 @@ impl SystemCatalog {
             exact_id
         };
         match (tenant_exists, admin_exists) {
-            (true, true) => return Ok(()),
+            (true, true) => return Ok(false),
             (true, false) => {
                 return Err(catalog_err(
                     "insert tenant admin",
@@ -237,7 +240,8 @@ impl SystemCatalog {
                     .map_err(|e| catalog_err("insert tenant_id_hwm", e))?;
             }
         }
-        write_txn.commit().map_err(|e| catalog_err("commit", e))
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(true)
     }
 
     /// Hard-delete a tenant identity record. Returns `true` if a row existed.

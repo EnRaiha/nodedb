@@ -2,16 +2,19 @@
 
 //! Synchronous catalog application for `PutOidcProvider` / `DeleteOidcProvider`.
 
-use crate::control::security::catalog::{StoredOidcProvider, SystemCatalog};
+use crate::control::security::catalog::{StoredOidcProvider, SystemCatalog, catalog_err};
 
-pub fn put(provider: &StoredOidcProvider, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_oidc_provider(provider) {
-        tracing::error!(provider = %provider.provider_name, error = %e, "put_oidc_provider failed");
-    }
+pub fn put(provider: &StoredOidcProvider, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_oidc_provider(provider).map_err(|e| {
+        catalog_err(
+            &format!("put_oidc_provider '{}'", provider.provider_name),
+            e,
+        )
+    })
 }
 
-pub fn delete(name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_oidc_provider(name) {
-        tracing::error!(provider = %name, error = %e, "delete_oidc_provider failed");
-    }
+pub fn delete(name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_oidc_provider(name)
+        .map_err(|e| catalog_err(&format!("delete_oidc_provider '{name}'"), e))
 }

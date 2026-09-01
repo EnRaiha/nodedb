@@ -2,28 +2,28 @@
 
 //! Apply synonym group catalog entries to `SystemCatalog` redb.
 
-use tracing::warn;
+use crate::control::security::catalog::{StoredSynonymGroup, SystemCatalog, catalog_err};
 
-use crate::control::security::catalog::{StoredSynonymGroup, SystemCatalog};
-
-pub fn put(stored: &StoredSynonymGroup, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.put_synonym_group(stored) {
-        warn!(
-            group = %stored.name,
-            tenant = stored.tenant_id,
-            error = %e,
-            "catalog_entry: put_synonym_group failed"
-        );
-    }
+pub fn put(stored: &StoredSynonymGroup, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog.put_synonym_group(stored).map_err(|e| {
+        catalog_err(
+            &format!(
+                "put_synonym_group '{}' (tenant {})",
+                stored.name, stored.tenant_id
+            ),
+            e,
+        )
+    })
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_synonym_group(tenant_id, name) {
-        warn!(
-            group = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: delete_synonym_group failed"
-        );
-    }
+pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+    catalog
+        .delete_synonym_group(tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!("delete_synonym_group '{name}' (tenant {tenant_id})"),
+                e,
+            )
+        })
+        .map(|_| ())
 }

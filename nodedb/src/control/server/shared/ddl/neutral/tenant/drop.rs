@@ -126,7 +126,8 @@ pub fn drop_tenant(
         crate::control::catalog_entry::apply::quota::purge_tenant_scope(
             tid,
             state.credentials.catalog(),
-        );
+        )
+        .map_err(|e| ddl_err("XX000", format!("quota purge failed: {e}")))?;
         crate::control::catalog_entry::post_apply::quota::release_tenant_scope(tenant_id, state);
     }
 

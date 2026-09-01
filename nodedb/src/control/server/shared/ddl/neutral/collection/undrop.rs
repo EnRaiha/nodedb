@@ -141,7 +141,8 @@ pub fn undrop_collection(
         // `PutCollection` apply — the collection row, its owner row, and the
         // visibility of the indexes the soft-delete hid. Writing the row
         // directly here restored a collection whose indexes stayed hidden.
-        crate::control::catalog_entry::apply::collection::put(&stored, catalog);
+        crate::control::catalog_entry::apply::collection::put(&stored, catalog)
+            .map_err(|e| DdlError::new("XX000", format!("catalog restore failed: {e}")))?;
     }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)
