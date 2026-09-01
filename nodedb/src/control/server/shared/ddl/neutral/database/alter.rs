@@ -13,11 +13,11 @@ use nodedb_sql::ddl_ast::AlterDatabaseOperation;
 use nodedb_types::QuotaRecord;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::replicate::propose_and_apply;
 use super::gate::{require_cluster_admin, require_database_owner};
 use super::support::{ddl_err, status};
 
@@ -65,16 +65,15 @@ pub fn alter_database(
                 }
             }
             descriptor.name = new_name.clone();
-            let outcome = propose_catalog_entry(
+            propose_and_apply(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-            )
-            .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if outcome.needs_local_apply() {
-                catalog
-                    .put_database(&descriptor)
-                    .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
-            }
+                || {
+                    catalog
+                        .put_database(&descriptor)
+                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                },
+            )?;
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseRenamed,
@@ -112,22 +111,22 @@ pub fn alter_database(
 
             // Replicated: every node writes the row and installs the quota in
             // its live enforcement components via post-apply.
-            let outcome = propose_catalog_entry(
+            propose_and_apply(
                 state,
                 &CatalogEntry::PutDatabaseQuota {
                     db_id: db_id.as_u64(),
                     record: Box::new(record.clone()),
                 },
-            )
-            .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if outcome.needs_local_apply() {
-                catalog
-                    .write_database_quota(db_id, &record)
-                    .map_err(|e| ddl_err("53400", format!("{e}")))?;
-                crate::control::catalog_entry::post_apply::quota::put_database(
-                    db_id, &record, state,
-                );
-            }
+                || {
+                    catalog
+                        .write_database_quota(db_id, &record)
+                        .map_err(|e| ddl_err("53400", format!("{e}")))?;
+                    crate::control::catalog_entry::post_apply::quota::put_database(
+                        db_id, &record, state,
+                    );
+                    Ok(())
+                },
+            )?;
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseQuotaChanged,
@@ -170,16 +169,15 @@ pub fn alter_database(
             )?;
             // Update the descriptor's `audit_dml` field and persist it.
             descriptor.audit_dml = *mode;
-            let outcome = propose_catalog_entry(
+            propose_and_apply(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-            )
-            .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if outcome.needs_local_apply() {
-                catalog
-                    .put_database(&descriptor)
-                    .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
-            }
+                || {
+                    catalog
+                        .put_database(&descriptor)
+                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                },
+            )?;
 
             // Update live cache so the Event Plane consumer sees the new mode
             // without a restart.
@@ -204,16 +202,15 @@ pub fn alter_database(
             )?;
             let before = descriptor.idle_session_timeout_secs;
             descriptor.idle_session_timeout_secs = *secs;
-            let outcome = propose_catalog_entry(
+            propose_and_apply(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-            )
-            .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-            if outcome.needs_local_apply() {
-                catalog
-                    .put_database(&descriptor)
-                    .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
-            }
+                || {
+                    catalog
+                        .put_database(&descriptor)
+                        .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))
+                },
+            )?;
 
             // Update the live idle-timeout cache so the sweep loop sees the
             // new value immediately without a restart.

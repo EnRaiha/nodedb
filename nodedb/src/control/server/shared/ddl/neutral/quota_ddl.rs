@@ -17,13 +17,13 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::catalog_entry::post_apply::scope_quota as scope_quota_post_apply;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
+use super::replicate::propose_and_apply;
 
 /// Default warning threshold when `WARN AT` is omitted, matching the
 /// documented default on `QuotaDefinition::warning_threshold`.
@@ -121,19 +121,19 @@ pub fn define_quota(
 
     // Replicated: every node writes the row and installs the definition in
     // its `QuotaManager` via post-apply.
-    let outcome = propose_catalog_entry(
+    propose_and_apply(
         state,
         &CatalogEntry::PutScopeQuota(Box::new(stored.clone())),
-    )
-    .map_err(|e| err("XX000", format!("catalog propose failed: {e}")))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_scope_quota(&stored)
-            .map_err(|e| err("XX000", e.to_string()))?;
-        scope_quota_post_apply::put(&stored, state);
-    }
+        || {
+            state
+                .credentials
+                .catalog()
+                .put_scope_quota(&stored)
+                .map_err(|e| err("XX000", e.to_string()))?;
+            scope_quota_post_apply::put(&stored, state);
+            Ok(())
+        },
+    )?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -175,21 +175,21 @@ pub fn drop_quota(
         ));
     }
 
-    let outcome = propose_catalog_entry(
+    propose_and_apply(
         state,
         &CatalogEntry::DeleteScopeQuota {
             scope_name: scope_name.clone(),
         },
-    )
-    .map_err(|e| err("XX000", format!("catalog propose failed: {e}")))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .delete_scope_quota(&scope_name)
-            .map_err(|e| err("XX000", e.to_string()))?;
-        scope_quota_post_apply::delete(&scope_name, state);
-    }
+        || {
+            state
+                .credentials
+                .catalog()
+                .delete_scope_quota(&scope_name)
+                .map_err(|e| err("XX000", e.to_string()))?;
+            scope_quota_post_apply::delete(&scope_name, state);
+            Ok(())
+        },
+    )?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

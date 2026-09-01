@@ -15,7 +15,6 @@ use nodedb_sql::ddl_ast::AlterTenantOperation;
 use nodedb_types::QuotaRecord;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -23,6 +22,7 @@ use crate::types::TenantId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::database::gate::require_tenant_admin;
+use super::super::replicate::propose_and_apply;
 use super::support::{ddl_err, status};
 
 /// Handle `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)`.
@@ -71,23 +71,23 @@ pub fn handle_alter_tenant_quota(
 
     // Replicated: every node writes the row and installs the quota in its live
     // enforcement components via post-apply.
-    let outcome = propose_catalog_entry(
+    propose_and_apply(
         state,
         &CatalogEntry::PutTenantQuota {
             db_id: db_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             record: Box::new(record.clone()),
         },
-    )
-    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
-    if outcome.needs_local_apply() {
-        catalog
-            .write_tenant_quota(db_id, tenant_id, &record)
-            .map_err(|e| ddl_err("53400", format!("{e}")))?;
-        crate::control::catalog_entry::post_apply::quota::put_tenant(
-            db_id, tenant_id, &record, state,
-        );
-    }
+        || {
+            catalog
+                .write_tenant_quota(db_id, tenant_id, &record)
+                .map_err(|e| ddl_err("53400", format!("{e}")))?;
+            crate::control::catalog_entry::post_apply::quota::put_tenant(
+                db_id, tenant_id, &record, state,
+            );
+            Ok(())
+        },
+    )?;
 
     state.audit_record(
         AuditEvent::AdminAction,
