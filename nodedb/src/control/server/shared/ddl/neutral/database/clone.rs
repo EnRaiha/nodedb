@@ -15,8 +15,11 @@ use nodedb_sql::ddl_ast::CloneAsOf;
 use nodedb_types::{DatabaseId, MAX_CLONE_DEPTH};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::clone::catalog_copy::copy_database_metadata;
 use crate::control::clone::lsn_resolve::wall_ms_to_lsn;
 use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::security::catalog::StoredOwner;
+use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::database_types::{
     DatabaseDescriptor, DatabaseStatus, ParentCloneRef,
 };
@@ -234,7 +237,40 @@ pub fn clone_database(
                     ),
                 )
             })?;
+
+            // The owner row is keyed by database, so the clone needs its own.
+            // Without it the collection resolves but every ownership check
+            // against it reports no owner.
+            let owner = StoredOwner {
+                database_id: target_db_id.as_u64(),
+                object_type: object_type::COLLECTION.to_string(),
+                object_name: coll.name.clone(),
+                tenant_id: coll.tenant_id,
+                owner_username: coll.owner.clone(),
+            };
+            catalog.put_owner(&owner).map_err(|e| {
+                ddl_err(
+                    "XX000",
+                    format!(
+                        "clone: stamping owner for collection '{}' failed: {e}",
+                        coll.name
+                    ),
+                )
+            })?;
         }
+
+        // Copy the source's database-scoped catalog rows: vector index
+        // params, vector models, column statistics, index records, RLS and
+        // redaction policies, triggers, retention policies, alert rules,
+        // continuous aggregates, and streaming materialized views. Schedules
+        // are not copied — see `catalog_copy::copy_scoped_objects`.
+        //
+        // A missing row is fatal, for the same reason an unstamped
+        // descriptor is fatal. The clone reports itself created while it
+        // answers queries the source answers differently, and nothing later
+        // re-copies the row.
+        copy_database_metadata(catalog, source_db_id, target_db_id)
+            .map_err(|e| ddl_err("XX000", format!("clone: copying catalog metadata: {e}")))?;
     }
 
     // Flush the allocator hwm so restarts pick up the correct next-id boundary.

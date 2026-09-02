@@ -167,6 +167,39 @@ impl SystemCatalog {
         }
     }
 
+    /// Every redaction policy attached to one collection of one tenant.
+    ///
+    /// `collection` is the database-qualified name the key carries. The scan
+    /// is bounded to that collection's key prefix.
+    pub fn list_redaction_policies_for_collection(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+    ) -> crate::Result<Vec<StoredRedactionPolicy>> {
+        let prefix = format!("{tenant_id}:{collection}:");
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(REDACTION_POLICIES)
+            .map_err(|e| catalog_err("open redaction_policies", e))?;
+        let mut out = Vec::new();
+        for entry in table
+            .range(prefix.as_str()..)
+            .map_err(|e| catalog_err("range redaction_policies", e))?
+        {
+            let (key, value) = entry.map_err(|e| catalog_err("read redaction", e))?;
+            if !key.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            let s: StoredRedactionPolicy = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser redaction", e))?;
+            out.push(s);
+        }
+        Ok(out)
+    }
+
     /// Load every redaction policy across every tenant. Used by boot replay.
     pub fn load_all_redaction_policies(&self) -> crate::Result<Vec<StoredRedactionPolicy>> {
         let read_txn = self

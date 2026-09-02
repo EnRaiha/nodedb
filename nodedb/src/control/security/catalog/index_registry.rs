@@ -22,6 +22,19 @@ fn tenant_prefix(database_id: u64, tenant_id: u64) -> String {
     format!("{database_id}:{tenant_id}:")
 }
 
+/// Prefix shared by every index record of one database.
+fn database_prefix(database_id: u64) -> String {
+    format!("{database_id}:")
+}
+
+/// Exclusive upper bound for [`database_prefix`].
+///
+/// The prefix ends with `:`. The next byte after `:` is `;`, so this key sorts
+/// immediately past every tenant of the database.
+fn database_upper_bound(database_id: u64) -> String {
+    format!("{database_id};")
+}
+
 impl SystemCatalog {
     /// Upsert one index record.
     pub fn put_index_record(&self, record: &StoredIndexRecord) -> crate::Result<()> {
@@ -156,6 +169,36 @@ impl SystemCatalog {
             if !key.value().starts_with(prefix.as_str()) {
                 break;
             }
+            out.push(
+                zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser index record", e))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Every index record of one database, across every tenant, in key order.
+    ///
+    /// The scan is bounded to the database's key range.
+    pub fn list_index_records_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<StoredIndexRecord>> {
+        let prefix = database_prefix(database_id);
+        let upper = database_upper_bound(database_id);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(INDEX_REGISTRY)
+            .map_err(|e| catalog_err("open index_registry", e))?;
+        let mut out = Vec::new();
+        for item in table
+            .range(prefix.as_str()..upper.as_str())
+            .map_err(|e| catalog_err("range index_registry", e))?
+        {
+            let (_, value) = item.map_err(|e| catalog_err("read index record", e))?;
             out.push(
                 zerompk::from_msgpack(value.value())
                     .map_err(|e| catalog_err("deser index record", e))?,

@@ -143,7 +143,10 @@ pub fn clone_apply(
             catalog,
         )?;
     }
-    Ok(())
+
+    // The shadow descriptors resolve the names. The rest of the source's
+    // database-scoped catalog rows make the clone answer like the source.
+    crate::control::clone::copy_database_metadata(catalog, source, child)
 }
 
 /// Apply a `DeleteDatabaseGrant` entry.

@@ -85,6 +85,18 @@ impl SystemCatalog {
         self.range_vector_models(&lower, &upper)
     }
 
+    /// List every vector model row of one database, across every tenant.
+    ///
+    /// The scan is bounded to the database's key range.
+    pub fn list_vector_models_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<VectorModelEntry>> {
+        let lower = format!("{database_id}:");
+        let upper = database_upper_bound(database_id);
+        self.range_vector_models(&lower, &upper)
+    }
+
     /// List every vector model row of one collection in one database.
     pub fn list_vector_models_for_collection(
         &self,
@@ -193,6 +205,14 @@ impl SystemCatalog {
 
 fn vector_model_key(database_id: u64, tenant_id: u64, collection: &str, column: &str) -> String {
     format!("{database_id}:{tenant_id}:{collection}:{column}")
+}
+
+/// Exclusive upper bound for one database's key prefix.
+///
+/// The prefix ends with `:`. The next byte after `:` is `;`, so this key sorts
+/// immediately past every tenant of the database.
+fn database_upper_bound(database_id: u64) -> String {
+    format!("{database_id};")
 }
 
 /// Exclusive upper bound for one tenant's key prefix.

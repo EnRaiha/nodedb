@@ -55,6 +55,32 @@ impl SystemCatalog {
         Ok(existed)
     }
 
+    /// Load every alert rule of one database, across every tenant.
+    ///
+    /// The compound key leads with `database_id`, so the scan is bounded to
+    /// the database's own rows.
+    pub fn load_alert_rules_in_database(&self, database_id: u64) -> crate::Result<Vec<AlertDef>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(ALERT_RULES)
+            .map_err(|e| catalog_err("open alert_rules", e))?;
+
+        let mut rules = Vec::new();
+        for entry in table
+            .range((database_id, "")..(database_id + 1, ""))
+            .map_err(|e| catalog_err("range alert_rules", e))?
+        {
+            let (_key, value) = entry.map_err(|e| catalog_err("read alert rule", e))?;
+            let def: AlertDef = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser alert rule", e))?;
+            rules.push(def);
+        }
+        Ok(rules)
+    }
+
     /// Load all alert rules (all databases, all tenants). Each returned
     /// def carries its own `database_id`.
     pub fn load_all_alert_rules(&self) -> crate::Result<Vec<AlertDef>> {

@@ -94,6 +94,22 @@ impl SystemCatalog {
         Ok(existed)
     }
 
+    /// Every streaming MV of one database, across every tenant.
+    ///
+    /// This scans every row and filters in memory, reusing
+    /// `load_all_streaming_mvs`'s v2/legacy dedup: a legacy row carries no
+    /// `database_id` prefix, so a bounded scan cannot find it.
+    pub fn load_streaming_mvs_for_database(
+        &self,
+        database_id: DatabaseId,
+    ) -> crate::Result<Vec<StreamingMvDef>> {
+        Ok(self
+            .load_all_streaming_mvs()?
+            .into_iter()
+            .filter(|def| def.database_id == database_id)
+            .collect())
+    }
+
     pub fn load_all_streaming_mvs(&self) -> crate::Result<Vec<StreamingMvDef>> {
         let read_txn = self
             .db

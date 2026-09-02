@@ -67,6 +67,36 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
+    /// Load every column statistics row of one database, across tenants.
+    ///
+    /// The scan is bounded to the database's key range.
+    pub fn load_column_stats_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<StoredColumnStats>> {
+        let prefix = format!("{database_id}:");
+        let upper = database_upper_bound(database_id);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(COLUMN_STATS)
+            .map_err(|e| catalog_err("open column_stats", e))?;
+
+        let mut stats = Vec::new();
+        for row in table
+            .range(prefix.as_str()..upper.as_str())
+            .map_err(|e| catalog_err("range column_stats", e))?
+        {
+            let (_, value) = row.map_err(|e| catalog_err("scan column_stats", e))?;
+            let decoded: StoredColumnStats = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser column_stats", e))?;
+            stats.push(decoded);
+        }
+        Ok(stats)
+    }
+
     /// Load all column statistics for one collection in one database.
     pub fn load_column_stats(
         &self,
@@ -105,6 +135,14 @@ impl SystemCatalog {
 
 fn stats_key(database_id: u64, tenant_id: u64, collection: &str, column: &str) -> String {
     format!("{database_id}:{tenant_id}:{collection}:{column}")
+}
+
+/// Exclusive upper bound for one database's key prefix.
+///
+/// The prefix ends with `:`. The next byte after `:` is `;`, so this key sorts
+/// immediately past every tenant of the database.
+fn database_upper_bound(database_id: u64) -> String {
+    format!("{database_id};")
 }
 
 /// Exclusive upper bound for one collection's key prefix.

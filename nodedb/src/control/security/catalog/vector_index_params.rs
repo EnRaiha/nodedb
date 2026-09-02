@@ -97,6 +97,37 @@ impl SystemCatalog {
         Ok(removed)
     }
 
+    /// List every vector index parameter row of one database, across tenants.
+    ///
+    /// The scan is bounded to the database's key range, so a node holding many
+    /// databases reads only the rows it returns.
+    pub fn list_vector_index_params_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<StoredVectorIndexParams>> {
+        let lower = format!("{database_id}:");
+        let upper = format!("{database_id};");
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(VECTOR_INDEX_PARAMS)
+            .map_err(|e| catalog_err("open vector_index_params", e))?;
+
+        let mut entries = Vec::new();
+        for item in table
+            .range(lower.as_str()..upper.as_str())
+            .map_err(|e| catalog_err("range vector index params", e))?
+        {
+            let (_, value) = item.map_err(|e| catalog_err("read vector index params", e))?;
+            let entry: StoredVectorIndexParams = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser vector index params", e))?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
     /// List all vector index parameter entries across all tenants.
     pub fn list_all_vector_index_params(&self) -> crate::Result<Vec<StoredVectorIndexParams>> {
         let read_txn = self

@@ -77,6 +77,34 @@ impl SystemCatalog {
         Ok(caggs)
     }
 
+    /// List every continuous aggregate of one database, across every tenant.
+    ///
+    /// The compound key leads with `database_id`, so the scan is bounded to
+    /// the database's own rows.
+    pub fn list_continuous_aggregates_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<StoredContinuousAggregate>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(CONTINUOUS_AGGREGATES)
+            .map_err(|e| catalog_err("open continuous_aggregates", e))?;
+        let mut caggs = Vec::new();
+        for entry in table
+            .range((database_id, "")..(database_id + 1, ""))
+            .map_err(|e| catalog_err("range scan", e))?
+        {
+            let (_key, val) = entry.map_err(|e| catalog_err("read entry", e))?;
+            let cagg: StoredContinuousAggregate = zerompk::from_msgpack(val.value())
+                .map_err(|e| catalog_err("deser continuous_aggregate", e))?;
+            caggs.push(cagg);
+        }
+        Ok(caggs)
+    }
+
     /// List continuous aggregates for a single tenant within a database.
     pub fn list_continuous_aggregates(
         &self,

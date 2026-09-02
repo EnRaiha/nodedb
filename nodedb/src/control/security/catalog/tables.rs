@@ -30,7 +30,7 @@ pub(super) const ROLES: TableDefinition<&str, &[u8]> = TableDefinition::new("_sy
 pub(super) const PERMISSIONS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.permissions");
 
-/// Table: "{object_type}:{tenant_id}:{object_name}" -> owner username.
+/// Table: "{object_type}:{database_id}:{tenant_id}:{object_name}" -> owner username.
 pub(super) const OWNERS: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.owners");
 
 // ── Collections ───────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ pub(super) const COLLECTIONS_LEGACY: TableDefinition<&str, &[u8]> =
 pub(super) const COLLECTIONS: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.collections_v2");
 
-/// Table: `(tenant_id, collection_name)` -> `purge_lsn` (u64 LE).
+/// Table: `(database_id, tenant_id, collection_name)` -> `purge_lsn` (u64 LE).
 ///
 /// Holds the canonical collection-tombstone set used by WAL replay to
 /// shadow writes that precede a hard-delete. Persisted here (rather
@@ -60,7 +60,7 @@ pub(super) const COLLECTIONS: TableDefinition<(u64, &str), &[u8]> =
 pub(super) const WAL_TOMBSTONES: TableDefinition<(u64, u64, &str), u64> =
     TableDefinition::new("_system.wal_tombstones");
 
-/// Table: `(tenant_id, collection_name)` -> MessagePack-serialized
+/// Table: `(database_id, tenant_id, collection_name)` -> MessagePack-serialized
 /// `StoredL2CleanupEntry`.
 ///
 /// Populated when a collection hard-delete finishes on this node but
@@ -208,7 +208,7 @@ pub(super) const SEQUENCES: TableDefinition<&str, &[u8]> =
 pub(super) const SEQUENCE_STATE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.sequence_state");
 
-/// Table: "{tenant_id}:{collection}:{column}" -> MessagePack-serialized column statistics.
+/// Table: "{database_id}:{tenant_id}:{collection}:{column}" -> MessagePack-serialized column statistics.
 pub(super) const COLUMN_STATS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.column_stats");
 
@@ -382,7 +382,7 @@ pub(super) const MIRROR_LAG: TableDefinition<u64, &[u8]> =
 pub(super) const VECTOR_MODEL_METADATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.vector_model_metadata");
 
-/// Table: "{tenant_id}:{collection}:{field_name}" -> MessagePack-serialized StoredVectorIndexParams.
+/// Table: "{database_id}:{tenant_id}:{collection}:{field_name}" -> MessagePack-serialized StoredVectorIndexParams.
 pub(super) const VECTOR_INDEX_PARAMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.vector_index_params");
 

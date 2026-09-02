@@ -55,6 +55,35 @@ impl SystemCatalog {
         Ok(existed)
     }
 
+    /// Load every retention policy of one database, across every tenant.
+    ///
+    /// The compound key leads with `database_id`, so the scan is bounded to
+    /// the database's own rows.
+    pub fn load_retention_policies_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<RetentionPolicyDef>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(RETENTION_POLICIES)
+            .map_err(|e| catalog_err("open retention_policies", e))?;
+
+        let mut policies = Vec::new();
+        for entry in table
+            .range((database_id, "")..(database_id + 1, ""))
+            .map_err(|e| catalog_err("range retention_policies", e))?
+        {
+            let (_key, value) = entry.map_err(|e| catalog_err("read retention policy", e))?;
+            let def: RetentionPolicyDef = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser retention policy", e))?;
+            policies.push(def);
+        }
+        Ok(policies)
+    }
+
     /// Load all retention policies (all databases, all tenants). Each
     /// returned def carries its own `database_id`.
     pub fn load_all_retention_policies(&self) -> crate::Result<Vec<RetentionPolicyDef>> {

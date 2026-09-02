@@ -135,6 +135,16 @@ impl SystemCatalog {
     ) -> crate::Result<Vec<StoredTrigger>> {
         self.load_triggers_matching(|t| t.database_id == database_id && t.tenant_id == tenant_id)
     }
+    /// Every trigger of one database, across every tenant.
+    ///
+    /// The key leads with `tenant_id`, not `database_id`, so this scans
+    /// every trigger row and filters in memory.
+    pub fn load_triggers_for_database(
+        &self,
+        database_id: DatabaseId,
+    ) -> crate::Result<Vec<StoredTrigger>> {
+        self.load_triggers_matching(|t| t.database_id == database_id)
+    }
     fn load_triggers_matching(
         &self,
         include: impl Fn(&StoredTrigger) -> bool,
