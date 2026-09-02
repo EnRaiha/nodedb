@@ -168,16 +168,24 @@ pub(super) async fn try_string(
     // ` SEAL` / ` COMPACT` / ` SET ` sub-clause guards, checked in this order)
     // stays byte-identical.
     if upper.starts_with("SHOW VECTOR INDEX ") {
-        return Some(maintenance::handle_show_vector_index(state, identity, sql).await);
+        return Some(
+            maintenance::handle_show_vector_index(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SEAL") {
-        return Some(maintenance::handle_alter_vector_index_seal(state, identity, sql).await);
+        return Some(
+            maintenance::handle_alter_vector_index_seal(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" COMPACT") {
-        return Some(maintenance::handle_alter_vector_index_compact(state, identity, sql).await);
+        return Some(
+            maintenance::handle_alter_vector_index_compact(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SET ") {
-        return Some(maintenance::handle_alter_vector_index_set(state, identity, sql).await);
+        return Some(
+            maintenance::handle_alter_vector_index_set(state, identity, database_id, sql).await,
+        );
     }
 
     // Vector model metadata. None of these are dispatched from a typed AST arm —
@@ -200,7 +208,11 @@ pub(super) async fn try_string(
         ));
     }
     if upper.starts_with("SHOW VECTOR MODELS") {
-        return Some(collection::handle_show_vector_models(state, identity));
+        return Some(collection::handle_show_vector_models(
+            state,
+            identity,
+            database_id,
+        ));
     }
     if upper.starts_with("SELECT VECTOR_METADATA(") || upper.starts_with("SELECT VECTOR_METADATA (")
     {
@@ -216,6 +228,7 @@ pub(super) async fn try_string(
                 return Some(collection::handle_vector_metadata_query(
                     state,
                     identity,
+                    database_id,
                     &args[0].to_lowercase(),
                     &args[1].to_lowercase(),
                 ));

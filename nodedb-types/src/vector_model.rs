@@ -2,8 +2,9 @@
 
 //! Per-column vector model metadata for embedding tracking and migration.
 //!
-//! Stored in the system catalog keyed by `(tenant_id, collection, column)`.
-//! Informational by default; optional strict dimension enforcement.
+//! Stored in the system catalog keyed by
+//! `(database_id, tenant_id, collection, column)`. Informational by default;
+//! optional strict dimension enforcement.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,8 @@ pub struct VectorModelMetadata {
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct VectorModelEntry {
+    /// Database that owns the collection.
+    pub database_id: u64,
     /// Tenant that owns this collection.
     pub tenant_id: u64,
     /// Collection name.
@@ -52,6 +55,7 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let entry = VectorModelEntry {
+            database_id: 5,
             tenant_id: 1,
             collection: "chunks".into(),
             column: "embedding".into(),
@@ -64,6 +68,7 @@ mod tests {
         };
         let bytes = zerompk::to_msgpack_vec(&entry).unwrap();
         let restored: VectorModelEntry = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(restored.database_id, 5);
         assert_eq!(restored.metadata.model, "text-embedding-3-large");
         assert_eq!(restored.metadata.dimensions, 1536);
         assert!(!restored.metadata.strict_dimensions);

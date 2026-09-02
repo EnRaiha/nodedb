@@ -384,7 +384,10 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             String::new(),
         ),
         E::PutVectorModel(m) => (
-            format!("vector_model:{}:{}:{}", m.tenant_id, m.collection, m.column),
+            format!(
+                "vector_model:{}:{}:{}:{}",
+                m.database_id, m.tenant_id, m.collection, m.column
+            ),
             0,
             String::new(),
         ),

@@ -378,7 +378,7 @@ pub(super) const MIRROR_LAG: TableDefinition<u64, &[u8]> =
 
 // ── Vector model + checkpoints ────────────────────────────────────────
 
-/// Table: "{tenant_id}:{collection}:{column}" -> MessagePack-serialized VectorModelEntry.
+/// Table: "{database_id}:{tenant_id}:{collection}:{column}" -> MessagePack-serialized VectorModelEntry.
 pub(super) const VECTOR_MODEL_METADATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.vector_model_metadata");
 

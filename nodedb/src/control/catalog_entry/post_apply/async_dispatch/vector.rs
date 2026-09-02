@@ -3,16 +3,28 @@
 //! Async post-apply for vector-index catalog entries.
 //!
 //! `PutVectorIndexParams` appends this node's `VectorParams` redo record and
-//! dispatches `VectorOp::SetParams` to every core. `DeleteVectorIndexParams`
+//! installs the committed parameters on every core. `DeleteVectorIndexParams`
 //! appends and fsyncs the drop record, then dispatches `VectorOp::DropIndex`.
 //! Both run on every node, so a follower builds and tears down the index it
 //! serves instead of learning about it at its next boot.
 //!
+//! ## Two plans install one row
+//!
+//! `VectorOp::SetParams` writes the build config a core uses when it first
+//! materializes the index, and `execute_set_vector_params` refuses a core
+//! whose index already materialized. `VectorOp::Rebuild` is the reverse: it
+//! reshapes a materialized index in place and reports `NotFound` on a core
+//! that has none. Each core must accept one of the two, so `Rebuild` follows
+//! `SetParams` wherever `SetParams` was refused. A core that accepted neither
+//! is the one this module reports.
+//!
+//! `Rebuild` reshapes the HNSW graph only. A quantization change against a
+//! materialized index therefore lands in the catalog row and reaches the cores
+//! at the next boot seed, which runs against unmaterialized state.
+//!
 //! Nothing here can propagate a failure: the catalog row is already
 //! committed. Every failed stage files a `Capture` instead, because a node
 //! silently missing an index is the defect this module exists to stop.
-
-use std::sync::Arc;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
@@ -20,7 +32,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::StoredVectorIndexParams;
 
-use super::core_fanout::{CoreFanout, dispatch_to_every_core};
+use super::core_fanout::{CoreFanout, dispatch_to_every_core, unacked_cores};
 
 /// One vector index, named the way every stage below reports it.
 struct IndexTarget<'a> {
@@ -50,6 +62,24 @@ fn set_params_plan(entry: &StoredVectorIndexParams) -> PhysicalPlan {
     })
 }
 
+/// Build the in-place reshape plan for a core whose index already
+/// materialized, so it converges on the same graph shape a fresh core builds
+/// from `SetParams`.
+///
+/// `m0` is derived as `2 * m`, the ratio every other install path applies.
+fn rebuild_plan(entry: &StoredVectorIndexParams) -> PhysicalPlan {
+    PhysicalPlan::Vector(VectorOp::Rebuild {
+        collection: nodedb_types::QualifiedCollection::new(
+            DatabaseId::new(entry.database_id),
+            &entry.collection,
+        ),
+        field_name: entry.field_name.clone(),
+        m: entry.m,
+        m0: entry.m * 2,
+        ef_construction: entry.ef_construction,
+    })
+}
+
 /// Build the `DropIndex` plan for one index.
 fn drop_index_plan(database_id: u64, collection: &str, field_name: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::DropIndex {
@@ -62,8 +92,11 @@ fn drop_index_plan(database_id: u64, collection: &str, field_name: &str) -> Phys
 }
 
 /// Install one vector index's build parameters on this node: append the redo
-/// record, then dispatch `SetParams` to every core.
-pub async fn put_async(entry: StoredVectorIndexParams, shared: Arc<SharedState>) {
+/// record, then bring every core to the committed parameters.
+///
+/// The single-node DDL handlers call this directly, where no applier runs and
+/// the post-apply lane never fires.
+pub async fn put_async(entry: StoredVectorIndexParams, shared: &SharedState) {
     let target = IndexTarget {
         database_id: entry.database_id,
         tenant_id: entry.tenant_id,
@@ -74,11 +107,28 @@ pub async fn put_async(entry: StoredVectorIndexParams, shared: Arc<SharedState>)
 
     // The record makes this node's log self-sufficient: replay rebuilds the
     // index from it in LSN order alongside the vector writes around it.
-    if let Err(error) = append_redo(&shared, &target, &plan) {
+    if let Err(error) = append_redo(shared, &target, &plan) {
         report(&error, "set_params_wal_append", &target);
     }
 
-    if let Err(error) = dispatch_to_every_core(&shared, &fanout(&target), &plan).await {
+    let target_fanout = fanout(&target);
+    let refused = unacked_cores(shared, &target_fanout, &plan).await;
+    if refused.is_empty() {
+        return;
+    }
+
+    // Every refused core already holds a materialized index, which only the
+    // in-place reshape reaches. A core that took `SetParams` answers this with
+    // `NotFound` and stays on the parameters it just accepted.
+    let reshaped = unacked_cores(shared, &target_fanout, &rebuild_plan(&entry)).await;
+    let missed: Vec<usize> = refused
+        .into_iter()
+        .filter(|core_id| reshaped.contains(core_id))
+        .collect();
+    if !missed.is_empty() {
+        let error = crate::Error::Internal {
+            detail: format!("cores did not apply the vector index change: {missed:?}"),
+        };
         report(&error, "set_params_dispatch", &target);
     }
 }
@@ -90,7 +140,7 @@ pub async fn delete_async(
     tenant_id: u64,
     collection: String,
     field_name: String,
-    shared: Arc<SharedState>,
+    shared: &SharedState,
 ) {
     let target = IndexTarget {
         database_id,
@@ -103,7 +153,7 @@ pub async fn delete_async(
     // The vector writes this drop cancels are already fsynced in this node's
     // log, so replay rebuilds the dropped index unless the drop record is
     // durable too. Append and fsync before touching the cores.
-    match append_redo(&shared, &target, &plan) {
+    match append_redo(shared, &target, &plan) {
         Ok(Some(lsn)) => {
             if let Err(error) = shared.wal.wait_durable(lsn).await {
                 report(&error, "drop_index_fsync", &target);
@@ -118,7 +168,7 @@ pub async fn delete_async(
         Err(error) => report(&error, "drop_index_wal_append", &target),
     }
 
-    if let Err(error) = dispatch_to_every_core(&shared, &fanout(&target), &plan).await {
+    if let Err(error) = dispatch_to_every_core(shared, &fanout(&target), &plan).await {
         report(&error, "drop_index_dispatch", &target);
     }
 }
@@ -216,6 +266,29 @@ mod tests {
         assert_eq!(pq_m, 8);
         assert_eq!(ivf_cells, 64);
         assert_eq!(ivf_nprobe, 16);
+    }
+
+    /// The reshape plan carries the committed HNSW shape, with `m0` at the
+    /// `2 * m` ratio every other install path applies. A core reshaped to a
+    /// different ratio diverges from one that seeds from the same row at boot.
+    #[test]
+    fn rebuild_plan_carries_the_committed_hnsw_shape() {
+        let entry = stored();
+        let PhysicalPlan::Vector(VectorOp::Rebuild {
+            collection,
+            field_name,
+            m,
+            m0,
+            ef_construction,
+        }) = rebuild_plan(&entry)
+        else {
+            panic!("rebuild_plan must build a VectorOp::Rebuild");
+        };
+        assert_eq!(collection.as_str(), "7/documents");
+        assert_eq!(field_name, "embedding");
+        assert_eq!(m, 32);
+        assert_eq!(m0, 64);
+        assert_eq!(ef_construction, 400);
     }
 
     /// The drop plan targets the same `(database, collection, field)` the

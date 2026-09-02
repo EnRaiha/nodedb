@@ -134,6 +134,7 @@ pub fn handle_set_vector_metadata(
     }
 
     let entry = VectorModelEntry {
+        database_id: database_id.as_u64(),
         tenant_id,
         collection: collection.clone(),
         column: column.clone(),
@@ -162,17 +163,19 @@ pub fn handle_set_vector_metadata(
     }])
 }
 
-/// Handle `SHOW VECTOR MODELS` — list all vector columns with model metadata.
+/// Handle `SHOW VECTOR MODELS` — list the current database's vector columns
+/// with their model metadata.
 pub fn handle_show_vector_models(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     let catalog = state.credentials.catalog();
 
     let entries = catalog
-        .list_vector_models(tenant_id)
+        .list_vector_models(database_id.as_u64(), tenant_id)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     let columns = vec![
@@ -225,6 +228,7 @@ pub fn handle_show_vector_models(
 pub fn handle_vector_metadata_query(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     column: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -233,7 +237,7 @@ pub fn handle_vector_metadata_query(
     let catalog = state.credentials.catalog();
 
     let entry = catalog
-        .get_vector_model(tenant_id, collection, column)
+        .get_vector_model(database_id.as_u64(), tenant_id, collection, column)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     let json = match entry {

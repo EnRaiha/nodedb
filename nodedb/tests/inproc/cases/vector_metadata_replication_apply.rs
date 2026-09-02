@@ -20,6 +20,7 @@ const FIELD: &str = "embedding";
 
 fn model() -> VectorModelEntry {
     VectorModelEntry {
+        database_id: DATABASE,
         tenant_id: TENANT,
         collection: COLLECTION.to_string(),
         column: FIELD.to_string(),
@@ -66,7 +67,7 @@ async fn replicated_put_installs_the_vector_model() {
             .shared
             .credentials
             .catalog()
-            .get_vector_model(TENANT, COLLECTION, FIELD)
+            .get_vector_model(DATABASE, TENANT, COLLECTION, FIELD)
             .expect("read vector model")
             .is_none(),
         "no vector model is stored before the entry applies"
@@ -78,7 +79,7 @@ async fn replicated_put_installs_the_vector_model() {
         .shared
         .credentials
         .catalog()
-        .get_vector_model(TENANT, COLLECTION, FIELD)
+        .get_vector_model(DATABASE, TENANT, COLLECTION, FIELD)
         .expect("read the vector model back")
         .expect("apply must write the durable row on this node");
     assert_eq!(stored.metadata.model, "all-MiniLM-L6-v2");

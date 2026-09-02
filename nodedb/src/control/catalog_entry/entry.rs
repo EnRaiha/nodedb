@@ -503,7 +503,8 @@ pub enum CatalogEntry {
 
     // ── Vector model metadata / index parameters ───────────────────
     /// Embedding-model row in `_system.vector_model_metadata`, keyed by
-    /// `(tenant_id, collection, column)`. A re-delivery rewrites the row.
+    /// `(database_id, tenant_id, collection, column)`. A re-delivery rewrites
+    /// the row.
     PutVectorModel(Box<VectorModelEntry>),
     /// Build-parameter row in `_system.vector_index_params`, keyed by
     /// `(database_id, tenant_id, collection, field_name)`.

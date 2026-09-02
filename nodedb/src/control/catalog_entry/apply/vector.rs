@@ -19,7 +19,10 @@ use crate::control::security::catalog::{SystemCatalog, catalog_err};
 pub fn put_model(entry: &VectorModelEntry, catalog: &SystemCatalog) -> crate::Result<()> {
     catalog.put_vector_model(entry).map_err(|e| {
         catalog_err(
-            &format!("put_vector_model '{}.{}'", entry.collection, entry.column),
+            &format!(
+                "put_vector_model '{}.{}' (database {}, tenant {})",
+                entry.collection, entry.column, entry.database_id, entry.tenant_id
+            ),
             e,
         )
     })
@@ -79,6 +82,7 @@ mod tests {
 
     fn model() -> VectorModelEntry {
         VectorModelEntry {
+            database_id: DATABASE,
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             column: FIELD.to_string(),
@@ -113,6 +117,7 @@ mod tests {
         let entry = CatalogEntry::PutVectorModel(Box::new(model()));
         match decode(&encode(&entry).unwrap()).unwrap() {
             CatalogEntry::PutVectorModel(record) => {
+                assert_eq!(record.database_id, DATABASE);
                 assert_eq!(record.tenant_id, TENANT);
                 assert_eq!(record.collection, COLLECTION);
                 assert_eq!(record.column, FIELD);
@@ -174,7 +179,7 @@ mod tests {
         apply::apply_to(&CatalogEntry::PutVectorModel(Box::new(model())), &catalog).unwrap();
 
         let stored = catalog
-            .get_vector_model(TENANT, COLLECTION, FIELD)
+            .get_vector_model(DATABASE, TENANT, COLLECTION, FIELD)
             .unwrap()
             .expect("apply writes the vector model row");
         assert_eq!(stored.metadata.model, "all-MiniLM-L6-v2");

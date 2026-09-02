@@ -256,9 +256,12 @@ pub async fn insert_document(
             } else {
                 field_name.as_str()
             };
-            if let Ok(Some(entry)) =
-                catalog.get_vector_model(tenant_id.as_u64(), &parsed.coll_name, col)
-                && entry.metadata.strict_dimensions
+            if let Ok(Some(entry)) = catalog.get_vector_model(
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                &parsed.coll_name,
+                col,
+            ) && entry.metadata.strict_dimensions
                 && entry.metadata.dimensions != dim
             {
                 return Some(Err(ddl_err(

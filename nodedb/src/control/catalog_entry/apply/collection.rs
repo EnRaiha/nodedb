@@ -197,14 +197,31 @@ pub fn finalize_purge(
     Ok(())
 }
 
-/// Remove every index record of `name`, along with each index's ownership row
-/// and (for vector indexes) its durable build parameters.
+/// Remove every index record of `name`, along with each index's ownership row,
+/// each vector index's durable build parameters, and every embedding-model row
+/// the collection carries.
+///
+/// The model rows are removed by collection, not by index field: `ALTER
+/// COLLECTION … SET VECTOR METADATA ON <column>` needs no index, so a column
+/// with no index can hold one. A row left behind hands its `dimensions` and
+/// `strict_dimensions` enforcement to the next collection of the same name.
 fn purge_index_records(
     database_id: u64,
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
+    let models = catalog
+        .delete_vector_models_for_collection(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_vector_models_for_collection '{name}' \
+                     (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })?;
     let records = catalog.list_index_records_for_collection(database_id, tenant_id, name)?;
     for record in &records {
         if record.kind == crate::control::security::catalog::IndexKind::Vector {
@@ -237,6 +254,7 @@ fn purge_index_records(
         collection = %name,
         tenant = tenant_id,
         indexes = records.len(),
+        vector_models = models,
         "catalog_entry: purge_collection removed index records"
     );
     Ok(())
@@ -687,6 +705,97 @@ mod tests {
                 .unwrap()
                 .expect("row preserved")
                 .is_active
+        );
+    }
+
+    fn vector_model(collection: &str, column: &str) -> nodedb_types::VectorModelEntry {
+        nodedb_types::VectorModelEntry {
+            database_id: 0,
+            tenant_id: 1,
+            collection: collection.to_string(),
+            column: column.to_string(),
+            metadata: nodedb_types::VectorModelMetadata {
+                model: "all-MiniLM-L6-v2".to_string(),
+                dimensions: 384,
+                created_at: "2026-01-01".to_string(),
+                strict_dimensions: true,
+            },
+        }
+    }
+
+    /// A model row survives its collection only to hand stale dimension
+    /// enforcement to the next collection of the same name.
+    #[test]
+    fn purging_a_collection_removes_its_vector_model_rows() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+        catalog
+            .put_vector_model(&vector_model("chunks", "embedding"))
+            .expect("put model");
+        catalog
+            .put_vector_model(&vector_model("notes", "embedding"))
+            .expect("put sibling model");
+
+        purge_index_records(0, 1, "chunks", catalog).expect("purge");
+
+        assert!(
+            catalog
+                .get_vector_model(0, 1, "chunks", "embedding")
+                .unwrap()
+                .is_none(),
+            "the purged collection leaves no embedding-model row"
+        );
+        assert!(
+            catalog
+                .get_vector_model(0, 1, "notes", "embedding")
+                .unwrap()
+                .is_some(),
+            "a sibling collection keeps its own row"
+        );
+    }
+
+    /// `SET VECTOR METADATA` needs no index, so a purge driven by the index
+    /// list alone leaves this row behind.
+    #[test]
+    fn purging_a_collection_removes_a_model_row_no_index_covers() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+        catalog
+            .put_vector_model(&vector_model("chunks", "unindexed_column"))
+            .expect("put model");
+
+        purge_index_records(0, 1, "chunks", catalog).expect("purge");
+
+        assert!(
+            catalog
+                .list_vector_models_for_collection(0, 1, "chunks")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The key is database-scoped, so a same-named collection in another
+    /// database keeps its enforcement.
+    #[test]
+    fn purging_a_collection_spares_the_same_name_in_another_database() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+        let mut other = vector_model("chunks", "embedding");
+        other.database_id = 1024;
+        catalog
+            .put_vector_model(&vector_model("chunks", "embedding"))
+            .expect("put model");
+        catalog
+            .put_vector_model(&other)
+            .expect("put other database");
+
+        purge_index_records(0, 1, "chunks", catalog).expect("purge");
+
+        assert!(
+            catalog
+                .get_vector_model(1024, 1, "chunks", "embedding")
+                .unwrap()
+                .is_some()
         );
     }
 }

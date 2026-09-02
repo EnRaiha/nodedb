@@ -30,13 +30,32 @@ pub(super) struct CoreFanout<'a> {
     pub detail: &'a str,
 }
 
-/// Dispatch `plan` to every core on this node, returning the cores that never
-/// acknowledged it.
+/// Dispatch `plan` to every core on this node, raising when any core failed to
+/// apply it.
 pub(super) async fn dispatch_to_every_core(
     shared: &SharedState,
     target: &CoreFanout<'_>,
     plan: &PhysicalPlan,
 ) -> crate::Result<()> {
+    let unreached = unacked_cores(shared, target, plan).await;
+    if unreached.is_empty() {
+        return Ok(());
+    }
+    Err(crate::Error::Internal {
+        detail: format!("cores did not apply the {}: {unreached:?}", target.what),
+    })
+}
+
+/// Dispatch `plan` to every core on this node, returning the cores that
+/// answered with anything but `Ok`.
+///
+/// A caller that dispatches two plans covering each other reads the two lists
+/// per core instead of raising on the first refusal.
+pub(super) async fn unacked_cores(
+    shared: &SharedState,
+    target: &CoreFanout<'_>,
+    plan: &PhysicalPlan,
+) -> Vec<usize> {
     let num_cores = {
         let d = shared.dispatcher.lock().unwrap_or_else(|p| p.into_inner());
         d.num_cores()
@@ -96,10 +115,5 @@ pub(super) async fn dispatch_to_every_core(
         }
     }
 
-    if unreached.is_empty() {
-        return Ok(());
-    }
-    Err(crate::Error::Internal {
-        detail: format!("cores did not apply the {}: {unreached:?}", target.what),
-    })
+    unreached
 }

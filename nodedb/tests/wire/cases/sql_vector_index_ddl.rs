@@ -367,9 +367,8 @@ async fn alter_vector_index_rejects_malformed_set_item() {
         .await
         .unwrap();
 
-    // SET rejects unknown keys but silently drops list items that carry no
-    // `=` at all, so a typo'd item is ignored while the statement reports
-    // success for the items around it.
+    // A list item carrying no `=` is a typo. Dropping it reports success for
+    // the items around it while one of them never applied.
     server
         .expect_error(
             "ALTER VECTOR INDEX ON vi_setbad.embedding SET (m = 32, ef_construction)",
@@ -390,9 +389,9 @@ async fn alter_vector_index_set_index_type_accepted() {
         .await
         .unwrap();
 
-    // ALTER must accept the same quantization keyword set as CREATE — otherwise
+    // ALTER accepts the same quantization keyword set as CREATE. Without it,
     // users who defaulted to FP32 have no SQL migration path to the documented
-    // tiers. Today ALTER errors with "unknown parameter 'index_type'".
+    // tiers.
     server
         .exec("ALTER VECTOR INDEX ON vi_alter SET (index_type = 'hnsw_pq', pq_m = 2)")
         .await

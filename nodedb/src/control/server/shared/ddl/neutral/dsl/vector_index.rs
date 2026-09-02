@@ -164,7 +164,6 @@ pub async fn create_vector_index(
         &identity.username,
     )?;
 
-    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
     let set_params_plan = PhysicalPlan::Vector(VectorOp::SetParams {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         field_name: field_name.clone(),
@@ -199,35 +198,28 @@ pub async fn create_vector_index(
     // index at boot via `seed_vector_index_params`, and each node's post-apply
     // appends its own `VectorParams` redo record for `replay_vector_wal`, so a
     // crash between them converges on the next start.
-    let outcome = super::super::vector_replicate::propose_put_params(
-        state,
-        &nodedb_types::StoredVectorIndexParams {
-            database_id: database_id.as_u64(),
-            tenant_id: tenant_id.as_u64(),
-            collection: collection.to_string(),
-            field_name: field_name.clone(),
-            dim: params.dim,
-            metric: params.metric.clone(),
-            m: params.m,
-            ef_construction: params.ef_construction,
-            index_type: params.index_type.clone(),
-            pq_m: params.pq_m,
-            ivf_cells: params.ivf_cells,
-            ivf_nprobe: params.ivf_nprobe,
-        },
-    )?;
+    let stored = nodedb_types::StoredVectorIndexParams {
+        database_id: database_id.as_u64(),
+        tenant_id: tenant_id.as_u64(),
+        collection: collection.to_string(),
+        field_name: field_name.clone(),
+        dim: params.dim,
+        metric: params.metric.clone(),
+        m: params.m,
+        ef_construction: params.ef_construction,
+        index_type: params.index_type.clone(),
+        pq_m: params.pq_m,
+        ivf_cells: params.ivf_cells,
+        ivf_nprobe: params.ivf_nprobe,
+    };
+    let outcome = super::super::vector_replicate::propose_put_params(state, &stored)?;
 
-    // Single node: no applier runs, so post-apply never fires. Append the
-    // per-node redo record the post-apply lane appends everywhere else.
+    // Single node: no applier runs, so post-apply never fires. Run the
+    // per-node install the post-apply lane runs everywhere else — the redo
+    // record plus the fan-out that reaches every core, not just the one the
+    // pre-flight dispatched to.
     if outcome.needs_local_apply() {
-        crate::control::server::wal_dispatch::wal_append_if_write(
-            &state.wal,
-            tenant_id,
-            vshard,
-            database_id,
-            &set_params_plan,
-        )
-        .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
+        crate::control::catalog_entry::post_apply::install_vector_index_params(stored, state).await;
     }
 
     propose_index_record(
