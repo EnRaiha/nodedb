@@ -171,7 +171,7 @@ pub fn coerce_value(val: &Value, col_type: &ColumnType, col_name: &str) -> crate
             }
             Value::String(s) => {
                 // UPDATE path may serialize ARRAY literal as string — parse it.
-                match parse_vector_string(s) {
+                match crate::data::executor::vector_string::parse_vector_string(s) {
                     Some(floats) => validate_and_encode_vector(col_name, *dim, &floats),
                     None => Err(crate::Error::BadRequest {
                         detail: format!(
@@ -252,60 +252,6 @@ fn validate_and_encode_vector(col_name: &str, dim: u32, floats: &[f32]) -> crate
     }
     let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
     Ok(Value::Bytes(bytes))
-}
-
-/// Parse a vector from string representations that may arrive via UPDATE path.
-///
-/// Handles formats like:
-/// - `"ArrayLiteral([Literal(Float(0.9)), Literal(Float(0.1)), ...])"` (sqlparser debug repr)
-/// - `"ARRAY[0.1, 0.2, 0.3]"` (SQL literal)
-/// - `"[0.1, 0.2, 0.3]"` (JSON-style)
-fn parse_vector_string(s: &str) -> Option<Vec<f32>> {
-    // Try ARRAY[...] SQL literal format.
-    if nodedb_types::starts_with_ascii_case_insensitive(s, "ARRAY[") {
-        let start = "ARRAY[".len();
-        let end = s.rfind(']')?;
-        if end <= start {
-            return None;
-        }
-        let inner = &s[start..end];
-        let floats: Vec<f32> = inner
-            .split(',')
-            .filter_map(|tok| tok.trim().parse::<f32>().ok())
-            .collect();
-        if !floats.is_empty() {
-            return Some(floats);
-        }
-    }
-
-    // Try JSON-style [0.1, 0.2, ...] format.
-    if s.starts_with('[') && s.ends_with(']') {
-        let inner = &s[1..s.len() - 1];
-        let floats: Vec<f32> = inner
-            .split(',')
-            .filter_map(|tok| tok.trim().parse::<f32>().ok())
-            .collect();
-        if !floats.is_empty() {
-            return Some(floats);
-        }
-    }
-
-    // Try sqlparser debug repr: "ArrayLiteral([Literal(Float(0.9)), ...])"
-    if s.starts_with("ArrayLiteral(") {
-        let floats: Vec<f32> = s
-            .split("Float(")
-            .skip(1)
-            .filter_map(|chunk| {
-                let end = chunk.find(')')?;
-                chunk[..end].parse::<f32>().ok()
-            })
-            .collect();
-        if !floats.is_empty() {
-            return Some(floats);
-        }
-    }
-
-    None
 }
 
 /// Convert a typed `Value` to JSON (for pgwire output only).

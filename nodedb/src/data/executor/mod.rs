@@ -32,6 +32,7 @@ mod sync_hwm_checkpoint;
 pub mod task;
 pub(crate) mod timeseries_checkpoint;
 pub(crate) mod vector_checkpoint;
+pub(crate) mod vector_string;
 mod wal_replay;
 mod wal_replay_all;
 mod wal_replay_columnar_dml;

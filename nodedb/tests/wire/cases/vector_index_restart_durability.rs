@@ -298,3 +298,113 @@ async fn document_secondary_vector_index_upsert_restart_projects_pk() {
          with the OLD vector wrongly returned the upserted row first: {old_aligned:?}"
     );
 }
+
+/// A vector arriving as an SQL string literal survives a WAL-only restart
+/// and stays searchable.
+///
+/// `INSERT ... VALUES ('id', '[0.1, 0.2, ...]')` carries the vector as a text
+/// literal (the planner's `SqlValue::String`), which decodes to
+/// `Value::String` in the document body. The put path parses it like an
+/// `ARRAY[...]` literal; without that, the row is skipped and the rebuilt
+/// index returns nothing for it.
+#[tokio::test]
+async fn json_string_embedding_survives_restart_and_search() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION docs_vec_json_str TYPE document")
+        .await
+        .unwrap();
+    srv.exec(
+        "CREATE VECTOR INDEX idx_docs_vec_json_str ON docs_vec_json_str (embedding) \
+         METRIC cosine DIM 4",
+    )
+    .await
+    .unwrap();
+
+    // The vector is written as a JSON-array text literal, the shape the
+    // planner's SqlValue::String produces for a quoted SQL literal.
+    srv.exec(
+        "INSERT INTO docs_vec_json_str (id, embedding) VALUES \
+         ('json_row', '[1.0, 0.0, 0.0, 0.0]')",
+    )
+    .await
+    .unwrap();
+    srv.exec(
+        "INSERT INTO docs_vec_json_str (id, embedding) VALUES \
+         ('other_row', '[0.0, 1.0, 0.0, 0.0]')",
+    )
+    .await
+    .unwrap();
+
+    // Restart against the same data directory: WAL-only recovery, the exact
+    // path the durable-store rebuild uses.
+    let (srv, dir) = srv.take_dir();
+    srv.graceful_shutdown().await;
+    let (srv2, _dir) = TestServer::open_on_path(dir).await;
+
+    let ids = srv2
+        .query_rows(
+            "SELECT id FROM docs_vec_json_str \
+             ORDER BY vector_distance(embedding, ARRAY[1.0, 0.0, 0.0, 0.0]) LIMIT 1",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "JSON-string embedding must be indexed and survive restart; got {ids:?}"
+    );
+    assert_eq!(
+        ids[0][0], "json_row",
+        "search aligned with the JSON-string embedding must return its row: {ids:?}"
+    );
+}
+
+/// An empty embedding rejects the whole write at the client boundary.
+///
+/// `INSERT ... VALUES ('e', '')` carries an empty vector field, which is a
+/// missing embedding, not a valid one: the statement must fail with a
+/// constraint error instead of succeeding with the row silently skipped.
+/// `Value::Null` remains the clean skip — a document with no embedding is
+/// expressed as null.
+#[tokio::test]
+async fn empty_embedding_insert_is_refused_at_the_client() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION docs_vec_empty TYPE document")
+        .await
+        .unwrap();
+    srv.exec(
+        "CREATE VECTOR INDEX idx_docs_vec_empty ON docs_vec_empty (embedding) \
+         METRIC cosine DIM 4",
+    )
+    .await
+    .unwrap();
+
+    // Empty string embedding must be refused as an error.
+    let err = srv
+        .exec("INSERT INTO docs_vec_empty (id, embedding) VALUES ('e', '')")
+        .await;
+    assert!(
+        err.is_err(),
+        "an empty embedding must reject the write, not skip it silently"
+    );
+    let msg = err.unwrap_err();
+    assert!(
+        msg.contains("embedding"),
+        "error should name the vector field: {msg}"
+    );
+
+    // Empty array literal is the same shape — refused.
+    let err = srv
+        .exec("INSERT INTO docs_vec_empty (id, embedding) VALUES ('e2', '[]')")
+        .await;
+    assert!(
+        err.is_err(),
+        "an empty array literal embedding must reject the write"
+    );
+
+    // Null is the escape hatch: no embedding, no error.
+    srv.exec("INSERT INTO docs_vec_empty (id, embedding) VALUES ('n', NULL)")
+        .await
+        .expect("NULL embedding must be accepted as 'no vector field'");
+}
