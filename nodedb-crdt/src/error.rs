@@ -89,6 +89,26 @@ pub enum CrdtError {
     #[error("delta preview post-image exceeds byte limit: {actual} > {limit}")]
     PreviewPostImageTooLarge { limit: usize, actual: usize },
 
+    /// The requested version predates the compaction boundary, so the
+    /// operations that reconstruct it are gone.
+    ///
+    /// Loro answers such a request by clamping the version to the retained
+    /// boundary instead of refusing it, and a read at the clamped version
+    /// returns plausible state for a different version. Refusing is the only
+    /// honest answer: the requested state no longer exists on this node.
+    /// Reading it needs an archived snapshot taken before compaction.
+    #[error(
+        "version predates the compaction boundary: peer {peer} requested {requested} operations, \
+         compaction discarded the first {discarded}"
+    )]
+    VersionBeforeCompactionBoundary {
+        peer: u64,
+        requested: i32,
+        /// Operations of this peer the compaction discarded. A readable
+        /// version asks for more than this count.
+        discarded: i32,
+    },
+
     /// Loro internal error.
     #[error("loro error: {0}")]
     Loro(String),

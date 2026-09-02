@@ -24,10 +24,10 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 /// that applies it compacts its own oplog from post-apply. A single node has
 /// no applier, so this handler dispatches the compaction itself.
 ///
-/// Compaction replaces the document with a shallow snapshot, and `fork_at`
-/// refuses a shallow document outright. `AS OF` / `AT VERSION` reads of this
-/// document therefore stop working on a compacted node, at every version,
-/// including versions above the cutoff. Only the current-state read survives.
+/// Compaction replaces the document with a shallow snapshot. `AS OF` /
+/// `AT VERSION` reads keep working for every version at or above the cutoff.
+/// A version below the cutoff is refused: the operations that reconstruct it
+/// are gone, and reading it needs a snapshot archived before compaction.
 pub async fn compact_history(
     state: &SharedState,
     identity: &AuthenticatedIdentity,

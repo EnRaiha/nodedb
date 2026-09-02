@@ -336,16 +336,32 @@ async fn compact_history_on_leader_compacts_the_follower_oplog() {
     )
     .await;
 
-    // The refusal names the shallow document. Only a compacted oplog produces
-    // it: Loro refuses `fork_at` on a shallow document, and a node that never
-    // ran the dispatch still holds a full one and answers with the value.
+    // The refusal names the compaction boundary. Only a compacted oplog
+    // produces it: a node that never ran the dispatch still holds the
+    // discarded operations and answers with the value.
     let refusal = read_at_version(follower, &below_version)
         .await
         .expect_err("the compacted follower must not serve the pre-boundary version");
     assert!(
-        refusal.contains("shallow"),
-        "follower node {} must refuse the pre-boundary read because its own document \
-         is shallow; got {refusal}",
+        refusal.contains("predates the compaction boundary"),
+        "follower node {} must refuse the pre-boundary read by naming the boundary; \
+         got {refusal}",
+        follower.node_id,
+    );
+
+    // Compaction takes only the history below the cutoff. The boundary
+    // version names the shallow root, which the document keeps, so the
+    // follower still serves it.
+    let boundary_version = stored_checkpoint(follower, "boundary")
+        .expect("the boundary checkpoint survives its own exclusive cutoff")
+        .version_vector_json;
+    let at_boundary = read_at_version(follower, &boundary_version)
+        .await
+        .expect("the compacted follower must serve the boundary version");
+    assert!(
+        at_boundary.contains(REV_AT),
+        "follower node {} must read '{REV_AT}' at the boundary version after \
+         compaction; got {at_boundary}",
         follower.node_id,
     );
 

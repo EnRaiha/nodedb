@@ -19,8 +19,8 @@ impl CrdtState {
 
     /// Read the document state at a historical version.
     ///
-    /// Uses `fork_at` to create a lightweight copy at the target version
-    /// and reads the specified row. Returns `None` if the row didn't exist.
+    /// Forks a private copy at the target version and reads the specified
+    /// row. Returns `None` if the row didn't exist.
     ///
     /// Cost: O(oplog_size) for the fork — not for hot-path queries.
     pub fn read_at_version(
@@ -29,11 +29,7 @@ impl CrdtState {
         row_id: &str,
         version: &loro::VersionVector,
     ) -> Result<Option<LoroValue>> {
-        let frontiers = self.doc.vv_to_frontiers(version);
-        let forked = self
-            .doc
-            .fork_at(&frontiers)
-            .map_err(|e| CrdtError::Loro(format!("fork at version: {e}")))?;
+        let forked = fork_at_version(&self.doc, version)?;
 
         let coll = forked.get_map(collection);
         match coll.get(row_id) {
@@ -92,7 +88,8 @@ impl CrdtState {
     /// Compact history at a specific version (not just current frontiers).
     ///
     /// Discards oplog entries before the target version. Current state and
-    /// all versions after the target are preserved.
+    /// every version at or after the target, including the target itself,
+    /// stays readable.
     pub fn compact_at_version(&mut self, version: &loro::VersionVector) -> Result<()> {
         self.compact_to_frontiers(&self.doc.vv_to_frontiers(version))
     }
@@ -173,16 +170,61 @@ impl CrdtState {
     }
 }
 
+/// A private copy of `doc` holding the state at `version`.
+///
+/// Compaction turns a document shallow: the operations before the shallow
+/// boundary are discarded. Two Loro behaviours make a versioned read on such
+/// a document wrong, and this is the one place that handles both.
+///
+/// `fork_at` refuses every shallow document, whatever version is asked for,
+/// so a document stays readable only by forking whole and checking the fork
+/// out. The fork is what moves — checking out `doc` itself detaches the live
+/// document and changes what concurrent readers see.
+///
+/// `vv_to_frontiers` drops each peer the shallow boundary already covers
+/// rather than reporting the version as unreachable. A version below the
+/// boundary therefore resolves to a different frontier, and reading there
+/// returns plausible state for the wrong version. The guard rejects those
+/// versions before any frontier is computed.
+fn fork_at_version(doc: &LoroDoc, version: &loro::VersionVector) -> Result<LoroDoc> {
+    if !doc.is_shallow() {
+        return doc
+            .fork_at(&doc.vv_to_frontiers(version))
+            .map_err(|e| CrdtError::Loro(format!("fork at version: {e}")));
+    }
+
+    // The boundary counts, per peer, the operations compaction discarded:
+    // Loro documents it as the operations the shallow history does not hold.
+    // A version must therefore ask for more than that count to name any
+    // operation the document still carries. Asking for exactly the discarded
+    // count names the state before the shallow root, which no longer exists.
+    // One peer short of it makes the whole version unreachable.
+    let boundary = doc.shallow_since_vv();
+    for (peer, discarded) in boundary.iter() {
+        let requested = version.get(peer).copied().unwrap_or(0);
+        if *discarded > 0 && requested <= *discarded {
+            return Err(CrdtError::VersionBeforeCompactionBoundary {
+                peer: *peer,
+                requested,
+                discarded: *discarded,
+            });
+        }
+    }
+
+    let forked = doc.fork();
+    forked
+        .checkout(&doc.vv_to_frontiers(version))
+        .map_err(|e| CrdtError::Loro(format!("checkout at version: {e}")))?;
+    Ok(forked)
+}
+
 fn historical_row(
     doc: &LoroDoc,
     collection: &str,
     row_id: &str,
     version: &loro::VersionVector,
 ) -> Result<LoroMap> {
-    let frontiers = doc.vv_to_frontiers(version);
-    let forked = doc
-        .fork_at(&frontiers)
-        .map_err(|e| CrdtError::Loro(format!("fork at version: {e}")))?;
+    let forked = fork_at_version(doc, version)?;
     match forked.get_map(collection).get(row_id) {
         Some(ValueOrContainer::Container(loro::Container::Map(row))) => Ok(row),
         Some(_) => Err(CrdtError::Loro("historical state is not a map".into())),
@@ -230,6 +272,140 @@ mod tests {
     use loro::LoroValue;
 
     use super::CrdtState;
+    use crate::error::CrdtError;
+
+    /// Three committed versions of one row, and the version vector captured
+    /// after each. Shared by the compaction-boundary tests so they all agree
+    /// on where the boundary falls.
+    struct History {
+        state: CrdtState,
+        after_v1: loro::VersionVector,
+        after_v2: loro::VersionVector,
+        after_v3: loro::VersionVector,
+    }
+
+    fn three_versions() -> History {
+        let state = CrdtState::new(1).expect("state");
+        let mut versions = Vec::new();
+        for title in ["v1", "v2", "v3"] {
+            state
+                .upsert(
+                    "docs",
+                    "doc-1",
+                    &[("title", LoroValue::String(title.into()))],
+                )
+                .expect("write");
+            state.doc.commit();
+            versions.push(state.oplog_version_vector());
+        }
+        History {
+            state,
+            after_v1: versions[0].clone(),
+            after_v2: versions[1].clone(),
+            after_v3: versions[2].clone(),
+        }
+    }
+
+    fn title_of(row: &LoroValue) -> Option<LoroValue> {
+        match row {
+            LoroValue::Map(fields) => fields.get("title").cloned(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn version_above_compaction_boundary_reads_its_own_value() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v1)
+            .expect("compact");
+        assert!(history.state.doc.is_shallow());
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v2)
+            .expect("read above boundary")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v2".into())));
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v3)
+            .expect("read current")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v3".into())));
+    }
+
+    #[test]
+    fn version_below_compaction_boundary_is_refused() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("compact");
+
+        let error = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v1)
+            .expect_err("a discarded version must not read");
+        assert!(
+            matches!(error, CrdtError::VersionBeforeCompactionBoundary { .. }),
+            "expected a compaction-boundary refusal, got {error:?}"
+        );
+    }
+
+    /// The compaction target itself stays readable. It names the shallow
+    /// root, which the document keeps, so the guard must admit it.
+    #[test]
+    fn the_compaction_target_version_still_reads() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("compact");
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v2)
+            .expect("the compaction target must read")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v2".into())));
+    }
+
+    #[test]
+    fn full_history_still_reads_an_old_version() {
+        let history = three_versions();
+        assert!(!history.state.doc.is_shallow());
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v1)
+            .expect("read old version")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v1".into())));
+    }
+
+    #[test]
+    fn restore_preview_works_above_compaction_boundary() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("compact");
+
+        let delta = history
+            .state
+            .preview_restore_to_version("docs", "doc-1", &history.after_v2)
+            .expect("preview restore above boundary");
+        assert!(!delta.is_empty());
+
+        history.state.import(&delta).expect("apply preview delta");
+        assert_eq!(
+            history.state.read_field("docs", "doc-1", "title"),
+            Some(LoroValue::String("v2".into()))
+        );
+    }
 
     fn prepared_state() -> (CrdtState, loro::VersionVector, Vec<u8>) {
         let state = CrdtState::new(1).expect("state");
