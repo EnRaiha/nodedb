@@ -57,8 +57,11 @@ pub(super) async fn try_string(
     // on the pgwire path too), so the timeseries `show_partitions` handler stays
     // shadowed exactly as it was.
 
-    // Weighted random selection.
-    if upper.contains("WEIGHTED_PICK(") || upper.contains("WEIGHTED_PICK (") {
+    // Weighted random selection — anchored to the statement prefix so a
+    // doc-object UPSERT body carrying the token never reaches this arm.
+    if upper.starts_with("SELECT * FROM WEIGHTED_PICK(")
+        || upper.starts_with("SELECT * FROM WEIGHTED_PICK (")
+    {
         return Some(weighted_pick::weighted_pick(state, identity, sql).await);
     }
 
@@ -89,11 +92,17 @@ pub(super) async fn try_string(
         return Some(kv_sorted_index::drop_sorted_index(state, identity, database_id, sql).await);
     }
 
-    // Sorted index query functions.
+    // Sorted index query functions, anchored to the statement prefix: a
+    // doc-object UPSERT body, string literal, or comment carrying the token
+    // can never reach these arms.
     if upper.starts_with("SELECT RANK(") || upper.starts_with("SELECT RANK (") {
         return Some(kv_sorted_index::select_rank(state, identity, database_id, sql).await);
     }
-    if upper.contains("TOPK(") || upper.contains("TOPK (") {
+    if upper.starts_with("SELECT TOPK(")
+        || upper.starts_with("SELECT TOPK (")
+        || upper.starts_with("SELECT * FROM TOPK(")
+        || upper.starts_with("SELECT * FROM TOPK (")
+    {
         return Some(kv_sorted_index::select_topk(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT SORTED_COUNT(") || upper.starts_with("SELECT SORTED_COUNT (") {
@@ -291,14 +300,13 @@ pub(super) async fn try_string(
 
     // `NDB_CHUNK_TEXT(...)` table-valued function, `SHOW CHANGES FOR …`
     // change-stream query, and `SELECT ESTIMATE_COUNT(…)` — string-recognized
-    // (none parse into a typed DDL variant). The pgwire dsl string router
-    // recognized all three by prefix from the raw SQL; replicate that exactly
-    // here, before the parse gate, so the prefix recognition and syntax messages
-    // stay byte-identical. The `NDB_CHUNK_TEXT(` and `ESTIMATE_COUNT(`
-    // function-name checks are specific enough not to collide with the other
-    // migrated `SELECT …` arms above.
-    if (upper.starts_with("SELECT ") && upper.contains("NDB_CHUNK_TEXT("))
+    // (none parse into a typed DDL variant). Anchored to the statement prefix
+    // so a string literal or doc-object UPSERT body carrying the token never
+    // reaches this arm.
+    if upper.starts_with("SELECT * FROM NDB_CHUNK_TEXT(")
+        || upper.starts_with("SELECT * FROM NDB_CHUNK_TEXT (")
         || upper.starts_with("SELECT NDB_CHUNK_TEXT(")
+        || upper.starts_with("SELECT NDB_CHUNK_TEXT (")
     {
         return Some(chunk_text::execute_chunk_text(sql));
     }

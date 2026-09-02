@@ -130,6 +130,7 @@ mod redaction_policy_database_scope;
 mod reindex_concurrent;
 mod restart_refused_write_not_resurrected;
 mod rls_policy_database_scope;
+mod router_misroute_literals;
 mod scalar_aggregate_empty_input;
 mod scalar_aggregate_multicore_merge;
 mod schema_visibility_barrier;
