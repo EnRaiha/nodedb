@@ -28,16 +28,45 @@ pub(super) enum AuthMode {
     Password,
 }
 
-/// Write `nodedb.toml` into `dir` and return its path.
+/// `[tuning]` overrides a test asks the spawned server to boot with.
 ///
-/// `columnar_flush_threshold`, when `Some`, overrides
-/// `[tuning.query] columnar_flush_threshold` so a test can observe segment
-/// flushes without inserting 65k rows.
-pub(super) fn write_config(
-    dir: &Path,
-    auth_mode: AuthMode,
-    columnar_flush_threshold: Option<usize>,
-) -> PathBuf {
+/// Each field is `None` for the shipped default. One struct keeps the spawn
+/// path from growing a positional argument per knob.
+#[derive(Clone, Copy, Default)]
+pub(super) struct TuningOverrides {
+    /// Overrides `[tuning.query] columnar_flush_threshold` so a test can
+    /// observe segment flushes without inserting 65k rows.
+    pub(super) columnar_flush_threshold: Option<usize>,
+    /// Overrides `[tuning.maintenance] auto_analyze_min_mutations` so a test
+    /// can trip auto-ANALYZE without issuing 1000 writes.
+    pub(super) auto_analyze_min_mutations: Option<u64>,
+}
+
+impl TuningOverrides {
+    /// Boot with every tuning knob at its shipped default.
+    pub(super) fn none() -> Self {
+        Self::default()
+    }
+
+    /// Boot with a lowered columnar flush threshold.
+    pub(super) fn columnar_flush(threshold: usize) -> Self {
+        Self {
+            columnar_flush_threshold: Some(threshold),
+            ..Self::default()
+        }
+    }
+
+    /// Boot with a lowered auto-ANALYZE mutation floor.
+    pub(super) fn auto_analyze(min_mutations: u64) -> Self {
+        Self {
+            auto_analyze_min_mutations: Some(min_mutations),
+            ..Self::default()
+        }
+    }
+}
+
+/// Write `nodedb.toml` into `dir` and return its path.
+pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverrides) -> PathBuf {
     let (mode, max_failed_logins, lockout_duration_secs) = match auth_mode {
         AuthMode::Trust => ("trust", 0u32, 0u64),
         AuthMode::Password => ("password", 5u32, 300u64),
@@ -58,9 +87,14 @@ pub(super) fn write_config(
     // production drain outlives the harness's 20s SIGTERM patience, so the
     // server would be force-killed instead of exiting gracefully.
     toml.push_str("\n[tuning.network]\ndrain_timeout_secs = 2\n");
-    if let Some(threshold) = columnar_flush_threshold {
+    if let Some(threshold) = tuning.columnar_flush_threshold {
         toml.push_str(&format!(
             "\n[tuning.query]\ncolumnar_flush_threshold = {threshold}\n"
+        ));
+    }
+    if let Some(min_mutations) = tuning.auto_analyze_min_mutations {
+        toml.push_str(&format!(
+            "\n[tuning.maintenance]\nauto_analyze_min_mutations = {min_mutations}\n"
         ));
     }
     toml.push_str(&format!(

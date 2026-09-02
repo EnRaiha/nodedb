@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use super::config_toml::{self, AuthMode};
+use super::config_toml::{self, AuthMode, TuningOverrides};
 
 /// Bind an ephemeral port then release it for a child process to bind
 /// itself. Mirrors `crash_harness::free_port`, which accepts the same race.
@@ -117,10 +117,10 @@ pub(super) struct SpawnedServer {
 pub(super) fn spawn(
     data_dir: &Path,
     auth_mode: AuthMode,
-    columnar_flush_threshold: Option<usize>,
+    tuning: TuningOverrides,
     cores: usize,
 ) -> SpawnedServer {
-    spawn_with_failpoints(data_dir, auth_mode, columnar_flush_threshold, cores, None)
+    spawn_with_failpoints(data_dir, auth_mode, tuning, cores, None)
 }
 
 /// Spawn with `NODEDB_FAILPOINTS` set from `failpoints` (see
@@ -131,11 +131,11 @@ pub(super) fn spawn(
 pub(super) fn spawn_with_failpoints(
     data_dir: &Path,
     auth_mode: AuthMode,
-    columnar_flush_threshold: Option<usize>,
+    tuning: TuningOverrides,
     cores: usize,
     failpoints: Option<&str>,
 ) -> SpawnedServer {
-    let config_path = config_toml::write_config(data_dir, auth_mode, columnar_flush_threshold);
+    let config_path = config_toml::write_config(data_dir, auth_mode, tuning);
     let mut last_failure = String::new();
     for _ in 0..START_ATTEMPTS {
         match try_spawn(data_dir, &config_path, cores, failpoints) {

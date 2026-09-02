@@ -16,6 +16,7 @@ use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::neutral::maintenance::auto_analyze;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::SessionId;
@@ -367,9 +368,10 @@ impl NodeDbPgHandler {
                     )))
                 })?;
 
-                self.state.dml_counter.record_dml(
-                    task_database_id.as_u64(),
-                    tenant_id.as_u64(),
+                auto_analyze::record_and_maybe_analyze(
+                    &self.state,
+                    identity,
+                    task_database_id,
                     &info.collection,
                 );
             }

@@ -4,6 +4,7 @@ mod bitemporal;
 mod config;
 mod data_plane;
 mod engines;
+mod maintenance;
 mod memory;
 mod network;
 mod scheduler;
@@ -17,6 +18,7 @@ pub use engines::{
     DEFAULT_VARLEN_MAX_RESULTS, GraphTuning, KvTuning, SparseTuning, TimeseriesToning,
     VectorTuning,
 };
+pub use maintenance::MaintenanceTuning;
 pub use memory::MemoryTuning;
 pub use network::{BridgeTuning, ClusterTransportTuning, NetworkTuning, WalTuning};
 pub use scheduler::SchedulerTuning;

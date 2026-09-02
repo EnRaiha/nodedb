@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use super::config_toml::AuthMode;
+use super::config_toml::{AuthMode, TuningOverrides};
 use super::process::{self, SpawnedServer};
 use super::types::{TestClient, TestDataDir, TestServer};
 
@@ -19,7 +19,7 @@ impl TestServer {
     /// post-boot election race.
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, TuningOverrides::none(), 1);
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -28,7 +28,7 @@ impl TestServer {
     /// single-core server cannot.
     pub async fn start_multicores(cores: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, cores);
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, TuningOverrides::none(), cores);
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -37,7 +37,7 @@ impl TestServer {
     /// The harness user `nodedb` keeps password `nodedb`.
     pub async fn start_password() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Password, None, 1);
+        let spawned = process::spawn(dir.path(), AuthMode::Password, TuningOverrides::none(), 1);
         Self::connect_and_build(spawned, dir, AuthMode::Password).await
     }
 
@@ -50,8 +50,13 @@ impl TestServer {
     /// never fires, since `fail_point_err!` compiles to nothing without it.
     pub async fn start_with_failpoints(spec: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned =
-            process::spawn_with_failpoints(dir.path(), AuthMode::Trust, None, 1, Some(spec));
+        let spawned = process::spawn_with_failpoints(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::none(),
+            1,
+            Some(spec),
+        );
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -60,7 +65,25 @@ impl TestServer {
     /// behaviour on small datasets without inserting 65k rows.
     pub async fn start_with_columnar_flush_threshold(flush_threshold: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold), 1);
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::columnar_flush(flush_threshold),
+            1,
+        );
+        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
+    }
+
+    /// Spawn a single-core NodeDB server with a lowered auto-ANALYZE
+    /// mutation floor so a test can trip the trigger on a small write count.
+    pub async fn start_with_auto_analyze_threshold(min_mutations: u64) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::auto_analyze(min_mutations),
+            1,
+        );
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
@@ -68,7 +91,7 @@ impl TestServer {
     /// so a previous server's data is visible after boot. `dir` is not
     /// consumed — ownership stays with the caller.
     pub async fn open_on_path(dir: TestDataDir) -> (Self, TestDataDir) {
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, None, 1);
+        let spawned = process::spawn(dir.path(), AuthMode::Trust, TuningOverrides::none(), 1);
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
         (server, dir)
@@ -81,7 +104,12 @@ impl TestServer {
         dir: TestDataDir,
         flush_threshold: usize,
     ) -> (Self, TestDataDir) {
-        let spawned = process::spawn(dir.path(), AuthMode::Trust, Some(flush_threshold), 1);
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::columnar_flush(flush_threshold),
+            1,
+        );
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
         (server, dir)

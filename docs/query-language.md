@@ -1083,7 +1083,9 @@ EXPLAIN SELECT * FROM users WHERE age > 30;
 
 -- Collect per-column statistics for the cost-based planner
 -- (row_count, distinct_count, avg_value_len; used to pick distributed
--- join/aggregate strategies). Auto-ANALYZE re-runs after ~10% of rows change.
+-- join/aggregate strategies). Auto-ANALYZE re-runs in the background after
+-- ~10% of rows change, with a floor of `[tuning.maintenance]
+-- auto_analyze_min_mutations` writes (1000 by default).
 ANALYZE orders;
 ANALYZE;             -- all collections
 

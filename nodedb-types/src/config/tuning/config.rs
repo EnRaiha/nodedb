@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::bitemporal::BitemporalTuning;
 use super::data_plane::{DataPlaneTuning, QueryTuning};
 use super::engines::{GraphTuning, KvTuning, SparseTuning, TimeseriesToning, VectorTuning};
+use super::maintenance::MaintenanceTuning;
 use super::memory::MemoryTuning;
 use super::network::{BridgeTuning, ClusterTransportTuning, NetworkTuning, WalTuning};
 use super::scheduler::SchedulerTuning;
@@ -48,6 +49,8 @@ pub struct TuningConfig {
     pub shutdown: ShutdownTuning,
     #[serde(default)]
     pub bitemporal: BitemporalTuning,
+    #[serde(default)]
+    pub maintenance: MaintenanceTuning,
 }
 
 impl TuningConfig {
@@ -107,6 +110,18 @@ mod tests {
         assert_eq!(parsed.memory.overflow_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(parsed.memory.doc_cache_entries, 4096);
         assert_eq!(parsed.shutdown.deadline_ms, 900);
+        assert_eq!(parsed.maintenance.auto_analyze_min_mutations, 1000);
+    }
+
+    #[test]
+    fn maintenance_section_overrides_the_analyze_floor() {
+        let toml_str = r#"
+[maintenance]
+auto_analyze_min_mutations = 20
+"#;
+        let cfg: TuningConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.maintenance.auto_analyze_min_mutations, 20);
+        assert_eq!(cfg.query.sort_run_size, 100_000);
     }
 
     #[test]

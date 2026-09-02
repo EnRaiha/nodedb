@@ -168,7 +168,7 @@ SET cross_shard_txn = 'best_effort_non_atomic';
 
 ## Distributed Query Execution
 
-Multi-node SELECTs pick their execution strategy from `ANALYZE` statistics — run `ANALYZE <collection>` to collect per-column `row_count`, `distinct_count`, and `avg_value_len` into the catalog (auto-ANALYZE re-runs after ~10% of rows change).
+Multi-node SELECTs pick their execution strategy from `ANALYZE` statistics — run `ANALYZE <collection>` to collect per-column `row_count`, `distinct_count`, and `avg_value_len` into the catalog. Auto-ANALYZE re-runs in the background after ~10% of rows change, floored at `[tuning.maintenance] auto_analyze_min_mutations` writes (1000 by default) and gated by the database's maintenance CPU budget.
 
 **Joins** — The cost model estimates each side's size from statistics and chooses between **broadcast join** (small side shipped to every node) and **shuffle join** (both sides hash-partitioned across nodes over the QUIC streaming transport). Unanalyzed or empty sides fall back to broadcast. Overrides: `SET nodedb.force_shuffle_join = true`, `SET nodedb.broadcast_threshold_bytes = ...` (default from `[tuning.cluster_transport] broadcast_threshold_bytes`, 8 MiB).
 
