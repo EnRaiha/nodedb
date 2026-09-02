@@ -40,7 +40,9 @@ pub async fn try_dispatch(
     database_id: DatabaseId,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
-    let upper = sql.to_uppercase();
+    // Trim so prefix-anchored arms (SELECT TOPK(, SELECT RANK(, …) still
+    // match a statement that arrives with leading whitespace or a newline.
+    let upper = sql.trim().to_uppercase();
 
     if let Some(r) = string_admin::try_string(state, identity, sql, &upper, database_id).await {
         return Some(r);
