@@ -409,10 +409,12 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
-        | CatalogEntry::DeleteCheckpointsBefore { .. } => {
+        | CatalogEntry::DeleteCheckpointsBefore { .. }
+        | CatalogEntry::CompactHistory { .. } => {
             // no-op: checkpoints have no in-memory mirror — every reader
             // (SHOW VERSIONS, AT VERSION, COMPACT HISTORY) goes to the
-            // catalog, which `apply` already wrote on this node.
+            // catalog, which `apply` already wrote on this node. The oplog
+            // compaction runs from the async post-apply path.
         }
         CatalogEntry::PutVectorModel(_)
         | CatalogEntry::PutVectorIndexParams(_)

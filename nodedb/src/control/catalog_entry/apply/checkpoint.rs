@@ -32,7 +32,7 @@ pub fn delete(
         .map(|_| ())
 }
 
-/// Apply a `DeleteCheckpointsBefore` range delete.
+/// Apply the range delete `DeleteCheckpointsBefore` and `CompactHistory` share.
 ///
 /// The boundary is exclusive, so a checkpoint stamped exactly at
 /// `before_timestamp` survives on every node.
@@ -61,6 +61,7 @@ mod tests {
     use crate::control::catalog_entry::{apply, decode, encode};
 
     const TENANT: u64 = 7;
+    const DATABASE: u64 = 3;
     const COLLECTION: &str = "documents";
     const DOC: &str = "doc-1";
     const NAME: &str = "launch-ready";
@@ -155,6 +156,62 @@ mod tests {
             }
             other => panic!("unexpected variant: {}", other.kind()),
         }
+    }
+
+    /// The entry carries the compaction target as well as the boundary. A
+    /// target lost in the codec leaves every follower unable to compact.
+    #[test]
+    fn compact_history_roundtrips_through_codec() {
+        let entry = CatalogEntry::CompactHistory {
+            tenant_id: TENANT,
+            database_id: DATABASE,
+            collection: COLLECTION.to_string(),
+            doc_id: DOC.to_string(),
+            before_timestamp: 500,
+            target_version_json: "{\"n1\":4}".to_string(),
+        };
+        match decode(&encode(&entry).unwrap()).unwrap() {
+            CatalogEntry::CompactHistory {
+                tenant_id,
+                database_id,
+                collection,
+                doc_id,
+                before_timestamp,
+                target_version_json,
+            } => {
+                assert_eq!(tenant_id, TENANT);
+                assert_eq!(database_id, DATABASE);
+                assert_eq!(collection, COLLECTION);
+                assert_eq!(doc_id, DOC);
+                assert_eq!(before_timestamp, 500);
+                assert_eq!(target_version_json, "{\"n1\":4}");
+            }
+            other => panic!("unexpected variant: {}", other.kind()),
+        }
+    }
+
+    /// `CompactHistory` applies the same range delete `DeleteCheckpointsBefore`
+    /// does, so a node that receives either drops the same rows.
+    #[test]
+    fn compact_history_applies_the_same_range_delete() {
+        let (_dir, catalog) = open_catalog();
+        put(&sample("older", 99), &catalog).unwrap();
+        put(&sample("boundary", 100), &catalog).unwrap();
+
+        apply::apply_to(
+            &CatalogEntry::CompactHistory {
+                tenant_id: TENANT,
+                database_id: DATABASE,
+                collection: COLLECTION.to_string(),
+                doc_id: DOC.to_string(),
+                before_timestamp: 100,
+                target_version_json: "{\"n1\":4}".to_string(),
+            },
+            &catalog,
+        )
+        .unwrap();
+
+        assert_eq!(names(&catalog), vec!["boundary".to_string()]);
     }
 
     #[test]

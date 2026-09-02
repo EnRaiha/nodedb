@@ -2,18 +2,11 @@
 
 //! COMPACT HISTORY ON collection WHERE id = 'doc-id' BEFORE 'checkpoint'
 
-use std::time::Duration;
-
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
-};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -23,9 +16,18 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 
 /// COMPACT HISTORY ON collection WHERE id = 'doc-id' BEFORE 'checkpoint'
 ///
-/// Discards oplog entries before the specified checkpoint. Current state
-/// and all versions after the checkpoint are preserved. Checkpoints
-/// created before the cutoff are deleted from the catalog.
+/// Discards oplog entries before the specified checkpoint. Current state and
+/// the operations after the checkpoint are retained. Checkpoints created
+/// before the cutoff are deleted from the catalog.
+///
+/// The proposed entry carries the checkpoint's version vector, so every node
+/// that applies it compacts its own oplog from post-apply. A single node has
+/// no applier, so this handler dispatches the compaction itself.
+///
+/// Compaction replaces the document with a shallow snapshot, and `fork_at`
+/// refuses a shallow document outright. `AS OF` / `AT VERSION` reads of this
+/// document therefore stop working on a compacted node, at every version,
+/// including versions above the cutoff. Only the current-state read survives.
 pub async fn compact_history(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -47,38 +49,33 @@ pub async fn compact_history(
             )
         })?;
 
-    // Dispatch compact to Data Plane.
-    let plan = PhysicalPlan::Crdt(CrdtOp::CompactAtVersion {
-        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-        target_version_json: record.version_vector_json.clone(),
-    });
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_system(
-        state,
-        SystemTask::new(
-            SystemReason::CatalogMaintenance,
-            tenant_id,
-            database_id,
-            &collection,
-            plan,
-        ),
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", format!("compact dispatch: {e}")))?;
-
-    // Count on the leader: the replicated range delete carries the boundary,
-    // not a row count, and the audit line names how many rows it removes.
+    // Count on the leader: the replicated entry carries the boundary, not a
+    // row count, and the audit line names how many rows it removes.
     let deleted = catalog
         .count_checkpoints_before(tenant_id.as_u64(), &collection, &doc_id, record.created_at)
         .map_err(|e| err("XX000", e.to_string()))?;
-    super::replicate::propose_delete_before(
+    let outcome = super::replicate::propose_compact_history(
         state,
         tenant_id.as_u64(),
         &collection,
         &doc_id,
         record.created_at,
+        database_id.as_u64(),
+        &record.version_vector_json,
     )?;
+
+    // Single node: no applier runs, so post-apply never fires. Dispatch the
+    // compaction the post-apply lane dispatches everywhere else.
+    if outcome.needs_local_apply() {
+        crate::control::catalog_entry::post_apply::compact_async(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            &collection,
+            &record.version_vector_json,
+            state,
+        )
+        .await;
+    }
 
     state
         .audit

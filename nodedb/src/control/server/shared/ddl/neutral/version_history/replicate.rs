@@ -5,14 +5,18 @@
 //! Every mutation of `_system.checkpoints` proposes a `CatalogEntry`, so each
 //! node writes the row. A checkpoint created on one node resolves on all.
 //! Checkpoints have no in-memory mirror, so there is no post-apply install.
+//!
+//! The oplog compaction behind `COMPACT HISTORY` is node-local physical state,
+//! so it runs from the post-apply lane on every node that applies the entry.
 
 use crate::control::catalog_entry::apply::checkpoint as apply;
 use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::security::catalog::types::CheckpointRecord;
 use crate::control::state::SharedState;
 
 use super::super::super::result::DdlError;
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::{propose_and_apply, propose_and_apply_outcome};
 
 /// Propose the checkpoint row. The leader reports the duplicate before
 /// proposing, so apply is a plain write that never rejects.
@@ -53,24 +57,34 @@ pub(super) fn propose_delete(
     })
 }
 
-/// Propose the COMPACT HISTORY range delete as one entry carrying the boundary.
+/// Propose one COMPACT HISTORY statement as a single entry carrying the
+/// checkpoint boundary and the compaction target.
 ///
 /// Shipping the boundary rather than N per-row deletes keeps followers in step
-/// with the leader even when their scan order differs.
-pub(super) fn propose_delete_before(
+/// with the leader even when their scan order differs. `target_version_json`
+/// rides along because post-apply compacts each node's oplog to it, and apply
+/// has already deleted the checkpoint row that holds it.
+///
+/// The returned outcome tells the handler whether a post-apply lane will run
+/// this node's compaction dispatch.
+pub(super) fn propose_compact_history(
     state: &SharedState,
     tenant_id: u64,
     collection: &str,
     doc_id: &str,
     before_timestamp: u64,
-) -> Result<(), DdlError> {
-    let entry = CatalogEntry::DeleteCheckpointsBefore {
+    database_id: u64,
+    target_version_json: &str,
+) -> Result<ProposeOutcome, DdlError> {
+    let entry = CatalogEntry::CompactHistory {
         tenant_id,
+        database_id,
         collection: collection.to_string(),
         doc_id: doc_id.to_string(),
         before_timestamp,
+        target_version_json: target_version_json.to_string(),
     };
-    propose_and_apply(state, &entry, || {
+    propose_and_apply_outcome(state, &entry, || {
         apply::delete_before(
             tenant_id,
             collection,

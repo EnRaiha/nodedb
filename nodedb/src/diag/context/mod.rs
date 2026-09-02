@@ -7,6 +7,7 @@
 //! report with a rising count instead of one per attempt.
 
 mod catalog;
+mod crdt;
 mod data_plane;
 mod ingest;
 mod quota;
@@ -19,6 +20,7 @@ pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
     MetadataApplyWedged,
 };
+pub(in crate::diag) use crdt::HistoryCompactionNotApplied;
 pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{CalvinCompletionTimeout, DataPlaneResponseLost};
 pub(in crate::diag) use ingest::IlpAcceptedLinesDropped;

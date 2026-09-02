@@ -35,6 +35,12 @@
 //! refusal makes a late `DropIndex` block the same-name re-CREATE that may
 //! follow it.
 //!
+//! ## Ordering for `CompactHistory`
+//!
+//! `CrdtOp::CompactAtVersion` has no such refusal: a compaction that lands
+//! after a later read still discards the same oplog entries. It is spawned
+//! fire-and-forget.
+//!
 //! Variants without a read-after-apply dependency remain fire-and-forget.
 
 use std::sync::Arc;
@@ -184,6 +190,27 @@ pub fn spawn_post_apply_async_side_effects(
                 });
             });
         }
+        // `CompactHistory` dispatches the oplog compaction to every core so
+        // each node discards the same history the leader does. A late
+        // compaction still succeeds, so this stays fire-and-forget.
+        CatalogEntry::CompactHistory {
+            tenant_id,
+            collection,
+            database_id,
+            target_version_json,
+            ..
+        } => {
+            tokio::spawn(async move {
+                super::crdt_compact::compact_async(
+                    database_id,
+                    tenant_id,
+                    &collection,
+                    &target_version_json,
+                    &shared,
+                )
+                .await;
+            });
+        }
         // `DeleteContinuousAggregate` dispatches unregister to every
         // core so per-node runtime state is reclaimed symmetrically.
         CatalogEntry::DeleteContinuousAggregate {
@@ -279,6 +306,8 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteConsumerGroup { .. }
         | CatalogEntry::MigrateConsumerGroupStream { .. }
         // Checkpoints have no in-memory mirror at all.
+        // CompactHistory has its own async branch above; it does not appear
+        // here.
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::DeleteCheckpointsBefore { .. }

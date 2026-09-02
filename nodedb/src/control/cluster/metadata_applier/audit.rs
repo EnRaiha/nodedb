@@ -371,6 +371,13 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             collection,
             doc_id,
             before_timestamp,
+        }
+        | E::CompactHistory {
+            tenant_id,
+            collection,
+            doc_id,
+            before_timestamp,
+            ..
         } => (
             format!("checkpoint:{tenant_id}:{collection}:{doc_id}:<{before_timestamp}"),
             0,

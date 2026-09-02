@@ -21,6 +21,8 @@
 
 pub mod collection;
 pub mod continuous_aggregate;
+mod core_fanout;
+pub mod crdt_compact;
 mod dispatcher;
 pub mod materialized_view;
 pub mod vector;

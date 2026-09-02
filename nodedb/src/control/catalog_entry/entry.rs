@@ -488,8 +488,11 @@ pub enum CatalogEntry {
         doc_id: String,
         checkpoint_name: String,
     },
-    /// Range delete behind COMPACT HISTORY: drops every checkpoint for the
-    /// document whose `created_at` is strictly below `before_timestamp`.
+    /// Range delete: drops every checkpoint for the document whose
+    /// `created_at` is strictly below `before_timestamp`.
+    ///
+    /// `COMPACT HISTORY` proposes [`CatalogEntry::CompactHistory`]. This
+    /// variant applies the entries a metadata log already holds.
     DeleteCheckpointsBefore {
         tenant_id: u64,
         collection: String,
@@ -521,4 +524,23 @@ pub enum CatalogEntry {
     /// plans from the same figures. One entry carries every column so a
     /// planner never sees a subset and costs against it.
     PutColumnStats(Box<Vec<StoredColumnStats>>),
+
+    // ── COMPACT HISTORY ────────────────────────────────────────────
+    /// One `COMPACT HISTORY` statement: drops every checkpoint for the
+    /// document below `before_timestamp`, and compacts the document's oplog
+    /// to `target_version_json` on every node.
+    ///
+    /// The checkpoint delete and the compaction travel together because they
+    /// are one operator action. The target rides in the entry because apply
+    /// deletes the checkpoint row that holds it.
+    CompactHistory {
+        tenant_id: u64,
+        database_id: u64,
+        collection: String,
+        doc_id: String,
+        /// Exclusive boundary. A checkpoint stamped exactly here survives.
+        before_timestamp: u64,
+        /// Loro version vector every node compacts to.
+        target_version_json: String,
+    },
 }

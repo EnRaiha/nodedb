@@ -20,8 +20,11 @@ use nodedb_physical::physical_plan::CrdtOp;
 ///
 /// Returns `None` for the read-only / DDL-observability variants (`Read`,
 /// `ReadConstraints`, `SetPolicy`, `GetPolicy`, `ReadAtVersion`,
-/// `GetVersionVector`, `ExportDelta`, `CompactAtVersion`) and for
-/// `RestoreToVersion`. `RestoreToVersion` is deliberately not encoded here: the
+/// `GetVersionVector`, `ExportDelta`), for `CompactAtVersion`, and for
+/// `RestoreToVersion`. `CompactAtVersion` discards durable oplog entries, so it
+/// is a write; it replicates as a `CompactHistory` catalog entry that every
+/// node dispatches from post-apply, never through this encoder.
+/// `RestoreToVersion` is deliberately not encoded here: the
 /// restore path replicates its effect as a forward delta wrapped in
 /// `CrdtOp::Apply`, which then follows the normal apply replication route.
 /// Encoding the restore op directly would double-apply the change and is
@@ -168,6 +171,10 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             collection,
             constraint_version,
         } => drop_constraints(collection.as_str(), *constraint_version),
+        // `CompactAtVersion` discards durable oplog entries. It replicates as
+        // a `CompactHistory` catalog entry that every node dispatches from
+        // post-apply, so it never rides this encoder.
+        CrdtOp::CompactAtVersion { .. } => return None,
         CrdtOp::Read { .. }
         | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
@@ -176,7 +183,6 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
         | CrdtOp::ReadAtVersion { .. }
         | CrdtOp::GetVersionVector { .. }
         | CrdtOp::ExportDelta { .. }
-        | CrdtOp::CompactAtVersion { .. }
         | CrdtOp::RestoreToVersion { .. } => return None,
     })
 }

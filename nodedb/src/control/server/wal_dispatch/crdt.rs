@@ -207,8 +207,11 @@ pub(super) fn wal_append_crdt_op(
         | CrdtOp::SetPolicy { .. }
         | CrdtOp::ReadAtVersion { .. }
         | CrdtOp::GetVersionVector { .. }
-        | CrdtOp::ExportDelta { .. }
-        | CrdtOp::CompactAtVersion { .. } => None,
+        | CrdtOp::ExportDelta { .. } => None,
+        // DurableElsewhere — the op discards durable oplog entries, and it
+        // replicates as a `CompactHistory` catalog entry that every node
+        // dispatches from post-apply, never through this oracle
+        CrdtOp::CompactAtVersion { .. } => None,
         // DurableElsewhere — installed set is Raft-log-replay durable in cluster
         // mode; applied via SPSC from the distributed applier, never through this
         // oracle

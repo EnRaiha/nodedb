@@ -14,16 +14,13 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
-
-use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::StoredVectorIndexParams;
 
-/// Deadline for one core's acknowledgement of a vector-index meta op.
-const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use super::core_fanout::{CoreFanout, dispatch_to_every_core};
 
 /// One vector index, named the way every stage below reports it.
 struct IndexTarget<'a> {
@@ -81,7 +78,7 @@ pub async fn put_async(entry: StoredVectorIndexParams, shared: Arc<SharedState>)
         report(&error, "set_params_wal_append", &target);
     }
 
-    if let Err(error) = dispatch_to_every_core(&shared, &target, &plan).await {
+    if let Err(error) = dispatch_to_every_core(&shared, &fanout(&target), &plan).await {
         report(&error, "set_params_dispatch", &target);
     }
 }
@@ -121,7 +118,7 @@ pub async fn delete_async(
         Err(error) => report(&error, "drop_index_wal_append", &target),
     }
 
-    if let Err(error) = dispatch_to_every_core(&shared, &target, &plan).await {
+    if let Err(error) = dispatch_to_every_core(&shared, &fanout(&target), &plan).await {
         report(&error, "drop_index_dispatch", &target);
     }
 }
@@ -144,77 +141,15 @@ fn append_redo(
     Ok(outcome.lsn)
 }
 
-/// Dispatch `plan` to every core on this node, matching how the boot seed
-/// installs vector parameters on every core rather than one vshard.
-async fn dispatch_to_every_core(
-    shared: &SharedState,
-    target: &IndexTarget<'_>,
-    plan: &PhysicalPlan,
-) -> crate::Result<()> {
-    let num_cores = {
-        let d = shared.dispatcher.lock().unwrap_or_else(|p| p.into_inner());
-        d.num_cores()
-    };
-    let mut receivers = Vec::with_capacity(num_cores);
-    let mut unreached: Vec<usize> = Vec::new();
-
-    {
-        let mut d = shared.dispatcher.lock().unwrap_or_else(|p| p.into_inner());
-        for core_id in 0..num_cores {
-            let request_id = shared.next_request_id();
-            let request = Request {
-                request_id,
-                tenant_id: TenantId::new(target.tenant_id),
-                database_id: DatabaseId::new(target.database_id),
-                vshard_id: VShardId::new(core_id as u32),
-                plan: plan.clone(),
-                deadline: std::time::Instant::now() + DISPATCH_TIMEOUT,
-                priority: Priority::Background,
-                trace_id: TraceId::generate(),
-                consistency: ReadConsistency::Eventual,
-                idempotency_key: None,
-                event_source: crate::event::EventSource::User,
-                user_roles: Vec::new(),
-                user_id: None,
-                statement_digest: None,
-                txn_id: None,
-                wal_lsn: None,
-                resolved_now_ms: None,
-                admission: crate::bridge::envelope::Admission::Exempt(
-                    crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-                ),
-            };
-            let rx = shared.tracker.register(request_id);
-            if d.dispatch_to_core(core_id, request).is_err() {
-                shared.tracker.cancel(&request_id);
-                unreached.push(core_id);
-                continue;
-            }
-            receivers.push((core_id, rx));
-        }
+/// Name this index for the core fan-out's ack line and error detail.
+fn fanout<'a>(target: &'a IndexTarget<'a>) -> CoreFanout<'a> {
+    CoreFanout {
+        database_id: target.database_id,
+        tenant_id: target.tenant_id,
+        collection: target.collection,
+        what: "vector index change",
+        detail: target.field_name,
     }
-
-    for (core_id, mut rx) in receivers {
-        match tokio::time::timeout(DISPATCH_TIMEOUT, async { rx.recv().await.ok_or(()) }).await {
-            Ok(Ok(resp)) if resp.status == Status::Ok => {
-                debug!(
-                    tenant = target.tenant_id,
-                    collection = %target.collection,
-                    field = target.field_name,
-                    core_id,
-                    "vector index post-apply ack"
-                );
-            }
-            _ => unreached.push(core_id),
-        }
-    }
-
-    if unreached.is_empty() {
-        return Ok(());
-    }
-    Err(crate::Error::Internal {
-        detail: format!("cores did not apply the vector index change: {unreached:?}"),
-    })
 }
 
 /// File the one report for a stage this node lost, naming the index.

@@ -33,6 +33,7 @@ mod cluster_post_apply_follower_dispatch;
 mod cluster_surrogate_replication;
 mod column_stats_cross_node;
 mod constraint_delivery;
+mod crdt_compact_cross_node;
 mod cross_node_pk_lookup;
 mod cross_node_pk_write;
 mod cross_node_read_occ_abort;

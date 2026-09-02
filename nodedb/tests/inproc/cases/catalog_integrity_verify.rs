@@ -269,6 +269,9 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutCheckpoint(_) => VariantClass::Exempt,
         CatalogEntry::DeleteCheckpoint { .. } => VariantClass::Exempt,
         CatalogEntry::DeleteCheckpointsBefore { .. } => VariantClass::Exempt,
+        // COMPACT HISTORY deletes checkpoint rows and compacts the oplog. It
+        // creates no object, so the apply path writes no StoredOwner row.
+        CatalogEntry::CompactHistory { .. } => VariantClass::Exempt,
         // Vector model metadata and vector-index build parameters are
         // attribute rows on a collection column, keyed by
         // (database_id, tenant_id, collection, field). The index's own

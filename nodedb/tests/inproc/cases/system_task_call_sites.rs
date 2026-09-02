@@ -51,8 +51,9 @@ const ALLOWED: &[&str] = &[
     // `at_version.rs` and `diff.rs` are deliberately absent: they serve user
     // reads, so they dispatch through the authorized path rather than the
     // system door, which performs no authorization or RLS injection.
+    // `compact.rs` is absent too: COMPACT HISTORY replicates as a catalog
+    // entry, and each node's post-apply lane dispatches the compaction.
     "control/server/shared/ddl/neutral/version_history/checkpoint.rs",
-    "control/server/shared/ddl/neutral/version_history/compact.rs",
     // Tenant lifecycle.
     "control/server/shared/ddl/neutral/tenant/purge.rs",
     "control/server/shared/ddl/neutral/tenant/move_tenant/cutover.rs",
