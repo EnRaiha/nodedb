@@ -268,7 +268,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::MigrateConsumerGroupStream { .. }
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
-        | CatalogEntry::DeleteCheckpointsBefore { .. }
         | CatalogEntry::CompactHistory { .. }
         | CatalogEntry::PutVectorModel(_)
         | CatalogEntry::PutVectorIndexParams(_)

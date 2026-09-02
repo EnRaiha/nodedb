@@ -310,7 +310,6 @@ pub fn spawn_post_apply_async_side_effects(
         // here.
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
-        | CatalogEntry::DeleteCheckpointsBefore { .. }
         // Vector model metadata has no in-memory mirror.
         // PutVectorIndexParams / DeleteVectorIndexParams have their own
         // async branches above; they do not appear here.

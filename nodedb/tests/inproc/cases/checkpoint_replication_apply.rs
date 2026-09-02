@@ -15,6 +15,7 @@ use nodedb::control::security::catalog::types::CheckpointRecord;
 use nodedb_test_support::pgwire_harness::TestServer;
 
 const TENANT: u64 = 1;
+const DATABASE: u64 = 3;
 const COLLECTION: &str = "documents";
 const DOC: &str = "doc-1";
 const NAME: &str = "launch-ready";
@@ -102,7 +103,7 @@ async fn replicated_delete_removes_the_checkpoint_row() {
     assert!(stored_names(&server).is_empty());
 }
 
-/// A replicated `DeleteCheckpointsBefore` applies the same exclusive boundary
+/// A replicated `CompactHistory` applies the same exclusive boundary
 /// on every node, whatever order that node's catalog scan returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replicated_range_delete_keeps_the_boundary_checkpoint() {
@@ -116,11 +117,13 @@ async fn replicated_range_delete_keeps_the_boundary_checkpoint() {
 
     apply_entry(
         &server,
-        &CatalogEntry::DeleteCheckpointsBefore {
+        &CatalogEntry::CompactHistory {
             tenant_id: TENANT,
+            database_id: DATABASE,
             collection: COLLECTION.to_string(),
             doc_id: DOC.to_string(),
             before_timestamp: 100,
+            target_version_json: "{\"n1\":4}".to_string(),
         },
     );
 

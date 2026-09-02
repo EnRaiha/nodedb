@@ -366,13 +366,7 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
-        E::DeleteCheckpointsBefore {
-            tenant_id,
-            collection,
-            doc_id,
-            before_timestamp,
-        }
-        | E::CompactHistory {
+        E::CompactHistory {
             tenant_id,
             collection,
             doc_id,

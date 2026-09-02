@@ -296,16 +296,9 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             doc_id,
             checkpoint_name,
         } => checkpoint::delete(*tenant_id, collection, doc_id, checkpoint_name, catalog),
-        // Both variants apply the same range delete. `CompactHistory`'s
-        // `database_id` and `target_version_json` drive its post-apply
+        // `database_id` and `target_version_json` drive the post-apply
         // compaction, not the row delete.
-        CatalogEntry::DeleteCheckpointsBefore {
-            tenant_id,
-            collection,
-            doc_id,
-            before_timestamp,
-        }
-        | CatalogEntry::CompactHistory {
+        CatalogEntry::CompactHistory {
             tenant_id,
             collection,
             doc_id,

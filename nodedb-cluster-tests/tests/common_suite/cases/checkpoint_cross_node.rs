@@ -3,7 +3,7 @@
 //!
 //! `CREATE CHECKPOINT`, `DROP CHECKPOINT`, and the `COMPACT HISTORY` range
 //! delete propose `CatalogEntry::PutCheckpoint`, `DeleteCheckpoint`, and
-//! `DeleteCheckpointsBefore` through the metadata raft group. Every node writes
+//! `CompactHistory` through the metadata raft group. Every node writes
 //! or removes the `_system.checkpoints` row. Checkpoints have no in-memory
 //! mirror, so the durable row is the whole observation: `SHOW VERSIONS` and
 //! `COMPACT HISTORY` read it straight from the catalog. A checkpoint that
@@ -327,9 +327,8 @@ async fn compact_history_on_leader_keeps_the_boundary_on_follower() {
 
     // The boundary is exclusive: `created_at < before_timestamp` goes, the row
     // at the boundary stays.
-    let kept = stored_checkpoint(follower, "boundary").expect(
-        "DeleteCheckpointsBefore is exclusive: the boundary row must survive on the follower",
-    );
+    let kept = stored_checkpoint(follower, "boundary")
+        .expect("CompactHistory is exclusive: the boundary row must survive on the follower");
     assert_eq!(kept.created_at, boundary.created_at);
     assert_eq!(
         stored_names(follower),

@@ -409,7 +409,6 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
-        | CatalogEntry::DeleteCheckpointsBefore { .. }
         | CatalogEntry::CompactHistory { .. } => {
             // no-op: checkpoints have no in-memory mirror — every reader
             // (SHOW VERSIONS, AT VERSION, COMPACT HISTORY) goes to the

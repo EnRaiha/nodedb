@@ -32,7 +32,7 @@ pub fn delete(
         .map(|_| ())
 }
 
-/// Apply the range delete `DeleteCheckpointsBefore` and `CompactHistory` share.
+/// Apply the range delete `CompactHistory` carries.
 ///
 /// The boundary is exclusive, so a checkpoint stamped exactly at
 /// `before_timestamp` survives on every node.
@@ -134,30 +134,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delete_checkpoints_before_roundtrips_through_codec() {
-        let entry = CatalogEntry::DeleteCheckpointsBefore {
-            tenant_id: TENANT,
-            collection: COLLECTION.to_string(),
-            doc_id: DOC.to_string(),
-            before_timestamp: 500,
-        };
-        match decode(&encode(&entry).unwrap()).unwrap() {
-            CatalogEntry::DeleteCheckpointsBefore {
-                tenant_id,
-                collection,
-                doc_id,
-                before_timestamp,
-            } => {
-                assert_eq!(tenant_id, TENANT);
-                assert_eq!(collection, COLLECTION);
-                assert_eq!(doc_id, DOC);
-                assert_eq!(before_timestamp, 500);
-            }
-            other => panic!("unexpected variant: {}", other.kind()),
-        }
-    }
-
     /// The entry carries the compaction target as well as the boundary. A
     /// target lost in the codec leaves every follower unable to compact.
     #[test]
@@ -188,30 +164,6 @@ mod tests {
             }
             other => panic!("unexpected variant: {}", other.kind()),
         }
-    }
-
-    /// `CompactHistory` applies the same range delete `DeleteCheckpointsBefore`
-    /// does, so a node that receives either drops the same rows.
-    #[test]
-    fn compact_history_applies_the_same_range_delete() {
-        let (_dir, catalog) = open_catalog();
-        put(&sample("older", 99), &catalog).unwrap();
-        put(&sample("boundary", 100), &catalog).unwrap();
-
-        apply::apply_to(
-            &CatalogEntry::CompactHistory {
-                tenant_id: TENANT,
-                database_id: DATABASE,
-                collection: COLLECTION.to_string(),
-                doc_id: DOC.to_string(),
-                before_timestamp: 100,
-                target_version_json: "{\"n1\":4}".to_string(),
-            },
-            &catalog,
-        )
-        .unwrap();
-
-        assert_eq!(names(&catalog), vec!["boundary".to_string()]);
     }
 
     #[test]
@@ -251,11 +203,13 @@ mod tests {
         put(&sample("newer", 101), &catalog).unwrap();
 
         apply::apply_to(
-            &CatalogEntry::DeleteCheckpointsBefore {
+            &CatalogEntry::CompactHistory {
                 tenant_id: TENANT,
+                database_id: DATABASE,
                 collection: COLLECTION.to_string(),
                 doc_id: DOC.to_string(),
                 before_timestamp: 100,
+                target_version_json: "{\"n1\":4}".to_string(),
             },
             &catalog,
         )

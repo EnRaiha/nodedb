@@ -268,7 +268,6 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         // apply path writes no StoredOwner row and there is no orphan pair.
         CatalogEntry::PutCheckpoint(_) => VariantClass::Exempt,
         CatalogEntry::DeleteCheckpoint { .. } => VariantClass::Exempt,
-        CatalogEntry::DeleteCheckpointsBefore { .. } => VariantClass::Exempt,
         // COMPACT HISTORY deletes checkpoint rows and compacts the oplog. It
         // creates no object, so the apply path writes no StoredOwner row.
         CatalogEntry::CompactHistory { .. } => VariantClass::Exempt,

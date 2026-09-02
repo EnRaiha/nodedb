@@ -88,7 +88,6 @@ impl CatalogEntry {
             Self::MigrateConsumerGroupStream { .. } => "migrate_consumer_group_stream",
             Self::PutCheckpoint(_) => "put_checkpoint",
             Self::DeleteCheckpoint { .. } => "delete_checkpoint",
-            Self::DeleteCheckpointsBefore { .. } => "delete_checkpoints_before",
             Self::CompactHistory { .. } => "compact_history",
             Self::PutVectorModel(_) => "put_vector_model",
             Self::PutVectorIndexParams(_) => "put_vector_index_params",

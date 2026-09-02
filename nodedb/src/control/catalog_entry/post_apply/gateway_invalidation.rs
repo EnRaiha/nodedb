@@ -321,7 +321,6 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
-        | CatalogEntry::DeleteCheckpointsBefore { .. }
         | CatalogEntry::CompactHistory { .. } => {
             // no-op: a checkpoint names a version vector and never enters a
             // query plan.
