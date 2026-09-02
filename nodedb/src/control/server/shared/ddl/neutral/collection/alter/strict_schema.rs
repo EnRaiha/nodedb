@@ -31,11 +31,12 @@ use super::support::{err, load_active_collection};
 /// `timeseries_config` JSON fails to parse.
 pub(super) fn load_strict_collection(
     state: &SharedState,
+    database_id: DatabaseId,
     tenant_id: u64,
     name: &str,
     operation: &str,
 ) -> Result<(StoredCollection, nodedb_types::columnar::StrictSchema), DdlError> {
-    let coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
+    let coll = load_active_collection(state, database_id, tenant_id, name)?;
 
     if !coll.collection_type.is_strict() {
         return Err(err(

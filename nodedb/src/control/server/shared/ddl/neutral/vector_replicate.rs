@@ -33,6 +33,36 @@ pub(crate) fn propose_put_model(
     })
 }
 
+/// Propose removal of one column's embedding-model row on every node.
+///
+/// The caller skips the proposal when the row is already absent, but apply
+/// still treats a missing row as a no-op, so replay on every node stays
+/// idempotent.
+pub(crate) fn propose_delete_model(
+    state: &SharedState,
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+    column: &str,
+) -> Result<(), DdlError> {
+    let entry = CatalogEntry::DeleteVectorModel {
+        database_id,
+        tenant_id,
+        collection: collection.to_string(),
+        column: column.to_string(),
+    };
+    propose_and_apply(state, &entry, || {
+        apply::delete_model(
+            database_id,
+            tenant_id,
+            collection,
+            column,
+            state.credentials.catalog(),
+        )
+        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
+    })
+}
+
 /// Propose the build-parameter row for one vector index.
 ///
 /// The handler reports the duplicate index before proposing, so apply is a

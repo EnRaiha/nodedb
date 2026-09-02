@@ -342,3 +342,40 @@ async fn declared_width_is_enforced_on_strict_and_kv() {
         "kv rejection must say out of range; got: {err}"
     );
 }
+
+/// `ALTER COLUMN ... TYPE` refuses a parameter change inside one type.
+///
+/// `VECTOR(384)` and `VECTOR(768)` share a discriminant, so a discriminant
+/// comparison admits the change while every stored value keeps its old width,
+/// leaving the column advertising 768 floats over rows that hold 384.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn altering_a_type_parameter_is_refused() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION vec_retype (id TEXT PRIMARY KEY, v VECTOR(384)) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("CREATE COLLECTION vec_retype must succeed");
+
+    let err = server
+        .exec("ALTER COLLECTION vec_retype ALTER COLUMN v TYPE VECTOR(768)")
+        .await
+        .expect_err("widening a vector's dimension must be refused");
+    assert!(
+        err.to_string().contains("requires an online rewrite"),
+        "the refusal must name the rewrite it needs; got: {err}"
+    );
+
+    // The refused alter left the declared width alone, so a write of the
+    // wrong width still reports the original 384.
+    let width_err = server
+        .exec("INSERT INTO vec_retype (id, v) VALUES ('kept', '[0.5]')")
+        .await
+        .expect_err("a one-element embedding must not satisfy the column");
+    assert!(
+        width_err.to_string().contains("VECTOR(384)"),
+        "the column must still declare 384 dimensions; got: {width_err}"
+    );
+}

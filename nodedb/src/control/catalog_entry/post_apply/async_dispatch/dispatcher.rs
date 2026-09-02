@@ -314,6 +314,7 @@ pub fn spawn_post_apply_async_side_effects(
         // PutVectorIndexParams / DeleteVectorIndexParams have their own
         // async branches above; they do not appear here.
         | CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::DeleteVectorModel { .. }
         // Column statistics have no in-memory mirror.
         | CatalogEntry::PutColumnStats(_)
         | CatalogEntry::MoveTenantCutover { .. } => {

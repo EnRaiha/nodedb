@@ -50,6 +50,7 @@ pub(super) struct MaterializedSumRequest<'a> {
 pub(super) async fn add_materialized_sum(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     req: &MaterializedSumRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -74,8 +75,7 @@ pub(super) async fn add_materialized_sum(
 
     let catalog = state.credentials.catalog();
 
-    let mut coll =
-        load_active_collection(state, DatabaseId::DEFAULT, tenant_id, target_collection)?;
+    let mut coll = load_active_collection(state, database_id, tenant_id, target_collection)?;
 
     if coll
         .materialized_sums
@@ -89,7 +89,7 @@ pub(super) async fn add_materialized_sum(
     }
 
     let existing_bindings: Vec<MaterializedSumDef> = catalog
-        .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id)
+        .load_collections_for_tenant(database_id, tenant_id)
         .map_err(|e| err("XX000", e.to_string()))?
         .into_iter()
         .flat_map(|c| c.materialized_sums)

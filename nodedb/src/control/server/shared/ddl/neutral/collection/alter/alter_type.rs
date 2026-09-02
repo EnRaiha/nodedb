@@ -5,11 +5,15 @@
 //!
 //! Ported verbatim from the pgwire `ddl::collection::alter::alter_type`
 //! handler; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The same-discriminant gate (rejecting a
-//! true type change that would require re-encoding), version bump, persist,
-//! and audit are unchanged, as is the `ALTER COLLECTION` command tag.
+//! [`DdlResult`] / [`DdlError`]. The full-equality gate rejects any type
+//! change that requires re-encoding existing rows, including a parameter
+//! change (`VECTOR(384)` to `VECTOR(768)`) that shares a discriminant with
+//! the current type. Version bump, persist, and audit are unchanged, as is
+//! the `ALTER COLLECTION` command tag.
 
 use std::str::FromStr;
+
+use nodedb_types::DatabaseId;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -25,6 +29,7 @@ use super::support::{err, status};
 pub(super) async fn alter_collection_alter_column_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     column_name: &str,
     new_type_str: &str,
@@ -34,12 +39,17 @@ pub(super) async fn alter_collection_alter_column_type(
     let new_type = nodedb_types::columnar::ColumnType::from_str(new_type_str)
         .map_err(|e| err("42601", format!("invalid type '{new_type_str}': {e}")))?;
 
-    let (coll, mut schema) =
-        load_strict_collection(state, tenant_id.as_u64(), name, "ALTER COLUMN TYPE")?;
+    let (coll, mut schema) = load_strict_collection(
+        state,
+        database_id,
+        tenant_id.as_u64(),
+        name,
+        "ALTER COLUMN TYPE",
+    )?;
 
     let col = schema
         .columns
-        .iter_mut()
+        .iter()
         .find(|c| c.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| {
             err(
@@ -48,18 +58,25 @@ pub(super) async fn alter_collection_alter_column_type(
             )
         })?;
 
-    // Reject a true type change that would require re-encoding existing rows.
-    if std::mem::discriminant(&col.column_type) != std::mem::discriminant(&new_type) {
+    // Reject a type change that needs every stored row re-encoded.
+    //
+    // An alias change resolves to the identical `ColumnType`: every integer
+    // width parses to `Int64`, and only the declared spelling differs. A
+    // parameter change — `VECTOR(384)` to `VECTOR(768)`, `DECIMAL(10,2)` to
+    // `DECIMAL(38,10)` — shares the discriminant but rewrites every stored
+    // value, so full equality is the gate.
+    if col.column_type != new_type {
         return Err(err(
             "0A000",
             format!(
-                "cross-type change from {:?} to {:?} requires an online rewrite; \
+                "type change from {:?} to {:?} requires an online rewrite; \
                  only alias type changes (e.g. INT ↔ BIGINT) are supported today",
                 col.column_type, new_type
             ),
         ));
     }
-    col.column_type = new_type;
+    // The resolved type already matches; the alias change lands in
+    // `retype_field`, which records the declared spelling.
     schema.version = schema.version.saturating_add(1);
 
     let mut updated = coll;

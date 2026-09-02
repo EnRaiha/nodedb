@@ -28,6 +28,30 @@ pub fn put_model(entry: &VectorModelEntry, catalog: &SystemCatalog) -> crate::Re
     })
 }
 
+/// Apply a `DeleteVectorModel` entry.
+///
+/// A missing row is not an error: the entry is idempotent under replay.
+pub fn delete_model(
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+    column: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog
+        .delete_vector_model(database_id, tenant_id, collection, column)
+        .map_err(|e| {
+            catalog_err(
+                &format!(
+                    "delete_vector_model '{collection}.{column}' \
+                     (database {database_id}, tenant {tenant_id})"
+                ),
+                e,
+            )
+        })
+        .map(|_| ())
+}
+
 /// Apply a `PutVectorIndexParams` entry. A re-delivery rewrites the same row.
 pub fn put_params(entry: &StoredVectorIndexParams, catalog: &SystemCatalog) -> crate::Result<()> {
     catalog.put_vector_index_params(entry).map_err(|e| {
@@ -184,6 +208,80 @@ mod tests {
             .expect("apply writes the vector model row");
         assert_eq!(stored.metadata.model, "all-MiniLM-L6-v2");
         assert_eq!(stored.metadata.dimensions, 384);
+    }
+
+    #[test]
+    fn delete_vector_model_roundtrips_through_codec() {
+        let entry = CatalogEntry::DeleteVectorModel {
+            database_id: DATABASE,
+            tenant_id: TENANT,
+            collection: COLLECTION.to_string(),
+            column: FIELD.to_string(),
+        };
+        match decode(&encode(&entry).unwrap()).unwrap() {
+            CatalogEntry::DeleteVectorModel {
+                database_id,
+                tenant_id,
+                collection,
+                column,
+            } => {
+                assert_eq!(database_id, DATABASE);
+                assert_eq!(tenant_id, TENANT);
+                assert_eq!(collection, COLLECTION);
+                assert_eq!(column, FIELD);
+            }
+            other => panic!("unexpected variant: {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn apply_removes_the_vector_model_row() {
+        let (_dir, catalog) = open_catalog();
+        apply::apply_to(&CatalogEntry::PutVectorModel(Box::new(model())), &catalog).unwrap();
+
+        apply::apply_to(
+            &CatalogEntry::DeleteVectorModel {
+                database_id: DATABASE,
+                tenant_id: TENANT,
+                collection: COLLECTION.to_string(),
+                column: FIELD.to_string(),
+            },
+            &catalog,
+        )
+        .unwrap();
+
+        assert!(
+            catalog
+                .get_vector_model(DATABASE, TENANT, COLLECTION, FIELD)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleting_an_absent_vector_model_is_a_noop() {
+        let (_dir, catalog) = open_catalog();
+        delete_model(DATABASE, TENANT, COLLECTION, "never-created", &catalog)
+            .expect("delete absent");
+    }
+
+    #[test]
+    fn a_model_of_one_database_survives_a_delete_in_another() {
+        let (_dir, catalog) = open_catalog();
+        put_model(&model(), &catalog).unwrap();
+        let mut other = model();
+        other.database_id = DATABASE + 1;
+        put_model(&other, &catalog).unwrap();
+
+        delete_model(DATABASE, TENANT, COLLECTION, FIELD, &catalog).expect("delete");
+
+        assert!(
+            catalog
+                .get_vector_model(DATABASE + 1, TENANT, COLLECTION, FIELD)
+                .unwrap()
+                .is_some(),
+            "the key is scoped by database, so the sibling row stays"
+        );
     }
 
     #[test]

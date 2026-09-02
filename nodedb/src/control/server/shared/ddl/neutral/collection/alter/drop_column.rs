@@ -9,6 +9,8 @@
 //! (`dropped_columns` push + version bump), primary-key guard, persist,
 //! and audit are unchanged, as is the `ALTER COLLECTION` command tag.
 
+use nodedb_types::DatabaseId;
+
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
@@ -18,18 +20,20 @@ use super::strict_schema::{
     load_strict_collection, persist_schema_change, remove_field, write_schema_back,
 };
 use super::support::{err, status};
+use super::vector_model::drop_vector_model_row;
 
 /// ALTER COLLECTION <name> DROP COLUMN <column_name>
 pub(super) async fn alter_collection_drop_column(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     column_name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
     let (coll, mut schema) =
-        load_strict_collection(state, tenant_id.as_u64(), name, "DROP COLUMN")?;
+        load_strict_collection(state, database_id, tenant_id.as_u64(), name, "DROP COLUMN")?;
 
     let idx = schema
         .columns
@@ -64,6 +68,11 @@ pub(super) async fn alter_collection_drop_column(
     write_schema_back(&mut updated, schema);
     remove_field(&mut updated, column_name);
     persist_schema_change(state, &updated).await?;
+
+    // The embedding-model row is keyed by column name and outlives the column
+    // otherwise. A re-added column then inherits the old dimensions and
+    // `strict_dimensions`.
+    drop_vector_model_row(state, database_id, tenant_id.as_u64(), name, column_name)?;
 
     state.audit_record(
         AuditEvent::AdminAction,

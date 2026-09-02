@@ -24,6 +24,7 @@ use super::support::{err, status};
 pub(super) async fn alter_table_add_column(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     table_name: &str,
     col_def_str: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -54,7 +55,7 @@ pub(super) async fn alter_table_add_column(
 
     let updated = {
         let catalog = state.credentials.catalog();
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), table_name) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), table_name) {
             Ok(Some(coll)) if coll.is_active => {
                 if coll.collection_type.is_strict()
                     && let Some(config_json) = &coll.timeseries_config

@@ -270,6 +270,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::CompactHistory { .. }
         | CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::DeleteVectorModel { .. }
         | CatalogEntry::PutVectorIndexParams(_)
         | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::PutColumnStats(_)

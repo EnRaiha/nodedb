@@ -39,17 +39,29 @@ pub async fn dispatch_alter_collection(
             if let Some(def) = default_expr {
                 col_def.push_str(&format!(" DEFAULT {def}"));
             }
-            super::add_column::alter_table_add_column(state, identity, name, &col_def).await
+            super::add_column::alter_table_add_column(state, identity, database_id, name, &col_def)
+                .await
         }
 
         AlterCollectionOp::DropColumn { column_name } => {
-            super::drop_column::alter_collection_drop_column(state, identity, name, column_name)
-                .await
+            super::drop_column::alter_collection_drop_column(
+                state,
+                identity,
+                database_id,
+                name,
+                column_name,
+            )
+            .await
         }
 
         AlterCollectionOp::RenameColumn { old_name, new_name } => {
             super::rename_column::alter_collection_rename_column(
-                state, identity, name, old_name, new_name,
+                state,
+                identity,
+                database_id,
+                name,
+                old_name,
+                new_name,
             )
             .await
         }
@@ -61,6 +73,7 @@ pub async fn dispatch_alter_collection(
             super::alter_type::alter_collection_alter_column_type(
                 state,
                 identity,
+                database_id,
                 name,
                 column_name,
                 new_type,
@@ -73,22 +86,37 @@ pub async fn dispatch_alter_collection(
         }
 
         AlterCollectionOp::SetRetention { value } => {
-            super::enforcement::alter_collection_set_retention(state, identity, name, value)
+            super::enforcement::alter_collection_set_retention(
+                state,
+                identity,
+                database_id,
+                name,
+                value,
+            )
         }
 
         AlterCollectionOp::SetAppendOnly => {
-            super::enforcement::alter_collection_set_append_only(state, identity, name)
+            super::enforcement::alter_collection_set_append_only(state, identity, database_id, name)
         }
 
         AlterCollectionOp::SetLastValueCache { enabled } => {
             super::enforcement::alter_collection_set_last_value_cache(
-                state, identity, name, *enabled,
+                state,
+                identity,
+                database_id,
+                name,
+                *enabled,
             )
         }
 
         AlterCollectionOp::SetLegalHold { enabled, tag } => {
             super::enforcement::alter_collection_set_legal_hold(
-                state, identity, name, *enabled, tag,
+                state,
+                identity,
+                database_id,
+                name,
+                *enabled,
+                tag,
             )
         }
 
@@ -103,6 +131,7 @@ pub async fn dispatch_alter_collection(
             super::materialized_sum::add_materialized_sum(
                 state,
                 identity,
+                database_id,
                 &super::materialized_sum::MaterializedSumRequest {
                     target_collection,
                     target_column,

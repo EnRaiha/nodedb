@@ -416,6 +416,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // compaction runs from the async post-apply path.
         }
         CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::DeleteVectorModel { .. }
         | CatalogEntry::PutVectorIndexParams(_)
         | CatalogEntry::DeleteVectorIndexParams { .. } => {
             // no-op: the Control Plane keeps no mirror of either table. Every

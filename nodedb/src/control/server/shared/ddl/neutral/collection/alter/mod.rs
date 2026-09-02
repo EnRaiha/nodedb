@@ -13,5 +13,6 @@ mod ownership;
 mod rename_column;
 mod strict_schema;
 mod support;
+mod vector_model;
 
 pub use dispatch::dispatch_alter_collection;

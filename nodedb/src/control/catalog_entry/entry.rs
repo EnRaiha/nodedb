@@ -511,6 +511,14 @@ pub enum CatalogEntry {
     /// `(database_id, tenant_id, collection, column)`. A re-delivery rewrites
     /// the row.
     PutVectorModel(Box<VectorModelEntry>),
+    /// Drops one column's embedding-model row. Apply treats a missing row
+    /// as a no-op, so replay on every node stays idempotent.
+    DeleteVectorModel {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        column: String,
+    },
     /// Build-parameter row in `_system.vector_index_params`, keyed by
     /// `(database_id, tenant_id, collection, field_name)`.
     PutVectorIndexParams(Box<StoredVectorIndexParams>),

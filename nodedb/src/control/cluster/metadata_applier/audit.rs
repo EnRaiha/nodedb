@@ -385,6 +385,16 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             0,
             String::new(),
         ),
+        E::DeleteVectorModel {
+            database_id,
+            tenant_id,
+            collection,
+            column,
+        } => (
+            format!("vector_model:{database_id}:{tenant_id}:{collection}:{column}"),
+            0,
+            String::new(),
+        ),
         E::PutColumnStats(rows) => (
             rows.first().map_or_else(String::new, |r| {
                 format!(

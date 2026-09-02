@@ -9,6 +9,8 @@
 //! rename + version bump, persist, and audit are unchanged, as is the
 //! `ALTER COLLECTION` command tag.
 
+use nodedb_types::DatabaseId;
+
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
@@ -18,19 +20,26 @@ use super::strict_schema::{
     load_strict_collection, persist_schema_change, rename_field, write_schema_back,
 };
 use super::support::{err, status};
+use super::vector_model::move_vector_model_row;
 
 /// ALTER COLLECTION <name> RENAME COLUMN <old_name> TO <new_name>
 pub(super) async fn alter_collection_rename_column(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     old_name: &str,
     new_name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
-    let (coll, mut schema) =
-        load_strict_collection(state, tenant_id.as_u64(), name, "RENAME COLUMN")?;
+    let (coll, mut schema) = load_strict_collection(
+        state,
+        database_id,
+        tenant_id.as_u64(),
+        name,
+        "RENAME COLUMN",
+    )?;
 
     if schema
         .columns
@@ -60,6 +69,17 @@ pub(super) async fn alter_collection_rename_column(
     write_schema_back(&mut updated, schema);
     rename_field(&mut updated, old_name, new_name);
     persist_schema_change(state, &updated).await?;
+
+    // The embedding-model row is keyed by column name, so it stays under the
+    // old name unless the rename moves it.
+    move_vector_model_row(
+        state,
+        database_id,
+        tenant_id.as_u64(),
+        name,
+        old_name,
+        new_name,
+    )?;
 
     state.audit_record(
         AuditEvent::AdminAction,

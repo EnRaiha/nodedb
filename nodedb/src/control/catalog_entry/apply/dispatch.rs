@@ -306,6 +306,12 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             ..
         } => checkpoint::delete_before(*tenant_id, collection, doc_id, *before_timestamp, catalog),
         CatalogEntry::PutVectorModel(entry) => vector::put_model(entry, catalog),
+        CatalogEntry::DeleteVectorModel {
+            database_id,
+            tenant_id,
+            collection,
+            column,
+        } => vector::delete_model(*database_id, *tenant_id, collection, column, catalog),
         CatalogEntry::PutVectorIndexParams(entry) => vector::put_params(entry, catalog),
         CatalogEntry::DeleteVectorIndexParams {
             database_id,

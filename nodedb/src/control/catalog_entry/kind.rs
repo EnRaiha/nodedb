@@ -90,6 +90,7 @@ impl CatalogEntry {
             Self::DeleteCheckpoint { .. } => "delete_checkpoint",
             Self::CompactHistory { .. } => "compact_history",
             Self::PutVectorModel(_) => "put_vector_model",
+            Self::DeleteVectorModel { .. } => "delete_vector_model",
             Self::PutVectorIndexParams(_) => "put_vector_index_params",
             Self::PutColumnStats(_) => "put_column_stats",
             Self::DeleteVectorIndexParams { .. } => "delete_vector_index_params",

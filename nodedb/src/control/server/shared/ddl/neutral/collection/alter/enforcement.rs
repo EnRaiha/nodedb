@@ -22,11 +22,12 @@ use super::support::{err, load_active_collection, status};
 pub(super) fn alter_collection_set_retention(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     value: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
+    let mut coll = load_active_collection(state, database_id, tenant_id, name)?;
 
     crate::data::executor::enforcement::retention::parse_retention_period(value)
         .map_err(|e| err("22023", e.to_string()))?;
@@ -39,12 +40,13 @@ pub(super) fn alter_collection_set_retention(
 pub(super) fn alter_collection_set_legal_hold(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     enabled: bool,
     tag: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
+    let mut coll = load_active_collection(state, database_id, tenant_id, name)?;
 
     if enabled {
         if coll.legal_holds.iter().any(|h| h.tag == tag) {
@@ -81,10 +83,11 @@ pub(super) fn alter_collection_set_legal_hold(
 pub(super) fn alter_collection_set_append_only(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
+    let mut coll = load_active_collection(state, database_id, tenant_id, name)?;
 
     if coll.append_only {
         return Err(err(
@@ -100,11 +103,12 @@ pub(super) fn alter_collection_set_append_only(
 pub(super) fn alter_collection_set_last_value_cache(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     enabled: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = load_active_collection(state, DatabaseId::DEFAULT, tenant_id, name)?;
+    let mut coll = load_active_collection(state, database_id, tenant_id, name)?;
 
     if !coll.collection_type.is_timeseries() {
         return Err(err(

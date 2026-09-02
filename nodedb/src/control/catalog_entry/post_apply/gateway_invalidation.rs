@@ -326,6 +326,7 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // query plan.
         }
         CatalogEntry::PutVectorModel(_)
+        | CatalogEntry::DeleteVectorModel { .. }
         | CatalogEntry::PutVectorIndexParams(_)
         | CatalogEntry::DeleteVectorIndexParams { .. } => {
             // no-op: vector build parameters are read by the Data Plane index,

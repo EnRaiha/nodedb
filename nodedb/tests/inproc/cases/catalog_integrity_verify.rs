@@ -278,6 +278,7 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         // as `PutOwner` / `DeleteOwner`, so the apply path writes no
         // StoredOwner row and there is no orphan pair.
         CatalogEntry::PutVectorModel(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteVectorModel { .. } => VariantClass::Exempt,
         CatalogEntry::PutVectorIndexParams(_) => VariantClass::Exempt,
         CatalogEntry::DeleteVectorIndexParams { .. } => VariantClass::Exempt,
         // ANALYZE statistics are optimizer hints on a collection's columns,
