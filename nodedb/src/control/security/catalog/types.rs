@@ -10,6 +10,7 @@
 //! - `materialized_view.rs` — `StoredMaterializedView`.
 //! - `continuous_aggregate.rs` — `StoredContinuousAggregate`.
 //! - `checkpoint.rs` — `CheckpointRecord`.
+//! - `checkpoints.rs` — `CheckpointDoc` plus the checkpoint operations.
 //! - `auth_types.rs` — user, role, tenant, permission, audit, blacklist, owner records.
 //! - `collection_constraints.rs` — constraint and field/event definitions.
 //! - `system_catalog.rs` — the `SystemCatalog` struct itself.
@@ -18,6 +19,7 @@
 
 pub use super::auth_types::*;
 pub use super::checkpoint::CheckpointRecord;
+pub use super::checkpoints::CheckpointDoc;
 pub use super::collection::{IndexBuildState, StoredCollection, StoredIndex};
 pub use super::collection_constraints::{
     BalancedConstraintDef, CheckConstraintDef, EventDefinition, FieldDefinition, LegalHold,

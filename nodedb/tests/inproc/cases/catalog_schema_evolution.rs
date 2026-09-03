@@ -166,6 +166,7 @@ fn stored_collection_unknown_future_field_is_ignored() {
 
 #[derive(zerompk::ToMessagePack)]
 struct CheckpointRecordPrev {
+    database_id: u64,
     tenant_id: u64,
     collection: String,
     doc_id: String,
@@ -180,6 +181,7 @@ fn checkpoint_record_prev_shape_decodes() {
     // Today this is the full struct, but the spec must hold if a new
     // `#[serde(default)]` field is added tomorrow.
     let prev = CheckpointRecordPrev {
+        database_id: 2,
         tenant_id: 1,
         collection: "c".into(),
         doc_id: "d".into(),

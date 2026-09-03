@@ -350,30 +350,34 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         ),
         E::PutCheckpoint(c) => (
             format!(
-                "checkpoint:{}:{}:{}:{}",
-                c.tenant_id, c.collection, c.doc_id, c.checkpoint_name
+                "checkpoint:{}:{}:{}:{}:{}",
+                c.database_id, c.tenant_id, c.collection, c.doc_id, c.checkpoint_name
             ),
             0,
             String::new(),
         ),
         E::DeleteCheckpoint {
+            database_id,
             tenant_id,
             collection,
             doc_id,
             checkpoint_name,
         } => (
-            format!("checkpoint:{tenant_id}:{collection}:{doc_id}:{checkpoint_name}"),
+            format!("checkpoint:{database_id}:{tenant_id}:{collection}:{doc_id}:{checkpoint_name}"),
             0,
             String::new(),
         ),
         E::CompactHistory {
+            database_id,
             tenant_id,
             collection,
             doc_id,
             before_timestamp,
             ..
         } => (
-            format!("checkpoint:{tenant_id}:{collection}:{doc_id}:<{before_timestamp}"),
+            format!(
+                "checkpoint:{database_id}:{tenant_id}:{collection}:{doc_id}:<{before_timestamp}"
+            ),
             0,
             String::new(),
         ),

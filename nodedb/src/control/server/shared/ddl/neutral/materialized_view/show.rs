@@ -47,7 +47,7 @@ pub fn show_materialized_views(
     let views = state
         .credentials
         .catalog()
-        .list_materialized_views(tenant_id.as_u64())
+        .list_materialized_views(database_id.as_u64(), tenant_id.as_u64())
         .map_err(|e| err("XX000", format!("catalog read failed: {e}")))?;
 
     let mut rows = Vec::new();

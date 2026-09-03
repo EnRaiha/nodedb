@@ -5,6 +5,7 @@
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
@@ -50,9 +51,12 @@ pub fn show_versions(
 
     let records = catalog
         .list_checkpoints(
-            tenant_id.as_u64(),
-            &collection,
-            &doc_id,
+            CheckpointDoc::new(
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                &collection,
+                &doc_id,
+            ),
             if limit > 0 { limit } else { 1000 },
         )
         .map_err(|e| err("XX000", e.to_string()))?;

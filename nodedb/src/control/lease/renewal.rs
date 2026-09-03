@@ -252,7 +252,7 @@ fn lookup_current_version(shared: &SharedState, id: &DescriptorId) -> Option<u64
             .flatten()
             .map(|s| s.descriptor_version.max(1)),
         DescriptorKind::MaterializedView => catalog
-            .get_materialized_view(id.tenant_id, &id.name)
+            .get_materialized_view(id.database_id, id.tenant_id, &id.name)
             .ok()
             .flatten()
             .map(|v| v.descriptor_version.max(1)),

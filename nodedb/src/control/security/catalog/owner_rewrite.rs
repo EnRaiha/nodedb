@@ -61,7 +61,7 @@ impl SystemCatalog {
             }
             object_type::MATERIALIZED_VIEW => {
                 let mut stored = self
-                    .get_materialized_view(tenant_id, name)?
+                    .get_materialized_view(database_id, tenant_id, name)?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_materialized_view(&stored)?;

@@ -212,7 +212,11 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             tenant_id,
             name,
         },
-        OwnerKind::MaterializedView => CatalogEntry::DeleteMaterializedView { tenant_id, name },
+        OwnerKind::MaterializedView => CatalogEntry::DeleteMaterializedView {
+            database_id: owner.database_id,
+            tenant_id,
+            name,
+        },
         OwnerKind::StreamingMaterializedView => CatalogEntry::DeleteStreamingMaterializedView {
             database_id: owner.database_id,
             tenant_id,

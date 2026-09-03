@@ -37,7 +37,7 @@ pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<Descript
             stored.name.clone(),
         )),
         CatalogEntry::PutMaterializedView(stored) => Some(DescriptorId::new(
-            DatabaseId::DEFAULT.as_u64(),
+            stored.database_id,
             stored.tenant_id,
             DescriptorKind::MaterializedView,
             stored.name.clone(),
@@ -138,14 +138,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutMaterializedView(stored) => {
             let prior = catalog
-                .get_materialized_view(stored.tenant_id, &stored.name)
+                .get_materialized_view(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|v| v.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
-                    DatabaseId::DEFAULT.as_u64(),
+                    stored.database_id,
                     stored.tenant_id,
                     DescriptorKind::MaterializedView,
                     stored.name.clone(),

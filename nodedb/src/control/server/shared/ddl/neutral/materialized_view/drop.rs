@@ -94,10 +94,11 @@ pub fn drop_materialized_view(
     // Pre-check existence so `IF EXISTS` + missing is a no-op
     // that never touches raft.
     let exists_before = matches!(
-        state
-            .credentials
-            .catalog()
-            .get_materialized_view(tenant_id.as_u64(), &name),
+        state.credentials.catalog().get_materialized_view(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            &name
+        ),
         Ok(Some(_))
     );
     if !exists_before && !if_exists {
@@ -114,6 +115,7 @@ pub fn drop_materialized_view(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteMaterializedView {
+        database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         name: name.clone(),
     };
@@ -121,7 +123,7 @@ pub fn drop_materialized_view(
         Some(
             state
                 .quiesce
-                .try_acquire_lifecycle(0, tenant_id.as_u64(), &name)
+                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), &name)
                 .ok_or_else(|| {
                     err(
                         "55006",
@@ -146,7 +148,7 @@ pub fn drop_materialized_view(
             tokio::runtime::Handle::current().block_on(async {
                 crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
                     state,
-                    0,
+                    database_id.as_u64(),
                     tenant_id.as_u64(),
                     &name,
                     purge_lsn,

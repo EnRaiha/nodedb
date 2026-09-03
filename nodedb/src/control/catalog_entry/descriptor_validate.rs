@@ -65,7 +65,7 @@ pub fn validate(
         }
         CatalogEntry::PutMaterializedView(stored) => {
             let current = catalog
-                .get_materialized_view(stored.tenant_id, &stored.name)
+                .get_materialized_view(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
             validate_one(

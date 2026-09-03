@@ -6,6 +6,7 @@ use tracing::debug;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::types::CheckpointDoc;
 
 use super::{
     alert_rule, api_key, auth_user, change_stream, checkpoint, collection, column_stats,
@@ -149,12 +150,14 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
         CatalogEntry::RevokeApiKey { key_id } => api_key::revoke(key_id, catalog),
         CatalogEntry::PutAuthUser(stored) => auth_user::put(stored, catalog),
         CatalogEntry::PutMaterializedView(stored) => materialized_view::put(stored, catalog),
-        CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
-            match materialized_view::delete(*tenant_id, name, catalog) {
-                Ok(()) => Ok(()),
-                Err(error) => panic!("materialized-view catalog deletion failed: {error}"),
-            }
-        }
+        CatalogEntry::DeleteMaterializedView {
+            database_id,
+            tenant_id,
+            name,
+        } => match materialized_view::delete(*database_id, *tenant_id, name, catalog) {
+            Ok(()) => Ok(()),
+            Err(error) => panic!("materialized-view catalog deletion failed: {error}"),
+        },
         CatalogEntry::PutStreamingMaterializedView(definition) => {
             streaming_materialized_view::put(definition, catalog)
         }
@@ -291,20 +294,30 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
         }
         CatalogEntry::PutCheckpoint(record) => checkpoint::put(record, catalog),
         CatalogEntry::DeleteCheckpoint {
+            database_id,
             tenant_id,
             collection,
             doc_id,
             checkpoint_name,
-        } => checkpoint::delete(*tenant_id, collection, doc_id, checkpoint_name, catalog),
-        // `database_id` and `target_version_json` drive the post-apply
-        // compaction, not the row delete.
+        } => checkpoint::delete(
+            CheckpointDoc::new(*database_id, *tenant_id, collection, doc_id),
+            checkpoint_name,
+            catalog,
+        ),
+        // `target_version_json` drives the post-apply compaction, not the row
+        // delete.
         CatalogEntry::CompactHistory {
             tenant_id,
+            database_id,
             collection,
             doc_id,
             before_timestamp,
             ..
-        } => checkpoint::delete_before(*tenant_id, collection, doc_id, *before_timestamp, catalog),
+        } => checkpoint::delete_before(
+            CheckpointDoc::new(*database_id, *tenant_id, collection, doc_id),
+            *before_timestamp,
+            catalog,
+        ),
         CatalogEntry::PutVectorModel(entry) => vector::put_model(entry, catalog),
         CatalogEntry::DeleteVectorModel {
             database_id,

@@ -100,7 +100,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
             let prior = catalog
-                .get_committed_materialized_view(stored.tenant_id, &stored.name)
+                .get_committed_materialized_view(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|v| v.descriptor_version)
@@ -327,7 +327,7 @@ fn same_descriptor(prior: &CatalogEntry, current: &CatalogEntry) -> bool {
     }
     match (prior, current) {
         (CatalogEntry::PutMaterializedView(a), CatalogEntry::PutMaterializedView(b)) => {
-            a.tenant_id == b.tenant_id && a.name == b.name
+            a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name
         }
         (CatalogEntry::PutFunction(a), CatalogEntry::PutFunction(b)) => {
             a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name

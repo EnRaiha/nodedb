@@ -10,11 +10,13 @@
 //! - vector model metadata
 //! - column statistics
 //! - index records
+//! - version-history checkpoints
 //! - RLS and redaction policies
 //! - triggers
 //! - retention policies
 //! - alert rules
 //! - continuous aggregates
+//! - materialized views
 //! - streaming materialized views
 //!
 //! Each row is keyed by `database_id` and stays in the source unless this
@@ -26,6 +28,9 @@
 //! - no vector index builds
 //! - the planner costs every scan with no statistics
 //! - row-level security stops filtering
+//! - `SHOW VERSIONS` and `AT VERSION` resolve no named checkpoint
+//! - a materialized view's target collection is stamped with no definition
+//!   to maintain it
 //!
 //! Every write here is fatal on failure, for the same reason the shadow
 //! stamp is. Nothing later re-copies a row that silently failed to land.
@@ -34,7 +39,8 @@ use std::collections::{HashMap, HashSet};
 
 use nodedb_types::{DatabaseId, QualifiedCollection};
 
-use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::catalog::auth_types::object_type;
+use crate::control::security::catalog::{StoredOwner, SystemCatalog};
 
 /// The collection names a clone stamps a descriptor for, per tenant.
 ///
@@ -69,9 +75,9 @@ pub fn copy_database_metadata(
     copy_collection_policies(catalog, source, target, &stamped)
 }
 
-/// Copy the rows describing the shape of a collection: vector index build
-/// parameters, per-column embedding models, ANALYZE statistics, and the index
-/// identity registry.
+/// Copy the rows describing the shape and history of a collection: vector
+/// index build parameters, per-column embedding models, ANALYZE statistics,
+/// the index identity registry, and named version-history checkpoints.
 fn copy_collection_shape(
     catalog: &SystemCatalog,
     source: DatabaseId,
@@ -140,12 +146,27 @@ fn copy_collection_shape(
             .map_err(|e| copy_err("index record", &record.name, target, e))?;
     }
 
+    // A checkpoint names a collection and a document the clone holds through
+    // copy-up, and its version vector reads against the same oplog. Leaving it
+    // behind makes `SHOW VERSIONS` and `AT VERSION` answer differently in the
+    // clone than in the source.
+    for (tenant_id, names) in stamped {
+        for name in names {
+            catalog
+                .copy_checkpoints_for_collection(source_id, target_id, *tenant_id, name)
+                .map_err(|e| copy_err("checkpoints", name, target, e))?;
+        }
+    }
+
     Ok(())
 }
 
 /// Copy the database-scoped objects that act on the clone's own collections:
-/// triggers, retention policies, alert rules, continuous aggregates, and
-/// streaming materialized views.
+/// triggers, retention policies, alert rules, materialized views, continuous
+/// aggregates, and streaming materialized views.
+///
+/// Each object the integrity check pairs with an owner row gets that row here,
+/// carrying the copied record's own in-band owner.
 fn copy_scoped_objects(
     catalog: &SystemCatalog,
     source: DatabaseId,
@@ -159,6 +180,14 @@ fn copy_scoped_objects(
         catalog
             .put_trigger(&trigger)
             .map_err(|e| copy_err("trigger", &trigger.name, target, e))?;
+        copy_owner_row(
+            catalog,
+            object_type::TRIGGER,
+            target,
+            trigger.tenant_id,
+            &trigger.name,
+            &trigger.owner,
+        )?;
     }
 
     // Schedules are deliberately absent. A trigger fires on a write to the
@@ -181,11 +210,38 @@ fn copy_scoped_objects(
             .map_err(|e| copy_err("alert rule", &rule.name, target, e))?;
     }
 
+    // The clone stamps a descriptor for the view's implementation-owned target
+    // collection, so the definition must travel with it. Without it the clone
+    // holds a target no refresh loop maintains, and a cascade over the source
+    // collection finds no dependent view to drop.
+    for mut view in catalog.list_materialized_views_in_database(source_id)? {
+        view.database_id = target_id;
+        catalog
+            .put_materialized_view(&view)
+            .map_err(|e| copy_err("materialized view", &view.name, target, e))?;
+        copy_owner_row(
+            catalog,
+            object_type::MATERIALIZED_VIEW,
+            target,
+            view.tenant_id,
+            &view.name,
+            &view.owner,
+        )?;
+    }
+
     for mut cagg in catalog.list_continuous_aggregates_in_database(source_id)? {
         cagg.database_id = target_id;
         catalog
             .put_continuous_aggregate(&cagg)
             .map_err(|e| copy_err("continuous aggregate", &cagg.name, target, e))?;
+        copy_owner_row(
+            catalog,
+            object_type::CONTINUOUS_AGGREGATE,
+            target,
+            cagg.tenant_id,
+            &cagg.name,
+            &cagg.owner,
+        )?;
     }
 
     for mut mv in catalog.load_streaming_mvs_for_database(source)? {
@@ -193,6 +249,14 @@ fn copy_scoped_objects(
         catalog
             .put_streaming_mv(&mv)
             .map_err(|e| copy_err("streaming mv", &mv.name, target, e))?;
+        copy_owner_row(
+            catalog,
+            object_type::STREAMING_MATERIALIZED_VIEW,
+            target,
+            mv.tenant_id,
+            &mv.name,
+            &mv.owner,
+        )?;
     }
 
     Ok(())
@@ -235,6 +299,34 @@ fn copy_collection_policies(
     }
 
     Ok(())
+}
+
+/// Write the `StoredOwner` row for one copied object, keyed by the target
+/// database.
+///
+/// The startup integrity check pairs collections, functions, procedures,
+/// triggers, materialized views, streaming materialized views, sequences,
+/// schedules, change streams, and continuous aggregates with an owner row
+/// keyed by the object's own database. Ownership also gates DDL
+/// authorization, so the row must land with the copy rather than wait for a
+/// later pass.
+fn copy_owner_row(
+    catalog: &SystemCatalog,
+    object_type: &str,
+    target: DatabaseId,
+    tenant_id: u64,
+    object_name: &str,
+    owner_username: &str,
+) -> crate::Result<()> {
+    catalog
+        .put_owner(&StoredOwner {
+            database_id: target.as_u64(),
+            object_type: object_type.to_string(),
+            object_name: object_name.to_string(),
+            tenant_id,
+            owner_username: owner_username.to_string(),
+        })
+        .map_err(|e| copy_err(&format!("{object_type} owner"), object_name, target, e))
 }
 
 /// Whether a row's `(tenant_id, collection)` names a collection the clone
@@ -416,6 +508,184 @@ mod tests {
             .expect("read index records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].database_id, SOURCE.as_u64());
+    }
+
+    /// The clone stamps a descriptor for `chunks`, so its named checkpoints
+    /// must reach the target under the target's own key.
+    #[test]
+    fn checkpoints_follow_the_collection_into_the_clone() {
+        use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
+
+        let (_dir, catalog) = open();
+        seed_source(&catalog);
+        catalog
+            .put_checkpoint(&CheckpointRecord {
+                database_id: SOURCE.as_u64(),
+                tenant_id: TENANT,
+                collection: "chunks".into(),
+                doc_id: "doc-1".into(),
+                checkpoint_name: "launch".into(),
+                version_vector_json: "{\"n1\":4}".into(),
+                created_by: "cloner".into(),
+                created_at: 10,
+            })
+            .expect("seed checkpoint");
+
+        copy_database_metadata(&catalog, SOURCE, TARGET).expect("copy metadata");
+
+        let doc = CheckpointDoc::new(TARGET.as_u64(), TENANT, "chunks", "doc-1");
+        let copied = catalog
+            .get_checkpoint(doc, "launch")
+            .expect("read checkpoint")
+            .expect("the checkpoint must land in the target");
+        assert_eq!(copied.database_id, TARGET.as_u64());
+        assert_eq!(copied.version_vector_json, "{\"n1\":4}");
+
+        let source_doc = CheckpointDoc::new(SOURCE.as_u64(), TENANT, "chunks", "doc-1");
+        assert!(
+            catalog
+                .get_checkpoint(source_doc, "launch")
+                .expect("read source")
+                .is_some(),
+            "the source keeps its checkpoint"
+        );
+    }
+
+    /// The clone stamps the view's target collection, so the definition must
+    /// travel with it.
+    #[test]
+    fn a_materialized_view_definition_reaches_the_clone() {
+        let (_dir, catalog) = open();
+        seed_source(&catalog);
+        seed_owner_paired_objects(&catalog);
+
+        copy_database_metadata(&catalog, SOURCE, TARGET).expect("copy metadata");
+
+        let copied = catalog
+            .get_committed_materialized_view(TARGET.as_u64(), TENANT, "chunk_counts")
+            .expect("read view")
+            .expect("the definition must land in the target");
+        assert_eq!(copied.database_id, TARGET.as_u64());
+        assert_eq!(copied.source, "chunks");
+        assert!(
+            catalog
+                .get_committed_materialized_view(SOURCE.as_u64(), TENANT, "chunk_counts")
+                .expect("read source")
+                .is_some(),
+            "the source keeps its definition"
+        );
+    }
+
+    /// Seed one source object of every kind the integrity check pairs with an
+    /// owner row and `copy_scoped_objects` copies.
+    fn seed_owner_paired_objects(catalog: &SystemCatalog) {
+        use crate::control::security::catalog::StoredContinuousAggregate;
+        use crate::control::security::catalog::StoredMaterializedView;
+        use crate::control::security::catalog::trigger_types::{
+            StoredTrigger, TriggerEvents, TriggerGranularity, TriggerTiming,
+        };
+        use crate::event::streaming_mv::StreamingMvDef;
+
+        catalog
+            .put_trigger(&StoredTrigger {
+                tenant_id: TENANT,
+                database_id: SOURCE,
+                name: "chunks_audit".into(),
+                collection: "chunks".into(),
+                timing: TriggerTiming::After,
+                events: TriggerEvents {
+                    on_insert: true,
+                    on_update: false,
+                    on_delete: false,
+                },
+                granularity: TriggerGranularity::Row,
+                when_condition: None,
+                body_sql: "BEGIN END".into(),
+                priority: 0,
+                enabled: true,
+                execution_mode: Default::default(),
+                security: Default::default(),
+                batch_mode: Default::default(),
+                owner: "cloner".into(),
+                created_at: 0,
+                descriptor_version: 1,
+                modification_hlc: Default::default(),
+            })
+            .expect("seed trigger");
+
+        catalog
+            .put_materialized_view(&StoredMaterializedView {
+                database_id: SOURCE.as_u64(),
+                tenant_id: TENANT,
+                name: "chunk_counts".into(),
+                source: "chunks".into(),
+                query_sql: "SELECT count(*) FROM chunks".into(),
+                refresh_mode: "auto".into(),
+                owner: "cloner".into(),
+                created_at: 0,
+                descriptor_version: 1,
+                modification_hlc: Default::default(),
+            })
+            .expect("seed materialized view");
+
+        catalog
+            .put_continuous_aggregate(&StoredContinuousAggregate {
+                database_id: SOURCE.as_u64(),
+                tenant_id: TENANT,
+                name: "chunks_hourly".into(),
+                source: "chunks".into(),
+                def_bytes: Vec::new(),
+                owner: "cloner".into(),
+                created_at: 0,
+                descriptor_version: 1,
+                modification_hlc: Default::default(),
+            })
+            .expect("seed continuous aggregate");
+
+        catalog
+            .put_streaming_mv(&StreamingMvDef {
+                database_id: SOURCE,
+                tenant_id: TENANT,
+                name: "chunks_live".into(),
+                source_stream: "chunks_stream".into(),
+                group_by_columns: Vec::new(),
+                aggregates: Vec::new(),
+                filter_expr: None,
+                owner: "cloner".into(),
+                created_at: 0,
+            })
+            .expect("seed streaming mv");
+    }
+
+    /// Every copied object the integrity check pairs with an owner gets that
+    /// row under the target database, so DDL authorization works on the clone
+    /// without waiting for a later pass.
+    #[test]
+    fn every_owner_paired_copy_lands_its_owner_row() {
+        let (_dir, catalog) = open();
+        seed_source(&catalog);
+        seed_owner_paired_objects(&catalog);
+
+        copy_database_metadata(&catalog, SOURCE, TARGET).expect("copy metadata");
+
+        let owners = catalog.load_all_owners().expect("read owners");
+        for (kind, name) in [
+            (object_type::TRIGGER, "chunks_audit"),
+            (object_type::MATERIALIZED_VIEW, "chunk_counts"),
+            (object_type::CONTINUOUS_AGGREGATE, "chunks_hourly"),
+            (object_type::STREAMING_MATERIALIZED_VIEW, "chunks_live"),
+        ] {
+            assert!(
+                owners
+                    .iter()
+                    .any(|owner| owner.database_id == TARGET.as_u64()
+                        && owner.object_type == kind
+                        && owner.object_name == name
+                        && owner.tenant_id == TENANT
+                        && owner.owner_username == "cloner"),
+                "{kind} '{name}' must carry an owner row in the target database"
+            );
+        }
     }
 
     /// A database the clone never touched keeps an empty metadata set.

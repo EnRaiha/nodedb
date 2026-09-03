@@ -164,8 +164,12 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         CatalogEntry::PutMaterializedView(stored) => {
             materialized_view::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
-            materialized_view::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteMaterializedView {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            materialized_view::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutStreamingMaterializedView(definition) => {
             streaming_materialized_view::put((**definition).clone(), Arc::clone(shared));

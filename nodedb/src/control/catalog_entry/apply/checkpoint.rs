@@ -6,7 +6,7 @@
 //! before proposing, so apply runs the unvalidated catalog path: a rejection
 //! here would diverge a follower from a statement the leader already accepted.
 
-use crate::control::security::catalog::types::CheckpointRecord;
+use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::security::catalog::{SystemCatalog, catalog_err};
 
 /// Apply a `PutCheckpoint` entry. A re-delivery rewrites the same row.
@@ -20,14 +20,12 @@ pub fn put(record: &CheckpointRecord, catalog: &SystemCatalog) -> crate::Result<
 ///
 /// A missing row is not an error: the entry is idempotent under replay.
 pub fn delete(
-    tenant_id: u64,
-    collection: &str,
-    doc_id: &str,
+    doc: CheckpointDoc<'_>,
     checkpoint_name: &str,
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     catalog
-        .delete_checkpoint(tenant_id, collection, doc_id, checkpoint_name)
+        .delete_checkpoint(doc, checkpoint_name)
         .map_err(|e| catalog_err(&format!("delete_checkpoint '{checkpoint_name}'"), e))
         .map(|_| ())
 }
@@ -37,17 +35,18 @@ pub fn delete(
 /// The boundary is exclusive, so a checkpoint stamped exactly at
 /// `before_timestamp` survives on every node.
 pub fn delete_before(
-    tenant_id: u64,
-    collection: &str,
-    doc_id: &str,
+    doc: CheckpointDoc<'_>,
     before_timestamp: u64,
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     catalog
-        .delete_checkpoints_before(tenant_id, collection, doc_id, before_timestamp)
+        .delete_checkpoints_before(doc, before_timestamp)
         .map_err(|e| {
             catalog_err(
-                &format!("delete_checkpoints_before '{collection}/{doc_id}'"),
+                &format!(
+                    "delete_checkpoints_before '{}/{}'",
+                    doc.collection, doc.doc_id
+                ),
                 e,
             )
         })
@@ -73,7 +72,12 @@ mod tests {
     }
 
     fn sample(name: &str, created_at: u64) -> CheckpointRecord {
+        sample_in(DATABASE, name, created_at)
+    }
+
+    fn sample_in(database_id: u64, name: &str, created_at: u64) -> CheckpointRecord {
         CheckpointRecord {
+            database_id,
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             doc_id: DOC.to_string(),
@@ -84,9 +88,17 @@ mod tests {
         }
     }
 
+    fn doc_in(database_id: u64) -> CheckpointDoc<'static> {
+        CheckpointDoc::new(database_id, TENANT, COLLECTION, DOC)
+    }
+
+    fn doc() -> CheckpointDoc<'static> {
+        doc_in(DATABASE)
+    }
+
     fn names(catalog: &SystemCatalog) -> Vec<String> {
         catalog
-            .list_checkpoints(TENANT, COLLECTION, DOC, 0)
+            .list_checkpoints(doc(), 0)
             .unwrap()
             .into_iter()
             .map(|r| r.checkpoint_name)
@@ -98,6 +110,7 @@ mod tests {
         let entry = CatalogEntry::PutCheckpoint(Box::new(sample(NAME, 1_000)));
         match decode(&encode(&entry).unwrap()).unwrap() {
             CatalogEntry::PutCheckpoint(record) => {
+                assert_eq!(record.database_id, DATABASE);
                 assert_eq!(record.tenant_id, TENANT);
                 assert_eq!(record.collection, COLLECTION);
                 assert_eq!(record.doc_id, DOC);
@@ -113,6 +126,7 @@ mod tests {
     #[test]
     fn delete_checkpoint_roundtrips_through_codec() {
         let entry = CatalogEntry::DeleteCheckpoint {
+            database_id: DATABASE,
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             doc_id: DOC.to_string(),
@@ -120,11 +134,13 @@ mod tests {
         };
         match decode(&encode(&entry).unwrap()).unwrap() {
             CatalogEntry::DeleteCheckpoint {
+                database_id,
                 tenant_id,
                 collection,
                 doc_id,
                 checkpoint_name,
             } => {
+                assert_eq!(database_id, DATABASE);
                 assert_eq!(tenant_id, TENANT);
                 assert_eq!(collection, COLLECTION);
                 assert_eq!(doc_id, DOC);
@@ -178,6 +194,7 @@ mod tests {
 
         apply::apply_to(
             &CatalogEntry::DeleteCheckpoint {
+                database_id: DATABASE,
                 tenant_id: TENANT,
                 collection: COLLECTION.to_string(),
                 doc_id: DOC.to_string(),
@@ -192,7 +209,35 @@ mod tests {
     #[test]
     fn deleting_an_absent_checkpoint_is_a_noop() {
         let (_dir, catalog) = open_catalog();
-        delete(TENANT, COLLECTION, DOC, "never-created", &catalog).expect("delete absent");
+        delete(doc(), "never-created", &catalog).expect("delete absent");
+    }
+
+    /// Two databases of one tenant name the same collection, document, and
+    /// checkpoint. Applying a delete in one leaves the other's row standing.
+    #[test]
+    fn a_delete_in_one_database_leaves_the_other_databases_row() {
+        let (_dir, catalog) = open_catalog();
+        put(&sample_in(DATABASE, NAME, 1_000), &catalog).unwrap();
+        put(&sample_in(DATABASE + 1, NAME, 2_000), &catalog).unwrap();
+
+        apply::apply_to(
+            &CatalogEntry::DeleteCheckpoint {
+                database_id: DATABASE,
+                tenant_id: TENANT,
+                collection: COLLECTION.to_string(),
+                doc_id: DOC.to_string(),
+                checkpoint_name: NAME.to_string(),
+            },
+            &catalog,
+        )
+        .unwrap();
+
+        assert!(names(&catalog).is_empty());
+        let kept = catalog
+            .list_checkpoints(doc_in(DATABASE + 1), 0)
+            .expect("list");
+        assert_eq!(kept.len(), 1, "the key is scoped by database");
+        assert_eq!(kept[0].created_at, 2_000);
     }
 
     #[test]
@@ -232,12 +277,12 @@ mod tests {
         other.doc_id = "doc-2".to_string();
         put(&other, &catalog).unwrap();
 
-        delete_before(TENANT, COLLECTION, DOC, 1_000, &catalog).expect("range delete");
+        delete_before(doc(), 1_000, &catalog).expect("range delete");
 
         assert!(names(&catalog).is_empty());
         assert_eq!(
             catalog
-                .list_checkpoints(TENANT, COLLECTION, "doc-2", 0)
+                .list_checkpoints(CheckpointDoc::new(DATABASE, TENANT, COLLECTION, "doc-2"), 0)
                 .unwrap()
                 .len(),
             1
@@ -251,12 +296,8 @@ mod tests {
         put(&sample("b", 2), &catalog).unwrap();
         put(&sample("c", 9), &catalog).unwrap();
 
-        let counted = catalog
-            .count_checkpoints_before(TENANT, COLLECTION, DOC, 9)
-            .expect("count");
-        let deleted = catalog
-            .delete_checkpoints_before(TENANT, COLLECTION, DOC, 9)
-            .expect("delete");
+        let counted = catalog.count_checkpoints_before(doc(), 9).expect("count");
+        let deleted = catalog.delete_checkpoints_before(doc(), 9).expect("delete");
         assert_eq!(counted, 2);
         assert_eq!(deleted, counted);
     }

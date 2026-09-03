@@ -92,7 +92,7 @@ pub(super) const PENDING_RECLAIM: TableDefinition<&str, &[u8]> =
 
 // ── DDL objects ───────────────────────────────────────────────────────
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized materialized view metadata.
+/// Table: "{database_id}:{tenant_id}:{name}" -> MessagePack-serialized materialized view metadata.
 pub(super) const MATERIALIZED_VIEWS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.materialized_views");
 
@@ -410,6 +410,6 @@ pub(super) const VECTOR_INDEX_PARAMS: TableDefinition<&str, &[u8]> =
 pub(super) const INDEX_REGISTRY: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.index_registry");
 
-/// Table: "{tenant_id}:{collection}:{doc_id}:{checkpoint_name}" -> MessagePack CheckpointRecord.
+/// Table: "{database_id}:{tenant_id}:{collection}:{doc_id}:{checkpoint_name}" -> MessagePack CheckpointRecord.
 pub(super) const CHECKPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.checkpoints");

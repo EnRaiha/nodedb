@@ -173,7 +173,7 @@ fn per_kind_finders_match_orchestrator() {
         vec!["p_books"]
     );
     assert_eq!(
-        find_mvs_sourcing(&catalog, TENANT, "books").unwrap(),
+        find_mvs_sourcing(&catalog, DatabaseId::DEFAULT, TENANT, "books").unwrap(),
         vec!["mv_books"]
     );
     assert_eq!(
@@ -274,7 +274,7 @@ fn mv_cycle_detection_returns_cascade_cycle_error() {
             .unwrap();
     }
 
-    let res = find_mvs_sourcing(&catalog, TENANT, "root");
+    let res = find_mvs_sourcing(&catalog, DatabaseId::DEFAULT, TENANT, "root");
     match res {
         Ok(mvs) => panic!(
             "expected CascadeCycle, got Ok with {} mvs (depth cap should have tripped)",

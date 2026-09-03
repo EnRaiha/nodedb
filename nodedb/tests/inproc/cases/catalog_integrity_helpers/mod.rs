@@ -147,6 +147,7 @@ pub fn make_mv(name: &str) -> StoredMaterializedView {
 
 pub fn make_mv_sourced(name: &str, source: &str) -> StoredMaterializedView {
     StoredMaterializedView {
+        database_id: DatabaseId::DEFAULT.as_u64(),
         tenant_id: TENANT,
         name: name.into(),
         source: source.into(),

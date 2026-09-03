@@ -80,7 +80,7 @@ pub async fn create_materialized_view(
         // same-name target over an object whose existence check transiently
         // failed.
         if catalog
-            .get_materialized_view(tenant_id.as_u64(), &name)
+            .get_materialized_view(database_id.as_u64(), tenant_id.as_u64(), &name)
             .map_err(|error| err("XX000", error.to_string()))?
             .is_some()
         {
@@ -104,6 +104,7 @@ pub async fn create_materialized_view(
         .as_secs();
 
     let view = StoredMaterializedView {
+        database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         name: name.clone(),
         source: source.clone(),

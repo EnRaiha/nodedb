@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::cluster_harness::{TestCluster, TestClusterNode, wait_for, wait_for_async};
 
-use nodedb::control::security::catalog::types::CheckpointRecord;
+use nodedb::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 
 /// CRDT collection carrying the revised document.
 const COLLECTION: &str = "crdt_compact_docs";
@@ -125,12 +125,23 @@ fn pg_detail(e: &tokio_postgres::Error) -> String {
     }
 }
 
+/// The document every checkpoint in this file belongs to. The harness runs its
+/// SQL against the default database.
+fn doc() -> CheckpointDoc<'static> {
+    CheckpointDoc::new(
+        nodedb_types::DatabaseId::DEFAULT.as_u64(),
+        TENANT,
+        COLLECTION,
+        DOC,
+    )
+}
+
 /// The durable `_system.checkpoints` row this node holds for `name`.
 fn stored_checkpoint(node: &TestClusterNode, name: &str) -> Option<CheckpointRecord> {
     node.shared
         .credentials
         .catalog()
-        .get_checkpoint(TENANT, COLLECTION, DOC, name)
+        .get_checkpoint(doc(), name)
         .expect("read the checkpoint row")
 }
 

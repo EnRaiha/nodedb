@@ -203,7 +203,7 @@ fn committed_before_image(
                 .map(|prior| CatalogEntry::PutCollection(Box::new(prior)))
         }
         CatalogEntry::PutMaterializedView(stored) => catalog
-            .get_committed_materialized_view(stored.tenant_id, &stored.name)?
+            .get_committed_materialized_view(stored.database_id, stored.tenant_id, &stored.name)?
             .map(|prior| CatalogEntry::PutMaterializedView(Box::new(prior))),
         CatalogEntry::PutFunction(stored) => catalog
             .get_committed_function_in_database(stored.database_id, stored.tenant_id, &stored.name)?
@@ -435,6 +435,7 @@ fn reverse_create(entry: &CatalogEntry) -> crate::Result<CatalogEntry> {
             collection: stored.collection.clone(),
         }),
         CatalogEntry::PutMaterializedView(stored) => Ok(CatalogEntry::DeleteMaterializedView {
+            database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
         }),

@@ -269,7 +269,7 @@ fn reassign_one(
         }
         OwnerKind::MaterializedView => {
             let mut s = catalog
-                .get_materialized_view(tenant_id, name)
+                .get_materialized_view(database_id, tenant_id, name)
                 .map_err(|e| ddl_err(format!("get materialized_view '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
@@ -278,7 +278,15 @@ fn reassign_one(
                 catalog
                     .put_materialized_view(&s)
                     .map_err(|e| ddl_err(format!("put materialized_view '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::StreamingMaterializedView => {

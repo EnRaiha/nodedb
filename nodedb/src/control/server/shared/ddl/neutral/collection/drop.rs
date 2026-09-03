@@ -187,7 +187,7 @@ pub fn drop_collection(
     {
         let catalog = state.credentials.catalog();
         if catalog
-            .get_materialized_view(tenant_id.as_u64(), name)
+            .get_materialized_view(database_id.as_u64(), tenant_id.as_u64(), name)
             .map_err(|error| err("XX000", error.to_string()))?
             .is_some()
         {

@@ -98,7 +98,9 @@ pub fn collect_dependents(
             });
         }
     }
-    for name in materialized_views::find_mvs_sourcing(catalog, tenant_id, root_collection)? {
+    for name in
+        materialized_views::find_mvs_sourcing(catalog, database_id, tenant_id, root_collection)?
+    {
         if visited.insert((DependentKind::MaterializedView, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::MaterializedView,
@@ -247,6 +249,7 @@ mod tests {
         // visited set.
         catalog
             .put_materialized_view(&StoredMaterializedView {
+                database_id: 1,
                 tenant_id: 7,
                 name: "orders_summary".into(),
                 source: "orders".into(),

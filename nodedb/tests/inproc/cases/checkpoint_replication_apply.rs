@@ -11,7 +11,7 @@
 
 use nodedb::control::catalog_entry::post_apply::apply_post_apply_side_effects_sync;
 use nodedb::control::catalog_entry::{CatalogEntry, apply};
-use nodedb::control::security::catalog::types::CheckpointRecord;
+use nodedb::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use nodedb_test_support::pgwire_harness::TestServer;
 
 const TENANT: u64 = 1;
@@ -22,6 +22,7 @@ const NAME: &str = "launch-ready";
 
 fn record(name: &str, created_at: u64) -> CheckpointRecord {
     CheckpointRecord {
+        database_id: DATABASE,
         tenant_id: TENANT,
         collection: COLLECTION.to_string(),
         doc_id: DOC.to_string(),
@@ -30,6 +31,11 @@ fn record(name: &str, created_at: u64) -> CheckpointRecord {
         created_by: "admin".to_string(),
         created_at,
     }
+}
+
+/// The document every checkpoint in this file belongs to.
+fn doc() -> CheckpointDoc<'static> {
+    CheckpointDoc::new(DATABASE, TENANT, COLLECTION, DOC)
 }
 
 /// Apply an entry the way the metadata applier does: durable write first,
@@ -45,7 +51,7 @@ fn stored_names(server: &TestServer) -> Vec<String> {
         .shared
         .credentials
         .catalog()
-        .list_checkpoints(TENANT, COLLECTION, DOC, 0)
+        .list_checkpoints(doc(), 0)
         .expect("list checkpoints")
         .into_iter()
         .map(|r| r.checkpoint_name)
@@ -73,7 +79,7 @@ async fn replicated_put_installs_the_checkpoint() {
         .shared
         .credentials
         .catalog()
-        .get_checkpoint(TENANT, COLLECTION, DOC, NAME)
+        .get_checkpoint(doc(), NAME)
         .expect("read the checkpoint back")
         .expect("apply must write the durable row on this node");
     assert_eq!(stored.version_vector_json, "{\"n1\":4}");
@@ -91,6 +97,7 @@ async fn replicated_delete_removes_the_checkpoint_row() {
         &CatalogEntry::PutCheckpoint(Box::new(record(NAME, 1_000))),
     );
     let delete = CatalogEntry::DeleteCheckpoint {
+        database_id: DATABASE,
         tenant_id: TENANT,
         collection: COLLECTION.to_string(),
         doc_id: DOC.to_string(),

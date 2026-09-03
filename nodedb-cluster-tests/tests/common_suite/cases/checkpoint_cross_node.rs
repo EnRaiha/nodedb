@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::cluster_harness::{TestCluster, TestClusterNode, wait_for};
 
-use nodedb::control::security::catalog::types::CheckpointRecord;
+use nodedb::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 
 /// Document collection every checkpoint targets.
 const COLLECTION: &str = "checkpoint_cross_docs";
@@ -58,12 +58,23 @@ fn leader_id(cluster: &TestCluster) -> u64 {
         .expect("at least one node must report a non-zero leader id")
 }
 
+/// The document every checkpoint in this file belongs to. The harness runs its
+/// SQL against the default database.
+fn doc() -> CheckpointDoc<'static> {
+    CheckpointDoc::new(
+        nodedb_types::DatabaseId::DEFAULT.as_u64(),
+        TENANT,
+        COLLECTION,
+        DOC,
+    )
+}
+
 /// The durable `_system.checkpoints` row this node holds for `name`.
 fn stored_checkpoint(node: &TestClusterNode, name: &str) -> Option<CheckpointRecord> {
     node.shared
         .credentials
         .catalog()
-        .get_checkpoint(TENANT, COLLECTION, DOC, name)
+        .get_checkpoint(doc(), name)
         .expect("read the checkpoint row")
 }
 
@@ -73,7 +84,7 @@ fn stored_names(node: &TestClusterNode) -> Vec<String> {
         .shared
         .credentials
         .catalog()
-        .list_checkpoints(TENANT, COLLECTION, DOC, 0)
+        .list_checkpoints(doc(), 0)
         .expect("list checkpoints")
         .into_iter()
         .map(|r| r.checkpoint_name)

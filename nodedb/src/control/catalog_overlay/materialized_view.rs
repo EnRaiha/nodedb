@@ -2,23 +2,26 @@
 
 //! Uncommitted-DDL overlay for materialized views.
 //!
-//! See [`super::collection`] for the mechanism this mirrors. Materialized
-//! views are tenant-scoped only — `StoredMaterializedView` carries no
-//! `database_id`, so the target identity here is `(tenant_id, name)`.
+//! See [`super::collection`] for the mechanism this mirrors. The target
+//! identity is `(database_id, tenant_id, name)`, matching the catalog key.
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::security::catalog::types::StoredMaterializedView;
 
-/// True when `entry` mutates the materialized view `(tenant_id, name)`.
-fn targets(entry: &CatalogEntry, tenant_id: u64, name: &str) -> bool {
+/// True when `entry` mutates the materialized view
+/// `(database_id, tenant_id, name)`.
+fn targets(entry: &CatalogEntry, database_id: u64, tenant_id: u64, name: &str) -> bool {
     match entry {
         CatalogEntry::PutMaterializedView(stored) => {
-            stored.tenant_id == tenant_id && stored.name == name
+            stored.database_id == database_id
+                && stored.tenant_id == tenant_id
+                && stored.name == name
         }
         CatalogEntry::DeleteMaterializedView {
+            database_id: entry_database,
             tenant_id: entry_tenant,
             name: entry_name,
-        } => *entry_tenant == tenant_id && entry_name == name,
+        } => *entry_database == database_id && *entry_tenant == tenant_id && entry_name == name,
         _ => false,
     }
 }
@@ -37,11 +40,16 @@ fn step(
 
 /// Resolve one materialized view through this connection's uncommitted DDL.
 pub fn resolve_materialized_view(
+    database_id: u64,
     tenant_id: u64,
     name: &str,
     committed: Option<StoredMaterializedView>,
 ) -> Option<StoredMaterializedView> {
-    super::core::resolve(committed, |entry| targets(entry, tenant_id, name), step)
+    super::core::resolve(
+        committed,
+        |entry| targets(entry, database_id, tenant_id, name),
+        step,
+    )
 }
 
 #[cfg(test)]
@@ -51,6 +59,7 @@ mod tests {
 
     fn stored(name: &str) -> StoredMaterializedView {
         StoredMaterializedView {
+            database_id: 2,
             tenant_id: 1,
             name: name.to_owned(),
             source: "orders".into(),
@@ -69,6 +78,7 @@ mod tests {
 
     fn delete(name: &str) -> CatalogEntry {
         CatalogEntry::DeleteMaterializedView {
+            database_id: 2,
             tenant_id: 1,
             name: name.to_owned(),
         }
@@ -78,7 +88,7 @@ mod tests {
         name: &str,
         committed: Option<StoredMaterializedView>,
     ) -> Option<StoredMaterializedView> {
-        resolve_materialized_view(1, name, committed)
+        resolve_materialized_view(2, 1, name, committed)
     }
 
     #[tokio::test]
@@ -88,6 +98,18 @@ mod tests {
             assert!(ddl_buffer::try_buffer(put("mv_a")));
             let resolved = resolve("mv_a", None).expect("buffered create resolves");
             assert_eq!(resolved.name, "mv_a");
+        })
+        .await;
+    }
+
+    /// The overlay keys on the database too, so a buffered create in one
+    /// database never answers a lookup in another.
+    #[tokio::test]
+    async fn a_buffered_create_of_another_database_is_invisible() {
+        conn_scope::scoped(async {
+            ddl_buffer::activate();
+            assert!(ddl_buffer::try_buffer(put("mv_a")));
+            assert!(resolve_materialized_view(3, 1, "mv_a", None).is_none());
         })
         .await;
     }

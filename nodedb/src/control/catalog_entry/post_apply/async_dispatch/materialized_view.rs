@@ -20,11 +20,19 @@ use crate::control::state::SharedState;
 /// committed; serving through an incomplete reclaim would violate object
 /// incarnation isolation.
 pub async fn delete_async(
+    database_id: u64,
     tenant_id: u64,
     name: String,
     purge_lsn: u64,
     shared: Arc<SharedState>,
 ) -> Result<(), super::collection::ReclaimFailure> {
-    super::collection::reclaim_collection_storage(&shared, 0, tenant_id, &name, purge_lsn, false)
-        .await
+    super::collection::reclaim_collection_storage(
+        &shared,
+        database_id,
+        tenant_id,
+        &name,
+        purge_lsn,
+        false,
+    )
+    .await
 }

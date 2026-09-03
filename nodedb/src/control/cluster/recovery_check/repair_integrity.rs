@@ -231,7 +231,7 @@ fn primary_row_owner(
             .flatten()
             .map(|stored| stored.owner),
         object_type::MATERIALIZED_VIEW => catalog
-            .get_materialized_view(tenant_id, name)
+            .get_materialized_view(database_id, tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),

@@ -263,7 +263,7 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::MigrateConsumerGroupStream { .. } => VariantClass::Exempt,
         // Version-history checkpoints are standalone rows in
         // `_system.checkpoints`, keyed by
-        // (tenant_id, collection, doc_id, checkpoint_name). They name a
+        // (database_id, tenant_id, collection, doc_id, checkpoint_name). They name a
         // version vector on a document the collection already owns, so the
         // apply path writes no StoredOwner row and there is no orphan pair.
         CatalogEntry::PutCheckpoint(_) => VariantClass::Exempt,

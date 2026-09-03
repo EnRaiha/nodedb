@@ -158,7 +158,7 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .get_materialized_view(tenant_id, name)
+            .get_materialized_view(nodedb_types::DatabaseId::DEFAULT.as_u64(), tenant_id, name)
             .ok()
             .flatten()
             .is_some()

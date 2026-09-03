@@ -197,6 +197,7 @@ pub enum CatalogEntry {
     /// one mutation. Post-apply waits for Data Plane reclaim before advancing
     /// the applied index, so a same-name re-CREATE starts fresh.
     DeleteMaterializedView {
+        database_id: u64,
         tenant_id: u64,
         name: String,
     },
@@ -478,11 +479,12 @@ pub enum CatalogEntry {
 
     // ── Version-history checkpoint ─────────────────────────────────
     /// Named checkpoint row in `_system.checkpoints`, keyed by
-    /// `(tenant_id, collection, doc_id, checkpoint_name)`.
+    /// `(database_id, tenant_id, collection, doc_id, checkpoint_name)`.
     PutCheckpoint(Box<CheckpointRecord>),
     /// Drops one checkpoint row. The leader reports a missing checkpoint, so
     /// apply stays idempotent under replay.
     DeleteCheckpoint {
+        database_id: u64,
         tenant_id: u64,
         collection: String,
         doc_id: String,
@@ -495,6 +497,9 @@ pub enum CatalogEntry {
     /// The checkpoint delete and the compaction travel together because they
     /// are one operator action. The target rides in the entry because apply
     /// deletes the checkpoint row that holds it.
+    ///
+    /// `database_id` scopes both halves: it keys the checkpoint rows apply
+    /// removes, and it names the collection post-apply compacts.
     CompactHistory {
         tenant_id: u64,
         database_id: u64,

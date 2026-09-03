@@ -4,6 +4,7 @@
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
+use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -39,8 +40,14 @@ pub async fn compact_history(
 
     // Resolve checkpoint to version vector + timestamp.
     let catalog = state.credentials.catalog();
+    let doc = CheckpointDoc::new(
+        database_id.as_u64(),
+        tenant_id.as_u64(),
+        &collection,
+        &doc_id,
+    );
     let record = catalog
-        .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
+        .get_checkpoint(doc, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?
         .ok_or_else(|| {
             err(
@@ -52,15 +59,12 @@ pub async fn compact_history(
     // Count on the leader: the replicated entry carries the boundary, not a
     // row count, and the audit line names how many rows it removes.
     let deleted = catalog
-        .count_checkpoints_before(tenant_id.as_u64(), &collection, &doc_id, record.created_at)
+        .count_checkpoints_before(doc, record.created_at)
         .map_err(|e| err("XX000", e.to_string()))?;
     let outcome = super::replicate::propose_compact_history(
         state,
-        tenant_id.as_u64(),
-        &collection,
-        &doc_id,
+        doc,
         record.created_at,
-        database_id.as_u64(),
         &record.version_vector_json,
     )?;
 

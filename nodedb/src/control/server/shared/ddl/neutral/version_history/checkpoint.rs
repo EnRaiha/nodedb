@@ -12,7 +12,7 @@ use std::time::Duration;
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::catalog::types::CheckpointRecord;
+use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sync_dispatch::{
     SystemReason, SystemTask, dispatch_system,
@@ -65,6 +65,7 @@ pub async fn create_checkpoint(
         .as_secs();
 
     let record = CheckpointRecord {
+        database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         collection: collection.clone(),
         doc_id: doc_id.clone(),
@@ -77,8 +78,14 @@ pub async fn create_checkpoint(
     // The duplicate is reported here, on the leader. Apply is policy-free:
     // rejecting there would leave followers without a row the leader accepted.
     let catalog = state.credentials.catalog();
+    let doc = CheckpointDoc::new(
+        database_id.as_u64(),
+        tenant_id.as_u64(),
+        &collection,
+        &doc_id,
+    );
     if catalog
-        .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
+        .get_checkpoint(doc, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?
         .is_some()
     {
@@ -110,6 +117,7 @@ pub async fn create_checkpoint(
 pub fn drop_checkpoint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (checkpoint_name, collection, doc_id) = parse_checkpoint_sql(sql, "DROP CHECKPOINT")?;
@@ -118,8 +126,14 @@ pub fn drop_checkpoint(
     // Existence is checked here, on the leader. The replicated delete carries
     // no return value, so the SQLSTATE cannot be derived from apply.
     let catalog = state.credentials.catalog();
+    let doc = CheckpointDoc::new(
+        database_id.as_u64(),
+        tenant_id.as_u64(),
+        &collection,
+        &doc_id,
+    );
     if catalog
-        .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
+        .get_checkpoint(doc, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?
         .is_none()
     {
@@ -128,13 +142,7 @@ pub fn drop_checkpoint(
             format!("checkpoint '{checkpoint_name}' not found for {collection}/{doc_id}"),
         ));
     }
-    super::replicate::propose_delete(
-        state,
-        tenant_id.as_u64(),
-        &collection,
-        &doc_id,
-        &checkpoint_name,
-    )?;
+    super::replicate::propose_delete(state, doc, &checkpoint_name)?;
 
     state
         .audit

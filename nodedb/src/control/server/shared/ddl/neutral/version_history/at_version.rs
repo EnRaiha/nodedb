@@ -6,6 +6,7 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -48,9 +49,12 @@ pub async fn select_at_version(
     // Resolve checkpoint name to version vector.
     let vv_json = resolve_checkpoint_vv(
         state,
-        tenant_id.as_u64(),
-        &collection,
-        &doc_id,
+        CheckpointDoc::new(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            &collection,
+            &doc_id,
+        ),
         &checkpoint_name,
     )?;
 
@@ -82,9 +86,7 @@ pub async fn select_at_version(
 /// If the name looks like a raw JSON object (`{...}`), use it directly.
 pub(super) fn resolve_checkpoint_vv(
     state: &SharedState,
-    tenant_id: u64,
-    collection: &str,
-    doc_id: &str,
+    doc: CheckpointDoc<'_>,
     checkpoint_or_vv: &str,
 ) -> Result<String, DdlError> {
     // If it looks like raw JSON VV, pass through.
@@ -96,12 +98,15 @@ pub(super) fn resolve_checkpoint_vv(
     // Otherwise, look up checkpoint name in catalog.
     let catalog = state.credentials.catalog();
     let record = catalog
-        .get_checkpoint(tenant_id, collection, doc_id, checkpoint_or_vv)
+        .get_checkpoint(doc, checkpoint_or_vv)
         .map_err(|e| err("XX000", e.to_string()))?
         .ok_or_else(|| {
             err(
                 "42704",
-                format!("checkpoint '{checkpoint_or_vv}' not found for {collection}/{doc_id}"),
+                format!(
+                    "checkpoint '{checkpoint_or_vv}' not found for {}/{}",
+                    doc.collection, doc.doc_id
+                ),
             )
         })?;
     Ok(record.version_vector_json)

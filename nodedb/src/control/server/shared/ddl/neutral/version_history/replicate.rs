@@ -12,7 +12,7 @@
 use crate::control::catalog_entry::apply::checkpoint as apply;
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::propose_outcome::ProposeOutcome;
-use crate::control::security::catalog::types::CheckpointRecord;
+use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::state::SharedState;
 
 use super::super::super::result::DdlError;
@@ -34,26 +34,19 @@ pub(super) fn propose_put(state: &SharedState, record: &CheckpointRecord) -> Res
 /// idempotent under replay.
 pub(super) fn propose_delete(
     state: &SharedState,
-    tenant_id: u64,
-    collection: &str,
-    doc_id: &str,
+    doc: CheckpointDoc<'_>,
     checkpoint_name: &str,
 ) -> Result<(), DdlError> {
     let entry = CatalogEntry::DeleteCheckpoint {
-        tenant_id,
-        collection: collection.to_string(),
-        doc_id: doc_id.to_string(),
+        database_id: doc.database_id,
+        tenant_id: doc.tenant_id,
+        collection: doc.collection.to_string(),
+        doc_id: doc.doc_id.to_string(),
         checkpoint_name: checkpoint_name.to_string(),
     };
     propose_and_apply(state, &entry, || {
-        apply::delete(
-            tenant_id,
-            collection,
-            doc_id,
-            checkpoint_name,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
+        apply::delete(doc, checkpoint_name, state.credentials.catalog())
+            .map_err(|e| DdlError::new("XX000", format!("catalog delete: {e}")))
     })
 }
 
@@ -69,29 +62,20 @@ pub(super) fn propose_delete(
 /// this node's compaction dispatch.
 pub(super) fn propose_compact_history(
     state: &SharedState,
-    tenant_id: u64,
-    collection: &str,
-    doc_id: &str,
+    doc: CheckpointDoc<'_>,
     before_timestamp: u64,
-    database_id: u64,
     target_version_json: &str,
 ) -> Result<ProposeOutcome, DdlError> {
     let entry = CatalogEntry::CompactHistory {
-        tenant_id,
-        database_id,
-        collection: collection.to_string(),
-        doc_id: doc_id.to_string(),
+        tenant_id: doc.tenant_id,
+        database_id: doc.database_id,
+        collection: doc.collection.to_string(),
+        doc_id: doc.doc_id.to_string(),
         before_timestamp,
         target_version_json: target_version_json.to_string(),
     };
     propose_and_apply_outcome(state, &entry, || {
-        apply::delete_before(
-            tenant_id,
-            collection,
-            doc_id,
-            before_timestamp,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::new("XX000", format!("catalog range delete: {e}")))
+        apply::delete_before(doc, before_timestamp, state.credentials.catalog())
+            .map_err(|e| DdlError::new("XX000", format!("catalog range delete: {e}")))
     })
 }

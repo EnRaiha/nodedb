@@ -182,7 +182,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             object_type::MATERIALIZED_VIEW,
             materialized_views
                 .iter()
-                .map(|m| (0, m.tenant_id, m.name.clone()))
+                .map(|m| (m.database_id, m.tenant_id, m.name.clone()))
                 .collect(),
         ),
         (
@@ -314,13 +314,13 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
     // the source. Cascade-delete of MVs on `PurgeCollection` is the
     // preventive path; this check is the detective path.
     for mv in &materialized_views {
-        let key = (mv.tenant_id, mv.source.clone());
-        if !legacy_collection_keys.contains(&key) {
+        let key = (mv.database_id, mv.tenant_id, mv.source.clone());
+        if !collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "materialized_view",
-                from_key: format!("{}:{}", mv.tenant_id, mv.name),
+                from_key: format!("{}:{}:{}", mv.database_id, mv.tenant_id, mv.name),
                 to_kind: "collection",
-                to_key: format!("{}:{}", mv.tenant_id, mv.source),
+                to_key: format!("{}:{}:{}", mv.database_id, mv.tenant_id, mv.source),
             }));
         }
     }

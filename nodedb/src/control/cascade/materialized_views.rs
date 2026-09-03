@@ -22,27 +22,24 @@ use crate::types::DatabaseId;
 pub const MAX_DEPTH: usize = 32;
 
 /// Enumerate MVs whose source (direct or transitive) is
-/// `(tenant_id, root_collection)`. Returns MV names only, sorted.
+/// `(database_id, tenant_id, root_collection)`. Returns MV names only, sorted.
 ///
 /// Returns `NodeDbError::cascade_cycle` if the MV graph exceeds
 /// `MAX_DEPTH` levels — the orchestrator surfaces that up as a purge
 /// blocker rather than silently truncating.
 pub fn find_mvs_sourcing(
     catalog: &SystemCatalog,
+    database_id: DatabaseId,
     tenant_id: u64,
     root_collection: &str,
 ) -> crate::Result<Vec<String>> {
-    let all = catalog.load_all_materialized_views()?;
-
-    // Build adjacency: source-name → [mv names]. Only consider the
-    // target tenant — MV definitions are tenant-scoped.
+    // Build adjacency: source-name → [mv names]. The listing is bounded to the
+    // tenant's own database: identical MV and source names are valid in
+    // different databases for one tenant.
     use std::collections::HashMap;
     let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
-    for mv in all.iter().filter(|m| m.tenant_id == tenant_id) {
-        by_source
-            .entry(mv.source.clone())
-            .or_default()
-            .push(mv.name.clone());
+    for mv in catalog.list_materialized_views(database_id.as_u64(), tenant_id)? {
+        by_source.entry(mv.source).or_default().push(mv.name);
     }
 
     let mut found: HashSet<String> = HashSet::new();

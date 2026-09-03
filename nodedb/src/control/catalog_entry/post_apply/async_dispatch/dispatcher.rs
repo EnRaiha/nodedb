@@ -137,11 +137,21 @@ pub fn spawn_post_apply_async_side_effects(
         // A failure is fatal: the metadata deletion is already committed, so
         // continuing would serve an inconsistent catalog/Data Plane pair;
         // restart safely reconstructs the in-memory cache from empty state.
-        CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
+        CatalogEntry::DeleteMaterializedView {
+            database_id,
+            tenant_id,
+            name,
+        } => {
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
-                    super::materialized_view::delete_async(tenant_id, name, raft_index, shared)
-                        .await
+                    super::materialized_view::delete_async(
+                        database_id,
+                        tenant_id,
+                        name,
+                        raft_index,
+                        shared,
+                    )
+                    .await
                 })
             });
             if let Err(error) = result {

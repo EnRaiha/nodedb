@@ -644,6 +644,7 @@ mod tests {
             &shared,
             &cache,
             CatalogEntry::DeleteMaterializedView {
+                database_id: 2,
                 tenant_id: 1,
                 name: "mv_orders".into(),
             },

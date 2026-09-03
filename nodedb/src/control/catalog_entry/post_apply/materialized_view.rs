@@ -14,11 +14,13 @@ use crate::control::state::SharedState;
 pub fn put(stored: StoredMaterializedView, shared: Arc<SharedState>) {
     debug!(
         view = %stored.name,
+        database = stored.database_id,
         tenant = stored.tenant_id,
         "catalog_entry: materialized view upserted (refresh loop will pick it up)"
     );
-    super::owner::install_from_parent(
+    super::owner::install_from_parent_in_database(
         "materialized_view",
+        stored.database_id,
         stored.tenant_id,
         &stored.name,
         &stored.owner,
@@ -26,13 +28,19 @@ pub fn put(stored: StoredMaterializedView, shared: Arc<SharedState>) {
     );
 }
 
-pub fn delete(tenant_id: u64, name: String, shared: Arc<SharedState>) {
+pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<SharedState>) {
     debug!(
         view = %name,
+        database = database_id,
         tenant = tenant_id,
         "catalog_entry: materialized view removed"
     );
     shared
         .permissions
-        .install_replicated_remove_owner("materialized_view", tenant_id, &name);
+        .install_replicated_remove_owner_in_database(
+            "materialized_view",
+            database_id,
+            tenant_id,
+            &name,
+        );
 }

@@ -39,7 +39,10 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("DROP CHECKPOINT ") {
         return Some(version_history::checkpoint::drop_checkpoint(
-            state, identity, sql,
+            state,
+            identity,
+            database_id,
+            sql,
         ));
     }
     if upper.starts_with("SHOW VERSIONS OF ") {
