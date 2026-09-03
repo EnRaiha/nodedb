@@ -84,6 +84,9 @@ pub(super) const L2_CLEANUP_QUEUE: TableDefinition<(u64, u64, &str), &[u8]> =
 /// re-CREATE. A Tokio worker (and a boot-time drain) retries the engine
 /// purge for each entry until it succeeds, then removes the row. This
 /// gives durable at-least-once purge without wedging the node.
+///
+/// Table: `{database_id}:{tenant_id}:{collection}` -> MessagePack-serialized
+/// pending-reclaim record.
 pub(super) const PENDING_RECLAIM: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.pending_reclaim");
 
@@ -97,14 +100,18 @@ pub(super) const MATERIALIZED_VIEWS: TableDefinition<&str, &[u8]> =
 pub(super) const CONTINUOUS_AGGREGATES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.continuous_aggregates");
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized user function definition.
+/// Table: `v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
+/// user function definition. A legacy key builder reads rows written before
+/// the database segment existed.
 pub(super) const FUNCTIONS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.functions");
 
 /// Table: "{tenant_id}:{name}" -> MessagePack-serialized trigger definition.
 pub(super) const TRIGGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.triggers");
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized `ArrayCatalogEntry`.
+/// Table: `\0v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
+/// `ArrayCatalogEntry`. A legacy key builder reads rows written before the
+/// database segment existed.
 /// One row per ND array registered via DDL.
 pub(super) const ARRAYS: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.arrays");
 
@@ -153,11 +160,15 @@ pub(super) const SURROGATE_PK_REV_V3: TableDefinition<(u64, u64, &str, u32), &[u
 
 // ── Event Plane ───────────────────────────────────────────────────────
 
-/// Table: "{tenant_id}:{stream_name}" -> MessagePack-serialized ChangeStreamDef.
+/// Table: `v2/{database_id}/{tenant_id}/{len}/{hex(stream_name)}` ->
+/// MessagePack-serialized ChangeStreamDef. A legacy key builder reads rows
+/// written before the database segment existed.
 pub(super) const CHANGE_STREAMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.change_streams");
 
-/// Table: "{tenant_id}:{stream_name}:{group_name}" -> MessagePack-serialized ConsumerGroupDef.
+/// Table: `v2:{database_id}:{tenant_id}:{len}:{stream}:{len}:{group}` ->
+/// MessagePack-serialized ConsumerGroupDef. A legacy key builder reads rows
+/// written before the database segment existed.
 pub(super) const CONSUMER_GROUPS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.consumer_groups");
 
@@ -174,7 +185,9 @@ pub(super) const RETENTION_POLICIES: TableDefinition<(u64, &str), &[u8]> =
 pub(super) const ALERT_RULES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.alert_rules");
 
-/// Table: "{tenant_id}:{topic_name}" -> MessagePack-serialized TopicDef.
+/// Table: `v2/{database_id}/{tenant_id}/{len}/{hex(topic_name)}` ->
+/// MessagePack-serialized TopicDef. A legacy key builder reads rows written
+/// before the database segment existed.
 pub(super) const TOPICS_EP: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.topics_ep");
 
@@ -192,11 +205,15 @@ pub(super) const STREAMING_MVS: TableDefinition<&str, &[u8]> =
 
 // ── Procedures, deps, sequences, stats ────────────────────────────────
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized stored procedure definition.
+/// Table: `v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
+/// stored procedure definition. A legacy key builder reads rows written
+/// before the database segment existed.
 pub(super) const PROCEDURES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.procedures");
 
-/// Table: "{source_type}:{tenant_id}:{source_name}" -> MessagePack-serialized dependency list.
+/// Table: `v2:{source_type}:{tenant_id}:{database_id}:{source_name}` ->
+/// MessagePack-serialized dependency list. A legacy key builder reads rows
+/// written before the database segment existed.
 pub(super) const DEPENDENCIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.dependencies");
 
@@ -234,7 +251,7 @@ pub(super) const DATABASE_HWM: TableDefinition<&str, u64> =
 
 // ── Synonyms / custom types / WASM ────────────────────────────────────
 
-/// Table: "{tenant_id}:{group_name}" -> MessagePack-serialized `SynonymGroupDef`.
+/// Table: "{tenant_id}:{group_name}" -> MessagePack-serialized `StoredSynonymGroup`.
 pub(super) const SYNONYM_GROUPS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.synonym_groups");
 
