@@ -47,22 +47,44 @@ pub fn handle_show_tenant_quota_in_database(
         "maintenance_cpu_pct".to_string(),
     ];
 
-    let dims: &[(&str, u64)] = &[
+    // Every ceiling the record carries, in the record's own order. A zero
+    // renders as `unlimited`; the retention override renders `inherit` when
+    // the tenant takes the system-wide default.
+    let ceilings: &[(&str, u64)] = &[
         ("max_memory_bytes", record.max_memory_bytes),
         ("max_storage_bytes", record.max_storage_bytes),
         ("max_qps", record.max_qps as u64),
         ("max_connections", record.max_connections as u64),
+        (
+            "max_concurrent_requests",
+            record.max_concurrent_requests as u64,
+        ),
+        ("max_vector_dim", record.max_vector_dim as u64),
+        ("max_graph_depth", record.max_graph_depth as u64),
     ];
+    let mut dims: Vec<(&str, String)> = ceilings
+        .iter()
+        .map(|&(name, limit)| {
+            let rendered = if limit == 0 {
+                "unlimited".to_string()
+            } else {
+                limit.to_string()
+            };
+            (name, rendered)
+        })
+        .collect();
+    dims.push((
+        "deactivated_collection_retention_days",
+        match record.deactivated_collection_retention_days {
+            Some(days) => days.to_string(),
+            None => "inherit".to_string(),
+        },
+    ));
 
     let priority_str = format!("{:?}", record.priority_class).to_lowercase();
 
     let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
-    for &(quota_name, limit) in dims {
-        let limit_str = if limit == 0 {
-            "unlimited".to_string()
-        } else {
-            limit.to_string()
-        };
+    for (quota_name, limit_str) in dims {
         let mut row = Map::new();
         row.insert("tenant".to_string(), JsonValue::String(name.to_string()));
         row.insert(

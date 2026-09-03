@@ -2,32 +2,38 @@
 
 //! `ALTER TENANT <id|name> SET QUOTA <field> = <value>` handler.
 //!
-//! Tenant quotas live in the in-memory `TenantStore` and are not part
-//! of `StoredTenant`. Quota replication is handled separately from
-//! the tenant identity record.
+//! The unqualified form targets the session's current database, matching every
+//! other unqualified DDL. It writes the same `_system.tenant_quotas` row the
+//! `IN DATABASE` form writes, through the same
+//! `CatalogEntry::PutTenantQuota` propose, so the cap survives a restart and
+//! reaches every node.
 //!
 //! The tenant reference accepts either a numeric id or a tenant name
 //! (single-quoted optional), parallel to `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>`.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::alter` handler. The neutral
-//! string-prefix dispatch that reaches this handler must guard against the
-//! `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)` typed form (handled
-//! by [`super::alter_quota::handle_alter_tenant_quota`]) — that guard lives
-//! at the call site in `neutral::router`, not here, mirroring how the pgwire
-//! parser's typed-vs-string split worked (the typed AST claimed the
-//! `IN DATABASE` form first).
+//! The neutral string-prefix dispatch that reaches this handler must guard
+//! against the `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)` typed
+//! form (handled by [`super::alter_quota::handle_alter_tenant_quota`]) — that
+//! guard lives at the call site in `neutral::router`, not here, because the
+//! typed AST claims the `IN DATABASE` form first.
 
+use nodedb_types::QuotaRecord;
+
+use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::replicate::propose_and_apply;
 use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
 pub fn alter_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
@@ -79,21 +85,24 @@ pub fn alter_tenant(
         .parse()
         .map_err(|_| ddl_err("42601", "quota value must be a positive integer"))?;
 
-    let mut tenants = match state.tenants.lock() {
-        Ok(t) => t,
-        Err(p) => p.into_inner(),
-    };
+    let catalog = state.credentials.catalog();
 
-    let mut quota = tenants.quota(tenant_id).clone();
+    // Start from the stored record so an unset field keeps the value the
+    // operator set on an earlier statement.
+    let before = catalog
+        .get_tenant_quota(database_id, tenant_id)
+        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
+        .unwrap_or(QuotaRecord::DEFAULT);
+    let mut record = before.clone();
     match field.as_str() {
-        "max_memory_bytes" => quota.max_memory_bytes = value,
-        "max_storage_bytes" => quota.max_storage_bytes = value,
-        "max_concurrent_requests" => quota.max_concurrent_requests = value as u32,
-        "max_qps" => quota.max_qps = value as u32,
-        "max_vector_dim" => quota.max_vector_dim = value as u32,
-        "max_graph_depth" => quota.max_graph_depth = value as u32,
+        "max_memory_bytes" => record.max_memory_bytes = value,
+        "max_storage_bytes" => record.max_storage_bytes = value,
+        "max_concurrent_requests" => record.max_concurrent_requests = value as u32,
+        "max_qps" => record.max_qps = value as u32,
+        "max_vector_dim" => record.max_vector_dim = value as u32,
+        "max_graph_depth" => record.max_graph_depth = value as u32,
         "deactivated_collection_retention_days" => {
-            quota.deactivated_collection_retention_days = Some(value as u32);
+            record.deactivated_collection_retention_days = Some(value as u32);
         }
         other => {
             return Err(ddl_err(
@@ -104,13 +113,44 @@ pub fn alter_tenant(
             ));
         }
     }
-    tenants.set_quota(tenant_id, quota);
+
+    // The catalog enforces the sum-of-tenant-quotas ≤ database-quota ceiling.
+    catalog
+        .check_tenant_quota(database_id, tenant_id, &record)
+        .map_err(|e| ddl_err("53400", format!("{e}")))?;
+
+    // Replicated: every node writes the row and installs the cap in its live
+    // enforcement components via post-apply.
+    propose_and_apply(
+        state,
+        &CatalogEntry::PutTenantQuota {
+            db_id: database_id.as_u64(),
+            tenant_id: tenant_id.as_u64(),
+            record: Box::new(record.clone()),
+        },
+        || {
+            catalog
+                .write_tenant_quota(database_id, tenant_id, &record)
+                .map_err(|e| ddl_err("53400", format!("{e}")))?;
+            crate::control::catalog_entry::post_apply::quota::put_tenant(
+                database_id,
+                tenant_id,
+                &record,
+                state,
+            );
+            Ok(())
+        },
+    )?;
 
     state.audit_record(
         AuditEvent::AdminAction,
         Some(tenant_id),
         &identity.username,
-        &format!("altered tenant {tenant_id}: set {field} = {value}"),
+        &format!(
+            "altered tenant {tenant_id}: set {field} = {value} — before: [{}] — after: [{}]",
+            before.audit_summary(),
+            record.audit_summary()
+        ),
     );
 
     Ok(status("ALTER TENANT"))

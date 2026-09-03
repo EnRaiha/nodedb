@@ -345,6 +345,10 @@ mod tests {
             cache_weight: 1,
             priority_class: PriorityClass::Standard,
             maintenance_cpu_pct: 25,
+            max_concurrent_requests: 64,
+            max_vector_dim: 1536,
+            max_graph_depth: 8,
+            deactivated_collection_retention_days: Some(14),
         }
     }
 
@@ -401,6 +405,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, r);
+    }
+
+    #[test]
+    fn put_get_roundtrip_carries_every_field() {
+        let (_dir, cat) = open_catalog();
+        let r = sample_record();
+        cat.put_tenant_quota(DatabaseId::DEFAULT, TenantId::new(2), &r)
+            .unwrap();
+        let got = cat
+            .get_tenant_quota(DatabaseId::DEFAULT, TenantId::new(2))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(got.max_memory_bytes, 536870912);
+        assert_eq!(got.max_storage_bytes, 1073741824);
+        assert_eq!(got.max_qps, 500);
+        assert_eq!(got.max_connections, 50);
+        assert_eq!(got.cache_weight, 1);
+        assert_eq!(got.priority_class, PriorityClass::Standard);
+        assert_eq!(got.maintenance_cpu_pct, 25);
+        assert_eq!(got.max_concurrent_requests, 64);
+        assert_eq!(got.max_vector_dim, 1536);
+        assert_eq!(got.max_graph_depth, 8);
+        assert_eq!(got.deactivated_collection_retention_days, Some(14));
+    }
+
+    #[test]
+    fn retention_override_of_zero_survives_the_roundtrip() {
+        let (_dir, cat) = open_catalog();
+        let r = QuotaRecord {
+            deactivated_collection_retention_days: Some(0),
+            ..QuotaRecord::DEFAULT
+        };
+        cat.put_tenant_quota(DatabaseId::DEFAULT, TenantId::new(3), &r)
+            .unwrap();
+        let got = cat
+            .get_tenant_quota(DatabaseId::DEFAULT, TenantId::new(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.deactivated_collection_retention_days,
+            Some(0),
+            "an explicit zero must stay distinct from inherit"
+        );
     }
 
     #[test]

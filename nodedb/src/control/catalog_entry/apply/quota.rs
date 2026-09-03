@@ -114,6 +114,10 @@ mod tests {
             cache_weight: 2,
             priority_class: nodedb_types::PriorityClass::Standard,
             maintenance_cpu_pct: 40,
+            max_concurrent_requests: 64,
+            max_vector_dim: 1536,
+            max_graph_depth: 8,
+            deactivated_collection_retention_days: Some(14),
         }
     }
 
@@ -162,6 +166,27 @@ mod tests {
             }
             other => panic!("unexpected variant: {}", other.kind()),
         }
+    }
+
+    #[test]
+    fn put_tenant_quota_applies_every_field() {
+        let (_dir, catalog) = open_catalog();
+        let entry = CatalogEntry::PutTenantQuota {
+            db_id: 8,
+            tenant_id: 21,
+            record: Box::new(sample_record()),
+        };
+        crate::control::catalog_entry::apply::apply_to(&entry, &catalog).unwrap();
+
+        let stored = catalog
+            .get_tenant_quota(DatabaseId::new(8), TenantId::new(21))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.max_concurrent_requests, 64);
+        assert_eq!(stored.max_vector_dim, 1536);
+        assert_eq!(stored.max_graph_depth, 8);
+        assert_eq!(stored.deactivated_collection_retention_days, Some(14));
+        assert_eq!(stored, sample_record());
     }
 
     #[test]

@@ -146,7 +146,8 @@ pub(super) async fn try_string(
     // recognizes the `IN DATABASE` form when `parts.len() >= 8` and tokens 3/4
     // are `IN`/`DATABASE`; replicate that exact partition here so the
     // `IN DATABASE` form always falls through to the typed arm instead of
-    // being shadowed by this string handler.
+    // being shadowed by this string handler. The string form targets the
+    // session's `database_id`, so both forms write the same quota row.
     //
     // `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` (bare, no `IN DATABASE`) are
     // NOT recognized here: the typed `ddl_ast` tenant parser never returns
@@ -165,7 +166,7 @@ pub(super) async fn try_string(
             && parts[3].eq_ignore_ascii_case("IN")
             && parts[4].eq_ignore_ascii_case("DATABASE");
         if !is_in_database_form {
-            return Some(tenant::alter_tenant(state, identity, &parts));
+            return Some(tenant::alter_tenant(state, identity, database_id, &parts));
         }
     }
     if upper.starts_with("DROP TENANT ") {

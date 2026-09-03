@@ -159,6 +159,86 @@ async fn alter_tenant_quota_applies_connection_cap_and_memory_budget() {
     );
 }
 
+/// The unqualified `ALTER TENANT <name> SET QUOTA <field> = <value>` form
+/// writes the session database's quota row. A handler that mutates only the
+/// in-memory tenant view leaves no row, so this test fails outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alter_tenant_string_form_persists_every_field() {
+    let server = start_with_tenant().await;
+    let db = DatabaseId::DEFAULT;
+    let tenant = TenantId::new(TENANT);
+
+    for stmt in [
+        format!("ALTER TENANT acme SET QUOTA max_memory_bytes = {MIB}"),
+        "ALTER TENANT acme SET QUOTA max_qps = 250".to_string(),
+        "ALTER TENANT acme SET QUOTA max_concurrent_requests = 64".to_string(),
+        "ALTER TENANT acme SET QUOTA max_vector_dim = 512".to_string(),
+        "ALTER TENANT acme SET QUOTA max_graph_depth = 4".to_string(),
+        "ALTER TENANT acme SET QUOTA deactivated_collection_retention_days = 14".to_string(),
+    ] {
+        server.exec(&stmt).await.expect("ALTER TENANT SET QUOTA");
+    }
+
+    let stored = server
+        .shared
+        .credentials
+        .catalog()
+        .get_tenant_quota(db, tenant)
+        .expect("quota read")
+        .expect("the string form must leave a persisted row");
+
+    assert_eq!(stored.max_memory_bytes, MIB);
+    assert_eq!(stored.max_qps, 250);
+    assert_eq!(stored.max_concurrent_requests, 64);
+    assert_eq!(stored.max_vector_dim, 512);
+    assert_eq!(stored.max_graph_depth, 4);
+    assert_eq!(stored.deactivated_collection_retention_days, Some(14));
+}
+
+/// The string form reaches the same live enforcement the `IN DATABASE` form
+/// reaches: the memory governor and the tenant isolation view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alter_tenant_string_form_applies_live_enforcement() {
+    let server = start_with_tenant().await;
+    let db = DatabaseId::DEFAULT;
+    let tenant = TenantId::new(TENANT);
+    let gov = server
+        .shared
+        .governor
+        .clone()
+        .expect("the harness wires a memory governor");
+
+    server
+        .exec(&format!(
+            "ALTER TENANT acme SET QUOTA max_memory_bytes = {MIB}"
+        ))
+        .await
+        .expect("ALTER TENANT SET QUOTA");
+    server
+        .exec("ALTER TENANT acme SET QUOTA max_graph_depth = 4")
+        .await
+        .expect("ALTER TENANT SET QUOTA");
+
+    let err = gov
+        .try_reserve(db, tenant, EngineId::DocumentSchemaless, 2 * MIB as usize)
+        .expect_err("2 MiB must exceed the 1 MiB tenant ceiling");
+    assert!(
+        matches!(err, MemError::TenantBudgetExhausted { .. }),
+        "the denial must come from the tenant budget, got {err:?}"
+    );
+
+    let tenants = server
+        .shared
+        .tenants
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        tenants.quota(tenant).max_graph_depth,
+        4,
+        "the graph depth gate reads the isolation view, so the record must land there"
+    );
+}
+
 /// `max_connections = 0` clears the tenant cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alter_tenant_quota_zero_clears_connection_cap() {

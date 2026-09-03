@@ -306,6 +306,10 @@ mod tests {
             cache_weight: 2,
             priority_class: PriorityClass::Standard,
             maintenance_cpu_pct: 25,
+            max_concurrent_requests: 0,
+            max_vector_dim: 0,
+            max_graph_depth: 0,
+            deactivated_collection_retention_days: None,
         }
     }
 

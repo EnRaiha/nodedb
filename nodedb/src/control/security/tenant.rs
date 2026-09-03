@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use crate::types::TenantId;
 
 /// Per-tenant resource quotas.
+///
+/// Live projection of the tenant's persisted `QuotaRecord`, installed by the
+/// quota post-apply hook. Zero on any ceiling means "no limit", matching the
+/// record it comes from.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TenantQuota {
     /// Maximum memory budget in bytes (across all engines).
@@ -48,6 +52,25 @@ impl Default for TenantQuota {
             max_graph_depth: 10,
             max_connections: 0, // Unlimited by default.
             deactivated_collection_retention_days: None,
+        }
+    }
+}
+
+impl From<&nodedb_types::QuotaRecord> for TenantQuota {
+    /// Project a persisted quota record onto the live enforcement view.
+    ///
+    /// Every ceiling carries over verbatim, so a zero field keeps the record's
+    /// "no limit" meaning here as well.
+    fn from(record: &nodedb_types::QuotaRecord) -> Self {
+        Self {
+            max_memory_bytes: record.max_memory_bytes,
+            max_storage_bytes: record.max_storage_bytes,
+            max_concurrent_requests: record.max_concurrent_requests,
+            max_qps: record.max_qps,
+            max_vector_dim: record.max_vector_dim,
+            max_graph_depth: record.max_graph_depth,
+            max_connections: record.max_connections,
+            deactivated_collection_retention_days: record.deactivated_collection_retention_days,
         }
     }
 }
@@ -149,6 +172,12 @@ impl TenantIsolation {
         self.usage.remove(&tenant_id);
     }
 
+    /// Drop the explicit quota record so the tenant falls back to the default.
+    /// Usage counters stay, because the tenant itself still exists.
+    pub fn clear_quota(&mut self, tenant_id: TenantId) {
+        self.quotas.remove(&tenant_id);
+    }
+
     /// Get quota for a tenant (falls back to default).
     pub fn quota(&self, tenant_id: TenantId) -> &TenantQuota {
         self.quotas.get(&tenant_id).unwrap_or(&self.default_quota)
@@ -164,25 +193,29 @@ impl TenantIsolation {
             None => return QuotaCheck::Allowed, // No usage yet.
         };
 
-        if usage.memory_bytes > quota.max_memory_bytes {
+        // A zero ceiling means "no limit" on every dimension, the same
+        // convention `check_connection` and the persisted record use.
+        if quota.max_memory_bytes > 0 && usage.memory_bytes > quota.max_memory_bytes {
             return QuotaCheck::MemoryExceeded {
                 used: usage.memory_bytes,
                 limit: quota.max_memory_bytes,
             };
         }
-        if usage.storage_bytes > quota.max_storage_bytes {
+        if quota.max_storage_bytes > 0 && usage.storage_bytes > quota.max_storage_bytes {
             return QuotaCheck::StorageExceeded {
                 used: usage.storage_bytes,
                 limit: quota.max_storage_bytes,
             };
         }
-        if usage.active_requests >= quota.max_concurrent_requests {
+        if quota.max_concurrent_requests > 0
+            && usage.active_requests >= quota.max_concurrent_requests
+        {
             return QuotaCheck::ConcurrencyExceeded {
                 active: usage.active_requests,
                 limit: quota.max_concurrent_requests,
             };
         }
-        if usage.requests_this_second >= quota.max_qps {
+        if quota.max_qps > 0 && usage.requests_this_second >= quota.max_qps {
             return QuotaCheck::RateLimited {
                 qps: usage.requests_this_second,
                 limit: quota.max_qps,
@@ -371,6 +404,45 @@ mod tests {
 
         isolation.request_end(t(1));
         assert!(isolation.check(t(1)).is_allowed());
+    }
+
+    #[test]
+    fn zero_ceilings_mean_no_limit() {
+        let mut isolation = TenantIsolation::new(TenantQuota::default());
+        isolation.set_quota(t(1), TenantQuota::from(&nodedb_types::QuotaRecord::DEFAULT));
+        isolation.update_memory(t(1), u64::MAX);
+        isolation.update_storage(t(1), u64::MAX);
+        for _ in 0..1000 {
+            isolation.request_start(t(1));
+        }
+        assert!(
+            isolation.check(t(1)).is_allowed(),
+            "an all-zero record must impose no ceiling at all"
+        );
+    }
+
+    #[test]
+    fn quota_record_projects_every_dimension() {
+        let record = nodedb_types::QuotaRecord {
+            max_memory_bytes: 1 << 30,
+            max_storage_bytes: 1 << 34,
+            max_qps: 250,
+            max_connections: 7,
+            max_concurrent_requests: 64,
+            max_vector_dim: 1536,
+            max_graph_depth: 8,
+            deactivated_collection_retention_days: Some(14),
+            ..nodedb_types::QuotaRecord::DEFAULT
+        };
+        let quota = TenantQuota::from(&record);
+        assert_eq!(quota.max_memory_bytes, 1 << 30);
+        assert_eq!(quota.max_storage_bytes, 1 << 34);
+        assert_eq!(quota.max_qps, 250);
+        assert_eq!(quota.max_connections, 7);
+        assert_eq!(quota.max_concurrent_requests, 64);
+        assert_eq!(quota.max_vector_dim, 1536);
+        assert_eq!(quota.max_graph_depth, 8);
+        assert_eq!(quota.deactivated_collection_retention_days, Some(14));
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Post-apply side effects for tenant `CatalogEntry` variants.
 //!
 //! `PutTenant` seeds the in-memory `TenantStore` with default quota
-//! so reads work immediately on every node. Quota replication itself
-//! is not part of `StoredTenant` — that is a separate concern.
+//! so reads work immediately on every node. The quota record itself is not
+//! part of `StoredTenant`; it replicates as `PutTenantQuota`.
 //!
 //! `DeleteTenant` removes the in-memory quota entry and releases the
 //! tenant's caps in every database. Tenant data is left in place —

@@ -3,8 +3,8 @@
 //! Protocol-neutral tenant DDL handlers.
 //!
 //! - [`create`] — `CREATE TENANT` (proposes `CatalogEntry::PutTenant`).
-//! - [`alter`] — `ALTER TENANT SET QUOTA` (in-memory; quota is not
-//!   part of `StoredTenant` — quota replication is a separate concern).
+//! - [`alter`] — `ALTER TENANT <id|name> SET QUOTA <field> = <value>` against
+//!   the session database — persists to `_system.tenant_quotas`.
 //! - [`alter_quota`] — `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)` —
 //!   persists quota to `_system.tenant_quotas`.
 //! - [`drop`] — `DROP TENANT` (proposes `DeleteTenant`).

@@ -4,14 +4,16 @@
 //!
 //! Pushes the applied record into the live enforcement components on every
 //! node: the admission registry's connection cap, the memory governor's byte
-//! ceiling, and (database scope only) the maintenance CPU budget. A zero
-//! dimension clears the corresponding cap.
+//! ceiling, (database scope only) the maintenance CPU budget, and (tenant
+//! scope only) the tenant isolation view. A zero dimension clears the
+//! corresponding cap.
 //!
 //! A database or tenant drop releases the caps of that scope on every node.
 //! The matching row deletion is durable state and lives in apply.
 
 use nodedb_types::{DatabaseId, QuotaRecord, TenantId};
 
+use crate::control::security::tenant::TenantQuota;
 use crate::control::state::SharedState;
 
 /// Install a database quota into live enforcement.
@@ -38,7 +40,36 @@ pub fn delete_database(db_id: DatabaseId, shared: &SharedState) {
 }
 
 /// Install a tenant quota into live enforcement.
+///
+/// The record drives three consumers: the admission registry's connection cap,
+/// the memory governor's byte ceiling, and the tenant isolation view that the
+/// planner, the graph depth gate, and the collection-GC sweeper read.
 pub fn put_tenant(
+    db_id: DatabaseId,
+    tenant_id: TenantId,
+    record: &QuotaRecord,
+    shared: &SharedState,
+) {
+    set_tenant_caps(db_id, tenant_id, record, shared);
+    let mut tenants = match shared.tenants.lock() {
+        Ok(t) => t,
+        Err(p) => p.into_inner(),
+    };
+    tenants.set_quota(tenant_id, TenantQuota::from(record));
+}
+
+/// Drop a tenant quota from live enforcement, restoring defaults.
+pub fn delete_tenant(db_id: DatabaseId, tenant_id: TenantId, shared: &SharedState) {
+    set_tenant_caps(db_id, tenant_id, &QuotaRecord::DEFAULT, shared);
+    let mut tenants = match shared.tenants.lock() {
+        Ok(t) => t,
+        Err(p) => p.into_inner(),
+    };
+    tenants.clear_quota(tenant_id);
+}
+
+/// Point the admission registry and the memory governor at `record`.
+fn set_tenant_caps(
     db_id: DatabaseId,
     tenant_id: TenantId,
     record: &QuotaRecord,
@@ -54,11 +85,6 @@ pub fn put_tenant(
             governor.clear_tenant_budget(db_id, tenant_id);
         }
     }
-}
-
-/// Drop a tenant quota from live enforcement, restoring defaults.
-pub fn delete_tenant(db_id: DatabaseId, tenant_id: TenantId, shared: &SharedState) {
-    put_tenant(db_id, tenant_id, &QuotaRecord::DEFAULT, shared);
 }
 
 /// Release a dropped database's live caps, its tenants' caps included.
@@ -121,6 +147,54 @@ mod tests {
         assert_eq!(registry.database_live_connections(db), None);
         assert_eq!(registry.tenant_live_connections(db, tenant), None);
         assert_eq!(registry.database_live_connections(other), Some(0));
+    }
+
+    #[test]
+    fn put_tenant_installs_the_record_into_the_isolation_view() {
+        let (shared, _dir) = make_state();
+        let db = DatabaseId::new(3);
+        let tenant = TenantId::new(11);
+        let record = QuotaRecord {
+            max_vector_dim: 1536,
+            max_graph_depth: 8,
+            max_concurrent_requests: 64,
+            deactivated_collection_retention_days: Some(14),
+            ..QuotaRecord::DEFAULT
+        };
+
+        put_tenant(db, tenant, &record, &shared);
+
+        let tenants = shared.tenants.lock().unwrap_or_else(|p| p.into_inner());
+        let live = tenants.quota(tenant);
+        assert_eq!(live.max_vector_dim, 1536);
+        assert_eq!(live.max_graph_depth, 8);
+        assert_eq!(live.max_concurrent_requests, 64);
+        assert_eq!(live.deactivated_collection_retention_days, Some(14));
+    }
+
+    #[test]
+    fn delete_tenant_returns_the_isolation_view_to_the_default() {
+        let (shared, _dir) = make_state();
+        let db = DatabaseId::new(3);
+        let tenant = TenantId::new(12);
+        put_tenant(
+            db,
+            tenant,
+            &QuotaRecord {
+                max_graph_depth: 8,
+                ..QuotaRecord::DEFAULT
+            },
+            &shared,
+        );
+
+        delete_tenant(db, tenant, &shared);
+
+        let tenants = shared.tenants.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            tenants.quota(tenant).max_graph_depth,
+            crate::control::security::tenant::TenantQuota::default().max_graph_depth,
+            "dropping the row restores the default quota"
+        );
     }
 
     #[test]

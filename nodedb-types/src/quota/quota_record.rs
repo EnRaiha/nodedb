@@ -80,6 +80,19 @@ pub struct QuotaRecord {
     /// (compaction, HNSW link repair, etc.) may consume for this database.
     /// Valid range: 0–100. 0 = no budget cap.
     pub maintenance_cpu_pct: u8,
+    /// Maximum in-flight requests.
+    /// 0 = no limit.
+    pub max_concurrent_requests: u32,
+    /// Maximum vector dimension accepted on write and on query.
+    /// 0 = no limit.
+    pub max_vector_dim: u32,
+    /// Maximum hop count accepted on a graph traversal or MATCH pattern.
+    /// 0 = no limit.
+    pub max_graph_depth: u32,
+    /// Override for the deactivated-collection retention window, in days.
+    /// `None` inherits the system-wide default; `Some(0)` purges on the
+    /// next sweep.
+    pub deactivated_collection_retention_days: Option<u32>,
 }
 
 impl QuotaRecord {
@@ -96,6 +109,10 @@ impl QuotaRecord {
         cache_weight: 1,
         priority_class: PriorityClass::Standard,
         maintenance_cpu_pct: 25,
+        max_concurrent_requests: 0,
+        max_vector_dim: 0,
+        max_graph_depth: 0,
+        deactivated_collection_retention_days: None,
     };
 
     /// Validate invariants. Returns the first violation found, or `Ok(())` if
@@ -114,9 +131,10 @@ impl QuotaRecord {
 
     /// Compact one-line summary used in audit log entries.
     ///
-    /// Format: `mem=<n>,storage=<n>,qps=<n>,conns=<n>,cache_w=<n>,prio=<class>,maint=<pct>`.
+    /// Format: `mem=<n>,storage=<n>,qps=<n>,conns=<n>,cache_w=<n>,prio=<class>,
+    /// maint=<pct>,concurrent=<n>,vector_dim=<n>,graph_depth=<n>,retention_days=<n>`.
     /// Each numeric dimension renders zero as `unlimited` to match the SHOW
-    /// QUOTA presentation. Stable across versions — audit logs grep against this.
+    /// QUOTA presentation. The retention override renders `None` as `inherit`.
     pub fn audit_summary(&self) -> String {
         fn lim(v: u64) -> String {
             if v == 0 {
@@ -125,15 +143,24 @@ impl QuotaRecord {
                 v.to_string()
             }
         }
+        let retention = match self.deactivated_collection_retention_days {
+            Some(days) => days.to_string(),
+            None => "inherit".into(),
+        };
         format!(
-            "mem={},storage={},qps={},conns={},cache_w={},prio={},maint={}%",
+            "mem={},storage={},qps={},conns={},cache_w={},prio={},maint={}%,\
+             concurrent={},vector_dim={},graph_depth={},retention_days={}",
             lim(self.max_memory_bytes),
             lim(self.max_storage_bytes),
             lim(self.max_qps as u64),
             lim(self.max_connections as u64),
             self.cache_weight,
             self.priority_class,
-            self.maintenance_cpu_pct
+            self.maintenance_cpu_pct,
+            lim(self.max_concurrent_requests as u64),
+            lim(self.max_vector_dim as u64),
+            lim(self.max_graph_depth as u64),
+            retention
         )
     }
 
@@ -235,9 +262,31 @@ mod tests {
             cache_weight: 2,
             priority_class: PriorityClass::Critical,
             maintenance_cpu_pct: 25,
+            max_concurrent_requests: 64,
+            max_vector_dim: 1536,
+            max_graph_depth: 8,
+            deactivated_collection_retention_days: Some(14),
         };
         let bytes = zerompk::to_msgpack_vec(&record).unwrap();
         let decoded: QuotaRecord = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(record, decoded);
+    }
+
+    #[test]
+    fn audit_summary_renders_every_dimension() {
+        let mut r = QuotaRecord::DEFAULT;
+        r.max_concurrent_requests = 64;
+        r.max_vector_dim = 1536;
+        r.deactivated_collection_retention_days = Some(14);
+        let s = r.audit_summary();
+        assert!(s.contains("concurrent=64"), "{s}");
+        assert!(s.contains("vector_dim=1536"), "{s}");
+        assert!(s.contains("graph_depth=unlimited"), "{s}");
+        assert!(s.contains("retention_days=14"), "{s}");
+        assert!(
+            QuotaRecord::DEFAULT
+                .audit_summary()
+                .contains("retention_days=inherit")
+        );
     }
 }
