@@ -255,6 +255,7 @@ fn catalog_custom_type_roundtrip() {
     let catalog = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
 
     let def = StoredCustomType {
+        database_id: 0,
         tenant_id: 1,
         name: "emotion".to_string(),
         def: CustomTypeDef::Enum {
@@ -270,7 +271,7 @@ fn catalog_custom_type_roundtrip() {
     drop(catalog);
     let catalog2 = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
 
-    let loaded = catalog2.get_custom_type(1, "emotion").unwrap().unwrap();
+    let loaded = catalog2.get_custom_type(0, 1, "emotion").unwrap().unwrap();
     assert_eq!(loaded.name, "emotion");
     assert_eq!(loaded.oid, 70_001);
     match &loaded.def {
@@ -281,6 +282,6 @@ fn catalog_custom_type_roundtrip() {
     }
 
     // Delete.
-    assert!(catalog2.delete_custom_type(1, "emotion").unwrap());
-    assert!(catalog2.get_custom_type(1, "emotion").unwrap().is_none());
+    assert!(catalog2.delete_custom_type(0, 1, "emotion").unwrap());
+    assert!(catalog2.get_custom_type(0, 1, "emotion").unwrap().is_none());
 }

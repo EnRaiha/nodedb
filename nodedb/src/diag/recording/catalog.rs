@@ -102,3 +102,33 @@ pub fn consumer_group_offsets_retained(
     .with_backtrace()
     .emit();
 }
+
+/// Report per-node synonym group work that failed while applying a committed
+/// catalog entry. Called from the synonym group post-apply arms, which cannot
+/// propagate: `stage` names whether the record encode or the Data Plane
+/// dispatch was lost.
+pub fn synonym_group_not_applied(
+    err: &crate::Error,
+    stage: &'static str,
+    database_id: u64,
+    tenant_id: u64,
+    group: &str,
+) {
+    let class = error_class(err);
+    let ctx = context::SynonymGroupNotApplied {
+        stage,
+        database_id,
+        tenant_id,
+        group,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "synonym group post-apply: the committed group change never reached this node's \
+         FTS backend",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

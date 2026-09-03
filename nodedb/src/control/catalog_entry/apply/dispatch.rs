@@ -220,13 +220,17 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             object_name,
         } => owner::delete(object_type, *database_id, *tenant_id, object_name, catalog),
         CatalogEntry::PutSynonymGroup(stored) => synonym_group::put(stored, catalog),
-        CatalogEntry::DeleteSynonymGroup { tenant_id, name } => {
-            synonym_group::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteSynonymGroup {
+            database_id,
+            tenant_id,
+            name,
+        } => synonym_group::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutCustomType(stored) => custom_type::put(stored, catalog),
-        CatalogEntry::DeleteCustomType { tenant_id, name } => {
-            custom_type::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteCustomType {
+            database_id,
+            tenant_id,
+            name,
+        } => custom_type::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutDatabase(descriptor) => database::put(descriptor, catalog),
         CatalogEntry::DeleteDatabase { db_id } => database::delete(*db_id, catalog),
         CatalogEntry::PutDatabaseGrant {

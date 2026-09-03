@@ -177,6 +177,7 @@ impl NodeDbPgHandler {
                 _ => continue,
             };
             if let Err(msg) = self.state.custom_type_registry.validate_enum_label(
+                database_id.as_u64(),
                 tenant_id.as_u64(),
                 type_name,
                 label,

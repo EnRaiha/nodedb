@@ -183,3 +183,86 @@ impl DomainContext for ConsumerGroupOffsetsRetained<'_> {
         })
     }
 }
+
+/// A committed synonym group whose per-node FTS install failed, so this node
+/// expands query terms differently from the catalog every node agreed on.
+pub(in crate::diag) struct SynonymGroupNotApplied<'a> {
+    /// Stage that failed (`put_serialize`, `put_dispatch`, `delete_dispatch`).
+    pub stage: &'static str,
+    pub database_id: u64,
+    pub tenant_id: u64,
+    /// Group the entry names.
+    pub group: &'a str,
+    /// What failed, without the per-occurrence detail.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for SynonymGroupNotApplied<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.synonym_group_not_applied"
+    }
+
+    fn grouping_key(&self) -> String {
+        // Stage + error class name the bug; the group identity is the
+        // occurrence, so one broken node files one report.
+        format!("stage={};cause={}", self.stage, self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "stage": self.stage,
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "group": self.group,
+            "error_class": self.error_class,
+            "why_fatal": "the catalog row is already committed by consensus, so this node \
+                          lists the group in SHOW SYNONYM GROUPS while its FTS backend \
+                          never received it. A create that fails here answers a text \
+                          query with fewer rows than every other node returns; a drop \
+                          that fails here keeps expanding terms the statement removed. \
+                          Both answer with no error",
+            "operator_action": "re-run the CREATE or DROP SYNONYM GROUP statement once the \
+                                 underlying dispatch failure clears. The FTS backend holds \
+                                 its own durable copy and no boot seed rebuilds it from the \
+                                 catalog, so a restart does not heal this node",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synonym_sample() -> SynonymGroupNotApplied<'static> {
+        SynonymGroupNotApplied {
+            stage: "put_dispatch",
+            database_id: 1,
+            tenant_id: 2,
+            group: "db_terms",
+            error_class: "dispatch",
+        }
+    }
+
+    #[test]
+    fn synonym_grouping_ignores_the_group_identity() {
+        let first = synonym_sample();
+        let second = SynonymGroupNotApplied {
+            database_id: 90,
+            tenant_id: 91,
+            group: "colours",
+            ..first
+        };
+        assert_eq!(first.grouping_key(), second.grouping_key());
+        assert_eq!(first.grouping_key(), "stage=put_dispatch;cause=dispatch");
+    }
+
+    #[test]
+    fn synonym_grouping_separates_create_from_drop() {
+        let create = synonym_sample();
+        let drop = SynonymGroupNotApplied {
+            stage: "delete_dispatch",
+            ..create
+        };
+        assert_ne!(create.grouping_key(), drop.grouping_key());
+    }
+}

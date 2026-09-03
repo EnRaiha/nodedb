@@ -12,8 +12,19 @@
 //!    that contain a synonym term.
 //! 6. Drop removes expansion — post-drop query no longer expands.
 //! 7. Restart durability: groups survive server restart.
+//! 8. Database scoping: a group belongs to the database that created it, in
+//!    the registry and in the FTS backend alike.
 
 use crate::harness::TestServer;
+
+fn row_values(msgs: &[tokio_postgres::SimpleQueryMessage], column: usize) -> Vec<String> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(column).map(|v| v.to_string()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Create a synonym group and verify SHOW SYNONYM GROUPS reflects it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -280,5 +291,130 @@ async fn synonym_group_survives_restart() {
     assert!(
         ids_exp.contains(&"c2"),
         "c2 must match via synonym after restart: {ids_exp:?}"
+    );
+}
+
+/// A group belongs to the database that created it. The same name is accepted
+/// in a second database, and each database's FTS backend expands only its own
+/// terms.
+///
+/// The dispatch fans the group out to every core carrying the entry's own
+/// `database_id`. Send it under another database's id and the second query
+/// below expands `car` and returns an extra row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_expands_only_in_the_database_that_holds_it() {
+    let server = TestServer::start().await;
+    let client = &*server.client;
+
+    for name in ["syn_scope_a", "syn_scope_b"] {
+        client
+            .simple_query(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap_or_else(|e| panic!("CREATE DATABASE {name}: {e}"));
+        client
+            .simple_query(&format!("USE DATABASE {name}"))
+            .await
+            .unwrap_or_else(|e| panic!("USE {name}: {e}"));
+        client
+            .simple_query("CREATE COLLECTION scoped_docs WITH (engine='document_schemaless')")
+            .await
+            .unwrap_or_else(|e| panic!("CREATE COLLECTION in {name}: {e}"));
+        client
+            .simple_query("INSERT INTO scoped_docs { id: 'd1', body: 'automobile engine repair' }")
+            .await
+            .unwrap_or_else(|e| panic!("insert d1 in {name}: {e}"));
+        client
+            .simple_query("INSERT INTO scoped_docs { id: 'd2', body: 'car maintenance guide' }")
+            .await
+            .unwrap_or_else(|e| panic!("insert d2 in {name}: {e}"));
+    }
+
+    client
+        .simple_query("USE DATABASE syn_scope_a")
+        .await
+        .expect("USE syn_scope_a");
+    client
+        .simple_query("CREATE SYNONYM GROUP vehicles AS ('automobile', 'car')")
+        .await
+        .expect("CREATE SYNONYM GROUP in the first database");
+
+    let in_a = row_values(
+        &client
+            .simple_query(
+                "SELECT id FROM scoped_docs WHERE text_match(body, 'automobile') ORDER BY id",
+            )
+            .await
+            .expect("query the first database"),
+        0,
+    );
+    assert!(
+        in_a.iter().any(|id| id == "d2"),
+        "the first database must expand 'car': {in_a:?}"
+    );
+
+    // The same name in a second database is a different group, so this CREATE
+    // must be accepted rather than refused as a duplicate.
+    client
+        .simple_query("USE DATABASE syn_scope_b")
+        .await
+        .expect("USE syn_scope_b");
+    client
+        .simple_query("CREATE SYNONYM GROUP vehicles AS ('automobile', 'lorry')")
+        .await
+        .expect("the same group name in a second database must be accepted");
+
+    let in_b = row_values(
+        &client
+            .simple_query(
+                "SELECT id FROM scoped_docs WHERE text_match(body, 'automobile') ORDER BY id",
+            )
+            .await
+            .expect("query the second database"),
+        0,
+    );
+    assert!(
+        in_b.iter().any(|id| id == "d1"),
+        "the second database must still match the query term: {in_b:?}"
+    );
+    assert!(
+        !in_b.iter().any(|id| id == "d2"),
+        "the second database names no 'car' synonym, so its own group is the \
+         only one that reached its FTS backend: {in_b:?}"
+    );
+
+    let listed = row_values(
+        &client
+            .simple_query("SHOW SYNONYM GROUPS")
+            .await
+            .expect("SHOW in the second database"),
+        1,
+    );
+    assert!(
+        listed.iter().any(|terms| terms.contains("lorry")),
+        "the second database must list its own terms, not the first's: {listed:?}"
+    );
+
+    // Dropping the second database's group leaves the first database whole.
+    client
+        .simple_query("DROP SYNONYM GROUP vehicles")
+        .await
+        .expect("DROP in the second database");
+    client
+        .simple_query("USE DATABASE syn_scope_a")
+        .await
+        .expect("USE syn_scope_a");
+
+    let still_in_a = row_values(
+        &client
+            .simple_query(
+                "SELECT id FROM scoped_docs WHERE text_match(body, 'automobile') ORDER BY id",
+            )
+            .await
+            .expect("re-query the first database"),
+        0,
+    );
+    assert!(
+        still_in_a.iter().any(|id| id == "d2"),
+        "a drop in the second database must not remove the first's group: {still_in_a:?}"
     );
 }

@@ -8,20 +8,27 @@ pub fn put(stored: &StoredCustomType, catalog: &SystemCatalog) -> crate::Result<
     catalog.put_custom_type(stored).map_err(|e| {
         catalog_err(
             &format!(
-                "put_custom_type '{}' (tenant {})",
-                stored.name, stored.tenant_id
+                "put_custom_type '{}' (database {}, tenant {})",
+                stored.name, stored.database_id, stored.tenant_id
             ),
             e,
         )
     })
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+pub fn delete(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
     catalog
-        .delete_custom_type(tenant_id, name)
+        .delete_custom_type(database_id, tenant_id, name)
         .map_err(|e| {
             catalog_err(
-                &format!("delete_custom_type '{name}' (tenant {tenant_id})"),
+                &format!(
+                    "delete_custom_type '{name}' (database {database_id}, tenant {tenant_id})"
+                ),
                 e,
             )
         })

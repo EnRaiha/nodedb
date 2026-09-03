@@ -46,8 +46,9 @@ const ALLOWED: &[&str] = &[
     "control/server/shared/ddl/neutral/continuous_agg/drop.rs",
     "control/server/shared/ddl/neutral/continuous_agg/register.rs",
     "control/server/shared/ddl/neutral/continuous_agg/show.rs",
-    "control/server/shared/ddl/neutral/synonym_group/create.rs",
-    "control/server/shared/ddl/neutral/synonym_group/drop.rs",
+    // `synonym_group/create.rs` and `synonym_group/drop.rs` are absent:
+    // a synonym group replicates as a catalog entry, and each node's
+    // post-apply lane installs it in that node's FTS backend.
     // `at_version.rs` and `diff.rs` are deliberately absent: they serve user
     // reads, so they dispatch through the authorized path rather than the
     // system door, which performs no authorization or RLS injection.

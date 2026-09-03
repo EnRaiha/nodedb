@@ -8,20 +8,27 @@ pub fn put(stored: &StoredSynonymGroup, catalog: &SystemCatalog) -> crate::Resul
     catalog.put_synonym_group(stored).map_err(|e| {
         catalog_err(
             &format!(
-                "put_synonym_group '{}' (tenant {})",
-                stored.name, stored.tenant_id
+                "put_synonym_group '{}' (database {}, tenant {})",
+                stored.name, stored.database_id, stored.tenant_id
             ),
             e,
         )
     })
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+pub fn delete(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
     catalog
-        .delete_synonym_group(tenant_id, name)
+        .delete_synonym_group(database_id, tenant_id, name)
         .map_err(|e| {
             catalog_err(
-                &format!("delete_synonym_group '{name}' (tenant {tenant_id})"),
+                &format!(
+                    "delete_synonym_group '{name}' (database {database_id}, tenant {tenant_id})"
+                ),
                 e,
             )
         })

@@ -251,11 +251,11 @@ pub(super) const DATABASE_HWM: TableDefinition<&str, u64> =
 
 // ── Synonyms / custom types / WASM ────────────────────────────────────
 
-/// Table: "{tenant_id}:{group_name}" -> MessagePack-serialized `StoredSynonymGroup`.
+/// Table: "{database_id}:{tenant_id}:{group_name}" -> MessagePack-serialized `StoredSynonymGroup`.
 pub(super) const SYNONYM_GROUPS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.synonym_groups");
 
-/// Table: "{tenant_id}:{type_name}" -> MessagePack-serialized `StoredCustomType`.
+/// Table: "{database_id}:{tenant_id}:{type_name}" -> MessagePack-serialized `StoredCustomType`.
 pub(super) const CUSTOM_TYPES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.custom_types");
 

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Synonym group metadata operations for the system catalog.
+//!
+//! `_system.synonym_groups` keys on `"{database_id}:{tenant_id}:{name}"`.
+//!
+//! The database segment scopes the row. The Data Plane FTS backend already
+//! stores a group per database, so a tenant-only key lets one catalog row
+//! stand for groups that live in two databases.
 
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
@@ -12,6 +18,7 @@ use super::types::{SYNONYM_GROUPS, SystemCatalog, catalog_err};
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct StoredSynonymGroup {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub name: String,
     pub terms: Vec<String>,
@@ -20,8 +27,11 @@ pub struct StoredSynonymGroup {
 
 impl SystemCatalog {
     /// Store a synonym group. Overwrites any existing group with the same name.
+    ///
+    /// The key comes from the entry, so the row can never land under a
+    /// database the entry does not name.
     pub fn put_synonym_group(&self, def: &StoredSynonymGroup) -> crate::Result<()> {
-        let key = synonym_group_key(def.tenant_id, &def.name);
+        let key = synonym_group_key(def.database_id, def.tenant_id, &def.name);
         let bytes =
             zerompk::to_msgpack_vec(def).map_err(|e| catalog_err("serialize synonym group", e))?;
         let write_txn = self
@@ -39,9 +49,35 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
+    /// Get a synonym group by database, tenant, and name.
+    pub fn get_synonym_group(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredSynonymGroup>> {
+        let key = synonym_group_key(database_id, tenant_id, name);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(SYNONYM_GROUPS)
+            .map_err(|e| catalog_err("open synonym_groups", e))?;
+        let opt = table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get synonym group", e))?;
+        Ok(opt.and_then(|v| zerompk::from_msgpack::<StoredSynonymGroup>(v.value()).ok()))
+    }
+
     /// Delete a synonym group. Returns `true` if it existed.
-    pub fn delete_synonym_group(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
-        let key = synonym_group_key(tenant_id, name);
+    pub fn delete_synonym_group(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
+        let key = synonym_group_key(database_id, tenant_id, name);
         let write_txn = self
             .db
             .begin_write()
@@ -60,36 +96,34 @@ impl SystemCatalog {
         Ok(existed)
     }
 
-    /// Load all synonym groups for a tenant.
+    /// Load every synonym group of one tenant in one database.
+    ///
+    /// The scan is bounded to the tenant's key range, so a node holding many
+    /// tenants reads only the rows it returns.
     pub fn load_synonym_groups_for_tenant(
         &self,
+        database_id: u64,
         tenant_id: u64,
     ) -> crate::Result<Vec<StoredSynonymGroup>> {
-        let prefix = format!("{tenant_id}:");
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(SYNONYM_GROUPS)
-            .map_err(|e| catalog_err("open synonym_groups", e))?;
-
-        let mut groups = Vec::new();
-        let mut range = table
-            .range(prefix.as_str()..)
-            .map_err(|e| catalog_err("range synonym_groups", e))?;
-        while let Some(Ok((key, value))) = range.next() {
-            if !key.value().starts_with(&prefix) {
-                break;
-            }
-            if let Ok(def) = zerompk::from_msgpack::<StoredSynonymGroup>(value.value()) {
-                groups.push(def);
-            }
-        }
-        Ok(groups)
+        let lower = format!("{database_id}:{tenant_id}:");
+        let upper = tenant_upper_bound(database_id, tenant_id);
+        self.range_synonym_groups(&lower, &upper)
     }
 
-    /// Load all synonym groups (all tenants). Used on startup to hydrate the registry.
+    /// Load every synonym group of one database, across every tenant.
+    pub fn load_synonym_groups_in_database(
+        &self,
+        database_id: u64,
+    ) -> crate::Result<Vec<StoredSynonymGroup>> {
+        let lower = format!("{database_id}:");
+        let upper = database_upper_bound(database_id);
+        self.range_synonym_groups(&lower, &upper)
+    }
+
+    /// Load every synonym group across all databases and tenants.
+    ///
+    /// The registry loads every database on startup, so this stays a full-table
+    /// scan.
     pub fn load_all_synonym_groups(&self) -> crate::Result<Vec<StoredSynonymGroup>> {
         let read_txn = self
             .db
@@ -110,10 +144,53 @@ impl SystemCatalog {
         }
         Ok(groups)
     }
+
+    /// Decode every synonym group in one key range.
+    fn range_synonym_groups(
+        &self,
+        lower: &str,
+        upper: &str,
+    ) -> crate::Result<Vec<StoredSynonymGroup>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(SYNONYM_GROUPS)
+            .map_err(|e| catalog_err("open synonym_groups", e))?;
+
+        let mut groups = Vec::new();
+        for item in table
+            .range(lower..upper)
+            .map_err(|e| catalog_err("range synonym_groups", e))?
+        {
+            let (_, value) = item.map_err(|e| catalog_err("read synonym group", e))?;
+            let def: StoredSynonymGroup = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deserialize synonym group", e))?;
+            groups.push(def);
+        }
+        Ok(groups)
+    }
 }
 
-fn synonym_group_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
+fn synonym_group_key(database_id: u64, tenant_id: u64, name: &str) -> String {
+    format!("{database_id}:{tenant_id}:{name}")
+}
+
+/// Exclusive upper bound for one database's key prefix.
+///
+/// The prefix ends with `:`. The next byte after `:` is `;`, so this key sorts
+/// immediately past every tenant of the database.
+fn database_upper_bound(database_id: u64) -> String {
+    format!("{database_id};")
+}
+
+/// Exclusive upper bound for one tenant's key prefix.
+///
+/// The prefix ends with `:`. The next byte after `:` is `;`, so this key sorts
+/// immediately past every group of the tenant.
+fn tenant_upper_bound(database_id: u64, tenant_id: u64) -> String {
+    format!("{database_id}:{tenant_id};")
 }
 
 #[cfg(test)]
@@ -121,21 +198,27 @@ mod tests {
     use super::*;
     use crate::control::security::catalog::types::SystemCatalog;
 
-    fn make_catalog() -> SystemCatalog {
+    fn make_catalog() -> (tempfile::TempDir, SystemCatalog) {
         let dir = tempfile::tempdir().unwrap();
-        SystemCatalog::open(&dir.path().join("system.redb")).unwrap()
+        let catalog = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
+        (dir, catalog)
+    }
+
+    fn group(database_id: u64, tenant_id: u64, name: &str, terms: &[&str]) -> StoredSynonymGroup {
+        StoredSynonymGroup {
+            database_id,
+            tenant_id,
+            name: name.into(),
+            terms: terms.iter().map(|t| (*t).to_string()).collect(),
+            created_at: 1000,
+        }
     }
 
     #[test]
     fn put_and_load() {
-        let cat = make_catalog();
-        let def = StoredSynonymGroup {
-            tenant_id: 1,
-            name: "db_terms".into(),
-            terms: vec!["database".into(), "db".into(), "datastore".into()],
-            created_at: 1000,
-        };
-        cat.put_synonym_group(&def).unwrap();
+        let (_dir, cat) = make_catalog();
+        cat.put_synonym_group(&group(2, 1, "db_terms", &["database", "db", "datastore"]))
+            .unwrap();
 
         let all = cat.load_all_synonym_groups().unwrap();
         assert_eq!(all.len(), 1);
@@ -145,42 +228,77 @@ mod tests {
 
     #[test]
     fn delete_synonym_group() {
-        let cat = make_catalog();
-        let def = StoredSynonymGroup {
-            tenant_id: 1,
-            name: "g1".into(),
-            terms: vec!["a".into(), "b".into()],
-            created_at: 0,
-        };
-        cat.put_synonym_group(&def).unwrap();
-        assert!(cat.delete_synonym_group(1, "g1").unwrap());
-        assert!(!cat.delete_synonym_group(1, "g1").unwrap());
+        let (_dir, cat) = make_catalog();
+        cat.put_synonym_group(&group(2, 1, "g1", &["a", "b"]))
+            .unwrap();
+        assert!(cat.delete_synonym_group(2, 1, "g1").unwrap());
+        assert!(!cat.delete_synonym_group(2, 1, "g1").unwrap());
+        assert!(cat.get_synonym_group(2, 1, "g1").unwrap().is_none());
     }
 
     #[test]
     fn tenant_isolation() {
-        let cat = make_catalog();
-        cat.put_synonym_group(&StoredSynonymGroup {
-            tenant_id: 1,
-            name: "g".into(),
-            terms: vec!["a".into()],
-            created_at: 0,
-        })
-        .unwrap();
-        cat.put_synonym_group(&StoredSynonymGroup {
-            tenant_id: 2,
-            name: "g".into(),
-            terms: vec!["b".into()],
-            created_at: 0,
-        })
-        .unwrap();
+        let (_dir, cat) = make_catalog();
+        cat.put_synonym_group(&group(2, 1, "g", &["a"])).unwrap();
+        cat.put_synonym_group(&group(2, 2, "g", &["b"])).unwrap();
 
-        let t1 = cat.load_synonym_groups_for_tenant(1).unwrap();
+        let t1 = cat.load_synonym_groups_for_tenant(2, 1).unwrap();
         assert_eq!(t1.len(), 1);
         assert_eq!(t1[0].terms, vec!["a"]);
 
-        let t2 = cat.load_synonym_groups_for_tenant(2).unwrap();
+        let t2 = cat.load_synonym_groups_for_tenant(2, 2).unwrap();
         assert_eq!(t2.len(), 1);
         assert_eq!(t2[0].terms, vec!["b"]);
+    }
+
+    #[test]
+    fn load_in_database_excludes_another_database() {
+        let (_dir, cat) = make_catalog();
+        cat.put_synonym_group(&group(2, 1, "g", &["a"])).unwrap();
+        cat.put_synonym_group(&group(2, 5, "g", &["b"])).unwrap();
+        cat.put_synonym_group(&group(3, 1, "g", &["c"])).unwrap();
+
+        assert_eq!(cat.load_synonym_groups_in_database(2).unwrap().len(), 2);
+        assert_eq!(cat.load_synonym_groups_in_database(3).unwrap().len(), 1);
+    }
+
+    /// One name, two databases, one tenant: each database keeps its own group,
+    /// and a delete in one leaves the other whole. Drop the `database_id`
+    /// segment from the key and this fails.
+    #[test]
+    fn synonym_groups_of_one_database_survive_a_delete_in_another() {
+        let (_dir, cat) = make_catalog();
+
+        cat.put_synonym_group(&group(1, 7, "colours", &["red", "crimson"]))
+            .unwrap();
+        cat.put_synonym_group(&group(2, 7, "colours", &["blue", "azure"]))
+            .unwrap();
+
+        assert_eq!(
+            cat.get_synonym_group(1, 7, "colours")
+                .unwrap()
+                .unwrap()
+                .terms,
+            vec!["red", "crimson"]
+        );
+        assert_eq!(
+            cat.get_synonym_group(2, 7, "colours")
+                .unwrap()
+                .unwrap()
+                .terms,
+            vec!["blue", "azure"]
+        );
+
+        assert!(cat.delete_synonym_group(1, 7, "colours").unwrap());
+
+        assert!(cat.get_synonym_group(1, 7, "colours").unwrap().is_none());
+        assert_eq!(
+            cat.get_synonym_group(2, 7, "colours")
+                .unwrap()
+                .unwrap()
+                .terms,
+            vec!["blue", "azure"],
+            "the other database keeps its group"
+        );
     }
 }

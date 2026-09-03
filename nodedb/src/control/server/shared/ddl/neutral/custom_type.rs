@@ -8,16 +8,16 @@
 //! - `ALTER TYPE <name> ADD VALUE 'label'`
 //! - `SHOW TYPES`
 //!
-//! Ported from the pgwire `ddl::custom_type` handlers. All catalog logic
-//! (existence pre-checks, OID allocation, drop-protection scan, catalog
-//! propose + fallback apply, in-memory registry register/unregister) is
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! Each handler runs the existence pre-check, OID allocation, the
+//! drop-protection scan, the catalog propose + fallback apply, and the
+//! in-memory registry register/unregister.
 //!
-//! Custom types are tenant-scoped. DROP TYPE is blocked when any collection
-//! schema references the type. Each type receives a stable u32 OID from the
-//! high-numbered range (70000+) so pgwire clients see a recognisable type.
+//! A custom type belongs to one database and one tenant. Every check and
+//! every write carries the session's `database_id`, matching the catalog key.
+//! DROP TYPE is blocked when a collection of that database references the
+//! type. Each type receives a stable u32 OID from the high-numbered range
+//! (70000+) so pgwire clients see a recognisable type. The OID counter spans
+//! every database: a client reads an OID as the identity of one type.
 
 use nodedb_types::DatabaseId;
 
@@ -63,19 +63,25 @@ fn require_tenant_admin(identity: &AuthenticatedIdentity, action: &str) -> Resul
 pub fn create_enum_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     labels: &[String],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create custom types")?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id_u64 = database_id.as_u64();
 
-    if state.custom_type_registry.exists(tenant_id, name) {
+    if state
+        .custom_type_registry
+        .exists(database_id_u64, tenant_id, name)
+    {
         return Err(err("42710", &format!("type '{name}' already exists")));
     }
 
     let oid = state.custom_type_registry.alloc_oid();
     let created_at = current_epoch_secs()?;
     let stored = StoredCustomType {
+        database_id: database_id_u64,
         tenant_id,
         name: name.to_string(),
         def: CustomTypeDef::Enum {
@@ -94,13 +100,18 @@ pub fn create_enum_type(
 pub fn create_composite_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     fields: &[(String, String)],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create custom types")?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id_u64 = database_id.as_u64();
 
-    if state.custom_type_registry.exists(tenant_id, name) {
+    if state
+        .custom_type_registry
+        .exists(database_id_u64, tenant_id, name)
+    {
         return Err(err("42710", &format!("type '{name}' already exists")));
     }
 
@@ -114,6 +125,7 @@ pub fn create_composite_type(
         })
         .collect();
     let stored = StoredCustomType {
+        database_id: database_id_u64,
         tenant_id,
         name: name.to_string(),
         def: CustomTypeDef::Composite {
@@ -132,13 +144,18 @@ pub fn create_composite_type(
 pub fn drop_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     if_exists: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop custom types")?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id_u64 = database_id.as_u64();
 
-    if !state.custom_type_registry.exists(tenant_id, name) {
+    if !state
+        .custom_type_registry
+        .exists(database_id_u64, tenant_id, name)
+    {
         if if_exists {
             return Ok(status("DROP TYPE"));
         }
@@ -146,7 +163,7 @@ pub fn drop_type(
     }
 
     // Drop-protection: reject if any collection schema references this type.
-    let referencing = find_referencing_collections(state, tenant_id, name);
+    let referencing = find_referencing_collections(state, database_id, tenant_id, name);
     if !referencing.is_empty() {
         let list = referencing.join(", ");
         return Err(err(
@@ -158,6 +175,7 @@ pub fn drop_type(
     let catalog = state.credentials.catalog();
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteCustomType {
+        database_id: database_id_u64,
         tenant_id,
         name: name.to_string(),
     };
@@ -165,11 +183,13 @@ pub fn drop_type(
         .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
         catalog
-            .delete_custom_type(tenant_id, name)
+            .delete_custom_type(database_id_u64, tenant_id, name)
             .map_err(|e| err("XX000", &format!("catalog delete: {e}")))?;
     }
 
-    state.custom_type_registry.unregister(tenant_id, name);
+    state
+        .custom_type_registry
+        .unregister(database_id_u64, tenant_id, name);
 
     Ok(status("DROP TYPE"))
 }
@@ -178,6 +198,7 @@ pub fn drop_type(
 pub fn alter_type_add_value(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     type_name: &str,
     label: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -186,7 +207,7 @@ pub fn alter_type_add_value(
 
     let mut stored = state
         .custom_type_registry
-        .get(tenant_id, type_name)
+        .get(database_id.as_u64(), tenant_id, type_name)
         .ok_or_else(|| err("42704", &format!("type '{type_name}' does not exist")))?;
 
     let labels = match &mut stored.def {
@@ -214,12 +235,18 @@ pub fn alter_type_add_value(
 }
 
 /// Handle `SHOW TYPES`.
+///
+/// Lists only the types of the session's database. A type of another database
+/// is not resolvable here, so listing it misstates what a column can name.
 pub fn show_types(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let types = state.custom_type_registry.list_for_tenant(tenant_id);
+    let types = state
+        .custom_type_registry
+        .list_for_tenant(database_id.as_u64(), tenant_id);
 
     let columns = vec![
         "name".to_string(),
@@ -269,17 +296,18 @@ fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result
     Ok(())
 }
 
-/// Scan all collection schemas for references to `type_name`.
+/// Scan the collection schemas of one database for references to `type_name`.
 ///
 /// Collections store field definitions as `(field_name, type_name)` pairs in `fields`.
 /// A type is "referenced" when any field's type name matches `type_name`.
 fn find_referencing_collections(
     state: &SharedState,
+    database_id: DatabaseId,
     tenant_id: u64,
     type_name: &str,
 ) -> Vec<String> {
     let catalog = state.credentials.catalog();
-    let collections = match catalog.load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id) {
+    let collections = match catalog.load_collections_for_tenant(database_id, tenant_id) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };

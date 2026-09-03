@@ -35,6 +35,16 @@
 //! refusal makes a late `DropIndex` block the same-name re-CREATE that may
 //! follow it.
 //!
+//! ## Applied-index contract for the synonym-group variants
+//!
+//! `MetaOp::PutSynonymGroup` and `MetaOp::DeleteSynonymGroup` MUST complete
+//! before the applied-index watcher bumps. `propose_catalog_entry` returns to
+//! the DDL caller once the local watermark reaches the entry, so the client's
+//! next query runs immediately after. A group that installs after that query
+//! expands nothing, and a group that is deleted after it keeps expanding —
+//! both answer with the wrong row set and no error, which no later dispatch
+//! makes the client aware of.
+//!
 //! ## Ordering for `CompactHistory`
 //!
 //! `CrdtOp::CompactAtVersion` has no such refusal: a compaction that lands
@@ -233,6 +243,29 @@ pub fn spawn_post_apply_async_side_effects(
                     .await;
             });
         }
+        // SYNCHRONOUS: the group must reach every core's FTS backend before
+        // the applied-index watcher bumps. A query that runs first expands
+        // nothing and returns fewer rows with no error.
+        CatalogEntry::PutSynonymGroup(stored) => {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    super::synonym_group::put_async(*stored, &shared).await;
+                });
+            });
+        }
+        // SYNCHRONOUS: a query that runs before the removal lands keeps
+        // expanding terms the statement already dropped.
+        CatalogEntry::DeleteSynonymGroup {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    super::synonym_group::delete_async(database_id, tenant_id, name, &shared).await;
+                });
+            });
+        }
         // ── Variants with no async side effect today ─────────────────────────
         // Listed explicitly (no `_ => {}`) so the compiler forces a decision
         // when a new variant is added. Note: `DeleteTrigger` and
@@ -284,8 +317,10 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)
         | CatalogEntry::DeleteOwner { .. }
-        | CatalogEntry::PutSynonymGroup(_)
-        | CatalogEntry::DeleteSynonymGroup { .. }
+        // PutSynonymGroup / DeleteSynonymGroup have their own synchronous
+        // branches above; they do not appear here. A custom type has no Data
+        // Plane mirror — the registry install in `sync.rs` is the whole
+        // per-node effect.
         | CatalogEntry::PutCustomType(_)
         | CatalogEntry::DeleteCustomType { .. }
         | CatalogEntry::PutDatabase(_)

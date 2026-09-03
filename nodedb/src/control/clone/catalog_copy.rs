@@ -20,6 +20,12 @@
 //! - materialized views
 //! - streaming materialized views
 //!
+//! Synonym groups and custom types are database-scoped too, and are
+//! deliberately absent. Each needs effects this module cannot reach: the
+//! in-memory registry `SHOW` reads, and for a synonym group the per-node FTS
+//! backend. The clone handler proposes one catalog entry per row instead, so
+//! the applier and both post-apply lanes run for it on every node.
+//!
 //! Each row is keyed by `database_id` and stays in the source unless this
 //! module copies it.
 //!
@@ -768,6 +774,66 @@ mod tests {
                 "{kind} '{name}' must carry an owner row in the target database"
             );
         }
+    }
+
+    /// Synonym groups and custom types stay with the source here. Each needs
+    /// the in-memory registry and, for a group, the per-node FTS backend —
+    /// neither of which this module can reach. The clone handler proposes a
+    /// catalog entry per row instead, and the clone handler's own test covers
+    /// that they arrive.
+    #[test]
+    fn synonym_groups_and_custom_types_stay_with_the_source() {
+        use crate::control::security::catalog::{
+            CustomTypeDef, StoredCustomType, StoredSynonymGroup,
+        };
+
+        let (_dir, catalog) = open();
+        seed_source(&catalog);
+        catalog
+            .put_synonym_group(&StoredSynonymGroup {
+                database_id: SOURCE.as_u64(),
+                tenant_id: TENANT,
+                name: "db_terms".into(),
+                terms: vec!["database".into(), "db".into()],
+                created_at: 5,
+            })
+            .expect("seed synonym group");
+        catalog
+            .put_custom_type(&StoredCustomType {
+                database_id: SOURCE.as_u64(),
+                tenant_id: TENANT,
+                name: "mood".into(),
+                def: CustomTypeDef::Enum {
+                    labels: vec!["joy".into(), "anger".into()],
+                },
+                oid: 70_005,
+                created_at: 5,
+            })
+            .expect("seed custom type");
+
+        copy_database_metadata(&catalog, SOURCE, TARGET).expect("copy metadata");
+
+        assert!(
+            catalog
+                .get_synonym_group(TARGET.as_u64(), TENANT, "db_terms")
+                .expect("read target group")
+                .is_none(),
+            "a catalog-only copy would list a group whose expansion does nothing"
+        );
+        assert!(
+            catalog
+                .get_custom_type(TARGET.as_u64(), TENANT, "mood")
+                .expect("read target type")
+                .is_none(),
+            "a catalog-only copy would leave the type unresolvable until restart"
+        );
+        assert!(
+            catalog
+                .get_synonym_group(SOURCE.as_u64(), TENANT, "db_terms")
+                .expect("read source group")
+                .is_some(),
+            "the source keeps its group"
+        );
     }
 
     /// A database the clone never touched keeps an empty metadata set.

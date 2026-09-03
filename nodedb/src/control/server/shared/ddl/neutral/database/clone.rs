@@ -26,6 +26,7 @@ use crate::control::security::catalog::database_types::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
 use super::gate::require_superuser;
 use super::support::{ddl_err, status};
@@ -40,7 +41,7 @@ pub struct CloneDatabaseParams<'a> {
 /// Handle `CLONE DATABASE <new_name> FROM <source_name> [AS OF …]`.
 ///
 /// Required role: `Superuser`.
-pub fn clone_database(
+pub async fn clone_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     params: CloneDatabaseParams<'_>,
@@ -273,6 +274,18 @@ pub fn clone_database(
             .map_err(|e| ddl_err("XX000", format!("clone: copying catalog metadata: {e}")))?;
     }
 
+    // Synonym groups and custom types travel as proposed entries, not as a
+    // catalog copy. Each needs two more effects than a redb write: the
+    // in-memory registry SHOW reads, and for a group the FTS backend on every
+    // node. A propose runs the applier and both post-apply lanes everywhere,
+    // which is the only path that delivers all three.
+    //
+    // Outside the `needs_local_apply` block above on purpose: a propose is the
+    // thing that reaches every node, and on a cluster proposer that branch is
+    // false.
+    copy_synonym_groups(state, source_db_id, target_db_id).await?;
+    copy_custom_types(state, source_db_id, target_db_id)?;
+
     // Flush the allocator hwm so restarts pick up the correct next-id boundary.
     if state.database_registry.should_flush() {
         let hwm = state.database_registry.current_hwm();
@@ -296,6 +309,91 @@ pub fn clone_database(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Propose one `PutSynonymGroup` per source group, rewritten to the target.
+///
+/// A group also lives in each node's FTS backend, which only the post-apply
+/// lane reaches. On the `LocalOnly` path no applier runs, so this installs the
+/// group and registers it here instead.
+///
+/// A failed propose is fatal, for the same reason an unstamped descriptor is:
+/// the clone reports itself created while a text query against it expands
+/// fewer terms than the source, and nothing later re-proposes the row.
+async fn copy_synonym_groups(
+    state: &SharedState,
+    source: DatabaseId,
+    target: DatabaseId,
+) -> Result<(), DdlError> {
+    let catalog = state.credentials.catalog();
+    let groups = catalog
+        .load_synonym_groups_in_database(source.as_u64())
+        .map_err(|e| {
+            ddl_err(
+                "XX000",
+                format!("clone: enumerate source synonym groups: {e}"),
+            )
+        })?;
+
+    for mut group in groups {
+        group.database_id = target.as_u64();
+        let entry = CatalogEntry::PutSynonymGroup(Box::new(group.clone()));
+        let outcome = propose_and_apply(state, &entry).map_err(|e| {
+            ddl_err(
+                "XX000",
+                format!(
+                    "clone: copying synonym group '{}': {}",
+                    group.name, e.message
+                ),
+            )
+        })?;
+        if outcome.needs_local_apply() {
+            state.synonym_registry.register(group.clone());
+            crate::control::catalog_entry::post_apply::install_synonym_group(group, state).await;
+        }
+    }
+    Ok(())
+}
+
+/// Propose one `PutCustomType` per source type, rewritten to the target.
+///
+/// The copy keeps the source OID. Every node applies the entry verbatim, so
+/// re-allocating here would hand each node a different OID for one type.
+///
+/// A failed propose is fatal: the clone would resolve neither a copied
+/// descriptor's typed column nor the OID a pgwire client reads back.
+fn copy_custom_types(
+    state: &SharedState,
+    source: DatabaseId,
+    target: DatabaseId,
+) -> Result<(), DdlError> {
+    let catalog = state.credentials.catalog();
+    let types = catalog
+        .load_custom_types_in_database(source.as_u64())
+        .map_err(|e| {
+            ddl_err(
+                "XX000",
+                format!("clone: enumerate source custom types: {e}"),
+            )
+        })?;
+
+    for mut custom_type in types {
+        custom_type.database_id = target.as_u64();
+        let entry = CatalogEntry::PutCustomType(Box::new(custom_type.clone()));
+        let outcome = propose_and_apply(state, &entry).map_err(|e| {
+            ddl_err(
+                "XX000",
+                format!(
+                    "clone: copying custom type '{}': {}",
+                    custom_type.name, e.message
+                ),
+            )
+        })?;
+        if outcome.needs_local_apply() {
+            state.custom_type_registry.register(custom_type);
+        }
+    }
+    Ok(())
+}
 
 /// Returns `true` if `descriptor` represents a mirror database.
 ///

@@ -2,13 +2,17 @@
 
 //! Protocol-neutral synonym group DDL — CREATE / DROP / SHOW.
 //!
-//! Ported from the pgwire `ddl::synonym_group` handlers. All non-return logic
-//! (tenant-admin gate, duplicate / existence checks against the in-memory
-//! `synonym_registry`, the `propose_catalog_entry` + `LocalOnly` manual
-//! catalog write, the in-memory registry update, and the Data-Plane FTS
-//! `PutSynonymGroup` / `DeleteSynonymGroup` dispatch) is preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError`
-//! to the protocol-neutral `DdlResult` / `DdlError`.
+//! Each handler runs the tenant-admin gate, the duplicate / existence check
+//! against the in-memory `synonym_registry`, the `propose_catalog_entry` +
+//! `LocalOnly` manual catalog write, and the in-memory registry update.
+//!
+//! A group belongs to one database and one tenant. Every check and every
+//! write carries the session's `database_id`, matching the catalog key and
+//! the per-database FTS backend.
+//!
+//! The Data-Plane FTS install belongs to the post-apply lane, which runs on
+//! every node. A handler reaches it only on the `LocalOnly` path, where no
+//! applier runs, and calls the same function the lane calls.
 
 pub mod create;
 pub mod drop;

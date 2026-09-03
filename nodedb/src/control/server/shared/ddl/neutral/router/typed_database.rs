@@ -77,15 +77,18 @@ pub(super) async fn try_typed(
             new_name,
             source_name,
             as_of,
-        }) => Some(database::clone::clone_database(
-            state,
-            identity,
-            database::clone::CloneDatabaseParams {
-                new_name,
-                source_name,
-                as_of,
-            },
-        )),
+        }) => Some(
+            database::clone::clone_database(
+                state,
+                identity,
+                database::clone::CloneDatabaseParams {
+                    new_name,
+                    source_name,
+                    as_of,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Database(DatabaseStmt::MirrorDatabase {
             local_name,

@@ -9,6 +9,7 @@ mod bulk_dml_event_emission;
 mod calvin_sql_routing;
 mod clone_alter_materialize;
 mod clone_carries_collection_metadata;
+mod clone_carries_synonym_groups_and_types;
 mod clone_columnar_write_requires_materialize;
 mod clone_copyup_creates_target_row;
 mod clone_cow_return_time;

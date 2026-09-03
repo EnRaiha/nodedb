@@ -2,28 +2,12 @@
 
 //! Protocol-neutral `CREATE SYNONYM GROUP` handler.
 
-use std::time::Duration;
-
-use nodedb_fts::SynonymGroupRecord;
-
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::StoredSynonymGroup;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
-};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::MetaOp;
 
 use super::super::super::result::{DdlError, DdlResult};
-
-/// Sentinel collection name used for routing synonym group MetaOp dispatches.
-///
-/// Synonym groups are global to the tenant (not collection-bound).
-/// Routes via `VShardId::from_collection_in_database` on the default database;
-/// any stable name works and `_synonym_groups` is descriptive.
-pub(super) const SYNONYM_SENTINEL_COLLECTION: &str = "_synonym_groups";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
@@ -39,11 +23,14 @@ pub async fn create_synonym_group(
 ) -> Result<Vec<DdlResult>, DdlError> {
     super::super::auth_support::require_tenant_admin(identity, "create synonym groups")?;
 
-    let tenant_id = identity.tenant_id;
-    let tenant_id_u64 = tenant_id.as_u64();
+    let tenant_id_u64 = identity.tenant_id.as_u64();
+    let database_id_u64 = database_id.as_u64();
 
-    // Duplicate check via in-memory registry.
-    if state.synonym_registry.exists(tenant_id_u64, name) {
+    // Duplicate check via in-memory registry, scoped to this database.
+    if state
+        .synonym_registry
+        .exists(database_id_u64, tenant_id_u64, name)
+    {
         return Err(err(
             "42710",
             format!("synonym group '{name}' already exists"),
@@ -56,56 +43,34 @@ pub async fn create_synonym_group(
         .as_secs();
 
     let stored = StoredSynonymGroup {
+        database_id: database_id_u64,
         tenant_id: tenant_id_u64,
         name: name.to_string(),
         terms: terms.to_vec(),
         created_at,
     };
 
-    // Persist to catalog.
     let catalog = state.credentials.catalog();
 
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored.clone()));
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+
+    // Single node: no applier runs, so post-apply never fires. Run the two
+    // per-node effects the applier runs everywhere else — the catalog write,
+    // and the fan-out that installs the group in every core's FTS backend.
     if outcome.needs_local_apply() {
         catalog
             .put_synonym_group(&stored)
             .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+        crate::control::catalog_entry::post_apply::install_synonym_group(stored.clone(), state)
+            .await;
     }
 
-    // Update in-memory registry.
-    state.synonym_registry.register(stored.clone());
-
-    // Push to Data Plane FTS backend (all shards via collection-independent dispatch).
-    let fts_record = SynonymGroupRecord {
-        name: stored.name.clone(),
-        terms: stored.terms.clone(),
-        created_at: stored.created_at,
-    };
-    let record_json = sonic_rs::to_string(&fts_record)
-        .map_err(|e| err("XX000", format!("serialize synonym group: {e}")))?;
-
-    let plan = PhysicalPlan::Meta(MetaOp::PutSynonymGroup {
-        tenant_id: tenant_id_u64,
-        record_json,
-    });
-
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_system(
-        state,
-        SystemTask::new(
-            SystemReason::CatalogMaintenance,
-            tenant_id,
-            database_id,
-            SYNONYM_SENTINEL_COLLECTION,
-            plan,
-        ),
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", format!("data plane dispatch: {e}")))?;
+    // Idempotent: the applier's synchronous post-apply already registered the
+    // group on the replicated path.
+    state.synonym_registry.register(stored);
 
     Ok(vec![DdlResult::Status {
         command: "CREATE SYNONYM GROUP".to_string(),

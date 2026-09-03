@@ -299,14 +299,22 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         CatalogEntry::PutSynonymGroup(stored) => {
             synonym_group::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteSynonymGroup { tenant_id, name } => {
-            synonym_group::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteSynonymGroup {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            synonym_group::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutCustomType(stored) => {
             custom_type::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteCustomType { tenant_id, name } => {
-            custom_type::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteCustomType {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            custom_type::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutDatabase(stored) => {
             database::put((**stored).clone(), Arc::clone(shared));

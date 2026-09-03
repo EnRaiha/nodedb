@@ -411,6 +411,7 @@ pub fn build_generated_column_specs(
 pub(super) fn resolve_custom_type_columns(
     columns: &[(String, String)],
     state: &crate::control::state::SharedState,
+    database_id: u64,
     tenant_id: u64,
 ) -> Vec<(String, String)> {
     columns
@@ -420,7 +421,7 @@ pub(super) fn resolve_custom_type_columns(
             let bare = type_str.split_whitespace().next().unwrap_or(type_str);
             if state
                 .custom_type_registry
-                .exists(tenant_id, &bare.to_lowercase())
+                .exists(database_id, tenant_id, &bare.to_lowercase())
             {
                 // Replace the custom type name with TEXT, preserving any
                 // trailing modifiers (e.g. "priority NOT NULL" → "TEXT NOT NULL").

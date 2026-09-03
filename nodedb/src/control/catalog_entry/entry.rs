@@ -130,6 +130,7 @@ pub enum CatalogEntry {
     PutSynonymGroup(Box<StoredSynonymGroup>),
     /// Post-apply removes it from `synonym_registry`.
     DeleteSynonymGroup {
+        database_id: u64,
         tenant_id: u64,
         name: String,
     },
@@ -139,6 +140,7 @@ pub enum CatalogEntry {
     PutCustomType(Box<StoredCustomType>),
     /// Post-apply removes it from `custom_type_registry`.
     DeleteCustomType {
+        database_id: u64,
         tenant_id: u64,
         name: String,
     },

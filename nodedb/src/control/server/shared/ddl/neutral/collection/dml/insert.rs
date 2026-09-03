@@ -159,6 +159,7 @@ pub async fn insert_document(
                     _ => continue,
                 };
                 if let Err(msg) = state.custom_type_registry.validate_enum_label(
+                    database_id.as_u64(),
                     tenant_id.as_u64(),
                     type_name,
                     label,

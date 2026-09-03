@@ -11,6 +11,8 @@ pub fn put(stored: StoredSynonymGroup, shared: Arc<SharedState>) {
     shared.synonym_registry.register(stored);
 }
 
-pub fn delete(tenant_id: u64, name: String, shared: Arc<SharedState>) {
-    shared.synonym_registry.unregister(tenant_id, &name);
+pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<SharedState>) {
+    shared
+        .synonym_registry
+        .unregister(database_id, tenant_id, &name);
 }

@@ -182,7 +182,7 @@ pub async fn build_and_persist(
     // Resolve user-defined type names to TEXT for schema building.
     // Original names are preserved in `fields` for drop-protection.
     let resolved_columns: Vec<(String, String)> =
-        resolve_custom_type_columns(columns, state, tenant_id.as_u64());
+        resolve_custom_type_columns(columns, state, database_id.as_u64(), tenant_id.as_u64());
 
     let (collection_type, columnar_schema_columns) = nodedb_sql::ddl_ast::build_collection_type(
         canonical_engine,

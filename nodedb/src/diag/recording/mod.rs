@@ -20,7 +20,7 @@ mod vector;
 
 pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
-    metadata_apply_wedged,
+    metadata_apply_wedged, synonym_group_not_applied,
 };
 pub use crdt::history_compaction_not_applied;
 pub use data_plane::{

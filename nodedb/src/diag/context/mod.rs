@@ -18,7 +18,7 @@ mod write_path;
 
 pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
-    MetadataApplyWedged,
+    MetadataApplyWedged, SynonymGroupNotApplied,
 };
 pub(in crate::diag) use crdt::HistoryCompactionNotApplied;
 pub use data_plane::LostResponseWrite;

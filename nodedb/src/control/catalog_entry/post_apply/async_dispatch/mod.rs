@@ -25,6 +25,7 @@ mod core_fanout;
 pub mod crdt_compact;
 mod dispatcher;
 pub mod materialized_view;
+pub mod synonym_group;
 pub mod vector;
 
 pub use dispatcher::spawn_post_apply_async_side_effects;
