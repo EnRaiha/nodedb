@@ -108,9 +108,11 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             }
         }
         CatalogEntry::PutSequence(stored) => sequence::put(stored, catalog),
-        CatalogEntry::DeleteSequence { tenant_id, name } => {
-            sequence::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteSequence {
+            database_id,
+            tenant_id,
+            name,
+        } => sequence::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSequenceState(state) => sequence::put_state(state, catalog),
         CatalogEntry::PutTrigger(stored) => trigger::put(stored, catalog),
         CatalogEntry::DeleteTrigger {

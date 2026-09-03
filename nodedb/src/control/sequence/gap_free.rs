@@ -28,7 +28,13 @@ pub struct ReservationId(u64);
 #[derive(Debug, Clone)]
 pub struct ReservationHandle {
     pub id: ReservationId,
-    /// Registry key: `"{tenant_id}:{sequence_name}"`.
+    /// Database the sequence belongs to.
+    pub database_id: u64,
+    /// Tenant the sequence belongs to.
+    pub tenant_id: u64,
+    /// Sequence name, unqualified.
+    pub name: String,
+    /// Registry key: `"{database_id}:{tenant_id}:{name}"`.
     pub sequence_key: String,
     /// The reserved counter value.
     pub value: i64,
@@ -72,14 +78,19 @@ impl GapFreeManager {
     /// the underlying counter.
     pub fn reserve(
         &self,
-        sequence_key: &str,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
         advance_fn: impl FnOnce() -> Result<i64, SequenceError>,
     ) -> Result<ReservationHandle, SequenceError> {
+        // The lock key is the registry key, so two databases holding a
+        // same-named sequence serialize independently.
+        let sequence_key = format!("{database_id}:{tenant_id}:{name}");
         // Get or create the per-sequence lock.
         let lock = {
             let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
             locks
-                .entry(sequence_key.to_string())
+                .entry(sequence_key.clone())
                 .or_insert_with(|| {
                     Arc::new(SequenceLock {
                         locked: Mutex::new(false),
@@ -121,7 +132,10 @@ impl GapFreeManager {
 
         Ok(ReservationHandle {
             id,
-            sequence_key: sequence_key.to_string(),
+            database_id,
+            tenant_id,
+            name: name.to_string(),
+            sequence_key,
             value,
         })
     }
@@ -173,7 +187,9 @@ mod tests {
         let counter = AtomicI64::new(0);
 
         let handle = mgr
-            .reserve("1:test", || Ok(counter.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "test", || {
+                Ok(counter.fetch_add(1, Ordering::Relaxed) + 1)
+            })
             .unwrap();
 
         assert_eq!(handle.value, 1);
@@ -187,7 +203,9 @@ mod tests {
         let counter = AtomicI64::new(0);
 
         let handle = mgr
-            .reserve("1:test", || Ok(counter.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "test", || {
+                Ok(counter.fetch_add(1, Ordering::Relaxed) + 1)
+            })
             .unwrap();
 
         assert_eq!(handle.value, 1);
@@ -205,12 +223,16 @@ mod tests {
         let counter = AtomicI64::new(0);
 
         let h1 = mgr
-            .reserve("1:test", || Ok(counter.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "test", || {
+                Ok(counter.fetch_add(1, Ordering::Relaxed) + 1)
+            })
             .unwrap();
         mgr.commit(&h1);
 
         let h2 = mgr
-            .reserve("1:test", || Ok(counter.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "test", || {
+                Ok(counter.fetch_add(1, Ordering::Relaxed) + 1)
+            })
             .unwrap();
         assert_eq!(h2.value, 2);
         mgr.commit(&h2);
@@ -223,11 +245,11 @@ mod tests {
         let c2 = AtomicI64::new(0);
 
         let h1 = mgr
-            .reserve("1:seq_a", || Ok(c1.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "seq_a", || Ok(c1.fetch_add(1, Ordering::Relaxed) + 1))
             .unwrap();
 
         let h2 = mgr
-            .reserve("1:seq_b", || Ok(c2.fetch_add(1, Ordering::Relaxed) + 1))
+            .reserve(4, 1, "seq_b", || Ok(c2.fetch_add(1, Ordering::Relaxed) + 1))
             .unwrap();
 
         assert_eq!(h1.value, 1);
@@ -249,7 +271,9 @@ mod tests {
 
         // First reservation — held for a bit.
         let h1 = mgr
-            .reserve("1:test", || Ok(counter.fetch_add(1, Ordering::SeqCst) + 1))
+            .reserve(4, 1, "test", || {
+                Ok(counter.fetch_add(1, Ordering::SeqCst) + 1)
+            })
             .unwrap();
         assert_eq!(h1.value, 1);
         order.store(1, Ordering::SeqCst);
@@ -257,7 +281,9 @@ mod tests {
         // Second reservation in another thread — should block.
         let t = std::thread::spawn(move || {
             let h2 = mgr2
-                .reserve("1:test", || Ok(counter2.fetch_add(1, Ordering::SeqCst) + 1))
+                .reserve(4, 1, "test", || {
+                    Ok(counter2.fetch_add(1, Ordering::SeqCst) + 1)
+                })
                 .unwrap();
             // When we get here, h1 must have been committed (order == 2).
             assert!(order2.load(Ordering::SeqCst) >= 2);

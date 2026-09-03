@@ -19,26 +19,33 @@ impl TestClusterNode {
             .unwrap_or(0)
     }
 
-    /// Number of sequences visible in this node's in-memory
-    /// `sequence_registry`. After the applier spawns its
+    /// Number of sequences of the default database visible in this node's
+    /// in-memory `sequence_registry`. After the applier spawns its
     /// post-apply side effect for a `PutSequence`, the registry
-    /// should see the new record on every node.
+    /// sees the new record on every node.
     pub fn sequence_count(&self, tenant_id: u64) -> usize {
-        self.shared.sequence_registry.list(tenant_id).len()
+        self.shared
+            .sequence_registry
+            .list(nodedb_types::DatabaseId::DEFAULT.as_u64(), tenant_id)
+            .len()
     }
 
-    /// Check whether a sequence with the given name exists in this
-    /// node's in-memory registry.
+    /// Check whether the default database holds a sequence with the given
+    /// name in this node's in-memory registry.
     pub fn has_sequence(&self, tenant_id: u64, name: &str) -> bool {
-        self.shared.sequence_registry.exists(tenant_id, name)
+        self.shared.sequence_registry.exists(
+            nodedb_types::DatabaseId::DEFAULT.as_u64(),
+            tenant_id,
+            name,
+        )
     }
 
-    /// Read the current counter of a sequence from this node's
-    /// in-memory registry, if present.
+    /// Read the current counter of a default-database sequence from this
+    /// node's in-memory registry, if present.
     pub fn sequence_current_value(&self, tenant_id: u64, name: &str) -> Option<i64> {
         self.shared
             .sequence_registry
-            .list(tenant_id)
+            .list(nodedb_types::DatabaseId::DEFAULT.as_u64(), tenant_id)
             .into_iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, current, _)| current)

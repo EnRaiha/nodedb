@@ -74,7 +74,12 @@ pub fn collect_dependents(
 ) -> crate::Result<Vec<Dependent>> {
     let mut out: Vec<Dependent> = Vec::new();
 
-    for name in sequences::find_implicit_sequences(catalog, tenant_id, root_collection)? {
+    for name in sequences::find_implicit_sequences(
+        catalog,
+        database_id.as_u64(),
+        tenant_id,
+        root_collection,
+    )? {
         if visited.insert((DependentKind::Sequence, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::Sequence,
@@ -186,8 +191,13 @@ mod tests {
     fn visited_suppresses_duplicates_across_calls() {
         let (c, _t) = cat();
         use crate::control::security::catalog::sequence_types::StoredSequence;
-        c.put_sequence(&StoredSequence::new(1, "users_id_seq".into(), "o".into()))
-            .unwrap();
+        c.put_sequence(&StoredSequence::new(
+            DatabaseId::DEFAULT.as_u64(),
+            1,
+            "users_id_seq".into(),
+            "o".into(),
+        ))
+        .unwrap();
 
         let mut visited = HashSet::new();
         let first = collect_dependents(&c, DatabaseId::DEFAULT, 1, "users", &mut visited).unwrap();

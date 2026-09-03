@@ -68,7 +68,7 @@ impl SystemCatalog {
             }
             object_type::SEQUENCE => {
                 let mut stored = self
-                    .get_sequence(tenant_id, name)?
+                    .get_sequence(database_id, tenant_id, name)?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_sequence(&stored)?;

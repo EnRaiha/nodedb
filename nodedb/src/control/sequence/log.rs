@@ -48,22 +48,23 @@ pub struct SequenceLogEntry {
     pub status: ReservationStatus,
     pub timestamp_ms: u64,
     pub user: String,
+    pub database_id: u64,
     pub tenant_id: u64,
 }
 
 /// Append a sequence log entry to the catalog.
 ///
-/// Stored via `put_sequence_state` with a prefixed key to avoid collision
-/// with regular sequence state entries. Uses the existing `_system.sequence_state`
-/// table with key = `"log:{tenant}:{sequence}:{timestamp_ms}"`.
+/// The entry rides the `_system.sequence_state` table as a `SequenceState`
+/// row. Its name segment starts with `log:`, which no SQL identifier can
+/// produce, so a log row never collides with a real counter. The row carries
+/// the entry's own database, so the key is
+/// `"{database_id}:{tenant_id}:log:{sequence}:{timestamp_ms}:{status}"`.
 pub fn log_reservation(
     catalog: &crate::control::security::catalog::types::SystemCatalog,
     entry: &SequenceLogEntry,
 ) {
-    // Serialize the entry as a SequenceState-compatible blob using the
-    // existing catalog infrastructure. We use `put_sequence_state` with
-    // a synthetic name that starts with "log:" to distinguish from real state.
     let synthetic_state = crate::control::security::catalog::sequence_types::SequenceState {
+        database_id: entry.database_id,
         tenant_id: entry.tenant_id,
         name: format!(
             "log:{}:{}:{}",
@@ -84,13 +85,20 @@ pub fn log_reservation(
 }
 
 /// Create a log entry for a committed reservation.
-pub fn committed(sequence_name: &str, value: i64, user: &str, tenant_id: u64) -> SequenceLogEntry {
+pub fn committed(
+    sequence_name: &str,
+    value: i64,
+    user: &str,
+    database_id: u64,
+    tenant_id: u64,
+) -> SequenceLogEntry {
     SequenceLogEntry {
         sequence_name: sequence_name.to_string(),
         value,
         status: ReservationStatus::Committed,
         timestamp_ms: now_ms(),
         user: user.to_string(),
+        database_id,
         tenant_id,
     }
 }
@@ -100,6 +108,7 @@ pub fn rolled_back(
     sequence_name: &str,
     value: i64,
     user: &str,
+    database_id: u64,
     tenant_id: u64,
 ) -> SequenceLogEntry {
     SequenceLogEntry {
@@ -108,6 +117,7 @@ pub fn rolled_back(
         status: ReservationStatus::RolledBack,
         timestamp_ms: now_ms(),
         user: user.to_string(),
+        database_id,
         tenant_id,
     }
 }
@@ -125,12 +135,13 @@ mod tests {
 
     #[test]
     fn entry_serialization_roundtrip() {
-        let entry = committed("invoice_seq", 42, "admin", 1);
+        let entry = committed("invoice_seq", 42, "admin", 4, 1);
         let bytes = zerompk::to_msgpack_vec(&entry).unwrap();
         let decoded: SequenceLogEntry = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.sequence_name, "invoice_seq");
         assert_eq!(decoded.value, 42);
         assert_eq!(decoded.status, ReservationStatus::Committed);
+        assert_eq!(decoded.database_id, 4);
         assert_eq!(decoded.tenant_id, 1);
     }
 

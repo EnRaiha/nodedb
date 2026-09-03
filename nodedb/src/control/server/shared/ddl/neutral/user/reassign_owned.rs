@@ -319,7 +319,7 @@ fn reassign_one(
         }
         OwnerKind::Sequence => {
             let mut s = catalog
-                .get_sequence(tenant_id, name)
+                .get_sequence(database_id, tenant_id, name)
                 .map_err(|e| ddl_err(format!("get sequence '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();

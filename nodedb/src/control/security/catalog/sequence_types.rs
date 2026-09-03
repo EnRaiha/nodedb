@@ -4,10 +4,15 @@
 
 /// Persisted sequence definition in the system catalog.
 ///
-/// Stored in redb under `_system.sequences` with key `"{tenant_id}:{name}"`.
+/// Stored in redb under `_system.sequences` with key
+/// `"{database_id}:{tenant_id}:{name}"`.
+///
+/// The database segment scopes the row: two databases in one tenant can hold a
+/// same-named sequence, and a shared key lets one hand out the other's numbers.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[msgpack(map, allow_unknown_fields)]
 pub struct StoredSequence {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub name: String,
     /// Owner username (creator).
@@ -49,8 +54,9 @@ pub struct StoredSequence {
 
 impl StoredSequence {
     /// Create a new sequence definition with default values for unspecified options.
-    pub fn new(tenant_id: u64, name: String, owner: String) -> Self {
+    pub fn new(database_id: u64, tenant_id: u64, name: String, owner: String) -> Self {
         Self {
+            database_id,
             tenant_id,
             name,
             owner,
@@ -111,9 +117,14 @@ impl StoredSequence {
 ///
 /// Persisted to catalog periodically and on shutdown. Not synced via CRDT —
 /// each node maintains its own counter within an allocated range.
+///
+/// Stored in redb under `_system.sequence_state` with key
+/// `"{database_id}:{tenant_id}:{name}"` — the same key as the definition in
+/// `_system.sequences`, so counter and definition share one identity.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[msgpack(map, allow_unknown_fields)]
 pub struct SequenceState {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub name: String,
     /// Current value (last returned by nextval on this node).
@@ -129,8 +140,15 @@ pub struct SequenceState {
 }
 
 impl SequenceState {
-    pub fn new(tenant_id: u64, name: String, start_value: i64, epoch: u64) -> Self {
+    pub fn new(
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+        start_value: i64,
+        epoch: u64,
+    ) -> Self {
         Self {
+            database_id,
             tenant_id,
             name,
             // Start one step before start_value so the first nextval returns start_value.
@@ -148,20 +166,20 @@ mod tests {
 
     #[test]
     fn validate_ok() {
-        let seq = StoredSequence::new(1, "s1".into(), "admin".into());
+        let seq = StoredSequence::new(2, 1, "s1".into(), "admin".into());
         assert!(seq.validate().is_ok());
     }
 
     #[test]
     fn validate_zero_increment() {
-        let mut seq = StoredSequence::new(1, "s1".into(), "admin".into());
+        let mut seq = StoredSequence::new(2, 1, "s1".into(), "admin".into());
         seq.increment = 0;
         assert!(seq.validate().is_err());
     }
 
     #[test]
     fn validate_min_gt_max() {
-        let mut seq = StoredSequence::new(1, "s1".into(), "admin".into());
+        let mut seq = StoredSequence::new(2, 1, "s1".into(), "admin".into());
         seq.min_value = 100;
         seq.max_value = 10;
         assert!(seq.validate().is_err());
@@ -169,7 +187,7 @@ mod tests {
 
     #[test]
     fn validate_start_out_of_range() {
-        let mut seq = StoredSequence::new(1, "s1".into(), "admin".into());
+        let mut seq = StoredSequence::new(2, 1, "s1".into(), "admin".into());
         seq.start_value = 0;
         seq.min_value = 1;
         assert!(seq.validate().is_err());

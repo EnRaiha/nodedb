@@ -80,8 +80,12 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         CatalogEntry::PutSequence(stored) => {
             sequence::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteSequence { tenant_id, name } => {
-            sequence::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteSequence {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            sequence::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutSequenceState(state) => {
             sequence::put_state((**state).clone(), Arc::clone(shared));

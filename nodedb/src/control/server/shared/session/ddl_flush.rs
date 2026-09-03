@@ -219,7 +219,7 @@ fn committed_before_image(
             .get_committed_trigger_in_database(stored.database_id, stored.tenant_id, &stored.name)?
             .map(|prior| CatalogEntry::PutTrigger(Box::new(prior))),
         CatalogEntry::PutSequence(stored) => catalog
-            .get_sequence(stored.tenant_id, &stored.name)?
+            .get_sequence(stored.database_id, stored.tenant_id, &stored.name)?
             .map(|prior| CatalogEntry::PutSequence(Box::new(prior))),
         CatalogEntry::PutContinuousAggregate(stored) => catalog
             .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)?
@@ -410,6 +410,7 @@ fn reverse_create(entry: &CatalogEntry) -> crate::Result<CatalogEntry> {
             })
         }
         CatalogEntry::PutSequence(stored) => Ok(CatalogEntry::DeleteSequence {
+            database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
         }),
@@ -594,7 +595,7 @@ mod tests {
     /// must take the `Pending` branch on this fixture's fake metadata raft
     /// group.
     async fn propose_one_sequence<'a>(state: &'a SharedState, name: &str) -> PendingDdlHandle<'a> {
-        let stored = StoredSequence::new(7, name.into(), "alice".into());
+        let stored = StoredSequence::new(0, 7, name.into(), "alice".into());
         let (sessions, session_id) = test_session();
         let plan = conn_scope::scoped(async {
             ddl_buffer::activate();
@@ -634,11 +635,11 @@ mod tests {
     async fn local_flush_populates_the_sequence_registry() {
         let (state, _dir) = local_only_state();
         assert!(
-            !state.sequence_registry.exists(7, "orders_seq"),
+            !state.sequence_registry.exists(0, 7, "orders_seq"),
             "registry starts empty"
         );
 
-        let stored = StoredSequence::new(7, "orders_seq".into(), "alice".into());
+        let stored = StoredSequence::new(0, 7, "orders_seq".into(), "alice".into());
         let ok = buffer_and_flush(&state, vec![CatalogEntry::PutSequence(Box::new(stored))]).await;
 
         assert!(ok, "local flush must not abort");
@@ -646,13 +647,13 @@ mod tests {
             state
                 .credentials
                 .catalog()
-                .get_sequence(7, "orders_seq")
+                .get_sequence(0, 7, "orders_seq")
                 .expect("catalog read")
                 .is_some(),
             "the catalog write is the part that already worked"
         );
         assert!(
-            state.sequence_registry.exists(7, "orders_seq"),
+            state.sequence_registry.exists(0, 7, "orders_seq"),
             "flush_local must run the post-apply sync phase: without it the catalog \
              and the live registry disagree until restart, and NEXTVAL / DROP SEQUENCE \
              report the sequence as missing"
@@ -691,11 +692,13 @@ mod tests {
         let (state, _dir) = local_only_state();
         let entries = vec![
             CatalogEntry::PutSequence(Box::new(StoredSequence::new(
+                0,
                 7,
                 "first_seq".into(),
                 "alice".into(),
             ))),
             CatalogEntry::PutSequence(Box::new(StoredSequence::new(
+                0,
                 7,
                 "second_seq".into(),
                 "alice".into(),
@@ -706,9 +709,9 @@ mod tests {
             buffer_and_flush(&state, entries).await,
             "flush must not abort"
         );
-        assert!(state.sequence_registry.exists(7, "first_seq"));
+        assert!(state.sequence_registry.exists(0, 7, "first_seq"));
         assert!(
-            state.sequence_registry.exists(7, "second_seq"),
+            state.sequence_registry.exists(0, 7, "second_seq"),
             "the hook must run per entry, not once for the batch"
         );
     }
@@ -784,18 +787,23 @@ mod tests {
 
     #[test]
     fn reverse_create_deletes_a_created_sequence() {
-        let stored = StoredSequence::new(7, "orders_seq".into(), "alice".into());
+        let stored = StoredSequence::new(0, 7, "orders_seq".into(), "alice".into());
         let reversed = reverse_create(&CatalogEntry::PutSequence(Box::new(stored)))
             .expect("PutSequence reverses");
         assert!(matches!(
             reversed,
-            CatalogEntry::DeleteSequence { tenant_id: 7, name } if name == "orders_seq"
+            CatalogEntry::DeleteSequence {
+                database_id: 0,
+                tenant_id: 7,
+                name
+            } if name == "orders_seq"
         ));
     }
 
     #[test]
     fn reverse_create_rejects_an_unreversible_kind() {
         let err = reverse_create(&CatalogEntry::DeleteSequence {
+            database_id: 0,
             tenant_id: 7,
             name: "orders_seq".into(),
         });

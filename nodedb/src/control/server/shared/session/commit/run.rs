@@ -342,10 +342,11 @@ pub async fn run_commit(
             crate::control::sequence::log::log_reservation(
                 catalog,
                 &crate::control::sequence::log::committed(
-                    &handle.sequence_key,
+                    &handle.name,
                     handle.value,
                     &identity.username,
-                    identity.tenant_id.as_u64(),
+                    handle.database_id,
+                    handle.tenant_id,
                 ),
             );
         }

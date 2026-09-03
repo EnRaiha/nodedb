@@ -82,6 +82,7 @@ pub async fn insert_document(
                 && !fields.contains_key(&field_def.name)
             {
                 match state.sequence_registry.nextval_formatted(
+                    database_id.as_u64(),
                     tenant_id.as_u64(),
                     seq_name,
                     "",

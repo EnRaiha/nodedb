@@ -133,7 +133,7 @@ pub fn validate(
         }
         CatalogEntry::PutSequence(stored) => {
             let current = catalog
-                .get_sequence(stored.tenant_id, &stored.name)
+                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
             validate_one(
@@ -374,7 +374,7 @@ mod tests {
     fn validate_acknowledges_stale_sequence_replay() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
-        let mut persisted = StoredSequence::new(1, "invoice_seq".into(), "tester".into());
+        let mut persisted = StoredSequence::new(0, 1, "invoice_seq".into(), "tester".into());
         persisted.descriptor_version = 4;
         catalog.put_sequence(&persisted).expect("seed sequence");
 

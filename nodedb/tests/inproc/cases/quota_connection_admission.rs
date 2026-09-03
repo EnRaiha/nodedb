@@ -273,8 +273,7 @@ async fn use_database_into_a_full_database_is_refused() {
         .client
         .simple_query("USE DATABASE switch_target_db")
         .await
-        .err()
-        .expect("switching into a full database must be refused");
+        .expect_err("switching into a full database must be refused");
     // `tokio_postgres::Error` displays as "db error"; the server's SQLSTATE
     // rides on the wrapped `DbError`.
     let code = refusal

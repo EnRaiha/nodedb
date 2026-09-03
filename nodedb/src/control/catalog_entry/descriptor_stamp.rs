@@ -156,7 +156,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutSequence(mut stored) => {
             let prior = catalog
-                .get_sequence(stored.tenant_id, &stored.name)
+                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|s| s.descriptor_version)
@@ -682,7 +682,7 @@ mod tests {
     fn stamp_batch_advances_repeated_sequence_mutations() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
-        let sequence = StoredSequence::new(1, "invoice_seq".into(), "tester".into());
+        let sequence = StoredSequence::new(0, 1, "invoice_seq".into(), "tester".into());
         let stamped = stamp_batch(
             vec![
                 CatalogEntry::PutSequence(Box::new(sequence.clone())),

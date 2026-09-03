@@ -15,6 +15,7 @@
 //! - triggers
 //! - retention policies
 //! - alert rules
+//! - sequences, definition and counter
 //! - continuous aggregates
 //! - materialized views
 //! - streaming materialized views
@@ -162,8 +163,8 @@ fn copy_collection_shape(
 }
 
 /// Copy the database-scoped objects that act on the clone's own collections:
-/// triggers, retention policies, alert rules, materialized views, continuous
-/// aggregates, and streaming materialized views.
+/// triggers, retention policies, alert rules, sequences, materialized views,
+/// continuous aggregates, and streaming materialized views.
 ///
 /// Each object the integrity check pairs with an owner row gets that row here,
 /// carrying the copied record's own in-band owner.
@@ -208,6 +209,36 @@ fn copy_scoped_objects(
         catalog
             .put_alert_rule(&rule)
             .map_err(|e| copy_err("alert rule", &rule.name, target, e))?;
+    }
+
+    // A `SERIAL` column's descriptor names its sequence, so the clone stamps
+    // collections that read a sequence the source owns. The counter travels
+    // with the definition: a clone restarting at START reissues identifiers the
+    // source already handed out, and rows copied up carry those identifiers.
+    for mut sequence in catalog.load_sequences_in_database(source_id)? {
+        let source_state =
+            catalog.get_sequence_state(source_id, sequence.tenant_id, &sequence.name)?;
+        sequence.database_id = target_id;
+        catalog
+            .put_sequence(&sequence)
+            .map_err(|e| copy_err("sequence", &sequence.name, target, e))?;
+        if let Some(mut state) = source_state {
+            state.database_id = target_id;
+            catalog
+                .put_sequence_state(&state)
+                .map_err(|e| copy_err("sequence state", &sequence.name, target, e))?;
+        }
+        // A sequence owner row is keyed at database 0, matching the key the
+        // sequence applier writes and the startup integrity check probes.
+        catalog
+            .put_owner(&StoredOwner {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                object_type: object_type::SEQUENCE.to_string(),
+                object_name: sequence.name.clone(),
+                tenant_id: sequence.tenant_id,
+                owner_username: sequence.owner.clone(),
+            })
+            .map_err(|e| copy_err("sequence owner", &sequence.name, target, e))?;
     }
 
     // The clone stamps a descriptor for the view's implementation-owned target
@@ -480,6 +511,57 @@ mod tests {
         assert_eq!(records[0].name, "chunks_emb_idx");
         assert_eq!(records[0].kind, IndexKind::Vector);
         assert_eq!(records[0].fields, vec!["embedding".to_string()]);
+    }
+
+    /// A `SERIAL` column's sequence must reach the clone with its counter
+    /// intact. A clone restarting at START reissues identifiers the copied-up
+    /// rows already carry.
+    #[test]
+    fn a_sequence_and_its_counter_follow_the_database_into_the_clone() {
+        use crate::control::security::catalog::sequence_types::{SequenceState, StoredSequence};
+
+        let (_dir, catalog) = open();
+        seed_source(&catalog);
+        catalog
+            .put_sequence(&StoredSequence::new(
+                SOURCE.as_u64(),
+                TENANT,
+                "chunks_id_seq".into(),
+                "cloner".into(),
+            ))
+            .expect("seed sequence");
+        catalog
+            .put_sequence_state(&SequenceState::new(
+                SOURCE.as_u64(),
+                TENANT,
+                "chunks_id_seq".into(),
+                4_200,
+                1,
+            ))
+            .expect("seed sequence state");
+
+        copy_database_metadata(&catalog, SOURCE, TARGET).expect("copy metadata");
+
+        let copied = catalog
+            .get_sequence(TARGET.as_u64(), TENANT, "chunks_id_seq")
+            .expect("read sequence")
+            .expect("the sequence must land in the target");
+        assert_eq!(copied.database_id, TARGET.as_u64());
+        assert_eq!(copied.owner, "cloner");
+
+        let state = catalog
+            .get_sequence_state(TARGET.as_u64(), TENANT, "chunks_id_seq")
+            .expect("read sequence state")
+            .expect("the counter must land in the target");
+        assert_eq!(state.current_value, 4_200);
+
+        assert!(
+            catalog
+                .get_sequence(SOURCE.as_u64(), TENANT, "chunks_id_seq")
+                .expect("read source sequence")
+                .is_some(),
+            "the source keeps its sequence"
+        );
     }
 
     #[test]

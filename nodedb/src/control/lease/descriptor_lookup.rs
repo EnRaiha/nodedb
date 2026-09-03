@@ -62,7 +62,7 @@ pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<Descript
         )),
 
         CatalogEntry::PutSequence(stored) => Some(DescriptorId::new(
-            DatabaseId::DEFAULT.as_u64(),
+            stored.database_id,
             stored.tenant_id,
             DescriptorKind::Sequence,
             stored.name.clone(),
@@ -206,14 +206,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutSequence(stored) => {
             let prior = catalog
-                .get_sequence(stored.tenant_id, &stored.name)
+                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|s| s.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
-                    DatabaseId::DEFAULT.as_u64(),
+                    stored.database_id,
                     stored.tenant_id,
                     DescriptorKind::Sequence,
                     stored.name.clone(),

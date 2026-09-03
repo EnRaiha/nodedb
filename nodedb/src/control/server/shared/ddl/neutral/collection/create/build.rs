@@ -300,7 +300,7 @@ pub async fn build_and_persist(
     propose_and_apply(state, &entry)?;
 
     log_vector_fields(name, &coll.fields);
-    create_serial_sequences(state, identity, name, &serial_fields, now)?;
+    create_serial_sequences(state, identity, database_id, name, &serial_fields, now)?;
 
     state.audit_record(
         AuditEvent::AdminAction,

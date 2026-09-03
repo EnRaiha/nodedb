@@ -342,7 +342,11 @@ impl NodeDbPgHandler {
             if let Some(collection) = &truncate_restart_collection {
                 self.state
                     .sequence_registry
-                    .restart_sequences_for_collection(tenant_id.as_u64(), collection);
+                    .restart_sequences_for_collection(
+                        task_database_id.as_u64(),
+                        tenant_id.as_u64(),
+                        collection,
+                    );
             }
 
             // --- AFTER triggers ---

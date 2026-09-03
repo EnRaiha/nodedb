@@ -315,7 +315,7 @@ mod tests {
     use crate::control::security::catalog::sequence_types::StoredSequence;
 
     fn make_handle(start: i64, inc: i64, min: i64, max: i64, cycle: bool) -> SequenceHandle {
-        let mut def = StoredSequence::new(1, "test".into(), "admin".into());
+        let mut def = StoredSequence::new(4, 1, "test".into(), "admin".into());
         def.start_value = start;
         def.increment = inc;
         def.min_value = min;

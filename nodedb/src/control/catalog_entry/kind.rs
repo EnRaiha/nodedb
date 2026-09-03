@@ -123,12 +123,13 @@ mod tests {
             "deactivate_collection"
         );
         assert_eq!(
-            CatalogEntry::PutSequence(Box::new(StoredSequence::new(1, "c".into(), "b".into())))
+            CatalogEntry::PutSequence(Box::new(StoredSequence::new(0, 1, "c".into(), "b".into())))
                 .kind(),
             "put_sequence"
         );
         assert_eq!(
             CatalogEntry::DeleteSequence {
+                database_id: 0,
                 tenant_id: 1,
                 name: "c".into()
             }

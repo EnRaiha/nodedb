@@ -20,8 +20,9 @@ use std::collections::HashMap;
 
 use crate::control::sequence::types::SequenceHandle;
 
-/// Ephemeral handles for one connection, keyed by `"{tenant_id}:{name}"`
-/// (the same key `SequenceRegistry` uses for its shared map).
+/// Ephemeral handles for one connection, keyed by
+/// `"{database_id}:{tenant_id}:{name}"` (the same key `SequenceRegistry` uses
+/// for its shared map).
 pub type EphemeralSequences = HashMap<String, SequenceHandle>;
 
 /// Run `f` against this connection's ephemeral-sequence slot, or return
@@ -65,13 +66,13 @@ mod tests {
     use crate::control::server::shared::session::conn_scope;
 
     fn def(name: &str) -> StoredSequence {
-        StoredSequence::new(1, name.to_owned(), "alice".into())
+        StoredSequence::new(4, 1, name.to_owned(), "alice".into())
     }
 
     #[tokio::test]
     async fn miss_outside_materialization_is_none() {
         conn_scope::scoped(async {
-            assert!(with_handle("1:orders_seq", |h| h.def.name.clone()).is_none());
+            assert!(with_handle("4:1:orders_seq", |h| h.def.name.clone()).is_none());
         })
         .await;
     }
@@ -80,7 +81,7 @@ mod tests {
     async fn materialize_then_reuse_the_same_handle() {
         conn_scope::scoped(async {
             let first = materialize_and_with(
-                "1:orders_seq",
+                "4:1:orders_seq",
                 || SequenceHandle::new(def("orders_seq"), None),
                 |h| h.nextval().unwrap(),
             )
@@ -90,7 +91,7 @@ mod tests {
             // A second materialize call reuses the existing handle rather
             // than resetting the counter — `make` must not run again.
             let second = materialize_and_with(
-                "1:orders_seq",
+                "4:1:orders_seq",
                 || panic!("must not re-materialize an existing handle"),
                 |h| h.nextval().unwrap(),
             )
@@ -104,19 +105,19 @@ mod tests {
     async fn clear_drops_every_handle() {
         conn_scope::scoped(async {
             materialize_and_with(
-                "1:orders_seq",
+                "4:1:orders_seq",
                 || SequenceHandle::new(def("orders_seq"), None),
                 |_| (),
             );
             clear();
-            assert!(with_handle("1:orders_seq", |h| h.def.name.clone()).is_none());
+            assert!(with_handle("4:1:orders_seq", |h| h.def.name.clone()).is_none());
         })
         .await;
     }
 
     #[test]
     fn outside_any_scope_is_inert() {
-        assert!(with_handle("1:orders_seq", |h| h.def.name.clone()).is_none());
+        assert!(with_handle("4:1:orders_seq", |h| h.def.name.clone()).is_none());
         clear();
     }
 }

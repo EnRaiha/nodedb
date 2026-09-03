@@ -580,7 +580,11 @@ async fn drop_user_reassigns_every_owner_bearing_kind_and_sweeps_grants() {
     // the separate StoredOwner rows.
     assert_eq!(
         catalog
-            .get_sequence(TENANT, "victim_seq")
+            .get_sequence(
+                nodedb_types::DatabaseId::DEFAULT.as_u64(),
+                TENANT,
+                "victim_seq"
+            )
             .unwrap()
             .unwrap()
             .owner,

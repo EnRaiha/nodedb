@@ -246,7 +246,7 @@ fn primary_row_owner(
             })
             .map(|stored| stored.owner),
         object_type::SEQUENCE => catalog
-            .get_sequence(tenant_id, name)
+            .get_sequence(database_id, tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),

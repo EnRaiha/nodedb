@@ -19,15 +19,16 @@
 
 use crate::control::security::catalog::SystemCatalog;
 
-/// Enumerate implicit sequences owned by `(tenant_id, collection)`.
-/// Returns sequence names only.
+/// Enumerate implicit sequences owned by `(database_id, tenant_id,
+/// collection)`. Returns sequence names only.
 pub fn find_implicit_sequences(
     catalog: &SystemCatalog,
+    database_id: u64,
     tenant_id: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
     let prefix = format!("{collection}_");
-    let all = catalog.load_sequences_for_tenant(tenant_id)?;
+    let all = catalog.load_sequences_for_tenant(database_id, tenant_id)?;
     let mut out: Vec<String> = all
         .into_iter()
         .filter_map(|s| {
@@ -54,32 +55,44 @@ mod tests {
         (cat, tmp)
     }
 
-    fn seq(tenant: u64, name: &str) -> StoredSequence {
-        StoredSequence::new(tenant, name.to_string(), "o".into())
+    fn seq(database: u64, tenant: u64, name: &str) -> StoredSequence {
+        StoredSequence::new(database, tenant, name.to_string(), "o".into())
     }
 
     #[test]
     fn matches_implicit_serial_pattern() {
         let (c, _t) = cat();
-        c.put_sequence(&seq(1, "users_id_seq")).unwrap();
-        c.put_sequence(&seq(1, "users_created_at_seq")).unwrap();
-        c.put_sequence(&seq(1, "orders_id_seq")).unwrap();
-        let found = find_implicit_sequences(&c, 1, "users").unwrap();
+        c.put_sequence(&seq(4, 1, "users_id_seq")).unwrap();
+        c.put_sequence(&seq(4, 1, "users_created_at_seq")).unwrap();
+        c.put_sequence(&seq(4, 1, "orders_id_seq")).unwrap();
+        let found = find_implicit_sequences(&c, 4, 1, "users").unwrap();
         assert_eq!(found, vec!["users_created_at_seq", "users_id_seq"]);
     }
 
     #[test]
     fn skips_cross_tenant() {
         let (c, _t) = cat();
-        c.put_sequence(&seq(1, "users_id_seq")).unwrap();
-        c.put_sequence(&seq(2, "users_id_seq")).unwrap();
-        assert_eq!(find_implicit_sequences(&c, 2, "users").unwrap().len(), 1);
+        c.put_sequence(&seq(4, 1, "users_id_seq")).unwrap();
+        c.put_sequence(&seq(4, 2, "users_id_seq")).unwrap();
+        assert_eq!(find_implicit_sequences(&c, 4, 2, "users").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn skips_another_database() {
+        let (c, _t) = cat();
+        c.put_sequence(&seq(4, 1, "users_id_seq")).unwrap();
+        c.put_sequence(&seq(5, 1, "users_id_seq")).unwrap();
+        assert_eq!(find_implicit_sequences(&c, 5, 1, "users").unwrap().len(), 1);
     }
 
     #[test]
     fn ignores_non_seq_suffix() {
         let (c, _t) = cat();
-        c.put_sequence(&seq(1, "users_id_counter")).unwrap();
-        assert!(find_implicit_sequences(&c, 1, "users").unwrap().is_empty());
+        c.put_sequence(&seq(4, 1, "users_id_counter")).unwrap();
+        assert!(
+            find_implicit_sequences(&c, 4, 1, "users")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

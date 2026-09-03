@@ -121,6 +121,7 @@ mod tests {
 
     fn sample_entry(name: &str) -> CatalogEntry {
         CatalogEntry::DeleteSequence {
+            database_id: 0,
             tenant_id: 1,
             name: name.to_string(),
         }

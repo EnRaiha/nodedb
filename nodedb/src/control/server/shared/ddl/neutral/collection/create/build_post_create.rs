@@ -7,6 +7,7 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::super::catalog::propose_and_apply;
 use super::super::super::super::result::DdlError;
@@ -32,6 +33,7 @@ pub(super) fn log_vector_fields(collection_name: &str, fields: &[(String, String
 pub(super) fn create_serial_sequences(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection_name: &str,
     serial_fields: &[String],
     now: u64,
@@ -39,6 +41,7 @@ pub(super) fn create_serial_sequences(
     for field_name in serial_fields {
         let seq_name = format!("{collection_name}_{field_name}_seq");
         let mut seq_def = crate::control::security::catalog::sequence_types::StoredSequence::new(
+            database_id.as_u64(),
             identity.tenant_id.as_u64(),
             seq_name.clone(),
             identity.username.clone(),

@@ -63,6 +63,7 @@ mod tests {
 
     fn sample_entry() -> CatalogEntry {
         CatalogEntry::DeleteSequence {
+            database_id: 0,
             tenant_id: 1,
             name: "replicate-helper".to_string(),
         }

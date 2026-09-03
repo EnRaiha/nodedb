@@ -145,6 +145,7 @@ mod tests {
     #[test]
     fn non_collection_entries_are_not_targets() {
         let batch = vec![buffered(CatalogEntry::DeleteSequence {
+            database_id: 0,
             tenant_id: TENANT,
             name: "orders_seq".to_owned(),
         })];

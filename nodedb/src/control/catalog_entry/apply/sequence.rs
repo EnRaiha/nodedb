@@ -10,8 +10,8 @@ pub fn put(stored: &StoredSequence, catalog: &SystemCatalog) -> crate::Result<()
     catalog.put_sequence(stored).map_err(|e| {
         catalog_err(
             &format!(
-                "put_sequence '{}' (tenant {})",
-                stored.name, stored.tenant_id
+                "put_sequence '{}' (database {}, tenant {})",
+                stored.name, stored.database_id, stored.tenant_id
             ),
             e,
         )
@@ -25,10 +25,20 @@ pub fn put(stored: &StoredSequence, catalog: &SystemCatalog) -> crate::Result<()
     )
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
+pub fn delete(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
     catalog
-        .delete_sequence(tenant_id, name)
-        .map_err(|e| catalog_err(&format!("delete_sequence '{name}' (tenant {tenant_id})"), e))?;
+        .delete_sequence(database_id, tenant_id, name)
+        .map_err(|e| {
+            catalog_err(
+                &format!("delete_sequence '{name}' (database {database_id}, tenant {tenant_id})"),
+                e,
+            )
+        })?;
     super::owner::delete_parent_owner(object_type::SEQUENCE, tenant_id, name, catalog)
 }
 
@@ -38,8 +48,8 @@ pub fn put_state(state: &SequenceState, catalog: &SystemCatalog) -> crate::Resul
     catalog.put_sequence_state(state).map_err(|e| {
         catalog_err(
             &format!(
-                "put_sequence_state '{}' (tenant {})",
-                state.name, state.tenant_id
+                "put_sequence_state '{}' (database {}, tenant {})",
+                state.name, state.database_id, state.tenant_id
             ),
             e,
         )
@@ -68,11 +78,12 @@ mod tests {
 
     #[test]
     fn roundtrip_put_sequence() {
-        let seq = StoredSequence::new(1, "counter".into(), "bob".into());
+        let seq = StoredSequence::new(3, 1, "counter".into(), "bob".into());
         let entry = CatalogEntry::PutSequence(Box::new(seq));
         let bytes = encode(&entry).unwrap();
         match decode(&bytes).unwrap() {
             CatalogEntry::PutSequence(s) => {
+                assert_eq!(s.database_id, 3);
                 assert_eq!(s.tenant_id, 1);
                 assert_eq!(s.name, "counter");
                 assert_eq!(s.owner, "bob");
@@ -84,12 +95,18 @@ mod tests {
     #[test]
     fn roundtrip_delete_sequence() {
         let entry = CatalogEntry::DeleteSequence {
+            database_id: 3,
             tenant_id: 42,
             name: "gone".into(),
         };
         let bytes = encode(&entry).unwrap();
         match decode(&bytes).unwrap() {
-            CatalogEntry::DeleteSequence { tenant_id, name } => {
+            CatalogEntry::DeleteSequence {
+                database_id,
+                tenant_id,
+                name,
+            } => {
+                assert_eq!(database_id, 3);
                 assert_eq!(tenant_id, 42);
                 assert_eq!(name, "gone");
             }
@@ -102,17 +119,18 @@ mod tests {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
 
-        let seq = StoredSequence::new(1, "orders_id_seq".into(), "alice".into());
+        let seq = StoredSequence::new(3, 1, "orders_id_seq".into(), "alice".into());
         apply_to(&CatalogEntry::PutSequence(Box::new(seq)), catalog).expect("apply put_sequence");
 
         let loaded = catalog
-            .get_sequence(1, "orders_id_seq")
+            .get_sequence(3, 1, "orders_id_seq")
             .unwrap()
             .expect("present");
         assert_eq!(loaded.name, "orders_id_seq");
 
         apply_to(
             &CatalogEntry::DeleteSequence {
+                database_id: 3,
                 tenant_id: 1,
                 name: "orders_id_seq".into(),
             },
@@ -120,6 +138,11 @@ mod tests {
         )
         .expect("apply delete_sequence");
 
-        assert!(catalog.get_sequence(1, "orders_id_seq").unwrap().is_none());
+        assert!(
+            catalog
+                .get_sequence(3, 1, "orders_id_seq")
+                .unwrap()
+                .is_none()
+        );
     }
 }

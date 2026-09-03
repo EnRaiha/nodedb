@@ -189,12 +189,17 @@ pub(super) async fn try_typed(
             // planner today (the pgwire guard returned None and no create arm
             // matched `if_not_exists: true`). Replicate by returning None.
             let tenant_id = identity.tenant_id.as_u64();
-            if *if_not_exists && !state.sequence_registry.exists(tenant_id, name) {
+            if *if_not_exists
+                && !state
+                    .sequence_registry
+                    .exists(database_id.as_u64(), tenant_id, name)
+            {
                 return None;
             }
             Some(sequence::create_sequence(
                 state,
                 identity,
+                database_id,
                 &CreateSequenceRequest {
                     name,
                     if_not_exists: *if_not_exists,
@@ -219,22 +224,23 @@ pub(super) async fn try_typed(
         }) => Some(sequence::alter_sequence(
             state,
             identity,
+            database_id,
             name,
             action,
             with_value.as_deref(),
         )),
 
-        NodedbStatement::Collection(CollectionStmt::DropSequence { name, if_exists }) => {
-            Some(sequence::drop_sequence(state, identity, name, *if_exists))
-        }
+        NodedbStatement::Collection(CollectionStmt::DropSequence { name, if_exists }) => Some(
+            sequence::drop_sequence(state, identity, database_id, name, *if_exists),
+        ),
 
         NodedbStatement::Collection(CollectionStmt::ShowSequences) => {
-            Some(sequence::show_sequences(state, identity))
+            Some(sequence::show_sequences(state, identity, database_id))
         }
 
-        NodedbStatement::Collection(CollectionStmt::DescribeSequence { name }) => {
-            Some(sequence::describe_sequence(state, identity, name))
-        }
+        NodedbStatement::Collection(CollectionStmt::DescribeSequence { name }) => Some(
+            sequence::describe_sequence(state, identity, database_id, name),
+        ),
 
         // `ALTER COLLECTION <name> <operation>` for every typed
         // `AlterCollectionOp` variant (ADD/DROP/RENAME/ALTER COLUMN, OWNER TO,

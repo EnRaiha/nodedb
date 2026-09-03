@@ -155,7 +155,13 @@ fn per_kind_finders_match_orchestrator() {
     put_targeted_schedule(&catalog, "sch_books", "books");
 
     assert_eq!(
-        find_implicit_sequences(&catalog, TENANT, "books").unwrap(),
+        find_implicit_sequences(
+            &catalog,
+            nodedb::types::DatabaseId::DEFAULT.as_u64(),
+            TENANT,
+            "books"
+        )
+        .unwrap(),
         vec!["books_id_seq"]
     );
     assert_eq!(

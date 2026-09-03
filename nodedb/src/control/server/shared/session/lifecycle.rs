@@ -108,10 +108,11 @@ pub async fn run_rollback(
             crate::control::sequence::log::log_reservation(
                 catalog,
                 &crate::control::sequence::log::rolled_back(
-                    key,
+                    &handle.name,
                     handle.value,
                     &identity.username,
-                    identity.tenant_id.as_u64(),
+                    handle.database_id,
+                    handle.tenant_id,
                 ),
             );
         }

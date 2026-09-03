@@ -161,7 +161,12 @@ pub fn make_mv_sourced(name: &str, source: &str) -> StoredMaterializedView {
 }
 
 pub fn make_sequence(name: &str) -> StoredSequence {
-    StoredSequence::new(TENANT, name.into(), ADMIN.into())
+    StoredSequence::new(
+        DatabaseId::DEFAULT.as_u64(),
+        TENANT,
+        name.into(),
+        ADMIN.into(),
+    )
 }
 
 pub fn make_schedule(name: &str) -> ScheduleDef {

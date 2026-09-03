@@ -78,6 +78,7 @@ pub enum CatalogEntry {
     /// DROP SEQUENCE, and the DROP COLLECTION cascade that removes implicit
     /// `{coll}_{field}_seq` sequences for SERIAL columns.
     DeleteSequence {
+        database_id: u64,
         tenant_id: u64,
         name: String,
     },

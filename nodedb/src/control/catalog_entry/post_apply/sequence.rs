@@ -22,6 +22,7 @@ pub fn put(stored: StoredSequence, shared: Arc<SharedState>) {
     if let Err(e) = shared.sequence_registry.create(stored.clone()) {
         debug!(
             sequence = %stored.name,
+            database = stored.database_id,
             tenant = stored.tenant_id,
             error = %e,
             "catalog_entry: sequence_registry create (ignored — already exists?)"
@@ -29,10 +30,14 @@ pub fn put(stored: StoredSequence, shared: Arc<SharedState>) {
     }
 }
 
-pub fn delete(tenant_id: u64, name: String, shared: Arc<SharedState>) {
-    if let Err(e) = shared.sequence_registry.remove(tenant_id, &name) {
+pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<SharedState>) {
+    if let Err(e) = shared
+        .sequence_registry
+        .remove(database_id, tenant_id, &name)
+    {
         debug!(
             sequence = %name,
+            database = database_id,
             tenant = tenant_id,
             error = %e,
             "catalog_entry: sequence_registry remove (ignored)"
@@ -47,13 +52,15 @@ pub fn put_state(state: SequenceState, shared: Arc<SharedState>) {
     // ALTER SEQUENCE RESTART ships a fresh `SequenceState`;
     // replicate the counter into the in-memory registry handle so
     // `NEXTVAL` on every node returns from the new value.
-    if let Err(e) =
-        shared
-            .sequence_registry
-            .restart(state.tenant_id, &state.name, state.current_value)
-    {
+    if let Err(e) = shared.sequence_registry.restart(
+        state.database_id,
+        state.tenant_id,
+        &state.name,
+        state.current_value,
+    ) {
         debug!(
             sequence = %state.name,
+            database = state.database_id,
             tenant = state.tenant_id,
             error = %e,
             "catalog_entry: sequence_registry restart (ignored — sequence may be missing on fresh follower)"

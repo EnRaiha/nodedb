@@ -14,6 +14,7 @@ use crate::control::security::catalog::sequence_types::StoredSequence;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::catalog::propose_and_apply;
 use super::super::result::{DdlError, DdlResult};
@@ -56,18 +57,25 @@ fn status(command: &str) -> Vec<DdlResult> {
 pub fn create_sequence(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     req: &CreateSequenceRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
+    let db = database_id.as_u64();
 
     // IF NOT EXISTS: swallow duplicate-creation (folded from the pgwire guard).
     // Placed before any building so an existing sequence returns the tag
     // without option parsing — matching the guard's behavior exactly.
-    if req.if_not_exists && state.sequence_registry.exists(tenant_id, req.name) {
+    if req.if_not_exists && state.sequence_registry.exists(db, tenant_id, req.name) {
         return Ok(status("CREATE SEQUENCE"));
     }
 
-    let mut def = StoredSequence::new(tenant_id, req.name.to_string(), identity.username.clone());
+    let mut def = StoredSequence::new(
+        db,
+        tenant_id,
+        req.name.to_string(),
+        identity.username.clone(),
+    );
 
     if let Some(s) = req.start {
         def.start_value = s;
@@ -113,7 +121,7 @@ pub fn create_sequence(
     def.validate()
         .map_err(|e| DdlError::new("42P17", e.to_string()))?;
 
-    if state.sequence_registry.exists(tenant_id, &def.name) {
+    if state.sequence_registry.exists(db, tenant_id, &def.name) {
         return Err(DdlError::new(
             "42P07",
             format!("sequence \"{}\" already exists", def.name),
@@ -138,13 +146,15 @@ pub fn create_sequence(
 pub fn alter_sequence(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     action: &str,
     with_value: Option<&str>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
+    let db = database_id.as_u64();
 
-    if !state.sequence_registry.exists(tenant_id, name) {
+    if !state.sequence_registry.exists(db, tenant_id, name) {
         return Err(DdlError::new(
             "42P01",
             format!("sequence \"{name}\" does not exist"),
@@ -152,8 +162,8 @@ pub fn alter_sequence(
     }
 
     match action.to_uppercase().as_str() {
-        "RESTART" => alter_restart(state, tenant_id, name, with_value),
-        "FORMAT" => alter_format(state, tenant_id, name, with_value),
+        "RESTART" => alter_restart(state, db, tenant_id, name, with_value),
+        "FORMAT" => alter_format(state, db, tenant_id, name, with_value),
         _ => Err(DdlError::new(
             "42601",
             "ALTER SEQUENCE supports: RESTART [WITH value], FORMAT 'template'",
@@ -164,6 +174,7 @@ pub fn alter_sequence(
 /// `ALTER SEQUENCE <name> RESTART [WITH <value>]`
 fn alter_restart(
     state: &SharedState,
+    database_id: u64,
     tenant_id: u64,
     name: &str,
     with_value: Option<&str>,
@@ -173,7 +184,7 @@ fn alter_restart(
     } else {
         state
             .sequence_registry
-            .get_def(tenant_id, name)
+            .get_def(database_id, tenant_id, name)
             .map(|d| d.start_value)
             .unwrap_or(1)
     };
@@ -183,12 +194,13 @@ fn alter_restart(
     // registry converges on the new counter value.
     let def = state
         .sequence_registry
-        .get_def(tenant_id, name)
+        .get_def(database_id, tenant_id, name)
         .ok_or(DdlError::new(
             "42P01",
             format!("sequence \"{name}\" does not exist"),
         ))?;
     let new_state = crate::control::security::catalog::sequence_types::SequenceState {
+        database_id,
         tenant_id,
         name: name.to_string(),
         current_value: restart_value,
@@ -202,7 +214,7 @@ fn alter_restart(
     if outcome.needs_local_apply() {
         state
             .sequence_registry
-            .restart(tenant_id, name, restart_value)
+            .restart(database_id, tenant_id, name, restart_value)
             .map_err(|e| DdlError::new("22023", e.to_string()))?;
         {
             let catalog = state.credentials.catalog();
@@ -216,6 +228,7 @@ fn alter_restart(
 /// `ALTER SEQUENCE <name> FORMAT '<template>'`
 fn alter_format(
     state: &SharedState,
+    database_id: u64,
     tenant_id: u64,
     name: &str,
     with_value: Option<&str>,
@@ -230,12 +243,15 @@ fn alter_format(
     // FORMAT alters the stored *definition*, not the counter — ship the whole
     // updated `StoredSequence` through `PutSequence` and let every node's
     // applier replace it in redb + registry.
-    if let Some(mut def) = state.sequence_registry.get_def(tenant_id, name) {
+    if let Some(mut def) = state
+        .sequence_registry
+        .get_def(database_id, tenant_id, name)
+    {
         def.format_template = Some(tokens);
         let entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(def.clone()));
         let outcome = propose_and_apply(state, &entry)?;
         if outcome.needs_local_apply() {
-            let _ = state.sequence_registry.remove(tenant_id, name);
+            let _ = state.sequence_registry.remove(database_id, tenant_id, name);
             let _ = state.sequence_registry.create(def);
         }
     }
@@ -250,12 +266,14 @@ fn alter_format(
 pub fn drop_sequence(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     if_exists: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
+    let db = database_id.as_u64();
 
-    if !state.sequence_registry.exists(tenant_id, name) {
+    if !state.sequence_registry.exists(db, tenant_id, name) {
         if if_exists {
             return Ok(status("DROP SEQUENCE"));
         }
@@ -268,6 +286,7 @@ pub fn drop_sequence(
     // Propose the delete through the metadata raft group. Every node's applier
     // removes the record from local redb and from its in-memory registry.
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteSequence {
+        database_id: db,
         tenant_id,
         name: name.to_string(),
     };
@@ -277,9 +296,9 @@ pub fn drop_sequence(
         // Single-node / no-cluster fallback.
         {
             let catalog = state.credentials.catalog();
-            let _ = catalog.delete_sequence(tenant_id, name);
+            let _ = catalog.delete_sequence(db, tenant_id, name);
         }
-        let _ = state.sequence_registry.remove(tenant_id, name);
+        let _ = state.sequence_registry.remove(db, tenant_id, name);
     }
 
     state.schema_version.bump();
@@ -288,12 +307,18 @@ pub fn drop_sequence(
 }
 
 /// Handle `SHOW SEQUENCES`.
+///
+/// Lists only the sequences of the session's current database. A sequence name
+/// is unique per database, so two databases can each hold their own.
 pub fn show_sequences(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let sequences = state.sequence_registry.list(tenant_id);
+    let sequences = state
+        .sequence_registry
+        .list(database_id.as_u64(), tenant_id);
 
     let columns = vec![
         "name".to_string(),
@@ -325,10 +350,11 @@ pub fn show_sequences(
     })])
 }
 
-/// Handle `DESCRIBE SEQUENCE <name>`.
+/// Handle `DESCRIBE SEQUENCE <name>`, resolved in the current database.
 pub fn describe_sequence(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -336,7 +362,7 @@ pub fn describe_sequence(
 
     let def = state
         .sequence_registry
-        .get_def(tenant_id, &name)
+        .get_def(database_id.as_u64(), tenant_id, &name)
         .ok_or(DdlError::new(
             "42P01",
             format!("sequence \"{name}\" does not exist"),

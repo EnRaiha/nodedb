@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct RangeAllocationRequest {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub sequence_name: String,
     /// How many values to allocate in this chunk.
@@ -33,6 +34,7 @@ pub struct RangeAllocationRequest {
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct GapFreeAdvanceRequest {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub sequence_name: String,
     /// The value being reserved (must match the local counter advance).
@@ -75,6 +77,7 @@ impl RangeAllocator {
     pub fn allocate_chunk(
         &self,
         state: &crate::control::state::SharedState,
+        database_id: u64,
         tenant_id: u64,
         sequence_name: &str,
         increment: i64,
@@ -85,6 +88,7 @@ impl RangeAllocator {
         // In cluster mode, propose through Raft for distributed uniqueness.
         if let Some(proposer) = state.raft_proposer.get() {
             let request = RangeAllocationRequest {
+                database_id,
                 tenant_id,
                 sequence_name: sequence_name.to_string(),
                 chunk_size,
@@ -106,7 +110,7 @@ impl RangeAllocator {
             // The Raft commit handler will advance the global counter.
             let current = state
                 .sequence_registry
-                .get_def(tenant_id, sequence_name)
+                .get_def(database_id, tenant_id, sequence_name)
                 .map(|d| d.start_value)
                 .unwrap_or(1);
 
@@ -126,7 +130,9 @@ impl RangeAllocator {
 
         // Single-node mode: allocate directly from the local counter.
         // No Raft needed — just advance the counter by chunk_size.
-        let handle_exists = state.sequence_registry.exists(tenant_id, sequence_name);
+        let handle_exists = state
+            .sequence_registry
+            .exists(database_id, tenant_id, sequence_name);
         if !handle_exists {
             return Err(crate::Error::BadRequest {
                 detail: format!("sequence \"{sequence_name}\" does not exist"),
@@ -135,7 +141,7 @@ impl RangeAllocator {
 
         let current_val = state
             .sequence_registry
-            .currval(tenant_id, sequence_name)
+            .currval(database_id, tenant_id, sequence_name)
             .unwrap_or(0);
 
         let range_start = current_val + increment;
@@ -156,6 +162,7 @@ impl RangeAllocator {
     pub fn propose_gap_free_advance(
         &self,
         state: &crate::control::state::SharedState,
+        database_id: u64,
         tenant_id: u64,
         sequence_name: &str,
         reserved_value: i64,
@@ -167,6 +174,7 @@ impl RangeAllocator {
         };
 
         let request = GapFreeAdvanceRequest {
+            database_id,
             tenant_id,
             sequence_name: sequence_name.to_string(),
             reserved_value,
@@ -200,6 +208,7 @@ mod tests {
     #[test]
     fn request_roundtrip() {
         let req = RangeAllocationRequest {
+            database_id: 7,
             tenant_id: 1,
             sequence_name: "order_seq".into(),
             chunk_size: 10_000,
@@ -207,6 +216,7 @@ mod tests {
         };
         let bytes = zerompk::to_msgpack_vec(&req).unwrap();
         let decoded: RangeAllocationRequest = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.database_id, 7);
         assert_eq!(decoded.sequence_name, "order_seq");
         assert_eq!(decoded.chunk_size, 10_000);
     }

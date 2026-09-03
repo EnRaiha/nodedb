@@ -332,13 +332,13 @@ pub fn drop_collection(
 
     // Cascade: drop implicit sequences (SERIAL/BIGSERIAL fields create {coll}_{field}_seq).
     let catalog = state.credentials.catalog();
-    if let Ok(seqs) = catalog.load_sequences_for_tenant(tenant_id.as_u64()) {
+    if let Ok(seqs) = catalog.load_sequences_for_tenant(database_id.as_u64(), tenant_id.as_u64()) {
         let prefix = format!("{name}_");
         let suffix = "_seq";
         for seq in &seqs {
             if seq.name.starts_with(&prefix) && seq.name.ends_with(suffix) {
                 catalog
-                    .delete_sequence(tenant_id.as_u64(), &seq.name)
+                    .delete_sequence(database_id.as_u64(), tenant_id.as_u64(), &seq.name)
                     .map_err(|e| {
                         err(
                             "XX000",
@@ -347,9 +347,11 @@ pub fn drop_collection(
                     })?;
                 // Best-effort: registry removal is non-critical since catalog
                 // is the source of truth and the sequence won't be reloaded.
-                let _ = state
-                    .sequence_registry
-                    .remove(tenant_id.as_u64(), &seq.name);
+                let _ = state.sequence_registry.remove(
+                    database_id.as_u64(),
+                    tenant_id.as_u64(),
+                    &seq.name,
+                );
             }
         }
     }

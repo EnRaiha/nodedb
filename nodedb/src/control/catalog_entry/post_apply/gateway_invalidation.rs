@@ -527,6 +527,7 @@ mod tests {
             &shared,
             &cache,
             CatalogEntry::DeleteSequence {
+                database_id: 0,
                 tenant_id: 1,
                 name: "seq".into(),
             },
@@ -538,6 +539,7 @@ mod tests {
             &shared,
             &cache,
             CatalogEntry::PutSequence(Box::new(StoredSequence::new(
+                0,
                 1,
                 "seq2".into(),
                 "alice".into(),

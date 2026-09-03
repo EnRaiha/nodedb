@@ -222,7 +222,11 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             tenant_id,
             name,
         },
-        OwnerKind::Sequence => CatalogEntry::DeleteSequence { tenant_id, name },
+        OwnerKind::Sequence => CatalogEntry::DeleteSequence {
+            database_id: owner.database_id,
+            tenant_id,
+            name,
+        },
         OwnerKind::Schedule => CatalogEntry::DeleteSchedule {
             database_id: crate::types::DatabaseId::new(owner.database_id),
             tenant_id,
