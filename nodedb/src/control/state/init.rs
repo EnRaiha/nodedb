@@ -336,14 +336,6 @@ impl SharedState {
                         .create_with_backend(redb::backends::InMemoryBackend::new())
                         .expect("failed to create test schema_registry db"),
                 );
-                {
-                    let txn = db.begin_write().expect("schema_registry init txn");
-                    txn.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                        "array_schema_docs",
-                    ))
-                    .expect("schema_registry init table");
-                    txn.commit().expect("schema_registry init commit");
-                }
                 let replica_id = nodedb_array::sync::ReplicaId::new(0);
                 let hlc_gen =
                     std::sync::Arc::new(nodedb_array::sync::HlcGenerator::new(replica_id));

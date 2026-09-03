@@ -65,7 +65,7 @@ impl SystemCatalog {
         Ok(inserted)
     }
 
-    /// Delete a consumer group. Legacy unscoped records belong to DEFAULT.
+    /// Delete a consumer group.
     pub fn delete_consumer_group(
         &self,
         database_id: DatabaseId,
@@ -78,7 +78,7 @@ impl SystemCatalog {
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
-        let mut existed;
+        let existed;
         {
             let mut table = write_txn
                 .open_table(CONSUMER_GROUPS)
@@ -87,13 +87,6 @@ impl SystemCatalog {
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("delete consumer_group", e))?
                 .is_some();
-            if database_id == DatabaseId::DEFAULT {
-                let legacy = legacy_group_key(tenant_id, stream, group);
-                existed |= table
-                    .remove(legacy.as_str())
-                    .map_err(|e| catalog_err("delete legacy consumer_group", e))?
-                    .is_some();
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -132,18 +125,11 @@ impl SystemCatalog {
             let _ = table
                 .remove(legacy_key.as_str())
                 .map_err(|e| catalog_err("delete consumer_group", e))?;
-            if def.database_id == DatabaseId::DEFAULT {
-                let legacy_key = legacy_group_key(def.tenant_id, legacy_stream, &def.name);
-                let _ = table
-                    .remove(legacy_key.as_str())
-                    .map_err(|e| catalog_err("delete legacy consumer_group", e))?;
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
-    /// Load all groups while preferring v2 rows over a legacy DEFAULT row with
-    /// the same logical identity.
+    /// Load every durable consumer group definition.
     pub fn load_all_consumer_groups(&self) -> crate::Result<Vec<ConsumerGroupDef>> {
         let read_txn = self
             .db
@@ -157,21 +143,15 @@ impl SystemCatalog {
         let mut range = table
             .range(..)
             .map_err(|e| catalog_err("range consumer_groups", e))?;
-        while let Some(Ok((key, value))) = range.next() {
-            if let Some(mut def) = decode_consumer_group(value.value()) {
-                let is_v2 = key.value().starts_with("v2:");
-                if !is_v2 {
-                    def.database_id = DatabaseId::DEFAULT;
-                }
+        while let Some(Ok((_, value))) = range.next() {
+            if let Some(def) = decode_consumer_group(value.value()) {
                 let identity = (
                     def.database_id,
                     def.tenant_id,
                     def.stream_name.clone(),
                     def.name.clone(),
                 );
-                if is_v2 || !groups.contains_key(&identity) {
-                    groups.insert(identity, def);
-                }
+                groups.insert(identity, def);
             }
         }
         Ok(groups.into_values().collect())
@@ -185,10 +165,6 @@ fn group_key(database_id: DatabaseId, tenant_id: u64, stream: &str, group: &str)
         stream.len(),
         group.len()
     )
-}
-
-fn legacy_group_key(tenant_id: u64, stream: &str, group: &str) -> String {
-    format!("{tenant_id}:{stream}:{group}")
 }
 
 /// Positional wire shape written before consumer groups adopted map encoding.
@@ -299,38 +275,5 @@ mod tests {
         let groups = catalog.load_all_consumer_groups().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, def.name);
-    }
-
-    #[test]
-    fn legacy_default_group_is_loaded_and_deleted() {
-        let catalog = make_catalog();
-        let legacy = LegacyConsumerGroupDef {
-            tenant_id: 1,
-            name: "analytics".into(),
-            stream_name: "orders".into(),
-            owner: "admin".into(),
-            created_at: 0,
-        };
-        let bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(CONSUMER_GROUPS).unwrap();
-            table
-                .insert(
-                    legacy_group_key(1, "orders", "analytics").as_str(),
-                    bytes.as_slice(),
-                )
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        assert_eq!(
-            catalog.load_all_consumer_groups().unwrap()[0].database_id,
-            DatabaseId::DEFAULT
-        );
-        assert!(
-            catalog
-                .delete_consumer_group(DatabaseId::DEFAULT, 1, "orders", "analytics")
-                .unwrap()
-        );
     }
 }

@@ -40,19 +40,19 @@ use tracing::{debug, warn};
 pub struct ArraySubscriberState {
     /// The sync session this subscriber belongs to.
     pub session_id: String,
-    /// Database namespace of the subscribed array. Missing legacy values are
-    /// DEFAULT and are read only after V3 and then V2 both miss.
+    /// Database namespace of the subscribed array. A missing value decodes as
+    /// DEFAULT.
     #[serde(default = "default_database_id")]
     pub database_id: DatabaseId,
-    /// Authenticated tenant namespace of the subscribed array. Missing legacy
-    /// values are tenant 0 and can only be read through compatible old keys.
+    /// Authenticated tenant namespace of the subscribed array. A missing value
+    /// decodes as tenant 0.
     #[serde(default)]
     pub tenant_id: u64,
     /// The array being subscribed.
     pub array_name: String,
     /// Highest HLC whose op has been confirmed-enqueued to this subscriber.
     ///
-    /// `Hlc::ZERO` on first registration (triggers full backfill in Phase H).
+    /// `Hlc::ZERO` on first registration, which triggers a full backfill.
     pub last_pushed_hlc: Hlc,
     /// Optional coordinate range filter. `None` = all ops on the array.
     pub coord_range: Option<ArrayCoordRange>,
@@ -301,17 +301,6 @@ impl SubscriberStore {
         )
     }
 
-    fn v2_cursor_key(session_id: &str, database_id: DatabaseId, array_name: &str) -> String {
-        format!(
-            "array.subscriber:v2:{session_id}:{}:{array_name}",
-            database_id.as_u64()
-        )
-    }
-
-    fn legacy_cursor_key(session_id: &str, array_name: &str) -> String {
-        format!("array.subscriber:{session_id}:{array_name}")
-    }
-
     /// Persist a subscriber cursor.
     fn save(&self, state: &ArraySubscriberState) -> crate::Result<()> {
         let key = Self::cursor_key(
@@ -360,22 +349,7 @@ impl SubscriberStore {
         let key = Self::cursor_key(session_id, database_id, tenant_id, array_name);
         let txn = self.db.begin_read().ok()?;
         let table = txn.open_table(CURSOR_TABLE).ok()?;
-        let bytes = match table.get(key.as_str()).ok()? {
-            Some(entry) => entry.value().to_vec(),
-            None if tenant_id == 0 => match table
-                .get(Self::v2_cursor_key(session_id, database_id, array_name).as_str())
-                .ok()?
-            {
-                Some(entry) => entry.value().to_vec(),
-                None if database_id == DatabaseId::DEFAULT => table
-                    .get(Self::legacy_cursor_key(session_id, array_name).as_str())
-                    .ok()??
-                    .value()
-                    .to_vec(),
-                None => return None,
-            },
-            None => return None,
-        };
+        let bytes = table.get(key.as_str()).ok()??.value().to_vec();
         let mut state: ArraySubscriberState = zerompk::from_msgpack(&bytes).ok()?;
         state.database_id = database_id;
         state.tenant_id = tenant_id;
@@ -385,9 +359,7 @@ impl SubscriberStore {
     /// Delete all cursors for a given session (disconnect cleanup).
     fn delete_session(&self, session_id: &str) {
         use redb::ReadableTable;
-        let legacy_prefix = format!("array.subscriber:{session_id}:");
-        let v2_prefix = format!("array.subscriber:v2:{session_id}:");
-        let v3_prefix = format!("array.subscriber:v3:{session_id}:");
+        let prefix = format!("array.subscriber:v3:{session_id}:");
         let Ok(txn) = self.db.begin_write() else {
             return;
         };
@@ -403,14 +375,7 @@ impl SubscriberStore {
             .filter_map(|entry| {
                 let (k, _) = entry.ok()?;
                 let key: &str = k.value();
-                if key.starts_with(&legacy_prefix)
-                    || key.starts_with(&v2_prefix)
-                    || key.starts_with(&v3_prefix)
-                {
-                    Some(key.to_string())
-                } else {
-                    None
-                }
+                key.starts_with(&prefix).then(|| key.to_string())
             })
             .collect();
 
@@ -521,91 +486,6 @@ mod tests {
                 .register_in_database("s1", db2, 0, "same", None)
                 .last_pushed_hlc,
             h2
-        );
-    }
-
-    #[test]
-    fn v2_cursor_is_limited_to_tenant_zero_and_v3_takes_precedence() {
-        use nodedb_array::sync::replica_id::ReplicaId;
-
-        let store = make_store();
-        let database_id = DatabaseId::new(7);
-        let legacy_hlc = Hlc::new(10, 0, ReplicaId::new(1)).unwrap();
-        let current_hlc = Hlc::new(20, 0, ReplicaId::new(1)).unwrap();
-        let mut legacy =
-            ArraySubscriberState::new("s1".into(), database_id, 0, "same".into(), None);
-        legacy.last_pushed_hlc = legacy_hlc;
-        let bytes = zerompk::to_msgpack_vec(&legacy).expect("encode legacy cursor");
-        let v2_key = SubscriberStore::v2_cursor_key("s1", database_id, "same");
-        let txn = store.db.begin_write().expect("begin legacy write");
-        {
-            let mut table = txn.open_table(CURSOR_TABLE).expect("open cursor table");
-            table
-                .insert(v2_key.as_str(), bytes.as_slice())
-                .expect("write v2 cursor");
-        }
-        txn.commit().expect("commit legacy cursor");
-
-        let map = SubscriberMap::new(Arc::clone(&store));
-        assert_eq!(
-            map.register_in_database("s1", database_id, 0, "same", None)
-                .last_pushed_hlc,
-            legacy_hlc,
-            "tenant zero may read V2 cursors"
-        );
-        assert_eq!(
-            map.register_in_database("s1", database_id, 1, "same", None)
-                .last_pushed_hlc,
-            Hlc::ZERO,
-            "non-zero tenants must not read V2 cursors"
-        );
-
-        map.mark_sent_in_database("s1", database_id, 0, "same", current_hlc);
-        let reloaded = SubscriberMap::new(store);
-        assert_eq!(
-            reloaded
-                .register_in_database("s1", database_id, 0, "same", None)
-                .last_pushed_hlc,
-            current_hlc,
-            "the V3 cursor written during migration takes precedence over V2"
-        );
-    }
-
-    #[test]
-    fn bare_cursor_is_limited_to_default_database_tenant_zero() {
-        use nodedb_array::sync::replica_id::ReplicaId;
-
-        let store = make_store();
-        let legacy_hlc = Hlc::new(10, 0, ReplicaId::new(1)).unwrap();
-        let mut legacy =
-            ArraySubscriberState::new("s1".into(), DatabaseId::DEFAULT, 0, "same".into(), None);
-        legacy.last_pushed_hlc = legacy_hlc;
-        let bytes = zerompk::to_msgpack_vec(&legacy).expect("encode bare cursor");
-        let key = SubscriberStore::legacy_cursor_key("s1", "same");
-        let txn = store.db.begin_write().expect("begin legacy write");
-        {
-            let mut table = txn.open_table(CURSOR_TABLE).expect("open cursor table");
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .expect("write bare cursor");
-        }
-        txn.commit().expect("commit bare cursor");
-
-        let map = SubscriberMap::new(store);
-        assert_eq!(
-            map.register_in_database("s1", DatabaseId::DEFAULT, 0, "same", None)
-                .last_pushed_hlc,
-            legacy_hlc
-        );
-        assert_eq!(
-            map.register_in_database("s1", DatabaseId::new(7), 0, "same", None)
-                .last_pushed_hlc,
-            Hlc::ZERO
-        );
-        assert_eq!(
-            map.register_in_database("s1", DatabaseId::DEFAULT, 1, "same", None)
-                .last_pushed_hlc,
-            Hlc::ZERO
         );
     }
 

@@ -3,8 +3,6 @@
 //! [`ArrayAckRegistry`] — per-replica ack HLC tracking for array GC.
 //!
 //! Acknowledgements are persisted by `(database_id, tenant_id, array, replica_id)`.
-//! The legacy table is read only as a `(DatabaseId::DEFAULT, 0)` fallback; all
-//! new data is stored in the V2 table.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,17 +16,12 @@ use tracing::warn;
 
 use crate::types::DatabaseId;
 
-/// Legacy redb table: `[name_len: u8][name][replica: u64 BE]` → HLC.
-///
-/// This table is retained solely to load pre-V2 DEFAULT-database rows.
-const ACK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("array_ack_hlcs");
-
-/// V2 redb table: `[db: u64 BE][tenant: u64 BE][name_len: u16 BE][name][replica: u64 BE]` → HLC.
+/// redb table: `[db: u64 BE][tenant: u64 BE][name_len: u16 BE][name][replica: u64 BE]` → HLC.
 const ACK_TABLE_V2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("array_ack_hlcs_v2");
 
 type ArrayScope = (DatabaseId, u64, String);
 
-/// Build a V2 key: `[db: u64 BE][tenant: u64 BE][name_len: u16 BE][name][replica: u64 BE]`.
+/// Build a key: `[db: u64 BE][tenant: u64 BE][name_len: u16 BE][name][replica: u64 BE]`.
 fn ack_key(
     database_id: DatabaseId,
     tenant_id: u64,
@@ -46,18 +39,7 @@ fn ack_key(
     Some(key)
 }
 
-/// Build a legacy key for removal after a DEFAULT-database V2 write.
-fn legacy_ack_key(array: &str, replica_id: u64) -> Option<Vec<u8>> {
-    let name_bytes = array.as_bytes();
-    let name_len = u8::try_from(name_bytes.len()).ok()?;
-    let mut key = Vec::with_capacity(1 + name_bytes.len() + 8);
-    key.push(name_len);
-    key.extend_from_slice(name_bytes);
-    key.extend_from_slice(&replica_id.to_be_bytes());
-    Some(key)
-}
-
-/// Parse a V2 key into its database, tenant, array name, and replica.
+/// Parse a key into its database, tenant, array name, and replica.
 fn scope_from_key(key: &[u8]) -> Option<(DatabaseId, u64, String, u64)> {
     if key.len() < 26 {
         return None;
@@ -74,21 +56,6 @@ fn scope_from_key(key: &[u8]) -> Option<(DatabaseId, u64, String, u64)> {
         .to_owned();
     let replica_id = u64::from_be_bytes(key[replica_start..].try_into().ok()?);
     Some((database_id, tenant_id, array, replica_id))
-}
-
-/// Parse a legacy key into its array name and replica.
-fn legacy_scope_from_key(key: &[u8]) -> Option<(String, u64)> {
-    if key.len() < 9 {
-        return None;
-    }
-    let name_len = key[0] as usize;
-    let replica_start = 1 + name_len;
-    if key.len() != replica_start + 8 {
-        return None;
-    }
-    let array = std::str::from_utf8(&key[1..replica_start]).ok()?.to_owned();
-    let replica_id = u64::from_be_bytes(key[replica_start..].try_into().ok()?);
-    Some((array, replica_id))
 }
 
 /// Registry tracking the latest acknowledged HLC per `(database, array, replica)`.
@@ -130,11 +97,6 @@ impl ArrayAckRegistry {
                 engine: "array_sync".into(),
                 detail: format!("ack_registry init begin_write: {e}"),
             })?;
-            txn.open_table(ACK_TABLE)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("ack_registry init open legacy table: {e}"),
-                })?;
             txn.open_table(ACK_TABLE_V2)
                 .map_err(|e| crate::Error::Storage {
                     engine: "array_sync".into(),
@@ -159,36 +121,30 @@ impl ArrayAckRegistry {
             engine: "array_sync".into(),
             detail: format!("ack_registry load begin_read: {e}"),
         })?;
-        let v2 = txn
+        let table = txn
             .open_table(ACK_TABLE_V2)
             .map_err(|e| crate::Error::Storage {
                 engine: "array_sync".into(),
-                detail: format!("ack_registry load open v2 table: {e}"),
-            })?;
-        let legacy = txn
-            .open_table(ACK_TABLE)
-            .map_err(|e| crate::Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("ack_registry load open legacy table: {e}"),
+                detail: format!("ack_registry load open table: {e}"),
             })?;
         let mut cache: HashMap<ArrayScope, AckVector> = HashMap::new();
 
-        let v2_rows = v2.iter().map_err(|e| crate::Error::Storage {
+        let rows = table.iter().map_err(|e| crate::Error::Storage {
             engine: "array_sync".into(),
-            detail: format!("ack_registry load v2 iter: {e}"),
+            detail: format!("ack_registry load iter: {e}"),
         })?;
-        for entry in v2_rows {
+        for entry in rows {
             let (key, value) = entry.map_err(|e| crate::Error::Storage {
                 engine: "array_sync".into(),
-                detail: format!("ack_registry load v2 entry: {e}"),
+                detail: format!("ack_registry load entry: {e}"),
             })?;
             let Some((database_id, tenant_id, array, replica_raw)) = scope_from_key(key.value())
             else {
-                warn!("ack_registry: malformed V2 key, skipping");
+                warn!("ack_registry: malformed key, skipping");
                 continue;
             };
             let Ok(hlc_bytes) = <[u8; 18]>::try_from(value.value()) else {
-                warn!(database = %database_id, array = %array, "ack_registry: V2 ack hlc wrong length, skipping");
+                warn!(database = %database_id, array = %array, "ack_registry: ack hlc wrong length, skipping");
                 continue;
             };
             cache
@@ -197,37 +153,12 @@ impl ArrayAckRegistry {
                 .record(ReplicaId::new(replica_raw), Hlc::from_bytes(&hlc_bytes));
         }
 
-        let legacy_rows = legacy.iter().map_err(|e| crate::Error::Storage {
-            engine: "array_sync".into(),
-            detail: format!("ack_registry load legacy iter: {e}"),
-        })?;
-        for entry in legacy_rows {
-            let (key, value) = entry.map_err(|e| crate::Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("ack_registry load legacy entry: {e}"),
-            })?;
-            let Some((array, replica_raw)) = legacy_scope_from_key(key.value()) else {
-                warn!("ack_registry: malformed legacy key, skipping");
-                continue;
-            };
-            let Ok(hlc_bytes) = <[u8; 18]>::try_from(value.value()) else {
-                warn!(array = %array, "ack_registry: legacy ack hlc wrong length, skipping");
-                continue;
-            };
-            let replica_id = ReplicaId::new(replica_raw);
-            let vector = cache.entry((DatabaseId::DEFAULT, 0, array)).or_default();
-            if vector.ack_for(replica_id).is_none() {
-                vector.record(replica_id, Hlc::from_bytes(&hlc_bytes));
-            }
-        }
-
         Ok(cache)
     }
 
     /// Record an acknowledgement in an explicit database scope.
     ///
-    /// The stored value advances monotonically. Every persisted write uses V2;
-    /// a DEFAULT-database write also removes its corresponding legacy row.
+    /// The stored value advances monotonically.
     pub fn record_in_database(
         &self,
         database_id: DatabaseId,
@@ -271,34 +202,18 @@ impl ArrayAckRegistry {
             detail: format!("ack_registry persist begin_write: {e}"),
         })?;
         {
-            let mut v2 = txn
+            let mut table = txn
                 .open_table(ACK_TABLE_V2)
                 .map_err(|e| crate::Error::Storage {
                     engine: "array_sync".into(),
-                    detail: format!("ack_registry persist open v2 table: {e}"),
+                    detail: format!("ack_registry persist open table: {e}"),
                 })?;
             let hlc_bytes = hlc.to_bytes();
-            v2.insert(key.as_slice(), hlc_bytes.as_slice())
+            table
+                .insert(key.as_slice(), hlc_bytes.as_slice())
                 .map_err(|e| crate::Error::Storage {
                     engine: "array_sync".into(),
                     detail: format!("ack_registry persist insert: {e}"),
-                })?;
-        }
-        if database_id == DatabaseId::DEFAULT
-            && tenant_id == 0
-            && let Some(legacy_key) = legacy_ack_key(array, replica_id.as_u64())
-        {
-            let mut legacy = txn
-                .open_table(ACK_TABLE)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("ack_registry persist open legacy table: {e}"),
-                })?;
-            legacy
-                .remove(legacy_key.as_slice())
-                .map_err(|e| crate::Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("ack_registry persist remove legacy row: {e}"),
                 })?;
         }
         txn.commit().map_err(|e| crate::Error::Storage {
@@ -453,41 +368,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_precedes_legacy_and_default_write_migrates_legacy_row() {
+    fn a_persisted_ack_advances_monotonically() {
         let reg = registry();
-        let legacy_key = legacy_ack_key("arr", r(1).as_u64()).expect("legacy key");
-        let v2_key = ack_key(DatabaseId::DEFAULT, 0, "arr", r(1).as_u64()).expect("v2 key");
-        let txn = reg.db.begin_write().expect("write transaction");
-        {
-            let mut legacy = txn.open_table(ACK_TABLE).expect("legacy table");
-            legacy
-                .insert(legacy_key.as_slice(), hlc(50).to_bytes().as_slice())
-                .expect("legacy row");
-            let mut v2 = txn.open_table(ACK_TABLE_V2).expect("v2 table");
-            v2.insert(v2_key.as_slice(), hlc(100).to_bytes().as_slice())
-                .expect("v2 row");
-        }
-        txn.commit().expect("commit test rows");
-
-        let cache = ArrayAckRegistry::load_cache(&reg.db).expect("reload cache");
-        assert_eq!(
-            cache
-                .get(&(DatabaseId::DEFAULT, 0, "arr".to_owned()))
-                .and_then(|v| v.ack_for(r(1))),
-            Some(hlc(100))
-        );
-
+        let key = ack_key(DatabaseId::DEFAULT, 0, "arr", r(1).as_u64()).expect("ack key");
+        reg.record("arr", r(1), hlc(100));
         reg.record("arr", r(1), hlc(150));
+        reg.record("arr", r(1), hlc(50));
+
+        assert_eq!(reg.min_ack_hlc("arr"), Some(hlc(150)));
         let txn = reg.db.begin_read().expect("read transaction");
-        let legacy = txn.open_table(ACK_TABLE).expect("legacy table");
-        assert!(
-            legacy
-                .get(legacy_key.as_slice())
-                .expect("legacy get")
-                .is_none()
-        );
-        let v2 = txn.open_table(ACK_TABLE_V2).expect("v2 table");
-        let persisted = v2.get(v2_key.as_slice()).expect("v2 get").expect("v2 row");
+        let table = txn.open_table(ACK_TABLE_V2).expect("ack table");
+        let persisted = table.get(key.as_slice()).expect("get").expect("row");
         assert_eq!(
             Hlc::from_bytes(&persisted.value().try_into().expect("HLC bytes")),
             hlc(150)

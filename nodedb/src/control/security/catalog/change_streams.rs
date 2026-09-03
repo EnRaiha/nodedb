@@ -8,9 +8,8 @@ use crate::types::DatabaseId;
 use redb::{ReadableDatabase, ReadableTable};
 
 impl SystemCatalog {
-    /// Store a change stream definition.
-    ///
-    /// Writes the versioned, length-prefixed v2 key. Legacy rows are read only.
+    /// Store a change stream definition under its versioned, length-prefixed
+    /// key.
     pub fn put_change_stream(&self, def: &ChangeStreamDef) -> crate::Result<()> {
         let key = stream_key(def.database_id, def.tenant_id, &def.name);
         let bytes =
@@ -45,25 +44,12 @@ impl SystemCatalog {
         let table = read_txn
             .open_table(CHANGE_STREAMS)
             .map_err(|e| catalog_err("open change_streams", e))?;
-        match table.get(key.as_str()) {
-            Ok(Some(value)) => {
-                let def: ChangeStreamDef = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser change_stream", e))?;
-                Ok(Some(def))
-            }
-            Ok(None) if database_id == DatabaseId::DEFAULT => {
-                let legacy = legacy_stream_key(tenant_id, name);
-                match table.get(legacy.as_str()) {
-                    Ok(Some(value)) => zerompk::from_msgpack(value.value())
-                        .map(Some)
-                        .map_err(|e| catalog_err("deser legacy change_stream", e)),
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(catalog_err("get legacy change_stream", e)),
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(catalog_err("get change_stream", e)),
-        }
+        table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get change_stream", e))?
+            .map(|value| zerompk::from_msgpack(value.value()))
+            .transpose()
+            .map_err(|e| catalog_err("deser change_stream", e))
     }
 
     /// Delete a change stream. Returns true if it existed.
@@ -82,20 +68,10 @@ impl SystemCatalog {
             let mut table = write_txn
                 .open_table(CHANGE_STREAMS)
                 .map_err(|e| catalog_err("open change_streams", e))?;
-            let current_existed = table
+            table
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("delete change_stream", e))?
-                .is_some();
-            let legacy_existed = if database_id == DatabaseId::DEFAULT {
-                let legacy = legacy_stream_key(tenant_id, name);
-                table
-                    .remove(legacy.as_str())
-                    .map_err(|e| catalog_err("delete legacy change_stream", e))?
-                    .is_some()
-            } else {
-                false
-            };
-            current_existed || legacy_existed
+                .is_some()
         };
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -115,16 +91,10 @@ impl SystemCatalog {
         let mut range = table
             .range(..)
             .map_err(|e| catalog_err("range change_streams", e))?;
-        while let Some(Ok((key, value))) = range.next() {
-            if let Ok(mut def) = zerompk::from_msgpack::<ChangeStreamDef>(value.value()) {
-                let is_v2 = key.value().starts_with("v2/");
-                if !is_v2 {
-                    def.database_id = DatabaseId::DEFAULT;
-                }
+        while let Some(Ok((_, value))) = range.next() {
+            if let Ok(def) = zerompk::from_msgpack::<ChangeStreamDef>(value.value()) {
                 let identity = (def.database_id, def.tenant_id, def.name.clone());
-                if is_v2 || !streams.contains_key(&identity) {
-                    streams.insert(identity, def);
-                }
+                streams.insert(identity, def);
             }
         }
         Ok(streams.into_values().collect())
@@ -143,10 +113,6 @@ fn stream_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
         tenant_id,
         name.len()
     )
-}
-
-fn legacy_stream_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
 }
 
 #[cfg(test)]

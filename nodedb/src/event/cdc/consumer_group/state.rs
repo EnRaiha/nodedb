@@ -6,7 +6,7 @@
 //! independent of other groups on the same stream. Offsets are committed
 //! explicitly (no auto-commit) to prevent lost events on consumer crash.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -16,7 +16,8 @@ use super::types::PartitionOffset;
 use crate::event::cdc::offset::CdcOffset;
 use crate::types::DatabaseId;
 
-/// redb table: "{tenant}:{stream}:{group}:{partition}" → 16-byte LE composite offset.
+/// redb table: `v2:{database}:{tenant}:{len}:{stream}:{len}:{group}:{partition}`
+/// → 16-byte LE composite offset.
 const OFFSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("consumer_offsets");
 
 /// Cache key: (database_id, tenant_id, stream_name, group_name).
@@ -85,31 +86,17 @@ impl OffsetStore {
                 engine: "event_plane".into(),
                 detail: format!("range: {e}"),
             })?;
-            // A v2 row wins over its legacy DEFAULT-database counterpart even
-            // if table iteration order changes. This lets an upgraded node
-            // write a corrected v2 offset without an old row reviving it on
-            // restart.
-            let mut v2_offsets = HashSet::new();
             while let Some(Ok((key_guard, value_guard))) = range.next() {
                 let key_str: &str = key_guard.value();
                 let bytes: &[u8] = value_guard.value();
                 let Some(offset) = decode_offset(bytes) else {
                     continue;
                 };
-                let is_v2 = key_str.starts_with("v2:");
                 if let Some((database_id, tenant, stream, group, partition)) =
                     parse_offset_key(key_str)
                 {
-                    let group_key = (database_id, tenant, stream, group);
-                    let offset_key = (group_key.clone(), partition);
-                    if !is_v2 && v2_offsets.contains(&offset_key) {
-                        continue;
-                    }
-                    if is_v2 {
-                        v2_offsets.insert(offset_key);
-                    }
                     cache
-                        .entry(group_key)
+                        .entry((database_id, tenant, stream, group))
                         .or_default()
                         .insert(partition, offset);
                 }
@@ -353,15 +340,6 @@ impl OffsetStore {
                             engine: "event_plane".into(),
                             detail: format!("delete offset: {e}"),
                         })?;
-                    if database_id == DatabaseId::DEFAULT {
-                        let legacy = legacy_offset_key(tenant_id, &key.2, &key.3, *partition_id);
-                        table
-                            .remove(legacy.as_str())
-                            .map_err(|e| crate::Error::Storage {
-                                engine: "event_plane".into(),
-                                detail: format!("delete legacy offset: {e}"),
-                            })?;
-                    }
                 }
             }
         }
@@ -461,7 +439,7 @@ fn encode_offset(offset: CdcOffset) -> [u8; 16] {
 }
 
 /// Versioned, length-prefixed key encoding. The lengths make stream and group
-/// names containing delimiters unambiguous; all new writes use this form.
+/// names containing delimiters unambiguous.
 fn offset_key(
     database_id: DatabaseId,
     tenant_id: u64,
@@ -477,41 +455,26 @@ fn offset_key(
     )
 }
 
-/// Historical unscoped encoding. It is read and deleted only for DEFAULT.
-fn legacy_offset_key(tenant_id: u64, stream: &str, group: &str, partition_id: u32) -> String {
-    format!("{tenant_id}:{stream}:{group}:{partition_id}")
-}
-
-/// Decode v2 keys, or historical keys as the default database for compatibility.
+/// Decode a key written by [`offset_key`].
 fn parse_offset_key(key: &str) -> Option<(DatabaseId, u64, String, String, u32)> {
-    if let Some(rest) = key.strip_prefix("v2:") {
-        let (database_id, rest) = rest.split_once(':')?;
-        let (tenant_id, rest) = rest.split_once(':')?;
-        let (stream_len, rest) = rest.split_once(':')?;
-        let stream_len: usize = stream_len.parse().ok()?;
-        let stream = rest.get(..stream_len)?.to_string();
-        let rest = rest.get(stream_len..)?.strip_prefix(':')?;
-        let (group_len, rest) = rest.split_once(':')?;
-        let group_len: usize = group_len.parse().ok()?;
-        let group = rest.get(..group_len)?.to_string();
-        let partition = rest.get(group_len..)?.strip_prefix(':')?.parse().ok()?;
-        return Some((
-            DatabaseId::new(database_id.parse().ok()?),
-            tenant_id.parse().ok()?,
-            stream,
-            group,
-            partition,
-        ));
-    }
-    let mut parts = key.split(':');
-    let tenant_id = parts.next()?.parse().ok()?;
-    let stream = parts.next()?.to_string();
-    let group = parts.next()?.to_string();
-    let partition_id = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((DatabaseId::DEFAULT, tenant_id, stream, group, partition_id))
+    let rest = key.strip_prefix("v2:")?;
+    let (database_id, rest) = rest.split_once(':')?;
+    let (tenant_id, rest) = rest.split_once(':')?;
+    let (stream_len, rest) = rest.split_once(':')?;
+    let stream_len: usize = stream_len.parse().ok()?;
+    let stream = rest.get(..stream_len)?.to_string();
+    let rest = rest.get(stream_len..)?.strip_prefix(':')?;
+    let (group_len, rest) = rest.split_once(':')?;
+    let group_len: usize = group_len.parse().ok()?;
+    let group = rest.get(..group_len)?.to_string();
+    let partition = rest.get(group_len..)?.strip_prefix(':')?.parse().ok()?;
+    Some((
+        DatabaseId::new(database_id.parse().ok()?),
+        tenant_id.parse().ok()?,
+        stream,
+        group,
+        partition,
+    ))
 }
 
 #[cfg(test)]
@@ -672,44 +635,6 @@ mod tests {
             store.get_offset(second_db, 1, "orders", "analytics", 0),
             200
         );
-    }
-
-    #[test]
-    fn legacy_default_offset_is_read_deduplicated_and_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = OffsetStore::open(dir.path()).unwrap();
-        let legacy = legacy_offset_key(1, "orders", "analytics", 0);
-        let txn = store.db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(OFFSETS).unwrap();
-            table
-                .insert(legacy.as_str(), 50u64.to_le_bytes().as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        drop(store);
-
-        let store = OffsetStore::open(dir.path()).unwrap();
-        assert_eq!(
-            store.get_offset(DatabaseId::DEFAULT, 1, "orders", "analytics", 0),
-            50
-        );
-        // A v2 commit wins over the legacy value after a reopen.
-        store
-            .commit_offset(DatabaseId::DEFAULT, 1, "orders", "analytics", 0, 75)
-            .unwrap();
-        drop(store);
-        let store = OffsetStore::open(dir.path()).unwrap();
-        assert_eq!(
-            store.get_offset(DatabaseId::DEFAULT, 1, "orders", "analytics", 0),
-            75
-        );
-        store
-            .delete_group(DatabaseId::DEFAULT, 1, "orders", "analytics")
-            .unwrap();
-        let txn = store.db.begin_read().unwrap();
-        let table = txn.open_table(OFFSETS).unwrap();
-        assert!(table.get(legacy.as_str()).unwrap().is_none());
     }
 
     /// A subsequent commit with an LSN strictly less than the currently

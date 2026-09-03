@@ -2,8 +2,7 @@
 
 //! [`OriginSchemaRegistry`] — per-array `SchemaDoc` cache with redb persistence.
 //!
-//! Legacy entries in `array_schema_docs` are names in the default database.
-//! New entries use `array_schema_docs_v2`, structurally keyed by database ID,
+//! Entries live in `array_schema_docs_v2`, structurally keyed by database ID,
 //! tenant ID, and a length-delimited UTF-8 array name.
 
 use std::collections::HashMap;
@@ -19,9 +18,7 @@ use tracing::warn;
 use crate::Error;
 use crate::types::DatabaseId;
 
-/// Legacy redb table: default-database array name → persisted schema.
-const SCHEMA_DOCS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("array_schema_docs");
-/// Current redb table: `[database_id: u64 BE][tenant_id: u64 BE][name_len: u16 BE][array name bytes]` → persisted schema.
+/// redb table: `[database_id: u64 BE][tenant_id: u64 BE][name_len: u16 BE][array name bytes]` → persisted schema.
 const SCHEMA_DOCS_V2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("array_schema_docs_v2");
 
 type SchemaKey = (DatabaseId, u64, String);
@@ -46,10 +43,8 @@ pub struct OriginSchemaRegistry {
 }
 
 impl OriginSchemaRegistry {
-    /// Open or create the schema registry tables in `db`.
-    ///
-    /// Cold-loads v2 entries first, then fills absent default-database entries
-    /// from the legacy table.
+    /// Open or create the schema registry table in `db` and cold-load its
+    /// entries.
     pub fn open(
         db: Arc<Database>,
         replica_id: ReplicaId,
@@ -59,10 +54,6 @@ impl OriginSchemaRegistry {
             let txn = db.begin_write().map_err(|e| Error::Storage {
                 engine: "array_sync".into(),
                 detail: format!("schema_registry begin_write init: {e}"),
-            })?;
-            txn.open_table(SCHEMA_DOCS).map_err(|e| Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("schema_registry open legacy table init: {e}"),
             })?;
             txn.open_table(SCHEMA_DOCS_V2).map_err(|e| Error::Storage {
                 engine: "array_sync".into(),
@@ -308,18 +299,6 @@ impl OriginSchemaRegistry {
                     detail: format!("schema_registry persist insert '{array}': {e}"),
                 })?;
         }
-        if database_id == DatabaseId::DEFAULT && tenant_id == 0 {
-            let mut legacy = txn.open_table(SCHEMA_DOCS).map_err(|e| Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("schema_registry persist open legacy table '{array}': {e}"),
-            })?;
-            legacy
-                .remove(array.as_bytes())
-                .map_err(|e| Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("schema_registry persist remove legacy '{array}': {e}"),
-                })?;
-        }
         txn.commit().map_err(|e| Error::Storage {
             engine: "array_sync".into(),
             detail: format!("schema_registry persist commit '{array}': {e}"),
@@ -359,24 +338,20 @@ impl OriginSchemaRegistry {
             engine: "array_sync".into(),
             detail: format!("schema_registry load_all begin_read: {e}"),
         })?;
-        let v2 = txn.open_table(SCHEMA_DOCS_V2).map_err(|e| Error::Storage {
+        let table = txn.open_table(SCHEMA_DOCS_V2).map_err(|e| Error::Storage {
             engine: "array_sync".into(),
-            detail: format!("schema_registry load_all open v2 table: {e}"),
-        })?;
-        let legacy = txn.open_table(SCHEMA_DOCS).map_err(|e| Error::Storage {
-            engine: "array_sync".into(),
-            detail: format!("schema_registry load_all open legacy table: {e}"),
+            detail: format!("schema_registry load_all open table: {e}"),
         })?;
 
         let mut docs = HashMap::new();
-        let v2_entries = v2.iter().map_err(|e| Error::Storage {
+        let entries = table.iter().map_err(|e| Error::Storage {
             engine: "array_sync".into(),
-            detail: format!("schema_registry load_all v2 iter: {e}"),
+            detail: format!("schema_registry load_all iter: {e}"),
         })?;
-        for entry in v2_entries {
+        for entry in entries {
             let (key, value) = entry.map_err(|e| Error::Storage {
                 engine: "array_sync".into(),
-                detail: format!("schema_registry load_all v2 entry: {e}"),
+                detail: format!("schema_registry load_all entry: {e}"),
             })?;
             let key = key.value();
             if key.len() < 18 {
@@ -428,31 +403,6 @@ impl OriginSchemaRegistry {
             let description = format!("{database_id}/{tenant_id}/{name}");
             if let Some(doc) = Self::load_document(&description, value.value()) {
                 docs.insert((database_id, tenant_id, name), doc);
-            }
-        }
-
-        let legacy_entries = legacy.iter().map_err(|e| Error::Storage {
-            engine: "array_sync".into(),
-            detail: format!("schema_registry load_all legacy iter: {e}"),
-        })?;
-        for entry in legacy_entries {
-            let (key, value) = entry.map_err(|e| Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("schema_registry load_all legacy entry: {e}"),
-            })?;
-            let name = match std::str::from_utf8(key.value()) {
-                Ok(name) => name.to_owned(),
-                Err(error) => {
-                    warn!(error = %error, "schema_registry: skipping non-UTF8 legacy key");
-                    continue;
-                }
-            };
-            let cache_key = (DatabaseId::DEFAULT, 0, name.clone());
-            if docs.contains_key(&cache_key) {
-                continue;
-            }
-            if let Some(doc) = Self::load_document(&name, value.value()) {
-                docs.insert(cache_key, doc);
             }
         }
         Ok(docs)
@@ -507,130 +457,6 @@ mod tests {
             Some(hlc(2))
         );
         assert_eq!(registry.schema_hlc("events"), None);
-    }
-
-    #[test]
-    fn v2_precedes_legacy_and_default_write_migrates_legacy_entry() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("schemas.redb");
-        let database = Arc::new(Database::create(&path).expect("create redb database"));
-        let snapshot = empty_snapshot();
-        let legacy = PersistedSchema {
-            replica_id: 1,
-            schema_hlc_bytes: hlc(1).to_bytes().to_vec(),
-            loro_snapshot: snapshot.clone(),
-        };
-        let v2 = PersistedSchema {
-            replica_id: 1,
-            schema_hlc_bytes: hlc(2).to_bytes().to_vec(),
-            loro_snapshot: snapshot.clone(),
-        };
-        let legacy_bytes = zerompk::to_msgpack_vec(&legacy).expect("encode legacy schema");
-        let v2_bytes = zerompk::to_msgpack_vec(&v2).expect("encode v2 schema");
-        let txn = database.begin_write().expect("begin write");
-        {
-            let mut legacy_table = txn.open_table(SCHEMA_DOCS).expect("open legacy table");
-            legacy_table
-                .insert(b"events".as_slice(), legacy_bytes.as_slice())
-                .expect("insert legacy schema");
-        }
-        {
-            let mut v2_table = txn.open_table(SCHEMA_DOCS_V2).expect("open v2 table");
-            v2_table
-                .insert(
-                    OriginSchemaRegistry::v2_key(DatabaseId::DEFAULT, 0, "events")
-                        .expect("v2 key")
-                        .as_slice(),
-                    v2_bytes.as_slice(),
-                )
-                .expect("insert v2 schema");
-        }
-        txn.commit().expect("commit seed schemas");
-
-        let replica_id = ReplicaId::new(7);
-        let registry = OriginSchemaRegistry::open(
-            Arc::clone(&database),
-            replica_id,
-            Arc::new(HlcGenerator::new(replica_id)),
-        )
-        .expect("open registry");
-        assert_eq!(registry.schema_hlc("events"), Some(hlc(2)));
-
-        registry
-            .import_snapshot_replicated("events", &snapshot, hlc(3))
-            .expect("migrate default schema");
-        let read = database.begin_read().expect("begin read");
-        let legacy_table = read.open_table(SCHEMA_DOCS).expect("open legacy table");
-        assert!(
-            legacy_table
-                .get(b"events".as_slice())
-                .expect("read legacy table")
-                .is_none()
-        );
-        let v2_table = read.open_table(SCHEMA_DOCS_V2).expect("open v2 table");
-        assert!(
-            v2_table
-                .get(
-                    OriginSchemaRegistry::v2_key(DatabaseId::DEFAULT, 0, "events")
-                        .expect("v2 key")
-                        .as_slice()
-                )
-                .expect("read v2 table")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn legacy_schema_loads_as_default_and_migrates_on_write() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("schemas.redb");
-        let database = Arc::new(Database::create(&path).expect("create redb database"));
-        let snapshot = empty_snapshot();
-        let persisted = PersistedSchema {
-            replica_id: 1,
-            schema_hlc_bytes: hlc(1).to_bytes().to_vec(),
-            loro_snapshot: snapshot.clone(),
-        };
-        let bytes = zerompk::to_msgpack_vec(&persisted).expect("encode legacy schema");
-        let txn = database.begin_write().expect("begin write");
-        {
-            let mut legacy = txn.open_table(SCHEMA_DOCS).expect("open legacy table");
-            legacy
-                .insert(b"events".as_slice(), bytes.as_slice())
-                .expect("insert legacy schema");
-        }
-        txn.commit().expect("commit legacy schema");
-
-        let replica_id = ReplicaId::new(7);
-        let registry = OriginSchemaRegistry::open(
-            Arc::clone(&database),
-            replica_id,
-            Arc::new(HlcGenerator::new(replica_id)),
-        )
-        .expect("open registry");
-        assert_eq!(registry.schema_hlc("events"), Some(hlc(1)));
-        registry
-            .import_snapshot_replicated("events", &snapshot, hlc(2))
-            .expect("migrate legacy schema");
-
-        let read = database.begin_read().expect("begin read");
-        let legacy = read.open_table(SCHEMA_DOCS).expect("open legacy table");
-        assert!(
-            legacy
-                .get(b"events".as_slice())
-                .expect("read legacy table")
-                .is_none()
-        );
-        let v2 = read.open_table(SCHEMA_DOCS_V2).expect("open v2 table");
-        assert!(
-            v2.get(
-                OriginSchemaRegistry::v2_key(DatabaseId::DEFAULT, 0, "events")
-                    .expect("v2 key")
-                    .as_slice()
-            )
-            .expect("read v2 table")
-            .is_some()
-        );
     }
 
     #[test]

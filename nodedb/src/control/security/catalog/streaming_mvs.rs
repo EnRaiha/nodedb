@@ -72,7 +72,7 @@ impl SystemCatalog {
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
-        let mut existed;
+        let existed;
         {
             let mut table = write_txn
                 .open_table(STREAMING_MVS)
@@ -81,14 +81,6 @@ impl SystemCatalog {
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("delete streaming_mv", e))?
                 .is_some();
-            if database_id == DatabaseId::DEFAULT {
-                let legacy_key = legacy_mv_key(tenant_id, name);
-                let legacy_existed = table
-                    .remove(legacy_key.as_str())
-                    .map_err(|e| catalog_err("delete legacy streaming_mv", e))?
-                    .is_some();
-                existed |= legacy_existed;
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -96,9 +88,8 @@ impl SystemCatalog {
 
     /// Every streaming MV of one database, across every tenant.
     ///
-    /// This scans every row and filters in memory, reusing
-    /// `load_all_streaming_mvs`'s v2/legacy dedup: a legacy row carries no
-    /// `database_id` prefix, so a bounded scan cannot find it.
+    /// The key leads with `database_id`, but this scans every row and filters
+    /// in memory so one code path serves every load.
     pub fn load_streaming_mvs_for_database(
         &self,
         database_id: DatabaseId,
@@ -123,17 +114,13 @@ impl SystemCatalog {
             .range(..)
             .map_err(|e| catalog_err("range streaming_mvs", e))?;
         for entry in range {
-            let (key, value) = entry.map_err(|e| catalog_err("read streaming_mv", e))?;
-            let is_v2 = key.value().starts_with("v2:");
+            let (_, value) = entry.map_err(|e| catalog_err("read streaming_mv", e))?;
             let def = zerompk::from_msgpack::<StreamingMvDef>(value.value()).or_else(|_| {
                 zerompk::from_msgpack::<LegacyStreamingMvDef>(value.value()).map(Into::into)
             });
             if let Ok(def) = def {
                 let identity = (def.database_id, def.tenant_id, def.name.clone());
-                // A v2 record is authoritative when both a migrated and legacy row exist.
-                if is_v2 || !mvs.contains_key(&identity) {
-                    mvs.insert(identity, def);
-                }
+                mvs.insert(identity, def);
             }
         }
         Ok(mvs.into_values().collect())
@@ -142,8 +129,4 @@ impl SystemCatalog {
 
 fn mv_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
     format!("v2:{}:{tenant_id}:{name}", database_id.as_u64())
-}
-
-fn legacy_mv_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
 }

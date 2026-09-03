@@ -107,12 +107,21 @@ fn run_gc(
                         "array_gc_task: GC run complete"
                     );
                 }
-                snapshots.delete_older_than_in_database(
+                // The sweep runs again on the next tick, so one error costs a
+                // cycle of retention rather than the snapshots themselves.
+                if let Err(error) = snapshots.delete_older_than_in_database(
                     *database_id,
                     *tenant_id,
                     &array_name,
                     frontier,
-                );
+                ) {
+                    error!(
+                        database = %database_id,
+                        array = %array_name,
+                        error = %error,
+                        "array_gc_task: obsolete snapshot sweep failed"
+                    );
+                }
                 match array_snapshot_hlcs.write() {
                     Ok(mut map) => {
                         map.insert((*database_id, *tenant_id, array_name.clone()), frontier);

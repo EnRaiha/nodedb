@@ -2,9 +2,7 @@
 
 //! [`OriginSnapshotStore`] — persistent store for array tile snapshots.
 //!
-//! Current snapshots are stored in a database-and-tenant-scoped redb table.
-//! The former name-only table remains readable only as a compatibility source
-//! for `(DatabaseId::DEFAULT, tenant 0)`.
+//! Snapshots are stored in a database-and-tenant-scoped redb table.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,33 +12,18 @@ use nodedb_array::sync::snapshot::{SnapshotSink, TileSnapshot, decode_snapshot, 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
-/// Legacy name-only table. It is read only for DEFAULT-database fallback.
-const SNAPSHOT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("array_tile_snapshots");
 /// Database-scoped snapshot table.
 const SNAPSHOT_TABLE_V2: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("array_tile_snapshots_v2");
 
-/// Legacy key: `[name_len: u8][name][hlc: 18 bytes]`.
-fn legacy_snapshot_key(array: &str, hlc: Hlc) -> Option<Vec<u8>> {
-    let name = array.as_bytes();
-    let name_len = u8::try_from(name.len()).ok()?;
-    let mut key = Vec::with_capacity(1 + name.len() + 18);
-    key.push(name_len);
-    key.extend_from_slice(name);
-    key.extend_from_slice(&hlc.to_bytes());
-    Some(key)
+fn store_err(detail: String) -> crate::Error {
+    crate::Error::Storage {
+        engine: "array_sync".into(),
+        detail,
+    }
 }
 
-fn legacy_name_prefix(array: &str) -> Option<Vec<u8>> {
-    let name = array.as_bytes();
-    let name_len = u8::try_from(name.len()).ok()?;
-    let mut prefix = Vec::with_capacity(1 + name.len());
-    prefix.push(name_len);
-    prefix.extend_from_slice(name);
-    Some(prefix)
-}
-
-/// V2 key: `[database_id: u64 BE][tenant_id: u64 BE][name_len: u16 BE][name][hlc: 18 bytes]`.
+/// Key: `[database_id: u64 BE][tenant_id: u64 BE][name_len: u16 BE][name][hlc: 18 bytes]`.
 fn snapshot_key(
     database_id: crate::types::DatabaseId,
     tenant_id: u64,
@@ -120,11 +103,6 @@ impl OriginSnapshotStore {
             engine: "array_sync".into(),
             detail: format!("snapshot_store init begin_write: {e}"),
         })?;
-        txn.open_table(SNAPSHOT_TABLE)
-            .map_err(|e| crate::Error::Storage {
-                engine: "array_sync".into(),
-                detail: format!("snapshot_store init open legacy table: {e}"),
-            })?;
         txn.open_table(SNAPSHOT_TABLE_V2)
             .map_err(|e| crate::Error::Storage {
                 engine: "array_sync".into(),
@@ -164,10 +142,6 @@ impl OriginSnapshotStore {
             engine: "array_sync".into(),
             detail: format!("snapshot_store encode: {e}"),
         })?;
-        let legacy_key = (database_id == crate::types::DatabaseId::DEFAULT && tenant_id == 0)
-            .then(|| legacy_snapshot_key(&snapshot.array, snapshot.snapshot_hlc))
-            .flatten();
-
         let txn = self.db.begin_write().map_err(|e| crate::Error::Storage {
             engine: "array_sync".into(),
             detail: format!("snapshot_store put begin_write: {e}"),
@@ -186,20 +160,6 @@ impl OriginSnapshotStore {
                     detail: format!("snapshot_store put insert: {e}"),
                 })?;
         }
-        if let Some(legacy_key) = legacy_key {
-            let mut legacy = txn
-                .open_table(SNAPSHOT_TABLE)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("snapshot_store put open legacy table: {e}"),
-                })?;
-            legacy
-                .remove(legacy_key.as_slice())
-                .map_err(|e| crate::Error::Storage {
-                    engine: "array_sync".into(),
-                    detail: format!("snapshot_store put remove legacy snapshot: {e}"),
-                })?;
-        }
         txn.commit().map_err(|e| crate::Error::Storage {
             engine: "array_sync".into(),
             detail: format!("snapshot_store put commit: {e}"),
@@ -212,7 +172,6 @@ impl OriginSnapshotStore {
     }
 
     /// Retrieve a snapshot by exact structural database identity and array name.
-    /// DEFAULT falls back to a legacy key only after an exact V2 miss.
     pub fn get_in_database(
         &self,
         database_id: crate::types::DatabaseId,
@@ -222,17 +181,9 @@ impl OriginSnapshotStore {
     ) -> Option<TileSnapshot> {
         let key = snapshot_key(database_id, tenant_id, array, hlc)?;
         let txn = self.db.begin_read().ok()?;
-        let v2 = txn.open_table(SNAPSHOT_TABLE_V2).ok()?;
-        if let Some(entry) = v2.get(key.as_slice()).ok()? {
-            return Self::decode(array, entry.value(), "get");
-        }
-        if database_id != crate::types::DatabaseId::DEFAULT || tenant_id != 0 {
-            return None;
-        }
-        let legacy_key = legacy_snapshot_key(array, hlc)?;
-        let legacy = txn.open_table(SNAPSHOT_TABLE).ok()?;
-        let entry = legacy.get(legacy_key.as_slice()).ok()??;
-        Self::decode(array, entry.value(), "get legacy")
+        let table = txn.open_table(SNAPSHOT_TABLE_V2).ok()?;
+        let entry = table.get(key.as_slice()).ok()??;
+        Self::decode(array, entry.value(), "get")
     }
 
     /// Return the latest DEFAULT-database snapshot for `array`.
@@ -240,8 +191,7 @@ impl OriginSnapshotStore {
         self.latest_for_array_in_database(crate::types::DatabaseId::DEFAULT, 0, array)
     }
 
-    /// Return the latest snapshot for one database/array scope. DEFAULT falls
-    /// back to legacy only when that scope has no V2 snapshots.
+    /// Return the latest snapshot for one database/array scope.
     pub fn latest_for_array_in_database(
         &self,
         database_id: crate::types::DatabaseId,
@@ -250,61 +200,56 @@ impl OriginSnapshotStore {
     ) -> Option<TileSnapshot> {
         let prefix = name_prefix(database_id, tenant_id, array)?;
         let txn = self.db.begin_read().ok()?;
-        let v2 = txn.open_table(SNAPSHOT_TABLE_V2).ok()?;
-        if let Some(bytes) = Self::latest_bytes(&v2, &prefix) {
-            return Self::decode(array, &bytes, "latest");
-        }
-        if database_id != crate::types::DatabaseId::DEFAULT || tenant_id != 0 {
-            return None;
-        }
-        let legacy = txn.open_table(SNAPSHOT_TABLE).ok()?;
-        let legacy_prefix = legacy_name_prefix(array)?;
-        Self::latest_bytes(&legacy, &legacy_prefix)
-            .and_then(|bytes| Self::decode(array, &bytes, "latest legacy"))
+        let table = txn.open_table(SNAPSHOT_TABLE_V2).ok()?;
+        let bytes = Self::latest_bytes(&table, &prefix)?;
+        Self::decode(array, &bytes, "latest")
     }
 
-    /// Delete DEFAULT-database V2 snapshots older than `older_than`.
-    pub fn delete_older_than(&self, array: &str, older_than: Hlc) {
-        self.delete_older_than_in_database(crate::types::DatabaseId::DEFAULT, 0, array, older_than);
-    }
-
-    /// Delete obsolete V2 snapshots in one explicit database scope. Legacy
-    /// snapshots are compatibility input and are never deleted here.
+    /// Delete obsolete snapshots in one explicit database scope.
+    ///
+    /// Returns how many snapshots it removed. Every error propagates: a
+    /// discarded one leaves obsolete snapshots on disk that nothing retries,
+    /// so the store grows without bound and no caller learns why.
     pub fn delete_older_than_in_database(
         &self,
         database_id: crate::types::DatabaseId,
         tenant_id: u64,
         array: &str,
         older_than: Hlc,
-    ) {
-        let Some(prefix) = name_prefix(database_id, tenant_id, array) else {
-            return;
-        };
-        let Ok(txn) = self.db.begin_write() else {
-            return;
-        };
-        let Ok(mut table) = txn.open_table(SNAPSHOT_TABLE_V2) else {
-            return;
-        };
-        let keys: Vec<Vec<u8>> = table
-            .iter()
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let (key, _) = entry.ok()?;
+    ) -> crate::Result<usize> {
+        let prefix = name_prefix(database_id, tenant_id, array)
+            .ok_or_else(|| store_err(format!("array name '{array}' exceeds the key length")))?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| store_err(format!("snapshot delete write txn: {e}")))?;
+        let removed = {
+            let mut table = txn
+                .open_table(SNAPSHOT_TABLE_V2)
+                .map_err(|e| store_err(format!("open snapshots: {e}")))?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| store_err(format!("scan snapshots: {e}")))?
+            {
+                let (key, _) = entry.map_err(|e| store_err(format!("read snapshot: {e}")))?;
                 let key = key.value();
-                (key.starts_with(&prefix) && hlc_from_key(key, prefix.len())? < older_than)
-                    .then(|| key.to_vec())
-            })
-            .collect();
-        for key in keys {
-            if let Err(error) = table.remove(key.as_slice()) {
-                warn!(array = %array, error = %error, "snapshot_store: delete_older_than remove error");
+                if key.starts_with(&prefix)
+                    && hlc_from_key(key, prefix.len()).is_some_and(|hlc| hlc < older_than)
+                {
+                    keys.push(key.to_vec());
+                }
             }
-        }
-        drop(table);
-        let _ = txn.commit();
+            for key in &keys {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|e| store_err(format!("remove snapshot: {e}")))?;
+            }
+            keys.len()
+        };
+        txn.commit()
+            .map_err(|e| store_err(format!("commit snapshot delete: {e}")))?;
+        Ok(removed)
     }
 
     fn latest_bytes(
@@ -374,16 +319,6 @@ mod tests {
         OriginSnapshotStore::open_in_memory().unwrap()
     }
 
-    fn insert_legacy(store: &OriginSnapshotStore, snapshot: &TileSnapshot) {
-        let key = legacy_snapshot_key(&snapshot.array, snapshot.snapshot_hlc).unwrap();
-        let value = encode_snapshot(snapshot).unwrap();
-        let txn = store.db.begin_write().unwrap();
-        let mut table = txn.open_table(SNAPSHOT_TABLE).unwrap();
-        table.insert(key.as_slice(), value.as_slice()).unwrap();
-        drop(table);
-        txn.commit().unwrap();
-    }
-
     #[test]
     fn put_and_get_roundtrip() {
         let s = store();
@@ -413,26 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn default_v2_has_exact_key_precedence_and_migrates_legacy() {
+    fn a_replacing_put_supersedes_the_snapshot_at_the_same_key() {
         let s = store();
-        let mut legacy = snap("arr", 100);
-        legacy.tile_blob = vec![1];
-        insert_legacy(&s, &legacy);
-        assert_eq!(s.get("arr", hlc(100)).unwrap().tile_blob, vec![1]);
-
-        let mut current = snap("arr", 100);
-        current.tile_blob = vec![2];
-        s.put(&current).unwrap();
+        let mut first = snap("arr", 100);
+        first.tile_blob = vec![1];
+        s.put(&first).unwrap();
+        let mut second = snap("arr", 100);
+        second.tile_blob = vec![2];
+        s.put(&second).unwrap();
         assert_eq!(s.get("arr", hlc(100)).unwrap().tile_blob, vec![2]);
-        let key = legacy_snapshot_key("arr", hlc(100)).unwrap();
-        let txn = s.db.begin_read().unwrap();
-        assert!(
-            txn.open_table(SNAPSHOT_TABLE)
-                .unwrap()
-                .get(key.as_slice())
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[test]
@@ -443,7 +367,10 @@ mod tests {
         s.put_in_database(db_one, 0, &snap("arr", 10)).unwrap();
         s.put_in_database(db_one, 0, &snap("arr", 30)).unwrap();
         s.put_in_database(db_two, 0, &snap("arr", 20)).unwrap();
-        s.delete_older_than_in_database(db_one, 0, "arr", hlc(20));
+        let removed = s
+            .delete_older_than_in_database(db_one, 0, "arr", hlc(20))
+            .expect("delete older than");
+        assert_eq!(removed, 1, "only the snapshot below the cutoff is removed");
         assert!(s.get_in_database(db_one, 0, "arr", hlc(10)).is_none());
         assert_eq!(
             s.latest_for_array_in_database(db_one, 0, "arr")

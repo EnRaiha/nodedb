@@ -30,8 +30,7 @@ impl SystemCatalog {
     ///
     /// Key format: `"v2:{source_type}:{tenant_id}:{database_id}:{source_name}"`.
     ///
-    /// A write in the default database removes the legacy unscoped row,
-    /// completing its migration to the v2 key. Overwrites any previous list.
+    /// Overwrites any previous list.
     pub fn put_dependencies(
         &self,
         database_id: DatabaseId,
@@ -56,11 +55,6 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert deps", e))?;
-            if database_id == DatabaseId::DEFAULT {
-                table
-                    .remove(legacy_dep_key(source_type, tenant_id, source_name).as_str())
-                    .map_err(|e| catalog_err("remove legacy deps", e))?;
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
@@ -85,11 +79,6 @@ impl SystemCatalog {
             let _ = table
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("remove deps", e))?;
-            if database_id == DatabaseId::DEFAULT {
-                let _ = table
-                    .remove(legacy_dep_key(source_type, tenant_id, source_name).as_str())
-                    .map_err(|e| catalog_err("remove legacy deps", e))?;
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
@@ -97,9 +86,7 @@ impl SystemCatalog {
     /// Find all source objects that depend on a given target.
     ///
     /// Scans dependency lists in the selected database and returns source
-    /// names that reference `(target_type, target_name)`. Legacy unscoped
-    /// rows are readable only in the default database; a v2 row wins when
-    /// both versions exist for the same source object.
+    /// names that reference `(target_type, target_name)`.
     pub fn find_dependents(
         &self,
         database_id: DatabaseId,
@@ -118,8 +105,7 @@ impl SystemCatalog {
         let mut lists = HashMap::new();
         for entry in table.range(..).map_err(|e| catalog_err("range deps", e))? {
             let (key, value) = entry.map_err(|e| catalog_err("read dep", e))?;
-            let Some((is_v2, source_type, entry_tid, entry_db, source_name)) =
-                parse_dep_key(key.value())
+            let Some((source_type, entry_tid, entry_db, source_name)) = parse_dep_key(key.value())
             else {
                 continue;
             };
@@ -132,10 +118,7 @@ impl SystemCatalog {
                 Err(_) => continue,
             };
             let source = (source_type.to_string(), source_name.to_string());
-            // Preserve a v2 record if the legacy record sorts after it.
-            if is_v2 || !lists.contains_key(&source) {
-                lists.insert(source, list);
-            }
+            lists.insert(source, list);
         }
 
         Ok(lists
@@ -162,25 +145,13 @@ pub(crate) fn dep_key(
     )
 }
 
-pub(crate) fn legacy_dep_key(source_type: &str, tenant_id: u64, source_name: &str) -> String {
-    format!("{source_type}:{tenant_id}:{source_name}")
-}
-
-fn parse_dep_key(key: &str) -> Option<(bool, &str, u64, DatabaseId, &str)> {
+fn parse_dep_key(key: &str) -> Option<(&str, u64, DatabaseId, &str)> {
     let parts: Vec<&str> = key.splitn(5, ':').collect();
     match parts.as_slice() {
         ["v2", source_type, tenant_id, database_id, source_name] => Some((
-            true,
             source_type,
             tenant_id.parse().ok()?,
             DatabaseId::new(database_id.parse().ok()?),
-            source_name,
-        )),
-        [source_type, tenant_id, source_name] => Some((
-            false,
-            source_type,
-            tenant_id.parse().ok()?,
-            DatabaseId::DEFAULT,
             source_name,
         )),
         _ => None,
@@ -201,16 +172,6 @@ mod tests {
             target_type: "collection".into(),
             target_name: name.into(),
         }
-    }
-
-    fn write_dependency_row(catalog: &SystemCatalog, key: &str, deps: Vec<Dependency>) {
-        let bytes = zerompk::to_msgpack_vec(&DependencyList { deps }).unwrap();
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(DEPENDENCIES).unwrap();
-            table.insert(key, bytes.as_slice()).unwrap();
-        }
-        txn.commit().unwrap();
     }
 
     #[test]
@@ -328,81 +289,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_are_confined_to_default_database() {
+    fn a_replacing_write_supersedes_the_previous_dependency_list() {
         let catalog = make_catalog();
-        write_dependency_row(
-            &catalog,
-            &legacy_dep_key("function", 1, "f"),
-            vec![collection_dependency("users")],
-        );
-
-        assert_eq!(
-            catalog
-                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "users")
-                .unwrap(),
-            vec![("function".into(), "f".into())]
-        );
-        assert!(
-            catalog
-                .find_dependents(DatabaseId::new(1), 1, "collection", "users")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn default_write_migrates_legacy_row_and_v2_wins() {
-        let catalog = make_catalog();
-        let legacy_key = legacy_dep_key("function", 1, "f");
-        write_dependency_row(&catalog, &legacy_key, vec![collection_dependency("legacy")]);
-
         catalog
             .put_dependencies(
                 DatabaseId::DEFAULT,
                 "function",
                 1,
                 "f",
-                &[collection_dependency("v2")],
+                &[collection_dependency("first")],
+            )
+            .unwrap();
+        catalog
+            .put_dependencies(
+                DatabaseId::DEFAULT,
+                "function",
+                1,
+                "f",
+                &[collection_dependency("second")],
             )
             .unwrap();
 
         assert!(
             catalog
-                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "legacy")
+                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "first")
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
             catalog
-                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "v2")
-                .unwrap(),
-            vec![("function".into(), "f".into())]
-        );
-    }
-
-    #[test]
-    fn v2_row_takes_precedence_over_coexisting_legacy_row() {
-        let catalog = make_catalog();
-        write_dependency_row(
-            &catalog,
-            &legacy_dep_key("function", 1, "f"),
-            vec![collection_dependency("legacy")],
-        );
-        write_dependency_row(
-            &catalog,
-            &dep_key(DatabaseId::DEFAULT, "function", 1, "f"),
-            vec![collection_dependency("v2")],
-        );
-
-        assert!(
-            catalog
-                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "legacy")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            catalog
-                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "v2")
+                .find_dependents(DatabaseId::DEFAULT, 1, "collection", "second")
                 .unwrap(),
             vec![("function".into(), "f".into())]
         );

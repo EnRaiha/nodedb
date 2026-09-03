@@ -26,7 +26,7 @@ impl SystemCatalog {
             let mut table = write_txn
                 .open_table(TOPICS_EP)
                 .map_err(|e| catalog_err("open topics_ep", e))?;
-            let (existing, legacy) =
+            let existing =
                 find_topic_definition(&table, def.database_id, def.tenant_id, &def.name)?;
             let mut stored = def.clone();
             if let Some(existing) = existing {
@@ -38,12 +38,6 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert topic", e))?;
-            if legacy {
-                let legacy_key = legacy_topic_key(def.tenant_id, &def.name);
-                table
-                    .remove(legacy_key.as_str())
-                    .map_err(|e| catalog_err("remove migrated legacy topic", e))?;
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
@@ -71,10 +65,7 @@ impl SystemCatalog {
             let mut table = write_txn
                 .open_table(TOPICS_EP)
                 .map_err(|e| catalog_err("open topics_ep", e))?;
-            if find_topic_definition(&table, def.database_id, def.tenant_id, &def.name)?
-                .0
-                .is_some()
-            {
+            if find_topic_definition(&table, def.database_id, def.tenant_id, &def.name)?.is_some() {
                 return Ok(false);
             }
             let bytes =
@@ -110,8 +101,7 @@ impl SystemCatalog {
             let mut definitions = write_txn
                 .open_table(TOPICS_EP)
                 .map_err(|e| catalog_err("open topics_ep", e))?;
-            let (Some(mut def), legacy) =
-                find_topic_definition(&definitions, database_id, tenant_id, topic)?
+            let Some(mut def) = find_topic_definition(&definitions, database_id, tenant_id, topic)?
             else {
                 return Err(catalog_err("append topic", "topic not found"));
             };
@@ -151,11 +141,6 @@ impl SystemCatalog {
                     bytes.as_slice(),
                 )
                 .map_err(|e| catalog_err("update topic high-water marks", e))?;
-            if legacy {
-                definitions
-                    .remove(legacy_topic_key(tenant_id, topic).as_str())
-                    .map_err(|e| catalog_err("remove migrated legacy topic", e))?;
-            }
         }
         write_txn
             .commit()
@@ -180,7 +165,6 @@ impl SystemCatalog {
     }
 
     /// Delete a topic and every one of its durable messages atomically.
-    /// Historical unscoped definitions are removed only for DEFAULT.
     pub fn delete_ep_topic(
         &self,
         database_id: DatabaseId,
@@ -201,12 +185,6 @@ impl SystemCatalog {
                 .remove(topic_key(database_id, tenant_id, name).as_str())
                 .map_err(|e| catalog_err("delete topic", e))?
                 .is_some();
-            if database_id == DatabaseId::DEFAULT {
-                existed |= definitions
-                    .remove(legacy_topic_key(tenant_id, name).as_str())
-                    .map_err(|e| catalog_err("delete legacy topic", e))?
-                    .is_some();
-            }
             let mut messages = write_txn
                 .open_table(TOPIC_MESSAGES)
                 .map_err(|e| catalog_err("open topic_messages", e))?;
@@ -245,13 +223,10 @@ impl SystemCatalog {
             .range(..)
             .map_err(|e| catalog_err("range consumer_groups", e))?
         {
-            let (key, value) = entry.map_err(|e| catalog_err("read consumer_group", e))?;
-            let Some(mut group) = decode_consumer_group(value.value()) else {
+            let (_, value) = entry.map_err(|e| catalog_err("read consumer_group", e))?;
+            let Some(group) = decode_consumer_group(value.value()) else {
                 continue;
             };
-            if !key.value().starts_with("v2:") {
-                group.database_id = DatabaseId::DEFAULT;
-            }
             if group.database_id == database_id
                 && group.tenant_id == tenant_id
                 && (group.stream_name == canonical || group.stream_name == name)
@@ -300,12 +275,6 @@ impl SystemCatalog {
                 .remove(topic_key(database_id, tenant_id, name).as_str())
                 .map_err(|e| catalog_err("delete topic", e))?
                 .is_some();
-            if database_id == DatabaseId::DEFAULT {
-                existed |= definitions
-                    .remove(legacy_topic_key(tenant_id, name).as_str())
-                    .map_err(|e| catalog_err("delete legacy topic", e))?
-                    .is_some();
-            }
             let mut messages = write_txn
                 .open_table(TOPIC_MESSAGES)
                 .map_err(|e| catalog_err("open topic_messages", e))?;
@@ -326,12 +295,9 @@ impl SystemCatalog {
                 .map_err(|e| catalog_err("range consumer_groups", e))?
             {
                 let (key, value) = entry.map_err(|e| catalog_err("read consumer_group", e))?;
-                let Some(mut group) = decode_consumer_group(value.value()) else {
+                let Some(group) = decode_consumer_group(value.value()) else {
                     continue;
                 };
-                if !key.value().starts_with("v2:") {
-                    group.database_id = DatabaseId::DEFAULT;
-                }
                 if group.database_id == database_id
                     && group.tenant_id == tenant_id
                     && (group.stream_name == canonical || group.stream_name == name)
@@ -351,8 +317,7 @@ impl SystemCatalog {
         Ok(existed)
     }
 
-    /// Load every durable topic, preferring a v2 definition over an older
-    /// DEFAULT-database row with the same logical identity.
+    /// Load every durable topic, sorted by database, tenant, and name.
     pub fn load_all_ep_topics(&self) -> crate::Result<Vec<TopicDef>> {
         let read_txn = self
             .db
@@ -366,16 +331,10 @@ impl SystemCatalog {
             .range(..)
             .map_err(|e| catalog_err("range topics_ep", e))?
         {
-            let (key, value) = entry.map_err(|e| catalog_err("read topic", e))?;
-            let is_v2 = key.value().starts_with("v2/");
-            let mut def = decode_topic(value.value())?;
-            if !is_v2 {
-                def.database_id = DatabaseId::DEFAULT;
-            }
+            let (_, value) = entry.map_err(|e| catalog_err("read topic", e))?;
+            let def = decode_topic(value.value())?;
             let identity = (def.database_id, def.tenant_id, def.name.clone());
-            if is_v2 || !topics.contains_key(&identity) {
-                topics.insert(identity, def);
-            }
+            topics.insert(identity, def);
         }
         let mut topics: Vec<_> = topics.into_values().collect();
         topics.sort_by(|left, right| {
@@ -449,29 +408,17 @@ fn find_topic_definition(
     database_id: DatabaseId,
     tenant_id: u64,
     name: &str,
-) -> crate::Result<(Option<TopicDef>, bool)> {
-    let v2 = topic_key(database_id, tenant_id, name);
-    if let Some(value) = table
-        .get(v2.as_str())
+) -> crate::Result<Option<TopicDef>> {
+    let key = topic_key(database_id, tenant_id, name);
+    let Some(value) = table
+        .get(key.as_str())
         .map_err(|e| catalog_err("get topic", e))?
-    {
-        let def = decode_topic(value.value())?;
-        validate_topic_identity(&def, database_id, tenant_id, name)?;
-        return Ok((Some(def), false));
-    }
-    if database_id == DatabaseId::DEFAULT {
-        let legacy = legacy_topic_key(tenant_id, name);
-        if let Some(value) = table
-            .get(legacy.as_str())
-            .map_err(|e| catalog_err("get legacy topic", e))?
-        {
-            let mut def = decode_topic(value.value())?;
-            def.database_id = DatabaseId::DEFAULT;
-            validate_topic_identity(&def, database_id, tenant_id, name)?;
-            return Ok((Some(def), true));
-        }
-    }
-    Ok((None, false))
+    else {
+        return Ok(None);
+    };
+    let def = decode_topic(value.value())?;
+    validate_topic_identity(&def, database_id, tenant_id, name)?;
+    Ok(Some(def))
 }
 
 fn validate_topic_identity(
@@ -590,10 +537,6 @@ fn topic_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
         tenant_id,
         name.len()
     )
-}
-
-fn legacy_topic_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
 }
 
 fn topic_message_key(
@@ -991,39 +934,5 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn appending_a_legacy_default_topic_migrates_its_high_water_marks() {
-        let (_dir, catalog) = catalog();
-        let legacy = LegacyTopicDef {
-            tenant_id: 1,
-            name: "events".into(),
-            retention: RetentionConfig::default(),
-            owner: "admin".into(),
-            created_at: 0,
-        };
-        let bytes = zerompk::to_msgpack_vec(&legacy).expect("legacy bytes");
-        let txn = catalog.db.begin_write().expect("txn");
-        {
-            let mut table = txn.open_table(TOPICS_EP).expect("topics");
-            table
-                .insert(legacy_topic_key(1, "events").as_str(), bytes.as_slice())
-                .expect("legacy insert");
-        }
-        txn.commit().expect("commit");
-        let message = catalog
-            .append_ep_topic_message(
-                DatabaseId::DEFAULT,
-                1,
-                "events",
-                "raw",
-                current_time_ms(),
-                4,
-            )
-            .expect("append");
-        assert_eq!((message.sequence, message.lsn), (1, 4));
-        let loaded = catalog.load_all_ep_topics().expect("definitions");
-        assert_eq!((loaded[0].last_sequence, loaded[0].last_lsn), (1, 4));
     }
 }

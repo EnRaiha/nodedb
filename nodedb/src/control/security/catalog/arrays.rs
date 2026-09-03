@@ -14,8 +14,7 @@ use crate::control::array_catalog::ArrayCatalogEntry;
 use super::types::{ARRAYS, SURROGATE_PK_REV_V3, SURROGATE_PK_V3, SystemCatalog, catalog_err};
 
 /// Version-two catalog key.  It includes both tenant and database because a
-/// database id is only meaningful inside a tenant. The leading NUL makes it
-/// disjoint from every legacy bare-name key.
+/// database id is only meaningful inside a tenant.
 fn array_storage_key(
     tenant_id: nodedb_types::TenantId,
     database_id: nodedb_types::DatabaseId,
@@ -36,29 +35,6 @@ fn array_storage_key_for_entry(entry: &ArrayCatalogEntry) -> String {
     )
 }
 
-/// A bare-name key predates tenant/database scoping. Its decoded identity,
-/// rather than its key, is authoritative before it can be used or removed.
-fn matching_legacy_entry(
-    entry: &ArrayCatalogEntry,
-    tenant_id: nodedb_types::TenantId,
-    name: &str,
-) -> bool {
-    entry.array_id.tenant_id == tenant_id
-        && entry.array_id.database_id == nodedb_types::DatabaseId::DEFAULT
-        && entry.array_id.name == name
-        && entry.name == name
-}
-
-fn array_identity(
-    entry: &ArrayCatalogEntry,
-) -> (nodedb_types::TenantId, nodedb_types::DatabaseId, String) {
-    (
-        entry.array_id.tenant_id,
-        entry.array_id.database_id,
-        entry.array_id.name.clone(),
-    )
-}
-
 impl SystemCatalog {
     /// Insert or overwrite an array catalog entry.
     pub fn put_array(&self, entry: &ArrayCatalogEntry) -> crate::Result<()> {
@@ -76,28 +52,11 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert array", e))?;
-            if entry.array_id.database_id == nodedb_types::DatabaseId::DEFAULT {
-                let legacy = table
-                    .get(entry.name.as_str())
-                    .map_err(|e| catalog_err("get legacy array", e))?
-                    .map(|value| value.value().to_vec());
-                if let Some(legacy) = legacy {
-                    let legacy_entry: ArrayCatalogEntry = zerompk::from_msgpack(&legacy)
-                        .map_err(|e| catalog_err("deser legacy array", e))?;
-                    if matching_legacy_entry(&legacy_entry, entry.array_id.tenant_id, &entry.name) {
-                        table
-                            .remove(entry.name.as_str())
-                            .map_err(|e| catalog_err("remove legacy array", e))?;
-                    }
-                }
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
-    /// Fetch an array by its explicit tenant/database identity. V2 takes
-    /// precedence; DEFAULT may use a legacy bare key only when its decoded
-    /// identity exactly matches the requested tenant and DEFAULT database.
+    /// Fetch an array by its explicit tenant/database identity.
     pub fn get_array_in_database(
         &self,
         tenant_id: nodedb_types::TenantId,
@@ -111,29 +70,16 @@ impl SystemCatalog {
         let table = read_txn
             .open_table(ARRAYS)
             .map_err(|e| catalog_err("open arrays", e))?;
-        let v2_key = array_storage_key(tenant_id, database_id, name);
-        let value = match table.get(v2_key.as_str()) {
-            Ok(Some(value)) => Some(value.value().to_vec()),
-            Ok(None) if database_id == nodedb_types::DatabaseId::DEFAULT => match table.get(name) {
-                Ok(Some(value)) => {
-                    let bytes = value.value().to_vec();
-                    let entry: ArrayCatalogEntry = zerompk::from_msgpack(&bytes)
-                        .map_err(|e| catalog_err("deser legacy array", e))?;
-                    matching_legacy_entry(&entry, tenant_id, name).then_some(bytes)
-                }
-                Ok(None) => None,
-                Err(e) => return Err(catalog_err("get legacy array", e)),
-            },
-            Ok(None) => None,
-            Err(e) => return Err(catalog_err("get array", e)),
-        };
-        value
-            .map(|bytes| zerompk::from_msgpack(&bytes).map_err(|e| catalog_err("deser array", e)))
+        let key = array_storage_key(tenant_id, database_id, name);
+        table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get array", e))?
+            .map(|value| zerompk::from_msgpack(value.value()))
             .transpose()
+            .map_err(|e| catalog_err("deser array", e))
     }
 
-    /// Delete by explicit tenant/database identity. Deletes a legacy bare key
-    /// only for DEFAULT, and only after its decoded identity matches.
+    /// Delete by explicit tenant/database identity.
     pub fn delete_array_in_database(
         &self,
         tenant_id: nodedb_types::TenantId,
@@ -144,32 +90,16 @@ impl SystemCatalog {
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
-        let mut existed;
+        let existed;
         {
             let mut table = write_txn
                 .open_table(ARRAYS)
                 .map_err(|e| catalog_err("open arrays", e))?;
-            let v2_key = array_storage_key(tenant_id, database_id, name);
+            let key = array_storage_key(tenant_id, database_id, name);
             existed = table
-                .remove(v2_key.as_str())
+                .remove(key.as_str())
                 .map_err(|e| catalog_err("remove array", e))?
                 .is_some();
-            if !existed && database_id == nodedb_types::DatabaseId::DEFAULT {
-                let legacy = table
-                    .get(name)
-                    .map_err(|e| catalog_err("get legacy array", e))?
-                    .map(|value| value.value().to_vec());
-                if let Some(legacy) = legacy {
-                    let legacy_entry: ArrayCatalogEntry = zerompk::from_msgpack(&legacy)
-                        .map_err(|e| catalog_err("deser legacy array", e))?;
-                    if matching_legacy_entry(&legacy_entry, tenant_id, name) {
-                        existed = table
-                            .remove(name)
-                            .map_err(|e| catalog_err("remove legacy array", e))?
-                            .is_some();
-                    }
-                }
-            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -191,7 +121,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("array/surrogate delete txn", e))?;
         let db_id = database_id.as_u64();
         let tid = tenant_id.as_u64();
-        let mut existed;
+        let existed;
         {
             let mut arrays = write_txn
                 .open_table(ARRAYS)
@@ -201,24 +131,6 @@ impl SystemCatalog {
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("remove array", e))?
                 .is_some();
-            // A DEFAULT array may still exist under the historical bare key.
-            // Remove it in this same transaction as its surrogate bindings.
-            if database_id == nodedb_types::DatabaseId::DEFAULT {
-                let legacy = arrays
-                    .get(name)
-                    .map_err(|e| catalog_err("get legacy array", e))?
-                    .map(|value| value.value().to_vec());
-                if let Some(legacy) = legacy {
-                    let entry: ArrayCatalogEntry = zerompk::from_msgpack(&legacy)
-                        .map_err(|e| catalog_err("deser legacy array", e))?;
-                    if matching_legacy_entry(&entry, tenant_id, name) {
-                        existed |= arrays
-                            .remove(name)
-                            .map_err(|e| catalog_err("remove legacy array", e))?
-                            .is_some();
-                    }
-                }
-            }
 
             let mut forward = write_txn
                 .open_table(SURROGATE_PK_V3)
@@ -293,28 +205,15 @@ pub(super) fn load_all_arrays_in(
     let table = read_txn
         .open_table(ARRAYS)
         .map_err(|e| catalog_err("open arrays", e))?;
-    let mut rows = std::collections::HashMap::new();
+    let mut rows = Vec::new();
     let iter = table.iter().map_err(|e| catalog_err("iter arrays", e))?;
     for row in iter {
-        let (key, value) = row.map_err(|e| catalog_err("iter row", e))?;
+        let (_, value) = row.map_err(|e| catalog_err("iter row", e))?;
         let entry: ArrayCatalogEntry =
             zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser array", e))?;
-        let is_v2 = key.value().starts_with('\0');
-        if !is_v2 && !matching_legacy_entry(&entry, entry.array_id.tenant_id, key.value()) {
-            continue;
-        }
-        let identity = array_identity(&entry);
-        match rows.entry(identity) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert((is_v2, entry));
-            }
-            std::collections::hash_map::Entry::Occupied(mut slot) if is_v2 && !slot.get().0 => {
-                slot.insert((true, entry));
-            }
-            std::collections::hash_map::Entry::Occupied(_) => {}
-        }
+        rows.push(entry);
     }
-    Ok(rows.into_values().map(|(_, entry)| entry).collect())
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -344,18 +243,6 @@ mod tests {
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
         }
-    }
-
-    fn insert_legacy(catalog: &SystemCatalog, entry: &ArrayCatalogEntry) {
-        let bytes = zerompk::to_msgpack_vec(entry).unwrap();
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(ARRAYS)
-                .unwrap()
-                .insert(entry.name.as_str(), bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
     }
 
     #[test]
@@ -389,107 +276,49 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bare_names_require_matching_tenant_and_default_database() {
+    fn a_replacing_put_is_visible_to_both_read_paths() {
         let catalog = catalog();
-        let legacy = entry(2, DatabaseId::DEFAULT, "same", 1);
-        insert_legacy(&catalog, &legacy);
+        catalog
+            .put_array(&entry(1, DatabaseId::DEFAULT, "same", 1))
+            .unwrap();
+        let replacement = entry(1, DatabaseId::DEFAULT, "same", 2);
+        catalog.put_array(&replacement).unwrap();
 
         assert_eq!(
             catalog
                 .get_array_in_database(TenantId::new(1), DatabaseId::DEFAULT, "same")
                 .unwrap(),
-            None
+            Some(replacement.clone())
         );
-        assert_eq!(
-            catalog
-                .get_array_in_database(TenantId::new(2), DatabaseId::new(7), "same")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            catalog
-                .get_array_in_database(TenantId::new(2), DatabaseId::DEFAULT, "same")
-                .unwrap(),
-            Some(legacy)
-        );
+        assert_eq!(catalog.load_all_arrays().unwrap(), vec![replacement]);
     }
 
     #[test]
-    fn wrong_tenant_delete_does_not_remove_legacy_bare_name() {
+    fn delete_is_scoped_to_one_tenant_and_database() {
         let catalog = catalog();
-        let legacy = entry(2, DatabaseId::DEFAULT, "same", 1);
-        insert_legacy(&catalog, &legacy);
+        let kept = entry(2, DatabaseId::DEFAULT, "same", 1);
+        catalog.put_array(&kept).unwrap();
 
         assert!(
             !catalog
                 .delete_array_in_database(TenantId::new(1), DatabaseId::DEFAULT, "same")
                 .unwrap()
         );
+        assert!(
+            !catalog
+                .delete_array_in_database(TenantId::new(2), DatabaseId::new(7), "same")
+                .unwrap()
+        );
         assert_eq!(
             catalog
                 .get_array_in_database(TenantId::new(2), DatabaseId::DEFAULT, "same")
                 .unwrap(),
-            Some(legacy)
+            Some(kept)
         );
-    }
-
-    #[test]
-    fn put_removes_only_a_matching_legacy_bare_name() {
-        let catalog = catalog();
-        let foreign_legacy = entry(2, DatabaseId::DEFAULT, "foreign", 1);
-        insert_legacy(&catalog, &foreign_legacy);
-        catalog
-            .put_array(&entry(1, DatabaseId::DEFAULT, "foreign", 2))
-            .unwrap();
-
-        let txn = catalog.db.begin_read().unwrap();
         assert!(
-            txn.open_table(ARRAYS)
-                .unwrap()
-                .get("foreign")
-                .unwrap()
-                .is_some()
-        );
-        drop(txn);
-
-        let matching_legacy = entry(1, DatabaseId::DEFAULT, "matching", 1);
-        insert_legacy(&catalog, &matching_legacy);
-        catalog
-            .put_array(&entry(1, DatabaseId::DEFAULT, "matching", 2))
-            .unwrap();
-        let txn = catalog.db.begin_read().unwrap();
-        assert!(
-            txn.open_table(ARRAYS)
-                .unwrap()
-                .get("matching")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn load_all_arrays_deduplicates_legacy_rows_with_v2_precedence() {
-        let catalog = catalog();
-        let legacy = entry(1, DatabaseId::DEFAULT, "same", 1);
-        let v2 = entry(1, DatabaseId::DEFAULT, "same", 2);
-        insert_legacy(&catalog, &legacy);
-        let bytes = zerompk::to_msgpack_vec(&v2).unwrap();
-        let key = array_storage_key_for_entry(&v2);
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(ARRAYS)
-                .unwrap()
-                .insert(key.as_str(), bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-
-        assert_eq!(
             catalog
-                .get_array_in_database(TenantId::new(1), DatabaseId::DEFAULT, "same")
-                .unwrap(),
-            Some(v2.clone())
+                .delete_array_in_database(TenantId::new(2), DatabaseId::DEFAULT, "same")
+                .unwrap()
         );
-        assert_eq!(catalog.load_all_arrays().unwrap(), vec![v2]);
     }
 }

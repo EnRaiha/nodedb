@@ -2,18 +2,17 @@
 
 //! User-defined function metadata operations for the system catalog.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use nodedb_types::id::DatabaseId;
 use redb::{ReadableDatabase, ReadableTable};
 
-use super::dependencies::{DependencyList, dep_key, legacy_dep_key};
+use super::dependencies::{DependencyList, dep_key};
 use super::function_types::StoredFunction;
 use super::types::{DEPENDENCIES, FUNCTIONS, SystemCatalog, WASM_MODULES, catalog_err};
 
 impl SystemCatalog {
-    /// Store a function under its tenant/database v2 key. A default-database
-    /// write removes the legacy tenant/name key after persisting its v2 form.
+    /// Store a function under its tenant/database key.
     pub fn put_function(&self, func: &StoredFunction) -> crate::Result<()> {
         let key = function_key(func.tenant_id, func.database_id, &func.name);
         // Module bytes are transport payload, not function metadata. Keeping
@@ -33,11 +32,6 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert function", e))?;
-            if func.database_id == DatabaseId::DEFAULT {
-                table
-                    .remove(legacy_function_key(func.tenant_id, &func.name).as_str())
-                    .map_err(|e| catalog_err("remove legacy function", e))?;
-            }
         }
         replace_function_dependencies(&write_txn, func)?;
         write_txn.commit().map_err(|e| catalog_err("commit", e))
@@ -55,7 +49,6 @@ impl SystemCatalog {
         module: Option<&[u8]>,
     ) -> crate::Result<()> {
         let key = function_key(func.tenant_id, func.database_id, &func.name);
-        let legacy_key = legacy_function_key(func.tenant_id, &func.name);
         let mut persisted = func.clone();
         persisted.wasm_module = None;
         let bytes = zerompk::to_msgpack_vec(&persisted)
@@ -69,36 +62,17 @@ impl SystemCatalog {
             let mut functions = write_txn
                 .open_table(FUNCTIONS)
                 .map_err(|e| catalog_err("open functions", e))?;
-            let previous = match functions
+            let previous: Option<StoredFunction> = functions
                 .get(key.as_str())
                 .map_err(|e| catalog_err("get function", e))?
-            {
-                Some(value) => Some(
-                    zerompk::from_msgpack(value.value())
-                        .map_err(|e| catalog_err("deser function", e))?,
-                ),
-                None if func.database_id == DatabaseId::DEFAULT => match functions
-                    .get(legacy_key.as_str())
-                    .map_err(|e| catalog_err("get legacy function", e))?
-                {
-                    Some(value) => Some(
-                        zerompk::from_msgpack(value.value())
-                            .map_err(|e| catalog_err("deser legacy function", e))?,
-                    ),
-                    None => None,
-                },
-                None => None,
-            };
+                .map(|value| zerompk::from_msgpack(value.value()))
+                .transpose()
+                .map_err(|e| catalog_err("deser function", e))?;
             functions
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert function", e))?;
-            if func.database_id == DatabaseId::DEFAULT {
-                functions
-                    .remove(legacy_key.as_str())
-                    .map_err(|e| catalog_err("remove legacy function", e))?;
-            }
 
-            let old_hash = previous.and_then(|function: StoredFunction| function.wasm_hash);
+            let old_hash = previous.and_then(|function| function.wasm_hash);
             if let Some(old_hash) = old_hash.as_deref()
                 && func.wasm_hash.as_deref() != Some(old_hash)
             {
@@ -162,7 +136,7 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("commit function WASM write", e))
     }
 
-    /// Legacy default-database lookup.
+    /// Get a function scoped to the default database.
     pub fn get_function(
         &self,
         tenant_id: u64,
@@ -174,8 +148,7 @@ impl SystemCatalog {
     /// Get a function in an exact database scope, with the calling
     /// connection's buffered transactional DDL merged in — a `CREATE
     /// FUNCTION` this same transaction has buffered but not yet committed
-    /// resolves here too. DEFAULT also reads legacy tenant/name records,
-    /// whose missing database field decodes as DEFAULT.
+    /// resolves here too.
     pub fn get_function_in_database(
         &self,
         database_id: DatabaseId,
@@ -207,32 +180,21 @@ impl SystemCatalog {
         let table = read_txn
             .open_table(FUNCTIONS)
             .map_err(|e| catalog_err("open functions", e))?;
-        for key in [
-            Some(function_key(tenant_id, database_id, name)),
-            (database_id == DatabaseId::DEFAULT).then(|| legacy_function_key(tenant_id, name)),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(value) = table
-                .get(key.as_str())
-                .map_err(|e| catalog_err("get function", e))?
-            {
-                let func: StoredFunction = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser function", e))?;
-                return Ok(Some(func));
-            }
-        }
-        Ok(None)
+        let key = function_key(tenant_id, database_id, name);
+        table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get function", e))?
+            .map(|value| zerompk::from_msgpack(value.value()))
+            .transpose()
+            .map_err(|e| catalog_err("deser function", e))
     }
 
-    /// Legacy default-database delete.
+    /// Delete a function scoped to the default database.
     pub fn delete_function(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
         self.delete_function_in_database(DatabaseId::DEFAULT, tenant_id, name)
     }
 
-    /// Delete only the selected database's function. DEFAULT also removes a
-    /// legacy key so destructive migration cannot revive an old definition.
+    /// Delete only the selected database's function.
     pub fn delete_function_in_database(
         &self,
         database_id: DatabaseId,
@@ -242,7 +204,7 @@ impl SystemCatalog {
         self.delete_function_with_unreferenced_wasm(database_id, tenant_id, name)
     }
 
-    /// Atomically delete a function row and dependency row, and remove each
+    /// Atomically delete a function row and dependency row, and remove the
     /// removed WASM blob only when no remaining function references its hash.
     pub fn delete_function_with_unreferenced_wasm(
         &self,
@@ -259,57 +221,38 @@ impl SystemCatalog {
                 .open_table(FUNCTIONS)
                 .map_err(|e| catalog_err("open functions", e))?;
             let key = function_key(tenant_id, database_id, name);
-            let legacy_key = legacy_function_key(tenant_id, name);
-            let v2 = functions
+            let removed = functions
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("remove function", e))?;
-            let v2_exists = v2.is_some();
-            let v2_function: Option<StoredFunction> = v2
+            let existed = removed.is_some();
+            let removed_function: Option<StoredFunction> = removed
                 .as_ref()
                 .map(|value| zerompk::from_msgpack(value.value()))
                 .transpose()
                 .map_err(|e| catalog_err("deserialize removed function", e))?;
-            drop(v2);
+            drop(removed);
 
-            let legacy = if database_id == DatabaseId::DEFAULT {
-                functions
-                    .remove(legacy_key.as_str())
-                    .map_err(|e| catalog_err("remove legacy function", e))?
-            } else {
-                None
-            };
-            let legacy_exists = legacy.is_some();
-            let legacy_function: Option<StoredFunction> = legacy
-                .as_ref()
-                .map(|value| zerompk::from_msgpack(value.value()))
-                .transpose()
-                .map_err(|e| catalog_err("deserialize legacy function", e))?;
-            drop(legacy);
-
-            let removed_hashes: HashSet<String> = [v2_function, legacy_function]
-                .into_iter()
-                .flatten()
-                .filter_map(|function| function.wasm_hash)
-                .collect();
-            let mut referenced_hashes = HashSet::new();
-            for row in functions
-                .range(..)
-                .map_err(|e| catalog_err("scan functions", e))?
-            {
-                let (_, value) = row.map_err(|e| catalog_err("read function", e))?;
-                let function: StoredFunction = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deserialize function", e))?;
-                if let Some(hash) = function.wasm_hash
-                    && removed_hashes.contains(&hash)
-                {
-                    referenced_hashes.insert(hash);
+            let removed_hash = removed_function.and_then(|function| function.wasm_hash);
+            let unreferenced_hash = match removed_hash {
+                Some(hash) => {
+                    let mut still_referenced = false;
+                    for row in functions
+                        .range(..)
+                        .map_err(|e| catalog_err("scan functions", e))?
+                    {
+                        let (_, value) = row.map_err(|e| catalog_err("read function", e))?;
+                        let function: StoredFunction = zerompk::from_msgpack(value.value())
+                            .map_err(|e| catalog_err("deserialize function", e))?;
+                        if function.wasm_hash.as_deref() == Some(hash.as_str()) {
+                            still_referenced = true;
+                            break;
+                        }
+                    }
+                    (!still_referenced).then_some(hash)
                 }
-            }
-            let unreferenced_hashes = removed_hashes
-                .difference(&referenced_hashes)
-                .cloned()
-                .collect::<Vec<_>>();
-            (v2_exists || legacy_exists, unreferenced_hashes)
+                None => None,
+            };
+            (existed, unreferenced_hash)
         };
         {
             let mut dependencies = write_txn
@@ -318,22 +261,15 @@ impl SystemCatalog {
             dependencies
                 .remove(dep_key(database_id, "function", tenant_id, name).as_str())
                 .map_err(|e| catalog_err("remove function dependencies", e))?;
-            if database_id == DatabaseId::DEFAULT {
-                dependencies
-                    .remove(legacy_dep_key("function", tenant_id, name).as_str())
-                    .map_err(|e| catalog_err("remove legacy function dependencies", e))?;
-            }
         }
-        if !removed_hash.is_empty() {
+        if let Some(hash) = removed_hash {
             let mut modules = write_txn
                 .open_table(WASM_MODULES)
                 .map_err(|e| catalog_err("open WASM modules", e))?;
-            for hash in removed_hash {
-                let module_key = format!("wasm_module:{hash}");
-                modules
-                    .remove(module_key.as_str())
-                    .map_err(|e| catalog_err("remove unreferenced WASM module", e))?;
-            }
+            let module_key = format!("wasm_module:{hash}");
+            modules
+                .remove(module_key.as_str())
+                .map_err(|e| catalog_err("remove unreferenced WASM module", e))?;
         }
         write_txn
             .commit()
@@ -373,7 +309,7 @@ impl SystemCatalog {
             .range(..)
             .map_err(|e| catalog_err("range functions", e))?
         {
-            let (key, value) = entry.map_err(|e| catalog_err("read function", e))?;
+            let (_, value) = entry.map_err(|e| catalog_err("read function", e))?;
             let function: StoredFunction = zerompk::from_msgpack(value.value())
                 .map_err(|e| catalog_err("deser function", e))?;
             if include(&function) {
@@ -382,11 +318,10 @@ impl SystemCatalog {
                     function.database_id,
                     function.name.clone(),
                 );
-                // v2 keys sort after legacy numeric keys and therefore win.
-                dedup.insert(scope, (key.value().starts_with("v2:"), function));
+                dedup.insert(scope, function);
             }
         }
-        Ok(dedup.into_values().map(|(_, function)| function).collect())
+        Ok(dedup.into_values().collect())
     }
 }
 
@@ -413,19 +348,11 @@ fn replace_function_dependencies(
             .insert(key.as_str(), bytes.as_slice())
             .map_err(|e| catalog_err("insert function dependencies", e))?;
     }
-    if func.database_id == DatabaseId::DEFAULT {
-        dependencies
-            .remove(legacy_dep_key("function", func.tenant_id, &func.name).as_str())
-            .map_err(|e| catalog_err("remove legacy function dependencies", e))?;
-    }
     Ok(())
 }
 
 fn function_key(tenant_id: u64, database_id: DatabaseId, name: &str) -> String {
     format!("v2:{tenant_id}:{}:{name}", database_id.as_u64())
-}
-fn legacy_function_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
 }
 
 #[cfg(test)]
@@ -555,120 +482,24 @@ mod tests {
     }
 
     #[test]
-    fn default_delete_cleans_distinct_v2_and_legacy_wasm_hashes() {
+    fn delete_removes_the_unreferenced_wasm_module() {
         use crate::control::planner::wasm::store::{load_wasm_binary, store_wasm_binary};
 
         let catalog = catalog();
-        let first_hash = store_wasm_binary(
+        let hash = store_wasm_binary(
             &catalog,
             b"\0asmv2",
             crate::control::planner::wasm::WasmConfig::default().max_binary_size,
         )
         .unwrap();
-        let second_hash = store_wasm_binary(
-            &catalog,
-            b"\0asmlegacy",
-            crate::control::planner::wasm::WasmConfig::default().max_binary_size,
-        )
-        .unwrap();
-        let mut v2 = function(DatabaseId::DEFAULT, "");
-        v2.language = FunctionLanguage::Wasm;
-        v2.wasm_hash = Some(first_hash.clone());
-        catalog.put_function(&v2).unwrap();
-
-        let mut legacy = v2.clone();
-        legacy.wasm_hash = Some(second_hash.clone());
-        let legacy_bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(FUNCTIONS)
-                .unwrap()
-                .insert(
-                    legacy_function_key(1, "same_name").as_str(),
-                    legacy_bytes.as_slice(),
-                )
-                .unwrap();
-        }
-        txn.commit().unwrap();
+        let mut stored = function(DatabaseId::DEFAULT, "");
+        stored.language = FunctionLanguage::Wasm;
+        stored.wasm_hash = Some(hash.clone());
+        catalog.put_function(&stored).unwrap();
 
         catalog
             .delete_function_with_unreferenced_wasm(DatabaseId::DEFAULT, 1, "same_name")
             .unwrap();
-        assert!(load_wasm_binary(&catalog, &first_hash).is_err());
-        assert!(load_wasm_binary(&catalog, &second_hash).is_err());
-    }
-
-    #[derive(zerompk::ToMessagePack)]
-    #[msgpack(map)]
-    struct LegacyFunction {
-        tenant_id: u64,
-        name: String,
-        parameters: Vec<FunctionParam>,
-        return_type: String,
-        body_sql: String,
-        volatility: FunctionVolatility,
-        owner: String,
-        created_at: u64,
-    }
-
-    #[test]
-    fn legacy_default_function_is_migrated_and_v2_wins_deduplication() {
-        let catalog = catalog();
-        let legacy = LegacyFunction {
-            tenant_id: 1,
-            name: "same_name".into(),
-            parameters: vec![],
-            return_type: "INT".into(),
-            body_sql: "legacy".into(),
-            volatility: FunctionVolatility::Immutable,
-            owner: "admin".into(),
-            created_at: 0,
-        };
-        let bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
-        let decoded: StoredFunction = zerompk::from_msgpack(&bytes).unwrap();
-        assert_eq!(decoded.database_id, DatabaseId::DEFAULT);
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(FUNCTIONS)
-                .unwrap()
-                .insert("1:same_name", bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        assert_eq!(
-            catalog
-                .get_function(1, "same_name")
-                .unwrap()
-                .unwrap()
-                .body_sql,
-            "legacy"
-        );
-
-        catalog
-            .put_function(&function(DatabaseId::DEFAULT, "v2"))
-            .unwrap();
-        let txn = catalog.db.begin_read().unwrap();
-        assert!(
-            txn.open_table(FUNCTIONS)
-                .unwrap()
-                .get("1:same_name")
-                .unwrap()
-                .is_none()
-        );
-        drop(txn);
-
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(FUNCTIONS)
-                .unwrap()
-                .insert("1:same_name", bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        let loaded = catalog
-            .load_functions_in_database(DatabaseId::DEFAULT, 1)
-            .unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].body_sql, "v2");
+        assert!(load_wasm_binary(&catalog, &hash).is_err());
     }
 }

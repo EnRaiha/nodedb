@@ -257,24 +257,9 @@ fn drop_tombstone_dir(dir: &std::path::Path) -> PathBuf {
     dir.with_file_name(format!(".{name}.drop-pending"))
 }
 
+/// Build the store directory for one array. Hex-encoding the name keeps
+/// separators and traversal components out of the path.
 pub(super) fn array_dir(root: &std::path::Path, id: &ArrayId) -> PathBuf {
-    // Keep legacy DEFAULT-database stores readable only for the historical
-    // identifier subset. Never interpolate separators or traversal components
-    // into a filesystem path, even for compatibility lookup.
-    let legacy_name_is_safe = !id.name.is_empty()
-        && id.name != "."
-        && id.name != ".."
-        && id
-            .name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-    if id.database_id == nodedb_types::DatabaseId::DEFAULT && legacy_name_is_safe {
-        let legacy = root.join(format!("t{}-{}", id.tenant_id.as_u64(), id.name));
-        if legacy.exists() || drop_tombstone_dir(&legacy).exists() {
-            return legacy;
-        }
-    }
-
     let encoded_name: String = id
         .name
         .as_bytes()

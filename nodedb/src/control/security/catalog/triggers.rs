@@ -23,11 +23,6 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert trigger", e))?;
-            if trigger.database_id == DatabaseId::DEFAULT {
-                table
-                    .remove(legacy_trigger_key(trigger.tenant_id, &trigger.name).as_str())
-                    .map_err(|e| catalog_err("remove legacy trigger", e))?;
-            }
         }
         txn.commit().map_err(|e| catalog_err("commit", e))
     }
@@ -69,23 +64,13 @@ impl SystemCatalog {
         let table = txn
             .open_table(TRIGGERS)
             .map_err(|e| catalog_err("open triggers", e))?;
-        for key in [
-            Some(trigger_key(tenant_id, database_id, name)),
-            (database_id == DatabaseId::DEFAULT).then(|| legacy_trigger_key(tenant_id, name)),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(value) = table
-                .get(key.as_str())
-                .map_err(|e| catalog_err("get trigger", e))?
-            {
-                return zerompk::from_msgpack(value.value())
-                    .map(Some)
-                    .map_err(|e| catalog_err("deser trigger", e));
-            }
-        }
-        Ok(None)
+        let key = trigger_key(tenant_id, database_id, name);
+        table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get trigger", e))?
+            .map(|value| zerompk::from_msgpack(value.value()))
+            .transpose()
+            .map_err(|e| catalog_err("deser trigger", e))
     }
     pub fn delete_trigger(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
         self.delete_trigger_in_database(DatabaseId::DEFAULT, tenant_id, name)
@@ -105,19 +90,10 @@ impl SystemCatalog {
             let mut table = txn
                 .open_table(TRIGGERS)
                 .map_err(|e| catalog_err("open triggers", e))?;
-            let v2 = table
+            existed = table
                 .remove(trigger_key(tenant_id, database_id, name).as_str())
                 .map_err(|e| catalog_err("remove trigger", e))?
                 .is_some();
-            let legacy = if database_id == DatabaseId::DEFAULT {
-                table
-                    .remove(legacy_trigger_key(tenant_id, name).as_str())
-                    .map_err(|e| catalog_err("remove legacy trigger", e))?
-                    .is_some()
-            } else {
-                false
-            };
-            existed = v2 || legacy;
         }
         txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -176,9 +152,6 @@ impl SystemCatalog {
 }
 fn trigger_key(tenant_id: u64, database_id: DatabaseId, name: &str) -> String {
     format!("v2:{tenant_id}:{}:{name}", database_id.as_u64())
-}
-fn legacy_trigger_key(tenant_id: u64, name: &str) -> String {
-    format!("{tenant_id}:{name}")
 }
 
 #[cfg(test)]
@@ -268,85 +241,5 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[derive(zerompk::ToMessagePack)]
-    #[msgpack(map)]
-    struct LegacyTrigger {
-        tenant_id: u64,
-        name: String,
-        collection: String,
-        timing: TriggerTiming,
-        events: TriggerEvents,
-        granularity: TriggerGranularity,
-        body_sql: String,
-        owner: String,
-        created_at: u64,
-    }
-
-    #[test]
-    fn legacy_default_trigger_is_migrated_and_v2_wins_deduplication() {
-        let catalog = catalog();
-        let legacy = LegacyTrigger {
-            tenant_id: 1,
-            name: "same_name".into(),
-            collection: "items".into(),
-            timing: TriggerTiming::After,
-            events: TriggerEvents {
-                on_insert: true,
-                on_update: false,
-                on_delete: false,
-            },
-            granularity: TriggerGranularity::Row,
-            body_sql: "legacy".into(),
-            owner: "admin".into(),
-            created_at: 0,
-        };
-        let bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
-        let decoded: StoredTrigger = zerompk::from_msgpack(&bytes).unwrap();
-        assert_eq!(decoded.database_id, DatabaseId::DEFAULT);
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(TRIGGERS)
-                .unwrap()
-                .insert("1:same_name", bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        assert_eq!(
-            catalog
-                .get_trigger(1, "same_name")
-                .unwrap()
-                .unwrap()
-                .body_sql,
-            "legacy"
-        );
-
-        catalog
-            .put_trigger(&trigger(DatabaseId::DEFAULT, "v2"))
-            .unwrap();
-        let txn = catalog.db.begin_read().unwrap();
-        assert!(
-            txn.open_table(TRIGGERS)
-                .unwrap()
-                .get("1:same_name")
-                .unwrap()
-                .is_none()
-        );
-        drop(txn);
-
-        let txn = catalog.db.begin_write().unwrap();
-        {
-            txn.open_table(TRIGGERS)
-                .unwrap()
-                .insert("1:same_name", bytes.as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        let loaded = catalog
-            .load_triggers_in_database(DatabaseId::DEFAULT, 1)
-            .unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].body_sql, "v2");
     }
 }

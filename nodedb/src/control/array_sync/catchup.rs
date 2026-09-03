@@ -319,14 +319,6 @@ mod tests {
                 .create_with_backend(redb::backends::InMemoryBackend::new())
                 .unwrap(),
         );
-        {
-            let txn = schema_db.begin_write().unwrap();
-            txn.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
-                "array_schema_docs",
-            ))
-            .unwrap();
-            txn.commit().unwrap();
-        }
         let replica_id = ReplicaId::new(0);
         let hlc_gen = Arc::new(nodedb_array::sync::HlcGenerator::new(replica_id));
         let schemas = Arc::new(

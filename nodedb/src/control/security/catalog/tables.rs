@@ -101,18 +101,16 @@ pub(super) const CONTINUOUS_AGGREGATES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.continuous_aggregates");
 
 /// Table: `v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
-/// user function definition. A legacy key builder reads rows written before
-/// the database segment existed.
+/// user function definition.
 pub(super) const FUNCTIONS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.functions");
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized trigger definition.
+/// Table: `v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
+/// trigger definition.
 pub(super) const TRIGGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.triggers");
 
 /// Table: `\0v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
-/// `ArrayCatalogEntry`. A legacy key builder reads rows written before the
-/// database segment existed.
-/// One row per ND array registered via DDL.
+/// `ArrayCatalogEntry`. One row per ND array registered via DDL.
 pub(super) const ARRAYS: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.arrays");
 
 // ── Surrogate PK map ──────────────────────────────────────────────────
@@ -161,19 +159,17 @@ pub(super) const SURROGATE_PK_REV_V3: TableDefinition<(u64, u64, &str, u32), &[u
 // ── Event Plane ───────────────────────────────────────────────────────
 
 /// Table: `v2/{database_id}/{tenant_id}/{len}/{hex(stream_name)}` ->
-/// MessagePack-serialized ChangeStreamDef. A legacy key builder reads rows
-/// written before the database segment existed.
+/// MessagePack-serialized ChangeStreamDef.
 pub(super) const CHANGE_STREAMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.change_streams");
 
 /// Table: `v2:{database_id}:{tenant_id}:{len}:{stream}:{len}:{group}` ->
-/// MessagePack-serialized ConsumerGroupDef. A legacy key builder reads rows
-/// written before the database segment existed.
+/// MessagePack-serialized ConsumerGroupDef.
 pub(super) const CONSUMER_GROUPS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.consumer_groups");
 
-/// Table: v2 `"v2:{tenant_id}:{database_id}:{schedule_name}"` (or legacy
-/// `"{tenant_id}:{schedule_name}"`) -> MessagePack-serialized ScheduleDef.
+/// Table: `v2:{tenant_id}:{database_id}:{schedule_name}` ->
+/// MessagePack-serialized ScheduleDef.
 pub(super) const SCHEDULES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.schedules");
 
@@ -186,8 +182,7 @@ pub(super) const ALERT_RULES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.alert_rules");
 
 /// Table: `v2/{database_id}/{tenant_id}/{len}/{hex(topic_name)}` ->
-/// MessagePack-serialized TopicDef. A legacy key builder reads rows written
-/// before the database segment existed.
+/// MessagePack-serialized TopicDef.
 pub(super) const TOPICS_EP: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.topics_ep");
 
@@ -199,21 +194,20 @@ pub(super) const TOPICS_EP: TableDefinition<&str, &[u8]> =
 pub(super) const TOPIC_MESSAGES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("_system.topic_messages");
 
-/// Table: "{tenant_id}:{mv_name}" -> MessagePack-serialized StreamingMvDef.
+/// Table: `v2:{database_id}:{tenant_id}:{mv_name}` -> MessagePack-serialized
+/// StreamingMvDef.
 pub(super) const STREAMING_MVS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.streaming_mvs");
 
 // ── Procedures, deps, sequences, stats ────────────────────────────────
 
 /// Table: `v2:{tenant_id}:{database_id}:{name}` -> MessagePack-serialized
-/// stored procedure definition. A legacy key builder reads rows written
-/// before the database segment existed.
+/// stored procedure definition.
 pub(super) const PROCEDURES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.procedures");
 
 /// Table: `v2:{source_type}:{tenant_id}:{database_id}:{source_name}` ->
-/// MessagePack-serialized dependency list. A legacy key builder reads rows
-/// written before the database segment existed.
+/// MessagePack-serialized dependency list.
 pub(super) const DEPENDENCIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.dependencies");
 
