@@ -148,6 +148,10 @@ impl NativeTestServer {
         let shared_listener = Arc::clone(&shared);
         let test_startup_gate = Arc::clone(&shared.startup);
         let bus_listener = shutdown_bus.clone();
+        // The registry `SharedState` carries, not a fresh one: quota DDL
+        // installs its caps there. A private registry leaves the listener
+        // enforcing no caps at all.
+        let listener_admission = Arc::clone(&shared.admission_registry);
         let _listener_handle = tokio::spawn(async move {
             listener
                 .run(nodedb::control::server::listener::ListenerRunParams {
@@ -157,9 +161,7 @@ impl NativeTestServer {
                     conn_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
                     startup_gate: test_startup_gate,
                     bus: bus_listener,
-                    admission: Arc::new(
-                        nodedb::control::server::admission::AdmissionRegistry::new(),
-                    ),
+                    admission: listener_admission,
                 })
                 .await
                 .expect("listener");

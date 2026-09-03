@@ -235,6 +235,16 @@ pub struct ConnSession {
     /// autocommit write must still floor a later transaction's read — and is
     /// therefore NOT cleared at transaction boundaries.
     pub own_write_versions: HashMap<(DatabaseId, TenantId, String), Lsn>,
+    /// Database- and tenant-scoped connection slots this session holds.
+    ///
+    /// pgwire takes them during the startup handshake, once the bound database
+    /// and the authenticated tenant are both known, and parks them here. The
+    /// store releases them when the session entry is removed at connection
+    /// teardown, so both scopes count exactly the connections that are live.
+    ///
+    /// `None` before admission runs. Native sessions park their permit on the
+    /// session object itself and leave this unset.
+    pub admission_permit: Option<crate::control::server::admission::ScopedConnectionPermit>,
 }
 
 pub(super) fn default_parameters() -> HashMap<String, String> {
@@ -314,6 +324,7 @@ impl ConnSession {
             last_activity_ms: AtomicU64::new(now_unix_ms()),
             in_flight: AtomicU32::new(0),
             own_write_versions: HashMap::new(),
+            admission_permit: None,
         }
     }
 }

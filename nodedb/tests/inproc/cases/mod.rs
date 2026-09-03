@@ -140,6 +140,7 @@ mod pgwire_tls_e2e;
 mod procedure_execution;
 mod quarantine_integration;
 mod quiesce_drain;
+mod quota_connection_admission;
 mod quota_drop_cleanup;
 mod quota_live_enforcement_apply;
 mod quota_three_level_denial;

@@ -20,6 +20,10 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::gate::require_tenant_admin;
 use super::support::{ddl_err, text_rows};
 
+/// Rendered where a dimension has no counter, so no number is measurable.
+/// Distinct from `0`, which asserts a measured zero.
+pub(crate) const UNMEASURED: &str = "n/a";
+
 /// Handle `SHOW DATABASE USAGE FOR <name>`.
 pub fn show_database_usage(
     state: &SharedState,
@@ -51,11 +55,15 @@ pub fn show_database_usage(
         ),
         None => (0, 0, 0),
     };
-    // No per-database connection gauge yet — `connections_accepted` /
-    // `connections_rejected` on SharedState are process-global and would
-    // mislead under a per-database column. Report `0` until per-database
-    // connection accounting lands.
-    let cur_connections: u64 = 0;
+    // Live connections come from the admission registry, which holds one
+    // permit per connection admitted to this database. `None` means the
+    // database has no `max_connections` cap, so no per-database counter
+    // exists — reported as `n/a`, never as a `0`, which reads as
+    // "no connections are open".
+    let cur_connections = state
+        .admission_registry
+        .database_live_connections(db_id)
+        .map(u64::from);
 
     let columns = vec![
         "database".to_string(),
@@ -65,10 +73,18 @@ pub fn show_database_usage(
         "percent_used".to_string(),
     ];
 
-    let dims: &[(&str, u64, u64)] = &[
-        ("max_memory_bytes", record.max_memory_bytes, cur_memory),
-        ("max_storage_bytes", record.max_storage_bytes, cur_storage),
-        ("max_qps", record.max_qps as u64, cur_queries),
+    let dims: &[(&str, u64, Option<u64>)] = &[
+        (
+            "max_memory_bytes",
+            record.max_memory_bytes,
+            Some(cur_memory),
+        ),
+        (
+            "max_storage_bytes",
+            record.max_storage_bytes,
+            Some(cur_storage),
+        ),
+        ("max_qps", record.max_qps as u64, Some(cur_queries)),
         (
             "max_connections",
             record.max_connections as u64,
@@ -83,7 +99,10 @@ pub fn show_database_usage(
         } else {
             limit.to_string()
         };
-        let pct_str = format_percent(limit, current);
+        let (current_str, pct_str) = match current {
+            Some(current) => (current.to_string(), format_percent(limit, current)),
+            None => (UNMEASURED.to_string(), UNMEASURED.to_string()),
+        };
         let mut row = Map::new();
         row.insert("database".to_string(), JsonValue::String(name.to_string()));
         row.insert(
@@ -91,10 +110,7 @@ pub fn show_database_usage(
             JsonValue::String(quota_name.to_string()),
         );
         row.insert("limit".to_string(), JsonValue::String(limit_str));
-        row.insert(
-            "current".to_string(),
-            JsonValue::String(current.to_string()),
-        );
+        row.insert("current".to_string(), JsonValue::String(current_str));
         row.insert("percent_used".to_string(), JsonValue::String(pct_str));
         rows.push(row);
     }
@@ -110,7 +126,7 @@ pub fn show_database_usage(
 /// overflow even when both inputs are near `u64::MAX`.
 pub(crate) fn format_percent(limit: u64, current: u64) -> String {
     if limit == 0 {
-        return "n/a".to_string();
+        return UNMEASURED.to_string();
     }
     let pct = (u128::from(current) * 100) / u128::from(limit);
     format!("{pct}%")

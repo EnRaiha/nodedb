@@ -7,7 +7,7 @@
 use nodedb_types::protocol::{NativeResponse, RequestFields};
 
 use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::server::admission::ConnectionPermit;
+use crate::control::server::admission::{AdmissionError, ConnectionPermit, ScopedConnectionPermit};
 use crate::control::server::shared::authorization::authorize_database;
 
 use super::NativeSession;
@@ -117,35 +117,27 @@ impl NativeSession {
                     return sqlstate_error(seq, "42501", "permission denied for database");
                 }
 
-                // Phase 2 admission: acquire per-database and per-tenant permits
+                // Scoped admission: acquire per-database and per-tenant permits
                 // only after authentication and database authorization succeed.
+                // `acquire` releases the database slot itself when the tenant
+                // slot is refused, so a rejected client holds no capacity.
                 let tenant_id = identity.tenant_id;
 
-                let db_permit = match self.admission_registry.try_acquire_database(db_id) {
-                    Ok(p) => p,
+                let scoped = match ScopedConnectionPermit::acquire(
+                    &self.admission_registry,
+                    db_id,
+                    tenant_id,
+                ) {
+                    Ok(scoped) => scoped,
                     Err(e) => {
                         return NativeResponse::error_with_code(
                             seq,
                             nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
                             format!("{e}"),
-                            nodedb_types::error::ErrorCode::DATABASE_QUOTA_EXCEEDED.0,
+                            admission_error_code(&e),
                         );
                     }
                 };
-                let tenant_permit =
-                    match self.admission_registry.try_acquire_tenant(db_id, tenant_id) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // db_permit is dropped here, releasing the DB slot.
-                            drop(db_permit);
-                            return NativeResponse::error_with_code(
-                                seq,
-                                nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
-                                format!("{e}"),
-                                nodedb_types::error::ErrorCode::TENANT_QUOTA_EXCEEDED.0,
-                            );
-                        }
-                    };
 
                 // Assemble the three-level permit. The global slot moves from
                 // `global_permit` into the `ConnectionPermit`. The re-auth
@@ -153,23 +145,16 @@ impl NativeSession {
                 // is still `Some` here — it is initialized at construction
                 // and only consumed on the auth path.
                 let Some(global) = self.global_permit.take() else {
-                    // Release the freshly acquired Phase 2 permits so we
+                    // Release the freshly acquired scoped permits so they
                     // don't leak slots into the per-DB / per-tenant pools.
-                    drop(tenant_permit);
-                    drop(db_permit);
+                    drop(scoped);
                     return sqlstate_error(
                         seq,
                         "XX000",
                         "internal error: global admission permit missing during auth assembly",
                     );
                 };
-                self.connection_permit = Some(ConnectionPermit {
-                    global,
-                    database: db_permit,
-                    tenant: tenant_permit,
-                    db_id,
-                    tenant_id,
-                });
+                self.connection_permit = Some(ConnectionPermit::assemble(global, scoped));
 
                 // Auth succeeds only once the selected database is persisted
                 // for every subsequent SQL and direct native operation.
@@ -227,6 +212,18 @@ impl NativeSession {
                 &e,
             ),
             Err(e) => sqlstate_error(seq, "28P01", format!("{e}")),
+        }
+    }
+}
+
+/// Native error code for an admission refusal, per exhausted scope.
+fn admission_error_code(error: &AdmissionError) -> u16 {
+    match error {
+        AdmissionError::DatabaseCapExhausted { .. } => {
+            nodedb_types::error::ErrorCode::DATABASE_QUOTA_EXCEEDED.0
+        }
+        AdmissionError::TenantCapExhausted { .. } => {
+            nodedb_types::error::ErrorCode::TENANT_QUOTA_EXCEEDED.0
         }
     }
 }

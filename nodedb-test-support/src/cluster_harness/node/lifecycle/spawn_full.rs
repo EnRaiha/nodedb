@@ -392,6 +392,10 @@ impl TestClusterNode {
         let shared_native = Arc::clone(&shared);
         let native_startup_gate = Arc::clone(&shared.startup);
         let bus_native = pg_shutdown_bus.clone();
+        // The registry `SharedState` carries, not a fresh one: quota DDL
+        // installs its caps there. A private registry leaves the listener
+        // enforcing no caps at all.
+        let native_admission = Arc::clone(&shared.admission_registry);
         let native_handle = tokio::spawn(async move {
             let _ = native_listener
                 .run(nodedb::control::server::listener::ListenerRunParams {
@@ -401,9 +405,7 @@ impl TestClusterNode {
                     conn_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
                     startup_gate: native_startup_gate,
                     bus: bus_native,
-                    admission: Arc::new(
-                        nodedb::control::server::admission::AdmissionRegistry::new(),
-                    ),
+                    admission: native_admission,
                 })
                 .await;
         });

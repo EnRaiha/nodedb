@@ -62,8 +62,33 @@ impl SessionStore {
     }
 
     /// Reset mutable state while preserving immutable typed-connection metadata.
+    ///
+    /// The admission permit carries over: it is connection capacity, not
+    /// session state, and the connection stays open across the reset. Dropping
+    /// it here frees the database and tenant slots of a live connection and
+    /// lets `DISCARD ALL` walk past `max_connections`.
     pub fn reset_session(&self, id: impl Into<SessionId>) {
-        self.write_session(id, |session| *session = ConnSession::new());
+        self.write_session(id, |session| {
+            let admission_permit = session.admission_permit.take();
+            *session = ConnSession::new();
+            session.admission_permit = admission_permit;
+        });
+    }
+
+    /// Park a connection's scoped admission permit on its session.
+    ///
+    /// Returns `false` when no session is registered under `id`; the permit is
+    /// then dropped, releasing the slots it holds. Any permit already parked is
+    /// replaced and released.
+    pub fn set_admission_permit(
+        &self,
+        id: impl Into<SessionId>,
+        permit: crate::control::server::admission::ScopedConnectionPermit,
+    ) -> bool {
+        self.write_session(id, move |session| {
+            session.admission_permit = Some(permit);
+        })
+        .is_some()
     }
 
     /// Register one immutable typed connection. Existing registrations are

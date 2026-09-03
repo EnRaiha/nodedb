@@ -58,6 +58,31 @@ pub async fn handle_use_database(
         ));
     }
 
+    // A switch moves the connection into another database's connection cap, so
+    // it must pass that database's admission the way a fresh connection does.
+    // The new slots are taken before the old ones are released: a refused
+    // switch leaves the connection admitted where it already is. A switch to
+    // the database the connection is already in takes nothing — its slot is
+    // held by this very connection.
+    let current_db = sessions
+        .get_current_database(session_id)
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
+    if db_id != current_db {
+        let permit = crate::control::server::admission::ScopedConnectionPermit::acquire(
+            &state.admission_registry,
+            db_id,
+            identity.tenant_id,
+        )
+        .map_err(|error| {
+            sqlstate_error(
+                nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
+                &error.to_string(),
+            )
+        })?;
+        // Replacing the parked permit releases the previous database's slots.
+        sessions.set_admission_permit(session_id, permit);
+    }
+
     // Validation above intentionally precedes every cleanup operation: an
     // invalid or unauthorized target must leave the current session untouched.
     // Use the neutral rollback lifecycle while its transaction identity remains

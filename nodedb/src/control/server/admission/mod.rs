@@ -3,5 +3,5 @@
 pub mod permit;
 pub mod registry;
 
-pub use permit::ConnectionPermit;
+pub use permit::{ConnectionPermit, ScopedConnectionPermit};
 pub use registry::{AdmissionError, AdmissionRegistry};

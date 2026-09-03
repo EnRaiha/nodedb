@@ -8,7 +8,7 @@ use futures::sink::Sink;
 
 use pgwire::api::ClientInfo;
 use pgwire::api::auth::StartupHandler;
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::control::security::audit::{ArcAuditEmitter, AuditEvent};
@@ -16,6 +16,9 @@ use crate::control::security::credential::store::{AuthRejection, ScramLookup};
 use crate::control::security::escalation::{
     AuthViolation, ViolationSubject, record_auth_violation,
 };
+use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
+use crate::control::server::admission::{AdmissionError, ScopedConnectionPermit};
+use crate::control::server::session_auth::identity::stored_user_identity;
 use crate::control::state::SharedState;
 
 use super::super::handler::NodeDbPgHandler;
@@ -72,6 +75,60 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
     Ok(())
 }
 
+/// Take this connection's database- and tenant-scoped connection slots and park
+/// them on its session.
+///
+/// The caps are keyed by the bound database and the authenticated tenant, so
+/// this runs after [`bind_startup_database`] and after the identity resolves.
+/// The database is read the way every pgwire query path reads it, so admission
+/// counts the connection against the database its statements will run in.
+///
+/// [`SessionStore::remove`] releases the slots at connection teardown, which
+/// the pgwire listener runs on normal close, timeout, cancellation, and a
+/// panicking session alike.
+///
+/// [`SessionStore::remove`]: crate::control::server::shared::session::SessionStore::remove
+fn admit_connection(
+    handler: &NodeDbPgHandler,
+    identity: &AuthenticatedIdentity,
+) -> PgWireResult<()> {
+    let db_id = handler
+        .sessions
+        .get_current_database(handler.session_id)
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
+
+    let permit = ScopedConnectionPermit::acquire(
+        &handler.state.admission_registry,
+        db_id,
+        identity.tenant_id,
+    )
+    .map_err(|error| admission_refusal(&error))?;
+
+    if !handler
+        .sessions
+        .set_admission_permit(handler.session_id, permit)
+    {
+        return Err(sqlstate_error(
+            "XX000",
+            "internal error: connection session is not registered",
+        ));
+    }
+    Ok(())
+}
+
+/// pgwire refusal for an exhausted connection cap.
+///
+/// `FATAL` closes the connection. The SQLSTATE and the message are the ones the
+/// native protocol reports for the same condition, so a cap refusal reads the
+/// same on both protocols.
+fn admission_refusal(error: &AdmissionError) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".to_owned(),
+        nodedb_types::error::sqlstate::QUOTA_EXCEEDED.to_owned(),
+        error.to_string(),
+    )))
+}
+
 #[async_trait]
 impl StartupHandler for AuthStartup {
     async fn on_startup<C>(
@@ -100,13 +157,19 @@ impl StartupHandler for AuthStartup {
                     // identities must remain connection-local, including the
                     // empty-store bootstrap identity.
                     let identity = handler.resolve_trust_user(client)?;
-                    handler.sessions.set_identity(handler.session_id, identity);
+                    handler
+                        .sessions
+                        .set_identity(handler.session_id, identity.clone());
                     // Before AuthenticationOk, for the same reason the trust
                     // user is: once `finish_authentication` announces
                     // ReadyForQuery the client treats the connection as
                     // established, and a refusal after that point arrives too
                     // late to stop it being used.
                     bind_startup_database(client, handler.session_id, handler)?;
+                    // The connection caps are keyed by the database bound just
+                    // above, so admission runs here — still ahead of
+                    // AuthenticationOk, for the same reason.
+                    admit_connection(handler, &identity)?;
                     pgwire::api::auth::finish_authentication(
                         client,
                         &super::provider::nodedb_parameter_provider(),
@@ -176,6 +239,32 @@ impl StartupHandler for AuthStartup {
                         // error before it can execute anything, so an
                         // unresolved name still never reaches `default`.
                         bind_startup_database(client, handler.session_id, handler)?;
+                        // Admission lands here for the same reason the bind
+                        // does — the SASL handler owns the exchange through
+                        // ReadyForQuery, so this is the first hook where the
+                        // client is authenticated and the database is known.
+                        // The error returned here tears the session down
+                        // before it can execute a statement, so a refused
+                        // connection still never runs anything.
+                        //
+                        // The identity is re-read from the credential store
+                        // under the authenticated username, the way every
+                        // pgwire query path resolves a password-mode identity.
+                        let identity = stored_user_identity(
+                            state,
+                            &username,
+                            AuthMethod::ScramSha256,
+                        )
+                        .ok_or_else(|| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "FATAL".to_owned(),
+                                "28000".to_owned(),
+                                format!(
+                                    "authenticated user '{username}' not found in credential store"
+                                ),
+                            )))
+                        })?;
+                        admit_connection(handler, &identity)?;
                     }
                     Err(_) if was_in_auth => {
                         // SCRAM failed. This is the single place the lockout

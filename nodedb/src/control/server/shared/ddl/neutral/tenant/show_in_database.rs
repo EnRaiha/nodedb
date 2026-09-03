@@ -21,7 +21,7 @@ use crate::types::TenantId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::database::gate::require_tenant_admin;
-use super::super::database::show_usage::format_percent;
+use super::super::database::show_usage::{UNMEASURED, format_percent};
 use super::support::{ddl_err, text_rows};
 
 /// Handle `SHOW TENANT QUOTA FOR <name> IN DATABASE <db>`.
@@ -94,12 +94,12 @@ pub fn handle_show_tenant_quota_in_database(
 
 /// Handle `SHOW TENANT USAGE FOR <name> IN DATABASE <db>`.
 ///
-/// Returns quota dimensions with current-usage columns. Per-tenant accounting
-/// gauges are not yet emitted by any subsystem (memory governor, compaction,
-/// query path), so `current` is reported as `0` — the value such a gauge
-/// would actually hold — and `percent_used` is computed accordingly via
-/// [`format_percent`]. When per-tenant gauges land they wire in here without
-/// changing the column shape.
+/// Returns quota dimensions with current-usage columns. `max_connections`
+/// reads the admission registry, which holds one permit per connection admitted
+/// to this tenant in this database. The memory, storage, and QPS gauges are not
+/// yet emitted per tenant by any subsystem (memory governor, compaction, query
+/// path), so they report `0` — the value such a gauge actually holds. When
+/// those gauges land they wire in here without changing the column shape.
 pub fn handle_show_tenant_usage_in_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -108,7 +108,7 @@ pub fn handle_show_tenant_usage_in_database(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show tenant usage")?;
 
-    let (_db_id, _tenant_id, record) = resolve_tenant_quota(state, name, database)?;
+    let (db_id, tenant_id, record) = resolve_tenant_quota(state, name, database)?;
 
     let columns = vec![
         "tenant".to_string(),
@@ -119,14 +119,25 @@ pub fn handle_show_tenant_usage_in_database(
         "percent_used".to_string(),
     ];
 
-    // Per-tenant accounting gauges are not yet emitted; every dimension reports
-    // 0 until they land. Keeping the same `(limit, current)` shape as the
-    // database handler so percent rendering stays uniform across both forms.
-    let dims: &[(&str, u64, u64)] = &[
-        ("max_memory_bytes", record.max_memory_bytes, 0),
-        ("max_storage_bytes", record.max_storage_bytes, 0),
-        ("max_qps", record.max_qps as u64, 0),
-        ("max_connections", record.max_connections as u64, 0),
+    // `None` means the tenant has no `max_connections` cap in this database, so
+    // no per-tenant counter exists — rendered as `n/a`, never as a `0`, which
+    // reads as "no connections are open".
+    let cur_connections = state
+        .admission_registry
+        .tenant_live_connections(db_id, tenant_id)
+        .map(u64::from);
+
+    // Keeping the same `(limit, current)` shape as the database handler so
+    // percent rendering stays uniform across both forms.
+    let dims: &[(&str, u64, Option<u64>)] = &[
+        ("max_memory_bytes", record.max_memory_bytes, Some(0)),
+        ("max_storage_bytes", record.max_storage_bytes, Some(0)),
+        ("max_qps", record.max_qps as u64, Some(0)),
+        (
+            "max_connections",
+            record.max_connections as u64,
+            cur_connections,
+        ),
     ];
 
     let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
@@ -136,7 +147,10 @@ pub fn handle_show_tenant_usage_in_database(
         } else {
             limit.to_string()
         };
-        let pct_str = format_percent(limit, current);
+        let (current_str, pct_str) = match current {
+            Some(current) => (current.to_string(), format_percent(limit, current)),
+            None => (UNMEASURED.to_string(), UNMEASURED.to_string()),
+        };
         let mut row = Map::new();
         row.insert("tenant".to_string(), JsonValue::String(name.to_string()));
         row.insert(
@@ -148,10 +162,7 @@ pub fn handle_show_tenant_usage_in_database(
             JsonValue::String(quota_name.to_string()),
         );
         row.insert("limit".to_string(), JsonValue::String(limit_str));
-        row.insert(
-            "current".to_string(),
-            JsonValue::String(current.to_string()),
-        );
+        row.insert("current".to_string(), JsonValue::String(current_str));
         row.insert("percent_used".to_string(), JsonValue::String(pct_str));
         rows.push(row);
     }

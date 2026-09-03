@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use nodedb::config::auth::AuthMode;
-use nodedb::control::server::admission::AdmissionRegistry;
 use nodedb::control::server::listener::{Listener, ListenerRunParams};
 use nodedb::control::state::SharedState;
 
@@ -46,7 +45,10 @@ pub(super) async fn bind_native_listener(
     let state = Arc::clone(shared);
     let startup_gate = Arc::clone(&shared.startup);
     let bus = shutdown_bus.clone();
-    let admission = Arc::new(AdmissionRegistry::new());
+    // The registry `SharedState` carries, not a fresh one: quota DDL installs
+    // its caps there. A private registry leaves the native listener enforcing
+    // an empty set of caps.
+    let admission = Arc::clone(&shared.admission_registry);
     let handle = tokio::spawn(async move {
         let _ = listener
             .run(ListenerRunParams {
