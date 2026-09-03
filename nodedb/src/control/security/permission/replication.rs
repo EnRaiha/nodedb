@@ -11,14 +11,18 @@ use super::store::PermissionStore;
 use super::types::{Grant, format_permission, owner_key, parse_permission};
 
 /// Build a `StoredOwner` ready for proposing as `CatalogEntry::PutOwner`.
+///
+/// `database_id` must name the database the object lives in. The owner row is
+/// keyed by it, and every authorization check looks it up database-scoped.
 pub fn prepare_owner(
     object_type: &str,
+    database_id: u64,
     tenant_id: TenantId,
     object_name: &str,
     owner_username: &str,
 ) -> StoredOwner {
     StoredOwner {
-        database_id: 0,
+        database_id,
         object_type: object_type.to_string(),
         object_name: object_name.to_string(),
         tenant_id: tenant_id.as_u64(),
@@ -85,12 +89,6 @@ impl PermissionStore {
         })
     }
 
-    /// Whether an owner record already exists (proposer-side pre-check).
-    pub fn owner_exists(&self, object_type: &str, tenant_id: u64, object_name: &str) -> bool {
-        let key = owner_key(object_type, 0, tenant_id, object_name);
-        self.owners.read().contains_key(&key)
-    }
-
     /// Install a replicated owner record into the in-memory cache.
     pub fn install_replicated_owner(&self, stored: &StoredOwner) {
         let key = owner_key(
@@ -113,16 +111,9 @@ impl PermissionStore {
     }
 
     /// Remove a replicated owner record from the in-memory cache.
+    ///
+    /// `database_id` must match the value the install wrote.
     pub fn install_replicated_remove_owner(
-        &self,
-        object_type: &str,
-        tenant_id: u64,
-        object_name: &str,
-    ) -> bool {
-        self.install_replicated_remove_owner_in_database(object_type, 0, tenant_id, object_name)
-    }
-
-    pub fn install_replicated_remove_owner_in_database(
         &self,
         object_type: &str,
         database_id: u64,

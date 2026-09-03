@@ -21,7 +21,7 @@ pub fn put(stored: &StoredFunction, catalog: &SystemCatalog) -> crate::Result<()
         .put_function_with_wasm_module(stored, module.as_deref())
         .unwrap_or_else(|error| panic!("atomic function/WASM catalog put failed: {error}"));
 
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::FUNCTION,
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -41,7 +41,7 @@ pub fn delete(
         .delete_function_with_unreferenced_wasm(database_id, tenant_id, name)
         .unwrap_or_else(|error| panic!("atomic function/WASM catalog delete failed: {error}"));
 
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::FUNCTION,
         database_id.as_u64(),
         tenant_id,

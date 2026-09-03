@@ -138,7 +138,7 @@ pub async fn create_sorted_index(
     )?;
 
     // Ownership record backs authorization for a later DROP.
-    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::Sorted.owner_object_type(),
         database_id.as_u64(),
@@ -186,7 +186,7 @@ pub async fn drop_sorted_index(
     // recorded owner, a superuser, or hold TenantAdmin.
     let is_owner = state
         .permissions
-        .get_owner_in_database(
+        .get_owner(
             IndexKind::Sorted.owner_object_type(),
             database_id.as_u64(),
             tenant_id,
@@ -217,7 +217,7 @@ pub async fn drop_sorted_index(
     .await?;
 
     propose_delete_index_record(state, database_id, tenant_id, &index_name, &collection)?;
-    crate::control::server::shared::ddl::owner::propose_delete_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_delete_owner(
         state,
         IndexKind::Sorted.owner_object_type(),
         database_id.as_u64(),

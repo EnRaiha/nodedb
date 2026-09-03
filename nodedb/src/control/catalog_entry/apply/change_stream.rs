@@ -22,7 +22,7 @@ pub fn put(stored: &ChangeStreamDef, catalog: &SystemCatalog) -> crate::Result<(
     // it under database 0 leaves an owner no `get_change_stream` can resolve,
     // which `verify_redb_integrity` reports as an orphan change_stream row and
     // which turns DROP USER reassignment into a hard failure.
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::CHANGE_STREAM,
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -48,7 +48,7 @@ pub fn delete(
                 e,
             )
         })?;
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::CHANGE_STREAM,
         database_id,
         tenant_id,

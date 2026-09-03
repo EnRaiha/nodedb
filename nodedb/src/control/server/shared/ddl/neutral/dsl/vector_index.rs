@@ -155,7 +155,7 @@ pub async fn create_vector_index(
         ));
     }
 
-    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::Vector.owner_object_type(),
         database_id.as_u64(),

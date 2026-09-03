@@ -331,7 +331,7 @@ async fn continuous_aggregate_drop_is_authorized_scoped_and_cache_consistent() {
     assert_eq!(
         srv.shared
             .permissions
-            .get_owner_in_database(
+            .get_owner(
                 "continuous_aggregate",
                 0,
                 nodedb::types::TenantId::new(1),
@@ -371,7 +371,7 @@ async fn continuous_aggregate_drop_is_authorized_scoped_and_cache_consistent() {
     assert!(
         srv.shared
             .permissions
-            .get_owner_in_database(
+            .get_owner(
                 "continuous_aggregate",
                 0,
                 nodedb::types::TenantId::new(1),

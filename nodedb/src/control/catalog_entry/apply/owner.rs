@@ -61,24 +61,11 @@ pub fn delete(
 /// `owner` field is canonical; this call keeps the `OWNERS` redb
 /// table in sync so `PermissionStore::load_from` rebuilds the
 /// in-memory authorization map correctly on restart.
+///
+/// `database_id` must be the database the object lives in. The
+/// owner row is keyed by it, so a wrong value grants ownership in
+/// the wrong database.
 pub(super) fn put_parent_owner(
-    object_type: &'static str,
-    tenant_id: u64,
-    object_name: &str,
-    owner_username: &str,
-    catalog: &SystemCatalog,
-) -> crate::Result<()> {
-    put_parent_owner_in_database(
-        object_type,
-        0,
-        tenant_id,
-        object_name,
-        owner_username,
-        catalog,
-    )
-}
-
-pub(super) fn put_parent_owner_in_database(
     object_type: &'static str,
     database_id: u64,
     tenant_id: u64,
@@ -109,17 +96,9 @@ pub(super) fn put_parent_owner_in_database(
 /// Symmetric counterpart of [`put_parent_owner`]. Every drop /
 /// deactivate applier for the 8 parent-replicated types must call
 /// this so the `OWNERS` redb table does not accumulate orphaned
-/// rows after the primary record is gone.
+/// rows after the primary record is gone. `database_id` must match
+/// the value the matching [`put_parent_owner`] wrote.
 pub(super) fn delete_parent_owner(
-    object_type: &'static str,
-    tenant_id: u64,
-    object_name: &str,
-    catalog: &SystemCatalog,
-) -> crate::Result<()> {
-    delete_parent_owner_in_database(object_type, 0, tenant_id, object_name, catalog)
-}
-
-pub(super) fn delete_parent_owner_in_database(
     object_type: &'static str,
     database_id: u64,
     tenant_id: u64,

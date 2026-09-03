@@ -88,7 +88,7 @@ impl DomainContext for CatalogApplyOrphanRow<'_> {
                           drops the object's ownership — degrading permission checks with \
                           no error anywhere",
             "operator_action": "the named CatalogEntry variant's apply/<type>.rs::put is \
-                                 missing its owner::put_parent_owner(_in_database) call, or a \
+                                 missing its owner::put_parent_owner call, or a \
                                  sibling delete path is missing the matching removal; fix the \
                                  applier so the primary and owner rows are written or deleted \
                                  in lockstep",

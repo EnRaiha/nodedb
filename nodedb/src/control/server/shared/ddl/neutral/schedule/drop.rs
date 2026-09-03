@@ -91,14 +91,12 @@ pub fn drop_schedule(
         state
             .schedule_registry
             .unregister(database_id, tenant_id, &name);
-        state
-            .permissions
-            .install_replicated_remove_owner_in_database(
-                "schedule",
-                database_id.as_u64(),
-                tenant_id,
-                &name,
-            );
+        state.permissions.install_replicated_remove_owner(
+            "schedule",
+            database_id.as_u64(),
+            tenant_id,
+            &name,
+        );
     }
 
     // Emit tombstone delta for Lite visibility (removes schedule from Lite catalog).

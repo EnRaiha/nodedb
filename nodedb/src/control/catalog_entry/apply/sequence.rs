@@ -18,6 +18,7 @@ pub fn put(stored: &StoredSequence, catalog: &SystemCatalog) -> crate::Result<()
     })?;
     super::owner::put_parent_owner(
         object_type::SEQUENCE,
+        stored.database_id,
         stored.tenant_id,
         &stored.name,
         &stored.owner,
@@ -39,7 +40,7 @@ pub fn delete(
                 e,
             )
         })?;
-    super::owner::delete_parent_owner(object_type::SEQUENCE, tenant_id, name, catalog)
+    super::owner::delete_parent_owner(object_type::SEQUENCE, database_id, tenant_id, name, catalog)
 }
 
 /// Persist the durable counter state. A lost write rewinds the sequence and
@@ -143,6 +144,59 @@ mod tests {
                 .get_sequence(3, 1, "orders_id_seq")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Owner rows are keyed by database. Two sequences sharing a name
+    /// in different databases own separate rows, and dropping one must
+    /// leave the other intact.
+    #[test]
+    fn an_owner_row_of_one_database_survives_a_drop_in_another() {
+        let (credentials, _tmp) = open_catalog();
+        let catalog = credentials.catalog();
+
+        for (database_id, owner) in [(1u64, "alice"), (2u64, "bob")] {
+            let seq = StoredSequence::new(database_id, 7, "shared_seq".into(), owner.into());
+            apply_to(&CatalogEntry::PutSequence(Box::new(seq)), catalog)
+                .expect("apply put_sequence");
+        }
+
+        let owner_in = |database_id: u64| -> Option<String> {
+            catalog
+                .load_all_owners()
+                .expect("load owners")
+                .into_iter()
+                .find(|o| {
+                    o.object_type == object_type::SEQUENCE
+                        && o.database_id == database_id
+                        && o.tenant_id == 7
+                        && o.object_name == "shared_seq"
+                })
+                .map(|o| o.owner_username)
+        };
+
+        assert_eq!(owner_in(1).as_deref(), Some("alice"));
+        assert_eq!(owner_in(2).as_deref(), Some("bob"));
+
+        apply_to(
+            &CatalogEntry::DeleteSequence {
+                database_id: 1,
+                tenant_id: 7,
+                name: "shared_seq".into(),
+            },
+            catalog,
+        )
+        .expect("apply delete_sequence");
+
+        assert_eq!(
+            owner_in(1),
+            None,
+            "the dropped database's owner row must be gone"
+        );
+        assert_eq!(
+            owner_in(2).as_deref(),
+            Some("bob"),
+            "another database's owner row must survive"
         );
     }
 }

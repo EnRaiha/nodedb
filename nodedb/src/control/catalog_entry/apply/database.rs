@@ -134,7 +134,7 @@ pub fn clone_apply(
                 e,
             )
         })?;
-        super::owner::put_parent_owner_in_database(
+        super::owner::put_parent_owner(
             object_type::COLLECTION,
             child.as_u64(),
             coll.tenant_id,

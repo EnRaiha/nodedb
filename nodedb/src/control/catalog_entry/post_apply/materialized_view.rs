@@ -18,7 +18,7 @@ pub fn put(stored: StoredMaterializedView, shared: Arc<SharedState>) {
         tenant = stored.tenant_id,
         "catalog_entry: materialized view upserted (refresh loop will pick it up)"
     );
-    super::owner::install_from_parent_in_database(
+    super::owner::install_from_parent(
         "materialized_view",
         stored.database_id,
         stored.tenant_id,
@@ -35,12 +35,10 @@ pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<Shared
         tenant = tenant_id,
         "catalog_entry: materialized view removed"
     );
-    shared
-        .permissions
-        .install_replicated_remove_owner_in_database(
-            "materialized_view",
-            database_id,
-            tenant_id,
-            &name,
-        );
+    shared.permissions.install_replicated_remove_owner(
+        "materialized_view",
+        database_id,
+        tenant_id,
+        &name,
+    );
 }

@@ -18,7 +18,7 @@ pub fn put(stored: &StoredProcedure, catalog: &SystemCatalog) -> crate::Result<(
             e,
         )
     })?;
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::PROCEDURE,
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -45,7 +45,7 @@ pub fn delete(
                 e,
             )
         })?;
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::PROCEDURE,
         database_id.as_u64(),
         tenant_id,

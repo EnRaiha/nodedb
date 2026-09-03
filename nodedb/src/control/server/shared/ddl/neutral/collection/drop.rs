@@ -143,7 +143,7 @@ pub fn drop_collection(
     // Check ownership or admin.
     let is_owner = state
         .permissions
-        .get_owner_in_database("collection", database_id.as_u64(), tenant_id, name)
+        .get_owner("collection", database_id.as_u64(), tenant_id, name)
         .as_deref()
         == Some(&identity.username);
 
@@ -301,14 +301,12 @@ pub fn drop_collection(
                 }
                 panic!("local collection reclaim failed: {}", failure.error);
             }
-            state
-                .permissions
-                .install_replicated_remove_owner_in_database(
-                    "collection",
-                    database_id.as_u64(),
-                    tenant_id.as_u64(),
-                    name,
-                );
+            state.permissions.install_replicated_remove_owner(
+                "collection",
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                name,
+            );
             state
                 .permissions
                 .remove_grants_for_target(&format!("collection:{}:{name}", tenant_id.as_u64()));

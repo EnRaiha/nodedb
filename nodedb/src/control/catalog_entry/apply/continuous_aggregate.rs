@@ -15,7 +15,7 @@ pub fn put(stored: &StoredContinuousAggregate, catalog: &SystemCatalog) -> crate
             e,
         )
     })?;
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::CONTINUOUS_AGGREGATE,
         stored.database_id,
         stored.tenant_id,
@@ -42,7 +42,7 @@ pub fn delete(
                 e,
             )
         })?;
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::CONTINUOUS_AGGREGATE,
         database_id,
         tenant_id,

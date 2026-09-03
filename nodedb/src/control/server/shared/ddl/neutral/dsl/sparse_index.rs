@@ -93,7 +93,7 @@ pub fn create_sparse_index(
             fields: vec![field.to_string()],
         },
     )?;
-    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::Sparse.owner_object_type(),
         database_id.as_u64(),

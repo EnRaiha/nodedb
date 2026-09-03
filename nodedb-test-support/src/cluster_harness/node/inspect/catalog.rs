@@ -128,10 +128,18 @@ impl TestClusterNode {
             .any(|g| g.grantee == grantee && g.permission == perm)
     }
 
-    /// Read the recorded owner of an object on this node.
-    pub fn owner_of(&self, object_type: &str, tenant_id: u64, object_name: &str) -> Option<String> {
+    /// Read the recorded owner of an object on this node. Owner rows
+    /// are keyed by database, so `database_id` selects the row.
+    pub fn owner_of(
+        &self,
+        object_type: &str,
+        database_id: u64,
+        tenant_id: u64,
+        object_name: &str,
+    ) -> Option<String> {
         self.shared.permissions.get_owner(
             object_type,
+            database_id,
             nodedb_types::TenantId::new(tenant_id),
             object_name,
         )

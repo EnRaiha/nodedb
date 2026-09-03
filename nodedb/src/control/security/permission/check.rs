@@ -309,7 +309,14 @@ mod tests {
         let store = PermissionStore::new();
         let roles = RoleStore::new();
         store
-            .set_owner("collection", TenantId::new(1), "users", "alice", None)
+            .set_owner(
+                "collection",
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(1),
+                "users",
+                "alice",
+                None,
+            )
             .unwrap();
 
         let id = identity("alice", vec![], false);
@@ -349,7 +356,7 @@ mod tests {
         let roles = RoleStore::new();
         let db = DatabaseId::new(7);
         store
-            .set_owner_in_database(
+            .set_owner(
                 "collection",
                 db.as_u64(),
                 TenantId::new(1),
@@ -382,7 +389,14 @@ mod tests {
         let store = PermissionStore::new();
         let roles = RoleStore::new();
         store
-            .set_owner("collection", TenantId::new(1), "users", "alice", None)
+            .set_owner(
+                "collection",
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(1),
+                "users",
+                "alice",
+                None,
+            )
             .unwrap();
 
         let id = identity("bob", vec![], false);
@@ -672,7 +686,14 @@ mod tests {
         let store = PermissionStore::new();
         let roles = RoleStore::new();
         store
-            .set_owner("collection", TenantId::new(1), "orders", "alice", None)
+            .set_owner(
+                "collection",
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(1),
+                "orders",
+                "alice",
+                None,
+            )
             .expect("seed owner");
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = store.owners.write();
@@ -690,7 +711,14 @@ mod tests {
             NOOP
         ));
         store
-            .set_owner("collection", TenantId::new(1), "orders", "bob", None)
+            .set_owner(
+                "collection",
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(1),
+                "orders",
+                "bob",
+                None,
+            )
             .expect("post-panic ownership mutation must succeed");
         assert!(!store.check(
             &alice,

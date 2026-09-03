@@ -90,14 +90,12 @@ pub(super) fn purge_owned_for_tenant_teardown(
                     &owner.object_name,
                 );
             }
-            state
-                .permissions
-                .install_replicated_remove_owner_in_database(
-                    &owner.object_type,
-                    owner.database_id,
-                    tenant.as_u64(),
-                    &owner.object_name,
-                );
+            state.permissions.install_replicated_remove_owner(
+                &owner.object_type,
+                owner.database_id,
+                tenant.as_u64(),
+                &owner.object_name,
+            );
         }
     }
     sweep_grants(state, catalog, username)?;

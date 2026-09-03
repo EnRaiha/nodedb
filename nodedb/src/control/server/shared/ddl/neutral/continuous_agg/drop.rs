@@ -98,14 +98,12 @@ pub async fn drop_continuous_aggregate(
     // raft-applier path would have done so the local manager forgets the
     // aggregate immediately.
     if outcome.needs_local_apply() {
-        state
-            .permissions
-            .install_replicated_remove_owner_in_database(
-                crate::control::security::catalog::auth_types::object_type::CONTINUOUS_AGGREGATE,
-                database_id.as_u64(),
-                tenant_id.as_u64(),
-                &name,
-            );
+        state.permissions.install_replicated_remove_owner(
+            crate::control::security::catalog::auth_types::object_type::CONTINUOUS_AGGREGATE,
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            &name,
+        );
         let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: name.clone() });
         sync_dispatch::dispatch_system(
             state,

@@ -269,10 +269,16 @@ async fn ownership_transfer_visible_on_every_node() {
         Duration::from_secs(10),
         Duration::from_millis(50),
         || {
-            cluster
-                .nodes
-                .iter()
-                .all(|n| n.owner_of("collection", 1, "assets").as_deref() == Some("new_owner_user"))
+            cluster.nodes.iter().all(|n| {
+                n.owner_of(
+                    "collection",
+                    nodedb_types::DatabaseId::DEFAULT.as_u64(),
+                    1,
+                    "assets",
+                )
+                .as_deref()
+                    == Some("new_owner_user")
+            })
         },
     )
     .await;

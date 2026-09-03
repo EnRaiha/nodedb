@@ -159,7 +159,7 @@ async fn create_text_index(
             fields: stmt.header.columns.clone(),
         },
     )?;
-    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::FullText.owner_object_type(),
         database_id.as_u64(),

@@ -77,7 +77,7 @@ pub fn drop_materialized_view(
             state
                 .mv_registry
                 .unregister(database_id, tenant_id.as_u64(), &name);
-            state.permissions.install_replicated_remove_owner_in_database(
+            state.permissions.install_replicated_remove_owner(
                 crate::control::security::catalog::auth_types::object_type::STREAMING_MATERIALIZED_VIEW,
                 database_id.as_u64(),
                 tenant_id.as_u64(),

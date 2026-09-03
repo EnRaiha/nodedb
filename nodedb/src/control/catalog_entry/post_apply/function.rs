@@ -12,7 +12,7 @@ pub fn put(func: StoredFunction, shared: &SharedState) {
     // whole cache mirrors PostgreSQL's "any DDL invalidates
     // prepared plans" behavior — cache is small, reparse is cheap.
     shared.block_cache.clear();
-    super::owner::install_from_parent_in_database(
+    super::owner::install_from_parent(
         "function",
         func.database_id.as_u64(),
         func.tenant_id,
@@ -29,12 +29,10 @@ pub fn delete(
     shared: &SharedState,
 ) {
     shared.block_cache.clear();
-    shared
-        .permissions
-        .install_replicated_remove_owner_in_database(
-            "function",
-            database_id.as_u64(),
-            tenant_id,
-            &name,
-        );
+    shared.permissions.install_replicated_remove_owner(
+        "function",
+        database_id.as_u64(),
+        tenant_id,
+        &name,
+    );
 }

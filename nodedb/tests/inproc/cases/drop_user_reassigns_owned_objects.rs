@@ -166,7 +166,7 @@ async fn drop_user_reassigns_non_default_database_collection() {
         server
             .shared
             .permissions
-            .get_owner_in_database("collection", 9, TenantId::new(TENANT), "global_notes",)
+            .get_owner("collection", 9, TenantId::new(TENANT), "global_notes",)
             .as_deref(),
         Some("nodedb")
     );
@@ -174,7 +174,7 @@ async fn drop_user_reassigns_non_default_database_collection() {
         server
             .shared
             .permissions
-            .get_owner_in_database("collection", 10, TenantId::new(TENANT), "global_notes",)
+            .get_owner("collection", 10, TenantId::new(TENANT), "global_notes",)
             .as_deref(),
         Some("other_owner")
     );

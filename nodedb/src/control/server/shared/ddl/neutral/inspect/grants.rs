@@ -119,7 +119,7 @@ pub fn show_permissions(
 
         // Show owner row (only when collection is specified).
         if for_grantee.is_none()
-            && let Some(owner) = state.permissions.get_owner_in_database(
+            && let Some(owner) = state.permissions.get_owner(
                 "collection",
                 database_id.as_u64(),
                 identity.tenant_id,

@@ -99,7 +99,7 @@ pub async fn drop_index(
     // Ownership check against the row this index's kind files under.
     let is_owner = state
         .permissions
-        .get_owner_in_database(
+        .get_owner(
             record.kind.owner_object_type(),
             database_id.as_u64(),
             tenant_id,
@@ -130,7 +130,7 @@ pub async fn drop_index(
         &record.collection,
     )?;
 
-    crate::control::server::shared::ddl::owner::propose_delete_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_delete_owner(
         state,
         record.kind.owner_object_type(),
         database_id.as_u64(),

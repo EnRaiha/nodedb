@@ -284,7 +284,7 @@ pub async fn create_index(
     )?;
 
     // Ownership record backs authorization for later ALTER / DROP.
-    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::Secondary.owner_object_type(),
         database_id.as_u64(),

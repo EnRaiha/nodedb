@@ -73,9 +73,12 @@ pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
 /// The result-checked Data Plane `UnregisterCollection` barrier lives in
 /// `async_dispatch/collection.rs::reclaim_collection_storage`.
 pub fn purge_sync(database_id: u64, tenant_id: u64, name: String, shared: Arc<SharedState>) {
-    let owner_removed = shared
-        .permissions
-        .install_replicated_remove_owner_in_database("collection", database_id, tenant_id, &name);
+    let owner_removed = shared.permissions.install_replicated_remove_owner(
+        "collection",
+        database_id,
+        tenant_id,
+        &name,
+    );
     // Permission grants referencing the purged collection are
     // evicted from the in-memory grant set — stale cached entries
     // would otherwise outlive the catalog row they reference.
@@ -125,14 +128,12 @@ fn evict_index_owners(
     records
         .iter()
         .filter(|record| {
-            shared
-                .permissions
-                .install_replicated_remove_owner_in_database(
-                    record.kind.owner_object_type(),
-                    database_id,
-                    tenant_id,
-                    &record.name,
-                )
+            shared.permissions.install_replicated_remove_owner(
+                record.kind.owner_object_type(),
+                database_id,
+                tenant_id,
+                &record.name,
+            )
         })
         .count()
 }

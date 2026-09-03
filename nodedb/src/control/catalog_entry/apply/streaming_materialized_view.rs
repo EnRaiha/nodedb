@@ -38,7 +38,7 @@ pub fn delete(
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     catalog.delete_streaming_mv(DatabaseId::new(database_id), tenant_id, name)?;
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::STREAMING_MATERIALIZED_VIEW,
         database_id,
         tenant_id,

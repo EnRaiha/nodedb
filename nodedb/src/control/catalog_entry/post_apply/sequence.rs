@@ -14,6 +14,7 @@ use crate::control::state::SharedState;
 pub fn put(stored: StoredSequence, shared: Arc<SharedState>) {
     super::owner::install_from_parent(
         "sequence",
+        stored.database_id,
         stored.tenant_id,
         &stored.name,
         &stored.owner,
@@ -45,7 +46,7 @@ pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<Shared
     }
     shared
         .permissions
-        .install_replicated_remove_owner("sequence", tenant_id, &name);
+        .install_replicated_remove_owner("sequence", database_id, tenant_id, &name);
 }
 
 pub fn put_state(state: SequenceState, shared: Arc<SharedState>) {

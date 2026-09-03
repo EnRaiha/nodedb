@@ -17,7 +17,7 @@ pub fn put(stored: &StoredMaterializedView, catalog: &SystemCatalog) -> crate::R
             e,
         )
     })?;
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::MATERIALIZED_VIEW,
         stored.database_id,
         stored.tenant_id,
@@ -44,7 +44,7 @@ pub fn delete(
                 e,
             )
         })?;
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::MATERIALIZED_VIEW,
         database_id,
         tenant_id,

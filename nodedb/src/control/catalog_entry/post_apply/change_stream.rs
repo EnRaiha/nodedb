@@ -16,7 +16,7 @@ pub fn put(stored: ChangeStreamDef, shared: Arc<SharedState>) {
     // by. Installing it under database 0 leaves an owner row that no
     // `get_change_stream` can resolve, which turns DROP USER reassignment
     // into a hard failure and shows up as an orphan row in catalog verify.
-    super::owner::install_from_parent_in_database(
+    super::owner::install_from_parent(
         "change_stream",
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -67,12 +67,10 @@ pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<Shared
         }
     }
 
-    shared
-        .permissions
-        .install_replicated_remove_owner_in_database(
-            "change_stream",
-            database_id.as_u64(),
-            tenant_id,
-            &name,
-        );
+    shared.permissions.install_replicated_remove_owner(
+        "change_stream",
+        database_id.as_u64(),
+        tenant_id,
+        &name,
+    );
 }

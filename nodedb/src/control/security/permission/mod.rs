@@ -13,8 +13,8 @@
 //!   (`load_from`) + legacy `grant` / `revoke` / `grants_on` /
 //!   `grants_for` CRUD.
 //! - [`check`] — `check`, `check_function`, `is_owner` evaluators.
-//! - [`owner`] — `set_owner` / `remove_owner` / `get_owner` /
-//!   `list_owners` ownership CRUD.
+//! - [`owner`] — `set_owner` / `get_owner` ownership CRUD, keyed by
+//!   database.
 //! - [`replication`] — applier-side helpers used by
 //!   `CatalogEntry::{PutPermission, DeletePermission, PutOwner,
 //!   DeleteOwner}`: `prepare_permission`,

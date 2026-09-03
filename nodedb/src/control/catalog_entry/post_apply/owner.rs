@@ -18,24 +18,11 @@ use crate::control::state::SharedState;
 /// this instead of constructing `StoredOwner` inline. Objects that
 /// have no parent `Stored*` variant (indexes, spatial indexes, raw
 /// `ALTER OBJECT OWNER`) use `CatalogEntry::PutOwner` directly.
+///
+/// `database_id` must be the database the object lives in. The
+/// in-memory owner key is built from it, so a wrong value installs
+/// ownership under the wrong database.
 pub(super) fn install_from_parent(
-    object_type: &'static str,
-    tenant_id: u64,
-    object_name: &str,
-    owner_username: &str,
-    shared: &SharedState,
-) {
-    install_from_parent_in_database(
-        object_type,
-        0,
-        tenant_id,
-        object_name,
-        owner_username,
-        shared,
-    );
-}
-
-pub(super) fn install_from_parent_in_database(
     object_type: &'static str,
     database_id: u64,
     tenant_id: u64,
@@ -70,14 +57,12 @@ pub fn delete(
     object_name: String,
     shared: Arc<SharedState>,
 ) {
-    let removed = shared
-        .permissions
-        .install_replicated_remove_owner_in_database(
-            &object_type,
-            database_id,
-            tenant_id,
-            &object_name,
-        );
+    let removed = shared.permissions.install_replicated_remove_owner(
+        &object_type,
+        database_id,
+        tenant_id,
+        &object_name,
+    );
     tracing::debug!(
         %object_type, tenant = tenant_id, %object_name, removed,
         "post_apply: owner removed"

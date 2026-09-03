@@ -36,7 +36,7 @@ pub(super) fn alter_collection_owner(
     // Check authorization: current owner or admin. Owner rows are keyed by
     // database, so a collection outside the default database is only found
     // when the lookup carries the same `database_id` the row was written with.
-    let current_owner = state.permissions.get_owner_in_database(
+    let current_owner = state.permissions.get_owner(
         "collection",
         database_id.as_u64(),
         identity.tenant_id,

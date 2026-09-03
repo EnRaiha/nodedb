@@ -22,7 +22,7 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) -> crate::Result<
                 e,
             )
         })?;
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::COLLECTION,
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -99,7 +99,7 @@ pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) -> crat
         );
         return Ok(());
     }
-    super::owner::put_parent_owner_in_database(
+    super::owner::put_parent_owner(
         object_type::COLLECTION,
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -170,7 +170,7 @@ pub fn finalize_purge(
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     let database_id = DatabaseId::new(database_id);
-    super::owner::delete_parent_owner_in_database(
+    super::owner::delete_parent_owner(
         object_type::COLLECTION,
         database_id.as_u64(),
         tenant_id,

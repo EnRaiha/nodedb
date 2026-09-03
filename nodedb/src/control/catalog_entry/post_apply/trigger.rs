@@ -9,7 +9,7 @@ use crate::control::state::SharedState;
 pub fn put(stored: StoredTrigger, shared: &SharedState) {
     // `register` is an upsert: inserts new triggers and replaces
     // on OR REPLACE / ALTER ENABLE/DISABLE.
-    super::owner::install_from_parent_in_database(
+    super::owner::install_from_parent(
         "trigger",
         stored.database_id.as_u64(),
         stored.tenant_id,
@@ -29,12 +29,10 @@ pub fn delete(
     shared
         .trigger_registry
         .unregister(database_id, tenant_id, &name);
-    shared
-        .permissions
-        .install_replicated_remove_owner_in_database(
-            "trigger",
-            database_id.as_u64(),
-            tenant_id,
-            &name,
-        );
+    shared.permissions.install_replicated_remove_owner(
+        "trigger",
+        database_id.as_u64(),
+        tenant_id,
+        &name,
+    );
 }

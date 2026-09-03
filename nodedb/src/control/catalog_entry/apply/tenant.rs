@@ -77,7 +77,7 @@ pub fn move_cutover(
                 e,
             )
         })?;
-        super::owner::put_parent_owner_in_database(
+        super::owner::put_parent_owner(
             object_type::COLLECTION,
             tgt.as_u64(),
             coll.tenant_id,
@@ -102,7 +102,7 @@ pub fn move_cutover(
         // Remove the stale source owner row so it does not outlive the
         // collection it was for — the primary row is already gone from
         // `src` above.
-        super::owner::delete_parent_owner_in_database(
+        super::owner::delete_parent_owner(
             object_type::COLLECTION,
             src.as_u64(),
             coll.tenant_id,

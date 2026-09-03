@@ -196,7 +196,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             object_type::SEQUENCE,
             sequences
                 .iter()
-                .map(|s| (0, s.tenant_id, s.name.clone()))
+                .map(|s| (s.database_id, s.tenant_id, s.name.clone()))
                 .collect(),
         ),
         (

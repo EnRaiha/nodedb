@@ -128,7 +128,7 @@ pub fn create_spatial_index(
             fields: vec![field.to_string()],
         },
     )?;
-    owner::propose_owner_in_database(
+    owner::propose_owner(
         state,
         IndexKind::Spatial.owner_object_type(),
         database_id.as_u64(),

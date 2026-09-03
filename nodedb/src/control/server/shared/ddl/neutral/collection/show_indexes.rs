@@ -78,7 +78,7 @@ pub fn show_indexes(
             // for every object's owner; the registry never duplicates it.
             let owner = state
                 .permissions
-                .get_owner_in_database(
+                .get_owner(
                     record.kind.owner_object_type(),
                     database_id.as_u64(),
                     tenant_id,
