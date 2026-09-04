@@ -179,16 +179,7 @@ chrono = { version = "0.4", features = ["std"], default-features = false }
 
 # MessagePack
 rmpv = "1"
-# Pinned to upstream main, past the 0.7.1 tag. The derived codecs were
-# `inline(always)`, which folds whole codec trees into one function and makes
-# large plan enums cost minutes to compile; the fix is merged upstream but was
-# not in 0.7.1. Drop the git source for a plain version once a release carries
-# it — note that a published build resolves the registry version regardless, so
-# until then only local builds get the faster compile.
-zerompk = { version = "0.7", git = "https://github.com/nuskey8/zerompk", rev = "75d527ff8930341c859a757866b0e07f03d09ef8", features = [
-  "std",
-  "derive",
-] }
+zerompk = { version = "0.8", features = ["std", "derive"] }
 
 # Bitmap
 roaring = "0.11"
