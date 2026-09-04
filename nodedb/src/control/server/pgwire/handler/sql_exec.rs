@@ -130,11 +130,18 @@ impl NodeDbPgHandler {
                     Ok(rows) => {
                         let spill_config =
                             crate::control::server::shared::session::cursor_spill::CursorSpillConfig::default();
-                        let (rows, _truncated) =
+                        let rows =
                             crate::control::server::shared::session::cursor_spill::enforce_cursor_limit(
                                 rows,
                                 &spill_config,
-                            );
+                            )
+                            .map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    e.sqlstate().to_owned(),
+                                    e.to_string(),
+                                )))
+                            })?;
                         self.sessions.declare_cursor(
                             session_id,
                             cursor_name,
