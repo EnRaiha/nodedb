@@ -119,10 +119,14 @@ pub enum SqlError {
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },
 
-    /// A LIMIT or OFFSET clause carried a negative literal, which Postgres
-    /// rejects as SQLSTATE `2201W` (invalid_limit_value) rather than treating
-    /// as unbounded. Without the rejection the planner silently drops the
-    /// bound and runs the full collection scan.
+    /// A LIMIT or OFFSET clause carried a negative literal.
+    ///
+    /// Postgres rejects this as SQLSTATE `2201W` (invalid_limit_value).
+    /// NodeDB surfaces this as a planner error that the pgwire layer maps
+    /// to `2201W` via an explicit `Error::InvalidLimitValue` conversion
+    /// (see `control/planner`); unmapped variants fall back to `PlanError`
+    /// (`42601`). The rejection prevents the planner from silently dropping
+    /// the bound and running a full collection scan.
     #[error("invalid limit value: {detail}")]
     InvalidLimitValue { detail: String },
 

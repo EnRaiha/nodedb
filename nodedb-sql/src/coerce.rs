@@ -86,6 +86,18 @@ pub fn expr_as_nonnegative_usize(
             detail: format!("{clause} must not be negative"),
         });
     }
+    if let ast::Expr::Value(v) = expr {
+        let is_negative = match &v.value {
+            ast::Value::SingleQuotedString(s) => s.trim_start().starts_with('-'),
+            ast::Value::Number(n, _) => n.trim_start().starts_with('-'),
+            _ => false,
+        };
+        if is_negative {
+            return Err(SqlError::InvalidLimitValue {
+                detail: format!("{clause} must not be negative"),
+            });
+        }
+    }
     Ok(expr_as_usize_literal(expr))
 }
 

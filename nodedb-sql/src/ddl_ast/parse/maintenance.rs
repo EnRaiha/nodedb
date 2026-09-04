@@ -18,7 +18,7 @@ pub(super) fn try_parse(
         // name. PostgreSQL has no `ANALYZE ... (cols)` form; any trailing
         // `(...)` after the collection name is stripped so the name stays
         // clean.
-        if upper == "ANALYZE" || upper.starts_with("ANALYZE ") {
+        if parts.first().is_some_and(|p| p.eq_ignore_ascii_case("ANALYZE")) {
             let collection = parts
                 .get(1)
                 .map(|s| s.split('(').next().unwrap_or(s).trim().to_string());
@@ -26,7 +26,7 @@ pub(super) fn try_parse(
                 collection,
             }));
         }
-        if upper.starts_with("COMPACT ") {
+        if parts.first().is_some_and(|p| p.eq_ignore_ascii_case("COMPACT")) {
             let collection = parts
                 .get(1)?
                 .split('(')
