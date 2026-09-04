@@ -97,7 +97,7 @@ impl NodeDbPgHandler {
     /// are routed through the DDL / AST router before this handler is
     /// reached.
     pub(super) fn resolve_guc(&self, session_id: SessionId, param: &str) -> PgWireResult<String> {
-        use crate::control::server::shared::session::is_known_pg_runtime_parameter;
+        use crate::control::server::shared::session::validate_show_parameter;
         use pgwire::error::ErrorInfo;
 
         let builtin = match param {
@@ -114,11 +114,11 @@ impl NodeDbPgHandler {
             (Some(v), _) => Ok(v),
             (None, Some(v)) => Ok(v),
             (None, None) => {
-                if !is_known_pg_runtime_parameter(param) {
+                if let Err(error) = validate_show_parameter(param) {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_owned(),
-                        "42704".to_owned(),
-                        format!("unrecognized configuration parameter \"{param}\""),
+                        error.sqlstate().to_owned(),
+                        error.to_string(),
                     ))));
                 }
                 Ok(String::new())

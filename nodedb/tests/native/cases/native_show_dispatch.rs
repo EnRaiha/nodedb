@@ -34,6 +34,9 @@ fn is_session_param_fallback(response: &nodedb_types::protocol::NativeResponse) 
     matches!(&rows[0][0], nodedb_types::value::Value::String(s) if s.is_empty())
 }
 
+/// A `SET` whose key is a multi-byte name is sliced at the right byte
+/// boundary: the refusal carries the key verbatim. The refusal itself is
+/// covered in `native_session_parameters`.
 #[tokio::test]
 async fn native_set_to_after_unicode_key_preserves_original_offsets() {
     let server = NativeTestServer::start().await;
@@ -42,17 +45,12 @@ async fn native_set_to_after_unicode_key_preserves_original_offsets() {
         .expect("handshake");
 
     let set = send_sql(&mut stream, 1, "SET custom.ﬀﬀ TO enabled").await;
-    assert_eq!(set.status, ResponseStatus::Ok, "Unicode SET must succeed");
-    let show = send_sql(&mut stream, 2, "SHOW custom.ﬀﬀ").await;
     server.shutdown().await;
 
-    assert_eq!(show.status, ResponseStatus::Ok, "Unicode SHOW must succeed");
+    let message = set.error.map(|error| error.message).unwrap_or_default();
     assert!(
-        matches!(
-            show.rows.as_deref(),
-            Some([row]) if matches!(row.as_slice(), [nodedb_types::value::Value::String(value)] if value == "enabled")
-        ),
-        "SHOW must return the value stored by SET, got {show:?}"
+        message.contains("custom.ﬀﬀ"),
+        "the key must survive parsing intact, got {message:?}"
     );
 }
 

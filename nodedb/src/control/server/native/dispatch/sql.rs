@@ -27,7 +27,7 @@ use super::transaction::{handle_begin, handle_commit, handle_rollback};
 use super::transaction_savepoint::{
     handle_release_savepoint, handle_rollback_to_savepoint, handle_savepoint,
 };
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_to_native, handle_reset};
 use crate::control::server::native::sqlstate_code::sqlstate_error;
 
 /// Handle a SQL statement: transaction control, SET/SHOW, DDL, or DataFusion.
@@ -124,10 +124,10 @@ async fn handle_sql_inner(
         return resp(handle_set_sql(ctx, seq, sql_trimmed));
     }
     if let Some(rest) = strip_prefix_ascii_case_insensitive(sql_trimmed, "RESET ") {
-        let param = rest.trim().to_lowercase();
-        ctx.sessions
-            .set_parameter(ctx.peer_addr, param, String::new());
-        return resp(NativeResponse::status_row(seq, "RESET"));
+        // The SQL form and the opcode form share one contract: the same
+        // allowlist, and the connection default restored rather than an empty
+        // string stored over the parameter.
+        return resp(handle_reset(ctx, seq, rest.trim()));
     }
     if upper == "DISCARD ALL" {
         // Recreate only disposable session state. The authenticated database

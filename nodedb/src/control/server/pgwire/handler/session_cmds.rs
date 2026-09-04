@@ -6,7 +6,6 @@ use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::planning_overrides::parse_bool_session_value;
 use crate::control::server::shared::session::SessionId;
 
 use super::super::types::sqlstate_error;
@@ -186,124 +185,6 @@ impl NodeDbPgHandler {
             _ => {}
         }
 
-        if key == "nodedb.consistency" {
-            match value.as_str() {
-                "strong" | "eventual" => {}
-                s if s.starts_with("bounded_staleness") => {}
-                _ => {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "22023".to_owned(),
-                        format!(
-                            "invalid value for nodedb.consistency: '{value}'. Valid: strong, bounded_staleness(<ms>), eventual"
-                        ),
-                    ))));
-                }
-            }
-        }
-
-        if key == crate::control::server::shared::session::read_consistency::PARAM_KEY
-            && crate::control::server::shared::session::read_consistency::parse_value(&value)
-                .is_none()
-        {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for {}: '{value}'. Valid: strong, bounded_staleness:<secs>, eventual",
-                    crate::control::server::shared::session::read_consistency::PARAM_KEY
-                ),
-            ))));
-        }
-
-        if key == crate::control::server::shared::session::cross_shard_mode::PARAM_KEY
-            && crate::control::server::shared::session::cross_shard_mode::parse_value(&value)
-                .is_none()
-        {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for {}: '{value}'. Valid values: 'strict', 'best_effort_non_atomic'",
-                    crate::control::server::shared::session::cross_shard_mode::PARAM_KEY
-                ),
-            ))));
-        }
-
-        // Validate the distributed shuffle-join override knobs eagerly so a bad
-        // value is rejected at SET time, not silently stored. `force_shuffle_join`
-        // is a boolean (`on`/`off`/`true`/`false`/`1`/`0`); `shuffle_num_parts`
-        // is a non-negative integer (`0` = let the planner default to the
-        // cluster data-node count).
-        if key == "nodedb.force_shuffle_join" && parse_bool_session_value(&value).is_none() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.force_shuffle_join: '{value}'. \
-                     Valid: on, off, true, false, 1, 0"
-                ),
-            ))));
-        }
-        if key == "nodedb.shuffle_num_parts" && value.parse::<u32>().is_err() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.shuffle_num_parts: '{value}'. \
-                     Must be a non-negative integer (0 = cluster default)"
-                ),
-            ))));
-        }
-        // Validate the distributed shuffle-aggregate override knobs eagerly so a
-        // bad value is rejected at SET time, not silently stored.
-        // `force_shuffle_agg` is a boolean; `shuffle_agg_num_parts` is a
-        // non-negative integer (`0` = let the planner default to the cluster
-        // data-node count). Mirrors the force_shuffle_join knobs above.
-        if key == "nodedb.force_shuffle_agg" && parse_bool_session_value(&value).is_none() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.force_shuffle_agg: '{value}'. \
-                     Valid: on, off, true, false, 1, 0"
-                ),
-            ))));
-        }
-        if key == "nodedb.shuffle_agg_num_parts" && value.parse::<u32>().is_err() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.shuffle_agg_num_parts: '{value}'. \
-                     Must be a non-negative integer (0 = cluster default)"
-                ),
-            ))));
-        }
-        if key == "nodedb.broadcast_threshold_bytes" && value.parse::<usize>().is_err() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.broadcast_threshold_bytes: '{value}'. \
-                     Must be a non-negative integer (bytes; 0 = always shuffle \
-                     when both sides are analyzed)"
-                ),
-            ))));
-        }
-        if key == "nodedb.shuffle_agg_threshold" && value.parse::<usize>().is_err() {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "22023".to_owned(),
-                format!(
-                    "invalid value for nodedb.shuffle_agg_threshold: '{value}'. \
-                     Must be a non-negative integer (distinct-group count; the GROUP \
-                     BY is auto-shuffled when its estimated group cardinality exceeds \
-                     this value)"
-                ),
-            ))));
-        }
-
         // Eager validation for `nodedb.auth_session`: drive the resolve path
         // now so rate-limit / audit / fingerprint checks fire on each SET
         // rather than being deferred to the next query. A probing client
@@ -352,29 +233,19 @@ impl NodeDbPgHandler {
             }
         }
 
-        // Any key that reaches this point must be a known runtime parameter.
-        // Mirroring the `SHOW` side (params.rs `is_known_pg_runtime_parameter`),
-        // unknown keys return `42704 undefined_object` instead of being
-        // silently stored — silent storage is the class of bug that allowed
-        // `SET TENANT` to look successful while routing nothing.
-        if !crate::control::server::shared::session::is_known_settable_runtime_parameter(&key) {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42704".to_owned(),
-                format!("unrecognized configuration parameter \"{key}\""),
-            ))));
-        }
-
-        // `statement_timeout` bounds every later statement on this session, so
-        // an unparsable value must fail at SET. Storing it would leave the
-        // session believing it has a cap the dispatcher cannot read.
-        if key.eq_ignore_ascii_case("statement_timeout")
-            && let Err(e) = crate::control::server::shared::session::parse_statement_timeout(&value)
+        // Any key that reaches this point must be a known runtime parameter
+        // carrying a value its own grammar accepts. The check is the shared
+        // one every protocol applies, so a name pgwire refuses is refused on
+        // the native protocol too — silent storage on either is the class of
+        // bug that allowed `SET TENANT` to look successful while routing
+        // nothing.
+        if let Err(error) =
+            crate::control::server::shared::session::validate_set_parameter(&key, &value)
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
-                nodedb_types::error::sqlstate::INVALID_PARAMETER_VALUE.to_owned(),
-                e.to_string(),
+                error.sqlstate().to_owned(),
+                error.to_string(),
             ))));
         }
 

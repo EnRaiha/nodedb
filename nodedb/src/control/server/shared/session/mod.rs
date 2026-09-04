@@ -30,6 +30,7 @@ pub mod read_set;
 pub mod record_reads;
 mod reservation_release;
 pub mod savepoint_ops;
+pub mod set_validation;
 pub mod staging_gate;
 mod state;
 pub mod statement_timeout;
@@ -47,15 +48,16 @@ pub use self::connection::{
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
 pub use self::deadline::{statement_budget, statement_deadline, statement_deadline_ms};
 pub use self::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
-pub use self::params::{
-    is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
-    parse_show_command,
-};
+pub use self::params::{parse_set_command, parse_show_command};
 pub use self::read_set::{
     EngineTag, ReadCapture, ReadKey, ReadOrigin, ReadSetEntry, record_read_set,
 };
 pub use self::record_reads::{ResponseReads, record_reads_for_response};
 pub use self::savepoint_ops::SavepointError;
+pub use self::set_validation::{
+    SessionParameterError, validate_reset_parameter, validate_set_parameter,
+    validate_show_parameter,
+};
 pub use self::staging_gate::{
     DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,
     route_in_tx_write,

@@ -33,7 +33,7 @@ pub(crate) use conversion::{
 pub(crate) use ctx::DispatchCtx;
 pub(crate) use direct_ops::handle_direct_op;
 pub(crate) use graph_match::handle_graph_match;
-pub(crate) use session_ops::{handle_reset, handle_set, handle_show};
+pub(crate) use session_ops::{handle_reset, handle_set, handle_show, show_all};
 pub(crate) use sql::{handle_sql, handle_sql_streaming};
 pub(crate) use streaming::{SqlOutcome, SqlStream};
 pub(crate) use transaction::{NativeTxnDp, handle_begin, handle_commit, handle_rollback};

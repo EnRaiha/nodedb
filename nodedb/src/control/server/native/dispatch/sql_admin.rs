@@ -40,8 +40,9 @@ pub(super) fn handle_set_sql(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -> Nati
         return sqlstate_error(seq, "42601", "invalid SET syntax");
     };
 
-    ctx.sessions.set_parameter(ctx.peer_addr, key, value);
-    NativeResponse::status_row(seq, "SET")
+    // The SQL form and the opcode form share one contract, so a statement
+    // refused as `SET x = 'junk'` is refused as the `Set` opcode too.
+    super::handle_set(ctx, seq, &key, &value)
 }
 
 pub(super) fn is_session_show(upper: &str) -> bool {
@@ -69,40 +70,9 @@ pub(super) fn is_session_show(upper: &str) -> bool {
 pub(super) fn handle_show_sql(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -> NativeResponse {
     let param = sql[5..].trim().to_lowercase();
     if param == "all" {
-        let params = ctx.sessions.all_parameters(ctx.peer_addr);
-        let columns = vec!["name".into(), "setting".into()];
-        let rows: Vec<Vec<Value>> = params
-            .into_iter()
-            .map(|(k, v)| vec![Value::String(k), Value::String(v)])
-            .collect();
-        return NativeResponse {
-            seq,
-            status: nodedb_types::protocol::ResponseStatus::Ok,
-            columns: Some(columns),
-            rows: Some(rows),
-            rows_affected: None,
-            watermark_lsn: 0,
-            error: None,
-            auth: None,
-            warnings: Vec::new(),
-        };
+        return super::show_all(ctx, seq);
     }
-
-    let value = ctx
-        .sessions
-        .get_parameter(ctx.peer_addr, &param)
-        .unwrap_or_default();
-    NativeResponse {
-        seq,
-        status: nodedb_types::protocol::ResponseStatus::Ok,
-        columns: Some(vec!["setting".into()]),
-        rows: Some(vec![vec![Value::String(value)]]),
-        rows_affected: None,
-        watermark_lsn: 0,
-        error: None,
-        auth: None,
-        warnings: Vec::new(),
-    }
+    super::handle_show(ctx, seq, &param)
 }
 
 // ─── Explain ───────────────────────────────────────────────────────

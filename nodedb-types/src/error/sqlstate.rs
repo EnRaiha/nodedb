@@ -128,6 +128,10 @@ pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
 /// `42601` — `syntax_error`
 pub const SYNTAX_ERROR: &str = "42601";
 
+/// `42704` — `undefined_object` (a runtime parameter the server does not
+/// carry, e.g. `SET nonsense = 1` or `SHOW nonsense`)
+pub const UNDEFINED_OBJECT: &str = "42704";
+
 /// `42846` — `cannot_coerce`
 pub const CANNOT_COERCE: &str = "42846";
 
@@ -334,6 +338,7 @@ mod tests {
             SERIALIZATION_FAILURE,
             INSUFFICIENT_PRIVILEGE,
             SYNTAX_ERROR,
+            UNDEFINED_OBJECT,
             CANNOT_COERCE,
             UNDEFINED_TABLE,
             UNDEFINED_FUNCTION,

@@ -256,12 +256,13 @@ impl NodeDbPgHandler {
                 self.sessions.reset_all_parameters(session_id);
                 return Ok(vec![Response::Execution(Tag::new("RESET"))]);
             }
-            if !crate::control::server::shared::session::is_known_settable_runtime_parameter(&param)
+            if let Err(error) =
+                crate::control::server::shared::session::validate_reset_parameter(&param)
             {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
-                    "42704".to_owned(),
-                    format!("unrecognized configuration parameter \"{param}\""),
+                    error.sqlstate().to_owned(),
+                    error.to_string(),
                 ))));
             }
             self.sessions.reset_parameter(session_id, &param);
