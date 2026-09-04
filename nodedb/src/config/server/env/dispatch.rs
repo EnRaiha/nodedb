@@ -55,13 +55,14 @@ use crate::config::server::ServerConfig;
 /// handled separately by `crate::config::auth::AuthConfig::resolve_superuser_password()`
 /// (called from `main.rs`) so that the value is never passed through logging
 /// code paths or stored in `ServerConfig` where it could appear in debug output.
-pub fn apply_env_overrides(config: &mut ServerConfig) {
+pub fn apply_env_overrides(config: &mut ServerConfig) -> crate::Result<()> {
     apply_host_and_ports(config);
     apply_cluster_overrides(config);
-    apply_numeric_settings(config);
+    apply_numeric_settings(config)?;
     apply_tls_overrides(config);
     apply_wal_tuning(config);
     apply_checkpoint_tuning(config);
     apply_timeseries_overrides(config);
     super::super::observability::apply_observability_env(&mut config.observability);
+    Ok(())
 }

@@ -96,7 +96,7 @@ async fn server_main() -> anyhow::Result<()> {
     // correct in case NODEDB_DATA_DIR / NODEDB_MEMORY_LIMIT also affect it.
     // The overrides are re-applied silently here; the real log messages
     // will be emitted by the second call after the subscriber is registered.
-    apply_env_overrides(&mut config);
+    apply_env_overrides(&mut config)?;
 
     // Own the black-box recorder before the subscriber is built: the panic hook
     // it installs chains in front of the one above, and the reports directory
@@ -126,7 +126,7 @@ async fn server_main() -> anyhow::Result<()> {
 
     // Re-apply env overrides after tracing initializes so that
     // info!/warn! messages are actually emitted for operators.
-    apply_env_overrides(&mut config);
+    apply_env_overrides(&mut config)?;
 
     let cluster_mode_str = startup_log::log_boot_banner(&config_path, &config);
 

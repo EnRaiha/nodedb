@@ -50,18 +50,19 @@ mod tests {
     /// it off — an absent or malformed env var must never be read as one.
     #[test]
     fn env_wal_direct_io_override() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert!(cfg.tuning.wal.direct_io, "default must be direct I/O");
 
         unsafe { std::env::set_var("NODEDB_WAL_DIRECT_IO", "false") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert!(!cfg.tuning.wal.direct_io);
 
         unsafe { std::env::set_var("NODEDB_WAL_DIRECT_IO", "nonsense") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert!(
             cfg.tuning.wal.direct_io,
             "a malformed value must not silently disable direct I/O"

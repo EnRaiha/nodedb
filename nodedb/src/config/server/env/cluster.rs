@@ -118,6 +118,7 @@ mod tests {
 
     #[test]
     fn env_cluster_overrides() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
         // Always start clean.
         unsafe {
             std::env::remove_var("NODEDB_NODE_ID");
@@ -131,7 +132,7 @@ mod tests {
             cluster: Some(make_cluster(1)),
             ..Default::default()
         };
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(
             cfg.cluster.as_ref().unwrap().node_id,
             42,
@@ -143,7 +144,7 @@ mod tests {
 
         unsafe { std::env::set_var("NODEDB_NODE_ID", "99") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert!(
             cfg.cluster.is_none(),
             "NODEDB_NODE_ID with no [cluster] section must not create cluster"
@@ -157,7 +158,7 @@ mod tests {
             cluster: Some(make_cluster(7)),
             ..Default::default()
         };
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(
             cfg.cluster.as_ref().unwrap().node_id,
             7,
@@ -172,7 +173,7 @@ mod tests {
             cluster: Some(make_cluster(1)),
             ..Default::default()
         };
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         let seeds = &cfg.cluster.as_ref().unwrap().seed_nodes;
         assert_eq!(seeds.len(), 2, "two seed addresses should be applied");
         assert_eq!(seeds[0].to_string(), "10.0.0.1:9400");
@@ -190,7 +191,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         let seeds = &cfg.cluster.as_ref().unwrap().seed_nodes;
         assert_eq!(
             seeds.len(),

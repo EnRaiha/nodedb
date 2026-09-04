@@ -5,47 +5,49 @@
 
 use crate::config::server::{LogFormat, ServerConfig};
 
-pub(super) fn apply_numeric_settings(config: &mut ServerConfig) {
-    if let Ok(val) = std::env::var("NODEDB_DATA_PLANE_CORES") {
-        match val.trim().parse::<usize>() {
-            Ok(cores) => {
-                tracing::info!(
-                    env_var = "NODEDB_DATA_PLANE_CORES",
-                    value = cores,
-                    "environment variable override applied"
-                );
-                config.server.data_plane_cores = cores;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    env_var = "NODEDB_DATA_PLANE_CORES",
-                    value = %val,
-                    "ignoring malformed environment variable (expected usize), using config value"
-                );
-            }
+/// Parse a positive-or-nonzero usize env override, failing boot on malformed
+/// input instead of silently keeping the compiled default (issue #277).
+fn apply_positive_usize(var: &str, target: &mut usize, allow_zero: bool) -> crate::Result<()> {
+    if let Ok(val) = std::env::var(var) {
+        let parsed = val
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| crate::Error::Config {
+                detail: format!("invalid value '{val}' for {var}: expected positive integer"),
+            })?;
+        if !allow_zero && parsed == 0 {
+            return Err(crate::Error::Config {
+                detail: format!("{var} must be greater than zero"),
+            });
         }
+        tracing::info!(
+            env_var = var,
+            value = parsed,
+            "environment variable override applied"
+        );
+        *target = parsed;
     }
+    Ok(())
+}
 
-    if let Ok(val) = std::env::var("NODEDB_MAX_CONNECTIONS") {
-        match val.trim().parse::<usize>() {
-            Ok(n) => {
-                tracing::info!(
-                    env_var = "NODEDB_MAX_CONNECTIONS",
-                    value = n,
-                    "environment variable override applied"
-                );
-                config.server.max_connections = n;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    env_var = "NODEDB_MAX_CONNECTIONS",
-                    value = %val,
-                    "ignoring malformed environment variable (expected usize), using config value"
-                );
-            }
-        }
-    }
+pub(super) fn apply_numeric_settings(config: &mut ServerConfig) -> crate::Result<()> {
+    apply_positive_usize(
+        "NODEDB_DATA_PLANE_CORES",
+        &mut config.server.data_plane_cores,
+        false,
+    )?;
+    apply_positive_usize(
+        "NODEDB_MAX_CONNECTIONS",
+        &mut config.server.max_connections,
+        false,
+    )?;
+    apply_log_format_override(config);
+    Ok(())
+}
 
+/// NODEDB_LOG_FORMAT is a string-valued override. Malformed values stay a
+/// warning (non-numeric path, out of C3 scope).
+fn apply_log_format_override(config: &mut ServerConfig) {
     if let Ok(val) = std::env::var("NODEDB_LOG_FORMAT") {
         let normalised = val.trim().to_lowercase();
         match normalised.as_str() {
@@ -73,5 +75,46 @@ pub(super) fn apply_numeric_settings(config: &mut ServerConfig) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c3_malformed_env_errors_instead_of_silent_default() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
+        unsafe { std::env::set_var("NODEDB_DATA_PLANE_CORES", "abc") };
+        let mut cfg = ServerConfig::default();
+        let err = apply_numeric_settings(&mut cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("NODEDB_DATA_PLANE_CORES"),
+            "C3: error must name the env var, got: {err}"
+        );
+        unsafe { std::env::remove_var("NODEDB_DATA_PLANE_CORES") };
+    }
+
+    #[test]
+    fn c3_valid_env_still_overrides() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
+        unsafe { std::env::set_var("NODEDB_DATA_PLANE_CORES", "8") };
+        let mut cfg = ServerConfig::default();
+        apply_numeric_settings(&mut cfg).unwrap();
+        assert_eq!(cfg.server.data_plane_cores, 8);
+        unsafe { std::env::remove_var("NODEDB_DATA_PLANE_CORES") };
+    }
+
+    #[test]
+    fn c3_zero_value_rejected() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
+        unsafe { std::env::set_var("NODEDB_DATA_PLANE_CORES", "0") };
+        let mut cfg = ServerConfig::default();
+        let err = apply_numeric_settings(&mut cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "C3: zero cores must be rejected, got: {err}"
+        );
+        unsafe { std::env::remove_var("NODEDB_DATA_PLANE_CORES") };
     }
 }

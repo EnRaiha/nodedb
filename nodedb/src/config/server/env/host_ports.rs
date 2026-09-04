@@ -91,9 +91,10 @@ mod tests {
 
     #[test]
     fn env_data_dir_override() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
         unsafe { std::env::set_var("NODEDB_DATA_DIR", "/tmp/test-nodedb") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(
             cfg.server.data_dir,
             std::path::PathBuf::from("/tmp/test-nodedb")
@@ -105,17 +106,18 @@ mod tests {
     /// env-var races (env vars are process-global, Rust tests run in parallel).
     #[test]
     fn env_memory_limit_overrides() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
         // ── Valid value → overrides memory_limit ──
         unsafe { std::env::set_var("NODEDB_MEMORY_LIMIT", "2GiB") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(cfg.server.memory_limit, 2 * 1024 * 1024 * 1024);
 
         // ── Malformed value → memory_limit unchanged ──
         unsafe { std::env::set_var("NODEDB_MEMORY_LIMIT", "notanumber") };
         let mut cfg = ServerConfig::default();
         let before = cfg.server.memory_limit;
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(
             cfg.server.memory_limit, before,
             "malformed value must not change config"
@@ -128,17 +130,18 @@ mod tests {
     /// env-var races (env vars are process-global, Rust tests run in parallel).
     #[test]
     fn env_sync_port_overrides() {
+        let _env_guard = super::super::test_support::env_lock().lock().unwrap();
         // ── Valid value → overrides ports.sync ──
         unsafe { std::env::set_var("NODEDB_PORT_SYNC", "19090") };
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(cfg.server.ports.sync, 19090);
 
         // ── Malformed value → ports.sync unchanged ──
         unsafe { std::env::set_var("NODEDB_PORT_SYNC", "notaport") };
         let mut cfg = ServerConfig::default();
         let before = cfg.server.ports.sync;
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg).unwrap();
         assert_eq!(
             cfg.server.ports.sync, before,
             "malformed value must not change config"
