@@ -363,6 +363,9 @@ pub struct SharedState {
     pub shutdown: Arc<crate::control::shutdown::ShutdownWatch>,
     /// Registry of every background loop's join handle for graceful shutdown.
     pub loop_registry: Arc<crate::control::shutdown::LoopRegistry>,
+    /// Latch the Data Plane drain sets once every core has finished its
+    /// in-flight work. The response poller keeps routing until it is set.
+    pub data_plane_drain: Arc<crate::control::shutdown::DataPlaneDrain>,
     /// Startup phase gate — listeners block until `GatewayEnable` phase.
     pub startup: Arc<crate::control::startup::StartupGate>,
     /// Calvin sequencer inbox for cross-shard transactions (empty in single-node mode).

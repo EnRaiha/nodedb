@@ -158,7 +158,7 @@ pub fn spawn_background_loops(
         trigger_dlq,
         cdc_router: Arc::clone(&shared.cdc_router),
         shutdown: Arc::clone(&shared.shutdown),
-        shutdown_bus,
+        shutdown_bus: shutdown_bus.clone(),
     });
     info!(num_cores, "event plane running");
 
@@ -256,13 +256,12 @@ pub fn spawn_background_loops(
     // much as by the engines': a consumer recovers only from the WAL above its
     // watermark, and nothing detects a gap if that suffix is deleted.
     let shared_ckpt = Arc::clone(shared);
-    let shutdown_rx_ckpt = shutdown_rx.clone();
-    crate::control::checkpoint_manager::spawn_checkpoint_task(
+    let _checkpoint_task = crate::control::checkpoint_task::spawn_checkpoint_task(
         shared_ckpt,
         Arc::clone(event_plane.watermark_store()),
         num_cores,
         config.checkpoint.to_manager_config(),
-        shutdown_rx_ckpt,
+        &shutdown_bus,
     );
 
     // Usage metering flush.
@@ -362,16 +361,34 @@ pub fn spawn_background_loops(
 }
 
 /// Spawn the response poller loop (routes Data Plane responses to waiting sessions).
-pub fn spawn_response_poller(shared: &Arc<SharedState>) {
+///
+/// The poller is a `DrainingDataPlane` participant, and it exits on the Data
+/// Plane drain latch rather than on the flat shutdown signal. Two things depend
+/// on that: the final checkpoint dispatched during `DrainingControlPlane` waits
+/// for one response per core, and the Data Plane drain itself is finished only
+/// once every in-flight response has reached its session. A poller that stopped
+/// at the flat signal would strand both.
+pub fn spawn_response_poller(
+    shared: &Arc<SharedState>,
+    bus: &crate::control::shutdown::ShutdownBus,
+) {
     let shared_poller = Arc::clone(shared);
+    let drain_guard = bus.register_task(
+        crate::control::shutdown::ShutdownPhase::DrainingDataPlane,
+        "response_poller",
+        None,
+    );
     crate::control::shutdown::spawn_loop(
         &shared.loop_registry,
         &shared.shutdown,
         "response_poller",
-        move |shutdown| async move {
+        move |_shutdown| async move {
             let mut idle_iters: u32 = 0;
             loop {
-                if shutdown.is_cancelled() {
+                if shared_poller.data_plane_drain.is_complete() {
+                    // One last pass so a response the drain's own final poll
+                    // raced is still routed before the loop ends.
+                    shared_poller.poll_and_route_responses();
                     break;
                 }
                 let routed = shared_poller.poll_and_route_responses();
@@ -389,6 +406,7 @@ pub fn spawn_response_poller(shared: &Arc<SharedState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
+            drain_guard.report_drained();
         },
     );
 }

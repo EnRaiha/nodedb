@@ -15,6 +15,7 @@
 //! and logging blocking laggards.
 
 pub mod bus;
+pub mod data_plane;
 pub mod phase;
 pub mod receiver;
 pub mod registry;
@@ -23,6 +24,9 @@ pub mod spawn;
 pub mod watch;
 
 pub use bus::{DrainGuard, PHASE_BUDGET, ShutdownBus, ShutdownHandle, TaskId, spawn_drainable};
+pub use data_plane::{
+    DataPlaneDrain, DataPlaneDrainReport, drain_data_plane_cores, spawn_data_plane_drain_supervisor,
+};
 pub use phase::ShutdownPhase;
 pub use receiver::ShutdownReceiver;
 pub use registry::{LoopHandle, LoopRegistry, RegistryClosed};

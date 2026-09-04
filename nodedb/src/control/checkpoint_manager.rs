@@ -30,7 +30,6 @@
 //! Default: every 5 minutes (matches the existing vector checkpoint interval).
 //! Configurable via `CheckpointManagerConfig`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -381,60 +380,6 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
     }
 
     Some(checkpoint_lsn)
-}
-
-/// Spawn the checkpoint manager as a background Tokio task.
-///
-/// Runs `run_checkpoint_cycle` at the configured interval until the
-/// shutdown signal is received. Performs a final checkpoint on graceful shutdown.
-pub fn spawn_checkpoint_task(
-    shared: Arc<crate::control::state::SharedState>,
-    watermark_store: Arc<crate::event::watermark::WatermarkStore>,
-    num_cores: usize,
-    config: CheckpointManagerConfig,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        info!(
-            interval_secs = config.interval.as_secs(),
-            "checkpoint manager started"
-        );
-
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(config.interval) => {}
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("shutdown: running final checkpoint");
-                        run_checkpoint_cycle(CheckpointCycleInputs {
-                            dispatcher: &shared.dispatcher,
-                            tracker: &shared.tracker,
-                            wal: &shared.wal,
-                            watermark_store: &watermark_store,
-                            num_cores,
-                            timeout: config.core_timeout,
-                            cold_storage: shared.cold_storage.clone(),
-                            catalog: Some(shared.credentials.catalog()),
-                        }).await;
-                        info!("checkpoint manager stopped");
-                        return;
-                    }
-                }
-            }
-
-            run_checkpoint_cycle(CheckpointCycleInputs {
-                dispatcher: &shared.dispatcher,
-                tracker: &shared.tracker,
-                wal: &shared.wal,
-                watermark_store: &watermark_store,
-                num_cores,
-                timeout: config.core_timeout,
-                cold_storage: shared.cold_storage.clone(),
-                catalog: Some(shared.credentials.catalog()),
-            })
-            .await;
-        }
-    })
 }
 
 /// Archive WAL segments that will be deleted by the upcoming `truncate_before(checkpoint_lsn)`.

@@ -96,7 +96,7 @@ pub(crate) fn spawn(
     });
 
     // Start response poller (routes Data Plane responses to waiting sessions).
-    bootstrap::background_loops::spawn_response_poller(shared);
+    bootstrap::background_loops::spawn_response_poller(shared, &shutdown_bus);
 
     // Spawn all persistent background loops and subsystems, then transfer
     // Event Plane ownership to its shutdown supervisor. The supervisor's

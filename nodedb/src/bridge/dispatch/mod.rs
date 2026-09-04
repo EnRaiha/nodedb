@@ -2,8 +2,10 @@
 
 mod core_channel;
 mod dispatcher;
+mod drain;
 
 pub use core_channel::{CoreChannel, CoreChannelDataSide};
 pub use dispatcher::{
     BridgeRequest, BridgeResponse, DatabasePriorityResolver, DefaultPriorityResolver, Dispatcher,
 };
+pub use drain::CorePending;

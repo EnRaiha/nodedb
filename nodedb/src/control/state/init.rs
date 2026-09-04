@@ -517,6 +517,7 @@ impl SharedState {
             ),
             shutdown: Arc::clone(&shutdown),
             loop_registry: Arc::clone(&loop_registry),
+            data_plane_drain: crate::control::shutdown::DataPlaneDrain::new(),
             startup: Arc::clone(&startup_gate),
         });
         Self::wire_session_handle_audit(&state);

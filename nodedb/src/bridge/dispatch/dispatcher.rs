@@ -70,16 +70,16 @@ impl DatabasePriorityResolver for DefaultPriorityResolver {
 /// databases.
 pub struct Dispatcher {
     /// One channel pair per Data Plane core.
-    cores: Vec<CoreChannel>,
+    pub(super) cores: Vec<CoreChannel>,
 
     /// Routes vShards to core IDs.
     router: VShardRouter,
 
     /// Per-tenant in-flight request count across all cores.
-    tenant_inflight: HashMap<u64, u32>,
+    pub(super) tenant_inflight: HashMap<u64, u32>,
 
     /// Maps request_id → tenant_id for in-flight requests.
-    request_tenant: HashMap<u64, u64>,
+    pub(super) request_tenant: HashMap<u64, u64>,
 
     /// Maximum in-flight requests per tenant (0 = unlimited).
     max_per_tenant_inflight: u32,
@@ -89,6 +89,13 @@ pub struct Dispatcher {
 
     /// Resolves priority class for a database_id (consulted on enqueue).
     priority_resolver: Box<dyn DatabasePriorityResolver>,
+
+    /// True once the shutdown bus has entered `DrainingDataPlane`.
+    ///
+    /// Set by [`Dispatcher::begin_data_plane_drain`] under the same mutex every
+    /// enqueue takes, so a dispatch that observed `false` has already pushed by
+    /// the time the drain starts. Nothing reaches a core after that.
+    pub(super) data_plane_draining: bool,
 }
 
 impl Dispatcher {
@@ -141,6 +148,7 @@ impl Dispatcher {
                 max_per_tenant_inflight: total_capacity as u32,
                 per_core_capacity: queue_capacity as u32,
                 priority_resolver,
+                data_plane_draining: false,
             },
             data_sides,
         )
@@ -154,6 +162,7 @@ impl Dispatcher {
     pub fn dispatch(&mut self, request: envelope::Request) -> crate::Result<()> {
         reject_uninjected_write(&request)?;
         assert_write_admitted(&request);
+        self.reject_if_draining()?;
         let tenant_id = request.tenant_id.as_u64();
         let req_id = request.request_id.as_u64();
         let database_id = request.database_id.as_u64();
@@ -260,6 +269,7 @@ impl Dispatcher {
     ) -> crate::Result<()> {
         reject_uninjected_write(&request)?;
         assert_write_admitted(&request);
+        self.reject_if_draining()?;
         if core_id >= self.cores.len() {
             return Err(crate::Error::Dispatch {
                 detail: format!("core {core_id} out of range (have {})", self.cores.len()),

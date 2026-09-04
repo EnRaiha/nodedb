@@ -51,6 +51,15 @@ pub(crate) fn wire_shutdown_bus(
         shutdown_bus.clone(),
     );
 
+    // Data Plane drain barrier. Registered here, at startup, for the same
+    // reason: the bus must not be able to pass through `DrainingDataPlane`
+    // without a participant, whichever code path initiates shutdown.
+    let _data_plane_drain_supervisor = nodedb::control::shutdown::spawn_data_plane_drain_supervisor(
+        Arc::clone(shared),
+        &shutdown_bus,
+        shared.tuning.shutdown.deadline(),
+    );
+
     // Test-only injection: if NODEDB_TEST_SLOW_DRAIN_TASK=1, register a drain
     // task that sleeps for 2s without calling report_drained, to verify the
     // offender-abort path in integration tests. This code path is guarded
