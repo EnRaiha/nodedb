@@ -249,7 +249,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             registry: Arc::clone(calvin_completion_registry),
             verdict_rx,
         });
-        // Route through `spawn_loop_no_abort` so `LoopRegistry::shutdown_all`
+        // Route through `spawn_loop_no_abort` so the Control Plane drain
         // waits for the scheduler to exit (dropping its captured
         // `Arc<SharedState>` deterministically) but NEVER force-aborts it: a
         // Calvin `Scheduler` advances a replicated state machine and a
@@ -257,6 +257,9 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         // `Scheduler::run` already breaks at an epoch-safe boundary (its
         // `biased` shutdown arm sits at the top of the select loop), so on a
         // signal it exits well within the shutdown deadline.
+        //
+        // The scheduler dispatches to the Data Plane, so it drains at
+        // `DrainingControlPlane`, before the enqueue gate closes.
         //
         // Fixed `&'static str` name: N schedulers register under one key.
         // `LoopRegistry::register` stores handles in a `Vec` with no de-dup,
@@ -267,6 +270,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             &shared.loop_registry,
             &shared.shutdown,
             "calvin_scheduler",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             move |shutdown| async move {
                 scheduler.run(shutdown).await;
             },
@@ -344,6 +348,7 @@ pub(super) fn spawn_vshard_schedulers(
         &shared.loop_registry,
         &shared.shutdown,
         "calvin_vshard_reconcile",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

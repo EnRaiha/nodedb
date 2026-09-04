@@ -152,6 +152,7 @@ pub(super) fn finish_observability(
         &shared.loop_registry,
         &shared.shutdown,
         "surrogate_refill_loop",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             tokio::select! {
                 _ = refiller.run_refill_loop(refiller_shared) => {}
@@ -176,14 +177,17 @@ pub(super) fn finish_observability(
     // Start the Raft tick loop. `RaftLoop::run` takes a raw
     // `watch::Receiver<bool>` and drives shutdown internally, so it gets one
     // from the canonical watch; the `spawn_loop` receiver is unused. Routing
-    // through `spawn_loop` registers the join handle so `shutdown_all` waits
-    // for it (dropping its captured `Arc<RaftLoopType>` deterministically).
+    // through `spawn_loop` registers the join handle so the Control Plane
+    // drain waits for it (dropping its captured `Arc<RaftLoopType>`
+    // deterministically). It drains there because a committed entry it
+    // delivers is applied through a Data Plane dispatch.
     let rl_run = raft_loop.clone();
     let raft_raw_shutdown = shared.shutdown.raw_receiver();
     crate::control::shutdown::spawn_loop(
         &shared.loop_registry,
         &shared.shutdown,
         "raft_tick_loop",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |_shutdown| async move {
             rl_run.run(raft_raw_shutdown).await;
             info!("raft loop stopped");
@@ -195,6 +199,7 @@ pub(super) fn finish_observability(
         &shared.loop_registry,
         &shared.shutdown,
         "raft_sequencer",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |_shutdown| async move {
             let mut sequencer_service = sequencer_service;
             sequencer_service.run(seq_raw_shutdown).await;
@@ -210,6 +215,7 @@ pub(super) fn finish_observability(
         &shared.loop_registry,
         &shared.shutdown,
         "raft_rpc_serve",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |_shutdown| async move {
             if let Err(e) = transport_serve.serve(rl_handler, serve_raw_shutdown).await {
                 tracing::error!(error = %e, "raft RPC server failed");
@@ -257,6 +263,7 @@ pub(super) fn finish_observability(
         &shared.loop_registry,
         &shared.shutdown,
         "raft_health_monitor",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |_shutdown| async move {
             health_monitor.run(health_raw_shutdown).await;
         },

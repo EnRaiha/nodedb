@@ -51,6 +51,7 @@ pub fn spawn_core_stall_monitor(shared: &Arc<SharedState>) {
         &shared.loop_registry,
         &shared.shutdown,
         "core_stall_monitor",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
             // Both buffers are allocated once and swapped, so a loop that runs

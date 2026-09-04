@@ -13,10 +13,19 @@
 //! Naming: pass a `&'static str` literal so the name is
 //! compile-time and cheap to log. Dynamic names would defeat
 //! the purpose of the registry's structured reporting.
+//!
+//! Phase: pass the [`ShutdownPhase`] that joins the loop. It selects
+//! WHEN the registry joins the handle, never when the loop is told to
+//! stop — the flat [`ShutdownWatch`] signals every loop at shutdown
+//! initiation. A loop that dispatches to the Data Plane joins at
+//! [`ShutdownPhase::DrainingControlPlane`], before the enqueue gate
+//! closes; a loop that services the Data Plane drain joins at
+//! [`ShutdownPhase::DrainingDataPlane`]; a loop that only consumes
+//! Event Plane state joins at [`ShutdownPhase::DrainingEventPlane`].
 
 use std::future::Future;
 
-use super::{LoopHandle, LoopRegistry, ShutdownReceiver, ShutdownWatch};
+use super::{LoopHandle, LoopRegistry, ShutdownPhase, ShutdownReceiver, ShutdownWatch};
 
 /// Spawn an async loop on the tokio runtime. The `body` closure
 /// receives a [`ShutdownReceiver`] it MUST select on to observe
@@ -31,6 +40,7 @@ use super::{LoopHandle, LoopRegistry, ShutdownReceiver, ShutdownWatch};
 ///     &shared.loop_registry,
 ///     &shared.shutdown,
 ///     "wal_catchup",
+///     ShutdownPhase::DrainingControlPlane,
 ///     |mut shutdown| async move {
 ///         let mut tick = tokio::time::interval(Duration::from_millis(50));
 ///         loop {
@@ -53,6 +63,7 @@ pub fn spawn_loop<F, Fut>(
     registry: &LoopRegistry,
     shutdown: &ShutdownWatch,
     name: &'static str,
+    phase: ShutdownPhase,
     body: F,
 ) where
     F: FnOnce(ShutdownReceiver) -> Fut + Send + 'static,
@@ -60,7 +71,7 @@ pub fn spawn_loop<F, Fut>(
 {
     let rx = shutdown.subscribe();
     let handle = tokio::spawn(async move { body(rx).await });
-    if let Err(e) = registry.register(name, LoopHandle::Async(handle)) {
+    if let Err(e) = registry.register(name, phase, LoopHandle::Async(handle)) {
         tracing::warn!(
             error = %e,
             "spawn_loop after registry close — task will run to completion \
@@ -91,6 +102,7 @@ pub fn spawn_loop_no_abort<F, Fut>(
     registry: &LoopRegistry,
     shutdown: &ShutdownWatch,
     name: &'static str,
+    phase: ShutdownPhase,
     body: F,
 ) where
     F: FnOnce(ShutdownReceiver) -> Fut + Send + 'static,
@@ -98,7 +110,7 @@ pub fn spawn_loop_no_abort<F, Fut>(
 {
     let rx = shutdown.subscribe();
     let handle = tokio::spawn(async move { body(rx).await });
-    if let Err(e) = registry.register(name, LoopHandle::AsyncNoAbort(handle)) {
+    if let Err(e) = registry.register(name, phase, LoopHandle::AsyncNoAbort(handle)) {
         tracing::warn!(
             error = %e,
             "spawn_loop_no_abort after registry close — task will run to \
@@ -121,13 +133,14 @@ pub fn spawn_blocking_loop<F>(
     registry: &LoopRegistry,
     shutdown: &ShutdownWatch,
     name: &'static str,
+    phase: ShutdownPhase,
     body: F,
 ) where
     F: FnOnce(ShutdownReceiver) + Send + 'static,
 {
     let rx = shutdown.subscribe();
     let handle = tokio::task::spawn_blocking(move || body(rx));
-    if let Err(e) = registry.register(name, LoopHandle::Blocking(handle)) {
+    if let Err(e) = registry.register(name, phase, LoopHandle::Blocking(handle)) {
         tracing::warn!(
             error = %e,
             "spawn_blocking_loop after registry close — thread will run to \
@@ -150,16 +163,22 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_c = Arc::clone(&counter);
 
-        spawn_loop(&registry, &watch, "test_loop", |mut rx| async move {
-            loop {
-                tokio::select! {
-                    _ = rx.wait_cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                        counter_c.fetch_add(1, Ordering::Relaxed);
+        spawn_loop(
+            &registry,
+            &watch,
+            "test_loop",
+            ShutdownPhase::DrainingEventPlane,
+            |mut rx| async move {
+                loop {
+                    tokio::select! {
+                        _ = rx.wait_cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                            counter_c.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
 
         // Let it tick a few times.
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -177,9 +196,15 @@ mod tests {
         let registry = LoopRegistry::new();
         let watch = Arc::new(ShutdownWatch::new());
 
-        spawn_loop(&registry, &watch, "wait_only", |mut rx| async move {
-            rx.wait_cancelled().await;
-        });
+        spawn_loop(
+            &registry,
+            &watch,
+            "wait_only",
+            ShutdownPhase::DrainingEventPlane,
+            |mut rx| async move {
+                rx.wait_cancelled().await;
+            },
+        );
 
         watch.signal();
         let report = registry.shutdown_all(Duration::from_millis(50)).await;
@@ -193,15 +218,21 @@ mod tests {
         let done = Arc::new(AtomicUsize::new(0));
         let done_c = Arc::clone(&done);
 
-        spawn_blocking_loop(&registry, &watch, "blocker", move |rx| {
-            // Poll is_cancelled() periodically — this is the
-            // correct idiom for a blocking thread that wants
-            // to observe shutdown without blocking on async.
-            while !rx.is_cancelled() {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            done_c.store(1, Ordering::SeqCst);
-        });
+        spawn_blocking_loop(
+            &registry,
+            &watch,
+            "blocker",
+            ShutdownPhase::DrainingEventPlane,
+            move |rx| {
+                // Poll is_cancelled() periodically — this is the
+                // correct idiom for a blocking thread that wants
+                // to observe shutdown without blocking on async.
+                while !rx.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                done_c.store(1, Ordering::SeqCst);
+            },
+        );
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         watch.signal();

@@ -47,6 +47,7 @@ pub fn spawn_export_loop(shared: &Arc<SharedState>) {
         &shared.loop_registry,
         &shared.shutdown,
         "siem_export",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut delay = base;
             loop {

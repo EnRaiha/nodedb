@@ -91,6 +91,7 @@ pub fn spawn_background_loops(
             &shared.loop_registry,
             &shared.shutdown,
             "mirror_lag_monitor",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             move |mut shutdown| async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 loop {
@@ -188,6 +189,7 @@ pub fn spawn_background_loops(
         &shared.loop_registry,
         &shared.shutdown,
         "tenant_rate_reset",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -218,6 +220,7 @@ pub fn spawn_background_loops(
         &shared.loop_registry,
         &shared.shutdown,
         "audit_log_flush",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -240,6 +243,7 @@ pub fn spawn_background_loops(
         &shared.loop_registry,
         &shared.shutdown,
         "tenant_memory_estimate",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -293,6 +297,7 @@ pub fn spawn_background_loops(
             &shared.loop_registry,
             &shared.shutdown,
             "clone_materializer_sweep",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             move |mut shutdown| async move {
                 let mut tick = tokio::time::interval(sweep_interval);
                 loop {
@@ -368,6 +373,10 @@ pub fn spawn_background_loops(
 /// for one response per core, and the Data Plane drain itself is finished only
 /// once every in-flight response has reached its session. A poller that stopped
 /// at the flat signal would strand both.
+///
+/// The registry must never abort it, so it registers as no-abort. The drain
+/// latch is its one safe exit boundary, and a cancellation short of that
+/// strands the responses the poller exists to route.
 pub fn spawn_response_poller(
     shared: &Arc<SharedState>,
     bus: &crate::control::shutdown::ShutdownBus,
@@ -378,10 +387,11 @@ pub fn spawn_response_poller(
         "response_poller",
         None,
     );
-    crate::control::shutdown::spawn_loop(
+    crate::control::shutdown::spawn_loop_no_abort(
         &shared.loop_registry,
         &shared.shutdown,
         "response_poller",
+        crate::control::shutdown::ShutdownPhase::DrainingDataPlane,
         move |_shutdown| async move {
             let mut idle_iters: u32 = 0;
             loop {

@@ -434,30 +434,18 @@ pub fn spawn_drainable<F, Fut>(
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let rx = bus.flat_watch.subscribe();
-    // We need the abort handle before spawning, so we use a oneshot channel.
-    // Instead, spawn first and register the abort handle via the bus after.
-    // The simplest approach: register without an abort handle initially (the
-    // LoopRegistry's abort via JoinHandle covers the same task).
+    // The bus entry carries no abort handle. The registry owns the join
+    // handle, so it is the one path that can cancel this task.
     let guard = bus.register_task(drain_at, name, None);
     let handle = tokio::spawn(async move { body(rx, guard).await });
-    let abort = handle.abort_handle();
-    // Patch the abort handle into the bus entry — we re-register with the
-    // correct abort handle using a separate method.
-    // For simplicity, patch via the shared state directly.
-    // (The DrainGuard's task_id is inside the spawned closure now, so
-    //  we can't easily patch. Use a different approach: register the guard
-    //  before spawning, then wire abort separately via the join handle.)
-    //
-    // Since we can't patch after the fact without exposing internals,
-    // we register the join handle with the LoopRegistry for flat abort.
-    if let Err(e) = registry.register(name, LoopHandle::Async(handle)) {
+    // The registry joins the loop at the same phase the bus drains it.
+    if let Err(e) = registry.register(name, drain_at, LoopHandle::Async(handle)) {
         tracing::warn!(
             error = %e,
             "spawn_drainable after registry close — task will run to completion \
              but shutdown_all will not wait for it"
         );
     }
-    drop(abort); // Suppress unused warning — abort via JoinHandle in registry.
 }
 
 #[cfg(test)]

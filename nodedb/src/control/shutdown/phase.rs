@@ -20,16 +20,18 @@ pub enum ShutdownPhase {
     /// Listeners stop accepting new connections; in-flight handshakes
     /// complete. Corresponds to reversing `ListenersAccepting`.
     DrainingListeners,
-    /// Raft leader step-down; session response pollers stop; lease
-    /// release committed. Corresponds to reversing `GatewayEnable`.
+    /// Raft leader step-down; lease release committed. Every loop that
+    /// dispatches to the Data Plane is joined here, before the next phase
+    /// closes the enqueue gate. Corresponds to reversing `GatewayEnable`.
     DrainingControlPlane,
     /// TPC Data Plane cores drain their request queues; WAL switches to
-    /// accelerated group-commit (10 ms cadence). Corresponds to
+    /// accelerated group-commit (10 ms cadence). The response poller runs
+    /// here, routing in-flight responses to their sessions. Corresponds to
     /// reversing `CatalogHydrated`.
     DrainingDataPlane,
-    /// Trigger retry loops, CDC consumers, scheduler, streaming MV
-    /// persist — all Event Plane tasks drain. Corresponds to reversing
-    /// `RaftReady`.
+    /// Trigger retry loops, CDC consumers, streaming MV persist — the Event
+    /// Plane tasks that touch no Data Plane dispatch. Corresponds to
+    /// reversing `RaftReady`.
     DrainingEventPlane,
     /// LSN watermarks are flushed to redb. Corresponds to reversing
     /// `StorageReady`.

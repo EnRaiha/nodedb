@@ -125,6 +125,7 @@ pub fn spawn_idle_sweep_loop(shared: &Arc<SharedState>) {
         &shared.loop_registry,
         &shared.shutdown,
         "idle_session_sweep",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {

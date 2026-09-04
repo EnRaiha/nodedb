@@ -214,10 +214,11 @@ pub(super) fn wire_proposers(
     // Spawn the background apply loop. It reads from the mpsc channel
     // pushed by `DistributedApplier::apply_committed`, dispatches to the
     // Data Plane, and notifies propose waiters. Registered via
-    // `spawn_loop_no_abort` so `LoopRegistry::shutdown_all` waits for it to
-    // exit (dropping its captured `Arc<SharedState>` deterministically) but
-    // NEVER force-aborts it — an abort mid-apply would strand
-    // committed-but-unapplied entries.
+    // `spawn_loop_no_abort` so the Control Plane drain waits for it to exit
+    // (dropping its captured `Arc<SharedState>` deterministically) but NEVER
+    // force-aborts it — an abort mid-apply would strand
+    // committed-but-unapplied entries. It drains at `DrainingControlPlane`
+    // because its applies dispatch to the Data Plane.
     let apply_state = shared.clone();
     let apply_tracker = tracker.clone();
     let apply_calvin_read_result_senders = Arc::clone(&calvin_read_result_senders);
@@ -225,6 +226,7 @@ pub(super) fn wire_proposers(
         &shared.loop_registry,
         &shared.shutdown,
         "raft_apply_loop",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             // `biased` polls `run_apply_loop` FIRST on every iteration: any
             // committed batch already queued in `apply_rx` is drained to the

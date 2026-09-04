@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use crate::control::shutdown::{LoopRegistry, ShutdownWatch, spawn_loop};
+use crate::control::shutdown::{LoopRegistry, ShutdownPhase, ShutdownWatch, spawn_loop};
 
 /// Spawn the task that drives `decommission_rx` into `shutdown`.
 ///
@@ -31,10 +31,13 @@ pub fn spawn_decommission_shutdown_bridge(
     mut decommission_rx: watch::Receiver<bool>,
 ) {
     let signal_shutdown = Arc::clone(shutdown);
+    // Joined at the Control Plane drain: the bridge owns no plane state and
+    // resolves on the shutdown signal itself, so the first drain joins it.
     spawn_loop(
         registry,
         shutdown,
         "decommission_shutdown_bridge",
+        ShutdownPhase::DrainingControlPlane,
         move |mut shutdown_rx| async move {
             tokio::select! {
                 _ = shutdown_rx.wait_cancelled() => {}

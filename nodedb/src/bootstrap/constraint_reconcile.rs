@@ -54,6 +54,7 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
         &shared.loop_registry,
         &shared.shutdown,
         "constraint_reconcile",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let shared = task_shared;
             // Task-local delivered-version map, persisted across ticks (NOT in

@@ -41,6 +41,7 @@ pub fn spawn_expiry_task(shared: Arc<SharedState>) {
         &shared.loop_registry,
         &shared.shutdown,
         "scope_expiry_sweep",
+        crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(interval);
             // Skip the first tick, which fires immediately.

@@ -135,6 +135,7 @@ impl EventPlane {
             });
             let _ = shared_state.loop_registry.register(
                 "event_plane::slab_budget",
+                crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
                 crate::control::shutdown::LoopHandle::Async(slab_budget_handle),
             );
         }
@@ -146,8 +147,11 @@ impl EventPlane {
             Arc::clone(&shared_state.job_history),
             shutdown.raw_receiver(),
         );
+        // Joined at the Control Plane drain: a due schedule dispatches SQL
+        // through Control -> Data and needs the enqueue gate still open.
         let _ = shared_state.loop_registry.register(
             "event_plane::scheduler",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             crate::control::shutdown::LoopHandle::Async(scheduler_handle),
         );
 
@@ -158,8 +162,11 @@ impl EventPlane {
                 Arc::clone(&shared_state.retention_policy_registry),
                 shutdown.raw_receiver(),
             );
+        // Joined at the Control Plane drain: enforcement dispatches MetaOp
+        // plans to the Data Plane.
         let _ = shared_state.loop_registry.register(
             "event_plane::retention_policy",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             crate::control::shutdown::LoopHandle::Async(retention_handle),
         );
 
@@ -173,8 +180,11 @@ impl EventPlane {
                 shutdown.raw_receiver(),
                 shared_state.tuning.bitemporal_retention_tick(),
             );
+        // Joined at the Control Plane drain: a purge pass dispatches
+        // `TemporalPurge` plans to the Data Plane.
         let _ = shared_state.loop_registry.register(
             "event_plane::bitemporal_retention",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             crate::control::shutdown::LoopHandle::Async(bitemporal_retention_handle),
         );
 
@@ -184,8 +194,11 @@ impl EventPlane {
             Arc::clone(&shared_state.alert_registry),
             shutdown.raw_receiver(),
         );
+        // Joined at the Control Plane drain: each evaluation dispatches a
+        // scan to the Data Plane.
         let _ = shared_state.loop_registry.register(
             "event_plane::alert_eval",
+            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
             crate::control::shutdown::LoopHandle::Async(alert_handle),
         );
 
@@ -197,6 +210,7 @@ impl EventPlane {
         );
         let _ = shared_state.loop_registry.register(
             "event_plane::cdc_compaction",
+            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
             crate::control::shutdown::LoopHandle::Async(compaction_handle),
         );
 
@@ -214,6 +228,7 @@ impl EventPlane {
         );
         let _ = shared_state.loop_registry.register(
             "event_plane::mv_persist",
+            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
             crate::control::shutdown::LoopHandle::Async(mv_persist_handle),
         );
 
@@ -234,6 +249,7 @@ impl EventPlane {
             );
             let _ = shared_state.loop_registry.register(
                 "event_plane::cross_shard_dispatcher",
+                crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
                 crate::control::shutdown::LoopHandle::Async(cross_shard_handle),
             );
             info!("cross-shard dispatcher task started");
@@ -246,6 +262,7 @@ impl EventPlane {
         );
         let _ = shared_state.loop_registry.register(
             "event_plane::crdt_sync_delivery",
+            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
             crate::control::shutdown::LoopHandle::Async(crdt_sync_handle),
         );
 
