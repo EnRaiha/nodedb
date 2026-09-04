@@ -93,7 +93,7 @@ impl ColumnarSegmentWriter {
                 encode_column(col_data, *col_type, requested_codec)?;
 
             let file_bytes = maybe_encrypt(kek, &encoded)?;
-            durable_write(&partition_dir.join(format!("{col_name}.col")), &file_bytes)?;
+            durable_write(&partition_dir, &format!("{col_name}.col"), &file_bytes)?;
 
             // Write symbol dictionary for tag columns.
             if *col_type == ColumnType::Symbol
@@ -102,7 +102,7 @@ impl ColumnarSegmentWriter {
                 let dict_json = sonic_rs::to_vec(dict)
                     .map_err(|e| SegmentError::Io(format!("serialize dict: {e}")))?;
                 let sym_bytes = maybe_encrypt(kek, &dict_json)?;
-                durable_write(&partition_dir.join(format!("{col_name}.sym")), &sym_bytes)?;
+                durable_write(&partition_dir, &format!("{col_name}.sym"), &sym_bytes)?;
             }
 
             column_stats.insert(col_name.clone(), stats);
@@ -121,7 +121,7 @@ impl ColumnarSegmentWriter {
         let schema_json = sonic_rs::to_vec(&schema_to_json(&schema_with_codecs))
             .map_err(|e| SegmentError::Io(format!("serialize schema: {e}")))?;
         let schema_bytes = maybe_encrypt(kek, &schema_json)?;
-        durable_write(&partition_dir.join("schema.json"), &schema_bytes)?;
+        durable_write(&partition_dir, "schema.json", &schema_bytes)?;
 
         // Build and write sparse index.
         let sparse_idx = super::super::sparse_index::SparseIndex::build(
@@ -132,7 +132,7 @@ impl ColumnarSegmentWriter {
         );
         let sparse_bytes = sparse_idx.to_bytes();
         let sparse_file_bytes = maybe_encrypt(kek, &sparse_bytes)?;
-        durable_write(&partition_dir.join("sparse_index.bin"), &sparse_file_bytes)?;
+        durable_write(&partition_dir, "sparse_index.bin", &sparse_file_bytes)?;
 
         let size_bytes = dir_size(&partition_dir)?;
 
@@ -154,7 +154,7 @@ impl ColumnarSegmentWriter {
         let meta_bytes = maybe_encrypt(kek, &meta_json)?;
         // Last, and the commit point: a reader that cannot read a meta treats
         // the whole directory as absent.
-        durable_write(&partition_dir.join("partition.meta"), &meta_bytes)?;
+        durable_write(&partition_dir, "partition.meta", &meta_bytes)?;
 
         // The files above each fsynced `partition_dir`; this fsyncs the
         // directory that NAMES it, without which the whole partition can be
@@ -166,20 +166,15 @@ impl ColumnarSegmentWriter {
     }
 }
 
-/// Write one segment file durably: data fsynced before the rename, parent
-/// directory fsynced after it.
+/// Write the segment file `name` inside `dir` durably: data fsynced before the
+/// rename, parent directory fsynced after it.
 ///
 /// Routed through the shared `nodedb_wal::segment::atomic_write_fsync` rather
-/// than re-implemented, so the ordering cannot drift per call site.
-fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), SegmentError> {
-    let mut tmp = path.to_path_buf();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    tmp.set_extension(format!("{ext}.tmp"));
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
-        .map_err(|e| SegmentError::Io(format!("write {}: {e}", path.display())))
+/// than re-implemented, so the ordering cannot drift per call site. That helper
+/// also rejects a column name that is not one plain path component.
+fn durable_write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), SegmentError> {
+    nodedb_wal::segment::atomic_write_fsync(dir, name, bytes)
+        .map_err(|e| SegmentError::Io(format!("write {}: {e}", dir.join(name).display())))
 }
 
 /// Encrypt `bytes` with `kek` if present, otherwise return as-is.

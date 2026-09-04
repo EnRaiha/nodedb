@@ -32,18 +32,56 @@ pub(crate) fn vector_ckpt_gen_dir(
     ckpt_dir.join(format!("gen-{generation}"))
 }
 
-/// The checkpoint filename stem of a collection's DEFAULT (unnamed) vector
-/// index: `{db}:{tid}:{coll}`. A named-field index appends `:{field}`.
+/// The checkpoint filename stem for one index key: `db-{db}-tenant-{tid}-key-`
+/// followed by the hex-encoded `coll_key` (`{collection}` for the default
+/// index, `{collection}:{field}` for a named-field one).
 ///
 /// The single authority on the encoding, shared with reclaim so a DROP can
-/// never miss a file the write path produced.
-pub(crate) fn vector_ckpt_collection_stem(db: u64, tid: u64, collection: &str) -> String {
-    format!("{db}:{tid}:{collection}")
+/// never miss a file the write path produced. The collection name is hex-encoded
+/// rather than embedded verbatim: a name is user-supplied, and the stem becomes
+/// a path component, so a verbatim `/` or `..` in it would address a file
+/// outside the generation directory. Hex is byte-wise, so a prefix relation
+/// between two names survives the encoding and reclaim can still match every
+/// field index of one collection.
+pub(crate) fn vector_ckpt_stem(db: u64, tid: u64, coll_key: &str) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(coll_key.len() * 2);
+    for b in coll_key.as_bytes() {
+        // Infallible: writing to a String never returns Err.
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("db-{db}-tenant-{tid}-key-{hex}")
 }
 
-/// Parse a `"{db}:{tid}:{coll_key}"` string (the `BuildComplete.key` and
-/// on-disk checkpoint filename form, produced by `vector_checkpoint_filename`)
-/// back into the `(DatabaseId, TenantId, String)` tuple map key.
+/// Parse a stem produced by [`vector_ckpt_stem`] back into the
+/// `(DatabaseId, TenantId, coll_key)` tuple map key.
+///
+/// Returns `None` for any stem this module did not write.
+pub(super) fn parse_vector_ckpt_stem(stem: &str) -> Option<(DatabaseId, TenantId, String)> {
+    let rest = stem.strip_prefix("db-")?;
+    let (db_str, rest) = rest.split_once("-tenant-")?;
+    let db = db_str.parse::<u64>().ok()?;
+    let (tid_str, hex) = rest.split_once("-key-")?;
+    let tid = tid_str.parse::<u64>().ok()?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let raw = hex.as_bytes();
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = (raw[i] as char).to_digit(16)?;
+        let lo = (raw[i + 1] as char).to_digit(16)?;
+        bytes.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    let coll_key = String::from_utf8(bytes).ok()?;
+    Some((DatabaseId::new(db), TenantId::new(tid), coll_key))
+}
+
+/// Parse a `"{db}:{tid}:{coll_key}"` string (the in-memory `BuildComplete.key`
+/// form, produced by `vector_build_key`) back into the
+/// `(DatabaseId, TenantId, String)` tuple map key.
 ///
 /// Returns `None` when the string is not in that format — i.e. it does not have
 /// at least three `:`-separated components whose first two parse as `u64`
@@ -87,11 +125,37 @@ mod tests {
 
     #[test]
     fn stem_roundtrips_through_parse() {
-        let stem = vector_ckpt_collection_stem(3, 9, "docs");
-        let (db, tid, coll) = parse_build_key(&stem).expect("stem must parse");
-        assert_eq!(db, DatabaseId::new(3));
-        assert_eq!(tid, TenantId::new(9));
-        assert_eq!(coll, "docs");
+        for coll_key in ["docs", "docs:emb", "2/docs", "a-tenant-b", "-key-"] {
+            let stem = vector_ckpt_stem(3, 9, coll_key);
+            let (db, tid, parsed) = parse_vector_ckpt_stem(&stem).expect("stem must parse");
+            assert_eq!(db, DatabaseId::new(3));
+            assert_eq!(tid, TenantId::new(9));
+            assert_eq!(parsed, coll_key);
+        }
+    }
+
+    /// The stem is one plain path component whatever the collection is named,
+    /// so the checkpoint write cannot address a file outside its generation
+    /// directory.
+    #[test]
+    fn stem_is_a_plain_path_component() {
+        for coll_key in ["docs", "../../etc/passwd", "a/b", "C:evil", ".."] {
+            let stem = vector_ckpt_stem(0, 1, coll_key);
+            assert!(
+                nodedb_types::is_plain_path_component(&format!("{stem}.ckpt")),
+                "{coll_key:?} produced a non-plain stem: {stem}"
+            );
+        }
+    }
+
+    /// Reclaim matches a collection's field indexes by prefix. Hex is
+    /// byte-wise, so the prefix relation survives the encoding.
+    #[test]
+    fn field_stems_extend_the_collection_stem() {
+        let bare = vector_ckpt_stem(0, 1, "docs");
+        let field = vector_ckpt_stem(0, 1, "docs:emb");
+        assert!(field.starts_with(&bare));
+        assert!(!vector_ckpt_stem(0, 1, "docs_archive").starts_with(&format!("{bare}3a")));
     }
 
     /// A named-field key keeps its `:` in the collection remainder — the parse

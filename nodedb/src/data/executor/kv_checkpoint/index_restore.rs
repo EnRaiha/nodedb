@@ -192,10 +192,10 @@ mod tests {
     /// load paths make, so an index kind that cannot survive msgpack fails here.
     fn through_disk(file: &KvCheckpointFile) -> KvCheckpointFile {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join(kv_ckpt_filename(TID, COLL));
-        let tmp_path = tmp.path().join("f.tmp");
+        let name = kv_ckpt_filename(TID, COLL);
+        let path = tmp.path().join(&name);
         let bytes = zerompk::to_msgpack_vec(file).expect("encode");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(tmp.path(), &name, &bytes).expect("write");
         let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
         zerompk::from_msgpack(&read_back).expect("decode")
     }

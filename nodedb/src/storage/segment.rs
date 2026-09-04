@@ -136,17 +136,19 @@ impl SegmentFooter {
     }
 }
 
-/// Write a local segment file with optional encryption.
+/// Write the local segment file `name` inside `dir`, with optional encryption.
 ///
 /// Local plaintext files remain supported only when `key` is absent. Encrypted
 /// files are a current authenticated envelope whose plaintext is
 /// `[data || footer]`; the footer is never exposed outside the AEAD payload.
 ///
 /// Published through the shared atomic helper: `File::create` + `write_all` +
-/// `flush` left `path` naming a truncated or partial segment across a crash,
-/// and `flush` on a `File` provides no durability at all.
+/// `flush` left the final name pointing at a truncated or partial segment
+/// across a crash, and `flush` on a `File` provides no durability at all. The
+/// helper also rejects a `name` that is not one plain path component.
 pub fn write_encrypted_segment(
-    path: &Path,
+    dir: &Path,
+    name: &str,
     data: &[u8],
     footer: &SegmentFooter,
     key: Option<&nodedb_wal::crypto::WalEncryptionKey>,
@@ -155,12 +157,9 @@ pub fn write_encrypted_segment(
         Some(key) => encrypt_untrusted_segment_bytes(data, footer, key)?,
         None => plaintext_segment_bytes(data, footer)?,
     };
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".seg-tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, &bytes).map_err(|e| crate::Error::Storage {
+    nodedb_wal::segment::atomic_write_fsync(dir, name, &bytes).map_err(|e| crate::Error::Storage {
         engine: "segment".into(),
-        detail: format!("publish segment {}: {e}", path.display()),
+        detail: format!("publish segment {}: {e}", dir.join(name).display()),
     })
 }
 
@@ -300,7 +299,7 @@ mod tests {
 
         // Write with key_v1 (epoch chosen randomly at construction).
         let key_v1 = test_key();
-        write_encrypted_segment(&path, data, &footer, Some(&key_v1)).unwrap();
+        write_encrypted_segment(dir.path(), "enc.seg", data, &footer, Some(&key_v1)).unwrap();
 
         // Simulate restart: new key instance with same bytes but different
         // in-memory epoch. Decryption MUST use the epoch from the on-disk preamble.
@@ -369,7 +368,7 @@ mod tests {
         let data = b"plain data";
         let footer = SegmentFooter::new("n", 99, Lsn::new(1), Lsn::new(5));
 
-        write_encrypted_segment(&path, data, &footer, None).unwrap();
+        write_encrypted_segment(dir.path(), "plain.seg", data, &footer, None).unwrap();
         let read_back = read_encrypted_segment(&path, None).unwrap();
         assert_eq!(read_back, data);
     }
@@ -396,8 +395,15 @@ mod tests {
         let path = dir.path().join("plain.seg");
         let footer = SegmentFooter::new("n", 1, Lsn::new(1), Lsn::new(2));
 
-        write_encrypted_segment(&path, b"first version, longer", &footer, None).unwrap();
-        write_encrypted_segment(&path, b"second", &footer, None).unwrap();
+        write_encrypted_segment(
+            dir.path(),
+            "plain.seg",
+            b"first version, longer",
+            &footer,
+            None,
+        )
+        .unwrap();
+        write_encrypted_segment(dir.path(), "plain.seg", b"second", &footer, None).unwrap();
 
         assert_eq!(read_encrypted_segment(&path, None).unwrap(), b"second");
         let entries: Vec<String> = std::fs::read_dir(dir.path())

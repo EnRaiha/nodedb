@@ -52,25 +52,25 @@ impl PartitionRegistry {
         key
     }
 
-    /// Persist the registry to a JSON file (atomic via write + rename).
+    /// Persist the registry as the JSON file `name` inside `dir` (atomic via
+    /// write + rename).
     ///
-    /// The write-then-rename pattern ensures crash safety:
-    /// - Write to `{path}.tmp`
-    /// - Rename `{path}.tmp` → `{path}` (atomic on most filesystems)
-    ///   If crash during write: `.tmp` file is orphaned, original intact.
+    /// The write-then-rename pattern gives crash safety:
+    /// - Write to `{name}.tmp`
+    /// - Rename `{name}.tmp` → `{name}` (atomic on most filesystems)
+    ///   If crash during write: the `.tmp` file is orphaned, original intact.
     ///   If crash during rename: atomic — either old or new version visible.
-    pub fn persist(&self, path: &std::path::Path) -> crate::Result<()> {
+    pub fn persist(&self, dir: &std::path::Path, name: &str) -> crate::Result<()> {
         let entries = self.export();
         let json = sonic_rs::to_vec_pretty(&entries).map_err(|e| crate::Error::Serialization {
             format: "json".to_string(),
             detail: format!("serialize partition registry: {e}"),
         })?;
 
-        let tmp_path = path.with_extension("tmp");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, path, &json).map_err(|e| {
+        nodedb_wal::segment::atomic_write_fsync(dir, name, &json).map_err(|e| {
             crate::Error::Storage {
                 engine: "timeseries".to_string(),
-                detail: format!("atomic write {}: {e}", path.display()),
+                detail: format!("atomic write {}: {e}", dir.join(name).display()),
             }
         })?;
         Ok(())

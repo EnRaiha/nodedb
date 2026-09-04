@@ -8,23 +8,25 @@ use super::format::{
     DTYPE_F32, FOOTER_SIZE, FORMAT_VERSION, HEADER_SIZE, MAGIC, VectorSegmentCodec, vec_pad,
 };
 
-/// Write a v2 NDVS segment file to `path`.
+/// Write a v2 NDVS segment file as `name` inside `dir`.
 ///
 /// `surrogate_ids[i]` is the u64 surrogate for `vectors[i]`. The slice may be
 /// empty, in which case all surrogate IDs are written as 0.
 ///
 /// The segment is assembled in memory and published with a single
-/// `write → sync_data → rename → fsync_dir` sequence, so `path` only ever names
-/// a complete, footer-terminated segment. Writing into the final path directly
-/// had two crash windows: truncating it destroyed an existing segment before
-/// anything valid replaced it, and a crash between the body and footer syncs
-/// left a final-named file that no reader could validate.
+/// `write → sync_data → rename → fsync_dir` sequence, so the final name only
+/// ever names a complete, footer-terminated segment. Writing into the final
+/// path directly had two crash windows: truncating it destroyed an existing
+/// segment before anything valid replaced it, and a crash between the body and
+/// footer syncs left a final-named file that no reader could validate.
 ///
 /// # Errors
 ///
-/// Returns `std::io::Error` on any I/O failure or arithmetic overflow.
+/// Returns `std::io::Error` on any I/O failure, arithmetic overflow, or a
+/// `name` that is not one plain path component.
 pub fn write_segment(
-    path: &Path,
+    dir: &Path,
+    name: &str,
     dim: usize,
     vectors: &[&[f32]],
     surrogate_ids: &[u64],
@@ -34,13 +36,7 @@ pub fn write_segment(
         "surrogate_ids length must match vectors length or be empty"
     );
 
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "segment path has no parent directory",
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(dir)?;
 
     let count = vectors.len() as u64;
 
@@ -114,12 +110,9 @@ pub fn write_segment(
     buf.extend_from_slice(&(FOOTER_SIZE as u32).to_le_bytes()); // size     [38..42]
     buf.extend_from_slice(&MAGIC); // trailing magic                        [42..46]
 
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".ndvs-tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, &buf)
-        .map_err(|e| std::io::Error::other(format!("publish segment {}: {e}", path.display())))
+    nodedb_wal::segment::atomic_write_fsync(dir, name, &buf).map_err(|e| {
+        std::io::Error::other(format!("publish segment {}: {e}", dir.join(name).display()))
+    })
 }
 
 #[cfg(test)]
@@ -144,7 +137,7 @@ mod tests {
         let path = dir.path().join("seg.ndvs");
         let v = [1.0f32, 2.0, 3.0];
 
-        write_segment(&path, 3, &[&v], &[7]).expect("write");
+        write_segment(dir.path(), "seg.ndvs", 3, &[&v], &[7]).expect("write");
 
         let bytes = std::fs::read(&path).expect("read");
         assert!(bytes.len() > FOOTER_SIZE);
@@ -175,11 +168,11 @@ mod tests {
         let path = dir.path().join("seg.ndvs");
 
         let a = [1.0f32, 2.0];
-        write_segment(&path, 2, &[&a, &a, &a], &[1, 2, 3]).expect("first write");
+        write_segment(dir.path(), "seg.ndvs", 2, &[&a, &a, &a], &[1, 2, 3]).expect("first write");
         let first_len = std::fs::metadata(&path).expect("stat").len();
 
         let b = [9.0f32, 8.0];
-        write_segment(&path, 2, &[&b], &[4]).expect("second write");
+        write_segment(dir.path(), "seg.ndvs", 2, &[&b], &[4]).expect("second write");
         let bytes = std::fs::read(&path).expect("read");
 
         assert_ne!(bytes.len() as u64, first_len, "smaller segment replaced it");
@@ -201,7 +194,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("empty.ndvs");
 
-        write_segment(&path, 4, &[], &[]).expect("write");
+        write_segment(dir.path(), "empty.ndvs", 4, &[], &[]).expect("write");
 
         let bytes = std::fs::read(&path).expect("read");
         assert_eq!(bytes.len(), HEADER_SIZE + FOOTER_SIZE);

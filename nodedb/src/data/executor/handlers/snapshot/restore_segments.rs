@@ -19,12 +19,16 @@ const PARTITION_META: &str = "partition.meta";
 ///
 /// Routed through the shared WAL helper so the `write → sync_data → rename →
 /// fsync_dir` ordering matches the partition writer's own and cannot drift.
+/// That helper rejects a `filename` that is not one plain path component.
 fn durable_write_into(dir: &Path, filename: &str, bytes: &[u8]) -> crate::Result<()> {
-    let dst = dir.join(filename);
-    let tmp = dir.join(format!("{filename}.restore-part"));
-    nodedb_wal::segment::atomic_write_fsync(&tmp, &dst, bytes).map_err(|e| crate::Error::Storage {
-        engine: "timeseries".into(),
-        detail: format!("restore: durable write {}: {e}", dst.display()),
+    nodedb_wal::segment::atomic_write_fsync(dir, filename, bytes).map_err(|e| {
+        crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!(
+                "restore: durable write {}: {e}",
+                dir.join(filename).display()
+            ),
+        }
     })
 }
 
@@ -191,10 +195,10 @@ impl CoreLoop {
                 // the boot registry scan and the orphan sweeper key on — a
                 // half-finished restore is therefore invisible to both rather
                 // than being adopted as a partition.
-                let staging_dir =
-                    segment_dir.join(format!(".restore-stage-{}", part_blob.dir_name));
-                let backup_dir =
-                    segment_dir.join(format!(".restore-backup-{}", part_blob.dir_name));
+                let staging_name = format!("restore-stage-{}", part_blob.dir_name);
+                let backup_name = format!("restore-backup-{}", part_blob.dir_name);
+                let staging_dir = segment_dir.join(&staging_name);
+                let backup_dir = segment_dir.join(&backup_name);
                 for scratch in [&staging_dir, &backup_dir] {
                     if scratch.exists() {
                         // Remains of a restore that crashed mid-swap.
@@ -222,9 +226,10 @@ impl CoreLoop {
 
                 if partition_dir.exists() {
                     nodedb_wal::segment::atomic_swap_dirs_fsync(
-                        &partition_dir,
-                        &backup_dir,
-                        &staging_dir,
+                        &segment_dir,
+                        &part_blob.dir_name,
+                        &backup_name,
+                        &staging_name,
                     )
                     .map_err(|e| crate::Error::Storage {
                         engine: "timeseries".into(),
@@ -450,7 +455,7 @@ mod tests {
         std::fs::write(partition_dir.join(PARTITION_META), b"old-meta").expect("write old meta");
 
         // Remains of an earlier restore that died mid-swap.
-        let leftover = segment_dir.join(".restore-stage-ts-1_2");
+        let leftover = segment_dir.join("restore-stage-ts-1_2");
         std::fs::create_dir_all(&leftover).expect("mkdir leftover");
         std::fs::write(leftover.join("junk"), b"junk").expect("write junk");
 
@@ -493,11 +498,9 @@ mod tests {
             names(&partition_dir),
             vec![PARTITION_META.to_string(), "value.col".to_string()]
         );
-        // No `.restore-part` tmp file may be left inside the published dir.
+        // No staging file may be left inside the published dir.
         assert!(
-            !names(&partition_dir)
-                .iter()
-                .any(|n| n.ends_with(".restore-part")),
+            !names(&partition_dir).iter().any(|n| n.ends_with(".tmp")),
             "atomic write tmp files must be renamed away"
         );
 

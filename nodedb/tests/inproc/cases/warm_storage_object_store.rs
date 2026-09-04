@@ -318,11 +318,17 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
 
     // ── Verify HNSW checkpoint file ──────────────────────────────────────────
     // A restore publishes its files as a GENERATION and swings the manifest, so
-    // the first restore into a fresh data dir lands in `gen-0`. The payload is
-    // checkpoint-framed (magic + CRC + length header), so the index bytes are
-    // the tail of the file rather than the whole of it.
+    // the first restore into a fresh data dir lands in `gen-0`. The collection
+    // key is hex-encoded into the filename, so no collection name can escape the
+    // generation directory. The payload is checkpoint-framed (magic + CRC +
+    // length header), so the index bytes are the tail of the file rather than
+    // the whole of it.
+    let hnsw_key_hex: String = "embeddings:emb"
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let ckpt_dir = data_dir.join("vector-ckpt").join("core-0").join("gen-0");
-    let hnsw_ckpt = ckpt_dir.join("0:1:embeddings:emb.ckpt");
+    let hnsw_ckpt = ckpt_dir.join(format!("db-0-tenant-1-key-{hnsw_key_hex}.ckpt"));
     assert!(
         hnsw_ckpt.exists(),
         "HNSW checkpoint file must exist after restore"

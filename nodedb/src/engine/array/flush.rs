@@ -64,10 +64,18 @@ impl ArrayEngine {
         flush_lsn: u64,
     ) -> ArrayEngineResult<SegmentRef> {
         let store = self.store_mut(id)?;
-        let path = store.root().join(&prepared.segment_id);
-        write_atomic(&path, &prepared.bytes).map_err(|e| ArrayEngineError::Io {
-            detail: format!("write segment {path:?}: {e}"),
-        })?;
+        let root = store.root().to_path_buf();
+        // Routed through the shared WAL helper because this is a
+        // checkpoint-class write: the coordinated checkpoint reports these
+        // segments as the array engine's durability and the WAL segments below
+        // that LSN are then deleted. A correctly-named file full of zeros after
+        // power loss — what a rename that reaches disk ahead of the data pages
+        // produces — is not a degraded segment, it is the only copy of those
+        // cells, gone.
+        nodedb_wal::segment::atomic_write_fsync(&root, &prepared.segment_id, &prepared.bytes)
+            .map_err(|e| ArrayEngineError::Io {
+                detail: format!("write segment {:?}: {e}", root.join(&prepared.segment_id)),
+            })?;
         // Any failure past this point leaves the segment file on disk but
         // unreferenced by the manifest — inert bytes, not a half-published
         // state, and the caller clamps the checkpoint LSN so the WAL records it
@@ -127,26 +135,6 @@ fn build_segment_from_memtable<'a>(
         max_tile,
         tile_count,
     })
-}
-
-/// Write a segment file durably: data fsynced before the rename, and the parent
-/// directory fsynced after it.
-///
-/// Routed through `nodedb_wal::segment::atomic_write_fsync` rather than
-/// re-implemented, because this is a checkpoint-class write: the coordinated
-/// checkpoint reports these segments as the array engine's durability and the
-/// WAL segments below that LSN are then deleted. A correctly-named file full of
-/// zeros after power loss — what a rename that reaches disk ahead of the data
-/// pages produces — is not a degraded segment, it is the only copy of those
-/// cells, gone. The one helper keeps the ordering from drifting per call site.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
-    let mut tmp = path.to_path_buf();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    tmp.set_extension(format!("{ext}.tmp"));
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 #[cfg(test)]

@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use nodedb_array::types::TileId;
 
 const MANIFEST_FILENAME: &str = "manifest.ndam";
-const MANIFEST_TMP_FILENAME: &str = "manifest.ndam.tmp";
 
 #[derive(
     Debug,
@@ -107,11 +106,9 @@ impl Manifest {
         let bytes = zerompk::to_msgpack_vec(self).map_err(|e| ManifestError::Encode {
             detail: e.to_string(),
         })?;
-        let tmp = root.join(MANIFEST_TMP_FILENAME);
-        let final_path = root.join(MANIFEST_FILENAME);
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &final_path, &bytes).map_err(|e| {
+        nodedb_wal::segment::write_checkpoint_framed(root, MANIFEST_FILENAME, &bytes).map_err(|e| {
             ManifestError::Io {
-                detail: format!("publish {final_path:?}: {e}"),
+                detail: format!("publish {:?}: {e}", root.join(MANIFEST_FILENAME)),
             }
         })
     }

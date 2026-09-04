@@ -235,11 +235,10 @@ pub async fn run_archive_cycle(
     }
 
     // Persist manifest after archival state changes.
-    if archived > 0 {
-        let manifest_path = base_dir.join("partition_manifest.json");
-        if let Err(e) = registry.persist(&manifest_path) {
-            tracing::warn!(error = %e, "failed to persist manifest after archival");
-        }
+    if archived > 0
+        && let Err(e) = registry.persist(base_dir, "partition_manifest.json")
+    {
+        tracing::warn!(error = %e, "failed to persist manifest after archival");
     }
 
     Ok(archived)

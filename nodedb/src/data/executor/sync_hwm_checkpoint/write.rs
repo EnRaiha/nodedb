@@ -59,8 +59,7 @@ impl CoreLoop {
         let ckpt_dir = sync_hwm_ckpt_dir(&self.data_dir, self.core_id);
         std::fs::create_dir_all(&ckpt_dir).map_err(|e| storage_err(&ckpt_dir, "create dir", &e))?;
         let path = sync_hwm_ckpt_state_path(&ckpt_dir);
-        let tmp = ckpt_dir.join(format!("{SYNC_HWM_CKPT_STATE}.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, SYNC_HWM_CKPT_STATE, &bytes)
             .map_err(|e| storage_err(&path, "publish state", &e))?;
 
         info!(

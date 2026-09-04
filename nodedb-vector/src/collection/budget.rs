@@ -71,7 +71,8 @@ impl VectorCollection {
             return (StorageTier::L0Ram, None);
         };
 
-        let seg_path = dir.join(format!("seg-{segment_id}.vseg"));
+        let seg_name = format!("seg-{segment_id}.vseg");
+        let seg_path = dir.join(&seg_name);
         let count = index.len();
 
         let refs: Vec<Vec<f32>> = (0..count)
@@ -91,7 +92,8 @@ impl VectorCollection {
             .collect();
 
         match MmapVectorSegment::create_with_surrogates(
-            &seg_path,
+            dir,
+            &seg_name,
             self.dim,
             &ref_slices,
             &surrogate_ids,

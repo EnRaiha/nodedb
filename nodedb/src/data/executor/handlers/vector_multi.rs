@@ -142,7 +142,7 @@ impl CoreLoop {
         }
 
         // Auto-seal if needed.
-        let seal_key = CoreLoop::vector_checkpoint_filename(&index_key);
+        let seal_key = CoreLoop::vector_build_key(&index_key);
         if coll.needs_seal()
             && let Some(req) = coll.seal(&seal_key)
             && let Some(tx) = &self.build_tx

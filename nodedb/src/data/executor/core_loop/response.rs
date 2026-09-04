@@ -177,9 +177,12 @@ impl CoreLoop {
         )
     }
 
-    /// Checkpoint filename for a vector collection key: `"{db}:{tid}:{coll}"`.
+    /// In-memory build key for a vector collection: `"{db}:{tid}:{coll}"`.
     /// `coll` may itself contain `:` — parsing uses `splitn(3, ':')`.
-    pub(in crate::data::executor) fn vector_checkpoint_filename(
+    ///
+    /// This key never becomes a filename; the on-disk name comes from
+    /// `vector_ckpt_stem`, which hex-encodes the collection.
+    pub(in crate::data::executor) fn vector_build_key(
         key: &(DatabaseId, TenantId, String),
     ) -> String {
         format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2)

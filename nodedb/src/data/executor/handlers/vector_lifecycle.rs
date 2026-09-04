@@ -125,7 +125,7 @@ impl CoreLoop {
             return self.response_ok(task);
         }
 
-        let seal_key = CoreLoop::vector_checkpoint_filename(&index_key);
+        let seal_key = CoreLoop::vector_build_key(&index_key);
         match coll.seal(&seal_key) {
             Some(req) => {
                 if let Some(tx) = &self.build_tx

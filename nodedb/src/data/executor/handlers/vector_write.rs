@@ -52,7 +52,7 @@ impl CoreLoop {
                 if let Some(lsn) = task.wal_lsn() {
                     collection_ref.note_checkpoint_lsn(lsn.as_u64());
                 }
-                let seal_key = CoreLoop::vector_checkpoint_filename(&index_key);
+                let seal_key = CoreLoop::vector_build_key(&index_key);
                 if collection_ref.needs_seal()
                     && let Some(req) = collection_ref.seal(&seal_key)
                     && let Some(tx) = &self.build_tx

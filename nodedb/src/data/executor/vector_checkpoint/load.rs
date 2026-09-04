@@ -9,7 +9,7 @@ use nodedb_types::DatabaseId;
 use tracing::info;
 
 use super::manifest::{read_vector_manifest_at, storage_err};
-use super::paths::{parse_build_key, vector_ckpt_dir, vector_ckpt_gen_dir};
+use super::paths::{parse_vector_ckpt_stem, vector_ckpt_dir, vector_ckpt_gen_dir};
 use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::vector::collection::VectorCollection;
@@ -99,11 +99,11 @@ impl CoreLoop {
                 continue;
             }
 
-            // Checkpoint filenames are `"{db}:{tid}:{coll}.ckpt"`. This
-            // directory is engine-private, so a `.ckpt` whose stem does not
-            // parse is a corrupted real checkpoint, not a foreign file to skip.
+            // Checkpoint filenames come from `vector_ckpt_stem`. This directory
+            // is engine-private, so a `.ckpt` whose stem does not parse is a
+            // corrupted real checkpoint, not a foreign file to skip.
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let key = parse_build_key(stem).ok_or_else(|| {
+            let key = parse_vector_ckpt_stem(stem).ok_or_else(|| {
                 CheckpointDecodeError::UnparseableFilename {
                     stem: stem.to_string(),
                 }
@@ -175,9 +175,8 @@ mod tests {
             durable_through_lsn: 5,
         })
         .expect("encode");
-        let path = ckpt_dir.join(VECTOR_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join("m.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, VECTOR_CKPT_MANIFEST, &bytes)
+            .expect("write");
         drop(core);
 
         let mut restored = open_core_at(dir.path());
@@ -195,11 +194,12 @@ mod tests {
         let ckpt_dir = vector_ckpt_dir(&core.data_dir, core.core_id);
         let gen_dir = vector_ckpt_gen_dir(&ckpt_dir, 0);
         std::fs::create_dir_all(&gen_dir).expect("create gen dir");
-        std::fs::write(gen_dir.join("0:1:docs.ckpt"), b"garbage").expect("write garbage index");
+        let stem = super::super::paths::vector_ckpt_stem(0, 1, "docs");
+        std::fs::write(gen_dir.join(format!("{stem}.ckpt")), b"garbage")
+            .expect("write garbage index");
         let bytes = super::super::format::test_manifest_bytes(0);
-        let path = ckpt_dir.join(VECTOR_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join("m.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write manifest");
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, VECTOR_CKPT_MANIFEST, &bytes)
+            .expect("write manifest");
         drop(core);
 
         let mut restored = open_core_at(dir.path());

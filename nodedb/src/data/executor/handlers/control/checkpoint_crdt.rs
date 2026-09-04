@@ -128,13 +128,11 @@ impl CoreLoop {
                 // because `gen_dir` is FRESH — the manifest swing retires the
                 // previous generation whole.
                 let fname = crdt_ckpt_filename(database_id, tid, &collection);
-                let ckpt_path = gen_dir.join(&fname);
-                let tmp_path = gen_dir.join(format!("{fname}.tmp"));
                 // Raw bytes, not the checkpoint frame: a Loro snapshot carries
                 // its own version and checksum, and the load path reads it back
                 // the same way.
-                nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snapshot)
-                    .map_err(|e| storage_err(&ckpt_path, "publish snapshot", &e))?;
+                nodedb_wal::segment::atomic_write_fsync(gen_dir, &fname, &snapshot)
+                    .map_err(|e| storage_err(&gen_dir.join(&fname), "publish snapshot", &e))?;
                 files_written += 1;
             }
         }

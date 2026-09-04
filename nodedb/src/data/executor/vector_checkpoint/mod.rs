@@ -48,7 +48,7 @@ mod test_support;
 mod write;
 
 pub(crate) use manifest::read_vector_manifest_at;
-pub(crate) use paths::{vector_ckpt_collection_stem, vector_ckpt_dir, vector_ckpt_gen_dir};
+pub(crate) use paths::{vector_ckpt_dir, vector_ckpt_gen_dir, vector_ckpt_stem};
 pub(crate) use publish::{next_generation, publish_vector_generation};
 
 #[cfg(test)]

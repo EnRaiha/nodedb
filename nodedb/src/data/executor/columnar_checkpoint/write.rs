@@ -158,10 +158,8 @@ impl CoreLoop {
                 })?;
 
             let fname = columnar_ckpt_filename(db_id.as_u64(), tenant_id.as_u64(), collection);
-            let ckpt_path = gen_dir.join(&fname);
-            let tmp_path = gen_dir.join(format!("{fname}.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes).map_err(
-                |e| crate::Error::Storage {
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &fname, &bytes).map_err(|e| {
+                crate::Error::Storage {
                     engine: "columnar".to_string(),
                     detail: format!(
                         "columnar checkpoint write failed for database {} tenant {} \
@@ -169,8 +167,8 @@ impl CoreLoop {
                         db_id.as_u64(),
                         tenant_id.as_u64()
                     ),
-                },
-            )?;
+                }
+            })?;
             written += 1;
         }
         Ok(written)
@@ -200,8 +198,7 @@ impl CoreLoop {
                 detail: format!("columnar checkpoint manifest encode failed: {e}"),
             })?;
         let path = ckpt_dir.join(COLUMNAR_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join(format!("{COLUMNAR_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, COLUMNAR_CKPT_MANIFEST, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

@@ -52,32 +52,37 @@ unsafe impl Sync for MmapVectorSegment {}
 impl MmapVectorSegment {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    /// Create a new segment file (surrogates default to 0) and open it.
-    pub fn create(path: &Path, dim: usize, vectors: &[&[f32]]) -> std::io::Result<Self> {
-        write_segment(path, dim, vectors, &[])?;
-        Self::open_with_policy(path, VectorSegmentDropPolicy::default())
+    /// Create the segment file `name` inside `dir` (surrogates default to 0)
+    /// and open it.
+    pub fn create(dir: &Path, name: &str, dim: usize, vectors: &[&[f32]]) -> std::io::Result<Self> {
+        write_segment(dir, name, dim, vectors, &[])?;
+        Self::open_with_policy(&dir.join(name), VectorSegmentDropPolicy::default())
     }
 
-    /// Create a new segment file with explicit surrogate IDs and open it.
+    /// Create the segment file `name` inside `dir` with explicit surrogate IDs
+    /// and open it.
     pub fn create_with_surrogates(
-        path: &Path,
+        dir: &Path,
+        name: &str,
         dim: usize,
         vectors: &[&[f32]],
         surrogate_ids: &[u64],
     ) -> std::io::Result<Self> {
-        write_segment(path, dim, vectors, surrogate_ids)?;
-        Self::open_with_policy(path, VectorSegmentDropPolicy::default())
+        write_segment(dir, name, dim, vectors, surrogate_ids)?;
+        Self::open_with_policy(&dir.join(name), VectorSegmentDropPolicy::default())
     }
 
-    /// Create a new segment with an explicit drop policy.
+    /// Create the segment file `name` inside `dir` with an explicit drop
+    /// policy.
     pub fn create_with_policy(
-        path: &Path,
+        dir: &Path,
+        name: &str,
         dim: usize,
         vectors: &[&[f32]],
         policy: VectorSegmentDropPolicy,
     ) -> std::io::Result<Self> {
-        write_segment(path, dim, vectors, &[])?;
-        Self::open_with_policy(path, policy)
+        write_segment(dir, name, dim, vectors, &[])?;
+        Self::open_with_policy(&dir.join(name), policy)
     }
 
     /// Open an existing segment file and memory-map it.
@@ -490,16 +495,20 @@ mod tests {
     #[test]
     fn create_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.vseg");
 
         let v0 = vec![1.0f32, 2.0, 3.0];
         let v1 = vec![4.0f32, 5.0, 6.0];
         let v2 = vec![7.0f32, 8.0, 9.0];
         let surrogates = vec![10u64, 20, 30];
 
-        let seg =
-            MmapVectorSegment::create_with_surrogates(&path, 3, &[&v0, &v1, &v2], &surrogates)
-                .unwrap();
+        let seg = MmapVectorSegment::create_with_surrogates(
+            dir.path(),
+            "test.vseg",
+            3,
+            &[&v0, &v1, &v2],
+            &surrogates,
+        )
+        .unwrap();
 
         assert_eq!(seg.dim(), 3);
         assert_eq!(seg.count(), 3);
@@ -516,13 +525,19 @@ mod tests {
     #[test]
     fn flat_slices() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("flat.vseg");
 
         let v0 = vec![1.0f32, 2.0, 3.0];
         let v1 = vec![4.0f32, 5.0, 6.0];
         let sids = vec![100u64, 200];
 
-        let seg = MmapVectorSegment::create_with_surrogates(&path, 3, &[&v0, &v1], &sids).unwrap();
+        let seg = MmapVectorSegment::create_with_surrogates(
+            dir.path(),
+            "flat.vseg",
+            3,
+            &[&v0, &v1],
+            &sids,
+        )
+        .unwrap();
 
         assert_eq!(seg.all_vectors_flat(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(seg.all_surrogate_ids(), &[100u64, 200]);
@@ -539,7 +554,8 @@ mod tests {
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         let sids: Vec<u64> = (0u64..100).collect();
 
-        MmapVectorSegment::create_with_surrogates(&path, 3, &refs, &sids).unwrap();
+        MmapVectorSegment::create_with_surrogates(dir.path(), "reopen.vseg", 3, &refs, &sids)
+            .unwrap();
 
         let seg = MmapVectorSegment::open(&path).unwrap();
         assert_eq!(seg.count(), 100);
@@ -552,20 +568,18 @@ mod tests {
     #[test]
     fn no_surrogates_defaults_to_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nosid.vseg");
 
         let v = vec![1.0f32, 2.0];
-        let seg = MmapVectorSegment::create(&path, 2, &[&v]).unwrap();
+        let seg = MmapVectorSegment::create(dir.path(), "nosid.vseg", 2, &[&v]).unwrap();
         assert_eq!(seg.get_surrogate_id(0).unwrap(), 0);
     }
 
     #[test]
     fn prefetch_does_not_crash() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("prefetch.vseg");
 
         let v = vec![1.0f32; 768];
-        let seg = MmapVectorSegment::create(&path, 768, &[&v]).unwrap();
+        let seg = MmapVectorSegment::create(dir.path(), "prefetch.vseg", 768, &[&v]).unwrap();
         seg.prefetch(0);
         seg.prefetch(999);
     }
@@ -573,9 +587,8 @@ mod tests {
     #[test]
     fn empty_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.vseg");
 
-        let seg = MmapVectorSegment::create(&path, 3, &[]).unwrap();
+        let seg = MmapVectorSegment::create(dir.path(), "empty.vseg", 3, &[]).unwrap();
         assert_eq!(seg.count(), 0);
         assert!(seg.get_vector(0).is_none());
         assert_eq!(seg.all_vectors_flat().len(), 0);
@@ -587,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("golden.vseg");
         let v = vec![1.0f32, 2.0, 3.0];
-        write_segment(&path, 3, &[&v], &[42]).unwrap();
+        write_segment(dir.path(), "golden.vseg", 3, &[&v], &[42]).unwrap();
         let data = std::fs::read(&path).unwrap();
 
         // Footer starts at file_size - FOOTER_SIZE.
@@ -617,7 +630,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trailmagic.vseg");
         let v = vec![1.0f32, 2.0, 3.0];
-        write_segment(&path, 3, &[&v], &[42]).unwrap();
+        write_segment(dir.path(), "trailmagic.vseg", 3, &[&v], &[42]).unwrap();
 
         let mut data = std::fs::read(&path).unwrap();
         // Corrupt the last 4 bytes (trailing magic).
@@ -643,7 +656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fvmismatch.vseg");
         let v = vec![1.0f32, 2.0, 3.0];
-        write_segment(&path, 3, &[&v], &[42]).unwrap();
+        write_segment(dir.path(), "fvmismatch.vseg", 3, &[&v], &[42]).unwrap();
 
         let mut data = std::fs::read(&path).unwrap();
         // Corrupt the footer format version bytes to 99.
@@ -664,7 +677,7 @@ mod tests {
         let path = dir.path().join("corrupt.vseg");
 
         let v = vec![1.0f32, 2.0, 3.0];
-        write_segment(&path, 3, &[&v], &[42]).unwrap();
+        write_segment(dir.path(), "corrupt.vseg", 3, &[&v], &[42]).unwrap();
 
         let mut data = std::fs::read(&path).unwrap();
         data[HEADER_SIZE] ^= 0xff;
@@ -681,7 +694,7 @@ mod tests {
         let path = dir.path().join("badmagic.vseg");
 
         let v = vec![1.0f32, 2.0];
-        write_segment(&path, 2, &[&v], &[]).unwrap();
+        write_segment(dir.path(), "badmagic.vseg", 2, &[&v], &[]).unwrap();
 
         let mut data = std::fs::read(&path).unwrap();
         data[0] = b'X';

@@ -102,13 +102,18 @@ mod tests {
 
     fn make_backing(dim: usize, vecs: &[Vec<f32>]) -> PlainMmapBacking {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.ndvs");
 
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let surrogates: Vec<u64> = (0..vecs.len() as u64).collect();
 
-        let seg =
-            MmapVectorSegment::create_with_surrogates(&path, dim, &refs, &surrogates).unwrap();
+        let seg = MmapVectorSegment::create_with_surrogates(
+            dir.path(),
+            "test.ndvs",
+            dim,
+            &refs,
+            &surrogates,
+        )
+        .unwrap();
 
         // Keep the tempdir alive by leaking it for the test duration.
         // The backing borrows from the mmap, which is already self-contained
@@ -157,8 +162,8 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
 
         let dir = tempdir().unwrap();
-        let path = dir.path().join("check.ndvs");
-        let seg = MmapVectorSegment::create(&path, 2, &[&[1.0_f32, 2.0]]).unwrap();
+        let seg =
+            MmapVectorSegment::create(dir.path(), "check.ndvs", 2, &[&[1.0_f32, 2.0]]).unwrap();
         let backing = PlainMmapBacking::new(seg);
 
         assert_send_sync(&backing);
@@ -183,8 +188,7 @@ mod tests {
     #[test]
     fn plain_backing_empty_segment() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("empty.ndvs");
-        let seg = MmapVectorSegment::create(&path, 4, &[]).unwrap();
+        let seg = MmapVectorSegment::create(dir.path(), "empty.ndvs", 4, &[]).unwrap();
         let backing = PlainMmapBacking::new(seg);
 
         assert_eq!(backing.len(), 0);

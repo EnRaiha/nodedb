@@ -233,14 +233,17 @@ fn restore_vector_checkpoints(
 
     let mut total_vectors = 0u64;
     for idx in hnsw_indexes {
-        let key = format!(
-            "{}:{}:{}:emb",
-            idx.database_id, idx.tenant_id, idx.collection
+        let stem = crate::data::executor::vector_checkpoint::vector_ckpt_stem(
+            idx.database_id,
+            idx.tenant_id,
+            &format!("{}:emb", idx.collection),
         );
-        let ckpt_path = gen_dir.join(format!("{key}.ckpt"));
-        let tmp_path = gen_dir.join(format!("{key}.ckpt.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &idx.checkpoint_bytes)
-            .map_err(crate::Error::Wal)?;
+        nodedb_wal::segment::write_checkpoint_framed(
+            &gen_dir,
+            &format!("{stem}.ckpt"),
+            &idx.checkpoint_bytes,
+        )
+        .map_err(crate::Error::Wal)?;
         total_vectors += 1;
     }
     crate::data::executor::vector_checkpoint::publish_vector_generation(
@@ -287,9 +290,7 @@ fn restore_crdt_checkpoints(
             snap.tenant_id,
             &snap.collection,
         );
-        let ckpt_path = gen_dir.join(&fname);
-        let tmp_path = gen_dir.join(format!("{fname}.tmp"));
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snap.snapshot_bytes)
+        nodedb_wal::segment::atomic_write_fsync(&gen_dir, &fname, &snap.snapshot_bytes)
             .map_err(crate::Error::Wal)?;
     }
     crate::data::executor::crdt_checkpoint::publish_crdt_generation(

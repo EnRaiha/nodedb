@@ -28,8 +28,9 @@ const VERSION: u8 = 1;
 const HEADER_LEN: usize = 17;
 
 /// Frame `payload` with a magic + version + CRC32C + length header and
-/// atomically write it to `dst` via `tmp` (see [`atomic_write_fsync`]).
-pub fn write_checkpoint_framed(tmp: &Path, dst: &Path, payload: &[u8]) -> Result<()> {
+/// atomically write it to `dir/name` (see [`atomic_write_fsync`], which owns
+/// the name check and the staging-file naming).
+pub fn write_checkpoint_framed(dir: &Path, name: &str, payload: &[u8]) -> Result<()> {
     let crc = crc32c::crc32c(payload);
     let payload_len = payload.len() as u64;
 
@@ -40,7 +41,7 @@ pub fn write_checkpoint_framed(tmp: &Path, dst: &Path, payload: &[u8]) -> Result
     framed.extend_from_slice(&payload_len.to_le_bytes());
     framed.extend_from_slice(payload);
 
-    atomic_write_fsync(tmp, dst, &framed)
+    atomic_write_fsync(dir, name, &framed)
 }
 
 /// Read a checkpoint file written by [`write_checkpoint_framed`], verify its
@@ -104,9 +105,8 @@ mod tests {
     fn roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
-        write_checkpoint_framed(&tmp, &dst, b"hello framed world").unwrap();
+        write_checkpoint_framed(dir.path(), "payload.ckpt", b"hello framed world").unwrap();
         let read_back = read_checkpoint_framed(&dst).unwrap();
         assert_eq!(read_back, b"hello framed world");
     }
@@ -115,9 +115,8 @@ mod tests {
     fn corruption_detected() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
-        write_checkpoint_framed(&tmp, &dst, b"integrity matters").unwrap();
+        write_checkpoint_framed(dir.path(), "payload.ckpt", b"integrity matters").unwrap();
 
         // Flip a byte in the payload region (after the 17-byte header).
         let mut bytes = fs::read(&dst).unwrap();
@@ -138,9 +137,8 @@ mod tests {
     fn truncation_detected() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
-        write_checkpoint_framed(&tmp, &dst, b"a longer payload body here").unwrap();
+        write_checkpoint_framed(dir.path(), "payload.ckpt", b"a longer payload body here").unwrap();
 
         let mut bytes = fs::read(&dst).unwrap();
         bytes.truncate(bytes.len() - 5);
@@ -159,10 +157,9 @@ mod tests {
     fn legacy_unframed_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
         // Raw pre-framing bytes: first 4 bytes are NOT the NCKF magic.
-        atomic_write_fsync(&tmp, &dst, b"legacy plaintext checkpoint").unwrap();
+        atomic_write_fsync(dir.path(), "payload.ckpt", b"legacy plaintext checkpoint").unwrap();
 
         let read_back = read_checkpoint_framed(&dst).unwrap();
         assert_eq!(read_back, b"legacy plaintext checkpoint");

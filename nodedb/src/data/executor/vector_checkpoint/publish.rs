@@ -42,8 +42,7 @@ pub(crate) fn publish_vector_generation(
         detail: format!("vector checkpoint manifest encode failed: {e}"),
     })?;
     let path = ckpt_dir.join(VECTOR_CKPT_MANIFEST);
-    let tmp = ckpt_dir.join(format!("{VECTOR_CKPT_MANIFEST}.tmp"));
-    nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+    nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, VECTOR_CKPT_MANIFEST, &bytes)
         .map_err(|e| storage_err(&path, "publish manifest", &e))?;
     Ok(())
 }

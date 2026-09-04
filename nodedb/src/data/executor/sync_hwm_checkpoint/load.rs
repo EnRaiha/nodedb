@@ -258,9 +258,7 @@ mod tests {
             epoch_floor: vec![(1, 3)],
         };
         let bytes = zerompk::to_msgpack_vec(&file).expect("encode");
-        let path = sync_hwm_ckpt_state_path(&ckpt_dir);
-        let tmp = ckpt_dir.join("STATE.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, "STATE", &bytes).expect("write");
 
         let mut core = open_core_at(dir.path());
         assert!(
@@ -277,9 +275,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ckpt_dir = sync_hwm_ckpt_dir(dir.path(), 0);
         std::fs::create_dir_all(&ckpt_dir).expect("mkdir");
-        let path = sync_hwm_ckpt_state_path(&ckpt_dir);
-        let tmp = ckpt_dir.join("STATE.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, b"not valid msgpack")
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, "STATE", b"not valid msgpack")
             .expect("write");
 
         let mut core = open_core_at(dir.path());

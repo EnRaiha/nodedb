@@ -493,7 +493,9 @@ mod tests {
         }
 
         // Persist manifest.
-        registry.persist(&manifest_path).unwrap();
+        registry
+            .persist(tmp.path(), "partition_manifest.json")
+            .unwrap();
 
         // Step 2: "Crash" — recover from manifest.
         let recovered = PartitionRegistry::recover(&manifest_path, cfg.clone()).unwrap();
@@ -505,7 +507,9 @@ mod tests {
         for d in 1..=3 {
             registry.seal_partition(d * day_ms);
         }
-        registry.persist(&manifest_path).unwrap();
+        registry
+            .persist(tmp.path(), "partition_manifest.json")
+            .unwrap();
 
         let recovered = PartitionRegistry::recover(&manifest_path, cfg.clone()).unwrap();
         assert_eq!(recovered.sealed_count(), 3);
@@ -513,7 +517,9 @@ mod tests {
         // Step 4: Start merge, "crash" mid-merge (state = Merging).
         let mut registry = recovered;
         registry.mark_merging(day_ms);
-        registry.persist(&manifest_path).unwrap();
+        registry
+            .persist(tmp.path(), "partition_manifest.json")
+            .unwrap();
 
         // Recovery should roll back Merging → Sealed.
         let recovered = PartitionRegistry::recover(&manifest_path, cfg.clone()).unwrap();
@@ -543,7 +549,9 @@ mod tests {
             "ts-merged".into(),
             &[day_ms, 2 * day_ms, 3 * day_ms],
         );
-        registry.persist(&manifest_path).unwrap();
+        registry
+            .persist(tmp.path(), "partition_manifest.json")
+            .unwrap();
 
         // Recovery should remove Deleted entries.
         let recovered = PartitionRegistry::recover(&manifest_path, cfg.clone()).unwrap();

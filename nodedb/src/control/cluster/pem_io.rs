@@ -30,34 +30,26 @@ pub fn pem_encode(label: &str, der: &[u8]) -> String {
     out
 }
 
-/// Write a DER certificate as a PEM-encoded `CERTIFICATE` block.
+/// Write a DER certificate as the PEM-encoded `CERTIFICATE` file `name` inside
+/// `dir`.
 ///
 /// The write is durable: bytes go to a sibling tmp file that is fsynced
-/// before being renamed over `path`, and the parent directory is fsynced
-/// after the rename. A power loss that interrupts the write leaves either
-/// the old cert intact or the new cert fully present — never a zero-byte
+/// before being renamed over the final name, and the parent directory is
+/// fsynced after the rename. A power loss that interrupts the write leaves
+/// either the old cert intact or the new cert fully present — never a zero-byte
 /// file.
-pub fn write_pem_cert(path: &Path, der: &[u8]) -> io::Result<()> {
-    let tmp = tmp_path(path);
+pub fn write_pem_cert(dir: &Path, name: &str, der: &[u8]) -> io::Result<()> {
     let pem = pem_encode("CERTIFICATE", der);
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, pem.as_bytes()).map_err(io::Error::other)
+    nodedb_wal::segment::atomic_write_fsync(dir, name, pem.as_bytes()).map_err(io::Error::other)
 }
 
-/// Write a DER private key as a PEM-encoded `PRIVATE KEY` block and
-/// tighten the file mode to 0600 (no-op on non-Unix). Same durability
+/// Write a DER private key as the PEM-encoded `PRIVATE KEY` file `name` inside
+/// `dir` and tighten the file mode to 0600 (no-op on non-Unix). Same durability
 /// semantics as `write_pem_cert`.
-pub fn write_pem_private_key(path: &Path, der: &[u8]) -> io::Result<()> {
-    let tmp = tmp_path(path);
+pub fn write_pem_private_key(dir: &Path, name: &str, der: &[u8]) -> io::Result<()> {
     let pem = pem_encode("PRIVATE KEY", der);
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, pem.as_bytes())
-        .map_err(io::Error::other)?;
-    set_private_key_perms(path)
-}
-
-fn tmp_path(path: &Path) -> std::path::PathBuf {
-    let mut os = path.as_os_str().to_owned();
-    os.push(".tmp");
-    std::path::PathBuf::from(os)
+    nodedb_wal::segment::atomic_write_fsync(dir, name, pem.as_bytes()).map_err(io::Error::other)?;
+    set_private_key_perms(&dir.join(name))
 }
 
 /// Tighten a file's permissions to 0600. No-op on non-Unix (Windows
@@ -93,7 +85,7 @@ mod tests {
     fn write_pem_cert_roundtrips() {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("t.crt");
-        write_pem_cert(&path, b"deadbeef").unwrap();
+        write_pem_cert(td.path(), "t.crt", b"deadbeef").unwrap();
         let back = fs::read_to_string(&path).unwrap();
         assert!(back.starts_with("-----BEGIN CERTIFICATE-----\n"));
     }
@@ -102,7 +94,7 @@ mod tests {
     fn write_pem_private_key_sets_0600_on_unix() {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("t.key");
-        write_pem_private_key(&path, b"secret").unwrap();
+        write_pem_private_key(td.path(), "t.key", b"secret").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

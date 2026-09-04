@@ -231,7 +231,7 @@ fn quarantine_vector_corrupt_crc_quarantines_and_renames_file() {
     let corrupt_path = tmp.path().join("corrupt.seg");
 
     let v = vec![1.0f32, 2.0, 3.0];
-    MmapVectorSegment::create(&good_path, 3, &[&v]).unwrap();
+    MmapVectorSegment::create(tmp.path(), "good.seg", 3, &[&v]).unwrap();
 
     // Corrupt the CRC in the footer (FOOTER_SIZE=46, CRC at bytes [34..38] from footer start).
     let mut bytes = std::fs::read(&good_path).unwrap();

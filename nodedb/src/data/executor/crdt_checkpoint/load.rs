@@ -126,9 +126,8 @@ mod tests {
         std::fs::create_dir_all(&gen_dir).expect("create gen dir");
         write_files(&gen_dir);
         let bytes = test_manifest_bytes(0);
-        let path = ckpt_dir.join(CRDT_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join("m.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write manifest");
+        nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, CRDT_CKPT_MANIFEST, &bytes)
+            .expect("write manifest");
     }
 
     /// An absent checkpoint directory is not corruption — a fresh data

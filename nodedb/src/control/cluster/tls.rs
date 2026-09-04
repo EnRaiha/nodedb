@@ -284,8 +284,8 @@ pub fn write_trusted_ca(tls_dir: &Path, ca_der: &[u8]) -> crate::Result<[u8; 32]
     })?;
     let cert = CertificateDer::from(ca_der.to_vec());
     let fp = nodedb_cluster::ca_fingerprint(&cert);
-    let path = dir.join(format!("{}.crt", nodedb_cluster::ca_fingerprint_hex(&fp)));
-    write_pem_cert(&path, ca_der)?;
+    let name = format!("{}.crt", nodedb_cluster::ca_fingerprint_hex(&fp));
+    write_pem_cert(&dir, &name, ca_der)?;
     Ok(fp)
 }
 
@@ -330,9 +330,9 @@ async fn fetch_creds_via_bootstrap(
 
     // Persist to disk so a restart takes the normal data-dir path
     // without needing the token a second time.
-    write_pem_cert(&tls_dir.join(CA_CERT_FILE), &resp.ca_cert_der)?;
-    write_pem_cert(&tls_dir.join(NODE_CERT_FILE), &resp.node_cert_der)?;
-    write_pem_private_key(&tls_dir.join(NODE_KEY_FILE), &resp.node_key_der)?;
+    write_pem_cert(tls_dir, CA_CERT_FILE, &resp.ca_cert_der)?;
+    write_pem_cert(tls_dir, NODE_CERT_FILE, &resp.node_cert_der)?;
+    write_pem_private_key(tls_dir, NODE_KEY_FILE, &resp.node_key_der)?;
     if resp.cluster_secret.len() != CLUSTER_SECRET_LEN {
         return Err(crate::Error::Config {
             detail: format!(
@@ -379,13 +379,13 @@ fn bootstrap_credentials(
         detail: format!("bootstrap cluster CA: {e}"),
     })?;
 
-    write_pem_cert(&tls_dir.join(CA_CERT_FILE), ca.cert_der().as_ref())?;
+    write_pem_cert(tls_dir, CA_CERT_FILE, ca.cert_der().as_ref())?;
     // Persist the CA key so `nodedb regen-certs` can reissue node
     // certs under the same CA. 0600 perms enforced by
     // `write_pem_private_key`.
-    write_pem_private_key(&tls_dir.join(CA_KEY_FILE), &ca.key_pair_pkcs8_der())?;
-    write_pem_cert(&tls_dir.join(NODE_CERT_FILE), creds.cert.as_ref())?;
-    write_pem_private_key(&tls_dir.join(NODE_KEY_FILE), creds.key.secret_der())?;
+    write_pem_private_key(tls_dir, CA_KEY_FILE, &ca.key_pair_pkcs8_der())?;
+    write_pem_cert(tls_dir, NODE_CERT_FILE, creds.cert.as_ref())?;
+    write_pem_private_key(tls_dir, NODE_KEY_FILE, creds.key.secret_der())?;
     write_cluster_secret(&tls_dir.join(CLUSTER_SECRET_FILE), &creds.cluster_secret)?;
 
     // Load the (empty-by-default) overlap-CA set so the bootstrap path
@@ -462,15 +462,15 @@ fn read_crls(path: &Path) -> crate::Result<Vec<CertificateRevocationListDer<'sta
     })
 }
 
-pub(crate) fn write_pem_cert(path: &Path, der: &[u8]) -> crate::Result<()> {
-    super::pem_io::write_pem_cert(path, der).map_err(|e| crate::Error::Config {
-        detail: format!("write {}: {e}", path.display()),
+pub(crate) fn write_pem_cert(dir: &Path, name: &str, der: &[u8]) -> crate::Result<()> {
+    super::pem_io::write_pem_cert(dir, name, der).map_err(|e| crate::Error::Config {
+        detail: format!("write {}: {e}", dir.join(name).display()),
     })
 }
 
-fn write_pem_private_key(path: &Path, der: &[u8]) -> crate::Result<()> {
-    super::pem_io::write_pem_private_key(path, der).map_err(|e| crate::Error::Config {
-        detail: format!("write {}: {e}", path.display()),
+fn write_pem_private_key(dir: &Path, name: &str, der: &[u8]) -> crate::Result<()> {
+    super::pem_io::write_pem_private_key(dir, name, der).map_err(|e| crate::Error::Config {
+        detail: format!("write {}: {e}", dir.join(name).display()),
     })
 }
 

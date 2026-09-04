@@ -70,9 +70,9 @@ pub fn run(data_dir: &Path, node_id: u64) -> Result<(), String> {
     let node_cert_path = tls_dir.join("node.crt");
     let node_key_path = tls_dir.join("node.key");
 
-    write_pem_cert(&node_cert_path, creds.cert.as_ref())
+    write_pem_cert(&tls_dir, "node.crt", creds.cert.as_ref())
         .map_err(|e| format!("write {}: {e}", node_cert_path.display()))?;
-    write_pem_key(&node_key_path, creds.key.secret_der())
+    write_pem_key(&tls_dir, "node.key", creds.key.secret_der())
         .map_err(|e| format!("write {}: {e}", node_key_path.display()))?;
 
     println!("reissued node cert:");
@@ -104,14 +104,13 @@ fn parse_private_key_pem(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(key.secret_der().to_vec())
 }
 
-// PEM writers live in `crate::control::cluster::pem_io`. Keep thin
-// aliases inside this module so the atomic-write staging block below
-// reads the same way it did before the extraction.
-fn write_pem_cert(path: &Path, der: &[u8]) -> std::io::Result<()> {
-    pem_io::write_pem_cert(path, der)
+// PEM writers live in `crate::control::cluster::pem_io`. These thin aliases
+// keep the call sites in this module short.
+fn write_pem_cert(dir: &Path, name: &str, der: &[u8]) -> std::io::Result<()> {
+    pem_io::write_pem_cert(dir, name, der)
 }
-fn write_pem_key(path: &Path, der: &[u8]) -> std::io::Result<()> {
-    pem_io::write_pem_private_key(path, der)
+fn write_pem_key(dir: &Path, name: &str, der: &[u8]) -> std::io::Result<()> {
+    pem_io::write_pem_private_key(dir, name, der)
 }
 
 fn ensure_ca_key_perms(path: &Path) -> Result<(), String> {
@@ -152,10 +151,10 @@ mod tests {
 
         let (ca, creds) =
             nodedb_cluster::generate_node_credentials_multi_san(&["node-1", SNI_HOSTNAME]).unwrap();
-        write_pem_cert(&tls_dir.join("ca.crt"), ca.cert_der().as_ref()).unwrap();
-        write_pem_key(&tls_dir.join("ca.key"), &ca.key_pair_pkcs8_der()).unwrap();
-        write_pem_cert(&tls_dir.join("node.crt"), creds.cert.as_ref()).unwrap();
-        write_pem_key(&tls_dir.join("node.key"), creds.key.secret_der()).unwrap();
+        write_pem_cert(&tls_dir, "ca.crt", ca.cert_der().as_ref()).unwrap();
+        write_pem_key(&tls_dir, "ca.key", &ca.key_pair_pkcs8_der()).unwrap();
+        write_pem_cert(&tls_dir, "node.crt", creds.cert.as_ref()).unwrap();
+        write_pem_key(&tls_dir, "node.key", creds.key.secret_der()).unwrap();
         // cluster_secret.bin isn't needed by regen-certs but exists in a real deployment.
         fs::write(tls_dir.join("cluster_secret.bin"), [0u8; 32]).unwrap();
         pem_io::set_private_key_perms(&tls_dir.join("cluster_secret.bin")).unwrap();
@@ -179,7 +178,7 @@ mod tests {
         let tls_dir = data_dir.join("tls");
         fs::create_dir_all(&tls_dir).unwrap();
         let (ca, _) = nodedb_cluster::generate_node_credentials_multi_san(&["node-1"]).unwrap();
-        write_pem_cert(&tls_dir.join("ca.crt"), ca.cert_der().as_ref()).unwrap();
+        write_pem_cert(&tls_dir, "ca.crt", ca.cert_der().as_ref()).unwrap();
         // Deliberately no ca.key.
         let err = run(data_dir, 1).unwrap_err();
         assert!(err.contains("CA private key not found"), "got: {err}");

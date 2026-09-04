@@ -47,11 +47,8 @@ fn assert_durable_checkpoint_writer(rel: &str) {
          data and the parent directory are fsynced before rename. Raw fs::write + \
          fs::rename is not crash-safe on ext4/XFS."
     );
-    // The raw anti-pattern must not coexist. Allow `fs::rename` only when the
-    // file also mentions the helper *and* the helper wraps it.
-    let raw_write_rename = src.contains("fs::write(&tmp")
-        && src.contains("fs::rename(&tmp")
-        && !src.contains("atomic_write_fsync(&tmp");
+    // The raw anti-pattern must not coexist with the helper.
+    let raw_write_rename = src.contains("fs::write(&tmp") && src.contains("fs::rename(&tmp");
     assert!(
         !raw_write_rename,
         "{rel} still contains the non-durable fs::write + fs::rename tmp \
@@ -144,9 +141,7 @@ fn snapshot_writer_core_and_manifest_writes_are_durable() {
          for durable, atomic writes across local and remote storage tiers."
     );
     // The raw non-durable pattern must not be present.
-    let raw_write_rename = src.contains("fs::write(&tmp")
-        && src.contains("fs::rename(&tmp")
-        && !src.contains("atomic_write_fsync(&tmp");
+    let raw_write_rename = src.contains("fs::write(&tmp") && src.contains("fs::rename(&tmp");
     assert!(
         !raw_write_rename,
         "snapshot_writer.rs still contains the non-durable fs::write + \
@@ -185,7 +180,7 @@ fn atomic_write_helper_fsyncs_parent_directory() {
     let wal_segment = read("nodedb-wal/src/segment/atomic_io.rs");
     assert!(
         wal_segment.contains("pub fn atomic_write_fsync"),
-        "nodedb_wal::segment must expose `atomic_write_fsync(tmp, dst, bytes)` \
+        "nodedb_wal::segment must expose `atomic_write_fsync(dir, name, bytes)` \
          — the single helper through which all tmp+rename checkpoint writes \
          go. Without it, the invariant is re-implemented (and re-broken) per \
          call site."

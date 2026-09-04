@@ -132,13 +132,10 @@ mod tests {
         f.write_all(&[0x5Au8; 32]).unwrap();
         drop(f);
         let ca = nexar::transport::tls::ClusterCa::generate().unwrap();
-        crate::control::cluster::tls::write_pem_cert(
-            &tls_dir.join("ca.crt"),
-            ca.cert_der().as_ref(),
-        )
-        .unwrap();
+        crate::control::cluster::tls::write_pem_cert(&tls_dir, "ca.crt", ca.cert_der().as_ref())
+            .unwrap();
         let (node_cert, _node_key) = ca.issue_cert("nodedb").unwrap();
-        crate::control::cluster::tls::write_pem_cert(&tls_dir.join("node.crt"), node_cert.as_ref())
+        crate::control::cluster::tls::write_pem_cert(&tls_dir, "node.crt", node_cert.as_ref())
             .unwrap();
         // Smoke test: succeeds and writes expected amount of output.
         create(td.path(), 9, Duration::from_secs(600)).unwrap();

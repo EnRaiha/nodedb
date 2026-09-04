@@ -140,10 +140,15 @@ async fn dropped_vector_collection_does_not_resurrect_after_restart() {
     ))
     .await;
 
+    // Vector checkpoint filenames hex-encode the collection key, so no
+    // collection name can escape the generation directory. Match on the same
+    // encoding the writer uses.
+    let needle: String = COLLECTION.bytes().map(|b| format!("{b:02x}")).collect();
+
     let ckpt_root = h.data_dir().join("vector-ckpt");
     let first_ckpt = wait_for_any_ckpt_file(&ckpt_root, "vector");
     assert!(
-        any_file_name_contains(&ckpt_root, COLLECTION).is_some(),
+        any_file_name_contains(&ckpt_root, &needle).is_some(),
         "a vector checkpoint file exists ({}), but none of them name '{COLLECTION}' — test \
          setup is not exercising the collection under test",
         first_ckpt.display()
@@ -158,7 +163,7 @@ async fn dropped_vector_collection_does_not_resurrect_after_restart() {
 
     assert_collection_missing(&h, &format!("SELECT id FROM {COLLECTION}"), COLLECTION).await;
 
-    let leaked = any_file_name_contains(&ckpt_root, COLLECTION);
+    let leaked = any_file_name_contains(&ckpt_root, &needle);
     assert!(
         leaked.is_none(),
         "vector checkpoint file for dropped collection '{COLLECTION}' is still on disk after \

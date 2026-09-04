@@ -179,18 +179,26 @@ impl JwksCache {
 
         let json = sonic_rs::to_string_pretty(&disk_cache).map_err(std::io::Error::other)?;
 
-        // Atomic write via temp file + rename.
+        // `jwks_cache_path` is one operator-supplied file path, so this is the
+        // boundary where it splits into the (directory, name) pair the durable
+        // writer takes. A path with no directory part or no final name is a
+        // config error and is reported as one.
         let disk_path = Path::new(path);
-        if let Some(parent) = disk_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = format!("{path}.tmp");
-        nodedb_wal::segment::atomic_write_fsync(
-            std::path::Path::new(&tmp),
-            disk_path,
-            json.as_bytes(),
-        )
-        .map_err(std::io::Error::other)?;
+        let (dir, name) = match (
+            disk_path.parent(),
+            disk_path.file_name().and_then(|n| n.to_str()),
+        ) {
+            (Some(dir), Some(name)) => (dir, name),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("jwks_cache_path is not a file path: {path}"),
+                ));
+            }
+        };
+        std::fs::create_dir_all(dir)?;
+        nodedb_wal::segment::atomic_write_fsync(dir, name, json.as_bytes())
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 }

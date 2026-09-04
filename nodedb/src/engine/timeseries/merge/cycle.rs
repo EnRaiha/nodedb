@@ -55,8 +55,7 @@ pub fn run_merge_cycle(
                 registry.commit_merge(result.meta, result.dir_name, group_starts);
 
                 // Persist manifest (atomic write-rename).
-                let manifest_path = base_dir.join("partition_manifest.json");
-                if let Err(e) = registry.persist(&manifest_path) {
+                if let Err(e) = registry.persist(base_dir, "partition_manifest.json") {
                     tracing::warn!(error = %e, "failed to persist partition manifest after merge");
                 }
 

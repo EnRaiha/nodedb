@@ -42,8 +42,7 @@ pub(crate) fn publish_crdt_generation(
         detail: format!("CRDT checkpoint manifest encode failed: {e}"),
     })?;
     let path = ckpt_dir.join(CRDT_CKPT_MANIFEST);
-    let tmp = ckpt_dir.join(format!("{CRDT_CKPT_MANIFEST}.tmp"));
-    nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+    nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, CRDT_CKPT_MANIFEST, &bytes)
         .map_err(|e| storage_err(&path, "publish manifest", &e))?;
     Ok(())
 }

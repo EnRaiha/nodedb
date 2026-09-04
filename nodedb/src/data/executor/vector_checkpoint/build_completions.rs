@@ -17,7 +17,7 @@ impl CoreLoop {
     /// Called at the top of `tick()` before draining new requests.
     ///
     /// `BuildComplete.key` is the `"{db}:{tid}:{coll}"` string produced by
-    /// `VectorCollection::seal` (fed the `vector_checkpoint_filename` of the
+    /// `VectorCollection::seal` (fed the `vector_build_key` of the
     /// index key). Parse it back to the tuple key to look up the map.
     pub fn poll_build_completions(&mut self) {
         let Some(rx) = &self.build_rx else { return };

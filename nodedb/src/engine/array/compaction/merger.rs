@@ -119,11 +119,17 @@ impl CompactionMerger {
         };
 
         let kek = store.kek().cloned();
-        let seg_path = store.root().join(&output_id);
+        let root = store.root().to_path_buf();
         let writer_bytes =
             build_segment_bytes(&schema, schema_hash, kek.as_ref(), merged.into_iter())?;
-        write_atomic(&seg_path, &writer_bytes).map_err(|e| CompactionError::Io {
-            detail: format!("write merged segment {seg_path:?}: {e}"),
+        // The shared WAL helper, as the flush path uses: compaction unlinks its
+        // inputs once the manifest names this file, so a rename that reaches
+        // disk ahead of the data pages would leave the merged cells with no
+        // surviving copy.
+        nodedb_wal::segment::atomic_write_fsync(&root, &output_id, &writer_bytes).map_err(|e| {
+            CompactionError::Io {
+                detail: format!("write merged segment {:?}: {e}", root.join(&output_id)),
+            }
         })?;
 
         // Reopen from the written bytes to pull tile bounds.
@@ -261,25 +267,6 @@ fn apply_retention(
     }
 
     Ok(out)
-}
-
-/// Write a merged segment durably: data fsynced before the rename, parent
-/// directory fsynced after it.
-///
-/// Routed through `nodedb_wal::segment::atomic_write_fsync` — the same helper
-/// the flush path uses — so the ordering cannot drift between the two callers
-/// and a failed directory fsync is reported instead of swallowed. Compaction
-/// unlinks its inputs once the manifest names this file, so a rename that
-/// reaches disk ahead of the data pages would leave the merged cells with no
-/// surviving copy.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
-    let mut tmp = path.to_path_buf();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    tmp.set_extension(format!("{ext}.tmp"));
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 fn build_segment_bytes(

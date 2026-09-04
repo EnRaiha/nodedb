@@ -131,10 +131,9 @@ impl CoreLoop {
             // the manifest swing below, so "no file" restores as "no entries"
             // rather than leaving last cycle's populated pair reachable under a
             // manifest claiming a later LSN.
-            let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
-                .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
+            let ckpt_name = format!("{stem}.ckpt");
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &ckpt_name, &bytes)
+                .map_err(|e| storage_err(&gen_dir.join(&ckpt_name), "publish checkpoint", &e))?;
             files_written += 1;
 
             let doc_entries: Vec<(u64, String)> = self
@@ -148,10 +147,9 @@ impl CoreLoop {
                     format: "msgpack".to_string(),
                     detail: format!("spatial doc_map encode failed for {stem}: {e}"),
                 })?;
-            let map_path = gen_dir.join(format!("{stem}.docmap"));
-            let map_tmp = gen_dir.join(format!("{stem}.docmap.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, &map_bytes)
-                .map_err(|e| storage_err(&map_path, "publish doc_map", &e))?;
+            let map_name = format!("{stem}.docmap");
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &map_name, &map_bytes)
+                .map_err(|e| storage_err(&gen_dir.join(&map_name), "publish doc_map", &e))?;
             files_written += 1;
         }
         Ok(files_written)
@@ -182,8 +180,7 @@ impl CoreLoop {
                 detail: format!("spatial checkpoint manifest encode failed: {e}"),
             })?;
         let path = ckpt_dir.join(SPATIAL_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join(format!("{SPATIAL_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, SPATIAL_CKPT_MANIFEST, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

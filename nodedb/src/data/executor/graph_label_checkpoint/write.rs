@@ -85,8 +85,7 @@ impl CoreLoop {
         let ckpt_dir = graph_label_ckpt_dir(&self.data_dir, self.core_id);
         std::fs::create_dir_all(&ckpt_dir).map_err(|e| storage_err(&ckpt_dir, "create dir", &e))?;
         let path = graph_label_ckpt_state_path(&ckpt_dir);
-        let tmp = ckpt_dir.join(format!("{GRAPH_LABEL_CKPT_STATE}.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, GRAPH_LABEL_CKPT_STATE, &bytes)
             .map_err(|e| storage_err(&path, "publish state", &e))?;
 
         info!(

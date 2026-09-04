@@ -13,15 +13,22 @@
 //! enforced in one place. [`atomic_swap_dirs_fsync`] does the same for
 //! directory-level swaps (rename old-dir → backup, rename new-dir → old-dir).
 //!
-//! Path safety is split across two layers, and this module owns only the
-//! second one. A caller that joins a name from catalog, wire, or user input
-//! onto its base directory must first pass that name through
-//! [`nodedb_types::is_plain_path_component`]. That check answers "is this one
-//! ordinary name?" — it rejects a separator, a drive letter, a NUL, `.`, `..`,
-//! and a control character, so the join cannot reach outside the base. This
-//! module answers a different question: "do these already-joined paths sit in
-//! one directory that a single fsync covers?" It sees only the joined result,
-//! so it cannot recover the base and cannot substitute for the caller's check.
+//! Path safety lives here, and a caller cannot opt out of it. Both helpers take
+//! the base directory and the plain names separately and do every join
+//! themselves, so no caller hands this module a path it assembled. Each name
+//! passes [`nodedb_types::is_plain_path_component`], which rejects a separator,
+//! a drive letter, a NUL, `.`, `..`, a leading or trailing dot or space, and a
+//! control character. A name that fails is `InvalidInput` naming the argument,
+//! and nothing is written.
+//!
+//! The tmp name is derived from the destination name as `{name}.tmp`, inside
+//! this module, so the five naming conventions the call sites used are gone.
+//! The suffix is APPENDED rather than replacing the extension: `a.col` and
+//! `a.idx` keep distinct tmp names, where `set_extension("tmp")` collapses both
+//! onto `a.tmp` and lets two concurrent writers destroy each other's staging
+//! file. The tmp lands in the same directory as the destination, so one parent
+//! fsync covers both entries and the rename stays within one filesystem
+//! directory.
 //!
 //! [`read_checkpoint_dontneed`] pairs with the write helper on the read side:
 //! checkpoint bytes are consumed once (deserialized into the in-memory index)
@@ -30,7 +37,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use crate::error::{Result, WalError};
 
@@ -60,97 +67,83 @@ fn invalid_input(detail: String) -> WalError {
     ))
 }
 
-/// Reject a path that cannot be renamed within a single fsynced directory.
+/// Reject a name that is not one ordinary path component.
 ///
-/// A `..` component makes the final name resolve outside the directory this
-/// module fsyncs, so the durability ordering no longer covers the entry that
-/// was created, and a name assembled from catalog or wire input can address a
-/// directory the caller never intended to write. Both are rejected here.
-///
-/// This check runs on the joined path, so it cannot see the base the caller
-/// started from. A caller that joins an untrusted name must sanitize that name
-/// with [`nodedb_types::is_plain_path_component`] first.
-fn checked_parent<'a>(op: &str, label: &str, path: &'a Path) -> Result<&'a Path> {
-    if path.components().any(|c| c == Component::ParentDir) {
-        return Err(invalid_input(format!(
-            "{op}: {label} path contains a '..' component: {}",
-            path.display()
-        )));
+/// A name carrying a separator, a `..`, or a drive letter resolves outside the
+/// directory this module fsyncs, so the durability ordering no longer covers
+/// the entry that was created, and a name taken from catalog, wire, or user
+/// input can address a directory the caller never intended to write. Rejecting
+/// the name is what makes the join below safe, which is why the join happens
+/// here and not at the call site.
+fn checked_name(op: &str, label: &str, name: &str) -> Result<()> {
+    if nodedb_types::is_plain_path_component(name) {
+        return Ok(());
     }
-    if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
-        return Err(invalid_input(format!(
-            "{op}: {label} path does not end in a plain name: {}",
-            path.display()
-        )));
-    }
-    path.parent().ok_or_else(|| {
-        invalid_input(format!(
-            "{op}: {label} path has no parent directory: {}",
-            path.display()
-        ))
-    })
+    Err(invalid_input(format!(
+        "{op}: {label} must be one plain name — no separator, no '..', no drive \
+         letter, no leading or trailing dot or space: {name:?}"
+    )))
 }
 
-/// Check that `other` resolves in the same directory as `parent`.
+/// Derive the staging name for a destination name.
 ///
-/// `rename` is atomic only within one filesystem directory, and this module
-/// fsyncs exactly one parent, so a cross-directory pair would leave the new
-/// entry undurable even though every call returned `Ok`.
-fn same_parent(op: &str, label: &str, parent: &Path, other: &Path) -> Result<()> {
-    let other_parent = checked_parent(op, label, other)?;
-    if other_parent != parent {
-        return Err(invalid_input(format!(
-            "{op}: {label} ({}) is not in the fsynced directory {}",
-            other.display(),
-            parent.display()
-        )));
-    }
-    Ok(())
+/// The suffix is appended, never substituted for the extension, so two
+/// destinations in one directory can never share a tmp name.
+fn tmp_name(name: &str) -> String {
+    format!("{name}.tmp")
 }
 
-/// Atomically write `bytes` to `dst` via a `tmp` file with full durability.
+/// Atomically write `bytes` to `dir/name` via a `dir/name.tmp` staging file
+/// with full durability.
 ///
 /// Order of operations (must not change):
-/// 1. Create / truncate `tmp` and write `bytes`.
-/// 2. `sync_data()` on `tmp` — forces file data pages to stable storage.
+/// 1. Create / truncate the tmp file and write `bytes`.
+/// 2. `sync_data()` on the tmp file — forces file data pages to stable storage.
 /// 3. `rename(tmp, dst)` — atomic on POSIX filesystems.
-/// 4. `fsync_directory(parent)` — forces the directory entry durable so the
-///    new name survives power loss.
+/// 4. `fsync_directory(dir)` — forces the directory entry durable so the new
+///    name survives power loss.
 ///
-/// `tmp` and `dst` MUST be in the same directory; otherwise rename is not
-/// atomic and the parent fsync won't cover both entries. This is checked, not
-/// assumed: a mismatched pair, or either path containing a `..` component,
-/// returns `InvalidInput` before anything is written.
-pub fn atomic_write_fsync(tmp: &Path, dst: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = checked_parent("atomic_write_fsync", "dst", dst)?;
-    same_parent("atomic_write_fsync", "tmp", parent, tmp)?;
+/// `name` must be one plain path component; anything else returns
+/// `InvalidInput` before a byte is written. Both paths are built here from
+/// `dir`, so the rename stays inside one filesystem directory and the single
+/// parent fsync covers both entries.
+pub fn atomic_write_fsync(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    checked_name("atomic_write_fsync", "name", name)?;
+
+    let dst = dir.join(name);
+    let tmp = dir.join(tmp_name(name));
 
     {
-        let mut f = fs::File::create(tmp).map_err(WalError::Io)?;
+        let mut f = fs::File::create(&tmp).map_err(WalError::Io)?;
         f.write_all(bytes).map_err(WalError::Io)?;
         f.sync_data().map_err(WalError::Io)?;
     }
 
-    fs::rename(tmp, dst).map_err(WalError::Io)?;
-    fsync_directory(parent)?;
+    fs::rename(&tmp, &dst).map_err(WalError::Io)?;
+    fsync_directory(dir)?;
     Ok(())
 }
 
-/// Atomically swap a directory: `rename(live, backup); rename(staged, live)`,
-/// fsyncing the parent directory once both renames have completed.
+/// Atomically swap a directory under `parent`:
+/// `rename(live, backup); rename(staged, live)`, fsyncing `parent` once both
+/// renames have completed.
 ///
-/// `live`, `backup`, and `staged` MUST share the same parent directory; this
-/// is checked, and a path outside it or containing a `..` component returns
-/// `InvalidInput` before either rename runs. The caller is responsible for
-/// removing the backup directory once the new state is proven good — this
-/// helper does not delete anything.
-pub fn atomic_swap_dirs_fsync(live: &Path, backup: &Path, staged: &Path) -> Result<()> {
-    let parent = checked_parent("atomic_swap_dirs_fsync", "live", live)?;
-    same_parent("atomic_swap_dirs_fsync", "backup", parent, backup)?;
-    same_parent("atomic_swap_dirs_fsync", "staged", parent, staged)?;
+/// `live`, `backup`, and `staged` are plain names under one `parent`, so the
+/// renames are same-directory by construction. A name that is not one plain
+/// component returns `InvalidInput` before either rename runs. The caller
+/// removes the backup directory once the new state is proven good — this helper
+/// deletes nothing.
+pub fn atomic_swap_dirs_fsync(parent: &Path, live: &str, backup: &str, staged: &str) -> Result<()> {
+    checked_name("atomic_swap_dirs_fsync", "live", live)?;
+    checked_name("atomic_swap_dirs_fsync", "backup", backup)?;
+    checked_name("atomic_swap_dirs_fsync", "staged", staged)?;
 
-    fs::rename(live, backup).map_err(WalError::Io)?;
-    fs::rename(staged, live).map_err(WalError::Io)?;
+    let live = parent.join(live);
+    let backup = parent.join(backup);
+    let staged = parent.join(staged);
+
+    fs::rename(&live, &backup).map_err(WalError::Io)?;
+    fs::rename(&staged, &live).map_err(WalError::Io)?;
     fsync_directory(parent)?;
     Ok(())
 }
@@ -202,26 +195,45 @@ pub fn read_checkpoint_dontneed(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn is_invalid_input(err: &WalError) -> bool {
+        matches!(err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+    }
+
+    /// Names that `is_plain_path_component` refuses, one per rejection reason.
+    const BAD_NAMES: [&str; 5] = ["sub/escaped.ckpt", "..", "/etc/passwd", "C:evil", "."];
+
     #[test]
     fn atomic_write_fsync_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
-        atomic_write_fsync(&tmp, &dst, b"hello world").unwrap();
-        assert!(!tmp.exists(), "tmp must be renamed away");
-        assert_eq!(fs::read(&dst).unwrap(), b"hello world");
+        atomic_write_fsync(dir.path(), "payload.ckpt", b"hello world").unwrap();
+
+        assert!(
+            !dir.path().join("payload.ckpt.tmp").exists(),
+            "tmp must be renamed away"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("payload.ckpt")).unwrap(),
+            b"hello world"
+        );
     }
 
     #[test]
     fn atomic_write_fsync_overwrites() {
         let dir = tempfile::tempdir().unwrap();
-        let dst = dir.path().join("payload.ckpt");
-        let tmp = dir.path().join("payload.ckpt.tmp");
 
-        atomic_write_fsync(&tmp, &dst, b"v1").unwrap();
-        atomic_write_fsync(&tmp, &dst, b"v2").unwrap();
-        assert_eq!(fs::read(&dst).unwrap(), b"v2");
+        atomic_write_fsync(dir.path(), "payload.ckpt", b"v1").unwrap();
+        atomic_write_fsync(dir.path(), "payload.ckpt", b"v2").unwrap();
+
+        assert_eq!(fs::read(dir.path().join("payload.ckpt")).unwrap(), b"v2");
+    }
+
+    /// The tmp suffix is appended, so two destinations sharing a stem stage
+    /// under different names and cannot clobber each other.
+    #[test]
+    fn tmp_name_keeps_the_full_destination_name() {
+        assert_eq!(tmp_name("a.col"), "a.col.tmp");
+        assert_ne!(tmp_name("a.col"), tmp_name("a.idx"));
     }
 
     #[test]
@@ -236,68 +248,66 @@ mod tests {
         fs::create_dir(&staged).unwrap();
         fs::write(staged.join("marker"), b"new").unwrap();
 
-        atomic_swap_dirs_fsync(&live, &backup, &staged).unwrap();
+        atomic_swap_dirs_fsync(dir.path(), "live", "backup", "staged").unwrap();
 
         assert_eq!(fs::read(live.join("marker")).unwrap(), b"new");
         assert_eq!(fs::read(backup.join("marker")).unwrap(), b"old");
         assert!(!staged.exists());
     }
 
+    /// Every rejection reason, checked on the one name argument the write
+    /// helper takes. Without the check each of these escapes `dir`.
     #[test]
-    fn atomic_write_fsync_rejects_cross_directory_tmp() {
+    fn atomic_write_fsync_rejects_a_name_that_is_not_one_component() {
         let dir = tempfile::tempdir().unwrap();
-        let other = dir.path().join("other");
-        fs::create_dir(&other).unwrap();
-        let dst = dir.path().join("payload.ckpt");
-        let tmp = other.join("payload.ckpt.tmp");
+        fs::create_dir(dir.path().join("sub")).unwrap();
 
-        let err = atomic_write_fsync(&tmp, &dst, b"x").unwrap_err();
+        for name in BAD_NAMES {
+            let err = atomic_write_fsync(dir.path(), name, b"x").unwrap_err();
+            assert!(
+                is_invalid_input(&err),
+                "{name:?} must be InvalidInput, got {err:?}"
+            );
+        }
+
         assert!(
-            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
-            "cross-directory tmp must be InvalidInput, got {err:?}"
+            fs::read_dir(dir.path().join("sub"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "nothing may be written before the check"
         );
-        assert!(!dst.exists(), "nothing may be written before the check");
-        assert!(!tmp.exists());
     }
 
+    /// The same rejection, exercised through each of the three name arguments
+    /// of the swap helper: a check present on only one of them leaves the other
+    /// two able to rename outside the fsynced directory.
     #[test]
-    fn atomic_write_fsync_rejects_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let dst = dir.path().join("sub").join("..").join("escaped.ckpt");
-        let tmp = dir.path().join("sub").join("..").join("escaped.ckpt.tmp");
+    fn atomic_swap_dirs_fsync_rejects_a_bad_name_in_each_position() {
+        for position in 0..3 {
+            for name in BAD_NAMES {
+                let dir = tempfile::tempdir().unwrap();
+                let live = dir.path().join("live");
+                fs::create_dir(&live).unwrap();
+                fs::write(live.join("marker"), b"old").unwrap();
+                fs::create_dir(dir.path().join("staged")).unwrap();
 
-        let err = atomic_write_fsync(&tmp, &dst, b"x").unwrap_err();
-        assert!(
-            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
-            "a `..` component must be InvalidInput, got {err:?}"
-        );
-        assert!(!dir.path().join("escaped.ckpt").exists());
-    }
+                let mut names = ["live", "backup", "staged"];
+                names[position] = name;
+                let err =
+                    atomic_swap_dirs_fsync(dir.path(), names[0], names[1], names[2]).unwrap_err();
 
-    #[test]
-    fn atomic_swap_dirs_fsync_rejects_cross_directory_member() {
-        let dir = tempfile::tempdir().unwrap();
-        let other = dir.path().join("other");
-        fs::create_dir(&other).unwrap();
-        let live = dir.path().join("live");
-        let staged = dir.path().join("staged");
-        fs::create_dir(&live).unwrap();
-        fs::write(live.join("marker"), b"old").unwrap();
-        fs::create_dir(&staged).unwrap();
-
-        // `backup` outside the fsynced directory: the rename would not be
-        // covered by the single parent fsync this helper performs.
-        let backup = other.join("backup");
-        let err = atomic_swap_dirs_fsync(&live, &backup, &staged).unwrap_err();
-        assert!(
-            matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
-            "cross-directory backup must be InvalidInput, got {err:?}"
-        );
-        assert_eq!(
-            fs::read(live.join("marker")).unwrap(),
-            b"old",
-            "live must be untouched when the check fails"
-        );
+                assert!(
+                    is_invalid_input(&err),
+                    "{name:?} at position {position} must be InvalidInput, got {err:?}"
+                );
+                assert_eq!(
+                    fs::read(live.join("marker")).unwrap(),
+                    b"old",
+                    "live must be untouched when the check fails"
+                );
+            }
+        }
     }
 
     #[test]

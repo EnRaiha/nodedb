@@ -99,10 +99,8 @@ impl CoreLoop {
             // document the deletes removed.
             let bytes = index.checkpoint_to_bytes()?;
             let stem = sparse_vector_checkpoint_stem(db.as_u64(), tid.as_u64(), coll, field);
-            let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes).map_err(
-                |e| crate::Error::Storage {
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &format!("{stem}.ckpt"), &bytes)
+                .map_err(|e| crate::Error::Storage {
                     engine: "sparse_vector".to_string(),
                     detail: format!(
                         "sparse-vector checkpoint write failed for database {} tenant {} \
@@ -110,8 +108,7 @@ impl CoreLoop {
                         db.as_u64(),
                         tid.as_u64()
                     ),
-                },
-            )?;
+                })?;
             written += 1;
         }
         Ok(written)
@@ -141,8 +138,7 @@ impl CoreLoop {
                 detail: format!("sparse-vector checkpoint manifest encode failed: {e}"),
             })?;
         let path = ckpt_dir.join(SPARSE_VECTOR_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join(format!("{SPARSE_VECTOR_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, SPARSE_VECTOR_CKPT_MANIFEST, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

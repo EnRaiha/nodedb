@@ -254,7 +254,7 @@ impl CoreLoop {
         }
 
         // Trigger segment seal if needed.
-        let seal_key = CoreLoop::vector_checkpoint_filename(&index_key);
+        let seal_key = CoreLoop::vector_build_key(&index_key);
         let coll = self
             .vector_collections
             .get_mut(&index_key)

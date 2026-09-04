@@ -210,10 +210,16 @@ fn rewrite_segment(store: &mut ArrayStore, action: &SegmentPurgeAction) -> Resul
             new_max_tile,
         } => {
             let new_seg_id = store.allocate_segment_id();
-            let new_seg_path = store.root().join(&new_seg_id);
-            write_atomic(&new_seg_path, &new_bytes).map_err(|e| ArrayError::SegmentCorruption {
-                detail: format!("purge: write segment {:?}: {e}", new_seg_path),
-            })?;
+            let root = store.root().to_path_buf();
+            // The shared WAL helper, as the flush and compaction paths use:
+            // purge unlinks the source segment once the manifest names this
+            // file, so a rename that reaches disk ahead of the data pages would
+            // leave the surviving tiles with no other copy.
+            nodedb_wal::segment::atomic_write_fsync(&root, &new_seg_id, &new_bytes).map_err(
+                |e| ArrayError::SegmentCorruption {
+                    detail: format!("purge: write segment {:?}: {e}", root.join(&new_seg_id)),
+                },
+            )?;
 
             let new_ref = SegmentRef {
                 id: new_seg_id,
@@ -259,25 +265,6 @@ fn remove_segment(store: &mut ArrayStore, seg_ref: &SegmentRef) -> Result<(), Ar
 fn update_bounds(min: &mut Option<TileId>, max: &mut Option<TileId>, id: TileId) {
     *min = Some(min.map_or(id, |m| m.min(id)));
     *max = Some(max.map_or(id, |m| m.max(id)));
-}
-
-/// Write a rewritten segment durably: data fsynced before the rename, parent
-/// directory fsynced after it.
-///
-/// Routed through `nodedb_wal::segment::atomic_write_fsync` — the same helper
-/// the flush and compaction paths use — so the ordering cannot drift between
-/// call sites and a failed directory fsync is reported instead of swallowed.
-/// Purge unlinks the source segment once the manifest names this file, so a
-/// rename that reaches disk ahead of the data pages would leave the surviving
-/// tiles with no other copy.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
-    let mut tmp = path.to_path_buf();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    tmp.set_extension(format!("{ext}.tmp"));
-    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -114,21 +114,22 @@ impl CoreLoop {
             if collection.is_empty() {
                 continue;
             }
-            // Checkpoint filename is `"{db}:{tid}:{coll}"`.
-            let filename = CoreLoop::vector_checkpoint_filename(key);
+            let build_key = CoreLoop::vector_build_key(key);
             let bytes = collection
                 .checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref())
                 .map_err(|e| crate::Error::Serialization {
                     format: "msgpack".to_string(),
                     detail: format!(
-                        "vector checkpoint encode failed for {filename} ({} vectors): {e}",
+                        "vector checkpoint encode failed for {build_key} ({} vectors): {e}",
                         collection.len()
                     ),
                 })?;
-            let ckpt_path = gen_dir.join(format!("{filename}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{filename}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
-                .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
+            let filename = format!(
+                "{}.ckpt",
+                super::paths::vector_ckpt_stem(key.0.as_u64(), key.1.as_u64(), &key.2)
+            );
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &filename, &bytes)
+                .map_err(|e| storage_err(&gen_dir.join(&filename), "publish checkpoint", &e))?;
             files_written += 1;
         }
         Ok(files_written)

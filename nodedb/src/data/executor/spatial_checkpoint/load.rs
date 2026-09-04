@@ -156,9 +156,8 @@ mod tests {
         std::fs::create_dir_all(&gen_dir).expect("create gen dir");
         write_files(&gen_dir);
         let bytes = test_manifest_bytes(0);
-        let path = ckpt_dir.join(SPATIAL_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join("m.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write manifest");
+        nodedb_wal::segment::write_checkpoint_framed(ckpt_dir, SPATIAL_CKPT_MANIFEST, &bytes)
+            .expect("write manifest");
     }
 
     fn one_entry_rtree_bytes() -> Vec<u8> {
@@ -236,9 +235,7 @@ mod tests {
         let stem = checkpoint_stem(DatabaseId::new(0), TenantId::new(7), "pts", "geom");
         publish(&ckpt_dir, |gen_dir| {
             let bytes = one_entry_rtree_bytes();
-            let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &format!("{stem}.ckpt"), &bytes)
                 .expect("publish checkpoint");
             // Deliberately do NOT write the `.docmap` companion.
         });
@@ -260,15 +257,15 @@ mod tests {
         let stem = checkpoint_stem(DatabaseId::new(0), TenantId::new(7), "pts", "geom");
         publish(&ckpt_dir, |gen_dir| {
             let bytes = one_entry_rtree_bytes();
-            let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &format!("{stem}.ckpt"), &bytes)
                 .expect("publish checkpoint");
             // Frame is valid, but the payload is not MessagePack.
-            let map_path = gen_dir.join(format!("{stem}.docmap"));
-            let map_tmp = gen_dir.join(format!("{stem}.docmap.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, b"not msgpack")
-                .expect("publish garbage docmap");
+            nodedb_wal::segment::write_checkpoint_framed(
+                gen_dir,
+                &format!("{stem}.docmap"),
+                b"not msgpack",
+            )
+            .expect("publish garbage docmap");
         });
         drop(core);
 
@@ -309,9 +306,8 @@ mod tests {
             durable_through_lsn: 5,
         })
         .expect("encode");
-        let path = ckpt_dir.join(SPATIAL_CKPT_MANIFEST);
-        let tmp = ckpt_dir.join("m.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, SPATIAL_CKPT_MANIFEST, &bytes)
+            .expect("write");
         drop(core);
 
         let mut restored = open_core_at(dir.path());
@@ -332,17 +328,17 @@ mod tests {
         let stem = checkpoint_stem(db, tid, "pts", "geom");
         publish(&ckpt_dir, |gen_dir| {
             let bytes = one_entry_rtree_bytes();
-            let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
-            let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            nodedb_wal::segment::write_checkpoint_framed(gen_dir, &format!("{stem}.ckpt"), &bytes)
                 .expect("publish checkpoint");
 
             let doc_entries: Vec<(u64, String)> = vec![(1, "doc-1".to_string())];
             let map_bytes = zerompk::to_msgpack_vec(&doc_entries).expect("encode docmap");
-            let map_path = gen_dir.join(format!("{stem}.docmap"));
-            let map_tmp = gen_dir.join(format!("{stem}.docmap.tmp"));
-            nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, &map_bytes)
-                .expect("publish docmap");
+            nodedb_wal::segment::write_checkpoint_framed(
+                gen_dir,
+                &format!("{stem}.docmap"),
+                &map_bytes,
+            )
+            .expect("publish docmap");
         });
         drop(core);
 

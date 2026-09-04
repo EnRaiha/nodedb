@@ -115,24 +115,22 @@ pub fn rewrite_partitions(
                     &format!("{dir_name}.rewrite"),
                 ) {
                     Ok(result) => {
-                        let rewrite_dir = ts_base.join(format!("{dir_name}.rewrite"));
-                        let backup_dir = ts_base.join(format!("{dir_name}.old"));
+                        let backup_name = format!("{dir_name}.old");
                         if nodedb_wal::segment::atomic_swap_dirs_fsync(
-                            &partition_dir,
-                            &backup_dir,
-                            &rewrite_dir,
+                            &ts_base,
+                            dir_name,
+                            &backup_name,
+                            &format!("{dir_name}.rewrite"),
                         )
                         .is_ok()
                         {
-                            let _ = std::fs::remove_dir_all(&backup_dir);
+                            let _ = std::fs::remove_dir_all(ts_base.join(&backup_name));
                             // Write updated metadata to partition.meta (on-disk source of truth).
-                            let meta_path = partition_dir.join("partition.meta");
-                            let meta_tmp = partition_dir.join("partition.meta.tmp");
                             let meta_bytes =
                                 sonic_rs::to_vec_pretty(&result.meta).unwrap_or_default();
                             let _ = nodedb_wal::segment::atomic_write_fsync(
-                                &meta_tmp,
-                                &meta_path,
+                                &partition_dir,
+                                "partition.meta",
                                 &meta_bytes,
                             );
                             rewritten += 1;

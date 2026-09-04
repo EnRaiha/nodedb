@@ -159,9 +159,8 @@ mod tests {
             std::fs::write(gen_dir.join(name), bytes).expect("write");
         }
         let manifest = test_manifest_bytes(generation);
-        let path = ckpt_dir.join("MANIFEST");
-        let tmp = ckpt_dir.join("MANIFEST.tmp");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &manifest).expect("manifest");
+        nodedb_wal::segment::write_checkpoint_framed(&ckpt_dir, "MANIFEST", &manifest)
+            .expect("manifest");
     }
 
     fn gen_dir_of(data_dir: &Path, core_id: usize, generation: u64) -> std::path::PathBuf {

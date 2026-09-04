@@ -157,9 +157,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let stem = sparse_vector_checkpoint_stem(0, 7, "docs", "emb");
         let path = tmp.path().join(format!("{stem}.ckpt"));
-        let tmp_path = tmp.path().join(format!("{stem}.ckpt.tmp"));
         let bytes = index.checkpoint_to_bytes().expect("encode");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(tmp.path(), &format!("{stem}.ckpt"), &bytes)
+            .expect("write");
 
         let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
         let restored = SparseInvertedIndex::from_checkpoint(&read_back).expect("decode");
@@ -210,10 +210,13 @@ mod tests {
             durable_through_lsn: 8_128,
         };
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join(SPARSE_VECTOR_CKPT_MANIFEST);
-        let tmp_path = tmp.path().join("m.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(
+            tmp.path(),
+            SPARSE_VECTOR_CKPT_MANIFEST,
+            &bytes,
+        )
+        .expect("write");
 
         let decoded = read_sparse_vector_manifest_at(tmp.path(), 0)
             .expect("manifest must read")
@@ -239,10 +242,13 @@ mod tests {
             durable_through_lsn: 5,
         };
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join(SPARSE_VECTOR_CKPT_MANIFEST);
-        let tmp_path = tmp.path().join("m.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(
+            tmp.path(),
+            SPARSE_VECTOR_CKPT_MANIFEST,
+            &bytes,
+        )
+        .expect("write");
 
         read_sparse_vector_manifest_at(tmp.path(), 0)
             .expect_err("a manifest this build cannot read must fail the load, not gate nothing");
