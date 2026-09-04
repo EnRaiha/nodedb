@@ -34,6 +34,13 @@ pub enum CustomTypeDef {
     Composite { fields: Vec<CompositeField> },
 }
 
+/// The `oid` a record carries before the catalog assigns one.
+///
+/// A proposed `CREATE TYPE` record uses this. No node can pick the real value:
+/// a concurrent statement on another node reaches the log first as often as
+/// not, and two types must never share one OID.
+pub const UNASSIGNED_OID: u32 = 0;
+
 /// Persisted custom type record.
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
@@ -43,17 +50,28 @@ pub struct StoredCustomType {
     pub tenant_id: u64,
     pub name: String,
     pub def: CustomTypeDef,
-    /// Stable u32 OID assigned at creation time. Persisted so the same OID
-    /// is always returned to pgwire clients, even after restart.
+    /// Stable u32 OID assigned at creation time by
+    /// `SystemCatalog::put_custom_type_assigning_oid`. Persisted so the same
+    /// OID is always returned to pgwire clients, even after restart.
+    ///
+    /// A record on its way to that method carries [`UNASSIGNED_OID`], and the
+    /// value it carries is ignored. Only a record read back from the catalog
+    /// holds the assigned OID.
     pub oid: u32,
     pub created_at: u64,
 }
 
 impl SystemCatalog {
-    /// Store a custom type. Overwrites any existing type with the same name.
+    /// Store a custom type verbatim, OID included. Overwrites any existing
+    /// type with the same name.
     ///
     /// The key comes from the entry, so the row can never land under a
     /// database the entry does not name.
+    ///
+    /// Use this only where the OID is already decided, such as restoring a
+    /// backup. A `CREATE TYPE` goes through
+    /// [`Self::put_custom_type_assigning_oid`], which is the only writer that
+    /// keeps two types from sharing one OID.
     pub fn put_custom_type(&self, def: &StoredCustomType) -> crate::Result<()> {
         let key = custom_type_key(def.database_id, def.tenant_id, &def.name);
         let bytes =
@@ -193,7 +211,7 @@ impl SystemCatalog {
     }
 }
 
-fn custom_type_key(database_id: u64, tenant_id: u64, name: &str) -> String {
+pub(super) fn custom_type_key(database_id: u64, tenant_id: u64, name: &str) -> String {
     format!("{database_id}:{tenant_id}:{name}")
 }
 

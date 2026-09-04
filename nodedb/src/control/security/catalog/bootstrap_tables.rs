@@ -107,6 +107,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "sequence_state" => SEQUENCE_STATE,
     "synonym_groups" => SYNONYM_GROUPS,
     "custom_types" => CUSTOM_TYPES,
+    "custom_type_oid_hwm" => super::custom_type_oid_hwm::CUSTOM_TYPE_OID_HWM,
     "wasm_modules" => WASM_MODULES,
     "rls_policies" => super::rls::RLS_POLICIES,
     "redaction_policies" => super::redaction::REDACTION_POLICIES,

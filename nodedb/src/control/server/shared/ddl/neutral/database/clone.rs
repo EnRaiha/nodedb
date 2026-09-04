@@ -15,14 +15,15 @@ use nodedb_sql::ddl_ast::CloneAsOf;
 use nodedb_types::{DatabaseId, MAX_CLONE_DEPTH};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
+use crate::control::catalog_entry::post_apply::custom_type::register_written;
 use crate::control::clone::catalog_copy::copy_database_metadata;
 use crate::control::clone::lsn_resolve::wall_ms_to_lsn;
 use crate::control::metadata_proposer::propose_catalog_entry;
-use crate::control::security::catalog::StoredOwner;
 use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::database_types::{
     DatabaseDescriptor, DatabaseStatus, ParentCloneRef,
 };
+use crate::control::security::catalog::{StoredOwner, UNASSIGNED_OID};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
@@ -356,8 +357,10 @@ async fn copy_synonym_groups(
 
 /// Propose one `PutCustomType` per source type, rewritten to the target.
 ///
-/// The copy keeps the source OID. Every node applies the entry verbatim, so
-/// re-allocating here would hand each node a different OID for one type.
+/// The copy drops the source OID. A shared OID holds only while both
+/// definitions match, and `ALTER TYPE ADD VALUE` on either side then leaves
+/// two definitions under one identity. The catalog assigns each copy a fresh
+/// OID when the entry applies, identically on every node.
 ///
 /// A failed propose is fatal: the clone would resolve neither a copied
 /// descriptor's typed column nor the OID a pgwire client reads back.
@@ -378,6 +381,7 @@ fn copy_custom_types(
 
     for mut custom_type in types {
         custom_type.database_id = target.as_u64();
+        custom_type.oid = UNASSIGNED_OID;
         let entry = CatalogEntry::PutCustomType(Box::new(custom_type.clone()));
         let outcome = propose_and_apply(state, &entry).map_err(|e| {
             ddl_err(
@@ -389,7 +393,12 @@ fn copy_custom_types(
             )
         })?;
         if outcome.needs_local_apply() {
-            state.custom_type_registry.register(custom_type);
+            register_written(
+                custom_type.database_id,
+                custom_type.tenant_id,
+                &custom_type.name,
+                state,
+            );
         }
     }
     Ok(())

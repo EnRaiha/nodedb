@@ -8,9 +8,9 @@
 //! - `ALTER TYPE <name> ADD VALUE 'label'`
 //! - `SHOW TYPES`
 //!
-//! Each handler runs the existence pre-check, OID allocation, the
-//! drop-protection scan, the catalog propose + fallback apply, and the
-//! in-memory registry register/unregister.
+//! Each handler runs the existence pre-check, the drop-protection scan, the
+//! catalog propose + fallback apply, and the in-memory registry
+//! register/unregister.
 //!
 //! A custom type belongs to one database and one tenant. Every check and
 //! every write carries the session's `database_id`, matching the catalog key.
@@ -18,12 +18,19 @@
 //! type. Each type receives a stable u32 OID from the high-numbered range
 //! (70000+) so pgwire clients see a recognisable type. The OID counter spans
 //! every database: a client reads an OID as the identity of one type.
+//!
+//! No handler picks an OID. A `CREATE TYPE` proposes a record whose `oid` is
+//! `0`, and the catalog assigns the value when the entry applies — on every
+//! node, in one log order. Two nodes handling concurrent statements therefore
+//! never hand one identity to two types.
 
 use nodedb_types::DatabaseId;
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::control::security::catalog::{CompositeField, CustomTypeDef, StoredCustomType};
+use crate::control::security::catalog::{
+    CompositeField, CustomTypeDef, StoredCustomType, UNASSIGNED_OID,
+};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -78,7 +85,6 @@ pub fn create_enum_type(
         return Err(err("42710", &format!("type '{name}' already exists")));
     }
 
-    let oid = state.custom_type_registry.alloc_oid();
     let created_at = current_epoch_secs()?;
     let stored = StoredCustomType {
         database_id: database_id_u64,
@@ -87,7 +93,7 @@ pub fn create_enum_type(
         def: CustomTypeDef::Enum {
             labels: labels.to_vec(),
         },
-        oid,
+        oid: UNASSIGNED_OID,
         created_at,
     };
 
@@ -115,7 +121,6 @@ pub fn create_composite_type(
         return Err(err("42710", &format!("type '{name}' already exists")));
     }
 
-    let oid = state.custom_type_registry.alloc_oid();
     let created_at = current_epoch_secs()?;
     let composite_fields: Vec<CompositeField> = fields
         .iter()
@@ -131,7 +136,7 @@ pub fn create_composite_type(
         def: CustomTypeDef::Composite {
             fields: composite_fields,
         },
-        oid,
+        oid: UNASSIGNED_OID,
         created_at,
     };
 
@@ -279,6 +284,11 @@ pub fn show_types(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Persist the entry to catalog and register in the in-memory registry.
+///
+/// The registry takes the record the catalog wrote, never `stored`: the
+/// catalog assigns the OID and `stored` does not carry it. On the replicated
+/// path the post-apply lane registers the written record on every node, this
+/// one included, so the handler registers nothing.
 fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result<(), DdlError> {
     let catalog = state.credentials.catalog();
 
@@ -287,12 +297,12 @@ fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", &format!("metadata propose: {e}")))?;
     if outcome.needs_local_apply() {
-        catalog
-            .put_custom_type(&stored)
+        let written = catalog
+            .put_custom_type_assigning_oid(&stored)
             .map_err(|e| err("XX000", &format!("catalog write: {e}")))?;
+        state.custom_type_registry.register(written);
     }
 
-    state.custom_type_registry.register(stored);
     Ok(())
 }
 

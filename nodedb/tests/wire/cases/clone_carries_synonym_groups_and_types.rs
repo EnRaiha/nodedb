@@ -24,6 +24,99 @@ fn row_values(msgs: &[tokio_postgres::SimpleQueryMessage], column: usize) -> Vec
         .collect()
 }
 
+/// The OID `SHOW TYPES` reports for `name`, or `None` when it lists no such
+/// type.
+fn shown_oid(msgs: &[tokio_postgres::SimpleQueryMessage], name: &str) -> Option<u32> {
+    msgs.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some(name) => {
+            row.get(3).and_then(|v| v.parse::<u32>().ok())
+        }
+        _ => None,
+    })
+}
+
+/// A clone's type and its source's type are two types: either side can run
+/// `ALTER TYPE ADD VALUE` and leave the definitions different. A pgwire client
+/// reads the OID as the identity of one type, so the copy takes a fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloned_custom_type_takes_an_oid_of_its_own() {
+    let server = TestServer::start().await;
+    let client = &*server.client;
+
+    client
+        .simple_query("CREATE DATABASE oid_clone_src")
+        .await
+        .expect("CREATE DATABASE oid_clone_src");
+    client
+        .simple_query("USE DATABASE oid_clone_src")
+        .await
+        .expect("USE oid_clone_src");
+    client
+        .simple_query("CREATE TYPE shade AS ENUM ('red', 'blue')")
+        .await
+        .expect("CREATE TYPE shade");
+
+    let source_types = client
+        .simple_query("SHOW TYPES")
+        .await
+        .expect("SHOW TYPES in the source");
+    let source_oid = shown_oid(&source_types, "shade").expect("the source lists shade");
+
+    client
+        .simple_query("USE DATABASE default")
+        .await
+        .expect("USE default");
+    client
+        .simple_query("CLONE DATABASE oid_clone_dst FROM oid_clone_src")
+        .await
+        .expect("CLONE DATABASE oid_clone_dst");
+    client
+        .simple_query("USE DATABASE oid_clone_dst")
+        .await
+        .expect("USE oid_clone_dst");
+
+    let clone_types = client
+        .simple_query("SHOW TYPES")
+        .await
+        .expect("SHOW TYPES in the clone");
+    let clone_oid = shown_oid(&clone_types, "shade").expect("the clone lists shade");
+
+    assert_ne!(
+        source_oid, clone_oid,
+        "the clone's type and the source's type must not share one identity"
+    );
+    assert!(clone_oid >= 70_000, "the OID must clear the built-in range");
+
+    // Both stay resolvable: each database's enum still validates its labels.
+    client
+        .simple_query(
+            "CREATE COLLECTION clone_paint (id TEXT, tone shade) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("CREATE COLLECTION clone_paint in the clone");
+
+    client
+        .simple_query("USE DATABASE oid_clone_src")
+        .await
+        .expect("USE oid_clone_src");
+    client
+        .simple_query(
+            "CREATE COLLECTION src_paint (id TEXT, tone shade) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("CREATE COLLECTION src_paint in the source");
+
+    let still_source = client
+        .simple_query("SHOW TYPES")
+        .await
+        .expect("SHOW TYPES in the source again");
+    assert_eq!(
+        shown_oid(&still_source, "shade"),
+        Some(source_oid),
+        "the source keeps the OID its clients already read"
+    );
+}
+
 /// The clone lists the source's group and type, and its own FTS backend
 /// expands the copied group over rows written into the clone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

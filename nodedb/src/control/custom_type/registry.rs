@@ -4,54 +4,40 @@
 //!
 //! Loaded from the system catalog on startup. Updated by DDL handlers.
 //! The registry is the single source of truth for duplicate detection,
-//! SHOW TYPES queries, OID assignment, and drop-protection checks.
+//! SHOW TYPES queries, and drop-protection checks.
 //!
 //! Entries key on `(database_id, tenant_id, type_name)`, matching the catalog
 //! row. One tenant can hold the same type name in two databases.
+//!
+//! The registry holds no OID counter. A pgwire client reads an OID as the
+//! identity of one type, so a per-process counter hands two nodes the same
+//! value for two distinct types. OIDs come from the durable counter in
+//! [`crate::control::security::catalog::custom_type_oid_hwm`], which every
+//! node advances from the same applied catalog entry.
 
 use std::collections::HashMap;
-use std::sync::{
-    RwLock,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::RwLock;
 
 use crate::control::security::catalog::{CustomTypeDef, StoredCustomType};
-
-/// Base OID for user-defined types. PG built-in OIDs end well below 10000;
-/// extension OIDs typically start at 16384. We use 70000+ to leave room.
-const USER_TYPE_OID_BASE: u32 = 70_000;
 
 /// In-memory custom type registry.
 pub struct CustomTypeRegistry {
     /// `(database_id, tenant_id, type_name)` → `StoredCustomType`.
     by_name: RwLock<HashMap<(u64, u64, String), StoredCustomType>>,
-    /// Next OID to assign. Starts at `USER_TYPE_OID_BASE + 1` and increments.
-    next_oid: AtomicU32,
 }
 
 impl CustomTypeRegistry {
     pub fn new() -> Self {
         Self {
             by_name: RwLock::new(HashMap::new()),
-            next_oid: AtomicU32::new(USER_TYPE_OID_BASE + 1),
         }
     }
 
-    /// Allocate the next available OID. The value is stable for the lifetime
-    /// of this process but is NOT persisted here — the DDL handler persists
-    /// the chosen OID inside `StoredCustomType` before writing to the catalog.
+    /// Insert or replace a type in the registry.
     ///
-    /// The counter spans every database. A pgwire client reads an OID as the
-    /// identity of one type, so two distinct types must never share one.
-    pub fn alloc_oid(&self) -> u32 {
-        self.next_oid.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Insert or replace a type in the registry. Also advances `next_oid`
-    /// past the stored OID to avoid collisions after restart-reload.
+    /// `def` must be the record the catalog wrote, not the one a handler
+    /// proposed: only the catalog knows the assigned OID.
     pub fn register(&self, def: StoredCustomType) {
-        let next = def.oid.saturating_add(1);
-        self.next_oid.fetch_max(next, Ordering::Relaxed);
         let key = (def.database_id, def.tenant_id, def.name.clone());
         let mut map = self.by_name.write().unwrap_or_else(|p| p.into_inner());
         map.insert(key, def);
@@ -128,8 +114,6 @@ impl CustomTypeRegistry {
         let mut map = self.by_name.write().unwrap_or_else(|p| p.into_inner());
         map.clear();
         for t in fresh {
-            let next = t.oid.saturating_add(1);
-            self.next_oid.fetch_max(next, Ordering::Relaxed);
             let key = (t.database_id, t.tenant_id, t.name.clone());
             map.insert(key, t);
         }
@@ -205,11 +189,16 @@ mod tests {
         assert!(reg.validate_enum_label(2, 7, "state", "live").is_ok());
     }
 
+    /// The registry mirrors what the catalog wrote. A re-register under one
+    /// key replaces the entry and keeps the OID the catalog assigned.
     #[test]
-    fn alloc_oid_never_repeats_across_databases() {
+    fn a_re_register_keeps_the_catalogs_oid() {
         let reg = CustomTypeRegistry::new();
-        let first = reg.alloc_oid();
-        let second = reg.alloc_oid();
-        assert_ne!(first, second);
+        reg.register(enum_type(1, 7, "state", "draft", 70011));
+        reg.register(enum_type(1, 7, "state", "live", 70011));
+
+        assert_eq!(reg.oid_for(1, 7, "state"), Some(70011));
+        assert_eq!(reg.list_for_tenant(1, 7).len(), 1);
+        assert!(reg.validate_enum_label(1, 7, "state", "live").is_ok());
     }
 }

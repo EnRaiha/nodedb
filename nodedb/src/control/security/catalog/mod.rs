@@ -20,6 +20,7 @@ pub mod constraint_translate;
 pub mod consumer_groups;
 pub mod continuous_aggregate;
 pub mod continuous_aggregates;
+pub mod custom_type_oid_hwm;
 pub mod custom_types;
 pub mod database;
 pub mod database_grants;
@@ -83,7 +84,8 @@ pub use collection_constraints::{
 };
 pub use collections::merge_inferred_fields;
 pub use constraint_translate::collection_constraints;
-pub use custom_types::{CompositeField, CustomTypeDef, StoredCustomType};
+pub use custom_type_oid_hwm::USER_TYPE_OID_BASE;
+pub use custom_types::{CompositeField, CustomTypeDef, StoredCustomType, UNASSIGNED_OID};
 pub use database_grants::DatabaseGrant;
 pub use database_quotas::GlobalQuotaCeiling;
 pub use database_types::{DatabaseDescriptor, DatabaseStatus, ParentCloneRef};
