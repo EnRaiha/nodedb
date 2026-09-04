@@ -71,28 +71,53 @@ pub fn expr_as_usize_literal(expr: &ast::Expr) -> Option<usize> {
 /// [`SqlError::InvalidLimitValue`] instead of collapsing to `None`
 /// (unbounded). Everything else behaves exactly like
 /// [`expr_as_usize_literal`].
+/// Fallible LIMIT/OFFSET resolution.
+///
+/// Rejects statically-negative bounds with [`SqlError::InvalidLimitValue`]:
+/// - `LIMIT -1` / `OFFSET -2` (`Expr::UnaryOp(Minus)` over a numeric literal)
+/// - `LIMIT '-1'` (UNKNOWN-param / string literal carrying a minus sign)
+/// - `LIMIT - '-1'` (unary minus over a string literal)
+///
+/// Non-literal operands (`LIMIT -$1`, `LIMIT -col`) stay uncoerced: their
+/// sign is unknowable at plan time, so they keep the documented pre-existing
+/// behavior of any non-literal bound (`None` = no static limit). This matches
+/// the docstring contract of [`expr_as_usize_literal`]: only literals are
+/// resolved; everything else is the caller's semantic.
 pub fn expr_as_nonnegative_usize(
     expr: &ast::Expr,
     clause: &'static str,
 ) -> Result<Option<usize>, SqlError> {
-    if matches!(
-        expr,
-        ast::Expr::UnaryOp {
-            op: ast::UnaryOperator::Minus,
-            ..
+    let reject_negative = |v: &ast::Value| match v {
+        ast::Value::SingleQuotedString(s) => s.trim_start().starts_with('-'),
+        ast::Value::Number(n, _) => n.trim_start().starts_with('-'),
+        _ => false,
+    };
+
+    if let ast::Expr::UnaryOp {
+        op: ast::UnaryOperator::Minus,
+        expr: inner,
+    } = expr
+    {
+        // Unary minus over ANY literal operand is statically negative
+        // (-5, -'5', - '-5'): the operand's own sign is irrelevant, the
+        // negation is. Reject all literal operands...
+        if matches!(
+            inner.as_ref(),
+            ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::Number(..), .. })
+                | ast::Expr::Value(ast::ValueWithSpan {
+                    value: ast::Value::SingleQuotedString(..),
+                    ..
+                })
+        ) {
+            return Err(SqlError::InvalidLimitValue {
+                detail: format!("{clause} must not be negative"),
+            });
         }
-    ) {
-        return Err(SqlError::InvalidLimitValue {
-            detail: format!("{clause} must not be negative"),
-        });
+        // Non-literal operand ($1, col): sign unknowable at plan time →
+        // unchanged "non-literal bound" semantics (None → unbounded).
     }
     if let ast::Expr::Value(v) = expr {
-        let is_negative = match &v.value {
-            ast::Value::SingleQuotedString(s) => s.trim_start().starts_with('-'),
-            ast::Value::Number(n, _) => n.trim_start().starts_with('-'),
-            _ => false,
-        };
-        if is_negative {
+        if reject_negative(&v.value) {
             return Err(SqlError::InvalidLimitValue {
                 detail: format!("{clause} must not be negative"),
             });
@@ -291,5 +316,41 @@ mod tests {
             panic!("expected LIMIT clause");
         };
         assert_eq!(expr_as_nonnegative_usize(expr, "LIMIT").unwrap(), Some(10));
+
+        // UNKNOWN-param negative text must also be rejected, not unbounded.
+        assert!(matches!(
+            expr_as_nonnegative_usize(
+                &ast::Expr::Value(ast::ValueWithSpan::from(ast::Value::SingleQuotedString(
+                    "-1".into()
+                ))),
+                "LIMIT"
+            ),
+            Err(SqlError::InvalidLimitValue { .. })
+        ));
+        // Unary minus over a string literal.
+        assert!(matches!(
+            expr_as_nonnegative_usize(
+                &ast::Expr::UnaryOp {
+                    op: ast::UnaryOperator::Minus,
+                    expr: Box::new(ast::Expr::Value(ast::ValueWithSpan::from(
+                        ast::Value::SingleQuotedString("1".into())
+                    ))),
+                },
+                "LIMIT"
+            ),
+            Err(SqlError::InvalidLimitValue { .. })
+        ));
+        // Non-literal operand: sign unknowable at plan time → unchanged None.
+        assert_eq!(
+            expr_as_nonnegative_usize(
+                &ast::Expr::UnaryOp {
+                    op: ast::UnaryOperator::Minus,
+                    expr: Box::new(ast::Expr::Identifier(ast::Ident::new("n"))),
+                },
+                "LIMIT"
+            )
+            .unwrap(),
+            None
+        );
     }
 }

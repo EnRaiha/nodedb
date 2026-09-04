@@ -149,6 +149,9 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::PlanError { detail } => NodeDbError::plan_error(detail),
         Error::UndefinedFunction { name } => NodeDbError::undefined_function(name.clone()),
         Error::DivisionByZero => NodeDbError::division_by_zero(),
+        // A negative/uncoercible LIMIT/OFFSET bound rejected at plan time
+        // (SQLSTATE 2201W). User error, not retryable.
+        Error::InvalidLimitValue { detail } => NodeDbError::bad_request(detail.clone()),
         Error::RetryableSchemaChanged { descriptor } => {
             NodeDbError::plan_error(format!("retryable schema change on {descriptor}"))
         }

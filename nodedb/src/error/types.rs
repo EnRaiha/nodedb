@@ -287,6 +287,11 @@ pub enum Error {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A LIMIT/OFFSET bound was rejected at plan time (negative literal).
+    /// Rendered as SQLSTATE `2201W` (invalid_limit_value) at the pgwire layer.
+    #[error("invalid limit value: {detail}")]
+    InvalidLimitValue { detail: String },
+
     /// Descriptor lease conflict; pgwire retries within `PLAN_RETRY_BUDGET`.
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },

@@ -45,6 +45,9 @@ fn map_plan_error(error: nodedb_sql::SqlError, tenant_id: crate::types::TenantId
         // A constant expression that divides by zero is the same condition the
         // row-scope evaluator raises, so it carries the same code.
         nodedb_sql::SqlError::DivisionByZero => crate::Error::DivisionByZero,
+        nodedb_sql::SqlError::InvalidLimitValue { detail } => {
+            crate::Error::InvalidLimitValue { detail }
+        }
         other => crate::Error::PlanError {
             detail: other.to_string(),
         },

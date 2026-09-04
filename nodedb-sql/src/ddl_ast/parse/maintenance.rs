@@ -76,6 +76,34 @@ mod tests {
     }
 
     #[test]
+    fn s2_analyze_tab_whitespace_is_accepted() {
+        let sql = "ANALYZE\tusers(id)";
+        let out = try_parse(
+            &sql.to_uppercase().replace('\t', " "),
+            &sql.split_whitespace().collect::<Vec<_>>(),
+            sql,
+        );
+        let Some(Ok(NodedbStatement::Cluster(ClusterStmt::Analyze { collection }))) = out else {
+            panic!("expected Analyze statement, got {out:?}");
+        };
+        assert_eq!(collection.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn s2_bare_analyze_has_no_collection() {
+        let sql = "ANALYZE";
+        let out = try_parse(
+            sql.to_uppercase().as_str(),
+            &sql.split_whitespace().collect::<Vec<_>>(),
+            sql,
+        );
+        let Some(Ok(NodedbStatement::Cluster(ClusterStmt::Analyze { collection }))) = out else {
+            panic!("expected Analyze statement, got {out:?}");
+        };
+        assert_eq!(collection, None);
+    }
+
+    #[test]
     fn s2_plain_analyze_parses_cleanly() {
         let sql = "ANALYZE users";
         let out = try_parse(

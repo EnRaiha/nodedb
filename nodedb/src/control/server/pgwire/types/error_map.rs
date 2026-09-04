@@ -51,6 +51,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             format!("function {name}(...) does not exist"),
         ),
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
+        crate::Error::InvalidLimitValue { detail } => {
+            ("ERROR", sqlstate::INVALID_LIMIT_VALUE, detail.clone())
+        }
         crate::Error::DocumentNotFound {
             collection,
             document_id,

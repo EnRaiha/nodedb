@@ -54,6 +54,12 @@ pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
 /// `22012` — `division_by_zero` (`/` or `%` with a zero divisor —
 /// raised at runtime instead of evaluating to `NULL`)
+/// `2201W` — `invalid_limit_value` — a negative LIMIT/OFFSET bound (or a
+/// bound that cannot be coerced non-negative) was rejected at plan time.
+/// Mirrors PostgreSQL's `2201W`; without it the planner would silently
+/// degrade the bound to "unbounded" and scan the full collection.
+pub const INVALID_LIMIT_VALUE: &str = "2201W";
+
 pub const DIVISION_BY_ZERO: &str = "22012";
 
 /// `22023` — `invalid_parameter_value` (a `SET` value the parameter's own
