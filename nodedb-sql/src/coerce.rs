@@ -103,11 +103,13 @@ pub fn expr_as_nonnegative_usize(
         // negation is. Reject all literal operands...
         if matches!(
             inner.as_ref(),
-            ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::Number(..), .. })
-                | ast::Expr::Value(ast::ValueWithSpan {
-                    value: ast::Value::SingleQuotedString(..),
-                    ..
-                })
+            ast::Expr::Value(ast::ValueWithSpan {
+                value: ast::Value::Number(..),
+                ..
+            }) | ast::Expr::Value(ast::ValueWithSpan {
+                value: ast::Value::SingleQuotedString(..),
+                ..
+            })
         ) {
             return Err(SqlError::InvalidLimitValue {
                 detail: format!("{clause} must not be negative"),
@@ -290,8 +292,9 @@ mod tests {
         let ast::Statement::Query(q) = &stmts[0] else {
             panic!("expected query statement");
         };
-        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
-            q.limit_clause.as_ref()
+        let Some(ast::LimitClause::LimitOffset {
+            limit: Some(expr), ..
+        }) = q.limit_clause.as_ref()
         else {
             panic!("expected LIMIT clause");
         };
@@ -310,8 +313,9 @@ mod tests {
         let ast::Statement::Query(q) = &stmts[0] else {
             panic!("expected query statement");
         };
-        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
-            q.limit_clause.as_ref()
+        let Some(ast::LimitClause::LimitOffset {
+            limit: Some(expr), ..
+        }) = q.limit_clause.as_ref()
         else {
             panic!("expected LIMIT clause");
         };

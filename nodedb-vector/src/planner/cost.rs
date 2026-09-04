@@ -131,9 +131,7 @@ pub fn estimate_cost(inputs: &CostModelInputs) -> VectorCost {
     let rerank_us = if inputs.quantization == QuantizationKind::None {
         0.0
     } else {
-        crate::rerank::codecs::bbq::DEFAULT_OVERSAMPLE as f32
-            * inputs.ef_search as f32
-            * 0.01
+        crate::rerank::codecs::bbq::DEFAULT_OVERSAMPLE as f32 * inputs.ef_search as f32 * 0.01
     };
 
     let predicted_recall = predicted_recall_for(inputs.index_type, inputs.quantization);
@@ -163,7 +161,6 @@ mod tests {
             "V3: rerank oversample ratio {ratio} must equal BBQ DEFAULT_OVERSAMPLE ({BBQ_OVERSAMPLE})"
         );
     }
-
 
     fn base_inputs() -> CostModelInputs {
         CostModelInputs {
