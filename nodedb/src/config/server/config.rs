@@ -120,13 +120,68 @@ pub struct ServerConfig {
     pub scheduler: SchedulerConfig,
 }
 
+/// Expand `$\{VAR\}` environment placeholders in raw TOML before parsing.
+///
+/// - `$\{VAR\}` with `VAR` set → substituted in place. With an *unquoted*
+///   placeholder (`ports.pgwire = $\{PORT\}`) the value lands in typed fields
+///   too (serde sees the resolved literal). With a quoted string
+///   (`data_dir = "/\${DATA_DIR}"`) the value lands as the string part.
+/// - `$\{VAR\}` with `VAR` unset → startup error naming the variable, so a
+///   misconfigured orchestration cannot silently boot with a literal
+///   `"/${VAR}"` path or a default port.
+/// - Malformed or non-placeholder text (`$\{hello world\}`, unclosed `$\{`)
+///   is left untouched for the TOML parser to reject on its own terms.
+///
+/// Part of the feature request in #278; referenced from the AI-review
+/// pipeline digest.
+pub fn interpolate_env_vars(raw: &str) -> crate::Result<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    loop {
+        let Some(start) = rest.find("${") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(close) = after.find('}') else {
+            out.push_str("${");
+            out.push_str(after);
+            break;
+        };
+        let name = &after[..close];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            out.push_str("${");
+            rest = after;
+            continue;
+        }
+        match std::env::var(name) {
+            Ok(val) => out.push_str(&val),
+            Err(_) => {
+                return Err(crate::Error::Config {
+                    detail: format!(
+                        "unresolved configuration placeholder: ${{{name}}} (set the environment variable or remove the placeholder)"
+                    ),
+                });
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    Ok(out)
+}
+
 impl ServerConfig {
     /// Load configuration from a TOML file, falling back to defaults.
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| crate::Error::Config {
             detail: format!("failed to read config file {}: {e}", path.display()),
         })?;
-        let parsed: Self = toml::from_str(&content).map_err(|e| crate::Error::Config {
+        let interpolated = interpolate_env_vars(&content)?;
+        let parsed: Self = toml::from_str(&interpolated).map_err(|e| crate::Error::Config {
             detail: format!("invalid TOML config: {e}"),
         })?;
         parsed.validate()?;
@@ -321,5 +376,45 @@ mod tests {
             err.contains("unknown field") || err.contains("server_typo"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn c1_unresolved_placeholder_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodedb.toml");
+        std::fs::write(&path, "[server]\ndata_dir = \"${DATA_DIR}\"\n").unwrap();
+        unsafe { std::env::remove_var("DATA_DIR") };
+        let err = ServerConfig::from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("DATA_DIR"),
+            "C1: unresolved placeholder must name the variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn c1_set_placeholder_is_interpolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodedb.toml");
+        std::fs::write(&path, "[server]\ndata_dir = \"${DATA_DIR}\"\n").unwrap();
+        let resolved = dir.path().join("data");
+        unsafe { std::env::set_var("DATA_DIR", resolved.to_str().unwrap()) };
+        let cfg = ServerConfig::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.server.data_dir, resolved,
+            "interpolated data_dir must match the resolved env value"
+        );
+        unsafe { std::env::remove_var("DATA_DIR") };
+    }
+
+    #[test]
+    fn c1_typed_field_unquoted_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodedb.toml");
+        // Unquoted placeholder: resolves to a bare integer before TOML parsing.
+        std::fs::write(&path, "[server]\ndata_plane_cores = ${CORES}\n").unwrap();
+        unsafe { std::env::set_var("CORES", "8") };
+        let cfg = ServerConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.server.data_plane_cores, 8);
+        unsafe { std::env::remove_var("CORES") };
     }
 }
