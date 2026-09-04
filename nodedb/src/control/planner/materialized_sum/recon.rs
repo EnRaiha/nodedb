@@ -187,6 +187,9 @@ async fn execute_read(
         TraceId::ZERO,
     )
     .await?;
+    // A shard verdict keeps its own typed error, so a read the statement's
+    // deadline cut short reports the deadline rather than a storage fault.
+    crate::control::server::dispatch_utils::reject_data_plane_error(&response)?;
     if response.status != crate::bridge::envelope::Status::Ok {
         return Err(crate::Error::Storage {
             engine: "materialized-sum-recon".into(),

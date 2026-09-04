@@ -220,34 +220,21 @@ pub async fn broadcast_match_to_all_cores(
     // (a core's result may stream as several Partial frames before its terminal
     // frame).
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
-    let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            crate::control::server::dispatch_utils::collect_bounded_response(
+    let response_futures = receivers
+        .into_iter()
+        .map(|(core_id, request_id, mut rx)| async move {
+            let context = format!("match gather on core {core_id}");
+            crate::control::server::dispatch_utils::collect_under_deadline(
                 &mut rx,
-                max_result_bytes,
-            ),
-        )
-        .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: format!("match gather timeout on core {core_id}"),
-        })? {
-            Ok(resp) => Ok(resp),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
-                bytes,
-            }) => Err(crate::Error::ExecutionLimitExceeded {
-                detail: format!(
-                    "match gather on core {core_id} exceeded max_query_result_bytes \
-                     ({bytes} > {max_result_bytes} bytes)"
-                ),
-            }),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed) => {
-                Err(crate::Error::Dispatch {
-                    detail: format!("match gather channel closed on core {core_id}"),
-                })
-            }
-        }
-    });
+                crate::control::server::dispatch_utils::DeadlineCollect {
+                    request_id,
+                    deadline,
+                    max_result_bytes,
+                    context: &context,
+                },
+            )
+            .await
+        });
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
 
@@ -255,28 +242,29 @@ pub async fn broadcast_match_to_all_cores(
     let mut frontier: Vec<UnresolvedExpansion> = Vec::new();
     let mut resume: Vec<VarLenResume> = Vec::new();
     let mut partial = false;
-    let mut had_error = false;
-    let mut error_msg = String::new();
+    // First error seen across cores, kept as a TYPED error: a core cut short by
+    // the statement's deadline reports the deadline rather than collapsing into
+    // a generic dispatch failure.
+    let mut first_error: Option<crate::Error> = None;
 
     for result in results {
         let resp = match result {
             Ok(r) => r,
-            Err(e) => {
-                had_error = true;
-                error_msg = e.to_string();
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
                 continue;
             }
         };
 
         if resp.status == Status::Error {
-            if let Some(ec) = resp.error_code.as_deref() {
-                match ec {
-                    crate::bridge::envelope::ErrorCode::NotFound => continue,
-                    _ => {
-                        had_error = true;
-                        error_msg = format!("{ec:?}");
-                    }
-                }
+            // `NotFound` is an empty CSR slice on this core, not an error.
+            if let Err(error) =
+                crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
             continue;
         }
@@ -298,8 +286,10 @@ pub async fn broadcast_match_to_all_cores(
         resume.append(&mut decoded.resume);
     }
 
-    if had_error && all_row_elements.is_empty() {
-        return Err(crate::Error::Dispatch { detail: error_msg });
+    if all_row_elements.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
 
     let merged_rows = encode_msgpack_array(&all_row_elements);

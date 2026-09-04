@@ -15,7 +15,9 @@ pub(crate) use change_events::{
     WriteChangeSet, extract_write_change_set, publish_change_set_with_lsn,
     publish_cluster_array_change_events, publish_origin_change_events,
 };
-pub(crate) use collect::{DispatchCollectError, collect_bounded_response};
+pub(crate) use collect::{
+    DeadlineCollect, DispatchCollectError, collect_bounded_response, collect_under_deadline,
+};
 pub use dispatch::{dispatch_authorized_autocommit_write, dispatch_authorized_to_data_plane};
 pub(crate) use dispatch::{
     dispatch_authorized_autocommit_write_with_source, dispatch_autocommit_write,

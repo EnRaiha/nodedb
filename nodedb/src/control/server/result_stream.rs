@@ -16,6 +16,7 @@
 //! fully-collected result.
 
 use crate::bridge::envelope::{Response, Status};
+use crate::control::server::dispatch_utils::reject_data_plane_error;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::types::Lsn;
 
@@ -44,10 +45,11 @@ pub type ResultStream =
 /// Each `Response` frame becomes one [`RowBatch`]. A running byte total over all
 /// frames is enforced against `max_result_bytes`; exceeding it ends the stream
 /// with `ExecutionLimitExceeded`. A terminal `Status::Error` frame ends the
-/// stream with `Dispatch` — except when `tolerate_not_found` is set and the
-/// error code is `NotFound`, in which case the stream simply ends cleanly (the
-/// shard had no matching rows). The stream ends after the terminal
-/// (`!partial`) frame is yielded, or when the channel closes.
+/// stream with the typed error its code maps to — except when
+/// `tolerate_not_found` is set and the error code is `NotFound`, in which case
+/// the stream simply ends cleanly (the shard had no matching rows). The stream
+/// ends after the terminal (`!partial`) frame is yielded, or when the channel
+/// closes.
 pub(crate) fn stream_response_channel(
     mut rx: tokio::sync::mpsc::Receiver<Response>,
     max_result_bytes: usize,
@@ -66,25 +68,22 @@ pub(crate) fn stream_response_channel(
                     // No rows on this source — end the stream cleanly.
                     return;
                 }
-                // A streamed Data Plane `Response` error otherwise degrades
-                // to the generic `crate::Error::Dispatch`
-                // below (SQLSTATE XX000) — special-cased here the same way
-                // `NotFound` already is, so a division/modulo-by-zero
-                // survives this stream-consumption boundary and reaches
-                // pgwire as SQLSTATE `22012` instead of a generic internal
-                // error.
-                if matches!(
-                    resp.error_code.as_deref(),
-                    Some(crate::bridge::envelope::ErrorCode::DivisionByZero)
-                ) {
-                    Err(crate::Error::DivisionByZero)?;
-                    return;
-                }
-                let detail = match resp.error_code {
-                    Some(ref ec) => format!("data plane error: {ec:?}"),
-                    None => "unknown data plane error".to_string(),
+                // Every other code becomes the typed error the one
+                // Data-Plane-code conversion the crate owns produces, so a
+                // deadline crosses this boundary as the statement's own
+                // timeout (`57014`) and a division by zero as `22012`. A
+                // `{ec:?}` dump into a generic dispatch failure made every
+                // condition reach the client as `XX000`.
+                let error = match reject_data_plane_error(&resp) {
+                    Err(error) => error,
+                    // `NotFound` is the one code that conversion reads as an
+                    // empty observation rather than an error. This stream
+                    // declined to tolerate it, so it stops here.
+                    Ok(()) => crate::Error::Dispatch {
+                        detail: "data plane error: NotFound".to_string(),
+                    },
                 };
-                Err(crate::Error::Dispatch { detail })?;
+                Err(error)?;
                 return;
             }
 
@@ -234,8 +233,11 @@ mod tests {
         assert!(matches!(err, crate::Error::ExecutionLimitExceeded { .. }));
     }
 
+    /// A terminal error frame ends the stream with the typed error its code
+    /// maps to. Collapsing every code into one generic variant is what made a
+    /// client's own timeout arrive as an internal failure.
     #[tokio::test]
-    async fn terminal_error_frame_errors() {
+    async fn terminal_error_frame_keeps_its_typed_error() {
         let (tx, rx) = mpsc::channel(8);
         tx.send(partial(10)).await.unwrap();
         tx.send(error_frame(ErrorCode::ResourcesExhausted))
@@ -243,8 +245,41 @@ mod tests {
             .unwrap();
         drop(tx);
         let stream = stream_response_channel(rx, 1 << 20, false);
-        let err = materialize(stream).await.unwrap_err();
-        assert!(matches!(err, crate::Error::Dispatch { .. }));
+        match materialize(stream).await {
+            Err(crate::Error::DataPlane(ErrorCode::ResourcesExhausted)) => {}
+            other => panic!("expected the shard's own code, got {other:?}"),
+        }
+    }
+
+    /// A shard that stopped because the statement ran out of time reports the
+    /// deadline through this adapter too, so a streamed SELECT answers the same
+    /// SQLSTATE a materialized one does.
+    #[tokio::test]
+    async fn terminal_deadline_frame_reports_the_deadline() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(partial(10)).await.unwrap();
+        tx.send(error_frame(ErrorCode::DeadlineExceeded))
+            .await
+            .unwrap();
+        drop(tx);
+        let stream = stream_response_channel(rx, 1 << 20, false);
+        match materialize(stream).await {
+            Err(crate::Error::DeadlineExceeded { request_id }) => {
+                assert_eq!(request_id, RequestId::new(1));
+            }
+            other => panic!("expected the deadline variant, got {other:?}"),
+        }
+    }
+
+    /// An untolerated `NotFound` still stops the stream rather than reading as
+    /// an empty success.
+    #[tokio::test]
+    async fn untolerated_not_found_errors() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(error_frame(ErrorCode::NotFound)).await.unwrap();
+        drop(tx);
+        let stream = stream_response_channel(rx, 1 << 20, false);
+        assert!(materialize(stream).await.is_err());
     }
 
     #[tokio::test]

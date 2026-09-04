@@ -187,15 +187,17 @@ async fn dispatch_plan(
     };
 
     // Await to the same instant the envelope carries — yields the thread so the
-    // response poller can run.
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-        rx.recv().await.ok_or(())
-    })
-    .await
-    .map_err(|_| crate::Error::Internal {
-        detail: format!("dispatch timeout after {}ms", timeout.as_millis()),
-    })?
-    .map_err(|_| crate::Error::Internal {
-        detail: "response channel closed".into(),
-    })
+    // response poller can run. Reaching that instant is the statement running
+    // out of time, so it reports the deadline, and so does a producer that
+    // stopped after it: the closure there is the symptom, not the cause.
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx.recv()).await {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) if Instant::now() >= deadline => {
+            Err(crate::Error::DeadlineExceeded { request_id })
+        }
+        Ok(None) => Err(crate::Error::Internal {
+            detail: "response channel closed".into(),
+        }),
+        Err(_) => Err(crate::Error::DeadlineExceeded { request_id }),
+    }
 }

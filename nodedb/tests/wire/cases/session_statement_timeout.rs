@@ -22,15 +22,19 @@
 //! in-handler safe point can produce its result — see
 //! `data::executor::handlers::columnar_read::scan`.
 //!
-//! ## Keeping the seed cheap
+//! ## Why the budget, not the query, is what makes these deterministic
 //!
-//! No sleep and no artificial delay. The server boots with
-//! `stream_chunk_size = 20`, so `ROWS` rows are more than enough to make the
-//! bounded query a streaming one — the shape the partial-result assertion is
-//! about — without the thousands of rows the shipped chunk size would need. The
-//! query still forces the slowest read shape the document engine has: an
-//! unfiltered full scan, a full materialize, and an `ORDER BY` on a text column
-//! seeded in reverse so the sort cannot short-circuit.
+//! No sleep and no artificial delay, and no bet that a given row count outruns
+//! a given budget — that bet fails in both directions and turns a real
+//! assertion into a coin flip. The budget instead is the smallest one
+//! `statement_timeout` can express, and it is spent before the statement is
+//! parsed, planned, authorized or dispatched. No machine finishes that
+//! prologue in a microsecond, so every one of these statements is over its
+//! deadline by construction.
+//!
+//! The seed stays several times `stream_chunk_size` so the bounded query is a
+//! streaming one — the shape the partial-result assertion is about — without
+//! the thousands of rows the shipped chunk size would need.
 
 use crate::harness::TestServer;
 
@@ -42,7 +46,13 @@ const CHUNK_ROWS: usize = 20;
 /// SQLSTATE `query_canceled` — what a statement over its deadline returns.
 const QUERY_CANCELED: &str = "57014";
 
-/// The bounded statement: unfiltered full scan, full materialize, sort.
+/// The smallest budget `statement_timeout` can express: one microsecond.
+///
+/// Unmeetable by construction — see the module doc — so a statement bounded
+/// with it stops on any machine at any load.
+const UNMEETABLE_BUDGET: &str = "1us";
+
+/// The bounded statement: an unfiltered full scan and materialize.
 const SLOW_QUERY: &str = "SELECT id, payload FROM slow_scan ORDER BY payload";
 
 async fn seeded_server() -> TestServer {
@@ -73,12 +83,15 @@ async fn seeded_server() -> TestServer {
 #[tokio::test]
 async fn statement_timeout_bounds_a_long_statement() {
     let srv = seeded_server().await;
-    srv.exec("SET statement_timeout = '1ms'").await.unwrap();
+    srv.exec(&format!("SET statement_timeout = '{UNMEETABLE_BUDGET}'"))
+        .await
+        .unwrap();
 
     let error = srv
         .query_rows(SLOW_QUERY)
         .await
-        .expect_err("a full scan and sort must not fit in a 1ms budget");
+        .map(|rows| rows.len())
+        .expect_err("a spent budget must stop the statement");
     assert!(
         error.contains(QUERY_CANCELED),
         "expected SQLSTATE {QUERY_CANCELED}, got {error}"
@@ -90,8 +103,16 @@ async fn statement_timeout_zero_means_no_limit() {
     let srv = seeded_server().await;
     // Prove the same statement is bounded first, so the success below is the
     // `0` doing the work and not a machine that happened to be fast.
-    srv.exec("SET statement_timeout = '1ms'").await.unwrap();
-    assert!(srv.query_rows(SLOW_QUERY).await.is_err());
+    srv.exec(&format!("SET statement_timeout = '{UNMEETABLE_BUDGET}'"))
+        .await
+        .unwrap();
+    assert!(
+        srv.query_rows(SLOW_QUERY)
+            .await
+            .map(|rows| rows.len())
+            .is_err(),
+        "the first half must bound the statement, or the second half proves nothing"
+    );
 
     srv.exec("SET statement_timeout = 0").await.unwrap();
     let rows = srv
@@ -113,13 +134,20 @@ async fn statement_well_within_its_timeout_is_unaffected() {
     assert_eq!(rows.len(), ROWS);
 }
 
-/// A statement cut off part way returns the error and NOTHING else. It never
-/// hands back the chunks it had already emitted, which the client could not
-/// tell apart from a complete result.
+/// A statement stopped by its deadline returns the error and NOTHING else — no
+/// partial row set a client could not tell apart from a complete one — and
+/// leaves the collection and the session usable.
+///
+/// It does not claim to stop the statement mid-stream: which point stops it is
+/// a race no client-visible signal reports, and pinning one would be a bet on
+/// machine speed. The in-handler safe point has its own deterministic proof in
+/// the columnar scan handler's unit test.
 #[tokio::test]
 async fn timed_out_streaming_statement_returns_no_rows() {
     let srv = seeded_server().await;
-    srv.exec("SET statement_timeout = '1ms'").await.unwrap();
+    srv.exec(&format!("SET statement_timeout = '{UNMEETABLE_BUDGET}'"))
+        .await
+        .unwrap();
 
     match srv.query_rows(SLOW_QUERY).await {
         Ok(rows) => panic!("expected an error, got {} rows", rows.len()),

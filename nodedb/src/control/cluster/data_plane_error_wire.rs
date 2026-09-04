@@ -23,6 +23,13 @@ use crate::bridge::envelope::ErrorCode;
 pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
     match err {
         crate::Error::DataPlane(code) => TypedClusterError::DataPlane { code: code.into() },
+        // A statement that ran out of time keeps the wire's own deadline
+        // variant, which the coordinator rebuilds as `Error::DeadlineExceeded`.
+        // Folding it into `Internal` would report a client's own timeout as an
+        // internal failure once it crossed a node boundary.
+        crate::Error::DeadlineExceeded { .. } => {
+            TypedClusterError::DeadlineExceeded { elapsed_ms: 0 }
+        }
         other => {
             let message = other.to_string();
             let code = u32::from(nodedb_types::error::NodeDbError::from(other).code().0);

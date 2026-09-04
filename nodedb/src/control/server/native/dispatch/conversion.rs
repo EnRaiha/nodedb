@@ -53,6 +53,15 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
             nodedb_types::error::sqlstate::TRANSACTION_ROLLBACK,
             format!("{e}"),
         ),
+        // A shard verdict that rode back as a typed code keeps the exact
+        // SQLSTATE and message the response-frame path would have given, from
+        // the same protocol-neutral table pgwire reads. Rendering `XX000` here
+        // made one condition answer two SQLSTATEs depending on whether its
+        // response was inspected in place or collapsed into a typed `Err`.
+        crate::Error::DataPlane(code) => {
+            let (_severity, sqlstate, message) = error_code_to_sqlstate(code);
+            (sqlstate, message)
+        }
         other => ("XX000", format!("{other}")),
     };
     let ndb_code = crate::error_classify::classify(e).code().0;
@@ -327,6 +336,48 @@ mod tests {
             .error
             .expect("error responses must carry a payload");
         assert_eq!(error.code, "28000");
+    }
+
+    /// One statement running out of time answers ONE SQLSTATE, whichever half
+    /// of the race reported it: the Control-Plane timer, which raises
+    /// `DeadlineExceeded` directly, or a shard refusing an already-expired
+    /// task, whose verdict arrives as a Data-Plane code. Rendering the second
+    /// as `XX000` made the code a client sees depend on machine load.
+    #[test]
+    fn both_halves_of_a_deadline_render_one_sqlstate() {
+        let from_timer = error_to_native(
+            1,
+            &crate::Error::DeadlineExceeded {
+                request_id: crate::types::RequestId::new(7),
+            },
+        );
+        let from_shard = error_to_native(
+            2,
+            &crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::DeadlineExceeded),
+        );
+
+        for response in [from_timer, from_shard] {
+            let error = response.error.expect("error responses carry a payload");
+            assert_eq!(error.code, "57014", "{error:?}");
+            assert_eq!(
+                error.ndb_code,
+                nodedb_types::error::ErrorCode::DEADLINE_EXCEEDED.0,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// Every other shard verdict keeps its own SQLSTATE too, from the same
+    /// protocol-neutral table pgwire reads.
+    #[test]
+    fn a_shard_verdict_keeps_its_sqlstate() {
+        let response = error_to_native(
+            1,
+            &crate::Error::DataPlane(crate::bridge::envelope::ErrorCode::DivisionByZero),
+        );
+
+        let error = response.error.expect("error responses carry a payload");
+        assert_eq!(error.code, "22012");
     }
 
     /// A Control-Plane classification must ride the frame as the numeric code,

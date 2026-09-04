@@ -99,60 +99,49 @@ pub(super) async fn gather_graph_op_all_cores(
             core_plan
         })?;
 
-    let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            crate::control::server::dispatch_utils::collect_bounded_response(
+    let response_futures = receivers
+        .into_iter()
+        .map(|(core_id, request_id, mut rx)| async move {
+            let context = format!("{label} gather on core {core_id}");
+            crate::control::server::dispatch_utils::collect_under_deadline(
                 &mut rx,
-                max_result_bytes,
-            ),
-        )
-        .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: format!("{label} gather timeout on core {core_id}"),
-        })? {
-            Ok(resp) => Ok(resp),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
-                bytes,
-            }) => Err(crate::Error::ExecutionLimitExceeded {
-                detail: format!(
-                    "{label} gather on core {core_id} exceeded max_query_result_bytes \
-                     ({bytes} > {max_result_bytes} bytes)"
-                ),
-            }),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed) => {
-                Err(crate::Error::Dispatch {
-                    detail: format!("{label} gather channel closed on core {core_id}"),
-                })
-            }
-        }
-    });
+                crate::control::server::dispatch_utils::DeadlineCollect {
+                    request_id,
+                    deadline,
+                    max_result_bytes,
+                    context: &context,
+                },
+            )
+            .await
+        });
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
 
     let mut out = Vec::with_capacity(num_cores);
-    let mut had_error = false;
-    let mut error_msg = String::new();
+    // First error seen across cores, kept as a TYPED error: a core cut short by
+    // the statement's deadline reports the deadline, and a constraint refusal
+    // keeps its own SQLSTATE. Stringifying either one made both read as
+    // internal.
+    let mut first_error: Option<crate::Error> = None;
 
     for result in results {
         let resp = match result {
             Ok(r) => r,
-            Err(e) => {
-                had_error = true;
-                error_msg = e.to_string();
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
                 continue;
             }
         };
 
         if resp.status == Status::Error {
-            if let Some(ec) = resp.error_code.as_deref() {
-                match ec {
-                    crate::bridge::envelope::ErrorCode::NotFound => continue,
-                    _ => {
-                        had_error = true;
-                        error_msg = format!("{ec:?}");
-                    }
-                }
+            // `NotFound` is an empty CSR slice on this core, not an error.
+            if let Err(error) =
+                crate::control::server::dispatch_utils::reject_data_plane_error(&resp)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
             continue;
         }
@@ -160,8 +149,10 @@ pub(super) async fn gather_graph_op_all_cores(
         out.push(resp);
     }
 
-    if had_error && out.is_empty() {
-        return Err(crate::Error::Dispatch { detail: error_msg });
+    if out.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
 
     Ok(out)

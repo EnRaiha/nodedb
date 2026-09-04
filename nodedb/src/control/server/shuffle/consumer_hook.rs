@@ -46,7 +46,9 @@ use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
 use crate::bridge::envelope::{ErrorCode, Priority, Request, Status};
 use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
-use crate::control::server::dispatch_utils::{DispatchCollectError, collect_bounded_response};
+use crate::control::server::dispatch_utils::{
+    DispatchCollectError, collect_bounded_response, reject_data_plane_error,
+};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId};
 
@@ -210,18 +212,19 @@ impl RegistryShuffleConsumer {
         {
             Ok(Ok(resp)) => {
                 if resp.status == Status::Error {
-                    // Carry the shard's verdict code across the hop; an error
-                    // status with no code fails closed as an internal verdict
-                    // rather than reading as an empty join result.
-                    let code = match resp.error_code.as_deref() {
-                        Some(code) => code.clone(),
-                        None => ErrorCode::Internal {
-                            detail: "shuffle consume join: data plane returned an error \
-                                     status with no error code"
-                                .into(),
-                        },
+                    // Carry the shard's verdict across the hop through the one
+                    // code-to-typed-error conversion the crate owns, so a shard
+                    // refusing an expired task reports the deadline the hop's
+                    // own timer reports. An error status with no code fails
+                    // closed there as an internal verdict rather than reading
+                    // as an empty join result.
+                    let error = match reject_data_plane_error(&resp) {
+                        Err(error) => error,
+                        // `NotFound` is an empty observation elsewhere; this
+                        // hop treats every error status as a failed join.
+                        Ok(()) => crate::Error::DataPlane(ErrorCode::NotFound),
                     };
-                    Err(execution_error_to_typed(crate::Error::DataPlane(code)))
+                    Err(execution_error_to_typed(error))
                 } else {
                     // The payload is a msgpack array of join-result rows — exactly
                     // the `ShuffleConsumeResponse.rows` shape.

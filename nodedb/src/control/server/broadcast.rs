@@ -37,6 +37,23 @@ pub(crate) fn broadcast_call_count_increment() {
     BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The typed error one core's refusal means to this barrier.
+///
+/// The code travels through the one Data-Plane-code conversion the crate
+/// owns, so a core that ran out of time reports the statement's deadline and
+/// a constraint refusal keeps its own SQLSTATE. A `{code:?}` dump into a
+/// generic dispatch failure made every one of them read as internal.
+fn typed_core_error(resp: &Response) -> crate::Error {
+    match crate::control::server::dispatch_utils::reject_data_plane_error(resp) {
+        Err(error) => error,
+        // `NotFound` is an empty observation elsewhere. A barrier takes any
+        // error status as a core that did not acknowledge.
+        Ok(()) => crate::Error::Dispatch {
+            detail: "core returned an error status: NotFound".into(),
+        },
+    }
+}
+
 /// The `Admission` stamp for a per-core fan-out `Request`.
 ///
 /// This fan-out builds its own per-core `Request` and enqueues directly (not
@@ -158,33 +175,42 @@ pub async fn broadcast_count_to_all_cores(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .dispatch_to_core(core_id, request)?;
-        receivers.push(rx);
+        receivers.push((request_id, rx));
     }
 
     let mut total = 0usize;
     let mut max_lsn = Lsn::ZERO;
-    let mut had_error = false;
-    let mut error_msg = String::new();
+    // First error seen across cores, kept as a TYPED error so a core that ran
+    // out of time reports the statement's deadline rather than collapsing into
+    // a generic dispatch failure.
+    let mut first_error: Option<crate::Error> = None;
+    // One statement, one deadline instant — every core waits to the same one.
+    let deadline = statement_deadline(shared.tuning.network.default_deadline_secs);
 
-    for mut rx in receivers {
-        let resp = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(statement_deadline(
-                shared.tuning.network.default_deadline_secs,
-            )),
-            async { rx.recv().await.ok_or(()) },
+    for (request_id, mut rx) in receivers {
+        let resp = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            rx.recv(),
         )
         .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast count timeout".into(),
-        })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast count channel closed".into(),
-        })?;
+        {
+            Ok(Some(resp)) => resp,
+            // A producer that stopped after the deadline stopped because the
+            // statement ran out of time; the closure is the symptom.
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                return Err(crate::Error::DeadlineExceeded { request_id });
+            }
+            Ok(None) => {
+                return Err(crate::Error::Dispatch {
+                    detail: "broadcast count channel closed".into(),
+                });
+            }
+            Err(_) => return Err(crate::Error::DeadlineExceeded { request_id }),
+        };
 
         if resp.status == crate::bridge::envelope::Status::Error {
-            had_error = true;
-            if let Some(ref ec) = resp.error_code {
-                error_msg = format!("{ec:?}");
+            if first_error.is_none() {
+                first_error = Some(typed_core_error(&resp));
             }
             continue;
         }
@@ -199,8 +225,8 @@ pub async fn broadcast_count_to_all_cores(
     // A broadcast is an all-core barrier. Returning success after even one
     // error would let callers finalize control-plane state while that core
     // still retains the old Array store.
-    if had_error {
-        return Err(crate::Error::Dispatch { detail: error_msg });
+    if let Some(error) = first_error {
+        return Err(error);
     }
 
     let mut map = std::collections::BTreeMap::new();
@@ -276,34 +302,34 @@ pub async fn broadcast_register_to_all_cores(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .dispatch_to_core(core_id, request)?;
-        receivers.push((core_id, rx));
+        receivers.push((core_id, request_id, rx));
     }
 
-    for (core_id, mut rx) in receivers {
-        let resp = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(statement_deadline(
-                shared.tuning.network.default_deadline_secs,
-            )),
-            async { rx.recv().await.ok_or(()) },
+    // One statement, one deadline instant — and every exit that ends on it
+    // reports the deadline rather than the closure that followed from it.
+    let deadline = statement_deadline(shared.tuning.network.default_deadline_secs);
+
+    for (core_id, request_id, mut rx) in receivers {
+        let resp = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            rx.recv(),
         )
         .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: format!("schema register barrier timeout on core {core_id}"),
-        })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: format!("schema register barrier channel closed on core {core_id}"),
-        })?;
+        {
+            Ok(Some(resp)) => resp,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                return Err(crate::Error::DeadlineExceeded { request_id });
+            }
+            Ok(None) => {
+                return Err(crate::Error::Dispatch {
+                    detail: format!("schema register barrier channel closed on core {core_id}"),
+                });
+            }
+            Err(_) => return Err(crate::Error::DeadlineExceeded { request_id }),
+        };
 
         if resp.status == crate::bridge::envelope::Status::Error {
-            let code_detail = resp
-                .error_code
-                .map(|ec| format!("{ec:?}"))
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(crate::Error::Dispatch {
-                detail: format!(
-                    "schema register barrier: core {core_id} returned error: {code_detail}"
-                ),
-            });
+            return Err(typed_core_error(&resp));
         }
     }
 

@@ -341,6 +341,12 @@ pub(crate) async fn submit_write(
             if !ddl_transition.preserves_on_ambiguous_apply() {
                 let _ = ddl_transition.rollback(shared);
             }
+            // A producer that stopped after the deadline stopped because the
+            // statement ran out of time. Reporting the closure would hand the
+            // client an internal error for its own timeout.
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::Error::DeadlineExceeded { request_id });
+            }
             return Err(crate::Error::Dispatch {
                 detail: "response channel closed".into(),
             });

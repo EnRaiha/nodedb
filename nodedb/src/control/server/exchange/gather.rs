@@ -45,6 +45,10 @@ pub(crate) use super::response::stream_to_response;
 /// `Request` so the Data-Plane scan handler can merge the transaction's
 /// staging overlay (read-your-own-writes). Autocommit / non-transactional
 /// callers pass `None`, which reproduces prior behaviour exactly.
+///
+/// Each entry is `(core_id, request_id, receiver)`. The request id travels
+/// with the receiver so a collect that ends at the deadline can name the
+/// request it cancelled.
 pub(crate) fn eager_dispatch_to_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -55,6 +59,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
 ) -> crate::Result<
     Vec<(
         usize,
+        crate::types::RequestId,
         tokio::sync::mpsc::Receiver<crate::bridge::envelope::Response>,
     )>,
 > {
@@ -102,7 +107,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .dispatch_to_core(core_id, request)?;
-        receivers.push((core_id, rx));
+        receivers.push((core_id, request_id, rx));
     }
 
     Ok(receivers)
@@ -168,36 +173,22 @@ pub(crate) async fn gather_all_cores(
     // frame would silently truncate that core's contribution to `stream_chunk_size`
     // rows.
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
-    let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        let result = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            crate::control::server::dispatch_utils::collect_bounded_response(
+    let response_futures = receivers
+        .into_iter()
+        .map(|(core_id, request_id, mut rx)| async move {
+            let context = format!("gather on core {core_id}");
+            let result = crate::control::server::dispatch_utils::collect_under_deadline(
                 &mut rx,
-                max_result_bytes,
-            ),
-        )
-        .await
-        {
-            Err(_) => Err(crate::Error::Dispatch {
-                detail: format!("gather timeout on core {core_id}"),
-            }),
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
-                bytes,
-            })) => Err(crate::Error::ExecutionLimitExceeded {
-                detail: format!(
-                    "gather on core {core_id} exceeded max_query_result_bytes \
-                     ({bytes} > {max_result_bytes} bytes)"
-                ),
-            }),
-            Ok(Err(
-                crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed,
-            )) => Err(crate::Error::Dispatch {
-                detail: format!("gather channel closed on core {core_id}"),
-            }),
-        };
-        (core_id, result)
-    });
+                crate::control::server::dispatch_utils::DeadlineCollect {
+                    request_id,
+                    deadline,
+                    max_result_bytes,
+                    context: &context,
+                },
+            )
+            .await;
+            (core_id, result)
+        });
 
     let results: Vec<(usize, crate::Result<Response>)> = join_all(response_futures).await;
 
@@ -332,7 +323,7 @@ pub(crate) fn gather_all_cores_stream(
             plan.clone()
         })?
         .into_iter()
-        .map(|(_core_id, rx)| stream_response_channel(rx, max_result_bytes, true))
+        .map(|(_core_id, _request_id, rx)| stream_response_channel(rx, max_result_bytes, true))
         .collect();
 
     Ok(Box::pin(futures::stream::select_all(per_core)))
