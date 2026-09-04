@@ -67,12 +67,6 @@ pub fn expr_as_usize_literal(expr: &ast::Expr) -> Option<usize> {
 
 /// Fallible LIMIT/OFFSET resolution.
 ///
-/// Rejects negative literals (`LIMIT -1`, `OFFSET -2`) with
-/// [`SqlError::InvalidLimitValue`] instead of collapsing to `None`
-/// (unbounded). Everything else behaves exactly like
-/// [`expr_as_usize_literal`].
-/// Fallible LIMIT/OFFSET resolution.
-///
 /// Rejects statically-negative bounds with [`SqlError::InvalidLimitValue`]:
 /// - `LIMIT -1` / `OFFSET -2` (`Expr::UnaryOp(Minus)` over a numeric literal)
 /// - `LIMIT '-1'` (UNKNOWN-param / string literal carrying a minus sign)
@@ -83,49 +77,61 @@ pub fn expr_as_usize_literal(expr: &ast::Expr) -> Option<usize> {
 /// behavior of any non-literal bound (`None` = no static limit). This matches
 /// the docstring contract of [`expr_as_usize_literal`]: only literals are
 /// resolved; everything else is the caller's semantic.
+/// Evaluate a literal (number or quoted string) as a signed integer,
+/// matching PostgreSQL's literal-coercion semantics for LIMIT/OFFSET.
+///
+/// `-0` evaluates to 0 and is accepted; `- '-5'` (double negation) evaluates
+/// to +5 and is accepted. Non-numeric or non-integer literals return `None`.
+fn literal_as_i64(v: &ast::Value) -> Option<i64> {
+    match v {
+        ast::Value::SingleQuotedString(s) => s.trim().parse::<i64>().ok(),
+        ast::Value::Number(n, _) => n.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 pub fn expr_as_nonnegative_usize(
     expr: &ast::Expr,
     clause: &'static str,
 ) -> Result<Option<usize>, SqlError> {
-    let reject_negative = |v: &ast::Value| match v {
-        ast::Value::SingleQuotedString(s) => s.trim_start().starts_with('-'),
-        ast::Value::Number(n, _) => n.trim_start().starts_with('-'),
-        _ => false,
-    };
-
+    // Fast path: positive integer literals (plain or quoted) unchanged.
+    if let Some(v) = expr_as_usize_literal(expr) {
+        return Ok(Some(v));
+    }
+    // Signed literals under unary minus: evaluate, then admit or reject
+    // (PostgreSQL parity — reject only when the RESULT is negative:
+    // LIMIT -0 → 0 accepted, LIMIT - '-5' → 5 accepted, LIMIT -5 rejected).
     if let ast::Expr::UnaryOp {
         op: ast::UnaryOperator::Minus,
         expr: inner,
     } = expr
     {
-        // Unary minus over ANY literal operand is statically negative
-        // (-5, -'5', - '-5'): the operand's own sign is irrelevant, the
-        // negation is. Reject all literal operands...
-        if matches!(
-            inner.as_ref(),
-            ast::Expr::Value(ast::ValueWithSpan {
-                value: ast::Value::Number(..),
-                ..
-            }) | ast::Expr::Value(ast::ValueWithSpan {
-                value: ast::Value::SingleQuotedString(..),
-                ..
-            })
-        ) {
-            return Err(SqlError::InvalidLimitValue {
-                detail: format!("{clause} must not be negative"),
-            });
+        if let ast::Expr::Value(v) = inner.as_ref() {
+            if let Some(signed) = literal_as_i64(&v.value) {
+                let negated = signed.checked_neg().unwrap_or(i64::MIN);
+                if negated < 0 {
+                    return Err(SqlError::InvalidLimitValue {
+                        detail: format!("{clause} must not be negative"),
+                    });
+                }
+                return Ok(Some(negated as usize));
+            }
         }
-        // Non-literal operand ($1, col): sign unknowable at plan time →
-        // unchanged "non-literal bound" semantics (None → unbounded).
     }
+    // Bare literals carrying their own minus sign (LIMIT '-1').
     if let ast::Expr::Value(v) = expr {
-        if reject_negative(&v.value) {
-            return Err(SqlError::InvalidLimitValue {
-                detail: format!("{clause} must not be negative"),
-            });
+        if let Some(signed) = literal_as_i64(&v.value) {
+            if signed < 0 {
+                return Err(SqlError::InvalidLimitValue {
+                    detail: format!("{clause} must not be negative"),
+                });
+            }
+            return Ok(Some(signed as usize));
         }
     }
-    Ok(expr_as_usize_literal(expr))
+    // Non-literal bound (LIMIT -$1, LIMIT -col): sign unknowable at plan
+    // time → documented pre-existing semantics (None = no static limit).
+    Ok(None)
 }
 
 /// Resolve a `Value` into an `f64` if numeric-shaped.
@@ -344,6 +350,46 @@ mod tests {
             ),
             Err(SqlError::InvalidLimitValue { .. })
         ));
+        // PostgreSQL literal coercion: -0 → 0 (accepted, not 2201W).
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT * FROM t LIMIT -0",
+        )
+        .unwrap();
+        let ast::Statement::Query(q) = &stmts[0] else {
+            panic!("expected query statement");
+        };
+        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
+            q.limit_clause.as_ref()
+        else {
+            panic!("expected LIMIT clause");
+        };
+        assert_eq!(
+            expr_as_nonnegative_usize(expr, "LIMIT").unwrap(),
+            Some(0),
+            "LIMIT -0 must evaluate to 0, not error"
+        );
+
+        // Double negation: LIMIT - '-5' → +5 (accepted).
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT * FROM t LIMIT - '-5'",
+        )
+        .unwrap();
+        let ast::Statement::Query(q) = &stmts[0] else {
+            panic!("expected query statement");
+        };
+        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
+            q.limit_clause.as_ref()
+        else {
+            panic!("expected LIMIT clause");
+        };
+        assert_eq!(
+            expr_as_nonnegative_usize(expr, "LIMIT").unwrap(),
+            Some(5),
+            "LIMIT - '-5' must evaluate to 5, not error"
+        );
+
         // Non-literal operand: sign unknowable at plan time → unchanged None.
         assert_eq!(
             expr_as_nonnegative_usize(

@@ -86,7 +86,7 @@ fn predicted_recall_for(index_type: IndexType, quantization: QuantizationKind) -
         }
         (IndexType::Hnsw, QuantizationKind::Binary) => 0.85,
         (IndexType::Hnsw, QuantizationKind::Ternary) => 0.90,
-        // Vamana + RaBitQ with default oversample-3 rerank.
+        // Vamana + RaBitQ with the unified BBQ oversample-4 rerank.
         (IndexType::Vamana, QuantizationKind::RaBitQ) => 0.96,
         (IndexType::Vamana, QuantizationKind::Bbq) => 0.96,
         (IndexType::Vamana, QuantizationKind::None) => 0.99,
