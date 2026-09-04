@@ -348,7 +348,7 @@ impl QueryParser for NodeDbQueryParser {
         client: &C,
         sql: &str,
         types: &[Option<Type>],
-    ) -> PgWireResult<Self::Statement>
+    ) -> PgWireResult<Option<Self::Statement>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -370,12 +370,12 @@ impl QueryParser for NodeDbQueryParser {
         // entirely. Authorization still precedes this early return so a denied
         // Parse cannot create a statement that later reaches Execute.
         if crate::control::backup::detect(sql).is_some() {
-            return Ok(ParsedStatement {
+            return Ok(Some(ParsedStatement {
                 sql: sql.to_owned(),
                 param_types: Vec::new(),
                 result_fields: Vec::new(),
                 is_dsl: false,
-            });
+            }));
         }
 
         let can_infer_schema = self
@@ -401,12 +401,12 @@ impl QueryParser for NodeDbQueryParser {
         // (same as the simple-query path) instead of `execute_planned_sql_with_params`.
         let is_dsl = result_fields.is_empty() && is_dsl_statement(sql);
 
-        Ok(ParsedStatement {
+        Ok(Some(ParsedStatement {
             sql: sql.to_owned(),
             param_types,
             result_fields,
             is_dsl,
-        })
+        }))
     }
 
     fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {

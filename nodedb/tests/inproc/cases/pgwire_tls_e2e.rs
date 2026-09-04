@@ -40,7 +40,7 @@ fn generate_self_signed_cert(dir: &TempDir) -> (std::path::PathBuf, std::path::P
         generate_simple_self_signed(subject_alt_names).expect("self-signed cert generation failed");
 
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
 
     let cert_path = dir.path().join("test.crt");
     let key_path = dir.path().join("test.key");

@@ -59,8 +59,8 @@ memmap2 = { workspace = true }
 # transitively and have no workspace entry to track.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
-getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { workspace = true }
+getrandom_02 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -70,7 +70,7 @@ tracing-subscriber = { workspace = true }
 # call `init` and read reports back. Same published version as the optional
 # dependency above, so Cargo still resolves a single package.
 faultbox = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 rand = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -346,7 +346,8 @@ mod tests {
     }
 
     fn gen_cert_with_spiffe(spiffe_uri: &str) -> (Vec<u8>, [u8; 32]) {
-        use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+        use rcgen::string::Ia5String;
+        use rcgen::{CertificateParams, KeyPair, SanType};
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let uri = Ia5String::try_from(spiffe_uri.to_string()).unwrap();

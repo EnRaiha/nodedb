@@ -103,8 +103,14 @@ hkdf = "0.12"
 subtle = "2"
 base64 = "0.23"
 getrandom = { version = "0.4", features = ["std"] }
+# wasm builds pin the older generations: `getrandom` 0.3 needs `wasm_js` and 0.2
+# needs `js` to reach the browser CSPRNG. Both are aliased so one crate can hold
+# all three generations at once.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
+rsa = "0.9"
 zeroize = { version = "1", features = ["derive"] }
 aws-sdk-kms = { version = "1", default-features = false, features = [
   "default-https-client",
@@ -129,7 +135,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 sha2 = { version = "0.10", features = ["oid"] }
 
 # WASM runtime
-wasmtime = { version = "47", default-features = false, features = [
+wasmtime = { version = "48", default-features = false, features = [
   "cranelift",
   "runtime",
 ] }
@@ -250,7 +256,7 @@ quinn = "0.11"
 nexar = "0.1"
 
 # H3 hexagonal spatial index
-h3o = "0.10"
+h3o = "0.11"
 
 # Linear algebra (SVD, matrix ops for OPQ Procrustes rotation)
 nalgebra = "0.35"
@@ -266,7 +272,7 @@ lz4_flex = { version = "0.14", default-features = false, features = [
 pco = "1"
 
 # PostgreSQL wire protocol
-pgwire = { version = "0.40", default-features = false, features = [
+pgwire = { version = "0.41", default-features = false, features = [
   "server-api-aws-lc-rs",
 ] }
 postgres-types = "0.2"
@@ -287,6 +293,34 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
   "aws-lc-rs",
 ] }
 rustls-pemfile = "2"
+
+# SQL parser
+sqlparser = { version = "0.61", features = ["visitor"] }
+
+# X.509 / PEM handling (TLS peer identity, certificate pinning)
+x509-parser = "0.18"
+pem = "4"
+rcgen = "0.14"
+
+# systemd readiness notification (Linux service integration)
+sd-notify = "0.5"
+
+# Pure-Rust zstd decoder (wasm builds, where zstd-sys cannot link)
+ruzstd = "0.9"
+
+# CJK / language segmentation (FTS analyzers)
+lindera = "2.3"
+icu_segmenter = "1"
+whatlang = "0.18"
+
+# Hex encoding
+hex = "0.4"
+
+# Property-based testing
+proptest = "1"
+
+# Fuzzing-adjacent TLS backend shared by cluster transport and its tests
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Benchmarking
 fluxbench = "0.1"

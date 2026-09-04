@@ -63,19 +63,19 @@ zerompk = { workspace = true }
 # QUIC transport (nexar for TLS utilities, quinn for bidi streams)
 nexar = { workspace = true }
 quinn = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 # X.509 DER parsing (SPIFFE URI SAN + SPKI fingerprint extraction)
-x509-parser = "0.16"
+x509-parser = { workspace = true }
 
 # systemd sd_notify readiness integration — Linux only.
 # Wrapped by `crate::readiness` so non-Linux builds no-op cleanly.
 [target.'cfg(target_os = "linux")'.dependencies]
-sd-notify = "0.4"
+sd-notify = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
-tempfile = "3"
-rcgen = "0.13"
+tempfile = { workspace = true }
+rcgen = { workspace = true }

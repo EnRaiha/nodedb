@@ -41,7 +41,7 @@ fn generate_self_signed_cert(dir: &TempDir) -> (std::path::PathBuf, std::path::P
     let cert_path = dir.path().join("test.crt");
     let key_path = dir.path().join("test.key");
     std::fs::write(&cert_path, certified.cert.pem().as_bytes()).expect("write cert");
-    std::fs::write(&key_path, certified.key_pair.serialize_pem().as_bytes()).expect("write key");
+    std::fs::write(&key_path, certified.signing_key.serialize_pem().as_bytes()).expect("write key");
 
     (cert_path, key_path)
 }

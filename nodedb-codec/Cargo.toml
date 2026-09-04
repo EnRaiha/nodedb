@@ -33,7 +33,7 @@ nalgebra = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ruzstd = "0.7"
+ruzstd = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

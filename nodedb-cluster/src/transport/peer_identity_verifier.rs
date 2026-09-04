@@ -287,7 +287,8 @@ mod tests {
 
     #[test]
     fn spiffe_match_accepted() {
-        use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+        use rcgen::string::Ia5String;
+        use rcgen::{CertificateParams, KeyPair, SanType};
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let spiffe_uri =
@@ -308,7 +309,8 @@ mod tests {
 
     #[test]
     fn spiffe_mismatch_falls_through_to_spki_rejection() {
-        use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+        use rcgen::string::Ia5String;
+        use rcgen::{CertificateParams, KeyPair, SanType};
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let spiffe_uri =

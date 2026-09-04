@@ -26,7 +26,7 @@ use tracing::warn;
 pub fn notify_ready() {
     #[cfg(target_os = "linux")]
     {
-        match sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        match sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
             Ok(()) => debug!("sd_notify READY=1 sent"),
             Err(e) => warn!(error = %e, "sd_notify READY=1 failed"),
         }
@@ -47,7 +47,7 @@ pub fn notify_ready() {
 pub fn notify_status(msg: &str) {
     #[cfg(target_os = "linux")]
     {
-        match sd_notify::notify(false, &[sd_notify::NotifyState::Status(msg)]) {
+        match sd_notify::notify(&[sd_notify::NotifyState::Status(msg)]) {
             Ok(()) => debug!(status = msg, "sd_notify STATUS sent"),
             Err(e) => warn!(error = %e, status = msg, "sd_notify STATUS failed"),
         }
@@ -66,7 +66,7 @@ pub fn notify_status(msg: &str) {
 pub fn notify_stopping() {
     #[cfg(target_os = "linux")]
     {
-        match sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]) {
+        match sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
             Ok(()) => debug!("sd_notify STOPPING=1 sent"),
             Err(e) => warn!(error = %e, "sd_notify STOPPING=1 failed"),
         }

@@ -25,15 +25,15 @@ rust-stemmers = { workspace = true }
 unicode-normalization = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-crc32c = "0.6"
+crc32c = { workspace = true }
 arc-swap = { workspace = true }
 
 # Dictionary-based CJK segmentation (always compiled in; selected at runtime)
 # lang-zh falls back to CJK bigrams — the previous dictionary chain pulled
 # jieba-rs → include-flate → libflate → yanked core2, breaking cargo publish.
 # The bigram code path is the permanent state for v0.1.0.
-lindera = { version = "2.3" }
-icu_segmenter = { version = "1" }
-whatlang = { version = "0.18" }
+lindera = { workspace = true }
+icu_segmenter = { workspace = true }
+whatlang = { workspace = true }
 
 [dev-dependencies]

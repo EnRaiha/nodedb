@@ -121,9 +121,9 @@ bytes = { workspace = true }
 # TLS & crypto
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-x509-parser = "0.16"
-pem = "3"
-rsa = "0.9"
+x509-parser = { workspace = true }
+pem = { workspace = true }
+rsa = { workspace = true }
 p256 = { workspace = true }
 p384 = { workspace = true }
 reqwest = { workspace = true }
@@ -151,7 +151,7 @@ zstd = { workspace = true }
 libc = { workspace = true }
 
 # SQL parser (used by function body validation and procedural executor)
-sqlparser = "0.61"
+sqlparser = { workspace = true }
 
 # Memory allocator
 tikv-jemallocator = { workspace = true }
@@ -166,17 +166,17 @@ tokio = { workspace = true, features = ["test-util"] }
 # integration tests can act as a reader: list and inspect reports the running
 # server filed, without depending on the binary's own `faultbox::init` call.
 faultbox = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 tokio-postgres = { workspace = true }
-proptest = "1"
+proptest = { workspace = true }
 nodedb-types = { workspace = true }
 reqwest = { workspace = true }
 nodedb-array = { workspace = true }
 nodedb-test-support = { workspace = true }
-rcgen = "0.13"
+rcgen = { workspace = true }
 zerompk = { workspace = true }
 loro = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io_uring for Data Plane batched I/O (columnar reads, WAL)

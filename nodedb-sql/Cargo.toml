@@ -16,7 +16,7 @@ categories = ["database", "parser-implementations"]
 nodedb-types = { workspace = true }
 nodedb-query = { workspace = true }
 nodedb-spatial = { workspace = true }
-sqlparser = { version = "0.61", features = ["visitor"] }
+sqlparser = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 sonic-rs = { workspace = true }

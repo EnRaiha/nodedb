@@ -26,4 +26,4 @@ libc = { workspace = true }
 tokio = { workspace = true }
 fluxbench = { workspace = true }
 tracing-subscriber = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
