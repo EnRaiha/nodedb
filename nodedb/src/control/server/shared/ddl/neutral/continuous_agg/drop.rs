@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -61,11 +62,14 @@ pub async fn drop_continuous_aggregate(
         ));
     }
 
-    let name = parts
-        .last()
-        .ok_or_else(|| err("42601", "missing continuous aggregate name".to_string()))?
-        .trim_matches(['\'', '"'])
-        .to_lowercase();
+    // A single-quoted spelling of the name is accepted, so strip that quoting
+    // before the identifier decode.
+    let name = parse_ident_token(
+        parts
+            .last()
+            .ok_or_else(|| err("42601", "missing continuous aggregate name".to_string()))?
+            .trim_matches('\''),
+    )?;
     let tenant_id = identity.tenant_id;
     let stored = state
         .credentials

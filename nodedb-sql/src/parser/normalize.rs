@@ -3,7 +3,7 @@
 //! SQL identifier normalization.
 
 use crate::error::{Result, SqlError};
-use crate::reserved::check_ast_identifier;
+use crate::reserved::{check_ast_identifier, check_identifier};
 
 /// Human-readable message for schema-qualified name rejections.
 /// Defined once so all rejection sites produce consistent output.
@@ -86,6 +86,41 @@ fn normalize_table_name(name: &sqlparser::ast::ObjectName) -> Result<String> {
         }
     }
     normalize_object_name_checked(name)
+}
+
+/// Resolve a raw relation token the same way [`normalize_table_name`] resolves
+/// a parsed one.
+///
+/// Handlers that read a relation out of a whitespace-split statement get the
+/// token before `sqlparser` sees it, so they need the rule in token form:
+///
+/// - `pg_catalog.pg_class` → `pg_class`.
+/// - `_system.audit_log` → `_system.audit_log`.
+/// - Any other qualifier is rejected as schema-qualified.
+/// - An unqualified token decodes through [`check_identifier`].
+///
+/// A token carrying a double quote is treated as one identifier, so a quoted
+/// name containing a dot never splits.
+pub fn check_relation_token(raw_name: &str) -> Result<String> {
+    if raw_name.contains('"') || !raw_name.contains('.') {
+        return check_identifier(raw_name);
+    }
+    // Validate every component before reflecting it in an error, the way
+    // `normalize_object_name_checked` does.
+    let parts = raw_name
+        .split('.')
+        .map(check_identifier)
+        .collect::<Result<Vec<_>>>()?;
+    if parts.len() == 2 {
+        match parts[0].as_str() {
+            "pg_catalog" => return Ok(parts[1].clone()),
+            "_system" => return Ok(format!("_system.{}", parts[1])),
+            _ => {}
+        }
+    }
+    Err(SqlError::Unsupported {
+        detail: format!("'{}': {SCHEMA_QUALIFIED_MSG}", parts.join(".")),
+    })
 }
 
 /// Extract table name and optional alias from a table factor.
@@ -197,6 +232,40 @@ mod tests {
         let quote = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("a\"b"))]);
         assert!(matches!(
             normalize_object_name_checked(&quote),
+            Err(SqlError::InvalidIdentifier { .. })
+        ));
+    }
+
+    #[test]
+    fn relation_tokens_accept_the_two_system_qualifiers() {
+        assert_eq!(
+            check_relation_token("_system.audit_log").expect("system relation"),
+            "_system.audit_log"
+        );
+        assert_eq!(
+            check_relation_token("pg_catalog.pg_class").expect("catalog relation"),
+            "pg_class"
+        );
+        assert_eq!(check_relation_token("MiXeD").expect("bare"), "mixed");
+        assert_eq!(check_relation_token("\"MiXeD\"").expect("quoted"), "MiXeD");
+    }
+
+    #[test]
+    fn relation_tokens_reject_other_qualifiers() {
+        for token in ["public.users", "db.public.users"] {
+            assert!(
+                matches!(
+                    check_relation_token(token),
+                    Err(SqlError::Unsupported { .. })
+                ),
+                "{token}"
+            );
+        }
+        // A quoted token never splits, so a dot inside it stays part of the
+        // name and fails the identifier grammar rather than reading as a
+        // qualifier.
+        assert!(matches!(
+            check_relation_token("_system.\"a.b\""),
             Err(SqlError::InvalidIdentifier { .. })
         ));
     }

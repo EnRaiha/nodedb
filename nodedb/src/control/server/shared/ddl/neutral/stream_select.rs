@@ -26,6 +26,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 use crate::control::state::SharedState;
 use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, consume_stream};
@@ -35,15 +36,6 @@ use super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
-}
-
-fn parse_stream_identifier(token: &str) -> Result<String, DdlError> {
-    if let Some(topic_name) = token.strip_prefix("topic:") {
-        let canonical = nodedb_sql::reserved::check_identifier(topic_name)
-            .map_err(|error| err("42602", error.to_string()))?;
-        return Ok(format!("topic:{canonical}"));
-    }
-    nodedb_sql::reserved::check_identifier(token).map_err(|error| err("42602", error.to_string()))
 }
 
 /// Handle `SELECT * FROM STREAM <stream> CONSUMER GROUP <group> [PARTITION <p>] [LIMIT <n>]`
@@ -72,8 +64,8 @@ pub async fn select_from_stream(
         ));
     }
 
-    let stream_name = parse_stream_identifier(parts[4])?;
-    let group_name = parse_stream_identifier(parts[7])?;
+    let stream_name = parse_stream_ident_token(parts[4])?;
+    let group_name = parse_ident_token(parts[7])?;
 
     let mut partition: Option<u32> = None;
     let mut limit: usize = 100;
@@ -256,18 +248,18 @@ fn result_columns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stream_identifier;
+    use super::{parse_ident_token, parse_stream_ident_token};
 
     #[test]
     fn generated_stream_identifiers_decode_without_losing_quoted_case() {
         assert_eq!(
-            parse_stream_identifier("\"orders_stream\"").expect("quoted stream"),
+            parse_stream_ident_token("\"orders_stream\"").expect("quoted stream"),
             "orders_stream"
         );
         assert_eq!(
-            parse_stream_identifier("\"Analytics\"").expect("quoted group"),
+            parse_ident_token("\"Analytics\"").expect("quoted group"),
             "Analytics"
         );
-        assert!(parse_stream_identifier("orders;DROP").is_err());
+        assert!(parse_stream_ident_token("orders;DROP").is_err());
     }
 }

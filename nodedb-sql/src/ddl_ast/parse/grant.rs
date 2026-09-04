@@ -51,15 +51,17 @@ pub(super) fn try_parse(
 /// `DATABASE` and `TENANT` are not handled here — the caller intercepts
 /// them first because they need different statement shapes.
 pub(super) fn classify_object_clause(after: &str, name_after: Option<&str>) -> (String, String) {
+    // Every name stays a raw token. The handler decodes it once, so a quoted
+    // target keeps its case.
     if after.eq_ignore_ascii_case("FUNCTION") {
         (
             "FUNCTION".to_string(),
-            name_after.map(|s| s.to_lowercase()).unwrap_or_default(),
+            name_after.map(|s| s.to_string()).unwrap_or_default(),
         )
     } else if after.eq_ignore_ascii_case("PROCEDURE") {
         (
             "PROCEDURE".to_string(),
-            name_after.map(|s| s.to_lowercase()).unwrap_or_default(),
+            name_after.map(|s| s.to_string()).unwrap_or_default(),
         )
     } else if after.eq_ignore_ascii_case("COLLECTION") || after.eq_ignore_ascii_case("TABLE") {
         (

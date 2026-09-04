@@ -9,6 +9,7 @@
 //! extraction, and the pre-check existence gate are shared by every protocol.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -49,9 +50,9 @@ pub fn drop_materialized_view(
         && parts[3].to_uppercase() == "IF"
         && parts[4].to_uppercase() == "EXISTS"
     {
-        (parts[5].to_lowercase(), true)
+        (parse_ident_token(parts[5])?, true)
     } else {
-        (parts[3].to_lowercase(), false)
+        (parse_ident_token(parts[3])?, false)
     };
 
     // Streaming MVs live in the Event-Plane registry (`mv_registry`), not the

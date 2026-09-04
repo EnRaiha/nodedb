@@ -4,6 +4,8 @@
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_keyword;
 
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
+
 use super::super::super::result::DdlError;
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
@@ -49,18 +51,21 @@ pub(super) fn parse_with_clause(parts: &[&str]) -> Option<String> {
 /// The `(...)` must appear before any `WITH` keyword. Returns `None` if
 /// no column definitions are present (falls back to default schema).
 ///
+/// Returns an error when a column name is not a usable SQL identifier.
+///
 /// Supported types: TIMESTAMP, FLOAT, FLOAT8, INT, INTEGER, VARCHAR, TEXT, BOOLEAN.
-pub(super) fn parse_column_defs(parts: &[&str]) -> Option<Vec<(String, String)>> {
+pub(super) fn parse_column_defs(parts: &[&str]) -> Result<Option<Vec<(String, String)>>, DdlError> {
     let sql = parts.join(" ");
     // Column defs start after name (index 2 in parts) and before WITH.
     // Find the first `(` that is NOT part of a WITH clause.
     let with_pos = find_ascii_keyword(&sql, "WITH").unwrap_or(sql.len());
     let before_with = &sql[..with_pos];
 
-    let open = before_with.find('(')?;
-    let close = before_with.rfind(')')?;
+    let (Some(open), Some(close)) = (before_with.find('('), before_with.rfind(')')) else {
+        return Ok(None);
+    };
     if close <= open {
-        return None;
+        return Ok(None);
     }
 
     let inner = &before_with[open + 1..close];
@@ -75,15 +80,15 @@ pub(super) fn parse_column_defs(parts: &[&str]) -> Option<Vec<(String, String)>>
         if col_parts.len() < 2 {
             continue;
         }
-        let col_name = col_parts[0].to_lowercase();
+        let col_name = parse_ident_token(col_parts[0])?;
         let col_type = col_parts[1].to_uppercase();
         fields.push((col_name, col_type));
     }
 
     if fields.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(fields)
+        Ok(Some(fields))
     }
 }
 
@@ -128,7 +133,7 @@ mod tests {
             "CREATE TIMESERIES metrics (timestamp TIMESTAMP, host VARCHAR, cpu FLOAT)"
                 .split_whitespace()
                 .collect();
-        let cols = parse_column_defs(&parts).unwrap();
+        let cols = parse_column_defs(&parts).unwrap().unwrap();
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0], ("timestamp".into(), "TIMESTAMP".into()));
         assert_eq!(cols[1], ("host".into(), "VARCHAR".into()));
@@ -141,7 +146,7 @@ mod tests {
             "CREATE TIMESERIES metrics (ts TIMESTAMP, val FLOAT) WITH (partition_by = '1d')"
                 .split_whitespace()
                 .collect();
-        let cols = parse_column_defs(&parts).unwrap();
+        let cols = parse_column_defs(&parts).unwrap().unwrap();
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].0, "ts");
         assert_eq!(cols[1].0, "val");
@@ -150,7 +155,7 @@ mod tests {
     #[test]
     fn parse_column_defs_none_when_absent() {
         let parts: Vec<&str> = "CREATE TIMESERIES metrics".split_whitespace().collect();
-        assert!(parse_column_defs(&parts).is_none());
+        assert!(parse_column_defs(&parts).unwrap().is_none());
     }
 
     #[test]
@@ -159,7 +164,7 @@ mod tests {
             .split_whitespace()
             .collect();
         // The `(...)` belongs to WITH, not column defs.
-        assert!(parse_column_defs(&parts).is_none());
+        assert!(parse_column_defs(&parts).unwrap().is_none());
     }
 
     #[test]

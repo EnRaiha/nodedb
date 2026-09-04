@@ -8,6 +8,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -110,7 +111,7 @@ fn parse_show_versions(sql: &str) -> Result<(String, String, usize), DdlError> {
 
     let where_pos = find_ascii_case_insensitive(rest, "WHERE")
         .ok_or_else(|| err("42601", "expected WHERE id = '<doc_id>'".to_string()))?;
-    let collection = rest[..where_pos].trim().to_lowercase();
+    let collection = parse_ident_token(rest[..where_pos].trim())?;
     let after_where = rest[where_pos + 5..].trim();
 
     // Parse "id = 'doc-id'" potentially followed by "LIMIT N"

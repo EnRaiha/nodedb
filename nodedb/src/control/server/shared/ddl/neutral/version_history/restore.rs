@@ -10,6 +10,7 @@ use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 #[cfg(test)]
@@ -186,7 +187,7 @@ fn parse_restore(sql: &str) -> Result<(String, String, String), DdlError> {
     // Collection: before "SET VERSION"
     let set_pos = find_ascii_case_insensitive(rest, "SET VERSION")
         .ok_or_else(|| err("42601", "expected SET VERSION".to_string()))?;
-    let collection = rest[..set_pos].trim().to_lowercase();
+    let collection = parse_ident_token(rest[..set_pos].trim())?;
 
     // Checkpoint: between "=" and "WHERE"
     let after_set = rest[set_pos + 11..].trim(); // After "SET VERSION"

@@ -10,6 +10,7 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use nodedb_types::DatabaseId;
 use serde_json::{Map, Value as JsonValue};
@@ -27,7 +28,7 @@ pub fn show_partitions(
         return Err(ddl_err("42601", "syntax: SHOW PARTITIONS FOR <collection>"));
     }
 
-    let name = parts[3].to_lowercase();
+    let name = parse_ident_token(parts[3])?;
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists and is timeseries.

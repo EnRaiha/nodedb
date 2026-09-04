@@ -32,8 +32,10 @@ pub async fn handle_reindex(
     concurrent: bool,
     database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let collection = collection.to_lowercase();
-    let index_name = index_name.map(str::to_lowercase);
+    // `nodedb_sql::ddl_ast::parse` already applied the canonical identifier
+    // convention, so both names arrive in their stored form.
+    let collection = collection.to_string();
+    let index_name = index_name.map(str::to_string);
     let tenant_id = identity.tenant_id;
 
     // Verify the collection exists.

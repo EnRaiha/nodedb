@@ -14,6 +14,7 @@ use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::catalog::types::StateTransitionDef;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::support::err;
@@ -28,24 +29,27 @@ pub fn add_state_constraint(
     let parts: Vec<&str> = sql.split_whitespace().collect();
     let upper = sql.to_uppercase();
 
-    let coll_name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let coll_name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
-    let constraint_name = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("CONSTRAINT"))
-        .and_then(|i| parts.get(i + 1))
-        .ok_or_else(|| err("42601", "missing constraint name after CONSTRAINT"))?
-        .to_lowercase();
+    let constraint_name = parse_ident_token(
+        parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case("CONSTRAINT"))
+            .and_then(|i| parts.get(i + 1))
+            .ok_or_else(|| err("42601", "missing constraint name after CONSTRAINT"))?,
+    )?;
 
-    let column_name = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("COLUMN"))
-        .and_then(|i| parts.get(i + 1))
-        .ok_or_else(|| err("42601", "missing column name after ON COLUMN"))?
-        .to_lowercase();
+    let column_name = parse_ident_token(
+        parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case("COLUMN"))
+            .and_then(|i| parts.get(i + 1))
+            .ok_or_else(|| err("42601", "missing column name after ON COLUMN"))?,
+    )?;
 
     let transitions = super::parse::parse_transitions(&upper)?;
 
@@ -94,21 +98,22 @@ pub fn add_transition_check(
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    let coll_name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let coll_name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
     let check_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("CHECK"))
         .ok_or_else(|| err("42601", "missing CHECK keyword"))?;
-    let check_name = parts
-        .get(check_idx + 1)
-        .ok_or_else(|| err("42601", "missing name after TRANSITION CHECK"))?
-        .to_lowercase()
-        .trim_matches('(')
-        .to_string();
+    let check_name = parse_ident_token(
+        parts
+            .get(check_idx + 1)
+            .ok_or_else(|| err("42601", "missing name after TRANSITION CHECK"))?
+            .trim_matches('('),
+    )?;
 
     let predicate_expr = super::parse::extract_parenthesized_predicate(sql)?;
     let parsed = super::parse::parse_transition_predicate(&predicate_expr)?;
@@ -153,17 +158,19 @@ pub fn add_check_constraint(
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    let coll_name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let coll_name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
-    let constraint_name = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("CONSTRAINT"))
-        .and_then(|i| parts.get(i + 1))
-        .ok_or_else(|| err("42601", "missing constraint name after CONSTRAINT"))?
-        .to_lowercase();
+    let constraint_name = parse_ident_token(
+        parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case("CONSTRAINT"))
+            .and_then(|i| parts.get(i + 1))
+            .ok_or_else(|| err("42601", "missing constraint name after CONSTRAINT"))?,
+    )?;
 
     let check_sql = super::parse::extract_check_body(sql, "CHECK")?;
 
@@ -238,17 +245,19 @@ pub fn drop_constraint(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
-    let constraint_name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing constraint name"))?
-        .to_lowercase();
+    let constraint_name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing constraint name"))?,
+    )?;
 
-    let coll_name = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("ON"))
-        .and_then(|i| parts.get(i + 1))
-        .ok_or_else(|| err("42601", "DROP CONSTRAINT requires ON <collection>"))?
-        .to_lowercase();
+    let coll_name = parse_ident_token(
+        parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case("ON"))
+            .and_then(|i| parts.get(i + 1))
+            .ok_or_else(|| err("42601", "DROP CONSTRAINT requires ON <collection>"))?,
+    )?;
 
     let catalog = state.credentials.catalog();
 

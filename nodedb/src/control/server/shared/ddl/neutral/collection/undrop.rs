@@ -23,6 +23,7 @@ use nodedb_types::DatabaseId;
 
 use crate::control::security::audit::{AuditEvent, UndropAuditDetail, UndropStage};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -37,7 +38,7 @@ pub fn undrop_collection(
         return Err(DdlError::new("42601", "syntax: UNDROP COLLECTION <name>"));
     }
 
-    let name_lower = parts[2].to_lowercase();
+    let name_lower = parse_ident_token(parts[2])?;
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
 

@@ -10,6 +10,7 @@
 //! Syntax: `CREATE TOPIC <name> [WITH (RETENTION = '1 hour')]`
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::event::cdc::stream_def::RetentionConfig;
 use crate::event::topic::{TopicDef, validate_topic_name};
@@ -33,7 +34,7 @@ pub async fn create_topic(
         return Err(DdlError::new("42601", "expected CREATE TOPIC <name>"));
     }
 
-    let name = parts[2].to_lowercase();
+    let name = parse_ident_token(parts[2])?;
     validate_topic_name(&name).map_err(|message| DdlError::new("42601", message.to_string()))?;
     let tenant_id = identity.tenant_id.as_u64();
     let lifecycle_lock = state

@@ -20,6 +20,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -37,8 +38,7 @@ pub fn subscribe_to(
     sql: &str,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let topic_name = nodedb_sql::reserved::check_identifier(parts.get(2).copied().unwrap_or(""))
-        .map_err(|error| err("42602", error.to_string()))?;
+    let topic_name = parse_ident_token(parts.get(2).copied().unwrap_or(""))?;
     let since_seq: u64 = find_ascii_case_insensitive(sql, " SINCE ")
         .and_then(|pos| sql[pos + 7..].split_whitespace().next())
         .and_then(|s| s.parse().ok())
@@ -48,9 +48,8 @@ pub fn subscribe_to(
     let group_name = find_ascii_case_insensitive(sql, " GROUP ")
         .map(|pos| sql[pos + 7..].split_whitespace().next().unwrap_or(""))
         .filter(|g| !g.is_empty())
-        .map(nodedb_sql::reserved::check_identifier)
-        .transpose()
-        .map_err(|error| err("42602", error.to_string()))?;
+        .map(parse_ident_token)
+        .transpose()?;
 
     let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
     authorize_collection(

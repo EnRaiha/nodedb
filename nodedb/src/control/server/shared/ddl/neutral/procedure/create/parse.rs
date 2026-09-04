@@ -13,6 +13,7 @@
 //! [`DdlError`].
 
 use crate::control::security::catalog::procedure_types::{ParamDirection, ProcedureParam};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 
 use super::super::super::super::result::DdlError;
 use super::super::parens::find_matching_paren;
@@ -59,14 +60,7 @@ pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlErr
     let paren_open = rest
         .find('(')
         .ok_or_else(|| DdlError::new("42601", "expected '(' after procedure name"))?;
-    let name = rest
-        .get(..paren_open)
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
-    if name.is_empty() {
-        return Err(DdlError::new("42601", "procedure name required"));
-    }
+    let name = parse_ident_token(rest.get(..paren_open).unwrap_or_default().trim())?;
 
     let paren_close = find_matching_paren(rest, paren_open)
         .ok_or_else(|| DdlError::new("42601", "unmatched '(' in parameter list"))?;
@@ -144,7 +138,7 @@ fn parse_procedure_params(params_str: &str) -> Result<Vec<ProcedureParam>, DdlEr
             ));
         }
 
-        let name = tokens[name_idx].to_lowercase();
+        let name = parse_ident_token(tokens[name_idx])?;
         let data_type = tokens[name_idx + 1..].join(" ").to_uppercase();
 
         params.push(ProcedureParam {

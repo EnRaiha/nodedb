@@ -6,6 +6,7 @@ use nodedb_types::DatabaseId;
 
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -24,7 +25,7 @@ pub fn alter_timeseries(
         ));
     }
 
-    let name = parts[2].to_lowercase();
+    let name = parse_ident_token(parts[2])?;
     let tenant_id = identity.tenant_id;
 
     {

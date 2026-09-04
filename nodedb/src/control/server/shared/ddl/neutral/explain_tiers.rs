@@ -9,6 +9,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -28,7 +29,7 @@ pub fn explain_tiers(
             "syntax: EXPLAIN TIERS ON <collection> [RANGE <start_ms> <end_ms>]",
         ));
     }
-    let collection = parts[3].to_lowercase();
+    let collection = parse_ident_token(parts[3])?;
     let tenant_id = identity.tenant_id.as_u64();
 
     let policy = state

@@ -6,6 +6,7 @@ use super::helpers::extract_name_after_if_exists;
 use crate::ddl_ast::statement::{NodedbStatement, StreamViewStmt};
 use crate::error::SqlError;
 use crate::parser::preprocess::lex::find_ascii_case_insensitive;
+use crate::reserved::{check_identifier, check_identifier_or_wildcard};
 
 pub(super) fn try_parse(
     upper: &str,
@@ -14,7 +15,7 @@ pub(super) fn try_parse(
 ) -> Option<Result<NodedbStatement, SqlError>> {
     (|| -> Result<Option<NodedbStatement>, SqlError> {
         if upper.starts_with("CREATE CHANGE STREAM ") {
-            return Ok(Some(parse_create_change_stream(upper, trimmed)));
+            return Ok(Some(parse_create_change_stream(upper, trimmed)?));
         }
         if upper.starts_with("DROP CHANGE STREAM ") {
             let if_exists = upper.contains("IF EXISTS");
@@ -28,7 +29,11 @@ pub(super) fn try_parse(
         }
         if upper.starts_with("ALTER CHANGE STREAM ") {
             // ALTER CHANGE STREAM <name> <action>
-            let name = parts.get(3).map(|s| s.to_lowercase()).unwrap_or_default();
+            let name = parts
+                .get(3)
+                .map(|s| check_identifier(s))
+                .transpose()?
+                .unwrap_or_default();
             let action = parts.get(4).map(|s| s.to_uppercase()).unwrap_or_default();
             return Ok(Some(NodedbStatement::StreamView(
                 StreamViewStmt::AlterChangeStream { name, action },
@@ -43,8 +48,11 @@ pub(super) fn try_parse(
         // Consumer group commands live in the same parse scope.
         if upper.starts_with("CREATE CONSUMER GROUP ") {
             // CREATE CONSUMER GROUP <name> ON <stream>
-            let group_name = parts.get(3).map(|s| s.to_lowercase()).unwrap_or_default();
-            let stream_name = parts.get(5).map(|s| s.to_lowercase()).unwrap_or_default();
+            //
+            // Both tokens stay raw. A stream name can carry the `topic:` buffer
+            // prefix, which the handler resolves along with the identifier.
+            let group_name = parts.get(3).map(|s| s.to_string()).unwrap_or_default();
+            let stream_name = parts.get(5).map(|s| s.to_string()).unwrap_or_default();
             return Ok(Some(NodedbStatement::StreamView(
                 StreamViewStmt::CreateConsumerGroup {
                     group_name,
@@ -89,25 +97,28 @@ pub(super) fn try_parse(
 ///
 /// Extracts name, collection, and the raw WITH clause inner text.
 /// The handler converts the raw WITH pairs to OpFilter, StreamFormat, etc.
-fn parse_create_change_stream(_upper: &str, trimmed: &str) -> NodedbStatement {
+///
+/// Returns an error when the stream name or collection is not a usable SQL
+/// identifier.
+fn parse_create_change_stream(_upper: &str, trimmed: &str) -> Result<NodedbStatement, SqlError> {
     let prefix = "CREATE CHANGE STREAM ";
     let rest = &trimmed[prefix.len()..];
     let tokens: Vec<&str> = rest.split_whitespace().collect();
 
-    let name = tokens.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let name = tokens
+        .first()
+        .map(|s| check_identifier(s))
+        .transpose()?
+        .unwrap_or_default();
 
-    // collection = token after ON
+    // collection = token after ON. `*` is the every-collection wildcard, not
+    // an identifier.
     let collection = tokens
         .iter()
         .position(|t| t.eq_ignore_ascii_case("ON"))
         .and_then(|i| tokens.get(i + 1))
-        .map(|s| {
-            if *s == "*" {
-                "*".to_string()
-            } else {
-                s.to_lowercase()
-            }
-        })
+        .map(|s| check_identifier_or_wildcard(s))
+        .transpose()?
         .unwrap_or_default();
 
     // Extract WITH clause inner text (everything inside outer parens after WITH).
@@ -121,11 +132,13 @@ fn parse_create_change_stream(_upper: &str, trimmed: &str) -> NodedbStatement {
         })
         .unwrap_or_default();
 
-    NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
-        name,
-        collection,
-        with_clause_raw,
-    })
+    Ok(NodedbStatement::StreamView(
+        StreamViewStmt::CreateChangeStream {
+            name,
+            collection,
+            with_clause_raw,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -134,7 +147,22 @@ mod tests {
 
     fn create(sql: &str) -> NodedbStatement {
         let upper = sql.to_uppercase();
-        parse_create_change_stream(&upper, sql)
+        parse_create_change_stream(&upper, sql).expect("valid CREATE CHANGE STREAM")
+    }
+
+    #[test]
+    fn quoted_names_keep_case() {
+        if let NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
+            name,
+            collection,
+            ..
+        }) = create("CREATE CHANGE STREAM \"MiXeD\" ON \"OrDeRs\"")
+        {
+            assert_eq!(name, "MiXeD");
+            assert_eq!(collection, "OrDeRs");
+        } else {
+            panic!("expected CreateChangeStream");
+        }
     }
 
     #[test]

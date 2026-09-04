@@ -10,6 +10,7 @@
 //! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -43,9 +44,9 @@ pub fn drop_schedule(
         && parts[2].eq_ignore_ascii_case("IF")
         && parts[3].eq_ignore_ascii_case("EXISTS")
     {
-        (true, parts[4].to_lowercase())
+        (true, parse_ident_token(parts[4])?)
     } else if parts.len() >= 3 {
-        (false, parts[2].to_lowercase())
+        (false, parse_ident_token(parts[2])?)
     } else {
         return Err(DdlError::new(
             "42601",

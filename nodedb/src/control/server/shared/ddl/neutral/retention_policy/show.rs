@@ -23,6 +23,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::retention_policy::types::ArchiveTarget;
 
@@ -39,7 +40,7 @@ pub fn show_retention_policy(
     let tenant_id = identity.tenant_id.as_u64();
     // Determine if filtering by collection.
     let collection_filter = if parts.len() >= 5 && parts[3].eq_ignore_ascii_case("ON") {
-        Some(parts[4].to_lowercase())
+        Some(parse_ident_token(parts[4])?)
     } else {
         None
     };

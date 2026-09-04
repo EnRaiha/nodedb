@@ -29,9 +29,11 @@ pub fn show_changes(
     database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if let Some(coll_name) =
-        crate::control::server::shared::ddl::sql_parse::extract_collection_after(sql, " FOR ")
+    if let Some(coll_token) =
+        crate::control::server::shared::ddl::sql_parse::extract_collection_token_after(sql, " FOR ")
     {
+        let coll_name =
+            crate::control::server::shared::ddl::sql_parse::parse_ident_token(coll_token)?;
         let since_ms: u64 = if let Some(since_pos) = find_ascii_case_insensitive(sql, " SINCE ") {
             let since_str = sql[since_pos + 7..]
                 .split_whitespace()

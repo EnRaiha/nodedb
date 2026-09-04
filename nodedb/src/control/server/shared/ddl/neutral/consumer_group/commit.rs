@@ -17,6 +17,7 @@
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 use crate::control::state::SharedState;
 use crate::event::cdc::CdcOffset;
 use crate::types::DatabaseId;
@@ -101,9 +102,9 @@ pub async fn commit_offset(
                 .map_err(|error: crate::event::cdc::offset::ParseCdcOffsetError| {
                     DdlError::new("42601", error.to_string())
                 })?;
-        let requested_stream = parts[7];
+        let requested_stream = parse_stream_ident_token(parts[7])?;
         let mut stream_name =
-            canonical_stream_name(state, database_id, tenant_id, requested_stream);
+            canonical_stream_name(state, database_id, tenant_id, &requested_stream);
         let topic_lock = stream_name.strip_prefix("topic:").map(|topic| {
             state
                 .ep_topic_registry
@@ -113,8 +114,8 @@ pub async fn commit_offset(
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
-        stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
-        let group_name = parts[10].to_lowercase();
+        stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
+        let group_name = parse_ident_token(parts[10])?;
         authorize_offset_commit(state, identity, database_id, &stream_name)?;
         let lifecycle_lock =
             state
@@ -171,9 +172,9 @@ pub async fn commit_offset(
         && parts[4].eq_ignore_ascii_case("CONSUMER")
         && parts[5].eq_ignore_ascii_case("GROUP")
     {
-        let requested_stream = parts[3];
+        let requested_stream = parse_stream_ident_token(parts[3])?;
         let mut stream_name =
-            canonical_stream_name(state, database_id, tenant_id, requested_stream);
+            canonical_stream_name(state, database_id, tenant_id, &requested_stream);
         let topic_lock = stream_name.strip_prefix("topic:").map(|topic| {
             state
                 .ep_topic_registry
@@ -183,8 +184,8 @@ pub async fn commit_offset(
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
-        stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
-        let group_name = parts[6].to_lowercase();
+        stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
+        let group_name = parse_ident_token(parts[6])?;
         authorize_offset_commit(state, identity, database_id, &stream_name)?;
         let lifecycle_lock =
             state

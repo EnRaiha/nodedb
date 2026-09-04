@@ -26,15 +26,24 @@ impl NodeDbPgHandler {
         session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let coll_name =
-            crate::control::server::shared::ddl::sql_parse::extract_collection_after(sql, " FROM ")
-                .ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "42601".to_owned(),
-                        "syntax: LIVE SELECT [*|fields] FROM <collection> [WHERE ...]".to_owned(),
-                    )))
-                })?;
+        let coll_token =
+            crate::control::server::shared::ddl::sql_parse::extract_collection_token_after(
+                sql, " FROM ",
+            )
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "syntax: LIVE SELECT [*|fields] FROM <collection> [WHERE ...]".to_owned(),
+                )))
+            })?;
+        let coll_name = nodedb_sql::reserved::check_identifier(coll_token).map_err(|error| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42602".to_owned(),
+                error.to_string(),
+            )))
+        })?;
 
         let database_id = self
             .sessions

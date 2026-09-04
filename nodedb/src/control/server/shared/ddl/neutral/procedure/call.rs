@@ -15,6 +15,7 @@ use crate::control::planner::procedural::executor::fuel::ExecutionBudget;
 use crate::control::security::catalog::procedure_types::ParamDirection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -157,14 +158,7 @@ fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
         .find('(')
         .ok_or_else(|| DdlError::new("42601", "expected '(' after procedure name in CALL"))?;
 
-    let name = after_call
-        .get(..paren_pos)
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
-    if name.is_empty() {
-        return Err(DdlError::new("42601", "procedure name required in CALL"));
-    }
+    let name = parse_ident_token(after_call.get(..paren_pos).unwrap_or_default().trim())?;
 
     // Extract arguments between parens.
     let close_paren = find_matching_paren(after_call, paren_pos)

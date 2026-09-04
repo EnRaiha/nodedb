@@ -47,7 +47,14 @@ pub async fn dispatch_register_if_needed(
     sql: &str,
     database_id: DatabaseId,
 ) -> crate::Result<()> {
-    let name = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
+    let name = parts
+        .get(2)
+        .map(|token| nodedb_sql::reserved::check_identifier(token))
+        .transpose()
+        .map_err(|error| crate::Error::BadRequest {
+            detail: error.to_string(),
+        })?
+        .unwrap_or_default();
     let tenant_id = identity.tenant_id;
 
     let catalog = state.credentials.catalog();

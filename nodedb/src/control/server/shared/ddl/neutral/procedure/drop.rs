@@ -10,6 +10,7 @@
 //! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -44,7 +45,7 @@ pub fn drop_procedure(
     if idx >= parts.len() {
         return Err(DdlError::new("42601", "procedure name required"));
     }
-    let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
+    let name = parse_ident_token(parts[idx].trim_end_matches(';'))?;
     let tenant_id = identity.tenant_id.as_u64();
     let database_id = identity
         .default_database

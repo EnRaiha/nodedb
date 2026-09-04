@@ -4,6 +4,7 @@
 
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -23,7 +24,7 @@ pub fn create_timeseries(
         ));
     }
 
-    let name = parts[2].to_lowercase();
+    let name = parse_ident_token(parts[2])?;
     let tenant_id = identity.tenant_id;
 
     match state
@@ -50,12 +51,13 @@ pub fn create_timeseries(
 
     // Parse column definitions from CREATE TIMESERIES name (...) syntax.
     // Falls back to (timestamp, value) if no columns specified.
-    let fields = parse_column_defs(parts).unwrap_or_else(|| {
-        vec![
+    let fields = match parse_column_defs(parts)? {
+        Some(fields) => fields,
+        None => vec![
             ("timestamp".into(), "TIMESTAMP".into()),
             ("value".into(), "FLOAT".into()),
-        ]
-    });
+        ],
+    };
 
     let coll = StoredCollection {
         tenant_id: tenant_id.as_u64(),

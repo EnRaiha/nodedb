@@ -17,6 +17,7 @@ use crate::types::DatabaseId;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 use super::identity::canonical_stream_name;
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 
 /// Handle `CREATE CONSUMER GROUP <name> ON <stream>`.
 ///
@@ -31,9 +32,9 @@ pub async fn create_consumer_group(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create consumer groups")?;
 
-    let group_name = group_name.to_lowercase();
+    let group_name = parse_ident_token(group_name)?;
     let tenant_id = identity.tenant_id.as_u64();
-    let requested_stream_name = stream_name.to_lowercase();
+    let requested_stream_name = parse_stream_ident_token(stream_name)?;
 
     // Consumer groups can be created on change streams or durable topics.
     let mut stream_name =

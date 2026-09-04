@@ -8,6 +8,7 @@
 //! every node.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::event::topic::validate_topic_name;
 use crate::types::DatabaseId;
@@ -28,7 +29,7 @@ pub async fn drop_topic(
         return Err(DdlError::new("42601", "expected DROP TOPIC <name>"));
     }
 
-    let name = parts[2].to_lowercase();
+    let name = parse_ident_token(parts[2])?;
     validate_topic_name(&name).map_err(|message| DdlError::new("42601", message.to_string()))?;
     let tenant_id = identity.tenant_id.as_u64();
     let lifecycle_lock = state

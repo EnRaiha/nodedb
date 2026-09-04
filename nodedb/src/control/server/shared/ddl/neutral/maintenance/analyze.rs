@@ -12,6 +12,7 @@ use nodedb_types::DatabaseId;
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::column_stats::StoredColumnStats;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 
@@ -35,12 +36,13 @@ pub async fn handle_analyze(
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    let collection = parts
-        .get(1)
-        .ok_or_else(|| ddl_err("42601", "ANALYZE requires a collection name"))?
-        .to_lowercase();
+    let collection = parse_ident_token(
+        parts
+            .get(1)
+            .ok_or_else(|| ddl_err("42601", "ANALYZE requires a collection name"))?,
+    )?;
 
-    let specific_columns = parse_column_list(sql);
+    let specific_columns = parse_column_list(sql)?;
 
     let catalog = state.credentials.catalog();
 
@@ -182,18 +184,21 @@ fn push_scan_rows(payload: &str, rows: &mut Vec<String>) {
 }
 
 /// Parse optional `(col1, col2)` column list from ANALYZE statement.
-fn parse_column_list(sql: &str) -> Vec<String> {
+///
+/// An empty entry carries no column, so it drops before the identifier check.
+fn parse_column_list(sql: &str) -> Result<Vec<String>, DdlError> {
     if let Some(paren_start) = sql.find('(')
         && let Some(paren_end) = sql.rfind(')')
     {
         let inner = &sql[paren_start + 1..paren_end];
         return inner
             .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(parse_ident_token)
             .collect();
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 fn now_ms() -> u64 {
@@ -201,4 +206,39 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_column_list;
+
+    #[test]
+    fn column_list_lowercases_bare_names() {
+        assert_eq!(
+            parse_column_list("ANALYZE metrics (Ts, VALUE)").expect("bare columns"),
+            vec!["ts".to_string(), "value".to_string()]
+        );
+    }
+
+    #[test]
+    fn column_list_preserves_quoted_case() {
+        assert_eq!(
+            parse_column_list("ANALYZE metrics (\"Ts\", \"MiXeD\")").expect("quoted columns"),
+            vec!["Ts".to_string(), "MiXeD".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_column_list_yields_no_columns() {
+        assert!(
+            parse_column_list("ANALYZE metrics")
+                .expect("no column list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_column_name_is_rejected() {
+        assert!(parse_column_list("ANALYZE metrics (\"unterminated)").is_err());
+    }
 }

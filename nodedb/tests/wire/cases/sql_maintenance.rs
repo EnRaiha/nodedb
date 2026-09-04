@@ -96,6 +96,59 @@ async fn reindex() {
     server.exec("REINDEX TABLE users").await.unwrap();
 }
 
+/// Maintenance statements resolve a quoted mixed-case collection.
+///
+/// A quoted identifier keeps its case in the catalog. A handler that reads the
+/// name out of the raw statement must strip the quotes and preserve that case,
+/// or every lookup here fails with `does not exist`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_resolves_quoted_mixed_case_collection() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE COLLECTION \"MiXeD\" FIELDS (ts BIGINT, value FLOAT)")
+        .await
+        .unwrap();
+
+    server.exec("COMPACT \"MiXeD\"").await.unwrap();
+    server.exec("ANALYZE \"MiXeD\"").await.unwrap();
+    server.exec("ANALYZE \"MiXeD\" (ts)").await.unwrap();
+    server.exec("REINDEX \"MiXeD\"").await.unwrap();
+
+    let rows = server
+        .query_named_rows("SHOW STORAGE FOR \"MiXeD\"")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.first().and_then(|row| row.get("collection")),
+        Some(&"MiXeD".to_string()),
+        "SHOW STORAGE reports the stored name"
+    );
+}
+
+/// A lowercased spelling of a quoted mixed-case name names no collection.
+///
+/// This pins the direction of the convention: `COMPACT mixed` must not reach
+/// the collection stored as `MiXeD`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_rejects_lowercased_spelling_of_quoted_collection() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE COLLECTION \"CaseD\" FIELDS (ts BIGINT)")
+        .await
+        .unwrap();
+
+    assert!(
+        server.exec("COMPACT cased").await.is_err(),
+        "a bare token lowercases and names a different collection"
+    );
+    assert!(
+        server.exec("ANALYZE cased").await.is_err(),
+        "a bare token lowercases and names a different collection"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn show_storage_and_compaction() {
     let server = TestServer::start().await;

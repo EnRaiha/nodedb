@@ -17,7 +17,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::catalog::types::FieldDefinition;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
-use crate::control::server::shared::ddl::sql_parse::extract_clause;
+use crate::control::server::shared::ddl::sql_parse::{extract_clause, parse_ident_token};
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
@@ -46,8 +46,8 @@ pub fn define_field(
         ));
     }
 
-    let field_name = parts[2].to_lowercase();
-    let collection = parts[4].to_lowercase();
+    let field_name = parse_ident_token(parts[2])?;
+    let collection = parse_ident_token(parts[4])?;
     let tenant_id = identity.tenant_id;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
@@ -168,8 +168,8 @@ pub fn define_event(
         ));
     }
 
-    let event_name = parts[2].to_lowercase();
-    let collection = parts[4].to_lowercase();
+    let event_name = parse_ident_token(parts[2])?;
+    let collection = parse_ident_token(parts[4])?;
     let tenant_id = identity.tenant_id;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));

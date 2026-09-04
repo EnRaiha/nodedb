@@ -22,7 +22,11 @@ pub(crate) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::co
         });
     }
 
-    let name = tokens[0].to_lowercase();
+    let name = nodedb_sql::reserved::check_identifier(tokens[0]).map_err(|error| {
+        crate::Error::BadRequest {
+            detail: error.to_string(),
+        }
+    })?;
 
     // Find the type string (may span tokens for VECTOR(dim)).
     let keywords = [

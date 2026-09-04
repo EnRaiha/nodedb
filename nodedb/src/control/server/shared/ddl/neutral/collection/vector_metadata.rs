@@ -24,6 +24,7 @@ use nodedb_types::{VectorModelEntry, VectorModelMetadata};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
@@ -48,16 +49,17 @@ pub fn handle_set_vector_metadata(
         ));
     }
 
-    let collection = parts[2].to_lowercase();
+    let collection = parse_ident_token(parts[2])?;
     // Find column name after " ON " (the second ON after "METADATA ON").
     let metadata_on_pos = find_ascii_case_insensitive(sql, "METADATA ON ")
         .ok_or_else(|| err("42601", "expected METADATA ON <column>"))?;
     let after_on = sql[metadata_on_pos + "METADATA ON ".len()..].trim();
-    let column = after_on
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| err("42601", "expected column name after ON"))?
-        .to_lowercase();
+    let column = parse_ident_token(
+        after_on
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| err("42601", "expected column name after ON"))?,
+    )?;
 
     // Verify collection exists.
     if state

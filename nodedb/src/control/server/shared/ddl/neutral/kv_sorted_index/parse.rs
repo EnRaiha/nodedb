@@ -15,7 +15,7 @@ pub(super) fn parse_sort_columns(cols_str: &str) -> Result<Vec<(String, String)>
         if tokens.is_empty() {
             continue;
         }
-        let name = tokens[0].to_lowercase();
+        let name = crate::control::server::shared::ddl::sql_parse::parse_ident_token(tokens[0])?;
         let dir = if tokens.len() > 1 {
             tokens[1].to_uppercase()
         } else {

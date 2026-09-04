@@ -8,6 +8,7 @@
 //! applied consistently on every node.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::catalog::propose_and_apply;
@@ -229,6 +230,6 @@ fn parse_drop_trigger(parts: &[&str]) -> Result<(String, bool), DdlError> {
     if idx >= parts.len() {
         return Err(DdlError::new("42601", "trigger name required"));
     }
-    let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
+    let name = parse_ident_token(parts[idx].trim_end_matches(';'))?;
     Ok((name, if_exists))
 }

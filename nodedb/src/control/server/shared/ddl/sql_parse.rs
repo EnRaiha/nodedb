@@ -6,6 +6,8 @@ use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from,
 };
 
+use super::result::DdlError;
+
 /// Split VALUES content respecting quoted strings and brackets.
 ///
 /// `'hello', 42, 'it''s'` → `["'hello'", "42", "'it''s'"]`
@@ -189,16 +191,18 @@ pub(crate) fn extract_clause(
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Extract a collection name after a SQL keyword marker.
+/// Extract the raw collection token after a SQL keyword marker.
 ///
 /// Given `sql = "SHOW CHANGES FOR users SINCE ..."` and `marker = " FOR "`,
-/// returns `Some("users")`. Returns `None` if the marker is missing or
-/// the collection name is empty.
-pub(crate) fn extract_collection_after(sql: &str, marker: &str) -> Option<String> {
+/// returns `Some("users")`. Returns `None` when the marker is missing or no
+/// token follows it.
+///
+/// The token keeps its quoting. Each caller decodes it through
+/// [`parse_ident_token`], or through `nodedb_sql::reserved::check_identifier`
+/// when it reports a different error type.
+pub(crate) fn extract_collection_token_after<'a>(sql: &'a str, marker: &str) -> Option<&'a str> {
     let pos = find_ascii_case_insensitive(sql, marker)?;
-    let after = sql[pos + marker.len()..].trim();
-    let name = after.split_whitespace().next()?.to_lowercase();
-    if name.is_empty() { None } else { Some(name) }
+    sql[pos + marker.len()..].split_whitespace().next()
 }
 
 /// Parse a timestamp from a SINCE clause.
@@ -216,6 +220,53 @@ pub(crate) fn parse_since_timestamp(input: &str) -> crate::Result<u64> {
             "invalid SINCE format: '{input}'. Expected ISO 8601 datetime or milliseconds"
         ),
     })
+}
+
+/// Resolve a raw statement token to the stored identifier it names.
+///
+/// Handlers that read a name straight out of a whitespace-split statement get
+/// the token with its double quotes still attached. `check_identifier` decodes
+/// it the way the DDL parser front end does: a quoted token keeps its case, a
+/// bare token lowercases, and a malformed or reserved token is rejected.
+///
+/// The same function guards `CREATE COLLECTION`, so a name it rejects here can
+/// name no stored object.
+pub fn parse_ident_token(token: &str) -> Result<String, DdlError> {
+    nodedb_sql::reserved::check_identifier(token)
+        .map_err(|error| DdlError::new("42602", error.to_string()))
+}
+
+/// Resolve a raw token that names an identifier or the `*` wildcard.
+///
+/// A clause meaning "every column" or "every collection" carries `*` where an
+/// identifier otherwise sits. Only the clauses whose grammar accepts the
+/// wildcard call this; every other slot stays on [`parse_ident_token`].
+pub fn parse_ident_or_wildcard_token(token: &str) -> Result<String, DdlError> {
+    nodedb_sql::reserved::check_identifier_or_wildcard(token)
+        .map_err(|error| DdlError::new("42602", error.to_string()))
+}
+
+/// Resolve a raw token that names a relation, which can be a system catalog
+/// relation such as `_system.audit_log` or `pg_catalog.pg_class`.
+///
+/// Only a statement whose target can be a catalog relation calls this. A
+/// statement that addresses user collections alone stays on
+/// [`parse_ident_token`], so a qualified name there is still rejected.
+pub fn parse_relation_token(token: &str) -> Result<String, DdlError> {
+    nodedb_sql::parser::normalize::check_relation_token(token)
+        .map_err(|error| DdlError::new("42602", error.to_string()))
+}
+
+/// Resolve a raw stream token, keeping the `topic:` buffer-key prefix.
+///
+/// A consumer group names either a change stream or a topic. The `topic:`
+/// prefix is a storage key, not part of the identifier, so it passes through
+/// while the name after it goes through [`parse_ident_token`].
+pub fn parse_stream_ident_token(token: &str) -> Result<String, DdlError> {
+    match token.strip_prefix("topic:") {
+        Some(topic) => Ok(format!("topic:{}", parse_ident_token(topic)?)),
+        None => parse_ident_token(token),
+    }
 }
 
 /// Decode a hex string into bytes.
@@ -236,7 +287,66 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_clause, parse_sql_value};
+    use super::{extract_clause, parse_ident_token, parse_sql_value, parse_stream_ident_token};
+
+    #[test]
+    fn bare_ident_token_lowercases() {
+        assert_eq!(parse_ident_token("MiXeD").expect("bare"), "mixed");
+        assert_eq!(parse_ident_token("USERS").expect("bare"), "users");
+    }
+
+    #[test]
+    fn bare_lowercase_ident_token_is_unchanged() {
+        assert_eq!(parse_ident_token("users").expect("bare"), "users");
+    }
+
+    #[test]
+    fn quoted_ident_token_preserves_case() {
+        assert_eq!(parse_ident_token("\"MiXeD\"").expect("quoted"), "MiXeD");
+        assert_eq!(
+            parse_ident_token("\"MiXeD 雪\"").expect("quoted"),
+            "MiXeD 雪"
+        );
+    }
+
+    #[test]
+    fn quoted_lowercase_ident_token_is_unchanged() {
+        assert_eq!(parse_ident_token("\"users\"").expect("quoted"), "users");
+    }
+
+    #[test]
+    fn malformed_ident_tokens_are_rejected() {
+        // A name `check_identifier` rejects can name no stored object, so the
+        // handler reports it instead of looking it up.
+        for token in ["\"unterminated", "\"a\"\"b\"", "\"\"", "\"", "name;drop"] {
+            let error = parse_ident_token(token).expect_err(token);
+            assert_eq!(error.sqlstate, "42602", "{token}");
+        }
+    }
+
+    #[test]
+    fn reserved_bare_ident_token_is_rejected() {
+        // `CREATE COLLECTION match` is rejected by the same check, so no
+        // collection named `match` exists to look up.
+        assert!(parse_ident_token("match").is_err());
+        assert_eq!(parse_ident_token("\"MATCH\"").expect("quoted"), "MATCH");
+    }
+
+    #[test]
+    fn stream_ident_token_keeps_topic_prefix() {
+        assert_eq!(
+            parse_stream_ident_token("topic:MiXeD").expect("bare topic"),
+            "topic:mixed"
+        );
+        assert_eq!(
+            parse_stream_ident_token("topic:\"MiXeD\"").expect("quoted topic"),
+            "topic:MiXeD"
+        );
+        assert_eq!(
+            parse_stream_ident_token("\"MiXeD\"").expect("change stream"),
+            "MiXeD"
+        );
+    }
 
     #[test]
     fn parse_sql_value_decodes_numeric_array_literals() {

@@ -110,6 +110,18 @@ pub fn check_identifier(raw_name: &str) -> Result<String, SqlError> {
     normalize_bare(raw_name)
 }
 
+/// Validate a raw token that names either an identifier or the `*` wildcard.
+///
+/// Clauses that accept "every column" or "every collection" carry `*` in the
+/// slot an identifier otherwise fills. The wildcard is recognized first, so the
+/// identifier grammar never sees it.
+pub fn check_identifier_or_wildcard(raw_name: &str) -> Result<String, SqlError> {
+    if raw_name == "*" {
+        return Ok("*".to_string());
+    }
+    check_identifier(raw_name)
+}
+
 fn decode_raw_quoted_identifier(raw_name: &str) -> Result<String, SqlError> {
     let mut rest = raw_name
         .strip_prefix('"')

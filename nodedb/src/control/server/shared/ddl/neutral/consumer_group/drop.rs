@@ -9,6 +9,7 @@
 //! Syntax: `DROP CONSUMER GROUP <name> ON <stream>`
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -33,10 +34,10 @@ pub async fn drop_consumer_group(
         ));
     }
 
-    let group_name = parts[3].to_lowercase();
+    let group_name = parse_ident_token(parts[3])?;
     let tenant_id = identity.tenant_id.as_u64();
-    let requested_stream = parts[5];
-    let mut stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
+    let requested_stream = parse_stream_ident_token(parts[5])?;
+    let mut stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
     let topic_lock = stream_name.strip_prefix("topic:").map(|topic| {
         state
             .ep_topic_registry
@@ -46,7 +47,7 @@ pub async fn drop_consumer_group(
         Some(lock) => Some(lock.lock_owned().await),
         None => None,
     };
-    stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
+    stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
     let lifecycle_lock =
         state
             .group_registry

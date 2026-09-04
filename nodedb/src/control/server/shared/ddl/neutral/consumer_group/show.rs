@@ -18,6 +18,7 @@ use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::identity::canonical_stream_name;
+use crate::control::server::shared::ddl::sql_parse::parse_stream_ident_token;
 
 /// Handle `SHOW CONSUMER GROUPS ON <stream>`
 pub fn show_consumer_groups(
@@ -35,7 +36,8 @@ pub fn show_consumer_groups(
     }
 
     let tenant_id = identity.tenant_id.as_u64();
-    let stream_name = canonical_stream_name(state, database_id, tenant_id, parts[4]);
+    let requested_stream = parse_stream_ident_token(parts[4])?;
+    let stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
 
     let columns = vec![
         "group_name".to_string(),
@@ -98,7 +100,8 @@ pub fn show_partitions(
     }
 
     let tenant_id = identity.tenant_id.as_u64();
-    let stream_name = canonical_stream_name(state, database_id, tenant_id, parts[3]);
+    let requested_stream = parse_stream_ident_token(parts[3])?;
+    let stream_name = canonical_stream_name(state, database_id, tenant_id, &requested_stream);
 
     // Get the stream's buffer from the CdcRouter.
     let buffer = state

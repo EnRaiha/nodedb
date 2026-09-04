@@ -9,6 +9,7 @@
 //! [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::catalog::propose_and_apply;
@@ -60,7 +61,7 @@ pub fn alter_function(
         ));
     }
 
-    let name = parts[2].to_lowercase();
+    let name = parse_ident_token(parts[2])?;
     let action = parts[3].to_uppercase();
 
     // ALTER FUNCTION <name> SET (FUEL = N, MEMORY = N)

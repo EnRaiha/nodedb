@@ -13,6 +13,7 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::IndexKind;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
@@ -46,21 +47,22 @@ pub async fn create_sorted_index(
     // Extract index name.
     let rest = nodedb_types::strip_prefix_ascii_case_insensitive(sql, "CREATE SORTED INDEX ")
         .ok_or_else(|| ddl_err("42601", "expected CREATE SORTED INDEX"))?;
-    let index_name = rest
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| ddl_err("42601", "missing index name"))?
-        .to_lowercase();
+    let index_name = parse_ident_token(
+        rest.split_whitespace()
+            .next()
+            .ok_or_else(|| ddl_err("42601", "missing index name"))?,
+    )?;
 
     // Extract collection name after ON.
     let on_pos = find_ascii_case_insensitive(sql, " ON ")
         .ok_or_else(|| ddl_err("42601", "missing ON clause"))?;
     let after_on = sql[on_pos + 4..].trim();
-    let collection = after_on
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| ddl_err("42601", "missing collection name after ON"))?
-        .to_lowercase();
+    let collection = parse_ident_token(
+        after_on
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| ddl_err("42601", "missing collection name after ON"))?,
+    )?;
 
     // Extract sort columns from parentheses.
     let paren_start = sql
@@ -166,11 +168,11 @@ pub async fn drop_sorted_index(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let rest = nodedb_types::strip_prefix_ascii_case_insensitive(sql, "DROP SORTED INDEX ")
         .ok_or_else(|| ddl_err("42601", "expected DROP SORTED INDEX"))?;
-    let index_name = rest
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| ddl_err("42601", "missing index name"))?
-        .to_lowercase();
+    let index_name = parse_ident_token(
+        rest.split_whitespace()
+            .next()
+            .ok_or_else(|| ddl_err("42601", "missing index name"))?,
+    )?;
 
     let tenant_id = identity.tenant_id;
     // Resolved before the engine state goes: the registry row is what the

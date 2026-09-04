@@ -25,6 +25,7 @@ use nodedb_types::DatabaseId;
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::permission_tree::types::PermissionTreeDef;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
@@ -53,7 +54,7 @@ pub async fn set_permission_tree(
     let start = "ALTER COLLECTION ".len();
     let end = find_ascii_case_insensitive(sql, " SET PERMISSION_TREE")
         .ok_or_else(|| err("42601", "expected SET PERMISSION_TREE"))?;
-    let collection = sql[start..end].trim().to_lowercase();
+    let collection = parse_ident_token(sql[start..end].trim())?;
 
     // Extract JSON: everything after '=' trimmed, between single quotes.
     let eq_pos = sql[end..]
@@ -126,7 +127,7 @@ pub async fn drop_permission_tree(
     let start = "ALTER COLLECTION ".len();
     let end = find_ascii_case_insensitive(sql, " DROP PERMISSION_TREE")
         .ok_or_else(|| err("42601", "expected DROP PERMISSION_TREE"))?;
-    let collection = sql[start..end].trim().to_lowercase();
+    let collection = parse_ident_token(sql[start..end].trim())?;
 
     let tenant_id = identity.tenant_id;
 

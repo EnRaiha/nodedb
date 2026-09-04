@@ -163,7 +163,9 @@ pub(super) async fn try_string(
                 "expected SELECT * FROM TOPIC <topic> CONSUMER GROUP <group>",
             )));
         }
-        let prefixed_name = format!("topic:{}", parts[4].to_lowercase());
+        // The token stays raw. `select_from_stream` decodes the name once,
+        // after the `topic:` prefix.
+        let prefixed_name = format!("topic:{}", parts[4]);
         let stream_keyword = "STREAM";
         let mut rewritten = Vec::with_capacity(parts.len());
         for (i, &p) in parts.iter().enumerate() {

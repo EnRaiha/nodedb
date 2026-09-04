@@ -14,6 +14,7 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::server::shared::ddl::sync_dispatch::{
     SystemReason, SystemTask, dispatch_system,
 };
@@ -184,11 +185,7 @@ fn parse_checkpoint_sql(sql: &str, prefix: &str) -> Result<(String, String, Stri
 
     let where_pos = find_ascii_case_insensitive(after_on, "WHERE")
         .ok_or_else(|| err("42601", "expected WHERE id = '<doc_id>'".to_string()))?;
-    let collection = after_on
-        .get(..where_pos)
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
+    let collection = parse_ident_token(after_on.get(..where_pos).unwrap_or_default().trim())?;
     let where_clause = after_on
         .get(where_pos + "WHERE".len()..)
         .unwrap_or_default()

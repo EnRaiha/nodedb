@@ -35,7 +35,9 @@ pub async fn estimate_count(
             .map(|s| s.trim().trim_matches('\''))
             .collect();
         if args.len() >= 2 {
-            let coll = args[0].to_lowercase();
+            // A string literal is data: the collection name resolves exactly as
+            // written, with no case folding.
+            let coll = args[0].to_string();
             let field = args[1].to_string();
             let tenant_id = identity.tenant_id;
 

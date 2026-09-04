@@ -9,6 +9,7 @@
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -28,7 +29,7 @@ pub fn rewrite_partitions(
         ));
     }
 
-    let name = parts[3].to_lowercase();
+    let name = parse_ident_token(parts[3])?;
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists and is timeseries.

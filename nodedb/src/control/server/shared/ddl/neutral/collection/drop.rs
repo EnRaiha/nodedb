@@ -56,7 +56,8 @@ pub struct DropCollectionRequest<'a> {
 /// DROP { COLLECTION | TABLE } [IF EXISTS] <name> [PURGE] [CASCADE [FORCE]]
 ///
 /// All fields arrive pre-parsed from `NodedbStatement::DropCollection`:
-/// - `name`: collection (lowercased by the parser).
+/// - `name`: collection, decoded by the parser via `check_identifier`
+///   (a quoted name keeps its case, a bare name lowercases).
 /// - `if_exists`: suppress `42P01` when the target does not exist.
 /// - `purge`: hard-delete via `PurgeCollection` (admin only).
 /// - `cascade` / `cascade_force`: reject for now (atomic batched
@@ -79,8 +80,6 @@ pub fn drop_collection(
         cascade_force,
         database_id,
     } = *req;
-    let name_lower = name.to_lowercase();
-    let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
 
     // Dependent-object check. When CASCADE is NOT specified we refuse

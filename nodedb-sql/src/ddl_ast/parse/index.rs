@@ -5,6 +5,7 @@
 use super::helpers::extract_name_after_if_exists;
 use crate::ddl_ast::statement::{CollectionStmt, NodedbStatement};
 use crate::error::SqlError;
+use crate::reserved::check_identifier;
 
 pub(super) fn try_parse(
     upper: &str,
@@ -74,7 +75,7 @@ pub(super) fn try_parse(
                             .to_string(),
                     });
                 }
-                index_name = Some(name.to_lowercase());
+                index_name = Some(check_identifier(name)?);
                 offset += 1;
             }
 
@@ -91,7 +92,7 @@ pub(super) fn try_parse(
             // Remaining token is the collection name
             let collection = match parts.get(offset) {
                 None => return Ok(None),
-                Some(s) => s.to_lowercase(),
+                Some(s) => check_identifier(s)?,
             };
 
             return Ok(Some(NodedbStatement::Collection(CollectionStmt::Reindex {
@@ -161,11 +162,7 @@ fn parse_create_index(
                         ),
                     });
                 }
-                let name = token.to_lowercase();
-                (
-                    if name.is_empty() { None } else { Some(name) },
-                    idx_offset + 1,
-                )
+                (Some(check_identifier(token)?), idx_offset + 1)
             }
         }
     };
@@ -173,12 +170,14 @@ fn parse_create_index(
     // parts[on_offset] should be "ON"; collection follows.
     let raw_collection_token = parts.get(on_offset + 1).copied().unwrap_or("");
 
+    // The collection and the field are both identifiers: a quoted token keeps
+    // its case, a bare one lowercases.
     let (collection, field) = if let Some(paren_pos) = raw_collection_token.find('(') {
         // Inline form: `collection(field)`.
-        let coll = raw_collection_token[..paren_pos].to_lowercase();
-        let fld = raw_collection_token[paren_pos..]
-            .trim_matches(|c| c == '(' || c == ')')
-            .to_string();
+        let coll = check_identifier(&raw_collection_token[..paren_pos])?;
+        let fld = check_identifier(
+            raw_collection_token[paren_pos..].trim_matches(|c| c == '(' || c == ')'),
+        )?;
         (coll, fld)
     } else if parts
         .get(on_offset + 2)
@@ -186,16 +185,19 @@ fn parse_create_index(
         .unwrap_or(false)
     {
         // FIELDS keyword form: ON collection FIELDS field
-        let coll = raw_collection_token.to_lowercase();
-        let fld = parts.get(on_offset + 3).copied().unwrap_or("").to_string();
+        let coll = check_identifier(raw_collection_token)?;
+        let fld = check_identifier(parts.get(on_offset + 3).copied().unwrap_or(""))?;
         (coll, fld)
     } else {
         // Standard form: ON collection (field)
-        let coll = raw_collection_token.to_lowercase();
-        let fld = parts
-            .get(on_offset + 2)
-            .map(|s| s.trim_matches(|c| c == '(' || c == ')').to_string())
-            .unwrap_or_default();
+        let coll = check_identifier(raw_collection_token)?;
+        let fld = check_identifier(
+            parts
+                .get(on_offset + 2)
+                .copied()
+                .unwrap_or("")
+                .trim_matches(|c| c == '(' || c == ')'),
+        )?;
         (coll, fld)
     };
 
@@ -322,6 +324,30 @@ mod tests {
         assert!(parsed.if_not_exists);
         assert!(parsed.index_name.is_none());
         assert_eq!(parsed.collection, "users");
+        assert_eq!(parsed.field, "email");
+    }
+
+    #[test]
+    fn quoted_index_collection_and_field_keep_their_case() {
+        let parsed = parse_index("CREATE INDEX \"IdX\" ON \"MiXeD\" (\"EmAiL\")");
+        assert_eq!(parsed.index_name.as_deref(), Some("IdX"));
+        assert_eq!(parsed.collection, "MiXeD");
+        assert_eq!(parsed.field, "EmAiL");
+
+        let fields_form = parse_index("CREATE INDEX idx ON \"MiXeD\" FIELDS \"EmAiL\"");
+        assert_eq!(fields_form.collection, "MiXeD");
+        assert_eq!(fields_form.field, "EmAiL");
+
+        let inline = parse_index("CREATE INDEX idx ON \"MiXeD\"(\"EmAiL\")");
+        assert_eq!(inline.collection, "MiXeD");
+        assert_eq!(inline.field, "EmAiL");
+    }
+
+    #[test]
+    fn bare_index_collection_and_field_lowercase() {
+        let parsed = parse_index("CREATE INDEX IdX ON MiXeD (EmAiL)");
+        assert_eq!(parsed.index_name.as_deref(), Some("idx"));
+        assert_eq!(parsed.collection, "mixed");
         assert_eq!(parsed.field, "email");
     }
 

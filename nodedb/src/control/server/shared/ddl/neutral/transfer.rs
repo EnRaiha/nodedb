@@ -40,7 +40,9 @@ pub async fn transfer(
         ));
     }
 
-    let collection = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the collection name resolves exactly as
+    // written, with no case folding.
+    let collection = unquote(&args[0]);
     let source_key = unquote(&args[1]);
     let dest_key = unquote(&args[2]);
     let field = unquote(&args[3]);
@@ -129,8 +131,10 @@ pub async fn transfer_item(
         ));
     }
 
-    let source_collection = unquote(&args[0]).to_lowercase();
-    let dest_collection = unquote(&args[1]).to_lowercase();
+    // A string literal is data: each collection name resolves exactly as
+    // written, with no case folding.
+    let source_collection = unquote(&args[0]);
+    let dest_collection = unquote(&args[1]);
     let item_id = unquote(&args[2]);
     let source_owner = unquote(&args[3]);
     let dest_owner = unquote(&args[4]);

@@ -98,12 +98,16 @@ fn extract_dml_target_collection(sql: &str) -> Option<String> {
     let upper = trimmed.to_uppercase();
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
 
+    // A token that names no usable identifier leaves the target undetermined,
+    // which is what `None` already means here.
+    let decode =
+        |token: &str| crate::control::server::shared::ddl::sql_parse::parse_ident_token(token).ok();
     if upper.starts_with("INSERT INTO") && tokens.len() >= 3 {
-        Some(tokens[2].to_lowercase().trim_matches('(').to_string())
+        decode(tokens[2].trim_matches('('))
     } else if upper.starts_with("UPDATE") && tokens.len() >= 2 {
-        Some(tokens[1].to_lowercase())
+        decode(tokens[1])
     } else if upper.starts_with("DELETE FROM") && tokens.len() >= 3 {
-        Some(tokens[2].to_lowercase())
+        decode(tokens[2])
     } else {
         None
     }

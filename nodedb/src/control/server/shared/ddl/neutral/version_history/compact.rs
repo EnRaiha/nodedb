@@ -6,6 +6,7 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
 use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -107,7 +108,7 @@ fn parse_compact(sql: &str) -> Result<(String, String, String), DdlError> {
     // Collection: before WHERE.
     let where_pos = find_ascii_case_insensitive(rest, "WHERE")
         .ok_or_else(|| err("42601", "expected WHERE".to_string()))?;
-    let collection = rest[..where_pos].trim().to_lowercase();
+    let collection = parse_ident_token(rest[..where_pos].trim())?;
     let after_where = rest[where_pos + 5..].trim();
 
     // id = 'doc-id' BEFORE 'checkpoint'

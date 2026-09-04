@@ -21,6 +21,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, Permission, Role
 use crate::control::security::permission::{
     format_permission, function_target, parse_permission, procedure_target, tenant_target,
 };
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_relation_token};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -136,13 +137,13 @@ fn resolve_target(
     target_name: &str,
 ) -> Result<(String, String), DdlError> {
     if target_type.eq_ignore_ascii_case("FUNCTION") {
-        let name = target_name.to_lowercase();
+        let name = parse_ident_token(target_name)?;
         Ok((
             function_target(identity.tenant_id, &name),
             format!("function '{name}'"),
         ))
     } else if target_type.eq_ignore_ascii_case("PROCEDURE") {
-        let name = target_name.to_lowercase();
+        let name = parse_ident_token(target_name)?;
         Ok((
             procedure_target(identity.tenant_id, &name),
             format!("procedure '{name}'"),
@@ -159,9 +160,13 @@ fn resolve_target(
         }
         Ok((tenant_target(tenant_id), format!("tenant '{target_name}'")))
     } else {
+        // A grant target can name a system catalog relation, so the qualified
+        // `_system.` / `pg_catalog.` forms resolve here the way a SELECT
+        // resolves them.
+        let name = parse_relation_token(target_name)?;
         Ok((
-            format!("collection:{}:{target_name}", identity.tenant_id.as_u64()),
-            format!("collection '{target_name}'"),
+            format!("collection:{}:{name}", identity.tenant_id.as_u64()),
+            format!("collection '{name}'"),
         ))
     }
 }

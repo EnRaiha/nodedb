@@ -26,6 +26,7 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::server::shared::ddl::sync_dispatch::{
     SystemReason, SystemTask, dispatch_system,
 };
@@ -193,11 +194,12 @@ fn parse_convert_sql(
     let coll_pos = find_ascii_case_insensitive(sql, "COLLECTION ")
         .ok_or_else(|| err("42601", "expected COLLECTION keyword"))?;
     let after_coll = sql[coll_pos + 11..].trim_start();
-    let collection = after_coll
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let collection = parse_ident_token(
+        after_coll
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
     // Extract target type: TO <type>
     let to_pos = find_ascii_case_insensitive_from(sql, " TO ", coll_pos + 11)
@@ -269,7 +271,7 @@ fn parse_column_defs(s: &str) -> Result<Vec<nodedb_types::columnar::ColumnDef>, 
                 &format!("expected 'name TYPE' in column def: {part}"),
             ));
         }
-        let col_name = tokens[0].to_lowercase();
+        let col_name = parse_ident_token(tokens[0])?;
         let col_type = tokens[1].to_uppercase();
         let nullable = !tokens
             .windows(2)

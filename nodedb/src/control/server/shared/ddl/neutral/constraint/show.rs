@@ -14,6 +14,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::support::err;
@@ -135,9 +136,6 @@ fn extract_collection_after_on(sql: &str) -> Result<String, DdlError> {
     let end = after
         .find(|c: char| c.is_whitespace() || c == ';')
         .unwrap_or(after.len());
-    let name = after[..end].trim().to_lowercase();
-    if name.is_empty() {
-        return Err(err("42601", "missing collection name after ON"));
-    }
-    Ok(name)
+    // An empty name is rejected by the identifier check.
+    parse_ident_token(after[..end].trim())
 }

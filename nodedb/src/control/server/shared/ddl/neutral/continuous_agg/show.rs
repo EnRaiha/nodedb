@@ -22,6 +22,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::StoredContinuousAggregate;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::{AggregateInfo, ContinuousAggregateDef};
@@ -45,7 +46,7 @@ pub async fn show_continuous_aggregates(
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let source_filter = if parts.len() >= 5 && parts[3].to_uppercase() == "FOR" {
-        Some(parts[4].to_lowercase())
+        Some(parse_ident_token(parts[4])?)
     } else {
         None
     };

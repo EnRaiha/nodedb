@@ -13,6 +13,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -31,7 +32,7 @@ pub fn show_materialized_views(
     let tenant_id = identity.tenant_id;
 
     let source_filter = if parts.len() >= 5 && parts[3].to_uppercase() == "FOR" {
-        Some(parts[4].to_lowercase())
+        Some(parse_ident_token(parts[4])?)
     } else {
         None
     };

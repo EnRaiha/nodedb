@@ -10,6 +10,7 @@
 //! DDL parser extracted, rather than re-parsing the full statement string. Parse
 //! failures surface as protocol-neutral [`DdlError`] with SQLSTATE `42601`.
 
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::event::streaming_mv::types::{AggDef, AggFunction};
 use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, rfind_ascii_case_insensitive,
@@ -48,11 +49,12 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
         .get(from_pos + " FROM ".len()..)
         .unwrap_or_default()
         .trim();
-    let source_stream = after_from
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let source_stream = parse_ident_token(
+        after_from
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| parse_err("expected a source name after FROM"))?,
+    )?;
 
     // Extract GROUP BY columns.
     let group_by_columns = if let Some(gb_pos) = find_ascii_case_insensitive(query, " GROUP BY ") {
@@ -62,9 +64,10 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
             .trim();
         gb_str
             .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(parse_ident_token)
+            .collect::<Result<Vec<String>, DdlError>>()?
     } else {
         Vec::new()
     };
@@ -100,7 +103,7 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
         .trim();
 
     // Parse aggregates from SELECT list.
-    let aggregates = parse_select_aggregates(select_list);
+    let aggregates = parse_select_aggregates(select_list)?;
 
     if aggregates.is_empty() {
         return Err(parse_err(
@@ -120,7 +123,9 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
 ///
 /// Supports: `count(*) AS cnt`, `sum(field) AS total`, `min(field)`, etc.
 /// Non-aggregate items (e.g. GROUP BY column references) are skipped.
-fn parse_select_aggregates(select_list: &str) -> Vec<AggDef> {
+///
+/// Returns an error when an alias is not a usable SQL identifier.
+fn parse_select_aggregates(select_list: &str) -> Result<Vec<AggDef>, DdlError> {
     let mut aggregates = Vec::new();
 
     for item in select_list.split(',') {
@@ -133,10 +138,7 @@ fn parse_select_aggregates(select_list: &str) -> Vec<AggDef> {
         let (expr_part, alias) = if let Some(as_pos) = rfind_ascii_case_insensitive(item, " AS ") {
             (
                 item.get(..as_pos).unwrap_or_default().trim(),
-                item.get(as_pos + " AS ".len()..)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_lowercase(),
+                parse_ident_token(item.get(as_pos + " AS ".len()..).unwrap_or_default().trim())?,
             )
         } else {
             (item, item.to_lowercase().replace(['(', ')', '*', ' '], "_"))
@@ -182,7 +184,7 @@ fn parse_select_aggregates(select_list: &str) -> Vec<AggDef> {
         }
     }
 
-    aggregates
+    Ok(aggregates)
 }
 
 #[cfg(test)]

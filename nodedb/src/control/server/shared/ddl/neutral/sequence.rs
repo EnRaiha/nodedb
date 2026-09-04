@@ -13,6 +13,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::catalog::sequence_types::StoredSequence;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -358,7 +359,9 @@ pub fn describe_sequence(
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let name = name.to_lowercase();
+    // `DESCRIBE SEQUENCE` carries the raw token, unlike the other sequence
+    // statements whose names the DDL parser already decoded.
+    let name = parse_ident_token(name)?;
 
     let def = state
         .sequence_registry

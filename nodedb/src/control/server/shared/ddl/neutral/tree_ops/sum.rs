@@ -12,6 +12,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::{DatabaseId, TraceId, VShardId};
@@ -38,16 +39,19 @@ pub async fn tree_sum(
             "TREE_SUM requires (column, graph_index, root_id [, collection])",
         ));
     }
-    let sum_column = args[0].trim().to_lowercase();
-    let graph_index = args[1].trim().to_lowercase();
+    // The first two arguments are bare identifiers, not string literals.
+    let sum_column = parse_ident_token(args[0].trim())?;
+    let graph_index = parse_ident_token(args[1].trim())?;
     let root_id = args[2]
         .trim()
         .trim_matches('\'')
         .trim_matches('"')
         .to_string();
+    // A string literal is data: the collection name resolves exactly as
+    // written, with no case folding.
     let explicit_collection = args
         .get(3)
-        .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_lowercase());
+        .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string());
 
     let max_depth = extract_number_after(&upper, "MAX_DEPTH")?.unwrap_or(100);
 

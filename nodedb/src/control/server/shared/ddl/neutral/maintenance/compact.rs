@@ -8,6 +8,7 @@
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -24,7 +25,7 @@ pub fn handle_compact(
         return Err(ddl_err("42601", "COMPACT requires a collection name"));
     }
 
-    let collection = parts[1].to_lowercase();
+    let collection = parse_ident_token(parts[1])?;
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists.

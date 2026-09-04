@@ -11,6 +11,9 @@ use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from, rfind_ascii_case_insensitive,
 };
 
+use crate::control::server::shared::ddl::sql_parse::{
+    parse_ident_or_wildcard_token, parse_ident_token,
+};
 use crate::engine::timeseries::continuous_agg::{
     AggFunction, AggregateExpr, ContinuousAggregateDef, RefreshPolicy,
 };
@@ -44,22 +47,24 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
         .ok_or_else(|| err("42601", "expected CONTINUOUS AGGREGATE keyword".to_string()))?;
     let after_ca_start = ca_pos + KW_CONTINUOUS_AGGREGATE.len();
     let after_ca = sql[after_ca_start..].trim_start();
-    let name = after_ca
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| err("42601", "missing aggregate name".to_string()))?
-        .to_lowercase();
+    let name = parse_ident_token(
+        after_ca
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| err("42601", "missing aggregate name".to_string()))?,
+    )?;
 
     // Extract source: word after "ON"
     let on_pos = find_ascii_case_insensitive_from(sql, KW_ON, after_ca_start)
         .ok_or_else(|| err("42601", "expected ON <source> clause".to_string()))?;
     let after_on_start = on_pos + KW_ON.len();
     let after_on = sql[after_on_start..].trim_start();
-    let source = after_on
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| err("42601", "missing source collection name".to_string()))?
-        .to_lowercase();
+    let source = parse_ident_token(
+        after_on
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| err("42601", "missing source collection name".to_string()))?,
+    )?;
 
     // Extract bucket interval: between BUCKET ' and '
     let bucket_interval = extract_quoted_value(sql, sql, KW_BUCKET)
@@ -79,7 +84,7 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
     }
 
     // Extract GROUP BY columns (optional).
-    let group_by = extract_group_by(sql, sql);
+    let group_by = extract_group_by(sql, sql)?;
 
     // Extract WITH options (optional).
     let (refresh_policy, retention_period_ms) = extract_with_options(sql, sql);
@@ -151,7 +156,7 @@ fn parse_single_aggregate(s: &str) -> Result<AggregateExpr, DdlError> {
     let (func_part, alias) = if let Some(as_pos) = find_ascii_case_insensitive(s, KW_AS) {
         (
             &s[..as_pos],
-            Some(s[as_pos + KW_AS.len()..].trim().to_lowercase()),
+            Some(parse_ident_token(s[as_pos + KW_AS.len()..].trim())?),
         )
     } else {
         (s, None)
@@ -166,8 +171,10 @@ fn parse_single_aggregate(s: &str) -> Result<AggregateExpr, DdlError> {
         .rfind(')')
         .ok_or_else(|| err("42601", format!("missing closing parenthesis: {s}")))?;
 
+    // The function word is matched against a fixed set, so it lowercases as a
+    // keyword. The argument names a column, or `*` for `count(*)`.
     let func_name = func_part[..open].trim().to_lowercase();
-    let col_name = func_part[open + 1..close].trim().to_lowercase();
+    let col_name = parse_ident_or_wildcard_token(func_part[open + 1..close].trim())?;
 
     let function = match func_name.as_str() {
         "sum" => AggFunction::Sum,
@@ -199,10 +206,12 @@ fn parse_single_aggregate(s: &str) -> Result<AggregateExpr, DdlError> {
 }
 
 /// Extract GROUP BY columns.
-fn extract_group_by(_upper: &str, sql: &str) -> Vec<String> {
+///
+/// Returns an error when a column token is not a usable SQL identifier.
+fn extract_group_by(_upper: &str, sql: &str) -> Result<Vec<String>, DdlError> {
     let gb_pos = match find_ascii_case_insensitive(sql, KW_GROUP_BY) {
         Some(p) => p,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let after_gb_start = gb_pos + KW_GROUP_BY.len();
 
@@ -215,8 +224,9 @@ fn extract_group_by(_upper: &str, sql: &str) -> Vec<String> {
 
     sql[after_gb_start..end_pos]
         .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(parse_ident_token)
         .collect()
 }
 
@@ -274,4 +284,43 @@ pub(super) fn extract_with_options(_upper: &str, sql: &str) -> (RefreshPolicy, u
     }
 
     (refresh, retention_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_create_sql;
+
+    #[test]
+    fn count_star_keeps_the_wildcard_as_its_source_column() {
+        let def = parse_create_sql(
+            "CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' AGGREGATE count(*)",
+        )
+        .expect("count(*) is a valid aggregate");
+        assert_eq!(def.aggregates[0].source_column, "*");
+        // A wildcard argument derives the bare function name as the alias.
+        assert_eq!(def.aggregates[0].output_column, "count");
+    }
+
+    #[test]
+    fn quoted_aggregate_column_keeps_its_case() {
+        let def = parse_create_sql(
+            "CREATE CONTINUOUS AGGREGATE m1 ON \"MiXeD\" BUCKET '1h' AGGREGATE sum(\"VaLuE\")",
+        )
+        .expect("quoted names are valid");
+        assert_eq!(def.source, "MiXeD");
+        assert_eq!(def.aggregates[0].source_column, "VaLuE");
+    }
+
+    #[test]
+    fn wildcard_is_rejected_outside_a_function_argument() {
+        // `*` is legal only in the argument slot, never as an aggregate item,
+        // a source, or a GROUP BY column.
+        for sql in [
+            "CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' AGGREGATE *",
+            "CREATE CONTINUOUS AGGREGATE m1 ON * BUCKET '1h' AGGREGATE count(*)",
+            "CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' AGGREGATE count(*) GROUP BY *",
+        ] {
+            assert!(parse_create_sql(sql).is_err(), "{sql}");
+        }
+    }
 }

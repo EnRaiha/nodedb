@@ -38,7 +38,9 @@ pub async fn select_rank(
         ));
     }
 
-    let index_name = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the index name resolves exactly as written,
+    // with no case folding.
+    let index_name = unquote(&args[0]);
     let key_value = unquote(&args[1]);
 
     let collection = gate_read(state, identity, database_id, &index_name, RANK_WHAT)?;
@@ -76,7 +78,9 @@ pub async fn select_topk(
         ));
     }
 
-    let index_name = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the index name resolves exactly as written,
+    // with no case folding.
+    let index_name = unquote(&args[0]);
     let k: u32 = args[1].trim().parse().map_err(|_| {
         ddl_err(
             "42601",
@@ -115,7 +119,9 @@ pub async fn select_range(
         ));
     }
 
-    let index_name = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the index name resolves exactly as written,
+    // with no case folding.
+    let index_name = unquote(&args[0]);
     let score_min = parse_score_arg(&args[1]);
     let score_max = parse_score_arg(&args[2]);
 
@@ -154,7 +160,9 @@ pub async fn select_sorted_count(
         ));
     }
 
-    let index_name = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the index name resolves exactly as written,
+    // with no case folding.
+    let index_name = unquote(&args[0]);
 
     let collection = gate_read(state, identity, database_id, &index_name, COUNT_WHAT)?;
 

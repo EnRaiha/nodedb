@@ -10,6 +10,7 @@
 //! [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -43,9 +44,9 @@ pub fn drop_change_stream(
         && parts[3].eq_ignore_ascii_case("IF")
         && parts[4].eq_ignore_ascii_case("EXISTS")
     {
-        (true, parts[5].to_lowercase())
+        (true, parse_ident_token(parts[5])?)
     } else if parts.len() >= 4 {
-        (false, parts[3].to_lowercase())
+        (false, parse_ident_token(parts[3])?)
     } else {
         return Err(DdlError::new(
             "42601",

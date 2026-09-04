@@ -42,6 +42,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::broadcast::broadcast_to_all_cores;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
@@ -60,10 +61,11 @@ pub async fn create_graph_index(
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
     // CREATE GRAPH INDEX <name> ON <collection> (<parent_col> -> <id_col>)
-    let index_name = parts
-        .get(3)
-        .ok_or_else(|| ddl_err("42601", "missing graph index name"))?
-        .to_lowercase();
+    let index_name = parse_ident_token(
+        parts
+            .get(3)
+            .ok_or_else(|| ddl_err("42601", "missing graph index name"))?,
+    )?;
 
     let on_idx = parts
         .iter()

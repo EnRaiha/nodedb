@@ -24,6 +24,7 @@ use nodedb_types::DatabaseId;
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::catalog::PeriodLockDef;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
@@ -45,20 +46,22 @@ pub fn add_period_lock(
     let upper = sql.to_uppercase();
 
     // ALTER COLLECTION <name> ADD PERIOD LOCK ON <col> REFERENCES <table>(<pk>) ...
-    let name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
     // Find the period column: "ON <col>"
     let on_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("ON"))
         .ok_or_else(|| err("42601", "ADD PERIOD LOCK requires ON <column>"))?;
-    let period_column = parts
-        .get(on_idx + 1)
-        .ok_or_else(|| err("42601", "missing column name after ON"))?
-        .to_lowercase();
+    let period_column = parse_ident_token(
+        parts
+            .get(on_idx + 1)
+            .ok_or_else(|| err("42601", "missing column name after ON"))?,
+    )?;
 
     // Find REFERENCES <table>(<pk>)
     let ref_idx = parts
@@ -73,10 +76,10 @@ pub fn add_period_lock(
     // Find STATUS <col> (optional, defaults to "status").
     let status_column =
         if let Some(si) = parts.iter().position(|p| p.eq_ignore_ascii_case("STATUS")) {
-            parts
-                .get(si + 1)
-                .map(|s| s.to_lowercase())
-                .unwrap_or_else(|| "status".into())
+            match parts.get(si + 1) {
+                Some(token) => parse_ident_token(token)?,
+                None => "status".to_string(),
+            }
         } else {
             "status".into()
         };
@@ -128,10 +131,11 @@ pub fn drop_period_lock(
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let name = parts
-        .get(2)
-        .ok_or_else(|| err("42601", "missing collection name"))?
-        .to_lowercase();
+    let name = parse_ident_token(
+        parts
+            .get(2)
+            .ok_or_else(|| err("42601", "missing collection name"))?,
+    )?;
 
     let catalog = state.credentials.catalog();
 
@@ -165,14 +169,9 @@ pub fn drop_period_lock(
 fn parse_table_pk(spec: &str) -> Result<(String, String), DdlError> {
     let spec = spec.trim();
     if let Some(paren_start) = spec.find('(') {
-        let table = spec[..paren_start].trim().to_lowercase();
-        let pk = spec[paren_start + 1..]
-            .trim_end_matches(')')
-            .trim()
-            .to_lowercase();
-        if table.is_empty() || pk.is_empty() {
-            return Err(err("42601", "REFERENCES requires table(pk) format"));
-        }
+        // An empty table or pk is rejected by the identifier check.
+        let table = parse_ident_token(spec[..paren_start].trim())?;
+        let pk = parse_ident_token(spec[paren_start + 1..].trim_end_matches(')').trim())?;
         Ok((table, pk))
     } else {
         Err(err(

@@ -17,6 +17,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::catalog::StoredIndexRecord;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -38,7 +39,7 @@ pub fn show_indexes(
         && parts[1].eq_ignore_ascii_case("INDEXES")
         && parts[2].eq_ignore_ascii_case("ON")
     {
-        Some(parts[3].to_lowercase())
+        Some(parse_ident_token(parts[3])?)
     } else {
         None
     };

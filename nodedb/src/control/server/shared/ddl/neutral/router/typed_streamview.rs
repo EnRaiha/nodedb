@@ -6,6 +6,7 @@
 use nodedb_sql::ddl_ast::statement::{NodedbStatement, StreamViewStmt};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -91,12 +92,24 @@ pub(super) async fn try_typed(
             // dispatch did. The guard checks the in-memory group registry for the
             // identity tenant using the parsed name / stream verbatim.
             let tid = identity.tenant_id.as_u64();
-            let stream =
-                consumer_group::identity::canonical_stream_name(state, database_id, tid, stream);
+            let requested_stream = match parse_stream_ident_token(stream) {
+                Ok(requested_stream) => requested_stream,
+                Err(error) => return Some(Err(error)),
+            };
+            let group = match parse_ident_token(name) {
+                Ok(group) => group,
+                Err(error) => return Some(Err(error)),
+            };
+            let stream = consumer_group::identity::canonical_stream_name(
+                state,
+                database_id,
+                tid,
+                &requested_stream,
+            );
             if *if_exists
                 && state
                     .group_registry
-                    .get(database_id, tid, &stream, name)
+                    .get(database_id, tid, &stream, &group)
                     .is_none()
             {
                 return Some(Ok(vec![DdlResult::Status {

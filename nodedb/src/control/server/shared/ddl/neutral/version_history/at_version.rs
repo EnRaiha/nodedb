@@ -9,6 +9,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::types::CheckpointDoc;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -121,7 +122,7 @@ fn parse_at_version(sql: &str) -> Result<(String, String, String), DdlError> {
     // Collection: between "FROM " and " AT VERSION"
     let from_pos = find_ascii_case_insensitive(sql, "FROM ")
         .ok_or_else(|| err("42601", "expected FROM <collection>".to_string()))?;
-    let collection = sql[from_pos + 5..at_pos].trim().to_lowercase();
+    let collection = parse_ident_token(sql[from_pos + 5..at_pos].trim())?;
 
     // Checkpoint name: after "AT VERSION " until "WHERE"
     let after_at = sql[at_pos + 10..].trim();

@@ -42,7 +42,9 @@ pub async fn weighted_pick(
         ));
     }
 
-    let collection = unquote(&args[0]).to_lowercase();
+    // A string literal is data: the collection name resolves exactly as
+    // written, with no case folding.
+    let collection = unquote(&args[0]);
 
     // Parse named parameters from remaining args.
     let mut weight_col = String::new();
@@ -56,7 +58,7 @@ pub async fn weighted_pick(
         let upper = trimmed.to_uppercase();
 
         if let Some(val) = strip_named_param(&upper, trimmed, "WEIGHT") {
-            weight_col = unquote(&val).to_lowercase();
+            weight_col = unquote(&val);
         } else if let Some(val) = strip_named_param(&upper, trimmed, "COUNT") {
             count = val.trim().parse().map_err(|_| {
                 ddl_err(
