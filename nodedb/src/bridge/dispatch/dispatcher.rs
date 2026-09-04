@@ -344,11 +344,18 @@ impl Dispatcher {
             let (_drained, producer_gone) = channel.response_rx.drain_into(&mut batch, 64);
             for br in batch {
                 let rid = br.inner.request_id.as_u64();
-                channel.outstanding.remove(&rid);
-                if let Some(tid) = self.request_tenant.remove(&rid)
-                    && let Some(count) = self.tenant_inflight.get_mut(&tid)
-                {
-                    *count = count.saturating_sub(1);
+                // A streaming scan answers with many partials before its final
+                // response. The request is still executing on the core until
+                // that final one arrives, so releasing it here would let the
+                // shutdown drain call a live scan finished and would drop the
+                // tenant's in-flight slot mid-stream.
+                if !br.inner.partial {
+                    channel.outstanding.remove(&rid);
+                    if let Some(tid) = self.request_tenant.remove(&rid)
+                        && let Some(count) = self.tenant_inflight.get_mut(&tid)
+                    {
+                        *count = count.saturating_sub(1);
+                    }
                 }
                 responses.push(br.inner);
             }
