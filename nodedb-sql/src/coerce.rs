@@ -21,6 +21,8 @@
 
 use sqlparser::ast;
 
+use crate::error::SqlError;
+
 /// Resolve a `Value` into a `usize` if numeric-shaped.
 ///
 /// Accepts:
@@ -61,6 +63,30 @@ pub fn expr_as_usize_literal(expr: &ast::Expr) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Fallible LIMIT/OFFSET resolution.
+///
+/// Rejects negative literals (`LIMIT -1`, `OFFSET -2`) with
+/// [`SqlError::InvalidLimitValue`] instead of collapsing to `None`
+/// (unbounded). Everything else behaves exactly like
+/// [`expr_as_usize_literal`].
+pub fn expr_as_nonnegative_usize(
+    expr: &ast::Expr,
+    clause: &'static str,
+) -> Result<Option<usize>, SqlError> {
+    if matches!(
+        expr,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            ..
+        }
+    ) {
+        return Err(SqlError::InvalidLimitValue {
+            detail: format!("{clause} must not be negative"),
+        });
+    }
+    Ok(expr_as_usize_literal(expr))
 }
 
 /// Resolve a `Value` into an `f64` if numeric-shaped.
@@ -215,5 +241,43 @@ mod tests {
             as_f64_literal(&ast::Value::SingleQuotedString("foo".into())),
             None
         );
+    }
+
+    #[test]
+    fn s1_negative_limit_rejected_not_unbounded() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT * FROM t LIMIT -1",
+        )
+        .unwrap();
+        let ast::Statement::Query(q) = &stmts[0] else {
+            panic!("expected query statement");
+        };
+        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
+            q.limit_clause.as_ref()
+        else {
+            panic!("expected LIMIT clause");
+        };
+        assert!(
+            matches!(
+                expr_as_nonnegative_usize(expr, "LIMIT"),
+                Err(SqlError::InvalidLimitValue { .. })
+            ),
+            "S1: negative LIMIT must error"
+        );
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "SELECT * FROM t LIMIT 10",
+        )
+        .unwrap();
+        let ast::Statement::Query(q) = &stmts[0] else {
+            panic!("expected query statement");
+        };
+        let Some(ast::LimitClause::LimitOffset { limit: Some(expr), .. }) =
+            q.limit_clause.as_ref()
+        else {
+            panic!("expected LIMIT clause");
+        };
+        assert_eq!(expr_as_nonnegative_usize(expr, "LIMIT").unwrap(), Some(10));
     }
 }

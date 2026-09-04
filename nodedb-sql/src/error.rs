@@ -119,6 +119,13 @@ pub enum SqlError {
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },
 
+    /// A LIMIT or OFFSET clause carried a negative literal, which Postgres
+    /// rejects as SQLSTATE `2201W` (invalid_limit_value) rather than treating
+    /// as unbounded. Without the rejection the planner silently drops the
+    /// bound and runs the full collection scan.
+    #[error("invalid limit value: {detail}")]
+    InvalidLimitValue { detail: String },
+
     /// Identifier violates NodeDB's canonical identifier rules.
     #[error("invalid identifier '{name}': {reason}")]
     InvalidIdentifier { name: String, reason: &'static str },

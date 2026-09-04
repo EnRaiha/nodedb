@@ -125,12 +125,15 @@ pub fn estimate_cost(inputs: &CostModelInputs) -> VectorCost {
     // Codec decode cost (ns per vector × ef_search vectors).
     let codec_decode_ns = codec_decode_ns_for(inputs.quantization);
 
-    // Rerank cost.
-    const DEFAULT_OVERSAMPLE: u8 = 3;
+    // Rerank cost. Single source of truth: the codec's oversample default
+    // (BBQ/rabitq training multiplier) — cost planning must not drift from
+    // the codec the collection actually built with.
     let rerank_us = if inputs.quantization == QuantizationKind::None {
         0.0
     } else {
-        DEFAULT_OVERSAMPLE as f32 * inputs.ef_search as f32 * 0.01
+        crate::rerank::codecs::bbq::DEFAULT_OVERSAMPLE as f32
+            * inputs.ef_search as f32
+            * 0.01
     };
 
     let predicted_recall = predicted_recall_for(inputs.index_type, inputs.quantization);
@@ -148,6 +151,19 @@ pub fn estimate_cost(inputs: &CostModelInputs) -> VectorCost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rerank::codecs::bbq::DEFAULT_OVERSAMPLE as BBQ_OVERSAMPLE;
+
+    #[test]
+    fn v3_oversample_constant_matches_bbq() {
+        // CLAIM V3: cost planner local const is 3; BBQ codec default is 4.
+        let inputs = base_inputs();
+        let ratio = estimate_cost(&inputs).rerank_us / (inputs.ef_search as f32 * 0.01);
+        assert!(
+            (ratio - BBQ_OVERSAMPLE as f32).abs() < 1e-3,
+            "V3: rerank oversample ratio {ratio} must equal BBQ DEFAULT_OVERSAMPLE ({BBQ_OVERSAMPLE})"
+        );
+    }
+
 
     fn base_inputs() -> CostModelInputs {
         CostModelInputs {

@@ -12,6 +12,8 @@
 
 use sqlparser::ast;
 
+use crate::error::SqlError;
+
 use crate::error::Result;
 use crate::types::SortKey;
 
@@ -41,24 +43,33 @@ impl QueryTail<'_> {
 
     /// `(limit, offset)` for the LIMIT clause. A missing clause is
     /// `(None, 0)`; a non-literal bound is `None` (unbounded).
-    pub(in crate::planner::select) fn limit_offset(&self) -> (Option<usize>, usize) {
-        match self.limit_clause {
+    ///
+    /// Negative literals are rejected with [`SqlError::InvalidLimitValue`]
+    /// (SQLSTATE 2201W class) instead of silently degrading to unbounded.
+    pub(in crate::planner::select) fn limit_offset(
+        &self,
+    ) -> std::result::Result<(Option<usize>, usize), SqlError> {
+        Ok(match self.limit_clause {
             None => (None, 0),
             Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => {
                 let lv = limit
                     .as_ref()
-                    .and_then(crate::coerce::expr_as_usize_literal);
+                    .map(|l| crate::coerce::expr_as_nonnegative_usize(l, "LIMIT"))
+                    .transpose()?
+                    .flatten();
                 let ov = offset
                     .as_ref()
-                    .and_then(|o| crate::coerce::expr_as_usize_literal(&o.value))
+                    .map(|o| crate::coerce::expr_as_nonnegative_usize(&o.value, "OFFSET"))
+                    .transpose()?
+                    .flatten()
                     .unwrap_or(0);
                 (lv, ov)
             }
             Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-                let lv = crate::coerce::expr_as_usize_literal(limit);
-                let ov = crate::coerce::expr_as_usize_literal(offset).unwrap_or(0);
+                let lv = crate::coerce::expr_as_nonnegative_usize(limit, "LIMIT")?;
+                let ov = crate::coerce::expr_as_nonnegative_usize(offset, "OFFSET")?.unwrap_or(0);
                 (lv, ov)
             }
-        }
+        })
     }
 }

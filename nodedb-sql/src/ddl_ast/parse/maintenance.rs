@@ -11,14 +11,29 @@ pub(super) fn try_parse(
     _trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
     (|| -> Option<NodedbStatement> {
-        if upper.starts_with("ANALYZE") {
-            let collection = parts.get(1).map(|s| s.to_string());
+        // `ANALYZE`/`COMPACT` are keyword-boundary matched: bare `ANALYZE`
+        // (whole statement, no target) or `ANALYZE <name>`. A bare prefix
+        // match would absorb statements like `ANALYZE users(id)` — actually
+        // `ANALYZE` followed by a parenthesised payload — into the collection
+        // name. PostgreSQL has no `ANALYZE ... (cols)` form; any trailing
+        // `(...)` after the collection name is stripped so the name stays
+        // clean.
+        if upper == "ANALYZE" || upper.starts_with("ANALYZE ") {
+            let collection = parts
+                .get(1)
+                .map(|s| s.split('(').next().unwrap_or(s).trim().to_string());
             return Some(NodedbStatement::Cluster(ClusterStmt::Analyze {
                 collection,
             }));
         }
         if upper.starts_with("COMPACT ") {
-            let collection = parts.get(1)?.to_string();
+            let collection = parts
+                .get(1)?
+                .split('(')
+                .next()
+                .unwrap_or(parts.get(1)?)
+                .trim()
+                .to_string();
             return Some(NodedbStatement::Cluster(ClusterStmt::Compact {
                 collection,
             }));
@@ -35,4 +50,42 @@ pub(super) fn try_parse(
         None
     })()
     .map(Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s2_analyze_parenthesized_payload_absorbs_token() {
+        // CLAIM S2: starts_with("ANALYZE") + raw parts[1] absorbs "(id)".
+        let sql = "ANALYZE users(id)";
+        let out = try_parse(
+            sql.to_uppercase().as_str(),
+            &sql.split_whitespace().collect::<Vec<_>>(),
+            sql,
+        );
+        let Some(Ok(NodedbStatement::Cluster(ClusterStmt::Analyze { collection }))) = out else {
+            panic!("expected Analyze statement, got {out:?}");
+        };
+        assert_eq!(
+            collection.as_deref(),
+            Some("users"),
+            "S2: ANALYZE users(id) must yield collection 'users', not 'users(id)'"
+        );
+    }
+
+    #[test]
+    fn s2_plain_analyze_parses_cleanly() {
+        let sql = "ANALYZE users";
+        let out = try_parse(
+            sql.to_uppercase().as_str(),
+            &sql.split_whitespace().collect::<Vec<_>>(),
+            sql,
+        );
+        let Some(Ok(NodedbStatement::Cluster(ClusterStmt::Analyze { collection }))) = out else {
+            panic!("expected Analyze statement, got {out:?}");
+        };
+        assert_eq!(collection.as_deref(), Some("users"));
+    }
 }
