@@ -8,6 +8,7 @@ pub mod cascade;
 pub mod catalog_entry;
 pub mod catalog_overlay;
 pub mod change_stream;
+pub mod checkpoint_archival;
 pub mod checkpoint_manager;
 pub mod checkpoint_task;
 pub mod clone;

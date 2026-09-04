@@ -30,7 +30,7 @@ pub(in crate::diag) use quota::{
     QuotaRowNotInstalled, QuotaRowWriteFailed, QuotaScopePurgeIncomplete, QuotaScopeReplayAborted,
     ScopeQuotaNotInstalled,
 };
-pub(in crate::diag) use recovery::ReplayRecordUnapplied;
+pub(in crate::diag) use recovery::{ReplayRecordUnapplied, WalArchivalFailedTruncationHeld};
 pub(in crate::diag) use retention::RetentionAutowireOrphaned;
 pub(in crate::diag) use vector::VectorIndexNotApplied;
 pub(in crate::diag) use write_path::{

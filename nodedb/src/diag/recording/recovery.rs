@@ -89,3 +89,32 @@ pub fn batch_insert_without_surrogates(
     .with_backtrace()
     .emit();
 }
+
+/// Report a WAL segment that cold storage did not accept before the segment
+/// was due for deletion. Called only from the checkpoint's archival loop,
+/// which also holds truncation back at the segment.
+pub fn wal_archival_failed_truncation_held(
+    stage: &str,
+    err: Option<&crate::Error>,
+    segment_first_lsn: u64,
+) {
+    let class = match err {
+        Some(e) => error_class(e),
+        None => "none".to_owned(),
+    };
+    let ctx = context::WalArchivalFailedTruncationHeld {
+        stage,
+        error_class: &class,
+        segment_first_lsn,
+    };
+    let capture = Capture::new(
+        EventKind::Error,
+        "WAL archival failed: truncation held back to keep the archive continuous",
+    )
+    .domain(&ctx)
+    .with_backtrace();
+    let _ = match err {
+        Some(e) => capture.error_chain(error_chain_of(e)).emit(),
+        None => capture.emit(),
+    };
+}

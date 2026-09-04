@@ -33,7 +33,7 @@ pub use quota::{
 };
 pub use recovery::{
     batch_insert_without_surrogates, fts_index_update_failed, replay_record_unapplied,
-    write_acked_without_durability,
+    wal_archival_failed_truncation_held, write_acked_without_durability,
 };
 pub use retention::retention_autowire_orphaned;
 pub use shared::entry_kind;

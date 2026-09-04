@@ -23,7 +23,10 @@
 //!    them, so a truncation past a lagging consumer silently drops every CDC
 //!    row, trigger fire and streaming-MV update in the gap.
 //! 5. A `RecordType::Checkpoint` WAL record is written at the global LSN.
-//! 6. `WalManager::truncate_before()` deletes old WAL segments.
+//! 6. Eligible segments are archived to cold storage when it is configured.
+//!    A segment the archive did not accept bounds the truncation point, so
+//!    no segment is deleted before it is safely in cold storage.
+//! 7. `WalManager::truncate_before()` deletes old WAL segments.
 //!
 //! ## Frequency
 //!
@@ -37,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::dispatch::Dispatcher;
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
+use crate::control::checkpoint_archival::archive_wal_segments_before_truncation;
 use crate::control::request_tracker::RequestTracker;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 use crate::wal::WalManager;
@@ -320,17 +324,30 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
     // the marker's LSN onward.
     crate::fail_point!("checkpoint::after_marker_before_truncate");
 
-    // 6. Archive eligible WAL segments to cold storage before deletion.
+    // 6. Archive eligible WAL segments to cold storage before deletion. A
+    // segment the archive did not accept bounds truncation: deleting it would
+    // leave a hole no point-in-time recovery can cross.
+    let mut truncate_lsn = global_lsn;
     if let Some(ref cold) = cold_storage {
-        archive_wal_segments_before_truncation(wal, global_lsn, cold).await;
+        let bound = archive_wal_segments_before_truncation(wal, global_lsn, cold).await;
+        if bound < global_lsn {
+            warn!(
+                checkpoint_lsn = global_lsn,
+                truncate_lsn = bound,
+                "WAL truncation held back to the archived bound: segments from this LSN up are \
+                 not in cold storage and stay on local disk until archival recovers"
+            );
+            truncate_lsn = bound;
+        }
     }
 
     // 7. Truncate old WAL segments.
-    match wal.truncate_before(checkpoint_lsn) {
+    match wal.truncate_before(Lsn::new(truncate_lsn)) {
         Ok(result) => {
             if result.segments_deleted > 0 {
                 info!(
                     checkpoint_lsn = global_lsn,
+                    truncate_lsn,
                     segments_deleted = result.segments_deleted,
                     bytes_reclaimed = result.bytes_reclaimed,
                     "WAL truncated after checkpoint"
@@ -338,22 +355,24 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
             } else {
                 debug!(
                     checkpoint_lsn = global_lsn,
-                    "checkpoint complete (no segments to truncate)"
+                    truncate_lsn, "checkpoint complete (no segments to truncate)"
                 );
             }
 
-            // 8. GC the redb tombstone set: no surviving WAL
-            // segment can carry a write older than `checkpoint_lsn`.
-            // Without this, `_system.wal_tombstones` grows forever and
-            // each startup replay pays to load the accumulated rows.
-            // Strict `<` threshold in the catalog primitive — entries
-            // whose `purge_lsn == checkpoint_lsn` are kept for one more
-            // cycle, matching the WAL's own retention semantics.
+            // 8. GC the redb tombstone set: no surviving WAL segment can
+            // carry a write older than `truncate_lsn`. The threshold is the
+            // truncation point, not the checkpoint LSN — a held-back
+            // truncation leaves segments whose rows still need their
+            // tombstones. Without this GC, `_system.wal_tombstones` grows
+            // forever and each startup replay pays to load the accumulated
+            // rows. Strict `<` threshold in the catalog primitive — entries
+            // whose `purge_lsn == truncate_lsn` are kept for one more cycle,
+            // matching the WAL's own retention semantics.
             if let Some(cat) = catalog {
-                match cat.delete_wal_tombstones_before_lsn(global_lsn) {
+                match cat.delete_wal_tombstones_before_lsn(truncate_lsn) {
                     Ok(removed) if removed > 0 => {
                         info!(
-                            checkpoint_lsn = global_lsn,
+                            truncate_lsn,
                             removed, "wal_tombstones GC: reaped rows whose segments are truncated"
                         );
                     }
@@ -363,7 +382,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
                         // it just wastes redb space until the next pass.
                         warn!(
                             error = %e,
-                            checkpoint_lsn = global_lsn,
+                            truncate_lsn,
                             "wal_tombstones GC failed; will retry next checkpoint"
                         );
                     }
@@ -374,76 +393,13 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
             warn!(
                 error = %e,
                 checkpoint_lsn = global_lsn,
+                truncate_lsn,
                 "WAL truncation failed after checkpoint"
             );
         }
     }
 
     Some(checkpoint_lsn)
-}
-
-/// Archive WAL segments that will be deleted by the upcoming `truncate_before(checkpoint_lsn)`.
-///
-/// A segment is eligible for deletion (and therefore archival) when the segment
-/// immediately following it has a `first_lsn <= checkpoint_lsn`. We upload each
-/// eligible segment before `truncate_before` deletes it, preserving a continuous
-/// WAL archive in cold storage for point-in-time recovery.
-///
-/// Failures are logged as warnings; archival is best-effort and never blocks
-/// the checkpoint cycle.
-async fn archive_wal_segments_before_truncation(
-    wal: &WalManager,
-    checkpoint_lsn: u64,
-    cold: &crate::storage::cold::ColdStorage,
-) {
-    let segments = match wal.list_segments() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "WAL archival: failed to list segments");
-            return;
-        }
-    };
-
-    // Determine which segments are eligible using the same logic as truncate_before:
-    // a segment is deletable when its successor's first_lsn <= checkpoint_lsn.
-    for seg in &segments {
-        let next_first_lsn = segments
-            .iter()
-            .find(|s| s.first_lsn > seg.first_lsn)
-            .map(|s| s.first_lsn)
-            .unwrap_or(u64::MAX);
-
-        if next_first_lsn > checkpoint_lsn {
-            // Not eligible for deletion; skip.
-            continue;
-        }
-
-        let segment_name = match seg.path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_owned(),
-            None => {
-                warn!(path = %seg.path.display(), "WAL archival: invalid segment path, skipping");
-                continue;
-            }
-        };
-
-        match cold.upload_wal_segment(&seg.path, &segment_name).await {
-            Ok(object_path) => {
-                debug!(
-                    segment = %segment_name,
-                    object_path = %object_path,
-                    first_lsn = seg.first_lsn,
-                    "WAL segment archived before truncation"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    segment = %segment_name,
-                    error = %e,
-                    "WAL archival: upload failed (segment will still be truncated)"
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
