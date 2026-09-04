@@ -13,6 +13,16 @@
 //! enforced in one place. [`atomic_swap_dirs_fsync`] does the same for
 //! directory-level swaps (rename old-dir → backup, rename new-dir → old-dir).
 //!
+//! Path safety is split across two layers, and this module owns only the
+//! second one. A caller that joins a name from catalog, wire, or user input
+//! onto its base directory must first pass that name through
+//! [`nodedb_types::is_plain_path_component`]. That check answers "is this one
+//! ordinary name?" — it rejects a separator, a drive letter, a NUL, `.`, `..`,
+//! and a control character, so the join cannot reach outside the base. This
+//! module answers a different question: "do these already-joined paths sit in
+//! one directory that a single fsync covers?" It sees only the joined result,
+//! so it cannot recover the base and cannot substitute for the caller's check.
+//!
 //! [`read_checkpoint_dontneed`] pairs with the write helper on the read side:
 //! checkpoint bytes are consumed once (deserialized into the in-memory index)
 //! and then superseded. Leaving them in the page cache wastes memory needed
@@ -55,9 +65,11 @@ fn invalid_input(detail: String) -> WalError {
 /// A `..` component makes the final name resolve outside the directory this
 /// module fsyncs, so the durability ordering no longer covers the entry that
 /// was created, and a name assembled from catalog or wire input can address a
-/// directory the caller never intended to write. Both are rejected here rather
-/// than left to the callers, which is why every caller passes paths it built
-/// by joining a fixed base with a single name.
+/// directory the caller never intended to write. Both are rejected here.
+///
+/// This check runs on the joined path, so it cannot see the base the caller
+/// started from. A caller that joins an untrusted name must sanitize that name
+/// with [`nodedb_types::is_plain_path_component`] first.
 fn checked_parent<'a>(op: &str, label: &str, path: &'a Path) -> Result<&'a Path> {
     if path.components().any(|c| c == Component::ParentDir) {
         return Err(invalid_input(format!(
